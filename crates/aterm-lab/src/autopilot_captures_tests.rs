@@ -1001,3 +1001,407 @@ fn a_capture_run_leaves_another_runs_lab_up() {
     );
     assert_eq!(still_up(&run, |_| false), None, "a lab whose run died");
 }
+
+/// CLAUDE CODE'S SCENES WEAR THE OWNER'S WHOLE GLASS
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step 5, judged 2026-11-08): its lab
+/// admits the stub's base URL as the default route, and its tabs run on the default home's own
+/// claude.ai login with aterm's usage tap on the line, a roster naming that login `main`, the
+/// scenes' folders trusted in that home's profile and the stub's week ([`WEEK`]) on every reply,
+/// so the glass claims Claude Code's statusLine row as line E. The forever lab's own launch (an
+/// API key, `CLAUDE_CONFIG_DIR`, no tap) drew no line E in any scene. agy's lab admits no route.
+/// A lab that does not admit it takes no own login, and nothing is laid. NEGATIVE CONTROL (run by
+/// hand): `scene_launcher` giving Claude Code the forever lab's launch, as the verb did before,
+/// fails it; so does `up_opts` leaving the route seam as the environment set it.
+#[test]
+fn claude_codes_scenes_run_on_the_owners_login_with_the_tap_so_line_e_shows() {
+    use aterm_agent::harness::{accounts, tap};
+    let a = parse_args(&["--harness".to_string(), "claude".to_string()])
+        .expect("its words")
+        .expect("no help");
+    let env = crate::lab::UpOpts::default();
+    assert!(up_opts(env.clone(), Harness::Claude, Look::Day, &a).route_seam);
+    assert!(!up_opts(env, Harness::Agy, Look::Night, &a).route_seam);
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let lab = |seam: &str| {
+        let run = Run {
+            tag: "apcap-claude-day-1x".into(),
+            run: root.join(format!("runs/{seam}")),
+            w: root.join(format!("runs/{seam}/scratch")),
+            port: "5".into(),
+            proxy: "http://127.0.0.1:6".into(),
+            claude_bin: "/c/claude".into(),
+            aterm: "/a/target/debug/aterm".into(),
+            route_seam: seam.into(),
+            ..Run::default()
+        };
+        // As `up` lays the scratch home: the API key's helper, and the profile in `.claude`.
+        let dot = run.w.join("home/.claude");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(dot.join("settings.json"), r#"{"apiKeyHelper": "/helper"}"#).unwrap();
+        std::fs::write(
+            dot.join(".claude.json"),
+            r#"{"hasCompletedOnboarding": true}"#,
+        )
+        .unwrap();
+        run
+    };
+    let dirs = [root.join("proj/cruise-n"), root.join("proj/land-b")];
+    let now = 1_794_000_000;
+    let roster_at = |run: &Run| run.w.join("cfg/aterm").join(accounts::ACCOUNTS_FILE);
+
+    let mut refused = lab("0");
+    assert!(scene_launcher(&mut refused, Harness::Claude, &dirs, now).is_err());
+    assert!(
+        !roster_at(&refused).exists() && !refused.w.join("headers.json").exists(),
+        "a refused lab lays nothing"
+    );
+
+    let mut run = lab("1");
+    let script = scene_launcher(&mut run, Harness::Claude, &dirs, now).expect("an own launch");
+    let text = crate::util::scratch_text(&script);
+    let value = tap::settings_value(Path::new(&run.aterm)).expect("the tap names the lab's aterm");
+    assert!(
+        text.contains(&format!("--settings {}", crate::util::shell_quote(&value))),
+        "the tap rides the line: {text}"
+    );
+    assert!(
+        !text.contains("CLAUDE_CONFIG_DIR") && text.contains("-u HTTP_PROXY"),
+        "the default home's own login, the stub its only route: {text}"
+    );
+    assert_eq!(run.claude_login, crate::run::OWN_LOGIN);
+    let profile = crate::pyjson::J::parse(&crate::util::scratch_text(&run.claude_json())).unwrap();
+    assert!(
+        profile.get("oauthAccount").is_some(),
+        "the HOME's own profile is signed in"
+    );
+    for d in &dirs {
+        let trusted = profile
+            .get("projects")
+            .and_then(|p| p.get(&d.to_string_lossy()))
+            .and_then(|e| e.get("hasTrustDialogAccepted"))
+            .is_some_and(crate::pyjson::J::truthy);
+        assert!(
+            trusted,
+            "{} trusted in the profile Claude Code reads",
+            d.display()
+        );
+    }
+    let roster = accounts::Roster::load(&roster_at(&run)).unwrap();
+    assert_eq!(
+        roster.row_for_login(None).map(|row| row.label.as_str()),
+        Some("main"),
+        "{roster:?}"
+    );
+    let headers =
+        crate::pyjson::J::parse(&crate::util::scratch_text(&run.w.join("headers.json"))).unwrap();
+    let on200 = |k: &str| {
+        headers
+            .get("on200")
+            .and_then(|b| b.get(&format!("anthropic-ratelimit-unified-{k}")))
+            .cloned()
+    };
+    assert_eq!(
+        on200("7d-utilization").as_ref().and_then(|j| j.as_str()),
+        Some(WEEK.0)
+    );
+    assert_eq!(
+        on200("7d-reset").and_then(|j| j.as_i64()),
+        Some(now + WEEK.1)
+    );
+    assert_eq!(
+        on200("5h-reset").and_then(|j| j.as_i64()),
+        Some(now + FIVE.1)
+    );
+}
+
+/// A headless lab whose `chrome` prints tab `s-1`'s Account node as its last frame drew it: none
+/// before the test's first draw, then with the lead's figure alone for the first `drawn_at`
+/// frames, and from it the replay's reading, with the week's projection where `projects`; tab
+/// `s-2`'s line E says its projection on every look. `s-1`'s node is line E's (`Accounts. …`), or
+/// with `on_line_d` line D's fallback unit's (`Account: …`), the same sentences under the account
+/// fact's head. Every read carries tab `s-1`'s `autopilot` line and says the build reports
+/// Account nodes (`a11y kinds=autopilot,account`) but where `unreported`, an aterm whose `chrome`
+/// prints no kinds line and no Account node; the read at look `fails_at` (1-based) fails instead,
+/// the client's `ERR …` alone. Tab `s-1`'s `status` says `autopilot=off` where `off`, else
+/// `autopilot=cruise`.
+struct LineE {
+    draws: Cell<usize>,
+    looks: Cell<usize>,
+    drawn_at: usize,
+    off: bool,
+    projects: bool,
+    on_line_d: bool,
+    unreported: bool,
+    fails_at: Option<usize>,
+}
+
+impl LineE {
+    fn new(drawn_at: usize, off: bool, projects: bool) -> Self {
+        Self {
+            draws: Cell::new(0),
+            looks: Cell::new(0),
+            drawn_at,
+            off,
+            projects,
+            on_line_d: false,
+            unreported: false,
+            fails_at: None,
+        }
+    }
+
+    /// The `chrome` read at look `look` (1-based) fails.
+    fn failing_at(self, look: usize) -> Self {
+        Self {
+            fails_at: Some(look),
+            ..self
+        }
+    }
+
+    /// Tab `s-1`'s node is line D's fallback unit, line E never claimed.
+    fn on_line_d(self) -> Self {
+        Self {
+            on_line_d: true,
+            ..self
+        }
+    }
+
+    /// An aterm whose `chrome` reports no Account node (main's before §7 step 5, or a release).
+    fn unreported(self) -> Self {
+        Self {
+            unreported: true,
+            ..self
+        }
+    }
+
+    /// The wait's `draw`: one more frame.
+    fn draw(&self) -> Result<(), Fail> {
+        self.draws.set(self.draws.get() + 1);
+        Ok(())
+    }
+}
+
+impl Lab for LineE {
+    fn said(&self, args: &[&str]) -> String {
+        if args == ["@s-1", "status"] {
+            let mode = if self.off { "off" } else { "cruise" };
+            return format!("sid=s-1 auth=stored autopilot={mode} program=claude\n");
+        }
+        if args.first() != Some(&"chrome") {
+            return String::new();
+        }
+        self.looks.set(self.looks.get() + 1);
+        if self.fails_at == Some(self.looks.get()) {
+            return "ERR the main thread did not answer within 5 s\n".to_string();
+        }
+        let autopilot = "autopilot sid=s-1 window=0 program=claude face=cruise drawn=- \
+                         why=not-drawn spoken=- description=- title=-\na11y window=0 autopilot \
+                         sid=s-1 role=Button label=\"Autopilot: cruise.\" description=-\n";
+        if self.unreported {
+            return autopilot.to_string();
+        }
+        let lead = "main, this tab, 80 percent of its week used";
+        let read = format!("{lead}, resets Tuesday 16:06.");
+        let projected = format!("{read} {LINE_E_PROJECTED}: main");
+        let other = format!(
+            "{autopilot}a11y kinds=autopilot,account\na11y window=0 account sid=s-2 role=Button \
+             label={:?} description=-\n",
+            format!("{LINE_E_HEAD}{projected}")
+        );
+        let Some(frame) = self.draws.get().checked_sub(1) else {
+            return other;
+        };
+        let said = match (frame >= self.drawn_at, self.projects) {
+            (false, _) => lead,
+            (true, false) => &read,
+            (true, true) => &projected,
+        };
+        let label = if self.on_line_d {
+            format!("Account: {said}")
+        } else {
+            format!("{LINE_E_HEAD}{said}")
+        };
+        format!("{other}a11y window=0 account sid=s-1 role=Button label={label:?} description=-\n")
+    }
+
+    fn images(&self) -> PathBuf {
+        PathBuf::new()
+    }
+
+    fn aterm_pid(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// The wait's finding where it found one, else a panic naming what it returned.
+fn finding_of(lab: &LineE) -> String {
+    match line_e_unsaid(lab, "s-1", Duration::ZERO, || lab.draw()) {
+        Ok(Some(Unsaid::Finding(why))) => why,
+        other => panic!("no finding: {other:?}"),
+    }
+}
+
+/// A CLAUDE CODE SCENE IS SHOT ONCE LINE E SAYS WHAT ITS PANE ALLOWS
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step 5, judged 2026-11-08): the scenes
+/// that settle seconds after their first reply (cruise-needs, off) showed line E before the
+/// outlook replayed (the lead alone, or `┄` ahead with the reset), so the shot waits for the tab's
+/// own line E node (`Accounts. …`), as `chrome` reads it, to say the week's chain, and at its hang
+/// detector says what the node said last; another tab's projection is not this tab's. The node is
+/// the last frame's and a headless window draws none of its own, so every look follows a frame
+/// the wait draws (the first wait drew none between its looks and saw no node for 60 s in every
+/// scene). Under Autopilot Off the pane's recovery refuses forecasts (§5.1), so there the shot
+/// waits for the replay's reading alone and calls a projection a finding. NEGATIVE CONTROLS (run
+/// by hand): `line_e_unsaid` answering at its first look, as the shots did before, fails it; so
+/// does a wait that draws only between its looks, and `line_e_due` always due the projection, as
+/// the first wait was, which held every Off scene to its hang.
+#[test]
+fn a_claude_scene_is_shot_once_line_e_says_what_its_pane_allows() {
+    let lab = LineE::new(3, false, true);
+    let waited = line_e_unsaid(&lab, "s-1", LINE_E_HANG, || lab.draw());
+    assert_eq!(waited.ok(), Some(None), "drawn at the fourth frame");
+    assert_eq!(
+        (lab.draws.get(), lab.looks.get()),
+        (4, 4),
+        "each look reads a frame drawn for it"
+    );
+    let never = finding_of(&LineE::new(usize::MAX, false, true));
+    assert!(
+        never.starts_with("line E drew no projection within 0 s")
+            && never.contains("label=\"Accounts. main, this tab, 80 percent")
+            && !never.contains(LINE_E_PROJECTED),
+        "{never}"
+    );
+    let unprojected = finding_of(&LineE::new(0, false, false));
+    assert!(
+        unprojected.starts_with("line E drew no projection"),
+        "{unprojected}"
+    );
+    let off = LineE::new(2, true, false);
+    let read = line_e_unsaid(&off, "s-1", LINE_E_HANG, || off.draw());
+    assert_eq!(read.ok(), Some(None), "Off's reading at the third frame");
+    assert_eq!((off.draws.get(), off.looks.get()), (3, 3));
+    let unread = finding_of(&LineE::new(usize::MAX, true, false));
+    assert!(
+        unread.starts_with("line E drew no reading of its week within 0 s"),
+        "{unread}"
+    );
+    let projected = finding_of(&LineE::new(0, true, true));
+    assert!(
+        projected.starts_with("line E drew a projection under Autopilot Off"),
+        "{projected}"
+    );
+    assert_eq!(line_e_due("sid=s-1 autopilot=land"), LINE_E_PROJECTED);
+    assert_eq!(line_e_due("sid=s-1 autopilot=off"), LINE_E_READ);
+    assert_eq!(
+        line_e_node(
+            "a11y window=0 autopilot sid=s-1 role=Button label=\"Accounts. x\" description=-",
+            "s-1"
+        ),
+        None,
+        "an Autopilot node is no Account node"
+    );
+}
+
+/// LINE D'S ACCOUNT UNIT IS NOT LINE E (§7 step 5, after review 2026-11-08): where line E is never
+/// claimed (Claude Code's statusLine row refused, or the tap gone), line D draws its fallback
+/// account unit about 10 s on, and its Account node says the quota view's sentences under the
+/// account fact's head (`Account: main, this tab, …, resets …. Next 7 days …`). The wait reads
+/// line E's node alone (`Accounts. …`), so that unit, projection and all, ends in the hang's
+/// finding, which names the unit that stood instead, as it does under Off. NEGATIVE CONTROL (run
+/// by hand): `line_e_node` taking any Account node, as `account_node` did, answers at the first
+/// look and fails it.
+#[test]
+fn line_ds_account_unit_is_not_line_e() {
+    let d = LineE::new(0, false, true).on_line_d();
+    let why = finding_of(&d);
+    assert!(
+        why.starts_with("line E drew no projection within 0 s")
+            && why.contains("(its Account node: -; line D's account unit stood instead: ")
+            && why.contains("label=\"Account: main, this tab, 80 percent"),
+        "{why}"
+    );
+    let off = finding_of(&LineE::new(0, true, false).on_line_d());
+    assert!(
+        off.starts_with("line E drew no reading of its week within 0 s"),
+        "{off}"
+    );
+}
+
+/// AN ATERM THAT REPORTS NO ACCOUNT NODE LEAVES LINE E UNJUDGED (§7 step 5, after review
+/// 2026-11-08): a release build's `chrome`, or main's from before step 5 under `LAB_ATERM`, prints
+/// no `a11y kinds=` line naming `account`, so no read can tell what line E drew. The scene is shot
+/// at its first look that answered for the tab, with no wait, and its caption says so plainly,
+/// which `faults` does not count; a finding it does. A read that failed (`ERR …`, after recheck
+/// 2026-11-09) says nothing of the build: the wait looks again, so one failed read on this
+/// branch's own build neither shoots early nor calls the build old. NEGATIVE CONTROLS (run by
+/// hand): the wait not asking `reports_account_nodes` runs its whole hang and calls it a finding;
+/// `Unsaid::noted` writing `NotJudged` as a FINDING fails it; the wait not asking `answered_for`
+/// calls the failed read not judged.
+#[test]
+fn an_aterm_that_reports_no_account_node_leaves_line_e_unjudged() {
+    let old = LineE::new(0, false, true).unreported();
+    let started = Instant::now();
+    let waited = line_e_unsaid(&old, "s-1", LINE_E_HANG, || old.draw());
+    let Ok(Some(Unsaid::NotJudged(why))) = waited else {
+        panic!("judged: {waited:?}");
+    };
+    assert!(why.contains("reports no Account node"), "{why}");
+    assert_eq!(
+        (old.draws.get(), old.looks.get()),
+        (1, 1),
+        "one look, no wait ({:?})",
+        started.elapsed()
+    );
+    let blip = LineE::new(3, false, true).failing_at(1);
+    let waited = line_e_unsaid(&blip, "s-1", LINE_E_HANG, || blip.draw());
+    assert_eq!(waited.ok(), Some(None), "a failed read is looked past");
+    assert_eq!((blip.draws.get(), blip.looks.get()), (4, 4));
+    let old_blip = LineE::new(0, false, true).unreported().failing_at(1);
+    let waited = line_e_unsaid(&old_blip, "s-1", LINE_E_HANG, || old_blip.draw());
+    assert!(
+        matches!(waited, Ok(Some(Unsaid::NotJudged(_)))),
+        "{waited:?}"
+    );
+    assert_eq!(
+        (old_blip.draws.get(), old_blip.looks.get()),
+        (2, 2),
+        "judged at the first read that answered"
+    );
+    assert!(reports_account_nodes("a11y kinds=autopilot,account\n"));
+    assert!(!reports_account_nodes(
+        "a11y kinds=autopilot\na11y window=3 autopilot sid=s-1 role=Button label=\"x\" \
+         description=-\n"
+    ));
+    assert!(!answered_for(
+        "ERR the main thread did not answer within 5 s\n",
+        "s-1"
+    ));
+    assert!(!answered_for(
+        "autopilot sid=s-2 window=0 program=claude\n",
+        "s-1"
+    ));
+    assert!(answered_for(
+        "autopilot sid=s-1 window=0 program=claude\n",
+        "s-1"
+    ));
+    let row = |unsaid: &Unsaid| {
+        Row::new(
+            Who::Agent(Harness::Claude),
+            Scene::CruiseNeeds,
+            Look::Day,
+            1,
+            "-",
+            format!("caption{}", unsaid.noted()),
+        )
+    };
+    let unjudged = row(&Unsaid::NotJudged(why));
+    assert!(unjudged.caption.contains(LINE_E_NOT_JUDGED));
+    assert!(faults(&[unjudged]).is_empty());
+    let found = faults(&[row(&Unsaid::Finding("line E drew no projection".into()))]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].fault,
+        Fault::Finding("line E drew no projection".into())
+    );
+}

@@ -37,6 +37,9 @@ pub struct Record {
     pub inputs: String,
     pub token: String,
     pub state: String,
+    /// Terminal interruption or infrastructure evidence; absent only in older journal entries.
+    #[serde(default)]
+    pub cause: String,
     pub started: u64,
     pub updated: u64,
     pub lease_until: u64,
@@ -316,6 +319,7 @@ mod tests {
             inputs: "i".into(),
             token: "one".into(),
             state: "judging".into(),
+            cause: String::new(),
             started: 0,
             updated: 0,
             lease_until: 120,
@@ -350,6 +354,7 @@ mod tests {
             inputs: "i".into(),
             token: "one".into(),
             state: "judging".into(),
+            cause: String::new(),
             started: 0,
             updated: 1,
             lease_until: 120,

@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::*;
 
@@ -17,14 +17,12 @@ struct Inputs {
     root: File,
     file: File,
     request: Request,
+    _scratch: aterm_tempfile::TempDir,
 }
 impl Inputs {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "object-source-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let scratch = aterm_tempfile::Builder::new().prefix("object-source-").tempdir().unwrap();
+        let path = scratch.path();
         fs::create_dir_all(path.join("src/bootstrap")).unwrap();
         let path = fs::canonicalize(path).unwrap();
         fs::write(path.join("src/bootstrap/native_object.rs"), SOURCE_BYTES).unwrap();
@@ -38,15 +36,10 @@ impl Inputs {
         let source = file.metadata().unwrap();
         request.source.device = source.dev();
         request.source.inode = source.ino();
-        Self { path, root, file, request }
+        Self { path, root, file, request, _scratch: scratch }
     }
     fn fds(&self) -> [BorrowedFd<'_>; 2] {
         [self.root.as_fd(), self.file.as_fd()]
-    }
-}
-impl Drop for Inputs {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.path).unwrap();
     }
 }
 #[test]

@@ -13,6 +13,10 @@ use crate::server::Options as ServerOptions;
 #[path = "coalesce_tests.rs"]
 mod coalesce;
 
+/// A home's content as the conformance searches keep and put back its states.
+#[path = "home_content_tests.rs"]
+pub(super) mod home_content;
+
 pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     join(
         paths,
@@ -7917,7 +7921,7 @@ fn a_draft_over_waiting_writes_that_do_not_read_refuses_an_everyone_edit() {
 ///
 /// NEGATIVE CONTROL: `admin_cached_unlocked` passing `land` to `admin_base` (restored with cp from
 /// a backup plus touch, confirmed with cmp): in this build with debug assertions the open panics
-/// "an exclusive take of … under this thread's own draft observation of it waits for good".
+/// "an exclusive take of … under this thread's own observation of it waits for good".
 #[test]
 fn a_cached_admin_open_under_an_authors_observation_lands_no_pending_set() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);

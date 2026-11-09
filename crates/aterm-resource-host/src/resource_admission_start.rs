@@ -171,6 +171,7 @@ impl Owner {
                 service_sdk,
             ),
             Err(error) => {
+                self.journal.fault(&mut self.faulted, "root-launch", &error);
                 let (spawned, no_child, refusal) = match error {
                     LaunchError::NotSpawned(proof) => (
                         None,
@@ -194,7 +195,6 @@ impl Owner {
                     checked_at: None,
                     _sdk: service_sdk,
                 });
-                self.faulted = true;
             }
         }
     }
@@ -285,7 +285,7 @@ impl Owner {
             cpu_ceiling: width,
             memory_limit: pending.submission.request.memory_bytes,
             memory_at: Instant::now(),
-            memory_fault: false,
+            memory_fault: None,
             started,
             ended: None,
             exit_moment,

@@ -1,6 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 #[test]
+fn only_a_detached_update_owns_the_automatic_pass_budget() {
+    let args = |verb: &str| vec![verb.to_owned()];
+    assert!(super::detached_update(
+        &args("update"),
+        Some(super::SPAWNER_DETACHED)
+    ));
+    for spawner in [None, Some("123"), Some(""), Some("detached-other")] {
+        assert!(!super::detached_update(&args("update"), spawner));
+    }
+    for verb in ["install", "seed", "status", "list"] {
+        assert!(!super::detached_update(
+            &args(verb),
+            Some(super::SPAWNER_DETACHED)
+        ));
+    }
+    assert!(!super::detached_update(&[], Some(super::SPAWNER_DETACHED)));
+}
+
+#[test]
 fn which_json_takes_one_tool_and_one_optional_flag() {
     let args = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
     for words in [&["--json", "targo"][..], &["targo", "--json"][..]] {

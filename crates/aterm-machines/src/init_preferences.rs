@@ -787,10 +787,7 @@ impl HidMapping {
 
 fn merged_mapping(maps: &[HidMapping]) -> Result<Option<Vec<KeyboardMapChange>>, String> {
     if maps.is_empty() {
-        return Err(
-            "the attached keyboard has no HID service; reconnect it and run aterm init again"
-                .into(),
-        );
+        return Err("no live HID service was observed for the attached keyboard".into());
     }
     let control = |key| matches!(key, keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL);
     let mut changes = Vec::new();

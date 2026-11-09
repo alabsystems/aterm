@@ -84,9 +84,11 @@ pub enum CompletionCause {
     Timeout,
     /// Cancellation of this exact session and attempt.
     Cancelled,
-    /// The host ended execution after resource coverage exceeded its claim or
-    /// could no longer be measured safely. This is not a solver verdict.
+    /// The host ended execution after a measured resource claim overrun or
+    /// critical system memory pressure. This is not a solver verdict.
     ResourceLimit,
+    /// The host lost execution or custody integrity; diagnostics retain the fault.
+    HostFault,
 }
 /// Lifecycle facts. Queue time is never execution time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,6 +394,7 @@ impl EventFrame {
                     CompletionCause::Timeout => 1,
                     CompletionCause::Cancelled => 2,
                     CompletionCause::ResourceLimit => 3,
+                    CompletionCause::HostFault => 4,
                 });
                 e.number(*runtime_ns)
             }
@@ -438,6 +441,7 @@ impl EventFrame {
                         1 => CompletionCause::Timeout,
                         2 => CompletionCause::Cancelled,
                         3 => CompletionCause::ResourceLimit,
+                        4 => CompletionCause::HostFault,
                         _ => return Err(bad()),
                     },
                     runtime_ns: d.number()?,
@@ -550,6 +554,11 @@ mod tests {
             Event::Finished {
                 outcome: Outcome::Signal(9),
                 cause: CompletionCause::ResourceLimit,
+                runtime_ns: 1,
+            },
+            Event::Finished {
+                outcome: Outcome::Signal(9),
+                cause: CompletionCause::HostFault,
                 runtime_ns: 1,
             },
         ] {

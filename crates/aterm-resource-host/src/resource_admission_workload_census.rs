@@ -55,6 +55,7 @@ fn entry(member_attempt: [u8; 16], source: &Census) -> wire::Entry {
             CompletionCause::Timeout => control::CompletionCause::Timeout,
             CompletionCause::Cancelled => control::CompletionCause::Cancelled,
             CompletionCause::ResourceLimit => control::CompletionCause::ResourceLimit,
+            CompletionCause::HostFault => control::CompletionCause::HostFault,
         };
         (
             control::Status::Finished {

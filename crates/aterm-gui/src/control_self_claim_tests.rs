@@ -4190,8 +4190,10 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
             open: 4,
             subscriptions: 0,
         });
-        assert_eq!(lanes.start().rpc, 1, "the request lane starts");
+        let started = lanes.start();
+        assert_eq!(started.rpc, 1, "the request lane starts");
         lanes.publish(service.clone());
+        started.activate();
         let (stream, _) = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the claimant connects",

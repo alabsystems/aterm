@@ -234,7 +234,7 @@ const fn head_args() -> [&'static str; 10] {
     head_args_with_timeout("30")
 }
 
-const fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 10] {
+const fn head_args_with_timeout(timeout_secs: &str) -> [&str; 10] {
     [
         "-sS",
         "-I",
@@ -265,6 +265,44 @@ pub fn head_no_redirect_quick(url: &str) -> Result<HeadAnswer, HttpError> {
         url,
         &head_args_with_timeout("5"),
         aterm_types::http_retry::Policy::NONE,
+    )
+}
+
+/// One optional HEAD, with no retry and only the time remaining until `deadline`.
+/// An expired deadline refuses before spawning curl. Multiple probes can share this deadline.
+/// # Errors
+/// A non-HTTPS URL, expired deadline, transport failure or exhausted one-attempt policy.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn head_no_redirect_until(
+    url: &str,
+    deadline: std::time::Instant,
+) -> Result<HeadAnswer, HttpError> {
+    require_https_url(url).map_err(HttpError::Transport)?;
+    head_until(url, deadline)
+}
+
+fn head_remaining(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> Result<String, HttpError> {
+    // curl treats zero as unlimited. Round down to milliseconds and refuse a sub-ms remainder.
+    let millis = deadline.saturating_duration_since(now).as_millis();
+    if millis == 0 {
+        return Err(HttpError::Transport(
+            "optional HEAD deadline exhausted".into(),
+        ));
+    }
+    Ok(format!("{}.{:03}", millis / 1000, millis % 1000))
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn head_until(url: &str, deadline: std::time::Instant) -> Result<HeadAnswer, HttpError> {
+    let remaining = head_remaining(deadline, std::time::Instant::now())?;
+    head_attempts(
+        url,
+        &head_args_with_timeout(&remaining),
+        1,
+        aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::NONE),
     )
 }
 
@@ -2922,6 +2960,96 @@ mod tests {
         let dir = scratch.0.clone();
         drop(scratch);
         assert!(!dir.exists(), "the scratch dir is removed on drop");
+    }
+
+    #[test]
+    fn optional_head_uses_only_the_remaining_deadline() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        assert_eq!(super::head_remaining(deadline, start).unwrap(), "5.000");
+        assert_eq!(
+            super::head_remaining(deadline, start + Duration::from_millis(4250)).unwrap(),
+            "0.750"
+        );
+        for now in [
+            deadline - Duration::from_nanos(1),
+            deadline,
+            deadline + Duration::from_secs(1),
+        ] {
+            assert!(super::head_remaining(deadline, now).is_err());
+        }
+        assert!(super::head_no_redirect_until("https://unused.invalid", start).is_err());
+        assert!(
+            super::head_no_redirect_until("http://unused.invalid", deadline)
+                .unwrap_err()
+                .to_string()
+                .contains("non-https")
+        );
+    }
+
+    fn unavailable_head_server() -> (agh_fake::FakeGithub, String) {
+        let fake = agh_fake::FakeGithub::start();
+        fake.fault_always(
+            agh_fake::Match::web("/"),
+            agh_fake::Fault::Status {
+                status: 504,
+                body: String::new(),
+                headers: vec![],
+            },
+        );
+        let url = format!("http://127.0.0.1:{}/index.toml", fake.ports().web);
+        (fake, url)
+    }
+
+    #[test]
+    fn optional_head_drops_a_504_without_retry() {
+        let (fake, url) = unavailable_head_server();
+        let refused = super::head_until(
+            &url,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("HTTP 504"), "{refused}");
+        assert_eq!(
+            fake.seen().len(),
+            1,
+            "mutating NONE to STANDARD retries this request"
+        );
+    }
+
+    /// ABBA on the original transport and the optional lane, using real curl and an endless
+    /// 504 server. The required lane is also the negative control: it must spend all retries
+    /// and refuse. No latency assertion: the recorded wall time is the measurement.
+    #[test]
+    #[ignore = "measurement: two required reads each spend the production retry bound"]
+    fn measure_optional_head_504() {
+        use std::time::{Duration, Instant};
+        assert!(aterm_types::dev_seam!(aterm_types::domain::ENV_DEV_FAST_TIMERS).is_none());
+        for optional in [false, true, true, false] {
+            let (fake, url) = unavailable_head_server();
+            let start = Instant::now();
+            let refused = if optional {
+                super::head_until(&url, start + Duration::from_secs(5))
+            } else {
+                super::head_attempts(
+                    &url,
+                    &head_args(),
+                    1,
+                    aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::STANDARD),
+                )
+            }
+            .unwrap_err()
+            .to_string();
+            let attempts = fake.seen().len();
+            assert_eq!(attempts, if optional { 1 } else { 19 });
+            assert!(refused.contains("HTTP 504"), "{refused}");
+            println!(
+                "hint-504 optional={optional} wall_s={:.6} requests={attempts} refused={refused}",
+                start.elapsed().as_secs_f64()
+            );
+        }
     }
 
     #[test]

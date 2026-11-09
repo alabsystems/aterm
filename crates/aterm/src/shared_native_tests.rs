@@ -11,6 +11,65 @@ thread_local! {
 }
 
 #[test]
+fn a_required_native_preparation_step_keeps_its_signed_input_and_original_deadline() {
+    let (_temp, approved, _config) = fixture(Provider::Google, false);
+    let read = |paths: &Paths, active: &Config| {
+        let entry = client::read_verified_entry(paths, active, "native-input")
+            .map_err(|e| e.to_string())?
+            .ok_or("owned input disappeared")?;
+        let value: Value = aterm_json::from_slice(entry.value().as_slice()).unwrap();
+        assert_eq!(value["key"].as_str(), Some("synthetic-private-key"));
+        Ok(value)
+    };
+    let before = with_custody(&approved.paths, &approved.expected, deadline(), read).unwrap();
+    for age in [11, 61, 0] {
+        let calls = std::cell::Cell::new(0);
+        let got = with_custody(
+            &approved.paths,
+            &approved.expected,
+            step_deadline(Instant::now() - Duration::from_secs(age)),
+            |paths, active| {
+                calls.set(calls.get() + 1);
+                read(paths, active)
+            },
+        );
+        if age == 61 {
+            assert!(got.is_err());
+            assert_eq!(calls.get(), 0, "expired work reads no credential");
+        } else {
+            assert_eq!(got.unwrap(), before);
+            assert_eq!(calls.get(), 1);
+        }
+        assert_eq!(
+            client::config(&approved.paths).unwrap().as_ref(),
+            Some(&approved.expected)
+        );
+        assert_eq!(
+            with_custody(
+                &approved.paths,
+                &approved.expected,
+                step_deadline(Instant::now()),
+                read
+            )
+            .unwrap(),
+            before,
+            "same signed input and authority recover without replay"
+        );
+    }
+    let mut wrong = approved.expected.clone();
+    wrong.name.push_str("-other");
+    assert!(
+        with_custody(
+            &approved.paths,
+            &wrong,
+            step_deadline(Instant::now()),
+            |_, _| -> Result<Value, String> { panic!("another authority cannot read the input") }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn native_connector_exec_preserves_success_and_failure_status() {
     const CHILD: &str = "ATERM_TEST_NATIVE_CONNECTOR_EXIT";
     const NAME: &str =

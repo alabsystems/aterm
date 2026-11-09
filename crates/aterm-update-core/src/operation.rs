@@ -14,10 +14,26 @@ use std::{
 #[derive(Default)]
 struct OperationState {
     requested: AtomicBool,
+    deadline: Option<std::time::Instant>,
     #[cfg(unix)]
     helpers: Mutex<usize>,
     #[cfg(unix)]
     retired: std::sync::Condvar,
+}
+
+impl OperationState {
+    fn requested(&self) -> bool {
+        if self.deadline.is_some() {
+            self.requested_at(std::time::Instant::now())
+        } else {
+            self.requested.load(Ordering::Acquire)
+        }
+    }
+
+    fn requested_at(&self, now: std::time::Instant) -> bool {
+        self.requested.load(Ordering::Acquire)
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+    }
 }
 
 static STOP: Mutex<Option<Arc<OperationState>>> = Mutex::new(None);
@@ -28,13 +44,24 @@ pub fn operation_active() -> bool {
     STOP.lock().unwrap_or_else(|p| p.into_inner()).is_some()
 }
 
-/// Whether this dedicated operation's owner closed its cancellation pipe.
+/// Whether optional post-install work must wait for a later upkeep pass.
+/// Owner-bound installs finish their bounded request first. Self-budgeted updates
+/// retain ordinary upkeep while their budget remains live.
+#[must_use]
+pub fn operation_defers_maintenance() -> bool {
+    STOP.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|stop| stop.deadline.is_none() || stop.requested())
+}
+
+/// Whether this dedicated operation's owner cancelled it or its own budget expired.
 #[must_use]
 pub fn operation_cancelled() -> bool {
     STOP.lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .is_some_and(|stop| stop.requested.load(Ordering::Acquire))
+        .is_some_and(|stop| stop.requested())
 }
 
 /// Refuse another operation step after cancellation. Completed mutations remain completed.
@@ -64,6 +91,36 @@ pub struct OperationCancellation {
 
 #[cfg(unix)]
 impl OperationCancellation {
+    /// Own a monotonic budget inside the package process, independent of its launcher.
+    /// Expiry cooperatively retires helpers and refuses further mutation; cleanup keeps
+    /// its existing custody until it finishes.
+    ///
+    /// # Errors
+    /// Refuses an already active operation.
+    pub fn until(deadline: std::time::Instant) -> io::Result<Self> {
+        Self::install(Some(deadline))
+    }
+
+    fn install(deadline: Option<std::time::Instant>) -> io::Result<Self> {
+        let stop = Arc::new(OperationState {
+            deadline,
+            ..OperationState::default()
+        });
+        let mut active = STOP.lock().unwrap_or_else(|p| p.into_inner());
+        if active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "an operation scope is already active",
+            ));
+        }
+        *active = Some(stop.clone());
+        Ok(Self {
+            stop,
+            shutdown: None,
+            observer: None,
+        })
+    }
+
     /// Adopt a read-only cancellation pipe from stdin, replacing stdin with `/dev/null`.
     ///
     /// # Errors
@@ -75,22 +132,9 @@ impl OperationCancellation {
     fn watch(reader: std::os::fd::OwnedFd) -> io::Result<Self> {
         use std::os::fd::AsFd as _;
         let (shutdown, held) = aterm_uds::kept_out(std::io::pipe)?;
-        let stop = Arc::new(OperationState::default());
-        {
-            let mut active = STOP.lock().unwrap_or_else(|p| p.into_inner());
-            if active.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "an operation scope is already active",
-                ));
-            }
-            *active = Some(stop.clone());
-        }
-        let mut scope = Self {
-            stop: stop.clone(),
-            shutdown: Some(held),
-            observer: None,
-        };
+        let mut scope = Self::install(None)?;
+        let stop = scope.stop.clone();
+        scope.shutdown = Some(held);
         scope.observer = Some(
             std::thread::Builder::new()
                 .name("package-cancel".into())
@@ -158,7 +202,7 @@ fn helper_scope() -> io::Result<Option<HelperLease>> {
     let Some(stop) = active.as_ref() else {
         return Ok(None);
     };
-    if stop.requested.load(Ordering::Acquire) {
+    if stop.requested() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "package operation cancelled",
@@ -199,12 +243,7 @@ pub(crate) fn run_command_until(
                 }
                 Ok(())
             },
-            || {
-                stopped()
-                    || helper
-                        .as_ref()
-                        .is_some_and(|helper| helper.0.requested.load(Ordering::Acquire))
-            },
+            || stopped() || helper.as_ref().is_some_and(|helper| helper.0.requested()),
         )?;
         status
             .map(|status| std::process::Output {
@@ -233,6 +272,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_deadline_expires_at_the_boundary_and_cannot_outlive_cancellation() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let stop = OperationState {
+            deadline: Some(deadline),
+            ..OperationState::default()
+        };
+        assert!(!stop.requested_at(deadline - std::time::Duration::from_nanos(1)));
+        assert!(stop.requested_at(deadline));
+        assert!(stop.requested_at(deadline + std::time::Duration::from_secs(1)));
+        stop.requested.store(true, Ordering::Release);
+        assert!(stop.requested_at(deadline - std::time::Duration::from_secs(1)));
+        let unbounded = OperationState::default();
+        assert!(!unbounded.requested_at(deadline));
+    }
+
+    #[test]
     fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
         const CHILD: &str = "ATERM_OPERATION_CANCEL_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -243,6 +298,7 @@ mod tests {
             let scope = OperationCancellation::watch(OwnedFd::from(read)).unwrap();
             assert!(operation_active());
             assert!(!operation_cancelled());
+            assert!(operation_defers_maintenance());
             let path = witness.clone();
             let closer = std::thread::spawn(move || {
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -325,6 +381,33 @@ mod tests {
             );
             assert!(ran, "helper execution hang detector");
             drop(held);
+
+            let scope = OperationCancellation::until(std::time::Instant::now()).unwrap();
+            assert!(operation_active());
+            assert!(operation_cancelled());
+            assert!(operation_defers_maintenance());
+            assert!(check_operation().is_err());
+            let mut absent = aterm_uds::spawnfd::command("/no-such-expired-helper");
+            assert_eq!(
+                run_operation_command(&mut absent).unwrap_err().kind(),
+                io::ErrorKind::Interrupted,
+                "the expired scope refuses before spawning another helper"
+            );
+            assert!(OperationCancellation::until(std::time::Instant::now()).is_err());
+            drop(scope);
+            assert!(!operation_active());
+            assert!(!operation_cancelled());
+            let scope = OperationCancellation::until(
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+            assert!(!operation_cancelled());
+            assert!(!operation_defers_maintenance());
+            drop(scope);
+            assert!(
+                !operation_active(),
+                "normal exit retires without waiting for the budget"
+            );
             return;
         }
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());

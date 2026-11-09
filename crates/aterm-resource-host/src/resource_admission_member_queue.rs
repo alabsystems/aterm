@@ -363,8 +363,9 @@ impl Owner {
             return;
         }
         let binding = request.member.binding.clone();
-        if self.journal.create(&binding).is_err() {
-            self.faulted = true;
+        if let Err(error) = self.journal.create(&binding) {
+            self.journal
+                .fault(&mut self.faulted, "member-create", error);
             let _ = events.emit(Event::Refused {
                 reason: "member journal refused before launch".into(),
             });
@@ -381,8 +382,9 @@ impl Owner {
                 } else {
                     workload::CensusKind::Compiler
                 };
-                if workload.register(binding.attempt, kind).is_err() {
-                    self.faulted = true;
+                if let Err(error) = workload.register(binding.attempt, kind) {
+                    self.journal
+                        .fault(&mut self.faulted, "member-register", error);
                     let _ = self.journal.settle(&binding); // Lexical no ARM or downstream delivery.
                     let _ = events.emit(Event::Refused {
                         reason: "workload census refused before ARM".into(),
@@ -472,9 +474,13 @@ impl Owner {
                 match member.tick(self, job, self.faulted) {
                     Ok(true) => return true,
                     Ok(false) => {}
-                    Err(_) => {
-                        self.faulted = true;
-                        job.cause = CompletionCause::ResourceLimit;
+                    Err(error) => {
+                        self.journal.fault(
+                            &mut self.faulted,
+                            "produced-member",
+                            (&slot.binding, error),
+                        );
+                        job.cause = CompletionCause::HostFault;
                         job.cleanup_at.get_or_insert_with(Instant::now);
                     }
                 }
@@ -788,7 +794,9 @@ impl Owner {
                     .as_ref()
                     .is_err_and(|error| error.kind() != io::ErrorKind::WouldBlock)
                 {
-                    self.faulted = true;
+                    self.journal
+                        .fault(&mut self.faulted, "member-return", &returned);
+                    job.cause = CompletionCause::HostFault;
                     job.cleanup_at.get_or_insert_with(Instant::now);
                 }
                 if !settled && returned.is_ok() {
@@ -796,16 +804,21 @@ impl Owner {
                 }
                 if settled && events.drained() {
                     if let Some(workload) = job.workload.as_mut()
-                        && workload.refused(slot.binding.attempt).is_err()
+                        && let Err(error) = workload.refused(slot.binding.attempt)
                     {
-                        self.faulted = true;
+                        self.journal
+                            .fault(&mut self.faulted, "member-refused", error);
                     }
                     return true;
                 }
                 State::Refused { events, settled }
             }
             State::Vacant => {
-                self.faulted = true;
+                self.journal.fault(
+                    &mut self.faulted,
+                    "member-vacant",
+                    "queued member has no state",
+                );
                 State::Vacant
             }
         };
@@ -951,7 +964,7 @@ impl Owner {
     }
     fn poll_member(&mut self, job: &mut Job, binding: &Binding, active: &mut Active) {
         let cause = if self.faulted {
-            Some(CompletionCause::ResourceLimit)
+            Some(CompletionCause::HostFault)
         } else {
             job.cleanup_at
                 .map(|_| {
@@ -975,19 +988,26 @@ impl Owner {
         };
         let progress = active.attempt.poll(&mut custody, cause);
         if let Some(workload) = custody.job.workload.as_mut()
-            && workload
-                .observe(binding.attempt, active.attempt.identity(), &progress)
-                .is_err()
+            && let Err(error) =
+                workload.observe(binding.attempt, active.attempt.identity(), &progress)
         {
-            self.faulted = true;
+            self.journal
+                .fault(&mut self.faulted, "member-observe", error);
+            custody.job.cause = CompletionCause::HostFault;
             custody.job.cleanup_at.get_or_insert_with(Instant::now);
         }
         if progress.uncertain
             || (progress.launched && !progress.go_attempted)
             || active.attempt.binding() != binding
         {
-            self.faulted = true;
-            custody.job.cause = CompletionCause::ResourceLimit;
+            self.journal.fault(
+                &mut self.faulted,
+                "member-progress",
+                format!("binding={binding:?} uncertain={} launched={} go_attempted={} binding_matches={} detail={:?}",
+                    progress.uncertain, progress.launched, progress.go_attempted,
+                    active.attempt.binding() == binding, active.attempt.failure()),
+            );
+            custody.job.cause = CompletionCause::HostFault;
             custody.job.cleanup_at.get_or_insert_with(Instant::now);
             if !custody.job.reaped
                 && custody
@@ -1000,44 +1020,60 @@ impl Owner {
             }
             let _ = active
                 .attempt
-                .poll(&mut custody, Some(CompletionCause::ResourceLimit));
+                .poll(&mut custody, Some(CompletionCause::HostFault));
         }
         if progress.ready_to_start && !self.faulted {
             if let Some((pid, birth)) = active.attempt.identity() {
-                active.bound = active.bound
-                    || self
-                        .journal
-                        .update(
+                let bound = if active.bound {
+                    Ok(())
+                } else {
+                    (|| {
+                        self.journal.update(
                             binding,
                             "member_bound",
                             aterm_json::json!({"pid":pid,"birth":birth}),
-                        )
-                        .is_ok()
-                        && self
-                            .journal
+                        )?;
+                        self.journal
                             .update(binding, "member_running", aterm_json::json!({}))
-                            .is_ok();
-                if active.bound {
-                    if let Ok(started) = active.attempt.start(&mut custody)
-                        && let Some(workload) = custody.job.workload.as_mut()
-                        && workload.started(binding.attempt, started).is_err()
-                    {
-                        self.faulted = true;
-                        custody.job.cleanup_at.get_or_insert_with(Instant::now);
+                    })()
+                };
+                match bound {
+                    Ok(()) => active.bound = true,
+                    Err(error) => {
+                        self.journal
+                            .fault(&mut self.faulted, "member-bind-journal", error);
+                        let _ = active
+                            .attempt
+                            .poll(&mut custody, Some(CompletionCause::HostFault));
                     }
-                } else {
-                    self.faulted = true;
-                    let _ = active
-                        .attempt
-                        .poll(&mut custody, Some(CompletionCause::Cancelled));
+                }
+                if active.bound && !self.faulted {
+                    match active.attempt.start(&mut custody) {
+                        Ok(started) => {
+                            if let Some(workload) = custody.job.workload.as_mut()
+                                && let Err(error) = workload.started(binding.attempt, started)
+                            {
+                                self.journal
+                                    .fault(&mut self.faulted, "member-started", error);
+                                custody.job.cause = CompletionCause::HostFault;
+                                custody.job.cleanup_at.get_or_insert_with(Instant::now);
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) => self.journal.record_fault("member-start", error),
+                    }
                 }
             } else {
                 // A ready attempt without its original bound identity cannot
                 // authorize GO. Preserve custody and begin actual cleanup.
-                self.faulted = true;
+                self.journal.fault(
+                    &mut self.faulted,
+                    "member-ready-identity",
+                    "ready attempt has no original bound identity",
+                );
                 let _ = active
                     .attempt
-                    .poll(&mut custody, Some(CompletionCause::ResourceLimit));
+                    .poll(&mut custody, Some(CompletionCause::HostFault));
             }
         }
         if progress.completed.is_some() && !active.terminal {

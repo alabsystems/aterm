@@ -6,18 +6,20 @@ use aterm_uds::secret::Secret;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) fn preparation_transition(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(template, before, action, false)
 }
 
 fn transition_with(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
     skip_validation: bool,
 ) -> aterm_spec::interp::State {
-    let (f, broker, token, _) = super::broker_tests::setup();
+    let (f, broker, token, _) = super::broker_tests::fork(template);
     let parsed = AtomicUsize::new(0);
     let entered = AtomicUsize::new(0);
     let bytes = b"owned provider input";
@@ -118,8 +120,9 @@ fn broker_preparation_conforms_and_invalid_input_cannot_consume_capacity() {
     let model = aterm_models_db::broker_preparation_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = super::broker_tests::template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::preparation_transition(&initial, action.name);
+        let next = super::preparation_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -127,6 +130,6 @@ fn broker_preparation_conforms_and_invalid_input_cannot_consume_capacity() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "Invalid", true);
+    let unsafe_next = transition_with(&template, &initial, "Invalid", true);
     assert!(!model.check_invariant("NoUnpreparedEffect", &unsafe_next));
 }

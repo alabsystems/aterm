@@ -942,10 +942,7 @@ impl Store {
                 "combined table observation has no single custody identity",
             ));
         }
-        let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm/commons/table-custody/1\0");
-        hash.update(&self.claim[..WITNESS_AT]);
-        Ok(hash.finalize())
+        Ok(custody_of(&self.claim))
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -2805,4 +2802,41 @@ pub(crate) fn claim_name_for(table: &Digest) -> String {
 /// The file name of `scope`'s enrollment claim inside [`claim_dir`].
 pub(crate) fn claim_name(scope: Scope) -> String {
     claim_name_for(&scope.digest())
+}
+
+/// The custody identity of the enrollment `claim` ([`Store::custody_id`]): its bytes before the
+/// receipt witness.
+fn custody_of(claim: &[u8]) -> Digest {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm/commons/table-custody/1\0");
+    hash.update(&claim[..WITNESS_AT]);
+    hash.finalize()
+}
+
+/// The directory identity `claim`, an enrollment claim, binds its table to (none for a claim no
+/// open has bound yet), in [`directory_identity`]'s encoding: for a test's copy of a lab
+/// (`table::fixture::Lab::fork`), whose table directories are other directories.
+#[cfg(test)]
+pub(crate) fn claimed_directory(claim: &[u8]) -> Option<[u8; 16]> {
+    assert_eq!(claim.len(), CLAIM_LEN, "an enrollment claim");
+    let identity: [u8; 16] = claim[ANCHOR_LEN..WITNESS_AT].try_into().unwrap();
+    (identity != [0; 16]).then_some(identity)
+}
+
+/// `dir`'s identity as a table's first open records it in the table's claim.
+#[cfg(test)]
+pub(crate) fn directory_identity(dir: &Path) -> Result<[u8; 16]> {
+    directory::legacy(dir)
+}
+
+/// `claim`, a bound enrollment claim, bound to `dir` instead, as a first open of the table there
+/// binds it: the claim a test's copy of a lab keeps for the copy of the claim's table directory.
+/// Returns the custody identity the claim had and the one it has now, which an application pin
+/// of the table holds ([`Store::custody_id`]).
+#[cfg(test)]
+pub(crate) fn rebind_claim(claim: &mut [u8], dir: &Path) -> Result<(Digest, Digest)> {
+    assert!(claimed_directory(claim).is_some(), "a bound claim");
+    let before = custody_of(claim);
+    claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(dir)?);
+    Ok((before, custody_of(claim)))
 }

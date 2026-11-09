@@ -625,17 +625,50 @@ fn typed_claim_refreshes_queued_prepared_history_before_any_readmission() {
     }
 }
 
-fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
+/// The variables a `Check` passes as its own arguments, the state its caller recorded and the
+/// caller's identity: [`account_claim::ready`] only reads the world the rest of a state shapes.
+const READINESS_ARGUMENTS: [&str; 2] = ["state", "identity"];
+
+/// The world a `Check` of `state` reads, built from its shape ([`readiness_shape`]).
+struct Readiness {
+    // Real custody, kept alive across the predicate (and dropped first, as it was made last).
+    _pending: Option<crate::session_timeline::NativeCustody>,
+    child: Arc<Mutex<Operation>>,
+    relation: Relation,
+    w: World,
+}
+
+/// `state` without [`READINESS_ARGUMENTS`]: the states of one shape share one world.
+fn readiness_shape(state: &State) -> State {
+    let mut shape = state.clone();
+    for argument in READINESS_ARGUMENTS {
+        shape.remove(argument);
+    }
+    shape
+}
+
+/// The world of `shape`, which names no [`READINESS_ARGUMENTS`] (a read of one panics).
+fn readiness_fixture(shape: &State) -> Readiness {
     let w = world(8760, ImagePhase::Forward);
     let relation = relation(&w, ImagePhase::Forward, "d7");
     w.facts.prepare_journal_ack.store(
-        state["confirmed"] == 1 && state["lifecycle"] != 4,
+        shape["confirmed"] == 1 && shape["lifecycle"] != 4,
         Ordering::SeqCst,
     );
-    let _ = admit(&w, relation.candidate().clone(), ImagePhase::Forward);
+    // The admission `admit` makes, over the relation it would rebuild from the same parts.
+    let admit = || {
+        let _ = account_continuation::prepare_account(
+            &w.handle.ctx,
+            -1,
+            relation.clone(),
+            w.caller.clone(),
+            &w.facts,
+        );
+    };
+    admit();
     let child =
         w.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&relation.candidate().id].clone();
-    if state["lifecycle"] == 4 {
+    if shape["lifecycle"] == 4 {
         w.facts
             .journal
             .lock()
@@ -644,7 +677,7 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
             .unwrap()
             .state = JournalState::MayExecute;
         w.facts.prepare_journal_ack.store(true, Ordering::SeqCst);
-        let _ = admit(&w, relation.candidate().clone(), ImagePhase::Forward);
+        admit();
         assert!(
             child
                 .lock()
@@ -653,11 +686,10 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
                 .terminal_already_recorded()
         );
     }
-    let mut caller = w.caller.clone();
     let completion = {
         let mut op = child.lock().unwrap();
         op.preparation.recorded = true;
-        match state["lifecycle"] {
+        match shape["lifecycle"] {
             0 => {
                 op.phase = Phase::Started;
                 None
@@ -673,10 +705,9 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
     if completion.is_some() {
         let _ = finish(&w.handle.ctx, &child, completion);
     }
-    // Keep real custody alive across the predicate. A separate context allows
-    // the model to inject an outstanding drain even into otherwise inconsistent
-    // snapshots; the real context correctly refuses a second native operation.
-    let pending = (state["drained"] == 0).then(|| {
+    // A separate context allows the model to inject an outstanding drain even into otherwise
+    // inconsistent snapshots; the real context correctly refuses a second native operation.
+    let pending = (shape["drained"] == 0).then(|| {
         let producer = crate::session_store::test_handle_on(8762, -1);
         let boundary = aterm_types::update_boundary::Boundary::process()
             .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
@@ -693,29 +724,26 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
     });
     {
         let mut op = child.lock().unwrap();
-        if state["writer"] == 1 {
+        if shape["writer"] == 1 {
             op.preparation =
                 preparation::Preparation::new(true, Some((w.original.clone(), w.binding.clone())));
         }
-        op.preparation.recorded = state["published"] == 1;
-        if state["granted"] == 1 {
+        op.preparation.recorded = shape["published"] == 1;
+        if shape["granted"] == 1 {
             op.grant_record = GrantRecord::Recorded;
         }
-        if state["phase"] == 0 {
+        if shape["phase"] == 0 {
             op.resume_phase = Some(ImagePhase::Rollback);
         }
-        op.resume_sent = state["dispatched"] == 1;
+        op.resume_sent = shape["dispatched"] == 1;
         if let Some(pending) = &pending {
             op.completion_drain = Some(pending.drain());
         }
     }
-    if state["identity"] == 0 {
-        caller.peer = Some(999999);
-    }
-    if state["current"] == 0 {
+    if shape["current"] == 0 {
         w.facts.account_allowed.store(false, Ordering::SeqCst);
     }
-    if state["cohort"] == 0 {
+    if shape["cohort"] == 0 {
         let NativePlan::Restart { process, .. } = &w.original.plan else {
             unreachable!()
         };
@@ -724,6 +752,23 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
             .lock()
             .unwrap()
             .insert(process.pid, process.clone());
+    }
+    Readiness {
+        _pending: pending,
+        child,
+        relation,
+        w,
+    }
+}
+
+/// `state`'s `Check` over `world`, which [`account_claim::ready`] only reads.
+fn readiness_check(world: &Readiness, state: &State, evidence: Option<&mut StepEvidence>) -> State {
+    let Readiness {
+        child, relation, w, ..
+    } = world;
+    let mut caller = w.caller.clone();
+    if state["identity"] == 0 {
+        caller.peer = Some(999999);
     }
     let recorded = match state["state"] {
         0 => ChildState::Prepared,
@@ -735,8 +780,8 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
         account_claim::ready(
             &w.handle.ctx,
             -1,
-            &child,
-            &relation,
+            child,
+            relation,
             &caller,
             &w.facts,
             recorded,
@@ -755,7 +800,7 @@ fn readiness_step(state: &State, evidence: Option<&mut StepEvidence>) -> State {
 
 pub(crate) fn readiness_transition(state: &State, action: &str) -> State {
     assert_eq!(action, "Check");
-    readiness_step(state, None)
+    readiness_check(&readiness_fixture(&readiness_shape(state)), state, None)
 }
 
 #[test]
@@ -766,12 +811,22 @@ fn typed_claim_readiness_refines_live_state_and_rejects_history_as_admission() {
         aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err(),
         "Buggy=1 must violate an invariant"
     );
-    let mut evidence = StepEvidence::new("AccountClaimReadiness");
+    let mut shapes: std::collections::BTreeMap<State, Vec<State>> = Default::default();
     for state in aterm_spec::interp::reachable_states(&model) {
         if model.action_enabled("Check", &state) {
-            let next = readiness_step(&state, Some(&mut evidence));
+            shapes
+                .entry(readiness_shape(&state))
+                .or_default()
+                .push(state);
+        }
+    }
+    let mut evidence = StepEvidence::new("AccountClaimReadiness");
+    for (shape, states) in &shapes {
+        let world = readiness_fixture(shape);
+        for state in states {
+            let next = readiness_check(&world, state, Some(&mut evidence));
             assert!(
-                model.successors("Check", &state).contains(&next),
+                model.successors("Check", state).contains(&next),
                 "{state:?} -> {next:?}"
             );
         }

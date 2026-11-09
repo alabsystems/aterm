@@ -569,7 +569,7 @@ impl UnverifiedGoogleGrant {
             let result = read(
                 token.as_str().ok_or("Native Google token is not text")?,
                 self.expected_email(),
-                wait.min(GOOGLE_REQUEST),
+                wait.min(super::google_profile::REQUEST_HANG),
             );
             match result {
                 Ok(profile) => break profile,
@@ -976,11 +976,6 @@ impl Drop for Child {
     }
 }
 
-/// The longest one Google account check ([`super::google_profile::read`]) may take: a request
-/// in flight while the host sleeps measures it on the clock that stops in sleep, so it holds a
-/// sign-in that sleep ended this long at most.
-const GOOGLE_REQUEST: Duration = Duration::from_secs(30);
-
 /// What is left of `deadline`, which counts the time the host slept: [`Error::Deadline`] once
 /// it passed.
 fn remaining(deadline: WakeDeadline) -> Result<Duration, Error> {
@@ -1109,7 +1104,7 @@ fn prepare_rejected_staging(
     let rejected = matches!(
         check(
             token.as_str().ok_or(Error::Native)?,
-            remaining(deadline)?.min(GOOGLE_REQUEST)
+            remaining(deadline)?.min(super::google_profile::REQUEST_HANG)
         ),
         Err(super::google_profile::Error::CredentialRejected)
     );
@@ -1480,7 +1475,9 @@ mod tests {
                 |token, expected, wait| {
                     calls += 1;
                     assert_eq!(expected, "person@example.com");
-                    assert!(!wait.is_zero() && wait <= Duration::from_secs(30));
+                    assert!(
+                        !wait.is_zero() && wait <= crate::harness::google_profile::REQUEST_HANG
+                    );
                     assert_eq!(std::fs::read(&native_path).unwrap(), original);
                     assert_eq!(std::fs::read(&snapshot).unwrap(), previous);
                     assert!(
@@ -2429,7 +2426,7 @@ mod tests {
                 |token, wait| {
                     assert_eq!(token, "synthetic-only");
                     assert!(
-                        !wait.is_zero() && wait <= GOOGLE_REQUEST,
+                        !wait.is_zero() && wait <= crate::harness::google_profile::REQUEST_HANG,
                         "the account check is capped, not given the hour: {wait:?}"
                     );
                     assert!(

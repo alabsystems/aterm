@@ -3106,6 +3106,45 @@ fn lay_own_login(run: &Run) -> Result<(), Fail> {
     crate::forever::sysmsg::login::lay_stored(run)
 }
 
+/// Why `run` cannot take an `--own` launch ([`Launch::own`]), `None` where it can: a stored
+/// login's process is the default route's only where the instance admits the stub's base URL
+/// ([`UpOpts::route_seam`]), and the usage tap's command must name the lab's aterm.
+pub(crate) fn own_refused(run: &Run) -> Option<String> {
+    if run.route_seam != "1" {
+        return Some(
+            "a stored login's process is the default route's only where the instance admits \
+             the stub's base URL: up the lab with LAB_ROUTE_SEAM=1"
+                .to_string(),
+        );
+    }
+    own_tap(run).is_none().then(|| {
+        format!(
+            "the usage tap's command cannot name the lab's aterm ({})",
+            run.aterm
+        )
+    })
+}
+
+/// `run` made ready for `--own` launches that are no `lab claude`'s (`autopilot-captures`'
+/// Claude Code tabs): refused as [`own_refused`] says, else the run saved as one whose Claude
+/// Code reads the default home ([`crate::run::OWN_LOGIN`], so [`Run::claude_json`] names the
+/// HOME's own profile) and the login and roster laid ([`lay_own_login`]); the launch to write.
+/// # Errors
+/// [`own_refused`]'s reason (a usage error), or the login could not be laid.
+pub(crate) fn ready_own(run: &mut Run) -> Result<Launch, Fail> {
+    if let Some(why) = own_refused(run) {
+        return Err(Fail::usage(format!("an own login: {why}")));
+    }
+    run.claude_login = crate::run::OWN_LOGIN.into();
+    run.save();
+    lay_own_login(run)?;
+    Ok(Launch {
+        own: true,
+        stub_route_alone: true,
+        ..Launch::default()
+    })
+}
+
 /// Type the launch line of the managed Claude Code into the lab's first tab.
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
@@ -3118,18 +3157,14 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     if let Some(why) = by_name_refused(run, l) {
         return Err(Fail::usage(why));
     }
-    if (l.stored || l.own) && run.route_seam != "1" {
-        return Err(Fail::usage(format!(
-            "claude {}: a stored login's process is the default route's only where the \
+    if l.stored && run.route_seam != "1" {
+        return Err(Fail::usage(
+            "claude --stored: a stored login's process is the default route's only where the \
              instance admits the stub's base URL: up the lab with LAB_ROUTE_SEAM=1",
-            if l.own { "--own" } else { "--stored" }
-        )));
+        ));
     }
-    if l.own && own_tap(run).is_none() {
-        return Err(Fail::usage(format!(
-            "claude --own: the usage tap's command cannot name the lab's aterm ({})",
-            run.aterm
-        )));
+    if let Some(why) = l.own.then(|| own_refused(run)).flatten() {
+        return Err(Fail::usage(format!("claude --own: {why}")));
     }
     procs::need_witness(run)?;
     let mut run = run.clone();

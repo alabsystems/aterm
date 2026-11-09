@@ -122,28 +122,61 @@ pub(super) fn succeed(f: &Fixture, source: &Billing, decision: Digest) -> Resour
     resources
 }
 
+/// The one-Mac world a walk's steps start from, built once ([`built`]), and its decision.
+pub(crate) struct Template {
+    built: Built,
+    decision: Digest,
+}
+
+/// `machines` Macs with account 31's decision issued and its resources initialized.
+fn built(machines: usize) -> (Fixture, Digest) {
+    let f = Fixture::new(machines);
+    let reference = f.policy("example-v1").reference([41; 32]).unwrap();
+    let decision = f.issue(31, 0, reference, vec![]);
+    f.source(31, 0)
+        .prepare_until(deadline())
+        .unwrap()
+        .resources()
+        .initialize()
+        .unwrap();
+    (f, decision)
+}
+
+fn template() -> Template {
+    let (f, decision) = built(1);
+    Template {
+        built: f.built(),
+        decision,
+    }
+}
+
 pub(crate) fn dispatch_transition(
+    template: &Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(template, before, action, false)
 }
 
 fn transition_with(
+    template: &Template,
     before: &aterm_spec::interp::State,
     action: &str,
     bypass: bool,
 ) -> aterm_spec::interp::State {
-    let f = Fixture::new(if action == "Succession" { 2 } else { 1 });
+    // Succession takes a second Mac, which no other step's world holds.
+    let (f, decision) = if action == "Succession" {
+        built(2)
+    } else {
+        (template.built.fork(), template.decision)
+    };
     let policy = f.policy("example-v1");
     let reference = policy.reference([41; 32]).unwrap();
-    let decision = f.issue(31, 0, reference, vec![]);
     let source = f.source(31, 0);
     let prepared = source.prepare_until(deadline()).unwrap();
     let allocation = prepared.allocation().clone();
     let resources = prepared.resources();
     let probe = (&resources, &allocation);
-    resources.initialize().unwrap();
     let monitor = Monitor::new();
     let scenario = match action {
         "Fresh" => 1,
@@ -319,8 +352,9 @@ fn metered_dispatch_conforms_and_catches_cross_window_replay() {
     let model = aterm_models_db::metered_dispatch_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::dispatch_transition(&initial, action.name);
+        let next = super::dispatch_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -328,7 +362,7 @@ fn metered_dispatch_conforms_and_catches_cross_window_replay() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "Window", true);
+    let unsafe_next = transition_with(&template, &initial, "Window", true);
     assert!(!model.check_invariant("NoReplay", &unsafe_next));
 }
 

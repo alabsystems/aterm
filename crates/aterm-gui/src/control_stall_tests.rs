@@ -127,9 +127,11 @@ impl Rig {
             open,
             subscriptions: 1,
         });
-        assert_eq!(lanes.start().rpc, 1, "the request lane started");
+        let started = lanes.start();
+        assert_eq!(started.rpc, 1, "the request lane started");
         let stub = Arc::new(Stub::default());
         lanes.publish(Arc::clone(&stub) as Arc<dyn LaneService>);
+        started.activate();
         Self { lanes, stub }
     }
 
@@ -414,8 +416,10 @@ fn a_framed_wait_refused_busy_closes_and_serves_none_of_its_body() {
             open,
             subscriptions: 1,
         });
-        assert_eq!(lanes.start().rpc, 1, "the request lane started");
+        let started = lanes.start();
+        assert_eq!(started.rpc, 1, "the request lane started");
         lanes.publish(Arc::new(FramedWaits) as Arc<dyn LaneService>);
+        started.activate();
         let (client, server) = CtlStream::pair().expect("socket pair");
         client
             .set_read_timeout(Some(HANG))
@@ -559,11 +563,13 @@ fn relay_one_subscription(run: u32, spell: fn(&str) -> String) {
         open: 16,
         subscriptions: 1,
     });
-    assert_eq!(lanes.start().rpc, 1, "the request lane started");
+    let started = lanes.start();
+    assert_eq!(started.rpc, 1, "the request lane started");
     lanes.publish(Arc::new(Forwarder {
         store: crate::session_store::new_store(),
         dir: dir.clone(),
     }) as Arc<dyn LaneService>);
+    started.activate();
     let dial = || {
         let (client, server) = CtlStream::pair().expect("socket pair");
         client

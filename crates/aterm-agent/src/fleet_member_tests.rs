@@ -9582,21 +9582,12 @@ struct Racing {
     template: RefCell<Option<(World, [Vec<Peer>; 3])>>,
 }
 
-/// The files and directories under `from` again under `to`, each with its mode. A fixture holds no
-/// symlink, which a copy would follow.
-fn copy_tree(from: &Path, to: &Path) {
+/// The files and directories under `from` again under `to`, each with its mode
+/// ([`crate::test_tree::clone_or_copy`]).
+fn clone_entries(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
-        let meta = entry.metadata().unwrap();
-        let target = to.join(entry.file_name());
-        if meta.is_dir() {
-            std::fs::create_dir(&target).unwrap();
-            std::fs::set_permissions(&target, meta.permissions()).unwrap();
-            copy_tree(&entry.path(), &target);
-        } else {
-            assert!(meta.is_file(), "{:?} in a fixture", entry.path());
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
+        crate::test_tree::clone_or_copy(&entry.path(), &to.join(entry.file_name()));
     }
 }
 
@@ -9631,7 +9622,7 @@ impl Racing {
             .unwrap();
         }
         let world = World::new("race");
-        copy_tree(made._tmp.path(), world._tmp.path());
+        clone_entries(made._tmp.path(), world._tmp.path());
         let own = read_key_file(&world.places.state)
             .ok()
             .filter(|_| matches!(fixture, Fixture::Issuer | Fixture::Unlistened));
@@ -9859,6 +9850,8 @@ fn race(racing: &Racing, race: &Race) -> Vec<String> {
     }
     let mut unserial = Vec::new();
     let mut ends = vec![alone.clone()];
+    // How the verb ends with a whole leave after it, from the leave's own turn, which comes first.
+    let mut left_after = None;
     for other in [
         Other::Leave,
         Other::StoppedLeave,
@@ -9881,8 +9874,11 @@ fn race(racing: &Racing, race: &Race) -> Vec<String> {
         };
         // A leave that meets no `[fleet]` in aterm.toml (one the verb has not written yet) is a
         // whole leave, whatever holds aterm.toml's lock.
+        if matches!(other, Other::Leave) {
+            left_after = Some(serial[1].clone());
+        }
         if matches!(other, Other::StoppedLeave) {
-            serial.push(racing.run(race, Some((Other::Leave, When::After))).0);
+            serial.push(left_after.clone().expect("the leave's turn came first"));
         }
         for &step in race.steps {
             let (end, done) = racing.run(race, Some((other, When::At(step))));

@@ -653,6 +653,13 @@ impl TapRef {
     }
 
     fn from_parts(prefix: &Prefix, user: String, repo: String) -> Self {
+        // brew capitalises the official users in Tap.fetch, and
+        // every Tap (path-derived ones too) carries that case.
+        let user = match user.as_str() {
+            "homebrew" => "Homebrew".to_owned(),
+            "linuxbrew" => "Linuxbrew".to_owned(),
+            _ => user,
+        };
         let installed = super::tap::list(prefix)
             .into_iter()
             .find(|t| t.user.eq_ignore_ascii_case(&user) && t.repo.eq_ignore_ascii_case(&repo));

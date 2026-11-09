@@ -9,7 +9,7 @@ use super::ObservationError;
 use aterm_http::{Client, Method, ProxyMode, Trust};
 use aterm_json::Value;
 use aterm_uds::secret::Secret;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
@@ -44,6 +44,22 @@ fn profile_value(value: &Value) -> Result<ClaudeProfile, String> {
 /// One bounded request to the vendor's canonical OAuth profile endpoint.
 /// Redirects are not followed by `aterm-http`.
 pub fn read_claude_profile(token: &str, wait: Duration) -> Result<ClaudeProfile, ObservationError> {
+    read_started(
+        token,
+        wait,
+        Instant::now(),
+        PROFILE_URL,
+        ProxyMode::Environment,
+    )
+}
+
+fn read_started(
+    token: &str,
+    wait: Duration,
+    started: Instant,
+    endpoint: &str,
+    proxy: ProxyMode,
+) -> Result<ClaudeProfile, ObservationError> {
     if !token_valid(token) {
         return Err(ObservationError::RecoveryRequired(
             "invalid OAuth profile request".into(),
@@ -56,20 +72,31 @@ pub fn read_claude_profile(token: &str, wait: Duration) -> Result<ClaudeProfile,
     }
     let mut header = b"Bearer ".to_vec();
     header.extend_from_slice(token.as_bytes());
-    let response = Client::new(Trust::PlatformVerifier, ProxyMode::Environment, wait)
-        .request(Method::Get, PROFILE_URL)
+    let by = started + wait;
+    let left = by.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(ObservationError::Unavailable(
+            "OAuth profile deadline expired".into(),
+        ));
+    }
+    let response = Client::new(Trust::PlatformVerifier, proxy, left)
+        .request(Method::Get, endpoint)
         .secret_header("Authorization", Secret::from_vec(header))
         .header("User-Agent", "claude-cli/aterm")
         .header("Content-Type", "application/json")
         .header("Cache-Control", "no-cache")
         .limit(256 * 1024)
-        .backstop(wait)
+        .backstop(by.saturating_duration_since(Instant::now()))
         .send(&[])
         .map_err(|_| {
             ObservationError::Unavailable("provider profile request did not complete".into())
         })?;
     profile_response(response.status(), response.body())
 }
+
+#[cfg(test)]
+#[path = "cli_shared_claude/native_wait_tests.rs"]
+mod native_wait_tests;
 
 fn profile_response(status: u16, body: &[u8]) -> Result<ClaudeProfile, ObservationError> {
     if status == 401 {

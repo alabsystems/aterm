@@ -113,6 +113,7 @@ impl Capture {
             Some(CompletionCause::Timeout) => 2,
             Some(CompletionCause::Cancelled) => 3,
             Some(CompletionCause::ResourceLimit) => 4,
+            Some(CompletionCause::HostFault) => 5,
         });
         optional(e, self.runtime_ns);
         e.number(u64::from(self.retirement_confirmed));
@@ -149,6 +150,7 @@ impl Capture {
             2 => Some(CompletionCause::Timeout),
             3 => Some(CompletionCause::Cancelled),
             4 => Some(CompletionCause::ResourceLimit),
+            5 => Some(CompletionCause::HostFault),
             _ => return Err(invalid()),
         };
         let runtime_ns = optional_read(d)?;

@@ -1126,7 +1126,10 @@ impl App {
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active())
-            .is_some_and(|tab| tab.root.len() == 1 && tab.root.contains(tab.focus))
+            .is_some_and(|tab| {
+                (tab.zoomed && tab.root.len() > 1)
+                    || (tab.root.len() == 1 && tab.root.contains(tab.focus))
+            })
     }
 
     pub(crate) fn active_tab_has_multiple_visible_panes(&self, wid: WindowId) -> bool {
@@ -1177,6 +1180,16 @@ impl App {
         wid: WindowId,
         session: u64,
     ) -> Option<(u16, u16, u16, u16)> {
+        if self.active_tab_is_single_focused_pane(wid) {
+            let ws = self.windows.get(&wid)?;
+            let tab = ws.tab_set.active()?;
+            let focus_session = self
+                .view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)?;
+            return (focus_session == session).then(|| (0, 0, ws.rows.max(1), ws.cols.max(1)));
+        }
         let plan = self.active_visible_leaf_plan(wid)?;
         plan.leaves
             .iter()
@@ -1196,8 +1209,17 @@ impl App {
         wid: WindowId,
         focused: Option<(u16, u16, u16, u16)>,
     ) -> PointerRoute {
+        self.pointer_route_with_plan(wid, focused, None)
+    }
+
+    fn pointer_route_with_plan(
+        &self,
+        wid: WindowId,
+        focused: Option<(u16, u16, u16, u16)>,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> PointerRoute {
         self.pointer_capture_route(wid)
-            .unwrap_or_else(|| self.pane_under_pointer(wid, focused))
+            .unwrap_or_else(|| self.pane_under_pointer_with_plan(wid, focused, frame_plan))
     }
 
     /// A held gesture keeps its owner even when the pointer crosses a pane.
@@ -1226,10 +1248,11 @@ impl App {
         None
     }
 
-    fn pane_under_pointer(
+    fn pane_under_pointer_with_plan(
         &self,
         wid: WindowId,
         focused: Option<(u16, u16, u16, u16)>,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> PointerRoute {
         let Some(ws) = self.windows.get(&wid) else {
             return PointerRoute::Front;
@@ -1238,12 +1261,23 @@ impl App {
             return PointerRoute::Front;
         }
         let window_cell = ws.last_mouse_window_cell;
-        let focused = focused.unwrap_or_else(|| self.focused_pane_rect(wid));
+        let focused = focused.unwrap_or_else(|| match frame_plan {
+            Some(plan) => self.focused_pane_rect_from_plan(wid, plan),
+            None => self.focused_pane_rect(wid),
+        });
         if rect_contains(focused, window_cell) {
             return PointerRoute::Front;
         }
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return PointerRoute::Front;
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                let Some(plan) = self.active_visible_leaf_plan(wid) else {
+                    return PointerRoute::Front;
+                };
+                owned_plan = plan;
+                &owned_plan
+            }
         };
         let Some(leaf) = plan.leaf_at(crate::tab_model::LogicalPoint {
             x: f32::from(window_cell.1),
@@ -1363,10 +1397,19 @@ impl App {
     /// `last_mouse_cell` translates where the pointer is rather than clamping where it is
     /// not.
     pub(crate) fn pointer_is_inside_focused_pane(&self, wid: WindowId) -> bool {
+        self.pointer_is_inside_focused_pane_with(wid, None)
+    }
+
+    fn pointer_is_inside_focused_pane_with(
+        &self,
+        wid: WindowId,
+        focused_rect: Option<(u16, u16, u16, u16)>,
+    ) -> bool {
         let Some((wr, wc)) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
             return false;
         };
-        rect_contains(self.focused_pane_rect(wid), (wr, wc))
+        let rect = focused_rect.unwrap_or_else(|| self.focused_pane_rect(wid));
+        rect_contains(rect, (wr, wc))
     }
 
     fn pane_header_at_with(
@@ -1375,6 +1418,17 @@ impl App {
         geom: PointerGeometry,
         x: f64,
         y: f64,
+    ) -> Option<crate::tab_model::ViewId> {
+        self.pane_header_at_with_plan(wid, geom, x, y, None)
+    }
+
+    fn pane_header_at_with_plan(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<crate::tab_model::ViewId> {
         if !self.active_tab_has_multiple_visible_panes(wid)
             || self.windows.get(&wid).is_none_or(|ws| ws.overlay_open())
@@ -1401,9 +1455,15 @@ impl App {
         {
             return None;
         }
-        self.active_visible_leaf_plan(wid)?
-            .header_at(point)
-            .map(|leaf| leaf.view)
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid)?;
+                &owned_plan
+            }
+        };
+        plan.header_at(point).map(|leaf| leaf.view)
     }
 
     fn pointer_is_over_pane_header(&self, wid: WindowId) -> bool {
@@ -1416,6 +1476,9 @@ impl App {
 
     /// Click-to-focus in window `wid`.
     pub(crate) fn focus_pane_under_pointer(&mut self, wid: WindowId) -> bool {
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return false;
+        }
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return false;
         };
@@ -1492,6 +1555,9 @@ impl App {
         wid: WindowId,
         canonical_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> bool {
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return false;
+        }
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
@@ -1965,8 +2031,22 @@ impl App {
         x: f64,
         y: f64,
     ) -> MouseCellMapping {
+        self.refresh_mouse_cell_with_plan(wid, geom, x, y, None)
+    }
+
+    fn refresh_mouse_cell_with_plan(
+        &mut self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> MouseCellMapping {
         let (row, col) = self.pixel_to_cell_with(wid, geom, x, y);
-        let pane_rect = self.focused_pane_rect(wid);
+        let pane_rect = match frame_plan {
+            Some(plan) => self.focused_pane_rect_from_plan(wid, plan),
+            None => self.focused_pane_rect(wid),
+        };
         let (lr, lc) = cell_in_rect((row, col), pane_rect);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_mouse_window_cell = (row, col);
@@ -2377,21 +2457,22 @@ impl App {
         wid: WindowId,
         hit: Option<(crate::tab_model::ViewId, crate::native_ui::UiKey)>,
     ) {
-        let visible_native_views = self
-            .active_visible_leaf_plan(wid)
-            .map(|plan| {
-                plan.leaves
-                    .into_iter()
-                    .filter_map(|leaf| {
-                        matches!(
-                            self.view_store.get(leaf.view),
-                            Some(crate::tab_model::View::Native(_))
-                        )
-                        .then_some(leaf.view)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut visible_native_views = Vec::new();
+        if let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) {
+            let mut push_if_native = |view: &crate::tab_model::ViewId| {
+                if matches!(
+                    self.view_store.get(*view),
+                    Some(crate::tab_model::View::Native(_))
+                ) {
+                    visible_native_views.push(*view);
+                }
+            };
+            if (tab.zoomed && tab.root.contains(tab.focus)) || tab.root.len() == 1 {
+                push_if_native(&tab.focus);
+            } else {
+                tab.root.visit(&mut push_if_native);
+            }
+        }
         let mut hover_changed = Vec::new();
         for target in visible_native_views {
             let desired = hit
@@ -2421,6 +2502,7 @@ impl App {
         x: f64,
         y: f64,
         over_chrome: bool,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<(
         crate::tab_model::ViewId,
         u64,
@@ -2431,7 +2513,7 @@ impl App {
         if over_chrome {
             return None;
         }
-        self.retained_native_leaf_at_pointer(wid, x, y)
+        self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)
             .and_then(|(artifact, local_x, local_y)| {
                 let hit = artifact.compiled.hit_test(local_x, local_y)?.clone();
                 let is_text = artifact
@@ -2463,20 +2545,24 @@ impl App {
             return;
         }
         let (x, y) = ws.last_cursor_px;
-        let current = self.active_visible_leaf_plan(wid).is_some_and(|plan| {
-            self.retained_native_pointer_artifact_from_plan(wid, front, &plan)
-                .is_some()
-        });
-        if !current {
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        if self
+            .retained_native_pointer_artifact_from_plan(wid, front, &plan)
+            .is_none()
+        {
             return;
         }
         let geom = self.pointer_geometry(wid);
-        let over_chrome = self.pane_header_at_with(wid, geom, x, y).is_some()
+        let over_chrome = self
+            .pane_header_at_with_plan(wid, geom, x, y, Some(&plan))
+            .is_some()
             || self.strip_col_at_with(wid, geom, x, y).is_some()
             || self.band_banner_at(wid, x, y).is_some()
             || self.find_bar_cell_at(wid, x, y).is_some()
             || self.stats_owns_pointer(wid);
-        let hit = self.native_hover_hit(wid, x, y, over_chrome);
+        let hit = self.native_hover_hit(wid, x, y, over_chrome, Some(&plan));
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.native_rehover = false;
         }
@@ -3199,7 +3285,7 @@ impl App {
     /// Resolve the OS cursor for the pointer's current location.
     pub(crate) fn update_hover_cursor(&mut self, wid: WindowId) {
         let parked = self.park_link_target(wid);
-        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, None);
+        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, None, None, None);
         self.settle_link_target(wid, parked);
     }
 
@@ -3222,7 +3308,7 @@ impl App {
             return;
         }
         let parked = self.park_link_target(wid);
-        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, Some(t));
+        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, Some(t), None, None);
     }
 
     fn park_link_target(&mut self, wid: WindowId) -> Option<crate::link_target::LinkHover> {
@@ -3255,8 +3341,10 @@ impl App {
         geom: PointerGeometry,
         parked: Option<crate::link_target::LinkHover>,
         probe: Option<&Terminal>,
+        precomputed: Option<(bool, (u16, u16, u16, u16))>,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
-        let resolved = match self.resolve_hover_cursor(wid, geom, probe) {
+        let resolved = match self.resolve_hover_cursor(wid, geom, probe, precomputed, frame_plan) {
             HoverProbe::Resolved(hover) => hover,
             HoverProbe::Deferred => parked,
         };
@@ -3270,6 +3358,8 @@ impl App {
         wid: WindowId,
         geom: PointerGeometry,
         probe: Option<&Terminal>,
+        precomputed: Option<(bool, (u16, u16, u16, u16))>,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> HoverProbe {
         use HoverProbe::Resolved;
         if self
@@ -3340,11 +3430,17 @@ impl App {
             }
             return Resolved(None);
         }
-        if self.pane_header_at_with(wid, geom, px, py).is_some() {
+        let over_pane_header = match precomputed {
+            Some((over_header, _)) => over_header,
+            None => self
+                .pane_header_at_with_plan(wid, geom, px, py, frame_plan)
+                .is_some(),
+        };
+        if over_pane_header {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             return Resolved(None);
         }
-        if let Some(icon) = self.divider_cursor_under_pointer(wid) {
+        if let Some(icon) = self.divider_cursor_under_pointer_with_plan(wid, frame_plan) {
             self.set_hover_cursor(wid, icon, true, true);
             return Resolved(None);
         }
@@ -3361,7 +3457,10 @@ impl App {
             .get(&wid)
             .map_or((0, 0), |ws| ws.last_mouse_window_cell);
         let (window_row, window_col) = window_cell;
-        let cell_is_under_pointer = self.pointer_is_inside_focused_pane(wid)
+        let focused_rect = precomputed
+            .map(|(_, rect)| rect)
+            .or_else(|| frame_plan.map(|plan| self.focused_pane_rect_from_plan(wid, plan)));
+        let cell_is_under_pointer = self.pointer_is_inside_focused_pane_with(wid, focused_rect)
             && !self.chrome_owns_terminal_cell(
                 wid,
                 usize::from(window_row),
@@ -3468,7 +3567,19 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn divider_cursor_under_pointer(&self, wid: WindowId) -> Option<CursorIcon> {
+        self.divider_cursor_under_pointer_with_plan(wid, None)
+    }
+
+    fn divider_cursor_under_pointer_with_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<CursorIcon> {
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return None;
+        }
         let ws = self.windows.get(&wid)?;
         let (px, py) = ws.last_cursor_px;
         if self.band_banner_at(wid, px, py).is_some()
@@ -3488,7 +3599,14 @@ impl App {
                 pane::SplitDir::Horizontal => CursorIcon::RowResize,
             });
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid)?;
+                &owned_plan
+            }
+        };
         let divider = plan.divider_at(crate::tab_model::LogicalPoint {
             x: f32::from(wc),
             y: f32::from(wr),
@@ -3504,13 +3622,17 @@ impl App {
         wid: WindowId,
         x: f64,
         y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<(crate::tab_model::ViewId, Option<usize>, usize)> {
-        let (_, active_view) = self.active_native_view(wid)?;
-        let (artifact, x, y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        let (instance, active_view) = self.active_native_view(wid)?;
+        if self.native_runtime.app(instance)?.kind() != crate::native_app::AppKind::Editor {
+            return None;
+        }
+        let (artifact, x, y) =
+            self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)?;
         if artifact.view != active_view
+            || artifact.instance != instance
             || self.native_runtime.view_generation(artifact.view) != Some(artifact.generation)
-            || self.native_runtime.app(artifact.instance)?.kind()
-                != crate::native_app::AppKind::Editor
         {
             return None;
         }
@@ -3545,10 +3667,16 @@ impl App {
         wid: WindowId,
         x: f64,
         y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<(crate::tab_model::ViewId, crate::native_ui::GridHit)> {
-        let (_, active_view) = self.active_native_view(wid)?;
-        let (artifact, x, y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        let (instance, active_view) = self.active_native_view(wid)?;
+        if self.native_runtime.app(instance)?.kind() != crate::native_app::AppKind::Editor {
+            return None;
+        }
+        let (artifact, x, y) =
+            self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)?;
         if artifact.view != active_view
+            || artifact.instance != instance
             || self.native_runtime.view_generation(artifact.view) != Some(artifact.generation)
         {
             return None;
@@ -3896,17 +4024,23 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return;
         }
-        let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
+        let motion_plan = (self.active_tab_has_multiple_visible_panes(wid)
+            || self.active_native_view(wid).is_some())
+        .then(|| self.active_visible_leaf_plan(wid))
+        .flatten();
+        let over_pane_header = self
+            .pane_header_at_with_plan(wid, geom, x, y, motion_plan.as_ref())
+            .is_some();
         if let Some((_, view)) = self.active_native_view(wid) {
             if self.active_tab_has_multiple_visible_panes(wid) {
-                self.refresh_mouse_cell(wid, geom, x, y);
+                self.refresh_mouse_cell_with_plan(wid, geom, x, y, motion_plan.as_ref());
             }
             let dragging_editor = self
                 .native_runtime
                 .view_state(view)
                 .and_then(|state| state.common().pressed.as_ref())
                 .is_some_and(|key| key.as_str() == "editor/buffer");
-            let editor_target = self.native_editor_pointer_target(wid, x, y);
+            let editor_target = self.native_editor_pointer_target(wid, x, y, motion_plan.as_ref());
             if dragging_editor && let Some((target_view, Some(byte), visible_lines)) = editor_target
             {
                 let _ =
@@ -3916,7 +4050,7 @@ impl App {
             let over_banner = self.band_banner_at(wid, x, y).is_some()
                 || self.find_bar_cell_at(wid, x, y).is_some();
             let over_chrome = over_pane_header || over_strip || over_banner;
-            let native_hover = self.native_hover_hit(wid, x, y, over_chrome);
+            let native_hover = self.native_hover_hit(wid, x, y, over_chrome, motion_plan.as_ref());
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.native_rest = NativePointerRest::after_motion(
                     ws.native_rest.take(),
@@ -3948,7 +4082,8 @@ impl App {
             }
             if !over_chrome
                 && !dragging_editor
-                && let Some(icon) = self.divider_cursor_under_pointer(wid)
+                && let Some(icon) =
+                    self.divider_cursor_under_pointer_with_plan(wid, motion_plan.as_ref())
             {
                 self.set_hover_cursor(wid, icon, true, true);
             } else {
@@ -3967,7 +4102,7 @@ impl App {
                 };
                 self.set_hover_cursor(wid, icon, pointer, text_cursor);
             }
-            if !self.pointer_routes_to_a_terminal_pane(wid) {
+            if !self.pointer_routes_to_a_terminal_pane_with_plan(wid, motion_plan.as_ref()) {
                 return;
             }
         }
@@ -3985,7 +4120,7 @@ impl App {
                 return;
             }
         }
-        let mapped_cell = self.refresh_mouse_cell(wid, geom, x, y);
+        let mapped_cell = self.refresh_mouse_cell_with_plan(wid, geom, x, y, motion_plan.as_ref());
         let (lr, lc) = mapped_cell.pane_cell;
         if self.active_native_view(wid).is_none()
             && !self
@@ -4034,7 +4169,14 @@ impl App {
             ws.hover_grid_owned = true;
             ws.hover_mapping = mapping;
         }
-        self.update_hover_cursor_with(wid, geom, parked, None);
+        self.update_hover_cursor_with(
+            wid,
+            geom,
+            parked,
+            None,
+            Some((over_pane_header, mapped_cell.pane_rect)),
+            motion_plan.as_ref(),
+        );
         let cw = geom.cell.0.max(1);
         let px_off = self.pointer_subcell_px(wid, geom, x, y);
         let side = if usize::from(px_off.x) * 2 >= cw {
@@ -4052,7 +4194,8 @@ impl App {
             ws.last_mouse_px_off = px_off;
         }
         self.selection_autoscroll_with(wid, geom, y, mapped_cell.pane_rect);
-        let route = self.pointer_route(wid, Some(mapped_cell.pane_rect));
+        let route =
+            self.pointer_route_with_plan(wid, Some(mapped_cell.pane_rect), motion_plan.as_ref());
         let (session, (row, col)) = match route {
             PointerRoute::Front => (
                 self.front_terminal(wid).map(|front| front.session),
@@ -4966,13 +5109,20 @@ impl App {
             .map(|node| node.key.clone())
     }
 
-    fn pointer_routes_to_a_terminal_pane(&self, wid: WindowId) -> bool {
-        matches!(self.pointer_route(wid, None), PointerRoute::Pane { .. })
+    fn pointer_routes_to_a_terminal_pane_with_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
+        matches!(
+            self.pointer_route_with_plan(wid, None, frame_plan),
+            PointerRoute::Pane { .. }
+        )
     }
 
     fn press_lands_on_a_terminal_pane(&self, wid: WindowId) -> bool {
         matches!(
-            self.pane_under_pointer(wid, None),
+            self.pane_under_pointer_with_plan(wid, None, None),
             PointerRoute::Pane { .. }
         )
     }
@@ -5322,10 +5472,13 @@ impl App {
                 {
                     return None;
                 }
-                let editor_target = self.native_editor_pointer_target(wid, px, py);
-                let grid_target = self.native_editor_grid_target(wid, px, py);
-                let press = self.retained_native_leaf_at_pointer(wid, px, py).and_then(
-                    |(artifact, x, y)| {
+                let press_plan = self.active_visible_leaf_plan(wid);
+                let editor_target =
+                    self.native_editor_pointer_target(wid, px, py, press_plan.as_ref());
+                let grid_target = self.native_editor_grid_target(wid, px, py, press_plan.as_ref());
+                let press = self
+                    .retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan.as_ref())
+                    .and_then(|(artifact, x, y)| {
                         let (_, active_view) = self.active_native_view(wid)?;
                         if artifact.view != active_view
                             || self.native_runtime.view_generation(artifact.view)
@@ -5342,11 +5495,10 @@ impl App {
                             artifact.compiled.text_field_byte_at(&hit.key, x),
                             hit.look_first,
                         ))
-                    },
-                );
+                    });
                 let picture = if press.is_none() {
-                    self.retained_native_leaf_at_pointer(wid, px, py).and_then(
-                        |(artifact, x, y)| {
+                    self.retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan.as_ref())
+                        .and_then(|(artifact, x, y)| {
                             let (_, active_view) = self.active_native_view(wid)?;
                             (artifact.view == active_view
                                 && self.native_runtime.view_generation(artifact.view)
@@ -5354,8 +5506,7 @@ impl App {
                             .then(|| artifact.compiled.list_picture_at(x, y).cloned())
                             .flatten()
                             .map(|key| (artifact.view, key))
-                        },
-                    )
+                        })
                 } else {
                     None
                 };
@@ -11645,9 +11796,9 @@ mod tests {
         reset_visible_leaf_plan_builds();
         app.on_cursor_moved(wid, x, y);
         let plain_motion_builds = visible_leaf_plan_builds();
-        assert!(
-            plain_motion_builds > 0,
-            "split fixture must exercise planning"
+        assert_eq!(
+            plain_motion_builds, 1,
+            "split motion must build a single VisibleLeafPlan across header, cell, hover, and routing"
         );
 
         app.begin_selection(wid, SelectionType::Simple);
@@ -11657,6 +11808,54 @@ mod tests {
             visible_leaf_plan_builds(),
             plain_motion_builds,
             "autoscroll must reuse refresh_mouse_cell's pane rect"
+        );
+    }
+
+    #[test]
+    fn zoomed_split_pointer_motion_and_hover_build_no_leaf_plans() {
+        use crate::{reset_visible_leaf_plan_builds, visible_leaf_plan_builds};
+
+        let (mut app, wid, _, _) = stacked_autoscroll_fixture();
+        app.toggle_pane_zoom();
+        assert!(app.active_tab_is_single_focused_pane(wid));
+        let (x, y) = app
+            .cell_centre_px(wid, 3, 5)
+            .expect("interior zoomed pixel");
+
+        reset_visible_leaf_plan_builds();
+        app.on_cursor_moved(wid, x, y);
+        app.update_hover_cursor(wid);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "a zoomed split tab occupies the full grid and needs no VisibleLeafPlan on pointer motion"
+        );
+    }
+
+    #[test]
+    fn native_settings_pointer_motion_and_rehover_build_one_leaf_plan() {
+        use crate::{App, WindowId, reset_visible_leaf_plan_builds, visible_leaf_plan_builds};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let _ = app.commit_glassless_native_frame(wid);
+
+        reset_visible_leaf_plan_builds();
+        app.on_cursor_moved(wid, 120.0, 140.0);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "native pointer motion must reuse a single VisibleLeafPlan across editor target, hover hit, and divider checks"
+        );
+
+        app.windows.get_mut(&wid).expect("window").native_rehover = true;
+        reset_visible_leaf_plan_builds();
+        app.refresh_native_hover_for_frame(wid);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "refresh_native_hover_for_frame must reuse a single VisibleLeafPlan"
         );
     }
 

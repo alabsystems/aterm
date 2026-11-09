@@ -344,6 +344,7 @@ impl StatusFrame {
                     CompletionCause::Timeout => 1,
                     CompletionCause::Cancelled => 2,
                     CompletionCause::ResourceLimit => 3,
+                    CompletionCause::HostFault => 4,
                 });
                 e.number(*runtime_ns);
             }
@@ -392,6 +393,7 @@ impl StatusFrame {
                     1 => CompletionCause::Timeout,
                     2 => CompletionCause::Cancelled,
                     3 => CompletionCause::ResourceLimit,
+                    4 => CompletionCause::HostFault,
                     _ => return Err(invalid()),
                 };
                 Status::Finished { outcome, cause, runtime_ns: d.number()? }

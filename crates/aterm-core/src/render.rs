@@ -836,6 +836,10 @@ pub enum BandIcon {
     /// `⎆` — an arrow entering a diamond outline, in the ring's box: the account line D's
     /// fallback unit and the Accounts card's items show.
     Enter,
+    /// `↺` — the ring opened across its top left, the open line's top end an arrowhead turning
+    /// back leftward, in the ring's box (`↻`'s turning arrow, [`Self::Update`], mirrored): the
+    /// reset line E's chart and tail, line D's fallback unit and the Accounts card show.
+    Reset,
     /// A padlock, the need pictogram ([`Self::is_pictogram`]) for a tab that waits for you: a password, an approval, an answer.
     Lock,
     /// An hourglass, its sand run down, the need pictogram for a stuck job.
@@ -846,7 +850,7 @@ pub enum BandIcon {
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 28] = [
+    pub const ALL: [BandIcon; 29] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -872,6 +876,7 @@ impl BandIcon {
         Self::Diamond,
         Self::Fork,
         Self::Enter,
+        Self::Reset,
         Self::Lock,
         Self::Hourglass,
         Self::Drive,
@@ -894,6 +899,7 @@ impl BandIcon {
             '\u{25c6}' => Self::Diamond,
             '\u{2387}' => Self::Fork,
             '\u{2386}' => Self::Enter,
+            '\u{21ba}' => Self::Reset,
             _ => return None,
         })
     }
@@ -964,6 +970,7 @@ impl BandIcon {
             Self::Diamond => '\u{25c6}',
             Self::Fork => '\u{2387}',
             Self::Enter => '\u{2386}',
+            Self::Reset => '\u{21ba}',
             Self::Lock => '\u{26bf}',
             Self::Hourglass => '\u{29d6}',
             Self::Drive => '\u{1f5b4}',

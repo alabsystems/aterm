@@ -3,13 +3,26 @@
 
 #[test]
 fn cancelled_operation_preserves_the_live_build_and_releases_its_store_lock() {
+    cancelled_replacement(false);
+}
+
+#[test]
+fn expired_budget_preserves_the_live_build_and_releases_its_store_lock() {
+    cancelled_replacement(true);
+}
+
+fn cancelled_replacement(budget: bool) {
     const CHILD: &str = "ATPKG_CANCEL_BOUNDARY_TEST";
     if let Some(root) = std::env::var_os(CHILD) {
         let layout = crate::store::Layout {
             prefix: root.into(),
         };
         let lock = crate::lock::try_lock_store(&layout).unwrap();
-        let scope = aterm_update_core::OperationCancellation::from_stdin().unwrap();
+        let scope = if budget {
+            aterm_update_core::OperationCancellation::until(std::time::Instant::now()).unwrap()
+        } else {
+            aterm_update_core::OperationCancellation::from_stdin().unwrap()
+        };
         let _operation = crate::cli::StoreOperation::new(Some(lock), Some(scope));
         let build = layout.build_dir("probe", 1);
         let incoming = layout.prefix.join("incoming");
@@ -49,7 +62,12 @@ fn cancelled_operation_preserves_the_live_build_and_releases_its_store_lock() {
     let (reader, writer) = aterm_uds::kept_out(std::io::pipe).unwrap();
     let mut writer = Some(writer);
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-    cmd.args(["--exact", "install::cancel_tests::cancelled_operation_preserves_the_live_build_and_releases_its_store_lock", "--nocapture"])
+    let test = if budget {
+        "install::cancel_tests::expired_budget_preserves_the_live_build_and_releases_its_store_lock"
+    } else {
+        "install::cancel_tests::cancelled_operation_preserves_the_live_build_and_releases_its_store_lock"
+    };
+    cmd.args(["--exact", test, "--nocapture"])
         .env(CHILD, dir.path());
     let mut output = Vec::new();
     let status = aterm_uds::deadline::stream_with_stdin_until_stopped(
@@ -64,13 +82,15 @@ fn cancelled_operation_preserves_the_live_build_and_releases_its_store_lock() {
                     .windows(b"ready\n".len())
                     .any(|part| part == b"ready\n")
             {
-                assert!(
-                    matches!(
-                        crate::lock::try_lock_store(&layout),
-                        Err(crate::lock::StoreLockError::Contended(_))
-                    ),
-                    "the child still holds its real writer lock before cancellation"
-                );
+                if !budget {
+                    assert!(
+                        matches!(
+                            crate::lock::try_lock_store(&layout),
+                            Err(crate::lock::StoreLockError::Contended(_))
+                        ),
+                        "the child still holds its real writer lock before cancellation"
+                    );
+                }
                 writer.take();
             }
             Ok(())

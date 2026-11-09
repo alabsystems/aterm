@@ -68,7 +68,6 @@ pub mod perf;
 pub mod plan;
 #[cfg(unix)]
 pub mod provision;
-mod release_test_env;
 pub mod report;
 mod run_log;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
@@ -84,6 +83,7 @@ pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
 pub mod status;
+mod test_env;
 pub mod test_history;
 pub mod test_index;
 pub mod test_plan;
@@ -721,8 +721,8 @@ pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV
 /// verify process ([`CARGO_RUN_ENV`]), and the disk claim that covers this run
 /// ([`aterm_capacity::DISK_COVER_ENV`], [`EnvSnapshot::disk_cover`]), which covers no child's
 /// own claim and which a test binary must never read (a release's children would then run its
-/// tests unlike a developer's). Release-shaped test commands explicitly inject their own
-/// marker and disposable HOME through `release_test_env`, including in a Background main lane.
+/// tests unlike a developer's). All test commands explicitly inject their own
+/// marker and disposable HOME through `test_env`, including in a Background main lane.
 pub const CHILD_ENV_REMOVED: [&str; 10] = {
     let mut all = [aterm_capacity::DISK_COVER_ENV; 10];
     all[8] = stages::CHECKERS_ENV;

@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.186.0"
+version = "0.187.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -246,6 +246,7 @@ dependencies = [
 name = "aterm-agent"
 version = "0.0.0"
 dependencies = [
+ "agh-fake",
  "astream-effects",
  "astream-sys",
  "astream-wire",

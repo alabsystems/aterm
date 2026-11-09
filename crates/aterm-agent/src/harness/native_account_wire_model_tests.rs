@@ -36,15 +36,24 @@ fn evaluate(state: &State, fault: u8, evidence: Option<&mut StepEvidence>) -> bo
     } else {
         base
     };
-    let mut parent = base.predecessor().clone();
-    if state["closure_phase"] == 0 && fault != 11 {
-        let mut prepare = parent.prepare().clone();
-        let NativePlan::Restart { rollback, .. } = &mut prepare.plan else {
-            unreachable!()
-        };
-        *rollback = None;
-        parent = Predecessor::new(prepare, parent.binding().clone()).unwrap();
-    }
+    // The base parent without its rollback, made once: a fixture value, whose making checks its
+    // encoding by parsing it again.
+    static NO_ROLLBACK: std::sync::OnceLock<Predecessor> = std::sync::OnceLock::new();
+    let parent = if state["closure_phase"] == 0 && fault != 11 {
+        NO_ROLLBACK
+            .get_or_init(|| {
+                let parent = base.predecessor();
+                let mut prepare = parent.prepare().clone();
+                let NativePlan::Restart { rollback, .. } = &mut prepare.plan else {
+                    unreachable!()
+                };
+                *rollback = None;
+                Predecessor::new(prepare, parent.binding().clone()).unwrap()
+            })
+            .clone()
+    } else {
+        base.predecessor().clone()
+    };
     let mut request = match state["request"] {
         0 => Request::Claim(rel.clone()),
         1 => Request::Fence(rel.clone()),

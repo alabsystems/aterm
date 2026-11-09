@@ -121,12 +121,10 @@ impl Pool {
 
     /// `text` as the `aterm.toml` beside the rosters.
     fn config(&self, text: &str) {
-        aterm_uds::atomic_file::write(
-            self.env.config.as_deref().expect("aterm.toml"),
-            text.as_bytes(),
-            0o600,
-        )
-        .expect("aterm.toml");
+        let path = self.env.config.as_deref().expect("aterm.toml");
+        if !holds(path, text.as_bytes(), Some(0o600)) {
+            aterm_uds::atomic_file::write(path, text.as_bytes(), 0o600).expect("aterm.toml");
+        }
     }
 
     /// Codex's login kept in the OS keyring (`cli_auth_credentials_store` in its default home's
@@ -237,11 +235,11 @@ impl Pool {
     /// The roster replaced by `rows`.
     fn rows(&self, rows: &[accounts::Row]) {
         let text = accounts::append_rows_for(self.cli, "", rows).expect("the rows admit");
-        std::fs::write(
-            self.env.accounts_roster_for(self.cli).expect("a roster"),
-            text,
-        )
-        .expect("roster");
+        put(
+            &self.env.accounts_roster_for(self.cli).expect("a roster"),
+            text.as_bytes(),
+            "roster",
+        );
     }
 
     /// Record an explicit current rejection, with real synthetic credentials for Codex.
@@ -270,6 +268,36 @@ impl Pool {
                 Ok(Vec::new())
             })
             .expect("state");
+    }
+}
+
+/// Whether `path` is a file, not a link, that holds `bytes`, and has `mode` where one is named: a
+/// write of them there would leave it as it is.
+fn holds(path: &Path, bytes: &[u8], mode: Option<u32>) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let moded = mode.is_none_or(|mode| {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777 == mode
+    });
+    #[cfg(not(unix))]
+    let moded = {
+        let _ = mode;
+        true
+    };
+    meta.file_type().is_file()
+        && moded
+        && meta.len() == bytes.len() as u64
+        && std::fs::read(path).is_ok_and(|held| held == bytes)
+}
+
+/// `bytes` at `path`, as `std::fs::write` leaves them, written only where the file does not hold
+/// them already: laying a world again rewrites what a step changed and leaves the rest.
+fn put(path: &Path, bytes: &[u8], what: &str) {
+    if !holds(path, bytes, None) {
+        std::fs::write(path, bytes).expect(what);
     }
 }
 
@@ -2686,6 +2714,11 @@ const LAW_MOVED_TO: &str = "moved@example.com";
 
 /// A login file naming the provider account `account`, and the address `email` where it has one.
 fn law_auth(path: &Path, account: &str, email: Option<&str>) {
+    std::fs::write(path, law_auth_text(account, email)).expect("a login file");
+}
+
+/// What [`law_auth`] writes.
+fn law_auth_text(account: &str, email: Option<&str>) -> String {
     let mut claims = aterm_json::json!({"https://api.openai.com/auth": {
         "chatgpt_account_id": account, "chatgpt_user_id": "user"
     }});
@@ -2699,14 +2732,10 @@ fn law_auth(path: &Path, account: &str, email: Option<&str>) {
         .trim_end_matches('=')
         .to_owned();
     let token = format!("e30.{encoded}.fixture");
-    std::fs::write(
-        path,
-        aterm_json::json!({"auth_mode": "chatgpt", "tokens": {
-            "id_token": token, "access_token": token, "refresh_token": "fixture"
-        }})
-        .to_string(),
-    )
-    .expect("a login file");
+    aterm_json::json!({"auth_mode": "chatgpt", "tokens": {
+        "id_token": token, "access_token": token, "refresh_token": "fixture"
+    }})
+    .to_string()
 }
 
 /// A provider that answers each login's read: its account, and whether its week is spent.
@@ -2916,9 +2945,13 @@ impl Pool {
                     let _ = std::fs::remove_file(file);
                 }
                 Some(LawLogin::Moved) => {
-                    law_auth(file, "moved", Some(LAW_MOVED_TO));
+                    put(
+                        file,
+                        law_auth_text("moved", Some(LAW_MOVED_TO)).as_bytes(),
+                        "a login file",
+                    );
                 }
-                _ => std::fs::write(file, "{}").expect("a stand-in login"),
+                _ => put(file, b"{}", "a stand-in login"),
             }
         }
         let vendor = accounts::Vendor {
@@ -2970,8 +3003,8 @@ impl Pool {
             .as_ref()
             .filter(|laid| laid.world == *world && laid.now == now)
         {
-            std::fs::write(store.state_file(), &laid.state).expect("the state");
-            std::fs::write(store.logins_file(), &laid.logins).expect("the logins");
+            put(&store.state_file(), &laid.state, "the state");
+            put(&store.logins_file(), &laid.logins, "the logins");
             return;
         }
         store
@@ -3135,11 +3168,11 @@ impl Pool {
     fn lay_launcher(&self, host: &LawHost) {
         let agents = self.tmp.path().join("pkg/agents");
         std::fs::create_dir_all(&agents).expect("atpkg's agents");
-        std::fs::write(
-            agents.join("codex"),
-            crate::harness::codex_alab::twin_text(&host.program),
-        )
-        .expect("atpkg's launcher");
+        put(
+            &agents.join("codex"),
+            crate::harness::codex_alab::twin_text(&host.program).as_bytes(),
+            "atpkg's launcher",
+        );
     }
 
     /// Whether the doctor and a review agree with what `launch_now` decided.
@@ -3713,14 +3746,16 @@ fn law_worlds(build: LawBuild) -> Vec<LawWorld> {
     worlds
 }
 
-/// [`law_worlds`]'s `share` of `build`, in one pool: how many, and each disagreement's kind and whole
-/// line.
+/// [`law_worlds`]'s `share` of `build`, in one pool: how many worlds it ran, and each disagreement's
+/// kind and whole line.
 fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String)>) {
     let pool = Pool::of(build.cli(), "launch-law");
     let host = build.program(&pool);
     pool.lay_launcher(&host);
     let mut wrong = Vec::new();
+    let mut ran = 0;
     for world in share {
+        ran += 1;
         let mut say = |what: &str, found: Vec<String>| {
             wrong.extend(found.into_iter().map(|disagreement| {
                 let class: String = disagreement.chars().take(24).collect();
@@ -3810,17 +3845,54 @@ fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String
             );
         }
     }
-    (share.len(), wrong)
+    (ran, wrong)
+}
+
+/// A FILE PUT AGAIN HOLDS WHAT WAS PUT: [`put`] writes a file that is not there, rewrites one that
+/// holds other bytes of the same length and leaves one that holds them, and [`Pool::config`]
+/// rewrites an `aterm.toml` that holds its words with another mode than its own.
+///
+/// NEGATIVE CONTROL (2026-11-08): with [`holds`] true of any file there, or of any of the same
+/// length, this fails at the second put's bytes; [`a_world_laid_again_is_the_one_its_commit_left`]
+/// passes the second one, whose step leaves a state as long as the one it replaces.
+#[test]
+fn a_file_put_again_holds_what_was_put() {
+    let tmp = tmp_dir("put-again");
+    let file = tmp.path().join("file");
+    for bytes in [b"{\"a\":1}", b"{\"a\":2}", b"{\"a\":2}"] {
+        put(&file, bytes, "the file");
+        assert_eq!(std::fs::read(&file).expect("the file"), bytes);
+    }
+    let pool = Pool::new("put-config");
+    let config = pool.env.config.clone().expect("aterm.toml");
+    pool.config("[harness]\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("aterm.toml")
+                .permissions()
+                .mode()
+        };
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("a mode");
+        pool.config("[harness]\n");
+        assert_eq!(mode(&config) & 0o7777, 0o600);
+    }
+    assert_eq!(std::fs::read(&config).expect("aterm.toml"), b"[harness]\n");
 }
 
 /// A WORLD LAID AGAIN IS THE ONE ITS COMMIT LEFT, whatever a step made of the records since, and
 /// another world is never laid from it.
 ///
-/// NEGATIVE CONTROL (2026-11-05): with the slot keyed on `main` alone this fails at "another world
-/// took this one's records", and so does the launch law, with 2 disagreements. With the state not
-/// put back it fails at the bytes compared after the second lay, and the step law with 7 wrong in 4
-/// classes; the launch law, which judges agreement on the records as they stand, passes that one.
-/// With the logins not put back it fails at the records compared after the second lay.
+/// NEGATIVE CONTROL (2026-11-05, again 2026-11-08): with the slot keyed on `main` alone this fails
+/// at "another world took this one's records", and so do the launch law's `on_codex_new` and
+/// `on_codex_old`, with one disagreement each, which needs the worlds laid in [`LAW_SHARES`] shares
+/// in their order. With the state not put back it fails at the bytes compared after the second
+/// lay, and the step law's `on_codex_new` (16 wrong in 1 class), `on_codex_old` (7 in 3), `on_grok`
+/// and `on_kimi` (2 each) and `where_the_default_login_moved` (1); the launch law, which judges
+/// agreement on the records as they stand, passes that one. With the logins not put back it fails
+/// at the records compared after the second lay.
 #[test]
 fn a_world_laid_again_is_the_one_its_commit_left() {
     let pool = Pool::new("lay-again");
@@ -3898,8 +3970,8 @@ fn a_world_laid_again_is_the_one_its_commit_left() {
 }
 
 /// THE SURFACES THAT SAY WHAT A LAUNCH DOES SAY THE SAME, AND NO LAUNCH DOES WHAT IT MUST REFUSE:
-/// across Codex (a build that keeps `CODEX_AUTH_PATH`'s login, one that does not, none there), Grok
-/// Build and Kimi Code CLI (there and not), the report's `next`, what `accounts use` decides,
+/// on `build` (Codex: a build that keeps `CODEX_AUTH_PATH`'s login, one that does not, none there;
+/// Grok Build and Kimi Code CLI, there and not), the report's `next`, what `accounts use` decides,
 /// `accounts_pool::launch_now`, `aterm ai review`'s row, the doctor's refusal and the launch itself
 /// (`launch_env_for`, which writes its claim) name one row or all refuse, on the records as they
 /// stand (a row signed out, with no login, walled; pinned, active or neither; held for another Mac
@@ -3914,62 +3986,35 @@ fn a_world_laid_again_is_the_one_its_commit_left() {
 /// `launch_now` (a Claude session starts on the login it is started with, and its moves are the
 /// supervisor's), and its `next:` has its own tests. A launch and a sign-in share one program here
 /// ([`LawHost`]). What Grok and Kimi cross a claim with, and the gap that leaves, is [`law_worlds`]'s.
-#[test]
-fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
-    let builds = [
-        LawBuild::CodexNew,
-        LawBuild::CodexOld,
-        LawBuild::CodexMissing,
-        LawBuild::Grok,
-        LawBuild::GrokMissing,
-        LawBuild::Kimi,
-        LawBuild::KimiMissing,
-    ];
+/// FLOOR: `build`'s matrix is at least `floor` worlds, and every one of them runs, so a build that
+/// quietly runs nothing fails. The matrix runs in [`LAW_SHARES`] shares, each in a pool of its own,
+/// one after another on this thread: the runner's own threads are the only concurrency, since the
+/// work is file calls, which more threads here only slow down.
+fn launch_law(build: LawBuild, floor: usize) {
+    if !links_here(build.cli()) {
+        return;
+    }
     let started = std::time::Instant::now();
-    let runs: Vec<(usize, Vec<(String, String)>)> = std::thread::scope(|scope| {
-        let threads: Vec<_> = builds
-            .into_iter()
-            .filter(|build| links_here(build.cli()))
-            .flat_map(|build| {
-                let worlds = law_worlds(build);
-                worlds
-                    .chunks(worlds.len().div_ceil(4))
-                    .map(<[LawWorld]>::to_vec)
-                    .map(|share| scope.spawn(move || law_share(build, &share)))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        threads
-            .into_iter()
-            .map(|thread| thread.join().expect("a share of a build's worlds"))
-            .collect()
-    });
-    let worlds: usize = runs.iter().map(|(worlds, _)| worlds).sum();
+    let matrix = law_worlds(build);
+    let (mut worlds, mut wrong) = (0, Vec::new());
+    for share in matrix.chunks(matrix.len().div_ceil(LAW_SHARES)) {
+        let (ran, found) = law_share(build, share);
+        worlds += ran;
+        wrong.extend(found);
+    }
     let mut classes: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
-    let mut count = 0;
-    for (class, line) in runs.iter().flat_map(|(_, wrong)| wrong) {
-        count += 1;
+    for (class, line) in &wrong {
         classes.entry(class).or_insert((0, line)).0 += 1;
     }
     eprintln!(
-        "the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse: {worlds} worlds, \
-         {count} disagreements, {:?}",
+        "{build:?}: {worlds} worlds, {} disagreements, {:?}",
+        wrong.len(),
         started.elapsed()
     );
-    // The matrix's size, to the world the code builds, so a build or a share that quietly runs
-    // nothing is a failure: a build that is not there is only four or six of them.
-    let matrix: usize = builds
-        .into_iter()
-        .filter(|build| links_here(build.cli()))
-        .map(|build| law_worlds(build).len())
-        .sum();
-    assert_eq!(worlds, matrix, "every world of the matrix runs");
-    if builds.iter().all(|build| links_here(build.cli())) {
-        assert!(matrix >= 1544, "the matrix shrank: {matrix} worlds");
-    }
-    assert_eq!(
-        count,
-        0,
+    assert_eq!(worlds, matrix.len(), "every world of the matrix runs");
+    assert!(worlds >= floor, "the matrix shrank: {worlds} worlds");
+    assert!(
+        wrong.is_empty(),
         "over {worlds} worlds, the first of each kind:\n{}",
         classes
             .values()
@@ -3977,6 +4022,51 @@ fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// How many pools [`launch_law`] shares a build's matrix among. A pool's worlds follow one another,
+/// and what a world's commit and its steps leave behind them passes on to the next one laid there
+/// ([`Pool::lay`]), so each world keeps the worlds it has always been laid after.
+const LAW_SHARES: usize = 4;
+
+/// [`launch_law`] on each build, at the size its matrix has.
+mod the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse {
+    use super::{LawBuild, launch_law};
+
+    #[test]
+    fn on_codex_new() {
+        launch_law(LawBuild::CodexNew, 555);
+    }
+
+    #[test]
+    fn on_codex_old() {
+        launch_law(LawBuild::CodexOld, 555);
+    }
+
+    #[test]
+    fn on_codex_missing() {
+        launch_law(LawBuild::CodexMissing, 6);
+    }
+
+    #[test]
+    fn on_grok() {
+        launch_law(LawBuild::Grok, 210);
+    }
+
+    #[test]
+    fn on_grok_missing() {
+        launch_law(LawBuild::GrokMissing, 4);
+    }
+
+    #[test]
+    fn on_kimi() {
+        launch_law(LawBuild::Kimi, 210);
+    }
+
+    #[test]
+    fn on_kimi_missing() {
+        launch_law(LawBuild::KimiMissing, 4);
+    }
 }
 
 impl Pool {

@@ -596,7 +596,7 @@ fn run_with_journal(
             binding.expected_email(),
             remaining(deadline)
                 .map_err(GoogleLoginError::Native)?
-                .min(GOOGLE_REQUEST),
+                .min(crate::harness::google_profile::REQUEST_HANG),
         );
         work_current()?;
         remaining(deadline).map_err(GoogleLoginError::Native)?;

@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 27, "0.27");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 28, "0.28");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,9 +289,8 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
         "waiting for a background agent",
         "waiting for background work",
     ];
-    let width = crate::question::screen_width(rows);
     let i = glyph_above(rows, top)?;
-    let end = status_line_end(rows, i, top, width).unwrap_or(i);
+    let end = status_line_end(rows, i, top, &|| crate::question::screen_width(rows)).unwrap_or(i);
     let text = status_words(rows, i, end);
     (status_busy(&text).is_some_and(|rule| WAITING.contains(&rule))
         && !waited_out(&text, rows, end + 1, top))
@@ -1811,12 +1810,14 @@ impl<'a> Transcript<'a> {
 
 pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     let parked = crate::survey::parked_span(rows);
-    let width = crate::question::screen_width(rows);
+    // The screen's width, measured only where a status line is read against it.
+    let width = std::cell::OnceCell::new();
+    let width = || *width.get_or_init(|| crate::question::screen_width(rows));
     for i in (0..top).rev() {
         if parked.is_some_and(|(first, last)| (first..=last).contains(&i)) {
             continue;
         }
-        if let Some(end) = status_line_end(rows, i, top, width) {
+        if let Some(end) = status_line_end(rows, i, top, &width) {
             return StatusBlock {
                 status: Some(i),
                 end,
@@ -1838,18 +1839,23 @@ pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     }
 }
 
-/// The last row of the status line row `i` opens, short of row `until`, in a pane `width` cells
-/// wide ([`line_end_in`]). Beside the side panel the line is read on its rows cut at the panel's
-/// rule ([`panel_cut`]) in a pane as wide as the rule's column: Claude Code lays the rows it
-/// draws beside the panel out that wide and wraps them there (the measured 2.1.316 captures wrap
-/// the transcript's prose and the spinner's tip at the rule), and the wrap readers take no row
-/// that draws the rule.
-fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
+/// The last row of the status line row `i` opens, short of row `until`, in a pane `width()` cells
+/// wide ([`line_end_in`]), measured only where that row opens one. Beside the side panel the line
+/// is read on its rows cut at the panel's rule ([`panel_cut`]) in a pane as wide as the rule's
+/// column: Claude Code lays the rows it draws beside the panel out that wide and wraps them there
+/// (the measured 2.1.316 captures wrap the transcript's prose and the spinner's tip at the rule),
+/// and the wrap readers take no row that draws the rule.
+fn status_line_end(
+    rows: &[String],
+    i: usize,
+    until: usize,
+    width: &dyn Fn() -> usize,
+) -> Option<usize> {
     if !crate::text::trim(&rows[i]).starts_with(is_spinner_glyph) {
         return None;
     }
     let Some(rule) = panel_rule(rows, i, i) else {
-        return line_end_in(rows, i, until, width);
+        return line_end_in(rows, i, until, width());
     };
     let cut: Vec<String> = rows[i..until.max(i + 1)]
         .iter()

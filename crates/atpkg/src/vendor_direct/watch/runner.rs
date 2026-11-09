@@ -19,7 +19,7 @@ use crate::store::Layout;
 pub const SLICE: Duration = Duration::from_secs(5);
 
 const PASS_FOLLOW_LIMIT: Duration =
-    Duration::from_secs(aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS + 60 * 60);
+    Duration::from_secs(aterm_update_core::pkg_check::PASS_OPERATION_LIMIT_SECS);
 
 /// Clocks a runner reads and the park it sleeps in.
 pub trait Clock: Send {

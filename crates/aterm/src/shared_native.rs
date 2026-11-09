@@ -24,16 +24,10 @@ const SELECTION: &str = "native-account-selection.json";
 static PREPARATIONS: OnceLock<Mutex<native_keys::PreparationQueue>> = OnceLock::new();
 static INPUT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// How long one native step (a policy write, a key intake, a launch's checks, a preparation
-/// pass) waits on custody, the vault and Commons: aterm-agent's check budget in product. In
-/// this crate's tests every holder a step races is the test's own, which releases it, so
-/// there the wait is the one-minute hang detector: a loaded parallel run starved
-/// `set_policy` past 10 s and refused it ("application pass deadline expired", "vault
-/// publication deadline expired").
-#[cfg(not(test))]
-const STEP_BUDGET: Duration = native_keys::CHECK_BUDGET;
-#[cfg(test)]
-const STEP_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// One original deadline for a required native policy, intake, launch or preparation step.
+fn step_deadline(started: Instant) -> Instant {
+    started + native_keys::CHECK_BUDGET
+}
 
 struct Observation {
     subject: Subject,
@@ -191,7 +185,7 @@ fn policy(
     paths: &Paths,
     expected: &Config,
 ) -> Result<Option<(Policy, aterm_secrets::client::EntrySnapshot)>, String> {
-    policy_at(paths, expected, Instant::now() + STEP_BUDGET)
+    policy_at(paths, expected, step_deadline(Instant::now()))
 }
 
 fn policy_at(
@@ -591,7 +585,7 @@ fn discover(
     if !native_keys::preparation_enabled(config)? {
         return Ok(None);
     }
-    let candidates = candidates(home, Instant::now() + STEP_BUDGET)?;
+    let candidates = candidates(home, step_deadline(Instant::now()))?;
     let selected = select_preparation(
         &mut PREPARATIONS
             .get_or_init(|| Mutex::new(native_keys::PreparationQueue::default()))
@@ -611,7 +605,7 @@ fn discover(
                     &approved,
                     &config,
                     &mut native_keys::LiveProbe,
-                    Instant::now() + STEP_BUDGET,
+                    step_deadline(Instant::now()),
                 )
                 .map(|_| ())
             }),
@@ -663,7 +657,7 @@ fn launcher(provider: Provider, config: &Path) -> Result<Option<PathBuf>, String
         return Ok(None);
     }
     let paths = Paths::live().map_err(|e| e.to_string())?;
-    if !selected_launch(&paths, config, provider, Instant::now() + STEP_BUDGET)? {
+    if !selected_launch(&paths, config, provider, step_deadline(Instant::now()))? {
         return Ok(None);
     }
     std::env::current_exe()
@@ -950,7 +944,7 @@ fn run(
     let approved = wait_selected(home, provider, config, || {
         std::thread::sleep(Duration::from_secs(1))
     })?;
-    let deadline = Instant::now() + STEP_BUDGET;
+    let deadline = step_deadline(Instant::now());
     let observed = observation(&approved, deadline)?;
     permits(&approved, &observed, config, deadline)?;
     let access = prepare_one(&approved, config, &mut native_keys::LiveProbe, deadline)?;
@@ -995,7 +989,7 @@ fn wait_selected(
     let paths = Paths::for_home(home);
     let mut waiting: Option<(Config, Subject, [u8; 16])> = None;
     loop {
-        let deadline = Instant::now() + STEP_BUDGET;
+        let deadline = step_deadline(Instant::now());
         let (settings, issues) =
             aterm_agent::supervise::config::SupervisorConfig::from_path(Some(config));
         if !issues.is_empty() {
@@ -1065,7 +1059,7 @@ fn set_policy_mode(
     warm: Vec<String>,
     automatic: bool,
 ) -> Result<Value, String> {
-    let deadline = Instant::now() + STEP_BUDGET;
+    let deadline = step_deadline(Instant::now());
     let paths = Paths::for_home(home);
     let expected = client::config(&paths)
         .map_err(|e| e.to_string())?

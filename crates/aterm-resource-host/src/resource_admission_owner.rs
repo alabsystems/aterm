@@ -205,7 +205,7 @@ struct Job {
     cpu_ceiling: u32,
     memory_limit: u64,
     memory_at: Instant,
-    memory_fault: bool,
+    memory_fault: Option<CompletionCause>,
     started: Instant,
     ended: Option<Instant>,
     exit_moment: Option<aterm_uds::exitwatch::ExitMoment<Instant>>,
@@ -362,8 +362,8 @@ impl Owner {
         }
     }
     pub(super) fn tick(&mut self) {
-        if self.fence.check_current().is_err() {
-            self.faulted = true;
+        if let Err(error) = self.fence.check_current() {
+            self.journal.fault(&mut self.faulted, "owner-fence", error);
         }
         self.tick_failed();
         self.tick_workload_registrations();
@@ -374,7 +374,7 @@ impl Owner {
                 .values_mut()
                 .filter(|job| !job.reaped && job.cleanup_at.is_none())
             {
-                job.cause = CompletionCause::ResourceLimit;
+                job.cause = CompletionCause::HostFault;
                 job.cleanup_at = Some(Instant::now());
                 if job
                     .child
@@ -388,8 +388,9 @@ impl Owner {
         self.tick_jobs();
         if !self.faulted && self.recovered_at.elapsed() >= Duration::from_secs(1) {
             self.recovered_at = Instant::now();
-            if self.recover().is_err() {
-                self.faulted = true;
+            if let Err(error) = self.recover() {
+                self.journal
+                    .fault(&mut self.faulted, "owner-recovery", error);
             }
         }
         if self.faulted {
@@ -410,10 +411,13 @@ impl Owner {
         session: &str,
         started: Instant,
     ) -> io::Result<Inspection> {
-        self.fence.check_current()?;
         if self.faulted {
-            return Err(refused("host custody is faulted"));
+            return Err(refused(&format!(
+                "host custody is faulted: {}",
+                self.journal.fault_summary()
+            )));
         }
+        self.fence.check_current()?;
         for job in self.jobs.values_mut() {
             let root = job.child.child_mut().id();
             let deadline = started + Duration::from_secs(60);

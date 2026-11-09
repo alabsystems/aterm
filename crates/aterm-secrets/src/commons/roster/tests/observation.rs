@@ -278,6 +278,131 @@ fn a_warm_access_check_looks_at_each_file_once() {
     });
 }
 
+/// What a Commons peer check's stages ask through their looks, asked through one
+/// ([`client::VaultLook`]): the roster and its deny list, every record held, the acknowledged log
+/// and that log's roster. The records it read.
+fn ask_through_a_look(vault: &Vault) -> crate::membership_log::Store {
+    let look = client::VaultLook::new(&vault.paths);
+    look.swarm_roster_until(std::time::Instant::now()).unwrap();
+    look.swarm_denied_nodes().unwrap();
+    let held = look.records().unwrap();
+    let client::CommonsLog::Trusted(log, _) = look
+        .acknowledged_commons_log(vault.bootstrap.trust())
+        .unwrap()
+    else {
+        panic!("a trusted log");
+    };
+    look.local_swarm_roster_for_log(&log).unwrap();
+    held
+}
+
+/// A warm look ([`client::VaultLook`]) asks each memo a Commons peer check's stages ask under one
+/// observation of the state lock, takes one stamping `lstat` of each file they stamp, and opens
+/// none; the records it gives are those a fresh read gives, and the next look looks again.
+/// NEGATIVE CONTROLS (2026-11-08): with `VaultLook::ask` on each memo's own call
+/// (`Memo::read_keyed`), a look observes the lock five times (`a look's observations`); with
+/// `VaultLook::records` on `load_records`, it opens the files that read reads (`a look's
+/// reads`).
+#[test]
+fn a_warm_look_looks_at_each_file_once_and_opens_none() {
+    let vault = Vault::new();
+    let home = vault.paths.home.clone();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let held = ask_through_a_look(&vault);
+        assert_eq!(
+            held.encode(),
+            client::load_records(&vault.paths).unwrap().encode()
+        );
+        let observations = client::lock_observations_of(&vault.paths);
+        let reads = crate::fsx::reads_under(&home);
+        let looked = looks_during(&home, || {
+            assert_eq!(ask_through_a_look(&vault).encode(), held.encode());
+        });
+        assert_eq!(
+            client::lock_observations_of(&vault.paths) - observations,
+            1,
+            "a look's observations"
+        );
+        assert_eq!(crate::fsx::reads_under(&home), reads, "a look's reads");
+        for file in [
+            vault.paths.dir.clone(),
+            vault.paths.dir.join("source.toml"),
+            vault.paths.state_file(),
+            vault.paths.cache_file(),
+        ] {
+            assert_eq!(looked.get(&file), Some(&1), "a look's looks: {looked:#?}");
+        }
+        assert!(
+            looked.values().all(|looks| *looks == 1),
+            "a look's looks: {looked:#?}"
+        );
+        assert_eq!(
+            looks_during(&home, || {
+                ask_through_a_look(&vault);
+            }),
+            looked,
+            "the next look looks again"
+        );
+    });
+}
+
+/// A look reads the records this Mac holds as they stand when it looks
+/// ([`client::VaultLook::records`]): one taken after they changed gives what a fresh read of them
+/// gives, by the stamps of the records' selection and data alone, every other file unmoved.
+/// NEGATIVE CONTROL (2026-11-08): with `Memo::kept` matching a memo's stamps of its listed files
+/// alone, not of the records' selection, the look gives the records from before the change (`a
+/// look reads the records as they stand`).
+#[test]
+fn a_look_reads_the_records_as_they_stand_when_it_looks() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let held = ask_through_a_look(&vault);
+        assert_eq!(ask_through_a_look(&vault).encode(), held.encode());
+        assert!(held.len() > 1, "a log past its genesis");
+        let data = crate::records_storage::reader_path(&vault.paths.records_file()).unwrap();
+        let genesis =
+            crate::membership_log::store::encode_records(held.log().unwrap().records().take(1));
+        crate::fsx::write_atomic(&data, &genesis, 0o600).unwrap();
+        let fresh = client::load_records(&vault.paths).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            client::VaultLook::new(&vault.paths)
+                .records()
+                .unwrap()
+                .encode(),
+            fresh.encode(),
+            "a look reads the records as they stand"
+        );
+    });
+}
+
+/// A look taken while a writer holds the state lock observes nothing, and reads the records
+/// afresh, never what its memo kept from before that writer: a writer mid-apply meets the read,
+/// as it did before the look.
+/// NEGATIVE CONTROL (2026-11-08): with the records' memo not quiet (`Memo::keyed(inputs,
+/// false)`), the look under the writer gives what it kept and opens nothing (`a look under a
+/// writer reads the records afresh`).
+#[test]
+fn a_look_under_a_writer_reads_the_records_afresh() {
+    let vault = Vault::new();
+    let home = vault.paths.home.clone();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let held = ask_through_a_look(&vault);
+        let data = crate::records_storage::reader_path(&vault.paths.records_file()).unwrap();
+        let writing = writer(&vault.paths).unwrap();
+        let reads = crate::fsx::reads_of(&data);
+        let look = client::VaultLook::new(&vault.paths);
+        assert_eq!(look.records().unwrap().encode(), held.encode());
+        assert!(
+            crate::fsx::reads_of(&data) > reads,
+            "a look under a writer reads the records afresh: {:#?}",
+            crate::fsx::reads_under(&home)
+        );
+        drop(look);
+        drop(writing);
+    });
+}
+
 #[test]
 fn a_failed_vault_read_cannot_poison_commons_access_without_an_input_change() {
     struct ReadFault(std::path::PathBuf);

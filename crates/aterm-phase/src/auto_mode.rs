@@ -32,7 +32,8 @@ pub(crate) fn footer_from(rows: &[String], end: usize) -> Option<usize> {
     let most = crate::anchor!("prompt.confirm").len()
         + " · ".len()
         + crate::anchor!("prompt.cancel").len();
-    let width = crate::question::screen_width(rows);
+    // The screen's width, measured once a row above is read as wrapped onto.
+    let width = std::cell::OnceCell::new();
     let mut first = end;
     loop {
         let run = crate::wrap::rejoined(&rows[first..=end]);
@@ -41,7 +42,11 @@ pub(crate) fn footer_from(rows: &[String], end: usize) -> Option<usize> {
         }
         let above = first.checked_sub(1)?;
         if crate::text::trim(&run).len() >= most
-            || !crate::prompt::wraps_onto(&rows[above], &rows[first], width)
+            || !crate::prompt::wraps_onto(
+                &rows[above],
+                &rows[first],
+                *width.get_or_init(|| crate::question::screen_width(rows)),
+            )
         {
             return None;
         }

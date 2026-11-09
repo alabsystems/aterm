@@ -1649,7 +1649,9 @@ fn unwrapped(rows: &[String]) -> std::borrow::Cow<'_, [String]> {
 const HINT_ROWS: usize = 8;
 
 fn last_hint(rows: &[String]) -> Option<(usize, usize)> {
-    let width = crate::question::screen_width(rows);
+    // The screen's width, measured once a row above is read as wrapped onto.
+    let width = std::cell::OnceCell::new();
+    let width = || *width.get_or_init(|| crate::question::screen_width(rows));
     let last = rows
         .iter()
         .rposition(|r| !crate::text::trim(r).is_empty())?;
@@ -1657,7 +1659,7 @@ fn last_hint(rows: &[String]) -> Option<(usize, usize)> {
     let mut first = last;
     while last - first + 1 < HINT_ROWS
         && first > 0
-        && wraps_onto(&rows[first - 1], &rows[first], width)
+        && wraps_onto(&rows[first - 1], &rows[first], width())
     {
         first -= 1;
         if is_key_hint_row(&crate::wrap::rejoined(&rows[first..=last])) {
@@ -1675,7 +1677,9 @@ fn last_footer(rows: &[String]) -> Option<(usize, usize)> {
     if !esc.contains(&true) {
         return None;
     }
-    let width = crate::question::screen_width(rows);
+    // The screen's width, measured once a row above is read as wrapped onto.
+    let width = std::cell::OnceCell::new();
+    let width = || *width.get_or_init(|| crate::question::screen_width(rows));
     (0..rows.len()).rev().find_map(|last| {
         if !esc[last.saturating_sub(FOOTER_ROWS - 1)..=last].contains(&true) {
             return None;
@@ -1684,7 +1688,7 @@ fn last_footer(rows: &[String]) -> Option<(usize, usize)> {
         let mut first = last;
         while last - first + 1 < FOOTER_ROWS
             && first > 0
-            && wraps_onto(&rows[first - 1], &rows[first], width)
+            && wraps_onto(&rows[first - 1], &rows[first], width())
         {
             first -= 1;
             let run = &rows[first..=last];

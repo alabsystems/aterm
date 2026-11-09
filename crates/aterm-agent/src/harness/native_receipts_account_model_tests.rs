@@ -3,6 +3,8 @@
 
 use super::*;
 use aterm_spec::{interp::State, xref::StepEvidence};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn cap(state: &State) -> Limits {
     Limits {
@@ -16,24 +18,72 @@ fn candidate_id(which: i64) -> String {
     format!("{:032x}", which + 1)
 }
 
-fn candidate(w: &World, which: i64, phase: i64) -> Prepare {
-    w.parent
-        .with_account_successor(
-            if phase == 0 {
-                ImagePhase::Forward
-            } else {
-                ImagePhase::Rollback
-            },
-            candidate_id(which),
-            2,
-            8,
-            w.parent.deadline_us + 1,
-            stored((which + 1) as u8),
-        )
-        .unwrap()
+/// A [`candidate`] made: its `which` and `phase`, the parent it succeeds, and itself.
+type Made = ((i64, i64), Prepare, Prepare);
+
+thread_local! {
+    /// Each [`candidate`] made so far, by its `which` and `phase` and the parent it succeeds: one is
+    /// a function of those alone, and making it checks its encoding by parsing it again.
+    static CANDIDATES: RefCell<Vec<Made>> = const { RefCell::new(Vec::new()) };
 }
 
-fn lay(state: &State) -> World {
+fn candidate(w: &World, which: i64, phase: i64) -> Prepare {
+    CANDIDATES.with(|made| {
+        let mut made = made.borrow_mut();
+        if let Some((_, _, candidate)) = made
+            .iter()
+            .find(|(of, parent, _)| *of == (which, phase) && *parent == w.parent)
+        {
+            return candidate.clone();
+        }
+        let candidate = w
+            .parent
+            .with_account_successor(
+                if phase == 0 {
+                    ImagePhase::Forward
+                } else {
+                    ImagePhase::Rollback
+                },
+                candidate_id(which),
+                2,
+                8,
+                w.parent.deadline_us + 1,
+                stored((which + 1) as u8),
+            )
+            .unwrap();
+        made.push(((which, phase), w.parent.clone(), candidate.clone()));
+        candidate
+    })
+}
+
+/// The fields of a state the journal [`lay_fresh`] lays for it depends on: the rest it never
+/// reads.
+const LAID_BY: [&str; 7] = ["limit", "byte_limit", "known", "a", "b", "winner", "child"];
+
+/// `state`'s journal in a world of its own: a clone of the one [`lay_fresh`] laid for the first
+/// state with its [`LAID_BY`] fields, which is byte for byte what the real writers lay for it
+/// again, since the journal holds no path or inode. Each state is held to the journal it is laid
+/// from once, as [`lay_fresh`] holds the state it lays.
+fn laid(
+    templates: &mut BTreeMap<[i64; 7], World>,
+    checked: &mut BTreeSet<State>,
+    state: &State,
+) -> World {
+    let template = templates
+        .entry(LAID_BY.map(|name| state[name]))
+        .or_insert_with(|| lay_fresh(state));
+    let w = World::cloned_from(template);
+    if checked.insert(state.clone()) {
+        assert_eq!(
+            project(&w, state.clone()),
+            *state,
+            "reconstruct exact journal"
+        );
+    }
+    w
+}
+
+fn lay_fresh(state: &State) -> World {
     let w = World::new(ImagePhase::Forward);
     w.seed(cap(state), state["known"] == 1);
     for (which, name) in [(1, "a"), (2, "b")] {
@@ -168,10 +218,17 @@ fn witnessed<T>(
 }
 
 pub(crate) fn transition(state: &State, action: &str) -> State {
-    step(state, action, 0, None)
+    step(state, action, 0, None, &mut lay_fresh)
 }
 
-fn step(state: &State, action: &str, fault: u8, mut evidence: Option<&mut StepEvidence>) -> State {
+/// `action` from `state`, on the world `lay` lays for it.
+fn step(
+    state: &State,
+    action: &str,
+    fault: u8,
+    mut evidence: Option<&mut StepEvidence>,
+    lay: &mut dyn FnMut(&State) -> World,
+) -> State {
     let mut next = state.clone();
     next.insert("ack", 0);
     next.insert("observed", 0);
@@ -317,7 +374,9 @@ fn account_journal_refines_real_claim_fence_and_retirement_transitions() {
     assert_eq!(ACCOUNT_FRAME, 520);
     assert_eq!(FENCE_FRAME, 524);
     let mut evidence = StepEvidence::new("AccountJournal");
-    let mut cache = std::collections::BTreeMap::new();
+    let mut cache = BTreeMap::new();
+    // The worlds laid so far, which each later step with the same journal starts from a clone of.
+    let (mut templates, mut checked) = (BTreeMap::new(), BTreeSet::new());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if !model.action_enabled(action.name, &state) {
@@ -329,9 +388,11 @@ fn account_journal_refines_real_claim_fence_and_retirement_transitions() {
             for name in ["ack", "observed", "which"] {
                 inputs.insert(name, 0);
             }
-            let next = cache
-                .entry((inputs, action.name))
-                .or_insert_with(|| step(&state, action.name, 0, Some(&mut evidence)));
+            let next = cache.entry((inputs, action.name)).or_insert_with(|| {
+                step(&state, action.name, 0, Some(&mut evidence), &mut |state| {
+                    laid(&mut templates, &mut checked, state)
+                })
+            });
             assert!(
                 model.successors(action.name, &state).contains(next),
                 "{}: {state:?} -> {next:?}",
@@ -348,18 +409,18 @@ fn ignoring_request_evidence_or_writing_on_replay_breaks_real_conformance() {
     let model = aterm_models_harness::account_journal_model();
     let mut wrong_phase = model.init_state();
     wrong_phase.insert("phase", 1);
-    let accepted = step(&wrong_phase, "RefuseA", 1, None);
+    let accepted = step(&wrong_phase, "RefuseA", 1, None, &mut lay_fresh);
     assert_eq!(accepted["a"], 2);
     assert!(!model.check_invariant("AcknowledgedExact", &accepted));
 
     let mut wrong_binding = model.init_state();
     wrong_binding.insert("binding", 0);
-    let accepted = step(&wrong_binding, "RefuseA", 6, None);
+    let accepted = step(&wrong_binding, "RefuseA", 6, None, &mut lay_fresh);
     assert!(!model.check_invariant("AcknowledgedExact", &accepted));
 
-    let invented = step(&model.init_state(), "ObserveA", 7, None);
+    let invented = step(&model.init_state(), "ObserveA", 7, None, &mut lay_fresh);
     assert!(!model.check_invariant("ObservationExact", &invented));
     let claimed = transition(&model.init_state(), "ClaimA");
-    let wrote = step(&claimed, "ReplayA", 9, None);
+    let wrote = step(&claimed, "ReplayA", 9, None, &mut lay_fresh);
     assert!(!model.check_invariant("CountedRecords", &wrote));
 }

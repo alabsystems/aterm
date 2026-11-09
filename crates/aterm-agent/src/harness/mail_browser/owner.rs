@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-const OPERATION: Duration = Duration::from_secs(30);
+/// Hang detector for required admitted owner work inside the original caller expiry.
+const OPERATION: Duration = Duration::from_secs(60);
 const IDLE: Duration = Duration::from_secs(300);
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 32 * 1024 * 1024;
@@ -284,7 +285,18 @@ impl RemoteTransport {
         request: Value,
         body: &[u8],
     ) -> Result<(Value, Zeroizing<Vec<u8>>), ApiError> {
-        let end = self.end.unwrap_or_else(|| Instant::now() + OPERATION);
+        self.exchange_started(request, body, Instant::now())
+    }
+
+    fn exchange_started(
+        &self,
+        request: Value,
+        body: &[u8],
+        started: Instant,
+    ) -> Result<(Value, Zeroizing<Vec<u8>>), ApiError> {
+        let hang = started + OPERATION;
+        let end = self.end.map_or(hang, |end| end.min(hang));
+        remaining(end).map_err(|error| failure(error.to_string()))?;
         let stream = self
             .connect(end)
             .map_err(|error| failure(error.to_string()))?;
@@ -417,6 +429,14 @@ fn monotonic_ms() -> Result<u64, ApiError> {
 }
 
 fn request_end(request: &Value, account: &str) -> Result<Instant, ApiError> {
+    request_end_started(request, account, Instant::now())
+}
+
+fn request_end_started(
+    request: &Value,
+    account: &str,
+    started: Instant,
+) -> Result<Instant, ApiError> {
     if request["version"].as_u64() != Some(1) || request["account"].as_str() != Some(account) {
         return Err(ApiError {
             kind: Kind::Refused,
@@ -430,7 +450,9 @@ fn request_end(request: &Value, account: &str) -> Result<Instant, ApiError> {
     if left == 0 {
         return Err(failure("Mail operation deadline expired"));
     }
-    Ok(Instant::now() + Duration::from_millis(left).min(OPERATION))
+    let end = (Instant::now() + Duration::from_millis(left)).min(started + OPERATION);
+    remaining(end).map_err(|error| failure(error.to_string()))?;
+    Ok(end)
 }
 
 fn decode_kind(kind: &str) -> Kind {
@@ -699,6 +721,10 @@ fn serve_connections(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "owner/native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 mod tests {

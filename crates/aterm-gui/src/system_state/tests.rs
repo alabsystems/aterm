@@ -3840,17 +3840,11 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
                 app.publish(status_of(scenario));
                 app.vault_open = Some(true);
                 let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
-                for node in &compiled.paint {
-                    let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
-                        continue;
-                    };
-                    // A text field scrolls its text by design.
-                    if !audit.contains("kind=text-field")
-                        && (audit.contains("overflow=true")
-                            || audit.contains("clip-truncated=true"))
-                    {
-                        cut.push(format!("{scale}x {width} {scenario}: {audit}"));
-                    }
+                // A text field scrolls its text by design.
+                for (_, audit) in compiled.text_fit_cuts(|kind, overflow, clipped| {
+                    kind != "text-field" && (overflow || clipped)
+                }) {
+                    cut.push(format!("{scale}x {width} {scenario}: {audit}"));
                 }
             }
         }
@@ -4501,20 +4495,17 @@ fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
                     entry.push(format!("w={width}: {failure}"));
                 }
             }
-            for node in &compiled.paint {
-                let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
-                    continue;
-                };
-                if !audit.contains("kind=text-field") && audit.contains("clip-truncated=true") {
-                    let entry = cut
-                        .entry(format!(
-                            "{scale}x {name} open={vault_open} :: clip-truncated {}",
-                            node.key.as_str()
-                        ))
-                        .or_default();
-                    if entry.len() < 3 {
-                        entry.push(format!("w={width}: {audit}"));
-                    }
+            for (key, audit) in
+                compiled.text_fit_cuts(|kind, _, clipped| kind != "text-field" && clipped)
+            {
+                let entry = cut
+                    .entry(format!(
+                        "{scale}x {name} open={vault_open} :: clip-truncated {}",
+                        key.as_str()
+                    ))
+                    .or_default();
+                if entry.len() < 3 {
+                    entry.push(format!("w={width}: {audit}"));
                 }
             }
             width += 8.0;

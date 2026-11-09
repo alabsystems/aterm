@@ -67,6 +67,10 @@ impl PassOutcome {
 /// atpkg's contention exit.
 pub const PASS_WAIT_LOCK_SECS: u64 = 30 * 60;
 
+/// A detached update owns this total budget, including its store-lock wait.
+/// Expiry requests cooperative cleanup inside the package process.
+pub const PASS_OPERATION_LIMIT_SECS: u64 = PASS_WAIT_LOCK_SECS + 60 * 60;
+
 /// The flags every scheduled pass carries after its verb.
 #[must_use]
 pub fn pass_flags(progress_file: Option<&Path>) -> Vec<OsString> {

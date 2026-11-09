@@ -2776,13 +2776,30 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(RetainedNativeLeafArtifact<'_>, f32, f32)> {
+        self.retained_native_leaf_at_pointer_from_plan(wid, x, y, None)
+    }
+
+    pub(crate) fn retained_native_leaf_at_pointer_from_plan(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<(RetainedNativeLeafArtifact<'_>, f32, f32)> {
         if !x.is_finite() || !y.is_finite() {
             return None;
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid)?;
+                &owned_plan
+            }
+        };
         for leaf in &plan.leaves {
             let Some(artifact) =
-                self.retained_native_pointer_artifact_from_plan(wid, leaf.view, &plan)
+                self.retained_native_pointer_artifact_from_plan(wid, leaf.view, plan)
             else {
                 continue;
             };

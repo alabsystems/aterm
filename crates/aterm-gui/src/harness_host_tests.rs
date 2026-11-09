@@ -676,8 +676,38 @@ fn switched(cfg: &SupervisorConfig) -> Arc<Switches> {
     switches
 }
 
+/// The tabs of the jobs no host runs ([`left_job`], [`acct_job`]), whose lost words this test's
+/// thread forgets as it ends, as a host forgets a closed tab's ([`forget_closed`]): no host ever
+/// closes these tabs, and a word left in [`LOST_SESSIONS`] stands for `snap`'s conversation in
+/// every later test.
+struct Hostless(std::cell::RefCell<Vec<(String, Arc<Mutex<Kept>>)>>);
+
+impl Drop for Hostless {
+    fn drop(&mut self) {
+        for (sid, kept) in self.0.get_mut().drain(..) {
+            if let Some(lost) = with_kept_of(&kept, |k| k.lost.take()) {
+                forget_lost(&lost.session, &sid);
+            }
+        }
+    }
+}
+
+thread_local! {
+    static HOSTLESS: Hostless = const { Hostless(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// `job`, whose tab's lost word ends with this thread ([`Hostless`]).
+fn hostless(job: WorkerJob) -> WorkerJob {
+    HOSTLESS.with(|tabs| {
+        tabs.0
+            .borrow_mut()
+            .push((job.sid.clone(), Arc::clone(&job.kept)));
+    });
+    job
+}
+
 fn left_job(sid: &str, agent: Program, cfg: &SupervisorConfig) -> WorkerJob {
-    WorkerJob {
+    hostless(WorkerJob {
         sid: sid.to_string(),
         agent,
         opts: SuperviseOpts::hosted(),
@@ -700,7 +730,7 @@ fn left_job(sid: &str, agent: Program, cfg: &SupervisorConfig) -> WorkerJob {
         watch_until: None,
         left_at_commit: Arc::default(),
         beside: Arc::default(),
-    }
+    })
 }
 
 fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -> WorkerIdle {
@@ -15034,13 +15064,13 @@ fn a_move_nobody_answered_is_relaunched_under_the_login_before_it() {
 }
 
 fn acct_job(sid: &str, idle: &WorkerIdle) -> WorkerJob {
-    WorkerJob {
+    hostless(WorkerJob {
         stop: Arc::default(),
         left: Arc::default(),
         switches: Arc::clone(&idle.switches),
         kept: Arc::clone(&idle.kept),
         ..left_job(sid, Program::Claude, &on())
-    }
+    })
 }
 
 #[test]
@@ -25110,6 +25140,149 @@ fn a_cannot_word_stands_until_its_conversation_is_held_again() {
 }
 
 #[test]
+fn a_word_for_a_conversation_held_before_it_stood_ends_with_no_ring_of_the_tests() {
+    // The holder publishes before the word stands, so its publish has no word to wake the host
+    // for, and nothing publishes after.
+    let a = Arc::new(Acting::default());
+    let (tab, holder) = ("s-lost-held-first", "s-lost-held-first-holder");
+    let lost = "1057c0de-8a88-4b1e-9e0f-0a6b7c8d9e0f".to_string();
+    *a.session_now.lock().unwrap() = Some(Some(lost.clone()));
+    a.open.lock().unwrap().insert(tab.to_string());
+    a.set(&[(tab, Program::Claude)]);
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    a.attached(&host, tab);
+    until("its loop runs", || a.runs.load(Ordering::SeqCst) >= 1);
+    crate::harness_host::publish_snapshot_for_test(
+        holder,
+        Some(&Snapshot {
+            pid: 77_777,
+            session: Some(lost.clone()),
+            ..snap(holder)
+        }),
+    );
+    let noted =
+        |a: &Acting, which: fn(&RelaunchSay) -> bool| {
+            a.notes.lock().unwrap().iter().any(
+                |n| matches!(n, HostNote::Relaunch { sid, said, .. } if sid == tab && which(said)),
+            )
+        };
+    *a.relaunches.lock().unwrap() = ["refused:stale-exit"].into();
+    a.set(&[]);
+    until("the word ended", || {
+        noted(&a, |said| matches!(said, RelaunchSay::Back))
+    });
+    assert!(
+        noted(&a, |said| matches!(said, RelaunchSay::Cannot { .. })),
+        "it stood: its agent could not be brought back"
+    );
+    assert!(!lost_session(&lost), "its conversation is let go");
+    crate::harness_host::publish_snapshot_for_test(holder, None);
+    host.shutdown_and_join();
+}
+
+#[test]
+fn a_word_rings_as_it_stands() {
+    let (tab, holder) = ("s-lost-rings-standing", "s-lost-rings-standing-holder");
+    let lost = "1057c0de-9b99-4c1e-8f10-1b7c8d9e0f1a";
+    let rings = || RINGS_HERE.with(std::cell::Cell::get);
+    let at = rings();
+    publish_snapshot_for_test(
+        holder,
+        Some(&Snapshot {
+            pid: 77_777,
+            session: Some(lost.to_string()),
+            ..snap(holder)
+        }),
+    );
+    assert_eq!(
+        rings() - at,
+        0,
+        "CONTROL: no word stands for the publish to wake a host to end"
+    );
+    let job = left_job(tab, Program::Claude, &on());
+    let at = rings();
+    stand_lost(tab, &job, lost, 4242);
+    assert_eq!(
+        rings() - at,
+        1,
+        "the word wakes the host to end it, as no publish of its holder will"
+    );
+    assert!(held_again(lost, 4242), "what the pass it wakes reads");
+    publish_snapshot_for_test(holder, None);
+}
+
+/// A word of tab `sid`'s agent `pid`, which cannot be brought back on `session` ([`lose`]).
+fn stand_lost(sid: &str, job: &WorkerJob, session: &str, pid: u32) {
+    let before = lose(
+        sid,
+        job,
+        Lost {
+            session: session.to_string(),
+            pid,
+            marked: false,
+            reason: "refused".to_string(),
+            restarted: false,
+            command: None,
+            other: upgrade_drive::Tasked::default(),
+            faulted: false,
+        },
+    );
+    assert!(before.is_none(), "the tab's first word");
+}
+
+#[test]
+fn a_lost_conversations_publish_rings_only_when_it_moved() {
+    // A tab and a conversation no other test names ([`LOST_SESSIONS`] is the process's): the
+    // ring wakes a host to end the word ([`end_lost_words`]), and a republish that rang with
+    // nothing moved woke its host into another follow and republish, for as long as the word
+    // stood.
+    let (tab, elsewhere) = ("s-lost-rings", "s-lost-rings-elsewhere");
+    let lost = "1057c0de-5d55-4d1e-8b0c-7d3e4f5a6b7c";
+    let job = left_job(tab, Program::Claude, &on());
+    stand_lost(tab, &job, lost, 4242);
+    let held = Snapshot {
+        pid: 77_777,
+        session: Some(lost.to_string()),
+        ..snap(elsewhere)
+    };
+    let rings = |snap: Option<&Snapshot>| {
+        let before = RINGS_HERE.with(std::cell::Cell::get);
+        publish_snapshot_for_test(elsewhere, snap);
+        RINGS_HERE.with(std::cell::Cell::get) - before
+    };
+    assert_eq!(
+        rings(Some(&held)),
+        1,
+        "a publish that names the lost conversation wakes the host to end its word"
+    );
+    assert_eq!(
+        rings(Some(&held)),
+        0,
+        "the same snapshot again moves nothing the word's end reads"
+    );
+    assert_eq!(rings(None), 0, "a snapshot gone names no conversation");
+    forget_lost(lost, tab);
+    assert_eq!(rings(Some(&held)), 0, "a conversation no word stands for");
+    publish_snapshot_for_test(elsewhere, None);
+}
+
+#[test]
+fn a_hostless_jobs_lost_word_ends_with_its_thread() {
+    let (tab, lost) = ("s-hostless-word", "1057c0de-7f77-4a1e-8d0e-9f5a6b7c8d9e");
+    std::thread::spawn(move || {
+        let job = left_job(tab, Program::Claude, &on());
+        stand_lost(tab, &job, lost, 4242);
+        assert!(lost_session(lost), "the word stands while its test runs");
+    })
+    .join()
+    .expect("the job's thread");
+    assert!(
+        !lost_session(lost),
+        "no host closes a hostless job's tab: its thread's end forgets the word"
+    );
+}
+
+#[test]
 fn a_lost_word_crosses_a_seamless_update_and_ends_as_it_would_have() {
     let tab = "s-lost-carried";
     let lost = "1057c0de-5d55-4e1e-8b0c-7d3e4f5a6b7c".to_string();
@@ -29081,6 +29254,7 @@ fn the_real_host_conforms_to_the_leave_model() {
             }
             let kept = expect["alive"] == 1 && expect["named"] == 0;
             let deadline = Instant::now() + Duration::from_secs(60);
+            let mut rung_at = None;
             let seen = loop {
                 let seen = leave_observed(&a, &host, (alive, ours, stray), expect["due"]);
                 for inv in [
@@ -29100,6 +29274,16 @@ fn the_real_host_conforms_to_the_leave_model() {
                     Instant::now() < deadline,
                     "{path:?} {action}: observed {seen:?}, model {expect:?}"
                 );
+                // The two passes that ask the hold again: a wake, as any change gives, rung once
+                // for each ask seen, since a ring wakes every live host. The host's own look at
+                // a kept agent is held by
+                // a_name_the_roster_cannot_read_is_no_exit_while_the_agent_holds_its_tab and
+                // a_pass_that_keeps_an_agent_owes_the_host_a_look.
+                let asks = a.holds_asked.lock().unwrap().len();
+                if seen == expect && rung_at != Some(asks) {
+                    rung_at = Some(asks);
+                    ring();
+                }
                 std::thread::sleep(Duration::from_millis(5));
             };
             for inv in &model.invariants {

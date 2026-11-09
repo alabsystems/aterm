@@ -1237,7 +1237,22 @@ impl Fx {
     ///
     /// A replay whose retry decision or cause differs from the recording.
     pub(crate) fn note_retry(&self, retry: Retry) -> Result<()> {
-        let line = format!("agh: retry {retry}");
+        self.note_line(format!("agh: retry {retry}"))
+    }
+
+    /// Log one failed round of a read that alternates routes (`Public::fetch`), as a retry is
+    /// logged.
+    ///
+    /// # Errors
+    ///
+    /// A replay whose line differs from the recording.
+    pub(crate) fn note_round(&self, line: &str) -> Result<()> {
+        self.note_line(format!("agh: {line}"))
+    }
+
+    /// `note_retry`'s and `note_round`'s line: kept by a simulated clock, else taped at
+    /// `DOOR_RETRY` and written to stderr.
+    fn note_line(&self, line: String) -> Result<()> {
         #[cfg(any(test, debug_assertions))]
         if let Seam::Simulated(clock) = &self.seam {
             clock.note_retry(line);

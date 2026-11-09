@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aterm_json::Value;
 use aterm_uds::secret::Secret;
@@ -17,8 +18,8 @@ use aterm_update_core::github_rest::Spawn;
 use super::Failed;
 use super::key::Key;
 
-/// How long curl may take to connect.
-const CONNECT_SECS: &str = "15";
+/// Hang detector for a required native curl connection.
+const CONNECT_HANG: Duration = Duration::from_secs(60);
 
 /// How long one API call may take.
 const API_SECS: &str = "120";
@@ -385,12 +386,27 @@ impl Client {
     /// total time), `stdin` on its standard input, the answer on its stdout and the
     /// status after it.
     fn run(&self, url: &str, args: &[&str], stdin: Option<&Secret>) -> Result<Answer, Unanswered> {
+        self.run_started(url, args, stdin, Instant::now())
+    }
+
+    fn run_started(
+        &self,
+        url: &str,
+        args: &[&str],
+        stdin: Option<&Secret>,
+        started: Instant,
+    ) -> Result<Answer, Unanswered> {
+        let connect = (started + CONNECT_HANG).saturating_duration_since(Instant::now());
+        if connect.is_zero() {
+            return Err(Unanswered::Unsent("curl connect deadline expired".into()));
+        }
+        let connect_secs = format!("{}.{:09}", connect.as_secs(), connect.subsec_nanos());
         let uploads = args.contains(&"--speed-limit");
         let mut argv: Vec<&str> = vec![
             "-sS",
             "--globoff",
             "--connect-timeout",
-            CONNECT_SECS,
+            &connect_secs,
             "--max-filesize",
             ANSWER_CAP,
             "-w",
@@ -455,6 +471,10 @@ fn origin(url: &str) -> &str {
         .map_or(url.len(), |i| after + i);
     &url[..end]
 }
+
+#[cfg(test)]
+#[path = "rest/native_connect_tests.rs"]
+mod native_connect_tests;
 
 #[cfg(test)]
 mod tests {

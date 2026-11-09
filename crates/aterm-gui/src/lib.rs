@@ -17851,12 +17851,18 @@ impl App {
     }
 
     fn observe_title_drift(&mut self, session: u64, now: Instant) {
-        let Some(live_epoch) = self
-            .pool
-            .get(session)
-            .and_then(|s| s.term.try_lock().ok().map(|t| t.title_epoch()))
-        else {
-            return; // unknown session or contended: next wake retries
+        let Some(live) = self.pool.get(session) else {
+            return;
+        };
+        let live_epoch = match live.term.try_lock() {
+            Ok(term) => term.title_epoch(),
+            Err(_) => {
+                // This may be the last PTY wake. Keep its observation on the existing
+                // debounce lane, whose deadline also runs when no further output arrives.
+                self.title_drift.pending.insert(session);
+                self.title_drift.last_flush.entry(session).or_insert(now);
+                return;
+            }
         };
         let stale = self.title_drift.seen.get(&session).copied() != Some(live_epoch)
             || self.windows.values().any(|ws| {

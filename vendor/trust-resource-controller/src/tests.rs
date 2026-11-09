@@ -138,6 +138,11 @@ fn lifecycle_and_cancellation_are_bound_and_unknown_keeps_execution_facts() {
             cause: CompletionCause::ResourceLimit,
             runtime_ns: 7,
         },
+        Status::Finished {
+            outcome: Outcome::Signal(9),
+            cause: CompletionCause::HostFault,
+            runtime_ns: 7,
+        },
         Status::Refused { reason: "before launch".into() },
         Status::Unknown { reason: "lost terminal".into(), started: Some(started()) },
     ];

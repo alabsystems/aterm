@@ -94,11 +94,8 @@ pub(crate) fn assert_replays(
     lines: &[String],
 ) -> Report {
     let bytes = tape.reframed(&header.encode());
-    let replayed = || {
-        replay(&bytes, &Options::default())
-            .unwrap_or_else(|e| panic!("the recorded run's tape does not replay: {e}"))
-    };
-    let first = replayed();
+    let first = replay(&bytes, &Options::default())
+        .unwrap_or_else(|e| panic!("the recorded run's tape does not replay: {e}"));
     assert_eq!(
         first.verdict,
         Verdict::Reproduced,
@@ -112,7 +109,6 @@ pub(crate) fn assert_replays(
         printed, lines,
         "the replay prints what the recorded run printed"
     );
-    assert_eq!(replayed(), first, "a tape replays the same way twice");
     let acts = replay(
         &bytes,
         &Options {
@@ -140,6 +136,18 @@ pub(crate) fn assert_replays(
         account.exact() && account.consumed == first.effects,
         "acts mode over an unchanged run follows the tape exactly: {account:?} of {} effects",
         first.effects
+    );
+    // Acts mode is a second replay of the tape from the tape alone, so a decision that hangs on a
+    // hash map's order, or on anything else the tape does not hold, says otherwise in one of the
+    // two: they agree on every field but the mode and its own account.
+    assert_eq!(
+        Report {
+            mode: first.mode,
+            acts: None,
+            ..acts.clone()
+        },
+        first,
+        "a tape replays the same way twice (strict, then acts)"
     );
     first
 }

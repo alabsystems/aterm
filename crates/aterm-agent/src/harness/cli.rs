@@ -7273,8 +7273,8 @@ pub const ACCOUNTS_AUTO_RECORDED: &str = "recorded: it stays the active account;
 /// The label the first `accounts add` gives this machine's own login (the row with no `dir`), so the login every session already runs on is in the roster: a session whose login no row names is never advised to move ([`accounts::StayWhy::NotListed`]).
 pub const ACCOUNTS_OWN_LABEL: &str = "main";
 
-/// How long one `claude auth status --json` may run ([`auth_status_of`]).
-pub const AUTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Hang detector for native authentication and required canonical provider checks.
+pub const AUTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The provider time allowed to one unattended Claude renewal.
 pub(super) const UNATTENDED_RENEWAL_BUDGET: std::time::Duration =

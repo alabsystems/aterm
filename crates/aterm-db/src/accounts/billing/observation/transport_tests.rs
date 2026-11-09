@@ -134,8 +134,9 @@ fn broker_transport_conforms_and_eof_barrier_is_necessary() {
     named.sort_unstable();
     actions.sort_unstable();
     assert_eq!(named, actions);
+    let template = super::broker_tests::template();
     aterm_spec::fs_lane::each(&worlds, |steps| {
-        let world = super::broker_tests::setup();
+        let world = super::broker_tests::fork(&template);
         for action in *steps {
             let next = super::transport_transition(&world, &initial, action);
             assert!(
@@ -144,7 +145,12 @@ fn broker_transport_conforms_and_eof_barrier_is_necessary() {
             );
         }
     });
-    let unsafe_next = transition_with(&super::broker_tests::setup(), &initial, "Trailing", true);
+    let unsafe_next = transition_with(
+        &super::broker_tests::fork(&template),
+        &initial,
+        "Trailing",
+        true,
+    );
     assert!(!model.check_invariant("FrameBeforeEffect", &unsafe_next));
 }
 

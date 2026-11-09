@@ -558,8 +558,10 @@ fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
         open: 8,
         subscriptions: 1,
     });
-    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
+    let started = lanes.start();
+    assert_eq!(started.rpc, 1, "the request lane starts");
     lanes.publish(service.clone());
+    started.activate();
 
     let (mut client, server) = CtlStream::pair().expect("socket pair");
     assert!(lanes.admit(server).is_ok(), "the connection is admitted");

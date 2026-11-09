@@ -16,7 +16,10 @@
 //!    ([`Branch`]), is INHERITED: named and not counted. Any other red, and a run
 //!    whose record is not whole, exits non-zero, and nothing is pushed.
 //! 4. Push (a push git reports failed whose landing main holds landed). Where main moved to M2
-//!    meanwhile, compose the pass onto M2 when AGENTS.md's rule holds: `merge-tree` is clean, and the files M1..M2 and M1..HEAD change are disjoint. That
+//!    meanwhile, compose the pass onto M2 when AGENTS.md's rule holds: a clean merge and
+//!    disjoint changed files, except a sole shared `Cargo.lock` whose isolated local product
+//!    version alone moved ([`version::independent_lock`]). The four immutable trees retain
+//!    every other lock byte and the source-proven binary-leaf identity boundary. That
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
 //!    ([`COMPOSES`] in a row at most). Where the rule fails, merge M2 and judge only the delta it
 //!    brought (`verify --base <the judged commit>`); after [`REJUDGES`] re-judges it stops, the
@@ -33,6 +36,9 @@ use aterm_uds::spawnfd::Command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+#[path = "land_version.rs"]
+mod version;
 
 /// The remote main is fetched from and pushed to.
 pub const REMOTE: &str = "origin";
@@ -354,7 +360,14 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             }
             None => Vec::new(),
         };
-        if let (Some(tree), true) = (&tree, overlap.is_empty()) {
+        let product_version = tree.as_ref().and_then(|tree| {
+            if overlap.len() == 1 && overlap[0].as_slice() == b"Cargo.lock" {
+                version::independent_lock(git, &merged, &tip, &judged_at, tree)
+            } else {
+                None
+            }
+        });
+        if let (Some(tree), true) = (&tree, overlap.is_empty() || product_version.is_some()) {
             if composes == COMPOSES {
                 say(
                     seams,
@@ -367,13 +380,20 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
                 return Ok(STOPPED);
             }
             composes += 1;
-            say(
-                seams,
-                format!(
-                    "verify land: composing onto {tip}: the merge is clean and its new commits \
-                     touch none of the branch's files"
-                ),
+            let why = product_version.map_or_else(
+                || {
+                    "the merge is clean and its new commits touch none of the branch's files"
+                        .to_owned()
+                },
+                |(old, new)| {
+                    format!(
+                        "the merge is clean and its only shared file is Cargo.lock, where the \
+                         isolated product version moved from {old} to {new}; every other lock \
+                         byte is preserved"
+                    )
+                },
             );
+            say(seams, format!("verify land: composing onto {tip}: {why}"));
             composed_tree = Some(tree.clone());
             onto = tip;
             continue;
@@ -1051,11 +1071,15 @@ pub fn usage() -> String {
         "usage: targo --unverified verify land [--admit wait|now]\n\n\
          Land this checkout's branch on {REMOTE}/{MAIN}, judged: merge {REMOTE}/{MAIN} (M1), run\n\
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
-         it (a clean merge whose new commits touch none of the branch's files) or merge it and\n\
+         it (a clean merge and disjoint files, except a sole shared Cargo.lock whose isolated\n\
+         local product version alone moved) or merge it and\n\
          judge the new delta, at most {REJUDGES} times. A red main's lane already named at the\n\
          main commit merged (M1, or the moved main a re-judge merged), in a crate outside the\n\
          branch's own, is INHERITED: named, not counted. The landing merge carries\n\
          Aterm-Checked, Aterm-Composed-Onto and Aterm-Inherited trailers.\n\n\
+         The lock exception validates four immutable trees, preserving every other lock byte,\n\
+         dependency, format and mode. Uncertain evidence is judged again. Aterm-Checked still\n\
+         names the tree that ran; a composed product identity is not that earlier executable.\n\n\
          --admit changes resource admission only, forwarded to every judgment. The full dev\n\
          set and change cone are unchanged; wait is the default.\n\n\
          GitHub reads and writes use agh (dry-run, expected refs, durable write intents); local\n\
@@ -1146,12 +1170,7 @@ fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
         Err(e) => return not_run(format!("{} did not start: {e}", tools.targo.display())),
     };
     let text = std::fs::read_to_string(&events).unwrap_or_default();
-    Judged {
-        code,
-        checks: text.lines().filter_map(CheckRow::of_event).collect(),
-        secs: began.elapsed().as_secs(),
-        finished: text.lines().rev().find_map(Finished::of_event),
-    }
+    Judged::from_events(&text, code, began.elapsed().as_secs())
 }
 
 fn judgment_command(

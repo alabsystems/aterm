@@ -812,14 +812,16 @@ fn large_records_keep_to_the_byte_line_and_never_spill_a_week_ahead() {
     let spool = &spools(scratch.path(), 1)[0];
     let mut next_account = 0u64;
     let mut big = |now: u64, passes: u64| {
-        for i in 0..passes {
-            for _ in 0..250 {
-                next_account += 1;
-                let account = pk(&format!("u{next_account}@example.test"));
-                spool.append(&ev(now + i, Kind::SignedIn, account)).unwrap();
-            }
-            flush::pass(&lab.paths[0], spool, &Presence::default, false, now + i).unwrap();
-        }
+        (0..passes)
+            .map(|i| {
+                for _ in 0..250 {
+                    next_account += 1;
+                    let account = pk(&format!("u{next_account}@example.test"));
+                    spool.append(&ev(now + i, Kind::SignedIn, account)).unwrap();
+                }
+                flush::pass(&lab.paths[0], spool, &Presence::default, false, now + i).unwrap()
+            })
+            .collect::<Vec<_>>()
     };
     let burst_bytes = BYTE_SHARE * BURST / JOURNAL_SHARES_RECORDS;
     let largest = crate::catalog::ring::record_bytes(caps::RECORD);
@@ -836,7 +838,22 @@ fn large_records_keep_to_the_byte_line_and_never_spill_a_week_ahead() {
         "large records still go: {start:?}"
     );
 
-    big((W + 1) * WEEK - 600, 40);
+    // The week's end: passes until a record goes into the next week's table, which only a full
+    // share sends there, then on until two passes have written nothing there, so passes past the
+    // next week's line are tried whatever number of records it admits.
+    let end = (W + 1) * WEEK - 600;
+    let (mut written_ahead, mut refused) = (0, 0);
+    for i in 0..40 {
+        let flushed = big(end + i, 1);
+        if matches!(flushed[..], [Flushed::Wrote { period, .. }] if period == W + 1) {
+            written_ahead += 1;
+        } else if written_ahead > 0 {
+            refused += 1;
+            if refused == 2 {
+                break;
+            }
+        }
+    }
     let (_, window) = window_at(&lab.paths[0], (W + 1) * WEEK - 500);
     let full = window.used[&W];
     assert!(
@@ -847,6 +864,10 @@ fn large_records_keep_to_the_byte_line_and_never_spill_a_week_ahead() {
     assert!(
         ahead.writer_records <= BURST && ahead.writer_bytes <= burst_bytes,
         "spent ahead in next week's table: {ahead:?}"
+    );
+    assert_eq!(
+        refused, 2,
+        "passes past the next week's line were tried: {written_ahead} written ahead"
     );
     let next = (W + 1) * WEEK + 60;
     assert!(

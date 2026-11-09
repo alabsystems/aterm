@@ -1399,6 +1399,13 @@ pub trait Backend {
     }
     /// The line's meaning check ([`crate::line::verify`]), which writes no ref: its summary.
     fn verify_line(&mut self, line: &crate::line::Line) -> Result<String, Refusal>;
+    /// Read-only main-commit hints for a qualify failure, using its diagnostic evidence.
+    fn failure_hints(
+        &mut self,
+        line: &crate::line::Line,
+        evidence: &str,
+        logs: &[String],
+    ) -> Vec<String>;
     fn verify_pending_line(&mut self, line: &crate::line::Line) -> Result<String, Refusal> {
         self.verify_line(line)
     }
@@ -2016,8 +2023,23 @@ impl Run<'_> {
         ));
     }
 
-    fn refuse(&mut self, r: Refusal) -> Flow {
+    fn refuse(&mut self, mut r: Refusal) -> Flow {
         let step = self.cur;
+        if step == Step::Qualify
+            && !r.could_not_run
+            && let Some(journal) = &self.journal
+        {
+            let logs = self
+                .facts
+                .checks
+                .failed
+                .iter()
+                .map(|f| f.log.clone())
+                .collect::<Vec<_>>();
+            let evidence = format!("{}\n{}", r.why, r.detail.join("\n"));
+            r.detail
+                .extend(self.b.failure_hints(&journal.line(), &evidence, &logs));
+        }
         if self.dry {
             self.would.push(format!("{}: {}", step.at(), r.why));
             self.say(&format!(

@@ -234,6 +234,10 @@ pub(super) fn install(sys: &dyn System) -> Result<(), Failure> {
                         | Unfinished::LowData
                 ) =>
             {
+                say(&aterm_log::sanitize_record(&format!(
+                    "retaining authorized setup after {:?}: {}",
+                    failure.class, failure.why
+                )));
                 false
             }
             Err(failure) if failure.class == Unfinished::AppleWindow => {

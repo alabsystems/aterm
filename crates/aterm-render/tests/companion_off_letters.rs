@@ -13,6 +13,7 @@ use crate::trail_letters_read::{
 };
 use aterm_effects::cursor_fx::TrailColor;
 use aterm_effects::kitty_pet::{OldPath, art_cols, head_law};
+use aterm_render::{FaceRef, FaceTarget, Renderer, Theme};
 use std::ops::RangeInclusive;
 
 /// The companion styles.
@@ -45,13 +46,30 @@ pub fn coats_driven(
     old: &[OldPath],
     drive: Drive,
 ) -> Vec<Judged> {
-    let mut r = Replay::gridded(
-        style,
-        look,
-        TrailColor::Automatic,
-        scene.rows(),
-        scene.cols(),
-    );
+    coats_driven_on(None, style, look, scene, old, drive)
+}
+
+/// [`coats_driven`] drawn in `face` at its px (`None`: the window's face at the gallery's px).
+pub fn coats_driven_on(
+    face: Option<(&FaceRef, f32)>,
+    style: &str,
+    look: Look,
+    scene: Scene,
+    old: &[OldPath],
+    drive: Drive,
+) -> Vec<Judged> {
+    let grid = (scene.rows(), scene.cols());
+    let mut r = match face {
+        None => Replay::gridded(style, look, TrailColor::Automatic, grid.0, grid.1),
+        Some((face, px)) => Replay::gridded_on(
+            Renderer::from_system_with_face(Some(face), px, Theme::default())
+                .expect("fixture: a face this host resolved loads"),
+            style,
+            look,
+            TrailColor::Automatic,
+            grid,
+        ),
+    };
     r.coat = true;
     r.keys_unnoted = drive != Drive::Console;
     if drive == Drive::Gallery {
@@ -2334,9 +2352,11 @@ struct WallCoat {
     /// Frames to the Enter (wrapped: to the wrap), and those on glass.
     held: usize,
     drawn: usize,
-    /// Of those on glass: frames whose box meets a lettered cell, whose body lies on letter ink,
-    /// and whose body lies in the caret's cell.
+    /// Of those on glass: frames whose box meets a lettered cell, those whose box reaches more
+    /// than [`SWELL`] into one, those whose body lies on letter ink, and those whose body lies in
+    /// the caret's cell.
     boxed: usize,
+    deep: usize,
     inked: usize,
     careted: usize,
     /// The first frame (ms) on glass whose box meets a lettered cell.
@@ -2349,17 +2369,18 @@ struct WallCoat {
     unfaded: Vec<u64>,
     /// The first frame (ms) on glass from `gone` to the Enter: the companion back before it.
     returned: Option<u64>,
-    /// Frames on glass from `gone` to the Enter whose box meets a lettered cell, or whose body
-    /// lies on letter ink or the caret.
+    /// Frames on glass from `gone` to the Enter whose box reaches more than [`SWELL`] into a
+    /// lettered cell, or whose body lies on letter ink or the caret.
     relaid: Vec<String>,
     /// Frames on glass from the first key past the burst's line ([`last_row_times`]) to the Enter
-    /// whose box meets a lettered cell, or whose body lies on letter ink or the caret.
+    /// whose box reaches more than [`SWELL`] into a lettered cell, or whose body lies on letter
+    /// ink or the caret.
     then_on: usize,
     /// Of those, the frames at full alpha.
     full: usize,
     /// Frames on glass past the Enter, to the next line's first key (wrapped: past the wrap, to
-    /// the Enter) whose box meets a lettered cell, or whose body lies on letter ink or the caret:
-    /// when (ms), and what.
+    /// the Enter) whose box reaches more than [`SWELL`] into a lettered cell, or whose body lies
+    /// on letter ink or the caret: when (ms), and what.
     after: Vec<(u64, String)>,
     /// The first frame (ms) on glass past the Enter (wrapped: the wrap) and past `gone`.
     back: Option<u64>,
@@ -2367,6 +2388,15 @@ struct WallCoat {
     last_key: u64,
     until: u64,
 }
+
+/// How far across into a lettered cell a pose's swell at the wall reaches where the line seats
+/// the companion, px ([`Coat::box_reach`]), which the wall's law leaves: the grid's end pushes
+/// the swell back onto the line (`OldPath::StretchOffLetters` leaves it so). The effects replay's
+/// bound, read as it reads it, across alone
+/// (`steam_tests::a_wall_that_holds_no_seat_hides_the_body_on_every_face`); measured 1 px on
+/// 11 x 28 where the line leaves four blank cells, none on 13 x 29 or 14 x 26 (Linux arm64,
+/// 2026-11-08).
+const SWELL: usize = 2;
 
 /// A [`Scene::LastRowRoom`] replay's [`WallCoat`]: `wraps`, the line wraps at its last key.
 fn wall_coat(judged: &[Judged], (room, then): (i16, LastRowThen)) -> WallCoat {
@@ -2384,11 +2414,11 @@ fn wall_coat(judged: &[Judged], (room, then): (i16, LastRowThen)) -> WallCoat {
     } else {
         (enter, next_line)
     };
-    let on = |c: &Coat| c.alpha > 0 && (!c.box_cells.is_empty() || c.ink_px > 0 || c.caret_px > 0);
+    let on = |c: &Coat| c.alpha > 0 && (c.box_reach > SWELL || c.ink_px > 0 || c.caret_px > 0);
     let told = |j: &&Judged| {
         format!(
-            "{} ms, box {:?}: {:?} ink {} caret {}",
-            j.ms, j.coat.pet, j.coat.box_cells, j.coat.ink_px, j.coat.caret_px
+            "{} ms, box {:?}: {:?} {} px in, ink {} caret {}",
+            j.ms, j.coat.pet, j.coat.box_cells, j.coat.box_reach, j.coat.ink_px, j.coat.caret_px
         )
     };
     let held: Vec<&Judged> = judged
@@ -2411,6 +2441,10 @@ fn wall_coat(judged: &[Judged], (room, then): (i16, LastRowThen)) -> WallCoat {
         boxed: held
             .iter()
             .filter(|j| j.coat.alpha > 0 && !j.coat.box_cells.is_empty())
+            .count(),
+        deep: held
+            .iter()
+            .filter(|j| j.coat.alpha > 0 && j.coat.box_reach > SWELL)
             .count(),
         inked: held
             .iter()
@@ -2509,9 +2543,55 @@ const WALL_THENS: [LastRowThen; 9] = [
     LastRowThen::Gapped,
 ];
 
-/// A run of the wall's scene: the companion, the page, the blank cells past the line and what
-/// follows the burst, how the keys come, and the law its negative control reverts, if it is one.
+/// The faces [`a_last_row_that_holds_no_seat_hides_the_companion`] draws the wall's scene in
+/// besides the window's, each where this host resolves it: Liberation Mono at 23 px, which lays
+/// the gallery's 14 x 26 px cell (a face Linux hosts install, which aterm does not bundle), and
+/// Iosevka Term at 22 px, 11 x 28 (bundled with aterm-render's `embedded-font`).
+const WALL_FACES: [(&str, f32); 2] = [
+    ("Liberation Mono", 23.0),
+    (aterm_render::bundled::IOSEVKA_FAMILY, 22.0),
+];
+
+/// A face the wall's scene is drawn in: its family, the face this host resolved it to and its px
+/// (`None`: the window's face at the gallery's px), and the cell it lays, px.
+struct WallFace {
+    family: &'static str,
+    face: Option<(FaceRef, f32)>,
+    cell: (usize, usize),
+}
+
+/// The window's face, then each of [`WALL_FACES`] this host resolves to a face that loads as
+/// itself (not the window's face standing in for it).
+fn wall_faces() -> Vec<WallFace> {
+    let mut faces = vec![WallFace {
+        family: "the window's face",
+        face: None,
+        cell: gallery_cell(),
+    }];
+    for (family, px) in WALL_FACES {
+        let Some(face) = aterm_render::resolve_family_or_bundled(family, FaceTarget::REGULAR)
+        else {
+            continue;
+        };
+        let Some(rend) = Renderer::from_system_with_face(Some(&face), px, Theme::default()) else {
+            continue;
+        };
+        if rend.primary_source_path() == Some(face.path.as_str()) {
+            faces.push(WallFace {
+                family,
+                cell: rend.cell_size(),
+                face: Some((face, px)),
+            });
+        }
+    }
+    faces
+}
+
+/// A run of the wall's scene: the face ([`wall_faces`]'s index), the companion, the page, the
+/// blank cells past the line and what follows the burst, how the keys come, and the law its
+/// negative control reverts, if it is one.
 type WallRun = (
+    usize,
     &'static str,
     Look,
     (i16, LastRowThen),
@@ -2523,31 +2603,40 @@ type WallRun = (
 /// gallery's `last-row`, [`Scene::LastRowRoom`]): on a full page's last row the row over the line
 /// holds a letter in every cell and none lies under it, so the companion has no seat off the line
 /// and is fitted to its row at the wall. The burst's line ends 4, 3, 2, 1 and 0 cells short of the
-/// grid's end, and one cell past it, so that it wraps and the page scrolls. Every companion style
-/// on every page, keys typed past the console (as the gallery types them) and through it; from 300
-/// ms past the first key. Where the line leaves the fitted body the room it takes on the window's
-/// face (`last_row_cols`: four cells under Linux's 13 x 29, three on the gallery's 14 x 26), typed
-/// to its end at once (and on the bundled face's 13 x 29 alone, paused six keys short of it, its
-/// last letters after a run of spaces or walked back into by ten Left arrows, which leave the
-/// companion at its seat off the line, [`OldPath::KeptOffTheLine`]), it is on glass in every frame
-/// to the Enter, and none lays its box on a lettered cell or its body on letter ink or the caret's
-/// cell. Where it leaves less, a frame's box meets the last letters as they come, and from that
-/// frame the companion fades out, its alpha never rising, and is off the glass a fade (0.45 s) and
-/// two frames on. Past the Enter (to the next line's first key), and past the wrap (to the Enter),
-/// it is back on glass within a second, and no frame lays its box on a lettered cell or its body on
-/// ink or the caret: it comes back by the new caret, and the wrapped line's first row stays clear.
+/// grid's end, and one cell past it, so that it wraps and the page scrolls. Drawn in the window's
+/// face at the gallery's px, every companion style on every page, and in each of [`WALL_FACES`]
+/// this host resolves (Liberation Mono at 23 px on 14 x 26, Iosevka Term at 22 px on 11 x 28), the
+/// cat and the dog on dark; keys typed past the console (as the gallery types them) and through
+/// it; from 300 ms past the first key. Where the line leaves the fitted body the room it takes on
+/// the face's cell (`last_row_cols`: four cells on 13 x 29 and 11 x 28, three on 14 x 26), typed
+/// to its end at once (and, in each face but a window's face that does not lay the bundled
+/// 13 x 29, paused six keys short of it, its last letters after a run of spaces, walked back into
+/// by ten Left arrows, which leave the companion at its seat off the line,
+/// [`OldPath::KeptOffTheLine`], or the row over it cleared, [`OldPath::FitWaitsForTheFeet`]), it
+/// is on glass in every frame to the Enter, and none lays its box more than [`SWELL`] across into
+/// a lettered cell (a pose's swell at the wall: 1 px on 11 x 28, in 3 to 16 frames; none on
+/// 13 x 29 and 14 x 26) or its body on letter ink or the caret's cell. Negative control of that
+/// reach (built to measure, not kept): with [`head_law`]'s fit raised to 1.06 rows, the box
+/// 1 to 2 px down into the lettered row over the line, it reached across it in 486 of the 565
+/// frames at four blank cells on 13 x 29 (Linux arm64, 2026-11-09). Where it leaves less, a frame's box
+/// meets the last letters as they come, and from that frame the companion fades out, its alpha
+/// never rising, and is off the glass a fade (0.45 s) and two frames on. Past the Enter (to the
+/// next line's first key), and past the wrap (to the Enter), it is back on glass within a second,
+/// and no frame lays its box more than [`SWELL`] into a lettered cell or its body on ink or the
+/// caret: it comes back by the new caret, and the wrapped line's first row stays clear.
 /// The fade itself lies over the letters as they come, for its 28 frames (on Linux's 13 x 29: box
 /// only at three blank cells; art on up to 39 px of ink at two, 103 at one, 165 and the caret's
 /// cell at none, 128 where the line wraps, each at the fade's alpha, below full; after the pause,
-/// 29 at one and none, one of them at full alpha with its art on no ink).
+/// 29 at one and none, one of them at full alpha with its art on no ink; 11 x 28 the same, and
+/// 14 x 26 the same a cell sooner, 29 after the pause at none alone).
 ///
 /// Where the line leaves no seat, what follows it before the Enter ([`WALL_THENS`]):
 /// - It rests: off the glass from its fade's end to the Enter.
 /// - 3, 6 or 12 Backspaces 1.5 s past the last key, or 6 from 150 ms, while it fades: where the
 ///   erase leaves the fitted body its room ([`erased_room`]), it is back on glass within a second
 ///   of the erase's last key (or of its fade's end), and where it leaves less, off the glass to
-///   the Enter. Either way no frame from its fade's end to the Enter lays its box on a lettered
-///   cell or its body on ink or the caret.
+///   the Enter. Either way no frame from its fade's end to the Enter lays its box more than
+///   [`SWELL`] into a lettered cell or its body on ink or the caret.
 /// - Ten Left arrows back into the line 1.5 s past the last key: off the glass from its fade's
 ///   end to the Enter.
 /// - The burst paused six keys short of its end for 3 s: off the glass within 0.45 s and 150 ms of
@@ -2555,8 +2644,8 @@ type WallRun = (
 /// - 1.5 s past the last key the program clears the row over the line
 ///   ([`LastRowThen::Opened`]), so a seat opens beside the line while the companion is out: back
 ///   on glass within a second of the clearing (or of its fade's end; measured 24 ms past the
-///   clearing), and no frame from its fade's end to the Enter lays its box on a lettered cell or
-///   its body on ink or the caret. Past the Enter, the frame before it moves has the Enter's
+///   clearing), and no frame from its fade's end to the Enter lays its box more than [`SWELL`]
+///   into a lettered cell or its body on ink or the caret. Past the Enter, the frame before it moves has the Enter's
 ///   scroll carry the line up under that seat (the same at four blank cells, which seat it, and
 ///   with the law reverted): that frame is the scroll's, and is not judged.
 /// - The burst's last two letters typed after fourteen spaces ([`LastRowThen::Gapped`]), so that
@@ -2564,86 +2653,130 @@ type WallRun = (
 ///   to the Enter (stood at that stand, it blinked back and out every 64 ms to the Enter in the
 ///   effects replay).
 ///
-/// The pause, the gap and the Left arrows are replayed where the line seats the companion too, on
-/// the bundled face's 13 x 29 alone (on glass in every frame to the Enter, and on no letter or the
-/// caret): at the gallery's 14 x 26 the effects replay's box overlaps the caret's cell by 12 px
-/// there, which no render on that face has judged.
+/// The pause, the gap, the Left arrows and the row over the line cleared are replayed where the
+/// line seats the companion too, in each face but a window's face that does not lay the bundled
+/// 13 x 29 (macOS's SF Mono on 14 x 26, where none of it was measured): on glass in every frame
+/// to the Enter, and on no letter (but the swell, on 11 x 28) or the caret; the cleared row's seat
+/// takes it off the line, grown only once it has risen to that row,
+/// [`OldPath::FitWaitsForTheFeet`]. On 14 x 26 the effects replay's box overlaps the caret's cell
+/// by 12 px at three blank cells, a seat; drawn on that cell in Liberation Mono, the companion's
+/// art lies in the caret's cell in no frame there (Linux arm64, 2026-11-08).
 ///
 /// In each, from the first key past the line (past the pause) to the Enter, at most one frame at
-/// full alpha lays its box on a lettered cell or its body on ink or the caret (measured: one past
-/// the pause at one blank cell and at none; none in the others).
+/// full alpha lays its box more than [`SWELL`] into a lettered cell or its body on ink or the caret
+/// (measured: one past the pause at one blank cell and at none on 13 x 29 and 11 x 28, and at none
+/// on 14 x 26; none in the others).
 ///
 /// Negative control (the law reverted, the cat on dark, both ways of typing, every room that leaves
-/// no seat): it stands at the wall on the line's last letters to the Enter, its box on them in 252
-/// frames or more of the 565 held (two thirds of the fewest; measured 378 at three cells, its art
-/// on ink in none, 381 and 325 at two, 384 and 381 at one, 387 and 384 at none, the caret's cell in
-/// 378; past the gap, 378 at three and 381 at two, one and none), and where the line wraps, typed
-/// past the console, its crossing back lays its box on the wrapped line's first row in 21 frames or
-/// more (two thirds of the 31 measured). From the first Left arrow to the Enter it follows the
-/// caret along the line's letters, on them in 190 frames or more (measured 284 of 284); from the
-/// end of the pause, in 252 or more (378 to 388 of 394); and an erase after the line ran to the
-/// grid's end leaves it on them from the first Backspace to the Enter in 22 or more (measured 284
-/// with three, 283 with six, 33 with twelve, 367 with six while it fades; at the other rooms the
-/// reverted body is clear of them within a few frames of the erase, and no control is taken there).
-/// Negative control of the seat kept off the line ([`OldPath::KeptOffTheLine`] reverted, the cat on
-/// dark, both ways of typing, the Left arrows at four blank cells, which seat it): it follows the
-/// caret onto the line's letters, on them from the first arrow to the Enter in 186 frames or more
-/// (measured 279 of 284, 264 at full alpha, its art on their ink in 227; with the law, none; Linux
-/// arm64, 2026-11-08). Negative control of the caret's own steps ([`OldPath::CaretTypesOn`]
-/// reverted, the cat on dark, keys typed past the console, the pause at every room but the wrap):
+/// no seat, in the window's face): it stands at the wall on the line's last letters to the Enter,
+/// its box on them in 252 frames or more of the 565 held (two thirds of the fewest; measured 378 at
+/// three cells, its art on ink in none, 381 and 325 at two, 384 and 381 at one, 387 and 384 at
+/// none, the caret's cell in 378; past the gap, 378 at three and 381 at two, one and none), and
+/// where the line wraps, typed past the console, its crossing back lays its box more than
+/// [`SWELL`] into the wrapped line's first row in 21 frames or more (two thirds of the 31
+/// measured). In each other face, at rest at every room that leaves no seat but the wrap, its box
+/// on them in 252 or more as well (measured 378 to 384 on 14 x 26, 378 to 387 on 11 x 28). From the
+/// first Left arrow to the Enter it follows the caret along the line's letters, on them in 190
+/// frames or more (measured 284 of 284); from the end of the pause, in 252 or more (378 to 388 of
+/// 394); and an erase after the line ran to the grid's end leaves it on them from the first
+/// Backspace to the Enter in 22 or more (measured 284 with three, 283 with six, 33 with twelve, 366
+/// with six while it fades; at the other rooms the reverted body is clear of them within a few
+/// frames of the erase, and no control is taken there). Negative control of the seat kept off the
+/// line ([`OldPath::KeptOffTheLine`] reverted, the cat on dark, both ways of typing, the Left arrows
+/// at four blank cells, which seat it): it follows the caret onto the line's letters, more than
+/// [`SWELL`] into them from the first arrow to the Enter in 186 frames or more (measured 278 of 284,
+/// 263 at full alpha, its art on their ink in 227; with the law, none; Linux arm64, 2026-11-08).
+/// Negative control of the fit that waits for the feet ([`OldPath::FitWaitsForTheFeet`]
+/// reverted, the cat on dark, both ways of typing, the row over the line cleared at four blank
+/// cells): it grows as it rises off the line's row, and its box reaches more than [`SWELL`] into
+/// the line's last letters in 4 frames or more from the clearing (measured 6, at full alpha, its
+/// art on their ink in none; with the law, none; Linux arm64, 2026-11-08). Negative control of
+/// the caret's own steps ([`OldPath::CaretTypesOn`] reverted, the cat on dark, keys typed past
+/// the console, the pause at every room but the wrap):
 /// the keys typed on after the pause find the margin untaken, and it walks over the caret onto the
-/// line's last letters at full alpha, in 17 frames or more over the rooms (measured 25: 11 at three
-/// blank cells and 12 at two, on up to 120 and 95 px of their ink, 1 at one and 1 at none), against
-/// 2 with the law. Each floor is two thirds of the fewest measured. Linux arm64, 2026-11-07.
+/// line's last letters at full alpha, more than [`SWELL`] into them in 15 frames or more over the
+/// rooms (measured 22: 10 at three blank cells and 10 at two, on up to 120 and 95 px of their ink,
+/// 1 at one and 1 at none; 2026-11-08), against 2 with the law. Each floor is two thirds of the
+/// fewest measured. Linux arm64, 2026-11-07.
 #[test]
 fn a_last_row_that_holds_no_seat_hides_the_companion() {
     const ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
-    let seated = i32::from(last_row_cols(gallery_cell())) - i32::from(last_row_line());
+    const PAGES: [Look; 4] = [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT];
+    let cat = "rainbow kitty pet";
+    let faces = wall_faces();
+    let seated_at = |cell| i32::from(last_row_cols(cell)) - i32::from(last_row_line());
     let mut runs: Vec<WallRun> = Vec::new();
-    for room in ROOMS {
-        for then in WALL_THENS {
-            let unseated = i32::from(room) < seated;
-            let judged = match then {
-                LastRowThen::Rests => true,
-                LastRowThen::Paused | LastRowThen::Gapped | LastRowThen::Back => {
-                    room >= 0 && (unseated || lays_the_bundled_cell())
-                }
-                _ => room >= 0 && unseated,
-            };
-            if !judged {
-                continue;
-            }
-            for drive in [Drive::Ctl, Drive::Console] {
-                for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
-                    for style in COMPANIONS {
-                        runs.push((style, look, (room, then), drive, None));
-                    }
-                }
-                let control = match then {
-                    LastRowThen::Rests => room >= 0 || drive == Drive::Ctl,
-                    LastRowThen::Erased { .. } => room == 0,
-                    LastRowThen::Back | LastRowThen::Paused | LastRowThen::Gapped => true,
-                    LastRowThen::Opened => false,
+    for (f, face) in faces.iter().enumerate() {
+        let window = face.face.is_none();
+        let seated = seated_at(face.cell);
+        // The window's face draws every companion on every page, another face the cat and the
+        // dog on dark; each replays what follows a line that seats the companion where it was
+        // measured (the window's face on the bundled 13 x 29 alone).
+        let (styles, looks): (&[&str], &[Look]) = if window {
+            (&COMPANIONS, &PAGES)
+        } else {
+            (&[cat, "rainbow dog"], &[DARK])
+        };
+        let seats_judged = !window || lays_the_bundled_cell();
+        for room in ROOMS {
+            for then in WALL_THENS {
+                let unseated = i32::from(room) < seated;
+                let judged = match then {
+                    LastRowThen::Rests => true,
+                    LastRowThen::Paused
+                    | LastRowThen::Gapped
+                    | LastRowThen::Back
+                    | LastRowThen::Opened => room >= 0 && (unseated || seats_judged),
+                    LastRowThen::Erased { .. } => room >= 0 && unseated,
                 };
-                let cat = "rainbow kitty pet";
-                if unseated && control {
-                    let old = Some(OldPath::NoSeatHidesTheBody);
-                    runs.push((cat, DARK, (room, then), drive, old));
+                if !judged {
+                    continue;
                 }
-                if !unseated && then == LastRowThen::Back {
-                    let old = Some(OldPath::KeptOffTheLine);
-                    runs.push((cat, DARK, (room, then), drive, old));
-                }
-                if then == LastRowThen::Paused && drive == Drive::Ctl {
-                    runs.push((cat, DARK, (room, then), drive, Some(OldPath::CaretTypesOn)));
+                for drive in [Drive::Ctl, Drive::Console] {
+                    for &look in looks {
+                        for &style in styles {
+                            runs.push((f, style, look, (room, then), drive, None));
+                        }
+                    }
+                    if !window {
+                        if unseated && room >= 0 && then == LastRowThen::Rests {
+                            let old = Some(OldPath::NoSeatHidesTheBody);
+                            runs.push((f, cat, DARK, (room, then), drive, old));
+                        }
+                        continue;
+                    }
+                    let control = match then {
+                        LastRowThen::Rests => room >= 0 || drive == Drive::Ctl,
+                        LastRowThen::Erased { .. } => room == 0,
+                        LastRowThen::Back | LastRowThen::Paused | LastRowThen::Gapped => true,
+                        LastRowThen::Opened => false,
+                    };
+                    if unseated && control {
+                        let old = Some(OldPath::NoSeatHidesTheBody);
+                        runs.push((f, cat, DARK, (room, then), drive, old));
+                    }
+                    if !unseated && then == LastRowThen::Back {
+                        let old = Some(OldPath::KeptOffTheLine);
+                        runs.push((f, cat, DARK, (room, then), drive, old));
+                    }
+                    if !unseated && then == LastRowThen::Opened {
+                        let old = Some(OldPath::FitWaitsForTheFeet);
+                        runs.push((f, cat, DARK, (room, then), drive, old));
+                    }
+                    if then == LastRowThen::Paused && drive == Drive::Ctl {
+                        let old = Some(OldPath::CaretTypesOn);
+                        runs.push((f, cat, DARK, (room, then), drive, old));
+                    }
                 }
             }
         }
     }
-    let seen = aterm_spec::check::each(&runs, |&(style, look, scene, drive, control)| {
+    let seen = aterm_spec::check::each(&runs, |&(f, style, look, scene, drive, control)| {
         let old: Vec<OldPath> = control.into_iter().collect();
+        let face = faces[f].face.as_ref().map(|(face, px)| (face, *px));
         wall_coat(
-            &coats_driven(
+            &coats_driven_on(
+                face,
                 style,
                 look,
                 Scene::LastRowRoom(scene.0, scene.1),
@@ -2656,22 +2789,24 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
     let full: Vec<usize> = runs
         .iter()
         .zip(&seen)
-        .filter(|(run, _)| run.4 == Some(OldPath::CaretTypesOn))
+        .filter(|(run, _)| run.5 == Some(OldPath::CaretTypesOn))
         .map(|(_, w)| w.full)
         .collect();
     assert!(
-        full.iter().sum::<usize>() >= 17,
+        full.iter().sum::<usize>() >= 15,
         "negative control ({:?}): typed on past the console after the pause, it lay on the \
          letters at full alpha in only {full:?} frames",
         OldPath::CaretTypesOn
     );
     let (_, fit) = head_law(true, true);
-    let (cw, ch) = gallery_cell();
-    for (&(style, look, (room, then), drive, control), w) in runs.iter().zip(&seen) {
+    for (&(f, style, look, (room, then), drive, control), w) in runs.iter().zip(&seen) {
+        let WallFace { family, cell, .. } = faces[f];
+        let seated = seated_at(cell);
         let why = format!(
-            "{style} on {}, {room} cells past the line, {then:?} ({drive:?}; body {:.2} cells)",
+            "{style} on {}, {family} ({cell:?}), {room} cells past the line, {then:?} ({drive:?}; \
+             body {:.2} cells)",
             look.name,
-            art_cols(cw as u16, ch as u16) * fit
+            art_cols(cell.0 as u16, cell.1 as u16) * fit
         );
         assert!(w.held >= 150, "fixture: {why} holds {} frames", w.held);
         if control == Some(OldPath::CaretTypesOn) {
@@ -2682,6 +2817,15 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
                 w.then_on >= 186,
                 "negative control, {why}: seated, from the first Left arrow it lay on the \
                  letters in only {} frames ({w:?})",
+                w.then_on
+            );
+            continue;
+        }
+        if control == Some(OldPath::FitWaitsForTheFeet) {
+            assert!(
+                w.then_on >= 4,
+                "negative control, {why}: seated, from the clearing over the line its box met \
+                 the letters in only {} frames ({w:?})",
                 w.then_on
             );
             continue;
@@ -2704,7 +2848,7 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         }
         if i32::from(room) >= seated {
             assert!(
-                w.drawn == w.held && w.boxed + w.inked + w.careted == 0,
+                w.drawn == w.held && w.deep + w.inked + w.careted == 0,
                 "{why}: seated, it left the glass or lay on the letters or the caret ({w:?})"
             );
             continue;

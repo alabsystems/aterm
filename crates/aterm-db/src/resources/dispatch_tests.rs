@@ -439,17 +439,43 @@ fn lose_history(lab: &Lab, allocation: &Allocation, db: &Resources) -> (i64, i64
     )
 }
 
+/// The worlds a step starts from, built once for a walk: one Mac's lab and its one-unit
+/// allocation, before and after `initialize`.
+pub(crate) struct Bases {
+    fresh: Lab,
+    initialized: Lab,
+    allocation: Allocation,
+}
+
+impl Bases {
+    fn new() -> Self {
+        let fresh = Lab::new(&[Role::Writer]);
+        let allocation = allocation(&fresh, &[1]);
+        let initialized = fresh.fork();
+        resources(&initialized, 0, &allocation)
+            .initialize()
+            .unwrap();
+        Self {
+            fresh,
+            initialized,
+            allocation,
+        }
+    }
+}
+
 pub(crate) fn dispatch_transition(
+    bases: &Bases,
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
     let phase = state["phase"];
-    let lab = Lab::new(&[Role::Writer]);
-    let allocation = allocation(&lab, &[1]);
-    let db = resources(&lab, 0, &allocation);
-    if action != "NotAdmitted" && (phase != 6 || state["damaged"] == 1) {
-        db.initialize().unwrap();
-    }
+    let lab = if action != "NotAdmitted" && (phase != 6 || state["damaged"] == 1) {
+        bases.initialized.fork()
+    } else {
+        bases.fresh.fork()
+    };
+    let allocation = &bases.allocation;
+    let db = resources(&lab, 0, allocation);
     let entered = Cell::new(0);
     let mut permit = None;
     let mut invoked = None;
@@ -494,7 +520,7 @@ pub(crate) fn dispatch_transition(
                     drop(p);
                 }
             }
-            loss = Some(lose_history(&lab, &allocation, &db));
+            loss = Some(lose_history(&lab, allocation, &db));
         }
         6 => {}
         _ => unreachable!(),
@@ -540,7 +566,7 @@ pub(crate) fn dispatch_transition(
         "LoseHistory" => {
             drop(permit.take());
             drop(invoked.take());
-            loss = Some(lose_history(&lab, &allocation, &db));
+            loss = Some(lose_history(&lab, allocation, &db));
             next.insert("damaged", 1);
         }
         "Legacy" => {
@@ -686,10 +712,11 @@ fn invocation_lifecycle_conforms_and_duplicate_entry_is_detected() {
         .collect();
     // A new action, phase or latch moves these counts, so it cannot fall out of the walk quietly.
     assert_eq!((every.len(), steps.len()), (135, 88));
-    // Each step builds its own Lab in its own temporary home, so the steps share
-    // nothing and run on the lane's places.
+    // Each step runs on its own copy of a world built once, in its own temporary home, so the
+    // steps share nothing and run on the lane's places.
+    let bases = Bases::new();
     let reached = aterm_spec::fs_lane::each(&steps, |(state, action)| {
-        let next = dispatch_transition(state, action);
+        let next = dispatch_transition(&bases, state, action);
         assert!(
             model.successors(action, state).contains(&next),
             "{action}: {state:?} -> {next:?}"

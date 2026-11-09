@@ -434,7 +434,7 @@ fn host_process() {
             if case == "cancel" {
                 CompletionCause::Cancelled
             } else {
-                CompletionCause::ResourceLimit
+                CompletionCause::HostFault
             }
         );
         assert!(matches!(outcome, Outcome::Signal(_)))

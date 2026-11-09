@@ -2427,7 +2427,9 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
         if sits {
             m.key_releases = Some(1);
         }
-        m.stall_sleep = Some(Duration::from_millis(20));
+        // Each stall answers at the end of the wait it asked for (the mock answers no move), so the
+        // loop wakes at its own dues and no sooner.
+        m.stall_sleep = Some(Duration::from_secs(3600));
         m.vanish_after = Some(20_000);
         m.exit_when = Some(|m| m.requests.iter().any(|r| r.starts_with("send ")));
         let opts = SuperviseOpts {

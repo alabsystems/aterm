@@ -6398,6 +6398,55 @@ impl Backend for Real {
         Ok(crate::line::verify(&self.git(), line)?)
     }
 
+    fn failure_hints(&mut self, line: &Line, evidence: &str, logs: &[String]) -> Vec<String> {
+        use std::io::{BufRead, BufReader};
+        // A qualify can outlive several main landings. Refresh only source tracking refs;
+        // never select a new candidate or touch the publication engine for a hint.
+        let refresh = (self.source_origin)(&self.repo).and_then(|origin| origin.fetch_origin());
+        let mut evidence = evidence.to_owned();
+        let paths = logs.iter().map(PathBuf::from).chain(
+            ["tree", "build", "build-fixtures"].map(|branch| self.side_log(Step::Qualify, branch)),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut unread = Vec::new();
+        for path in paths.filter(|path| seen.insert(path.clone())) {
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    for row in BufReader::new(file).lines() {
+                        match row {
+                            Ok(row)
+                                if row.contains("FAIL")
+                                    || row.contains("panicked at")
+                                    || row.contains("error")
+                                    || row.trim_start().starts_with("--> ") =>
+                            {
+                                evidence.push('\n');
+                                evidence.push_str(&row);
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                unread.push(format!("hint evidence {}: {error}", path.display()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => unread.push(format!("hint evidence {}: {error}", path.display())),
+            }
+        }
+        let mut hints = crate::line::failure_hints(&self.git(), line, &evidence)
+            .unwrap_or_else(|stop| vec![format!("main fix hints unavailable: {}", stop.why)]);
+        if let Err(why) = refresh {
+            hints.insert(
+                0,
+                format!("main hint refresh failed; using last fetched origin/main: {why}"),
+            );
+        }
+        hints.extend(unread);
+        hints
+    }
+
     fn verify_pending_line(&mut self, line: &Line) -> Result<String, Refusal> {
         Ok(crate::line::verify_pending(&self.git(), line)?)
     }

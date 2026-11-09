@@ -329,6 +329,7 @@ fn emit_mode(
                 CompletionCause::Timeout => "timeout",
                 CompletionCause::Cancelled => "cancelled",
                 CompletionCause::ResourceLimit => "resource_limit",
+                CompletionCause::HostFault => "host_fault",
             };
             aterm_json::json!({"event":"finished","outcome":outcome,"cause":cause,"runtime_ns":runtime_ns})
         }

@@ -441,53 +441,95 @@ fn prepare_partial(
     prepare_file(path, file, streamed, offset, exact_total, cap)
 }
 
-/// Send `call` into one durable part file, resuming a transiently broken body from the exact
-/// prefix already written. The client's shared progress budget bounds every Range retry.
-pub(crate) fn call_to_resumable_file(
-    gh: &Github,
-    call: &Call,
-    dest: &Path,
-    cap: u64,
-) -> Result<u64> {
-    refuse_part_name(dest)?;
-    refuse_non_file(dest)?;
-    let mut part = Part::create(dest)?;
-    let offset = Cell::new(0u64);
-    let written = gh.call_stream_resumable_with(
-        call,
-        || offset.get(),
-        |mut streamed| {
-            let partial = prepare_partial(&mut part, &streamed, offset.get(), None, cap)?;
-            offset.set(partial.start);
-            let (path, file) = part.path_and_file()?;
-            let copied = copy(
-                &mut streamed.body,
-                file,
-                &mut |chunk| {
-                    offset.set(
-                        offset
-                            .get()
-                            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX)),
-                    );
-                },
-                &|e| local("cannot write", path, e),
-            )?;
-            let all = partial.start.saturating_add(copied);
-            if let Some(total) = partial.total
-                && all < total
-            {
-                return Err(Error::could_not_run(format!(
-                    "truncated: download sent {all} of {total} bytes"
-                ))
-                .with_sub(Sub::Wire(WireKind::Truncated)));
-            }
-            Ok(all)
-        },
-    )?;
-    part.durable()?;
-    refuse_non_file(dest)?;
-    part.finish(dest)?;
-    Ok(written)
+/// One durable part file that file transfers fill, over one call or several: a later call
+/// resumes from the exact prefix the earlier ones left (a route change included), and the
+/// client's shared progress budget bounds every Range retry within each call.
+pub(crate) struct ResumableFile {
+    part: Part,
+    dest: PathBuf,
+    /// The bytes the part file holds.
+    offset: Cell<u64>,
+    /// Every byte any call has delivered (a prefix a 200 replaced counted again).
+    arrived: Cell<u64>,
+}
+
+impl ResumableFile {
+    /// A fresh part file for `dest`.
+    ///
+    /// # Errors
+    ///
+    /// Usage for a destination `refuse_part_name` or `refuse_non_file` refuses; the part
+    /// file's local error.
+    pub(crate) fn create(dest: &Path) -> Result<ResumableFile> {
+        refuse_part_name(dest)?;
+        refuse_non_file(dest)?;
+        Ok(ResumableFile {
+            part: Part::create(dest)?,
+            dest: dest.to_path_buf(),
+            offset: Cell::new(0),
+            arrived: Cell::new(0),
+        })
+    }
+
+    /// Every byte delivered so far, by every call.
+    pub(crate) fn arrived(&self) -> u64 {
+        self.arrived.get()
+    }
+
+    /// Send `call` and write its body after the prefix already held (or over it, when the
+    /// server answers 200), at most `cap` bytes in all. The bytes held.
+    ///
+    /// # Errors
+    ///
+    /// The call's or the write's error; Truncated when the body ends before its total.
+    pub(crate) fn call(&mut self, gh: &Github, call: &Call, cap: u64) -> Result<u64> {
+        let Self {
+            part,
+            offset,
+            arrived,
+            ..
+        } = self;
+        gh.call_stream_resumable_with(
+            call,
+            || offset.get(),
+            |mut streamed| {
+                let partial = prepare_partial(part, &streamed, offset.get(), None, cap)?;
+                offset.set(partial.start);
+                let (path, file) = part.path_and_file()?;
+                let copied = copy(
+                    &mut streamed.body,
+                    file,
+                    &mut |chunk| {
+                        let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                        offset.set(offset.get().saturating_add(n));
+                        arrived.set(arrived.get().saturating_add(n));
+                    },
+                    &|e| local("cannot write", path, e),
+                )?;
+                let all = partial.start.saturating_add(copied);
+                if let Some(total) = partial.total
+                    && all < total
+                {
+                    return Err(Error::could_not_run(format!(
+                        "truncated: download sent {all} of {total} bytes"
+                    ))
+                    .with_sub(Sub::Wire(WireKind::Truncated)));
+                }
+                Ok(all)
+            },
+        )
+    }
+
+    /// Make the bytes durable and rename the part file onto the destination.
+    ///
+    /// # Errors
+    ///
+    /// The local error; Usage when something other than a regular file took the destination.
+    pub(crate) fn finish(self) -> Result<()> {
+        self.part.durable()?;
+        refuse_non_file(&self.dest)?;
+        self.part.finish(&self.dest)
+    }
 }
 
 /// `O_NONBLOCK`, which differs: 0o4000 on Linux, 0x0004 on Darwin and the BSDs.

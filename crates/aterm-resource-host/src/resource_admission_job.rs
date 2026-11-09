@@ -21,6 +21,28 @@ fn ended_cause(started: Instant, ended: Instant, timeout: Option<Duration>) -> C
     }
 }
 
+fn memory_fault(
+    sample: io::Result<u64>,
+    limit: u64,
+    pressure: Option<aterm_sysprobe::MemoryLevel>,
+) -> Option<(CompletionCause, String)> {
+    match sample {
+        Err(error) => Some((
+            CompletionCause::HostFault,
+            format!("memory sampling: {error:?}"),
+        )),
+        Ok(bytes) if bytes > limit => Some((
+            CompletionCause::ResourceLimit,
+            format!("owned memory {bytes} exceeds claim {limit}"),
+        )),
+        Ok(bytes) if pressure == Some(aterm_sysprobe::MemoryLevel::Critical) => Some((
+            CompletionCause::ResourceLimit,
+            format!("critical system memory pressure; owned bytes={bytes}, claim={limit}"),
+        )),
+        Ok(_) => None,
+    }
+}
+
 pub(super) fn inspection(
     fence: &Fence,
     debt: &ExternalDebt,
@@ -117,7 +139,11 @@ impl Owner {
                 // EOF caused by our existing cancellation/timeout is not a
                 // second resource failure. Preserve the original accepted
                 // cause through the same owning wait and settlement.
-                job.cause = CompletionCause::ResourceLimit;
+                journal.record_fault(
+                    "root-control",
+                    "bootstrap query failed or workload control closed before drain",
+                );
+                job.cause = CompletionCause::HostFault;
                 job.cleanup_at.get_or_insert_with(Instant::now);
             }
             // This is sampled governance over actual owned groups, not a hard
@@ -138,28 +164,43 @@ impl Owner {
                     match root.query_sampling_group() {
                         Ok(Some(group)) => groups.push(group),
                         Ok(None) => {}
-                        Err(_) => job.memory_fault = true,
+                        Err(error) => {
+                            journal.record_fault("memory-query-group", error);
+                            job.memory_fault = Some(CompletionCause::HostFault);
+                        }
                     }
                 }
                 if !job.reaped {
                     if let Ok(group) = i32::try_from(job.child.child_mut().id()) {
                         groups.push(group);
                     } else {
-                        job.memory_fault = true;
+                        journal.record_fault(
+                            "memory-root-group",
+                            "root PID cannot be represented as a process group",
+                        );
+                        job.memory_fault = Some(CompletionCause::HostFault);
                     }
                 }
-                job.memory_fault = job.memory_fault
-                    || crate::resource_memory::sample(&groups)
-                        .ok()
-                        .is_none_or(|bytes| bytes > job.memory_limit)
-                    || aterm_sysprobe::memory_pressure()
-                        == Some(aterm_sysprobe::MemoryLevel::Critical);
+                if job.memory_fault.is_none() {
+                    let sample = crate::resource_memory::sample(&groups);
+                    let pressure = aterm_sysprobe::memory_pressure();
+                    if let Some((cause, detail)) = memory_fault(sample, job.memory_limit, pressure)
+                    {
+                        journal.record_fault("memory-observation", &detail);
+                        job.memory_fault = Some(cause);
+                    }
+                }
             }
-            if job.memory_fault && job.cause != CompletionCause::ResourceLimit {
-                job.cause = CompletionCause::ResourceLimit;
+            if let Some(cause) = job.memory_fault
+                && job.cause != cause
+                && job.cause != CompletionCause::HostFault
+            {
+                job.cause = cause;
                 job.cleanup_at.get_or_insert_with(Instant::now);
-                if !job.reaped && job.child.request_group(CohortSignal::Kill).is_err() {
-                    *faulted = true;
+                if !job.reaped
+                    && let Err(error) = job.child.request_group(CohortSignal::Kill)
+                {
+                    journal.fault(faulted, "memory-kill", error);
                     let _ = job.child.child_mut().kill();
                 }
             }
@@ -179,8 +220,8 @@ impl Owner {
                         // stamp before deciding which side of the deadline it
                         // witnessed. Actor wake latency must not choose exit.
                         None
-                    } else if job.memory_fault {
-                        Some(CompletionCause::ResourceLimit)
+                    } else if job.memory_fault.is_some() {
+                        job.memory_fault
                     } else if job
                         .timeout
                         .is_some_and(|limit| job.started.elapsed() >= limit)
@@ -202,13 +243,13 @@ impl Owner {
                         } else {
                             CohortSignal::Terminate
                         };
-                        if job.child.request_group(signal).is_err() {
+                        if let Err(error) = job.child.request_group(signal) {
                             let already_drained = job.child.child_mut().exited().unwrap_or(false)
                                 && crate::resource_memory::other_members_exited(
                                     job.child.child_mut().id(),
                                 );
                             if !already_drained {
-                                *faulted = true;
+                                journal.fault(faulted, "cleanup-signal", error);
                                 let _ = job.child.child_mut().kill();
                             }
                         }
@@ -225,10 +266,10 @@ impl Owner {
                 if job
                     .cleanup_at
                     .is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
-                    && job.child.request_group(CohortSignal::Kill).is_err()
+                    && let Err(error) = job.child.request_group(CohortSignal::Kill)
                     && !drained
                 {
-                    *faulted = true;
+                    journal.fault(faulted, "cleanup-kill", error);
                     let _ = job.child.child_mut().kill();
                 }
                 // For launched jobs use the kernel notification's stamp, not
@@ -258,14 +299,13 @@ impl Owner {
                             _ => None,
                         };
                         if let Some(outcome) = outcome {
-                            if job
-                                .metadata_sdk
-                                .as_ref()
-                                .is_some_and(|sdk| sdk.validate().is_err())
+                            if let Some(sdk) = job.metadata_sdk.as_ref()
+                                && let Err(error) = sdk.validate()
                             {
                                 // Preserve the real exit while refusing input
                                 // integrity. This check grants no drain fact.
-                                job.cause = CompletionCause::ResourceLimit;
+                                journal.record_fault("terminal-inputs", error);
+                                job.cause = CompletionCause::HostFault;
                             }
                             let runtime_ns = u64::try_from(
                                 job.ended
@@ -289,8 +329,10 @@ impl Owner {
                                 }
                                 job.terminal_sent = true;
                             }
+                            let faults = (job.cause == CompletionCause::HostFault).then(||
+                                journal.fault_summary().chars().take(4096).collect::<String>());
                             if journal
-                                .update(&job.binding, "terminal", aterm_json::json!({}))
+                                .update(&job.binding, "terminal", aterm_json::json!({"cause": format!("{:?}", job.cause), "host_faults": faults}))
                                 .is_err()
                             {
                                 return true;
@@ -336,6 +378,26 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_sampling_error_names_host_fault_not_a_limit() {
+        let (cause, detail) =
+            memory_fault(Err(io::Error::from_raw_os_error(libc::EACCES)), 1024, None).unwrap();
+        assert_eq!(cause, CompletionCause::HostFault);
+        assert!(detail.contains("PermissionDenied"));
+    }
+
+    #[test]
+    fn measured_memory_limit_and_critical_pressure_keep_their_evidence() {
+        let (cause, detail) = memory_fault(Ok(1025), 1024, None).unwrap();
+        assert_eq!(cause, CompletionCause::ResourceLimit);
+        assert!(detail.contains("1025") && detail.contains("1024"));
+        let (cause, detail) =
+            memory_fault(Ok(512), 1024, Some(aterm_sysprobe::MemoryLevel::Critical)).unwrap();
+        assert_eq!(cause, CompletionCause::ResourceLimit);
+        assert!(detail.contains("critical") && detail.contains("512"));
+        assert!(memory_fault(Ok(1024), 1024, None).is_none());
+    }
 
     #[test]
     fn completed_stamp_decides_deadline_independently_of_actor_wake() {

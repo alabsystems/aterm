@@ -68,24 +68,50 @@ struct Fixture {
     invoked: Option<Invoked>,
     before: Snapshot,
     actors: [astream_wire::sync::Actor; 2],
+    allocation: Allocation,
 }
 
-fn fixture(mode: i64) -> Fixture {
-    let lab = if matches!(mode, 2 | 4) {
+impl Fixture {
+    /// This world in a lab of its own, for a step that must not see the steps run on this one.
+    /// The copy holds no finished adapter call: only `Record` spends one.
+    fn fork(&self) -> Self {
+        let lab = self._lab.fork();
+        Self {
+            a: resources(&lab, 0, &self.allocation),
+            b: resources(&lab, 1, &self.allocation),
+            _lab: lab,
+            invoked: None,
+            before: self.before.clone(),
+            actors: self.actors,
+            allocation: self.allocation.clone(),
+        }
+    }
+}
+
+/// Two writers' world up to its first repair, the same for every environment of one lab kind
+/// (log-backed or not): both resource tables enrolled, B's first reservation repaired across, and
+/// a catalog-authored debit of A's.
+struct Template {
+    lab: Lab,
+    allocation: Allocation,
+    actors: [astream_wire::sync::Actor; 2],
+    scope: Scope,
+    log_backed: bool,
+}
+
+fn template(log_backed: bool) -> Template {
+    let lab = if log_backed {
         Lab::with_foundation(&[Role::Writer, Role::Writer])
     } else {
         Lab::new(&[Role::Writer, Role::Writer])
     };
-    if matches!(mode, 2 | 4) {
+    if log_backed {
         client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
         let records = client::load_records(&lab.paths[0]).unwrap().encode();
         client::save_records(&lab.paths[1], &records).unwrap();
     }
     for n in 0..2 {
-        assert_eq!(
-            lab.bootstrap(n).is_log_backed().unwrap(),
-            matches!(mode, 2 | 4)
-        );
+        assert_eq!(lab.bootstrap(n).is_log_backed().unwrap(), log_backed);
     }
     let actors = std::array::from_fn(|n| lab.bootstrap(n).request().unwrap().binding().actor());
     let allocation = allocation(&lab, &[3, 3]);
@@ -94,6 +120,7 @@ fn fixture(mode: i64) -> Fixture {
     let scope = a.initialize().unwrap();
     b.initialize().unwrap();
     let peer = b.reserve([1; 16], 1).unwrap();
+    assert_ne!(peer.receipt.id, [0; 32]);
     rounds(&lab);
     // Existing installations have catalog-authored debits. Preserve their
     // cross-writer parents, rather than testing only newly authored history.
@@ -107,6 +134,23 @@ fn fixture(mode: i64) -> Fixture {
             cumulative: 1,
         },
     );
+    Template {
+        lab,
+        allocation,
+        actors,
+        scope,
+        log_backed,
+    }
+}
+
+/// Environment `mode`'s world, on a copy of `template`: A's adapter call finished but not yet
+/// recorded, B's second reservation repaired across, then the mode's retirement.
+fn fixture(template: &Template, mode: i64) -> Fixture {
+    assert_eq!(template.log_backed, matches!(mode, 2 | 4));
+    let lab = template.lab.fork();
+    let (allocation, actors, scope) = (&template.allocation, template.actors, template.scope);
+    let a = resources(&lab, 0, allocation);
+    let b = resources(&lab, 1, allocation);
     let Admission::Fresh(permit) = a.admit([2; 16], 1, OPERATION).unwrap() else {
         panic!("fresh intent");
     };
@@ -150,7 +194,6 @@ fn fixture(mode: i64) -> Fixture {
         })
         .unwrap();
     }
-    assert_ne!(peer.receipt.id, [0; 32]);
     Fixture {
         _lab: lab,
         a,
@@ -158,6 +201,7 @@ fn fixture(mode: i64) -> Fixture {
         invoked: Some(invoked),
         before,
         actors,
+        allocation: allocation.clone(),
     }
 }
 
@@ -188,6 +232,7 @@ fn retirement_transition(
         invoked,
         before,
         actors,
+        allocation: _,
     } = world;
     let mut next = state.clone();
     next.insert("mode", mode);
@@ -313,15 +358,17 @@ fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
         .collect();
     assert_eq!(walked, steps);
     assert_eq!(steps.len(), 24, "6 environments, 3 appends in each");
-    // Each environment builds its own Lab in its own temporary home, on the lane's places, and a
-    // step reads the world it runs on. An accepted append changes that world. In modes 1-4 `Record`
-    // only adds the observation of a debit the fixture already counted, so `Reserve` follows it on
-    // its world with the same budget, and `Dispatch` runs first on a fresh one, so a first append
-    // on a retired frontier stays held. Modes 5 and 6 refuse all three on one world, so a refusal
-    // that latched could stand in for a later one's.
+    // Each environment runs on its own copy of its lab kind's template, in its own temporary home,
+    // on the lane's places, and a step reads the world it runs on. An accepted append changes that
+    // world. In modes 1-4 `Record` only adds the observation of a debit the fixture already
+    // counted, so `Reserve` follows it on its world with the same budget, and `Dispatch` runs first
+    // on a copy of the world taken as the fixture finished, so a first append on a retired frontier
+    // stays held. Modes 5 and 6 refuse all three on one world, so a refusal that latched could
+    // stand in for a later one's.
     // GAP: a `Reserve` that succeeds only because a `Record` ran before it is seen only if
     // `Dispatch` shares the defect, and the foreign-parents check on the `Reserve` step also reads
     // `Record`'s append.
+    let templates = [template(false), template(true)];
     aterm_spec::fs_lane::each(&environments, |(environment, seeded)| {
         let mode = seeded["mode"];
         let check = |world: &mut Fixture, state: &aterm_spec::interp::State, action: &str| {
@@ -331,14 +378,13 @@ fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
                 "{action}: {state:?} -> {next:?}"
             );
         };
-        let mut world = fixture(mode);
+        let mut world = fixture(&templates[usize::from(matches!(mode, 2 | 4))], mode);
+        let dispatch = (mode <= 4).then(|| world.fork());
         check(&mut world, &init, environment);
         for action in ["Record", "Reserve"] {
             check(&mut world, seeded, action);
         }
-        if mode <= 4 {
-            world = fixture(mode);
-        }
+        let mut world = dispatch.unwrap_or(world);
         check(&mut world, seeded, "Dispatch");
     });
     // Conformance is the walk's; this asks only the model.

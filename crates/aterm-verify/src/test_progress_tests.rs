@@ -171,6 +171,11 @@ exit 0"#,
         &mut report,
         "fixture",
         &crate::exec::Cmd::new(&targo)
+            .env(RECORDING_STANDIN, &dir)
+            .env(
+                "PHASE_VALID_RECORD",
+                std::env::var_os("PHASE_VALID_RECORD").unwrap(),
+            )
             .env("PHASE_ENTERED", dir.join("entered"))
             .env("PHASE_FIFO", dir.join("release.fifo"))
             .env("PHASE_RECORDER_EXE", std::env::current_exe().unwrap()),

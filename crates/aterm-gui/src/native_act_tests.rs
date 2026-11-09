@@ -701,13 +701,13 @@ impl Kernel for Facts {
                 .iter()
                 .any(|(prepare, _)| prepare.id == id))
     }
-    fn reject_unadmitted(&self, prepare: &Prepare) -> Result<bool, ()> {
+    fn reject_unadmitted(&self, _prepare: &Prepare) -> Result<bool, ()> {
         if !self.receipt_readable.load(Ordering::SeqCst) {
             return Err(());
         }
         #[cfg(unix)]
         if let Some(journal) = &self.native_journal {
-            return journal.reject_unadmitted(prepare).map_err(|_| ());
+            return journal.reject_unadmitted(_prepare).map_err(|_| ());
         }
         Err(())
     }

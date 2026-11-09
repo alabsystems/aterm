@@ -12,13 +12,21 @@
 //! clears at most one grant). A [`Pass`] exists only where the kernel reached [`Stage::Pass`] for
 //! this check, and every grant takes one by value, so a grant without a fresh check does not
 //! compile.
+//!
+//! Each stage the check reads itself reads through a look of its own at the vault ([`VaultLook`]):
+//! one observation of its state lock and one look at each file for the stage's reads, which ask
+//! memos of the same files. An enrollment's Acknowledged stage runs its caller's judgement
+//! instead ([`Judged::Enrollment`]), which reads the vault itself when the stage runs. The model
+//! reads each view at its own stage, and so does the check: a look is never carried into the next
+//! stage, so a stage reads a removal made durable before it.
 
 use super::{
     Custody, Error, Request, Result, Trust, denied_or_last, failure, held_records, local_failure,
-    roster_or_last, roster_to_check,
+    roster_or_last_in, roster_to_check,
 };
 use aterm_db_core::peer_check::{self as kernel, Read, Stage};
 use aterm_secrets::{
+    client::VaultLook,
     commons::binding::Binding,
     membership_log::{Body, EpochAudience, Log},
     swarm_roster::SwarmRoster,
@@ -144,7 +152,8 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
             }
             (_, Custody::None) => break,
             (Stage::Roster, Custody::Journal(paths) | Custody::Log(paths)) => {
-                match roster_to_check(code, roster_or_last(paths), denied_or_last(paths)) {
+                let look = VaultLook::new(paths);
+                match roster_to_check(code, roster_or_last_in(&look), denied_or_last(&look)) {
                     Ok(None) => Reading {
                         outcome: Read::Absent,
                         why: None,
@@ -163,11 +172,12 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
                 }
             }
             (Stage::Held, Custody::Journal(paths) | Custody::Log(paths)) => {
-                held(paths, trust, judged)
+                held(&VaultLook::new(paths), trust, judged)
             }
             (Stage::Acknowledged, Custody::Journal(paths) | Custody::Log(paths)) => match judged {
                 Judged::Peer { request, .. } => {
-                    let (read, log) = acknowledged_log(paths, trust, request, roster.as_ref());
+                    let (read, log) =
+                        acknowledged_log(&VaultLook::new(paths), trust, request, roster.as_ref());
                     acknowledged = log;
                     read
                 }
@@ -184,7 +194,7 @@ pub(crate) fn check(custody: Custody<'_>, trust: Trust, judged: &Judged<'_>) -> 
                     request,
                     log: Some(peer_log),
                 } => combined(
-                    paths,
+                    &VaultLook::new(paths),
                     request,
                     peer_log,
                     acknowledged.take(),
@@ -252,9 +262,10 @@ fn next(custody: kernel::Custody, stage: Stage, read: Read, witness: bool) -> St
     kernel::next(custody, stage, read, witness)
 }
 
-/// Every record this Mac holds, read for `judged`'s binding: out where they remove it.
-fn held(paths: &aterm_secrets::client::Paths, trust: Trust, judged: &Judged<'_>) -> Reading {
-    let held = match held_records(paths) {
+/// Every record this Mac holds, read through `look` for `judged`'s binding: out where they remove
+/// it.
+fn held(look: &VaultLook<'_>, trust: Trust, judged: &Judged<'_>) -> Reading {
+    let held = match held_records(look) {
         Ok(held) => held,
         Err(error) => {
             return Reading::of(
@@ -285,25 +296,24 @@ fn held(paths: &aterm_secrets::client::Paths, trust: Trust, judged: &Judged<'_>)
     Reading::clear()
 }
 
-/// The acknowledged log, read and judged for `request`: out where it, its roster or `roster`
-/// denies the peer or a seat that shares its actor or recipient; foreign where it is another
-/// root's or lineage's; absent where it holds no log or no Commons epoch to judge by
+/// The acknowledged log, read through `look` and judged for `request`: out where it, its roster
+/// or `roster` denies the peer or a seat that shares its actor or recipient; foreign where it is
+/// another root's or lineage's; absent where it holds no log or no Commons epoch to judge by
 /// ([`aterm_secrets::client::CommonsLog`]). Clear gives the log the combined stage adds the
 /// peer's evidence to.
 fn acknowledged_log(
-    paths: &aterm_secrets::client::Paths,
+    look: &VaultLook<'_>,
     trust: Trust,
     request: &Request,
     roster: Option<&SwarmRoster>,
 ) -> (Reading, Option<Log>) {
     #[cfg(test)]
-    let judged = super::faults::records_read()
-        .and_then(|()| aterm_secrets::client::acknowledged_commons_log_now(paths, trust));
+    let judged = super::faults::records_read().and_then(|()| look.acknowledged_commons_log(trust));
     #[cfg(not(test))]
-    let judged = aterm_secrets::client::acknowledged_commons_log_now(paths, trust);
+    let judged = look.acknowledged_commons_log(trust);
     match acknowledged_reading(judged) {
         Err(reading) => (reading, None),
-        Ok(log) if denied_by(paths, &log, request, roster) => {
+        Ok(log) if denied_by(look, &log, request, roster) => {
             (Reading::of(Read::Out, removed()), None)
         }
         Ok(log) => (Reading::clear(), Some(log)),
@@ -349,10 +359,10 @@ fn acknowledged_reading(
 }
 
 /// The acknowledged log `local` with the peer's evidence `peer_log` added, judged for
-/// `request`: another network's evidence is foreign; evidence that does not combine, or a
-/// combined log that denies the peer or gives it no historical seat, is out.
+/// `request` through `look`: another network's evidence is foreign; evidence that does not
+/// combine, or a combined log that denies the peer or gives it no historical seat, is out.
 fn combined(
-    paths: &aterm_secrets::client::Paths,
+    look: &VaultLook<'_>,
     request: &Request,
     peer_log: &Log,
     local: Option<Log>,
@@ -379,7 +389,7 @@ fn combined(
             }
         }
     }
-    if denied_by(paths, &combined, request, roster)
+    if denied_by(look, &combined, request, roster)
         || !combined.has_historical_seat(request.binding())
     {
         return Reading::of(Read::Out, removed());
@@ -388,18 +398,18 @@ fn combined(
 }
 
 /// Whether `log` denies `request`'s peer: it removes the peer ([`Log::seat_removed`]), leaves its
-/// recipient out of a newest epoch, the log's roster (or, while the log has none, `roster`)
-/// denies it, or a seat that shares its actor or recipient is left out or denied. A log roster
-/// that does not read denies it.
+/// recipient out of a newest epoch, the log's roster (read through `look`, or, while the log has
+/// none, `roster`) denies it, or a seat that shares its actor or recipient is left out or denied.
+/// A log roster that does not read denies it.
 fn denied_by(
-    paths: &aterm_secrets::client::Paths,
+    look: &VaultLook<'_>,
     log: &Log,
     request: &Request,
     roster: Option<&SwarmRoster>,
 ) -> bool {
     let binding = request.binding();
     let (actor, recipient) = (binding.actor(), binding.recipient());
-    let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log_now(paths, log) else {
+    let Ok(log_roster) = look.local_swarm_roster_for_log(log) else {
         return true;
     };
     let log_roster = log_roster.as_ref().or(roster);

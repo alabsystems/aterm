@@ -14,6 +14,10 @@ name = "aterm-serde"
 version = "0.0.0"
 
 [[package]]
+name = "aterm-tempfile"
+version = "0.0.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -68,6 +72,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "trust-resource-controller"
 version = "0.13.0"
 dependencies = [
+ "aterm-tempfile",
  "jobserver_utils",
  "libc 0.2.186",
  "trust-resource-provenance",

@@ -31,15 +31,6 @@ enum Start {
     Occupied,
 }
 
-const STARTS: [Start; 6] = [
-    Start::Two,
-    Start::Three,
-    Start::Held,
-    Start::Custody,
-    Start::Twin,
-    Start::Occupied,
-];
-
 /// The starts every short walk crosses: the others take the long walks and [`ONCE`]'s.
 const CROSSED_STARTS: [Start; 3] = [Start::Two, Start::Held, Start::Twin];
 
@@ -737,75 +728,66 @@ impl Walk {
     }
 }
 
-/// THE POOL KEEPS EVERY LOGIN AND SAYS WHAT IT DID, WHATEVER HAPPENS TO IT: from each roster (two
-/// rows, three, a hold, a custody row, a twin), through every short sequence of a sign-in outside
-/// aterm, a sync of each source, a row's sign-in, a pin, a wall and a launch, and a long walk through
-/// every change of the default login with a sync after each, by the real entries: every login that
-/// was here still is, a row or its `was` reaches it; at most one row owns a directory; a row whose
-/// login names another account is said by the report, and no launch takes it; what a receipt counts
-/// is what the file holds; a sync repeated with nothing changed writes nothing; a sync that refuses
-/// leaves the roster or names each change; and the report's `at a weekly limit:` is what the writer
-/// does. FLOOR: the walks it takes cannot silently shrink.
-#[test]
-fn a_walk_keeps_every_login_and_says_what_it_did() {
-    let mut walks: Vec<(Start, Vec<Event>)> = Vec::new();
-    for start in STARTS {
-        for a in CROSSED
-            .into_iter()
-            .filter(|_| CROSSED_STARTS.contains(&start))
-        {
-            for b in CROSSED {
-                for c in CROSSED {
-                    walks.push((start, vec![a, b, c]));
-                }
+/// The walks taken from `start`: every three steps of [`CROSSED`] from a crossed start, each of
+/// [`ONCE`] before each of [`CROSSED`] and a sync, and a long walk through every change of the
+/// default login with a sync after each.
+fn walks_from(start: Start) -> Vec<Vec<Event>> {
+    let mut walks: Vec<Vec<Event>> = Vec::new();
+    for a in CROSSED
+        .into_iter()
+        .filter(|_| CROSSED_STARTS.contains(&start))
+    {
+        for b in CROSSED {
+            for c in CROSSED {
+                walks.push(vec![a, b, c]);
             }
-        }
-        for a in ONCE {
-            for b in CROSSED {
-                walks.push((start, vec![a, b, Event::Sync]));
-            }
-        }
-        // Every change of the default login, each followed by each sync: `a` to `b` once.
-        const NAMES: [Event; 7] = [
-            Event::Names(OWNER),
-            Event::Names(WORK),
-            Event::Names(THIRD),
-            Event::Names(FAR),
-            Event::NamesNobody,
-            Event::Absent,
-            Event::Keyring,
-        ];
-        for sync in [Event::Sync, Event::SyncSheet, Event::SyncLab] {
-            let mut long = Vec::new();
-            for a in NAMES {
-                for b in NAMES {
-                    long.extend([a, sync, b, sync]);
-                }
-            }
-            walks.push((start, long));
         }
     }
-    assert!(walks.len() >= 1_250, "{} walks", walks.len());
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    let found: Vec<Vec<(String, String)>> = std::thread::scope(|scope| {
-        walks
-            .chunks(walks.len().div_ceil(threads))
-            .map(|share| {
-                scope.spawn(move || {
-                    let mut wrong = Vec::new();
-                    for (start, events) in share {
-                        Walk::run(*start, events, &mut wrong);
-                    }
-                    wrong
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|run| run.join().expect("a share"))
-            .collect()
-    });
+    for a in ONCE {
+        for b in CROSSED {
+            walks.push(vec![a, b, Event::Sync]);
+        }
+    }
+    // Every change of the default login, each followed by each sync: `a` to `b` once.
+    const NAMES: [Event; 7] = [
+        Event::Names(OWNER),
+        Event::Names(WORK),
+        Event::Names(THIRD),
+        Event::Names(FAR),
+        Event::NamesNobody,
+        Event::Absent,
+        Event::Keyring,
+    ];
+    for sync in [Event::Sync, Event::SyncSheet, Event::SyncLab] {
+        let mut long = Vec::new();
+        for a in NAMES {
+            for b in NAMES {
+                long.extend([a, sync, b, sync]);
+            }
+        }
+        walks.push(long);
+    }
+    walks
+}
+
+/// THE POOL KEEPS EVERY LOGIN AND SAYS WHAT IT DID, WHATEVER HAPPENS TO IT: from `start`'s roster,
+/// through [`walks_from`] by the real entries: every login that was here still is, a row or its
+/// `was` reaches it; at most one row owns a directory; a row whose login names another account is
+/// said by the report, and no launch takes it; what a receipt counts is what the file holds; a sync
+/// repeated with nothing changed writes nothing; a sync that refuses leaves the roster or names each
+/// change; and the report's `at a weekly limit:` is what the writer does. FLOOR: the walks it takes
+/// are `walks`, so they cannot silently shrink. The walks run one after another on this thread, the
+/// runner's own threads being the only concurrency: their work is file calls, which more threads
+/// here only slow down.
+fn walk_law(start: Start, walks: usize) {
+    let taken = walks_from(start);
+    assert_eq!(taken.len(), walks, "{start:?}: the walks it takes");
+    let mut found = Vec::new();
+    for events in &taken {
+        Walk::run(start, events, &mut found);
+    }
     let mut classes = BTreeMap::<String, (usize, String)>::new();
-    for (why, at) in found.into_iter().flatten() {
+    for (why, at) in found {
         let class: String = why
             .split_whitespace()
             .filter(|word| !word.contains("/var/") && !word.contains("/tmp"))
@@ -827,4 +809,40 @@ fn a_walk_keeps_every_login_and_says_what_it_did() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// [`walk_law`] from each roster: two rows, three, a hold, a custody row, a twin, and a default
+/// row whose managed directory holds another account's login.
+mod a_walk_keeps_every_login_and_says_what_it_did {
+    use super::{Start, walk_law};
+
+    #[test]
+    fn from_two() {
+        walk_law(Start::Two, 381);
+    }
+
+    #[test]
+    fn from_three() {
+        walk_law(Start::Three, 38);
+    }
+
+    #[test]
+    fn from_held() {
+        walk_law(Start::Held, 381);
+    }
+
+    #[test]
+    fn from_custody() {
+        walk_law(Start::Custody, 38);
+    }
+
+    #[test]
+    fn from_twin() {
+        walk_law(Start::Twin, 381);
+    }
+
+    #[test]
+    fn from_occupied() {
+        walk_law(Start::Occupied, 38);
+    }
 }

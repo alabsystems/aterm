@@ -232,11 +232,12 @@ struct Said {
     after: Option<String>,
 }
 
-/// What each surface of the laid world prints. `lay` lays the world again after a surface that
-/// writes. A Grok Build or Kimi Code CLI build here is a stand-in program with nothing laid in
-/// atpkg's store, where the doctor's facts read theirs, so only Codex's doctor is read.
-fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> Vec<Said> {
-    let (cli, id) = (pool.cli, pool.cli.id());
+/// What each surface of the laid world but a row's `accounts use` prints, every one read after one
+/// `lay`, and the labels of its rows, whose `accounts use` [`law_of_world`] runs itself. A Grok
+/// Build or Kimi Code CLI build here is a stand-in program with nothing laid in atpkg's store,
+/// where the doctor's facts read theirs, so only Codex's doctor is read.
+fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> (Vec<Said>, Vec<String>) {
+    let cli = pool.cli;
     let mut said: Vec<(String, String)> = Vec::new();
     lay();
     let (text, json) = pool.report_on(&host.host);
@@ -287,7 +288,7 @@ fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> Vec<Said> {
     {
         said.push(("a launch's refusal".to_owned(), why));
     }
-    let mut said: Vec<Said> = said
+    let said = said
         .into_iter()
         .map(|(surface, words)| Said {
             surface,
@@ -295,17 +296,13 @@ fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> Vec<Said> {
             after: None,
         })
         .collect();
-    for row in &records.roster.rows {
-        lay();
-        let line = format!("accounts use {} --cli {id}", row.label);
-        let (code, out, err) = pool.run_on(&line, &host.host);
-        said.push(Said {
-            surface: format!("`{line}`"),
-            words: format!("{out}\n{err}"),
-            after: (code == ExitCode::SUCCESS).then_some(line),
-        });
-    }
-    said
+    let labels = records
+        .roster
+        .rows
+        .iter()
+        .map(|row| row.label.clone())
+        .collect();
+    (said, labels)
 }
 
 /// A step's command line for the real parser: a label and an address a person chooses filled in.
@@ -645,60 +642,97 @@ impl Pool {
     }
 }
 
-/// One world's law: `lay` lays it; every command its surfaces name can be taken.
+/// The steps `said` names that this world has not taken, each with the line that names it, in the
+/// order it names them; a line no `Step` spells is `wrong`, and `seen` gains each step's first words.
+fn steps_to_take(
+    name: &str,
+    said: &Said,
+    taken: &mut BTreeSet<(String, Option<String>)>,
+    (seen, wrong): (&mut BTreeSet<String>, &mut Vec<String>),
+) -> Vec<(String, Step)> {
+    let mut steps = Vec::new();
+    for Named {
+        line,
+        after_another,
+    } in named_commands(&said.words)
+    {
+        if outside_step(&line) {
+            continue;
+        }
+        let step = match step_of(&line) {
+            Ok(step) => step,
+            Err(why) => {
+                wrong.push(format!("{name}: {}: {why}", said.surface));
+                continue;
+            }
+        };
+        if after_another || !taken.insert((line.clone(), said.after.clone())) {
+            continue;
+        }
+        seen.insert(
+            line.split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        steps.push((line, step));
+    }
+    steps
+}
+
+/// One world's law: `lay` lays it; every command its surfaces name can be taken, each in the world
+/// laid again. Each row's `accounts use` runs first, in the world laid again, and a step a
+/// successful one names is taken in the world that use leaves: the first in the one it just left,
+/// each later one in the world laid again and that use run again. The steps the other surfaces name
+/// come after them, each in the world laid again over what the uses and their steps left, so a
+/// laying that does not put back what they changed fails here too. What [`surfaces`] said comes
+/// back.
 fn law_of_world(
     pool: &Pool,
     build: LawBuild,
     name: &str,
     lay: &dyn Fn(),
     (seen, wrong): (&mut BTreeSet<String>, &mut Vec<String>),
-) {
+) -> Vec<Said> {
     let host = StepHost {
         host: build.program(pool),
         reached: Cell::new(0),
     };
-    let said = surfaces(pool, &host, lay);
+    let (said, labels) = surfaces(pool, &host, lay);
     let mut taken = BTreeSet::new();
-    for Said {
-        surface,
-        words,
-        after,
-    } in &said
-    {
-        for Named {
-            line,
-            after_another,
-        } in named_commands(words)
-        {
-            if outside_step(&line) {
-                continue;
-            }
-            let step = match step_of(&line) {
-                Ok(step) => step,
-                Err(why) => {
-                    wrong.push(format!("{name}: {surface}: {why}"));
-                    continue;
+    for label in labels {
+        lay();
+        let line = format!("accounts use {label} --cli {}", pool.cli.id());
+        let (code, out, err) = pool.run_on(&line, &host.host);
+        let used = Said {
+            surface: format!("`{line}`"),
+            words: format!("{out}\n{err}"),
+            after: (code == ExitCode::SUCCESS).then_some(line),
+        };
+        // The world is the one that use just left until a step is taken in it.
+        let mut as_used = used.after.is_some();
+        for (line, step) in steps_to_take(name, &used, &mut taken, (&mut *seen, &mut *wrong)) {
+            if !std::mem::take(&mut as_used) {
+                lay();
+                if let Some(after) = &used.after {
+                    let (code, out, err) = pool.run_on(after, &host.host);
+                    assert_eq!(code, ExitCode::SUCCESS, "`{after}`: {out}{err}");
                 }
-            };
-            if after_another || !taken.insert((line.clone(), after.clone())) {
-                continue;
-            }
-            seen.insert(
-                line.split_whitespace()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-            lay();
-            if let Some(after) = after {
-                let (code, out, err) = pool.run_on(after, &host.host);
-                assert_eq!(code, ExitCode::SUCCESS, "`{after}`: {out}{err}");
             }
             if let Err(why) = take(pool, build, &host, &step) {
-                wrong.push(format!("{name}: {surface} names `{line}`: {why}"));
+                wrong.push(format!("{name}: {} names `{line}`: {why}", used.surface));
             }
         }
     }
+    for said in &said {
+        for (line, step) in steps_to_take(name, said, &mut taken, (&mut *seen, &mut *wrong)) {
+            lay();
+            if let Err(why) = take(pool, build, &host, &step) {
+                wrong.push(format!("{name}: {} names `{line}`: {why}", said.surface));
+            }
+        }
+    }
+    said
 }
 
 /// EVERY STEP A SURFACE NAMES CAN BE TAKEN: across the launch law's worlds and those of a moved
@@ -707,7 +741,7 @@ fn law_of_world(
 /// records, the roster or a login change, or a person's sign-in reaches its stand-in. A step that
 /// exits with the refusal it was named from, or changes nothing, fails it. A pool's install and
 /// update, and a vendor's own login, are judged by what is on this Mac, since aterm cannot run
-/// them here. FLOOR: the steps it took cannot silently shrink.
+/// them here. FLOOR: each of `floors` is among the steps it took, so they cannot silently shrink.
 ///
 /// THE GAP, from [`law_worlds`]'s cuts. A build that is not there takes only that function's few
 /// worlds, so what a surface asks there of any other world is not taken: Codex's `use --auto`,
@@ -717,99 +751,10 @@ fn law_of_world(
 /// and Kimi cross a claim only where both rows can serve, so `accounts --cli <id>`, which
 /// `use <row>` names with both rows walled and one claimed, is not taken on either. A defect in one
 /// of those steps that shows only in such a world passes here.
-#[test]
-fn every_step_a_surface_names_can_be_taken() {
-    let builds = [
-        LawBuild::CodexNew,
-        LawBuild::CodexOld,
-        LawBuild::CodexMissing,
-        LawBuild::Grok,
-        LawBuild::GrokMissing,
-        LawBuild::Kimi,
-        LawBuild::KimiMissing,
-    ];
-    let runs: Vec<(BTreeSet<String>, Vec<String>)> = std::thread::scope(|scope| {
-        builds
-            .into_iter()
-            .filter(|build| links_here(build.cli()))
-            .flat_map(|build| {
-                let worlds: Vec<LawWorld> = law_worlds(build)
-                    .into_iter()
-                    .filter(|world| {
-                        matches!(
-                            world.rotation,
-                            LawRotation::On | LawRotation::AccountsOff | LawRotation::Keyring
-                        )
-                    })
-                    .collect();
-                let chunks: Vec<Vec<LawWorld>> = worlds
-                    .chunks(worlds.len().div_ceil(3))
-                    .map(<[LawWorld]>::to_vec)
-                    .collect();
-                chunks
-                    .into_iter()
-                    .map(|share| {
-                        scope.spawn(move || {
-                            let pool = Pool::of(build.cli(), "step-law");
-                            let (mut seen, mut wrong) = (BTreeSet::new(), Vec::new());
-                            for world in &share {
-                                law_of_world(
-                                    &pool,
-                                    build,
-                                    &format!("{build:?} {world:?}"),
-                                    &|| pool.lay(world),
-                                    (&mut seen, &mut wrong),
-                                );
-                            }
-                            (seen, wrong)
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|run| run.join().expect("a share"))
-            .collect()
-    });
-    let (mut seen, mut wrong) = (BTreeSet::new(), Vec::new());
-    for (share_seen, share_wrong) in runs {
-        seen.extend(share_seen);
-        wrong.extend(share_wrong);
-    }
-    for build in [LawBuild::CodexNew, LawBuild::CodexOld] {
-        for world in MOVED_WORLDS {
-            let pool = Pool::of(build.cli(), "step-law-moved");
-            law_of_world(
-                &pool,
-                build,
-                &format!("{build:?} {world:?}"),
-                &|| pool.lay_moved(world),
-                (&mut seen, &mut wrong),
-            );
-            // A launch refused for what its default login names says what ends it.
-            let host = StepHost {
-                host: build.program(&pool),
-                reached: Cell::new(0),
-            };
-            for said in surfaces(&pool, &host, &|| pool.lay_moved(world)) {
-                let about_the_login = !matches!(world, MovedWorld::PinOnWorkNoLogin);
-                if about_the_login
-                    && said.surface == "a launch's refusal"
-                    && named_commands(&said.words).is_empty()
-                {
-                    wrong.push(format!(
-                        "{build:?} {world:?}: a launch's refusal names no step: {}",
-                        said.words
-                    ));
-                }
-            }
-        }
-    }
-    #[cfg(unix)]
-    claude_token_worlds(&mut seen, &mut wrong);
+fn judge_steps(seen: &BTreeSet<String>, wrong: &[String], floors: &[&str]) {
     // One example of each class: the words past the world, with each scratch path's words gone.
     let mut classes = BTreeMap::<String, &String>::new();
-    for why in &wrong {
+    for why in wrong {
         let class = why
             .split_once(" }: ")
             .map_or(why.as_str(), |(_, rest)| rest);
@@ -832,18 +777,178 @@ fn every_step_a_surface_names_can_be_taken() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    for floor in [
-        "aterm harness accounts --cli",
-        "aterm harness accounts sync",
-        "aterm harness accounts login",
-        "aterm harness accounts use",
-        "aterm pkg install codex",
-        "aterm ai login codex",
-        "codex login",
-        #[cfg(unix)]
-        "aterm harness accounts token",
-    ] {
-        assert!(seen.contains(floor), "no surface named `{floor}`: {seen:?}");
+    for floor in floors {
+        assert!(
+            seen.contains(*floor),
+            "no surface named `{floor}`: {seen:?}"
+        );
+    }
+}
+
+/// [`judge_steps`] over `build`'s worlds of the launch law where rotation is on, off by `accounts`,
+/// or on with Codex's login in the keyring, in [`STEP_SHARES`] shares, each in a pool of its own,
+/// one after another on this thread: the runner's own threads are the only concurrency, since the
+/// work is file calls, which more threads here only slow down.
+fn step_law(build: LawBuild, floors: &[&str]) {
+    if !links_here(build.cli()) {
+        return;
+    }
+    let worlds: Vec<LawWorld> = law_worlds(build)
+        .into_iter()
+        .filter(|world| {
+            matches!(
+                world.rotation,
+                LawRotation::On | LawRotation::AccountsOff | LawRotation::Keyring
+            )
+        })
+        .collect();
+    let (mut seen, mut wrong) = (BTreeSet::new(), Vec::new());
+    for share in worlds.chunks(worlds.len().div_ceil(STEP_SHARES)) {
+        let pool = Pool::of(build.cli(), "step-law");
+        for world in share {
+            law_of_world(
+                &pool,
+                build,
+                &format!("{build:?} {world:?}"),
+                &|| pool.lay(world),
+                (&mut seen, &mut wrong),
+            );
+        }
+    }
+    judge_steps(&seen, &wrong, floors);
+}
+
+/// How many pools [`step_law`] shares a build's worlds among. A pool's worlds follow one another,
+/// and what a world's commit and its steps leave behind them passes on to the next one laid there
+/// ([`Pool::lay`]), so each world keeps the worlds it has always been laid after.
+const STEP_SHARES: usize = 3;
+
+/// [`judge_steps`] over each [`MovedWorld`] of either Codex build, each in a pool of its own, and a
+/// launch refused for what its default login names says what ends it.
+fn moved_step_law(floors: &[&str]) {
+    let (mut seen, mut wrong) = (BTreeSet::new(), Vec::new());
+    for build in [LawBuild::CodexNew, LawBuild::CodexOld] {
+        for world in MOVED_WORLDS {
+            let pool = Pool::of(build.cli(), "step-law-moved");
+            let said = law_of_world(
+                &pool,
+                build,
+                &format!("{build:?} {world:?}"),
+                &|| pool.lay_moved(world),
+                (&mut seen, &mut wrong),
+            );
+            for said in said {
+                let about_the_login = !matches!(world, MovedWorld::PinOnWorkNoLogin);
+                if about_the_login
+                    && said.surface == "a launch's refusal"
+                    && named_commands(&said.words).is_empty()
+                {
+                    wrong.push(format!(
+                        "{build:?} {world:?}: a launch's refusal names no step: {}",
+                        said.words
+                    ));
+                }
+            }
+        }
+    }
+    judge_steps(&seen, &wrong, floors);
+}
+
+/// [`judge_steps`] on each build, on the moved default logins and on Claude Code's token worlds,
+/// each with the floors it names.
+mod every_step_a_surface_names_can_be_taken {
+    use super::{LawBuild, moved_step_law, step_law};
+
+    #[test]
+    fn on_codex_new() {
+        step_law(
+            LawBuild::CodexNew,
+            &[
+                "aterm harness accounts --cli",
+                "aterm harness accounts login",
+                "aterm harness accounts use",
+                "aterm ai login codex",
+                "codex login",
+            ],
+        );
+    }
+
+    #[test]
+    fn on_codex_old() {
+        step_law(
+            LawBuild::CodexOld,
+            &[
+                "aterm harness accounts --cli",
+                "aterm harness accounts use",
+                "aterm ai login codex",
+                "codex login",
+            ],
+        );
+    }
+
+    #[test]
+    fn on_codex_missing() {
+        step_law(
+            LawBuild::CodexMissing,
+            &[
+                "aterm harness accounts use",
+                "aterm pkg install codex",
+                "aterm ai login codex",
+            ],
+        );
+    }
+
+    #[test]
+    fn on_grok() {
+        step_law(
+            LawBuild::Grok,
+            &[
+                "aterm harness accounts --cli",
+                "aterm harness accounts login",
+                "aterm harness accounts use",
+            ],
+        );
+    }
+
+    #[test]
+    fn on_grok_missing() {
+        step_law(LawBuild::GrokMissing, &["aterm pkg install grok"]);
+    }
+
+    #[test]
+    fn on_kimi() {
+        step_law(
+            LawBuild::Kimi,
+            &[
+                "aterm harness accounts --cli",
+                "aterm harness accounts login",
+                "aterm harness accounts use",
+            ],
+        );
+    }
+
+    #[test]
+    fn on_kimi_missing() {
+        step_law(LawBuild::KimiMissing, &["aterm pkg install kimi"]);
+    }
+
+    #[test]
+    fn where_the_default_login_moved() {
+        moved_step_law(&[
+            "aterm harness accounts --cli",
+            "aterm harness accounts sync",
+            "aterm harness accounts login",
+            "aterm harness accounts use",
+            "codex login",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_claude_code_tokens() {
+        let (mut seen, mut wrong) = (std::collections::BTreeSet::new(), Vec::new());
+        super::claude_token_worlds(&mut seen, &mut wrong);
+        super::judge_steps(&seen, &wrong, &["aterm harness accounts token"]);
     }
 }
 

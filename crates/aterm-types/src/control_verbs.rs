@@ -1956,10 +1956,11 @@ pub const VERBS: &[VerbSpec] = &[
          drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer|switch-only> \
          spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per supervised \
          pane in any window (debug builds add `title=\"<the title its hover reads>\"|title=-`, \
-         then `a11y window=<id> autopilot sid=<sid> role=<role> label=\"<words>\" \
-         description=\"<words>\"|description=-` lines: each Autopilot chip's node as the window's \
-         accessibility tree is built for a screen \
-         reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
+         then one `a11y kinds=autopilot,account` line naming the kinds the build reports, \
+         whatever any window shows, and per window `a11y window=<id> autopilot|account \
+         sid=<sid> role=<role> label=\"<words>\" description=\"<words>\"|description=-` \
+         lines: each Autopilot and Account chip's node as the window's accessibility tree is \
+         built for a screen reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
          done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
          `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
          [submenu]` lines (`statusmenu ---` for a separator; debug builds add `at=<i>[.<j>…]` for \

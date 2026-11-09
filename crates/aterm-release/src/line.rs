@@ -372,6 +372,157 @@ pub enum Merged {
     Conflict(Vec<String>),
 }
 
+/// Read-only suggestions after a qualify red. Evidence is diagnostic output, never commands.
+/// Candidates are ranked by the failing test's file, then its crate; no ref is changed.
+///
+/// # Errors
+/// Git cannot read the line or main's history.
+pub fn failure_hints(
+    git: &dyn GitRunner,
+    line: &Line,
+    evidence: &str,
+) -> Result<Vec<String>, Stop> {
+    let mut files = BTreeSet::new();
+    let mut crates = BTreeSet::new();
+    let known = out(
+        git,
+        &["ls-tree", "--name-only", &format!("{}:crates", line.head())],
+    )?;
+    for row in evidence.lines().filter(|row| {
+        row.contains("FAIL")
+            || row.contains("panicked at")
+            || row.contains("error")
+            || row.trim_start().starts_with("--> ")
+    }) {
+        for name in known.lines() {
+            if row
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .any(|word| word == name || word == name.replace('-', "_"))
+            {
+                crates.insert(format!("crates/{name}/"));
+            }
+        }
+        for word in row.split_whitespace() {
+            if let Some(start) = word.find("crates/") {
+                let path = &word[start..];
+                if let Some(end) = path.find(".rs") {
+                    let path = &path[..end + 3];
+                    files.insert(path.to_owned());
+                    if let Some(name) = path
+                        .strip_prefix("crates/")
+                        .and_then(|p| p.split('/').next())
+                    {
+                        crates.insert(format!("crates/{name}/"));
+                    }
+                }
+            }
+        }
+        if let Some(test) = row
+            .trim()
+            .strip_prefix("test ")
+            .and_then(|s| s.strip_suffix(" ... FAILED"))
+        {
+            let name = test.rsplit("::").next().unwrap_or(test);
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let result = run(
+                    git,
+                    &[
+                        "grep",
+                        "-l",
+                        "-z",
+                        "-F",
+                        &format!("fn {name}("),
+                        line.head(),
+                        "--",
+                        "crates",
+                    ],
+                )?;
+                if result.status > 1 {
+                    return Err(refused_call(git, &["grep"], &result));
+                }
+                for path in result
+                    .stdout
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(lossy)
+                {
+                    if let Some((_, path)) = path.split_once(':') {
+                        files.insert(path.to_owned());
+                        if let Some(name) = path
+                            .strip_prefix("crates/")
+                            .and_then(|p| p.split('/').next())
+                        {
+                            crates.insert(format!("crates/{name}/"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if files.is_empty() && crates.is_empty() {
+        return Ok(vec![
+            "no main fix candidates identified: diagnostics name no failing test source or crate"
+                .into(),
+        ]);
+    }
+    let mut candidates = Vec::new();
+    let range = format!("{}..origin/main", line.base);
+    let mut args = vec!["rev-list", "--full-history", "--no-merges", &range, "--"];
+    args.extend(files.iter().chain(crates.iter()).map(String::as_str));
+    let touching = if args.len() == 5 {
+        String::new()
+    } else {
+        out(git, &args)?
+    };
+    let landed = landed_since(git, &line.base)?;
+    for commit in touching.lines().filter(|commit| landed.contains(*commit)) {
+        let read = read_commit(git, commit)?;
+        if read.parents.len() != 1 || line.carried(commit) {
+            continue;
+        }
+        let paths = moved(git, &read.parents[0], commit)?;
+        let exact = paths.iter().any(|path| files.contains(path));
+        if exact
+            || paths
+                .iter()
+                .any(|path| crates.iter().any(|root| path.starts_with(root)))
+        {
+            candidates.push((!exact, commit.to_owned(), read.subject));
+        }
+    }
+    candidates.sort();
+    let mut hints = vec![format!(
+        "Main fix hints (origin/main as last fetched; base {}, head {}; hints only, use --fix):",
+        short(&line.base),
+        short(line.head())
+    )];
+    if candidates.is_empty() {
+        hints.push("no main commit since the base touches it".into());
+    }
+    for (crate_only, commit, subject) in candidates {
+        let rank = if crate_only { "crate" } else { "test file" };
+        match hop_tree(git, line.head(), &commit) {
+            Ok(Merged::Tree(_)) => {
+                hints.push(format!("{commit} ({subject}) [{rank}]: carries cleanly"))
+            }
+            Ok(Merged::Conflict(paths)) => {
+                hints.push(format!(
+                    "{commit} ({subject}) [{rank}]: conflicts in {}",
+                    paths.join(", ")
+                ));
+                if !paths.is_empty() && paths.iter().all(|p| p.starts_with("docs/")) {
+                    hints.push(format!("re-make plan only: create a worktree at {}; apply {commit}'s patch excluding docs/; commit, verify land and land that new non-merge commit on main; then --fix <new commit>", line.head()));
+                }
+            }
+            Err(stop) => hints.push(format!(
+                "{commit} ({subject}) [{rank}]: carry not judged: {}",
+                stop.why
+            )),
+        }
+    }
+    Ok(hints)
+}
+
 /// What [`record`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorded {

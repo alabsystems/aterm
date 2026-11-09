@@ -8394,9 +8394,19 @@ fn a_split_rows_reset_line_follows_what_it_says() {
 /// `width`×`height` after.
 fn tab(lab: &mut Lab, backwards: bool, width: f32, height: f32) -> Option<UiKey> {
     let compiled = lab.compile(width, height);
+    tab_on(lab, &compiled, backwards)
+}
+
+/// [`tab`] on `compiled`, the screen drawn since the last event, as the window takes the stop from
+/// the frame it shows (`move_native_focus`).
+fn tab_on(
+    lab: &mut Lab,
+    compiled: &crate::native_ui::CompiledUi,
+    backwards: bool,
+) -> Option<UiKey> {
     let current = lab.state().common.last_focus.clone();
     let target = crate::app_native::native_tab_target(
-        &compiled,
+        compiled,
         Some(lab.state()),
         current.as_ref(),
         backwards,
@@ -8588,9 +8598,14 @@ fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
                         let stood = place(&pressed);
                         let bar = stood.1.unwrap_or_default();
                         lab.state_mut().common.last_focus = Some(control.clone());
-                        let mut reached = false;
+                        let mut reached = None;
+                        let mut drawn = None;
                         for step in 0..6 {
-                            let Some(target) = tab(&mut lab, true, width, height) else {
+                            let target = match &drawn {
+                                Some(drawn) => tab_on(&mut lab, drawn, true),
+                                None => tab(&mut lab, true, width, height),
+                            };
+                            let Some(target) = target else {
                                 break;
                             };
                             let after = lab.compile(width, height);
@@ -8615,17 +8630,18 @@ fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
                                 break;
                             }
                             if target.as_str() == "settings/undo" {
-                                reached = true;
+                                reached = Some(after);
                                 break;
                             }
+                            drawn = Some(after);
                         }
-                        if !reached {
+                        let Some(drawn) = reached else {
                             faults
                                 .push(format!("{context}: Shift-Tab never reached the bar's Undo"));
                             continue;
-                        }
+                        };
                         read += 1;
-                        let Some(target) = tab(&mut lab, false, width, height) else {
+                        let Some(target) = tab_on(&mut lab, &drawn, false) else {
                             continue;
                         };
                         let after = lab.compile(width, height);
@@ -9109,11 +9125,14 @@ fn a_split_rows_name_is_said_once_a_screen() {
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
             let mut seen = std::collections::HashSet::new();
-            while let Some(target) = tab(&mut lab, false, width, height) {
+            let mut stop = tab(&mut lab, false, width, height);
+            while let Some(target) = stop {
                 if !seen.insert(target) {
                     break;
                 }
                 screens.push((lab.compile(width, height), None));
+                let (drawn, _) = screens.last().expect("the screen Tab drew");
+                stop = tab_on(&mut lab, drawn, false);
             }
             for (compiled, _) in &screens {
                 captioned += usize::from(compiled.paint.iter().any(|node| {
@@ -9485,14 +9504,15 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
                 let mut lab = Lab::new("");
                 lab.state_mut().navigate(route);
                 let mut landed = std::collections::HashSet::new();
+                let mut compiled = lab.compile(width, height);
                 for _ in 0..300 {
-                    let Some(target) = tab(&mut lab, backwards, width, height) else {
+                    let Some(target) = tab_on(&mut lab, &compiled, backwards) else {
                         break;
                     };
                     if !landed.insert(target.clone()) {
                         break;
                     }
-                    let compiled = lab.compile(width, height);
+                    compiled = lab.compile(width, height);
                     note(&compiled);
                     let key = target.as_str();
                     if (key.starts_with("settings/control/")

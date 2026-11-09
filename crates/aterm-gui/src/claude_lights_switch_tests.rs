@@ -837,7 +837,7 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
     };
     let cell = |ch: char| aterm_core::terminal::RenderCell { ch, ..blank };
     let mut cells: Vec<_> =
-        "\u{25cf}\u{25cb}\u{25d0}\u{25cc}\u{2298}\u{2913}\u{2387}\u{2386}\u{221e}\u{2713}\u{23f8}\u{b7}x"
+        "\u{25cf}\u{25cb}\u{25d0}\u{25cc}\u{2298}\u{2913}\u{2387}\u{2386}\u{21ba}\u{221e}\u{2713}\u{23f8}\u{b7}x"
             .chars()
             .map(cell)
             .collect();
@@ -863,6 +863,7 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
             icon(9, BandIcon::ToBar),
             icon(10, BandIcon::Fork),
             icon(11, BandIcon::Enter),
+            icon(12, BandIcon::Reset),
         ]
     );
 }

@@ -399,7 +399,7 @@ impl member::MemberCustody for Borrowed<'_> {
     fn return_producer(
         &mut self,
         retirement: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
+    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
         let returned = (|| {
             self.validate()?;
             self.check_producer(&retirement.original)?;
@@ -417,7 +417,7 @@ impl member::MemberCustody for Borrowed<'_> {
                 }
                 Ok(Box::new(ReturnedProducer { retirement }))
             }
-            Err(_) => Err(retirement),
+            Err(error) => Err((error, retirement)),
         }
     }
     fn before_arm(&mut self) -> io::Result<()> {

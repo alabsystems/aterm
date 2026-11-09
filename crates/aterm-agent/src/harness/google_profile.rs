@@ -6,7 +6,11 @@
 use aterm_http::{Client, Method, ProxyMode, Trust};
 use aterm_json::Value;
 use aterm_uds::secret::Secret;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Hang detector for a required sign-in profile response inside its original parent.
+#[cfg(unix)]
+pub(super) const REQUEST_HANG: Duration = Duration::from_secs(60);
 
 const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 
@@ -93,6 +97,24 @@ fn response(status: u16, body: &[u8], expected: &str) -> Result<GoogleProfile, E
 
 /// Bounded bearer request. Redirects are not followed; tokens never enter a URL or diagnostic.
 pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile, Error> {
+    read_started(
+        token,
+        expected,
+        wait,
+        Instant::now(),
+        USERINFO,
+        ProxyMode::Environment,
+    )
+}
+
+fn read_started(
+    token: &str,
+    expected: &str,
+    wait: Duration,
+    started: Instant,
+    endpoint: &str,
+    proxy: ProxyMode,
+) -> Result<GoogleProfile, Error> {
     if wait.is_zero()
         || token.is_empty()
         || token.len() > 64 * 1024
@@ -102,16 +124,25 @@ pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile
     }
     let mut header = b"Bearer ".to_vec();
     header.extend_from_slice(token.as_bytes());
-    let reply = Client::new(Trust::PlatformVerifier, ProxyMode::Environment, wait)
-        .request(Method::Get, USERINFO)
+    let by = started + wait;
+    let left = by.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Error::Unavailable);
+    }
+    let reply = Client::new(Trust::PlatformVerifier, proxy, left)
+        .request(Method::Get, endpoint)
         .secret_header("Authorization", Secret::from_vec(header))
         .header("Cache-Control", "no-cache")
         .limit(64 * 1024)
-        .backstop(wait)
+        .backstop(by.saturating_duration_since(Instant::now()))
         .send(&[])
         .map_err(|_| Error::Unavailable)?;
     response(reply.status(), reply.body(), expected)
 }
+
+#[cfg(all(test, unix))]
+#[path = "google_profile/native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 mod tests {

@@ -162,4 +162,30 @@ mod tests {
         let changed = observations.reading().unwrap();
         assert!(changed.available && !changed.constrained && changed.revision > held.revision);
     }
+
+    #[test]
+    fn a_path_change_before_wait_is_not_lost() {
+        let observations = Arc::new(Observations::default());
+        observations.publish(usable());
+        let revision = observations.reading().unwrap().revision;
+        observations.publish(PathReading {
+            status: PathStatus::Unsatisfied,
+            ..usable()
+        });
+        let (done, completed) = mpsc::sync_channel(1);
+        let waiting = Arc::clone(&observations);
+        let worker = std::thread::spawn(move || {
+            // Longer than the hang detector: the changed revision must end the wait,
+            // rather than the fallback timer.
+            waiting.wait(Some(revision), Duration::from_secs(3600));
+            done.send(waiting.reading()).unwrap();
+        });
+        let observed = completed
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the already-published path change must end the wait")
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!observed.available);
+        assert!(observed.revision > revision);
+    }
 }

@@ -464,6 +464,22 @@ pub struct Judged {
 }
 
 impl Judged {
+    /// Fold the raw file's completed record lines. A final fragment cannot
+    /// establish a check or terminal; later partial diagnostics do not erase
+    /// an earlier completed terminal or change its existing accounting policy.
+    pub(crate) fn from_events(text: &str, code: i32, secs: u64) -> Self {
+        let lines = text
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
+        Self {
+            code,
+            checks: lines.clone().filter_map(CheckRow::of_event).collect(),
+            secs,
+            finished: lines.rev().find_map(Finished::of_event),
+        }
+    }
+
     /// Whether its rows are the run's whole record: its `run-finished` event names its exit code
     /// and exactly the checks its rows name, each with its word. A line the events file lost
     /// leaves a check the event names with no row, or the event itself missing.

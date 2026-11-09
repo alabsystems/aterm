@@ -655,6 +655,18 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    } else if detached_update(&args, std::env::var(SPAWNER_PID_ENV).ok().as_deref()) {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(
+                aterm_update_core::pkg_check::PASS_OPERATION_LIMIT_SECS,
+            );
+        match aterm_update_core::OperationCancellation::until(deadline) {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                eprintln!("atpkg: update operation budget: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         None
     };
@@ -1286,6 +1298,11 @@ struct LaneFlags {
     published_index_hint: Option<u64>,
     defer_busy_flip: bool,
     cancel_stdin: bool,
+}
+
+#[cfg(any(unix, test))]
+fn detached_update(args: &[String], spawner: Option<&str>) -> bool {
+    args.first().is_some_and(|verb| verb == "update") && spawner == Some(SPAWNER_DETACHED)
 }
 
 impl LaneFlags {
@@ -8124,7 +8141,7 @@ fn do_install_with_index(
                 },
                 outcome,
             );
-            if !r.already_current && !aterm_update_core::operation_active() {
+            if !r.already_current && !aterm_update_core::operation_defers_maintenance() {
                 warm_alab_landed(layout, &before, seams.warm_agents);
                 let channel = last_verified_channel(layout);
                 let _ = crate::gc::run_keeping_pinned_partials(layout, channel.as_ref(), &|p| {
@@ -8146,7 +8163,9 @@ fn do_install_with_index(
     // Outside the typed pass, as an index-owned landing's sweep and hooks are above: they write no
     // progress and have no bound of their own, which aterm-gui's
     // `harness_host::INSTALL_QUIET_LIMIT` allows only past the pass's end.
-    if let Some(door_pass) = door_pass.filter(|_| !aterm_update_core::operation_active()) {
+    if let Some(door_pass) =
+        door_pass.filter(|_| !aterm_update_core::operation_defers_maintenance())
+    {
         let _ = settle_vendor_pass(layout, &door_pass, seams);
     }
     result
@@ -8197,7 +8216,7 @@ fn install_vendor_door(
     }
     record_vendor_status(layout, &outcome, now);
     note_landed(&mut pass, &outcome);
-    if !aterm_update_core::operation_active() {
+    if !aterm_update_core::operation_defers_maintenance() {
         warm_landed(layout, &mut pass, seams);
     }
     (outcome.into_install(layout), pass)
@@ -8626,7 +8645,7 @@ fn cmd_install_with_index(
                     crate::flow::DepResult::AlreadyPresent(_) => {}
                 }
             }
-            if !aterm_update_core::operation_active() {
+            if !aterm_update_core::operation_defers_maintenance() {
                 reassert_rustup_seam(layout);
                 let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
             }

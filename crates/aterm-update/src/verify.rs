@@ -8,12 +8,7 @@ use aterm_uds::spawnfd::Command;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[cfg(not(test))]
-const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
-/// A unit test's helper is a real program that finishes, so one a loaded machine slows is waited
-/// for to the hang detector; a test that needs the ceiling to fire opens an [`ApplyBudget`].
-#[cfg(test)]
-const HELPER_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
+const HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 
 const HELPER_REAP: Duration = Duration::from_millis(250);
 
@@ -297,7 +292,11 @@ pub fn probe_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), Stri
 }
 
 fn helper_deadline() -> (Instant, bool) {
-    let own = Instant::now() + HELPER_TIMEOUT;
+    helper_deadline_started(Instant::now())
+}
+
+fn helper_deadline_started(started: Instant) -> (Instant, bool) {
+    let own = started + HELPER_TIMEOUT;
     match APPLY_DEADLINE.with(|d| d.get()) {
         Some(b) if b < own => (b, true),
         _ => (own, false),
@@ -358,10 +357,20 @@ pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
 }
 
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
-    output_until(cmd, what, || {
-        let (deadline, bound_by_budget) = helper_deadline();
-        (deadline, timed_out(what, bound_by_budget))
-    })
+    output_bounded_started(cmd, what, Instant::now())
+}
+
+fn output_bounded_started(
+    cmd: &mut Command,
+    what: &str,
+    started: Instant,
+) -> Result<std::process::Output, String> {
+    let (deadline, bound_by_budget) = helper_deadline_started(started);
+    let timeout = timed_out(what, bound_by_budget);
+    if Instant::now() >= deadline {
+        return Err(timeout);
+    }
+    output_until(cmd, what, || (deadline, timeout))
 }
 
 /// [`output_bounded`] with an explicit `limit` instead of the helper timeout and the apply budget.
@@ -925,6 +934,85 @@ fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned helper child; the native helper parent invokes this exact test"]
+    fn owned_required_helper_child() {
+        let ready = std::env::var_os("ATERM_TEST_UPDATE_HELPER_READY").expect("owned ready path");
+        std::fs::write(ready, b"the actual updater helper ran\n").unwrap();
+        assert!(
+            std::env::var_os("ATERM_TEST_UPDATE_HELPER_REFUSES").is_none(),
+            "native helper refusal"
+        );
+        println!("native helper completed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_required_update_helper_waits_for_its_native_completion() {
+        for (age, refuses) in [(31, false), (61, false), (31, true)] {
+            let age = Duration::from_secs(age);
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let root = aterm_tempfile::tempdir().unwrap();
+            let ready = root.path().join("native-ready");
+            let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "verify::tests::owned_required_helper_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ATERM_TEST_UPDATE_HELPER_READY", &ready);
+            if refuses {
+                child.env("ATERM_TEST_UPDATE_HELPER_REFUSES", "1");
+            }
+            let result =
+                output_bounded_started(&mut child, "owned required helper", Instant::now() - age);
+            if expired {
+                let refusal = result.expect_err("an expired hang detector admits no new helper");
+                assert!(crate::is_passing_refusal(&refusal));
+                assert!(!ready.exists());
+                continue;
+            }
+            assert_eq!(
+                std::fs::read(&ready).unwrap(),
+                b"the actual updater helper ran\n"
+            );
+            let output = result.expect("a scheduled native verification helper is not a rejection");
+            if refuses {
+                assert_eq!(
+                    output.status.code(),
+                    Some(101),
+                    "the native refusal remains a nonzero exit"
+                );
+                assert!(String::from_utf8_lossy(&output.stderr).contains("native helper refusal"));
+            } else {
+                assert!(output.status.success());
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("native helper completed")
+                );
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let ready = root.path().join("outside-apply-budget");
+        let _budget = ApplyBudget::start(Duration::ZERO);
+        let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        child
+            .args([
+                "verify::tests::owned_required_helper_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ATERM_TEST_UPDATE_HELPER_READY", &ready);
+        let refusal = output_bounded(&mut child, "owned apply helper")
+            .expect_err("the original aggregate budget still binds");
+        assert!(crate::is_passing_refusal(&refusal));
+        assert!(refusal.contains("verification budget"));
+        assert!(!ready.exists());
+    }
 
     /// The aggregate budget binds before a helper's own ceiling (the rejection names
     /// the budget), so sixteen serial helpers are bounded by a number.

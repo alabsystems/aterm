@@ -22,6 +22,9 @@ mod test_config;
 #[cfg(test)]
 mod test_program;
 
+#[cfg(all(test, unix))]
+mod test_tree;
+
 /// A test's POSIX absolute path literal as this host reads it absolute, as a `&'static str`
 /// (`harness::host_path::abs` makes the same `String`): itself on Unix, on drive `C:` on Windows;
 /// with a text before and after it, that text with the path inside.

@@ -29,6 +29,57 @@ const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 const MEMORY: u64 = 1024 * 1024 * 1024;
 
+#[test]
+#[cfg(target_os = "macos")]
+fn queue_io_fault_ends_original_job_as_host_fault() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::queue_io_fault_ends_original_job_as_host_fault",
+    ) {
+        return;
+    }
+    assert_fault_terminal(io::Error::from_raw_os_error(libc::ENOTCONN), "NotConnected");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn queue_progress_fault_ends_original_job_as_host_fault() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::queue_progress_fault_ends_original_job_as_host_fault",
+    ) {
+        return;
+    }
+    assert_fault_terminal("launched without GO", "launched without GO");
+}
+
+#[cfg(target_os = "macos")]
+fn assert_fault_terminal(detail: impl std::fmt::Debug, expected: &str) {
+    crate::runtime::test_endpoint().unwrap();
+    let mut world = World::new();
+    let (binding, _, client) = world.queue_sleep(HANG);
+    assert_eq!(read_event(&client, &binding), Event::Queued);
+    world.owner.tick_queue();
+    assert!(matches!(
+        read_event(&client, &binding),
+        Event::Started { .. }
+    ));
+    world
+        .owner
+        .journal
+        .fault(&mut world.owner.faulted, "injected", detail);
+    assert!(world.owner.journal.fault_summary().contains(expected));
+    world.settle();
+    assert!(matches!(
+        read_event(&client, &binding),
+        Event::Finished {
+            outcome: Outcome::Signal(libc::SIGKILL),
+            cause: CompletionCause::HostFault,
+            ..
+        }
+    ));
+    assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+    assert!(world.owner.faulted);
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "resource_admission_owner_tests/bootstrap_object_engineering.rs"]
 mod bootstrap_object_engineering;

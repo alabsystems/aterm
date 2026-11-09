@@ -1384,11 +1384,13 @@ fn crossing_budgets(model: &aterm_spec::derive::Model) -> RecordBudgets {
 /// S8: a vault server refines `SwarmRecordsCapacity`'s `Crossing` in each configuration the
 /// model declares (the legacy held total, where it takes the batch up to the bound; the
 /// activation's, where it takes it all, past the bound): from every state the model reaches,
-/// every action it enables, replayed on a real server (a fresh store folder each), gives the
-/// state the model's walk found by that path, or another successor the model allows there. At
-/// the legacy held total a POST from a source that has not crossed (`Grow`, or `LegacyPost`
-/// before any mark) leaves the server holding the batch cut mid-`Wrap`s with no mark, which a
-/// legacy GET is served whole: the residual the model names, which the activation's room ends.
+/// every action it enables, replayed on a real server down the walk's path to that state (a
+/// fresh store folder each run, which goes on from the state an action took it to, by the walk's
+/// path, to judge that state's next action), gives the state the model's walk found by that
+/// path, or another successor the model allows there. At the legacy held total a POST from a
+/// source that has not crossed (`Grow`, or `LegacyPost` before any mark) leaves the server
+/// holding the batch cut mid-`Wrap`s with no mark, which a legacy GET is served whole: the
+/// residual the model names, which the activation's room ends.
 ///
 /// NEGATIVE CONTROLS: with `Faults::capped_prefix` (a crossed log's first records, capped at the
 /// legacy bound, for a GET that states no bound) the legacy GET after a crossed POST at the
@@ -1441,34 +1443,55 @@ fn the_crossed_fence_conforms_to_the_capacity_model() {
             .map(|(state, path)| (path.as_slice(), state))
             .collect();
         budgets.within(|| {
-            let run = CapacityRun::start(Faults::default());
-            assert_eq!(records_capacity_crossing(&run), start[0], "after Crossing");
-            run.stop();
-            let mut judged = BTreeSet::from([start[0].clone()]);
-            for (state, path) in &paths {
-                for action in &model.actions {
-                    if !model.action_enabled(action.name, state) {
-                        continue;
-                    }
+            // The actions each state enables that no run has judged from it yet, by the walk's
+            // path to the state.
+            let mut pending: BTreeMap<&[&str], Vec<&'static str>> = paths
+                .iter()
+                .map(|(state, path)| {
+                    let enabled = model
+                        .actions
+                        .iter()
+                        .map(|action| action.name)
+                        .filter(|action| model.action_enabled(action, state))
+                        .collect();
+                    (path.as_slice(), enabled)
+                })
+                .collect();
+            let mut froms: Vec<&[&str]> = pending.keys().copied().collect();
+            froms.sort_by_key(|path| path.len());
+            let mut judged = BTreeSet::new();
+            let mut runs = 0;
+            for from in froms {
+                while !pending[from].is_empty() {
+                    runs += 1;
                     let mut run = CapacityRun::start(Faults::default());
-                    for step in path {
+                    assert_eq!(records_capacity_crossing(&run), start[0], "after Crossing");
+                    judged.insert(start[0].clone());
+                    for step in from {
                         run.apply(step);
                     }
-                    run.apply(action.name);
-                    let observed = records_capacity_crossing(&run);
-                    run.stop();
-                    let next_path = [path.as_slice(), &[action.name]].concat();
-                    match found_by.get(next_path.as_slice()) {
-                        Some(&next) => {
-                            assert_eq!(&observed, next, "after {next_path:?}");
-                            judged.insert(next.clone());
+                    let mut path = from.to_vec();
+                    loop {
+                        let state = found_by[path.as_slice()];
+                        let action = pending.get_mut(path.as_slice()).expect("a state").remove(0);
+                        run.apply(action);
+                        let observed = records_capacity_crossing(&run);
+                        path.push(action);
+                        let Some(&next) = found_by.get(path.as_slice()) else {
+                            assert!(
+                                model.successors(action, state).contains(&observed),
+                                "{action} after {:?} gave {observed:?}",
+                                &path[..path.len() - 1]
+                            );
+                            break;
+                        };
+                        assert_eq!(&observed, next, "after {path:?}");
+                        judged.insert(next.clone());
+                        if pending[path.as_slice()].is_empty() {
+                            break;
                         }
-                        None => assert!(
-                            model.successors(action.name, state).contains(&observed),
-                            "{} after {path:?} gave {observed:?}",
-                            action.name
-                        ),
                     }
+                    run.stop();
                 }
             }
             assert_eq!(
@@ -1477,7 +1500,7 @@ fn the_crossed_fence_conforms_to_the_capacity_model() {
                 "every state was replayed and judged"
             );
             eprintln!(
-                "SwarmRecordsCapacity Crossing (held {}): {} states judged",
+                "SwarmRecordsCapacity Crossing (held {}): {} states judged on {runs} runs",
                 budgets.held,
                 judged.len()
             );

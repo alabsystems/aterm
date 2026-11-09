@@ -11,38 +11,89 @@ use super::super::reach::{MUTANT, Mutant, Reach, reserved_for};
 use super::weigh::{corpus, generated_logs};
 use super::*;
 
+/// A log's held records by their places in its order, each with the places of its parents: the
+/// graph the walks below follow, each parent looked up once.
+struct Edges<'a> {
+    log: &'a Log,
+    parents: Vec<Vec<usize>>,
+}
+
+impl<'a> Edges<'a> {
+    fn of(log: &'a Log) -> Self {
+        let parents = log
+            .order
+            .iter()
+            .map(|record| {
+                let at = places(log, record.parents());
+                assert_eq!(
+                    at.len(),
+                    record.parents().len(),
+                    "a held record's parents are held"
+                );
+                at
+            })
+            .collect();
+        Self { log, parents }
+    }
+
+    /// Which held records are at or reachable from the places `roots`, by walking parents: the
+    /// walk the index replaced in `Log::ancestors_of`.
+    fn past(&self, roots: Vec<usize>) -> Vec<bool> {
+        let mut seen = vec![false; self.parents.len()];
+        let mut stack = roots;
+        while let Some(at) = stack.pop() {
+            if !seen[at] {
+                seen[at] = true;
+                stack.extend(&self.parents[at]);
+            }
+        }
+        seen
+    }
+
+    /// Every held record in or reachable from `roots` ([`Edges::past`]).
+    fn ancestors(&self, roots: &[RecordId]) -> BTreeSet<RecordId> {
+        let past = self.past(places(self.log, roots));
+        self.log
+            .order
+            .iter()
+            .zip(past)
+            .filter_map(|(record, seen)| seen.then_some(record.id))
+            .collect()
+    }
+
+    /// Whether the held record `ancestor` is in `record`'s causal past, by the walk the index
+    /// replaced in `Log::precedes`.
+    fn precedes(&self, ancestor: &RecordId, record: &Record) -> bool {
+        if record.parents().contains(ancestor) {
+            return true;
+        }
+        let Some(target) = self.log.record_index(ancestor) else {
+            return false;
+        };
+        let mut seen = vec![false; self.parents.len()];
+        let mut stack = places(self.log, record.parents());
+        while let Some(at) = stack.pop() {
+            if at == target {
+                return true;
+            }
+            if !seen[at] {
+                seen[at] = true;
+                stack.extend(&self.parents[at]);
+            }
+        }
+        false
+    }
+}
+
+/// The places in `log`'s order of the held records among `ids`.
+fn places(log: &Log, ids: &[RecordId]) -> Vec<usize> {
+    ids.iter().filter_map(|id| log.record_index(id)).collect()
+}
+
 /// Every held record in or reachable from `roots`, by walking parents: the walk the index
 /// replaced in `Log::ancestors_of`.
 fn walked_ancestors(log: &Log, roots: &[RecordId]) -> BTreeSet<RecordId> {
-    let mut seen = BTreeSet::new();
-    let mut stack: Vec<RecordId> = roots.to_vec();
-    while let Some(id) = stack.pop() {
-        if log.held.contains_key(&id)
-            && seen.insert(id)
-            && let Some(parent) = log.get(&id)
-        {
-            stack.extend(parent.parents().iter().copied());
-        }
-    }
-    seen
-}
-
-/// Whether the held record `ancestor` is in `record`'s causal past, by the walk the index
-/// replaced in `Log::precedes`.
-fn walked_precedes(log: &Log, ancestor: &RecordId, record: &Record) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut stack: Vec<&RecordId> = record.parents().iter().collect();
-    while let Some(id) = stack.pop() {
-        if id == ancestor {
-            return true;
-        }
-        if seen.insert(*id)
-            && let Some(parent) = log.get(id)
-        {
-            stack.extend(parent.parents().iter());
-        }
-    }
-    false
+    Edges::of(log).ancestors(roots)
 }
 
 /// Whether `actor` holds a seat anywhere in `log`, by the scan the seat index replaced in
@@ -62,28 +113,29 @@ fn scanned_holds_seat(log: &Log, actor: &MemberId) -> bool {
 
 /// Whether `record`'s signer is a bound founder or admitted in its causal past, by the walk the
 /// seat index replaced in `Log::has_seat_in_past`.
-fn walked_seat_in_past(log: &Log, record: &Record) -> bool {
+fn walked_seat_in_past(edges: &Edges<'_>, record: &Record) -> bool {
+    let log = edges.log;
     let actor = record.actor();
     if let Body::Genesis { founders, .. } = log.genesis().body()
         && founders.iter().any(|f| f.member() == Some(*actor))
     {
         return true;
     }
-    walked_ancestors(log, record.parents()).iter().any(|id| {
-        log.get(id).is_some_and(|parent| {
-            matches!(
-                parent.body(),
-                Body::Admit { entrant, .. }
-                    if parent.actor() != &entrant.member() && entrant.member() == *actor
-            )
-        })
+    let past = edges.past(places(log, record.parents()));
+    log.order.iter().zip(past).any(|(parent, seen)| {
+        seen && matches!(
+            parent.body(),
+            Body::Admit { entrant, .. }
+                if parent.actor() != &entrant.member() && entrant.member() == *actor
+        )
     })
 }
 
 /// `Log::check_against_parents` as it stood before the index, walks and all: the verdict every
 /// check now reads from the index must equal.
-fn walked_check(log: &Log, record: &Record) -> Result<()> {
-    if log.enforce_seats && !walked_seat_in_past(log, record) {
+fn walked_check(edges: &Edges<'_>, record: &Record) -> Result<()> {
+    let log = edges.log;
+    if log.enforce_seats && !walked_seat_in_past(edges, record) {
         return Err(Error::new(
             "a membership record's signer has no seat in its causal past",
         ));
@@ -121,7 +173,7 @@ fn walked_check(log: &Log, record: &Record) -> Result<()> {
         }
     }
     if let Body::Remove { member, cutoff } = record.body() {
-        if !walked_precedes(log, cutoff, record) {
+        if !edges.precedes(cutoff, record) {
             return Err(Error::new(
                 "a removal's cutoff is a record in its own causal past",
             ));
@@ -139,7 +191,7 @@ fn walked_check(log: &Log, record: &Record) -> Result<()> {
     }
     match record.body() {
         Body::Wrap { epoch, .. }
-            if !walked_precedes(log, epoch, record)
+            if !edges.precedes(epoch, record)
                 || !matches!(log.get(epoch).map(Record::body), Some(Body::Epoch { .. })) =>
         {
             return Err(Error::new("a Wrap names an Epoch in its causal past"));
@@ -149,7 +201,7 @@ fn walked_check(log: &Log, record: &Record) -> Result<()> {
         }
         | Body::Delete {
             audience, epoch, ..
-        } if !walked_precedes(log, epoch, record)
+        } if !edges.precedes(epoch, record)
             || !matches!(
                 log.get(epoch).map(Record::body),
                 Some(Body::Epoch { audience: ep_aud, .. }) if ep_aud == audience
@@ -207,10 +259,14 @@ struct Verdicts {
 }
 
 impl Verdicts {
-    /// Check `record` against `log` both ways, recording a disagreement and the verdict.
-    fn check(&mut self, log: &Log, record: &Record, what: &'static str) {
-        let now = log.check_against_parents(record).map_err(|e| e.to_string());
-        let then = walked_check(log, record).map_err(|e| e.to_string());
+    /// Check `record` against the log of `edges` both ways, recording a disagreement and the
+    /// verdict.
+    fn check(&mut self, edges: &Edges<'_>, record: &Record, what: &'static str) {
+        let now = edges
+            .log
+            .check_against_parents(record)
+            .map_err(|e| e.to_string());
+        let then = walked_check(edges, record).map_err(|e| e.to_string());
         if now != then {
             self.disagreements += 1;
         }
@@ -249,9 +305,10 @@ fn check_both_ways(log: &Log, held: bool, count: usize, rng: &mut Rng, verdicts:
         .collect();
     let signers = signers();
     for view in [log, &enforcing] {
+        let edges = Edges::of(view);
         if held {
             for record in view.order.iter().skip(1) {
-                verdicts.check(view, record, "held");
+                verdicts.check(&edges, record, "held");
             }
         }
         for _ in 0..count {
@@ -305,7 +362,7 @@ fn check_both_ways(log: &Log, held: bool, count: usize, rng: &mut Rng, verdicts:
                     }
                 }
             };
-            verdicts.check(view, &probe(view, by.mac, parents, body), what);
+            verdicts.check(&edges, &probe(view, by.mac, parents, body), what);
         }
     }
     for by in signers {
@@ -313,13 +370,13 @@ fn check_both_ways(log: &Log, held: bool, count: usize, rng: &mut Rng, verdicts:
             verdicts.disagreements += 1;
         }
     }
+    let edges = Edges::of(log);
     for _ in 0..count {
         let n = log.order.len();
-        let from: Vec<RecordId> = (0..1 + rng.below(2))
-            .map(|_| log.order[rng.below(n)].id)
-            .collect();
-        let target = log.order[rng.below(n)].id;
-        if log.reaches(&from, &target) != walked_ancestors(log, &from).contains(&target) {
+        let from: Vec<usize> = (0..1 + rng.below(2)).map(|_| rng.below(n)).collect();
+        let target = rng.below(n);
+        let ids: Vec<RecordId> = from.iter().map(|&at| log.order[at].id).collect();
+        if log.reaches(&ids, &log.order[target].id) != edges.past(from)[target] {
             verdicts.disagreements += 1;
         }
     }

@@ -57,7 +57,8 @@ mod operation;
 #[cfg(unix)]
 pub use operation::OperationCancellation;
 pub use operation::{
-    check_operation, operation_active, operation_cancelled, run_operation_command,
+    check_operation, operation_active, operation_cancelled, operation_defers_maintenance,
+    run_operation_command,
 };
 mod privatedir;
 mod sentinel;
@@ -71,8 +72,8 @@ pub use http::{
     download_bytes_uncached_via, download_bytes_with_accept, download_error_is_local_write,
     download_error_is_not_found, download_to_resumable_https_only,
     download_to_resumable_https_only_via, head_no_redirect, head_no_redirect_again,
-    head_no_redirect_first, head_no_redirect_quick, note_link_down, vendor_content_length,
-    vendor_download_to, vendor_get, vendor_get_hint,
+    head_no_redirect_first, head_no_redirect_quick, head_no_redirect_until, note_link_down,
+    vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

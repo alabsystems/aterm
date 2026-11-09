@@ -14,6 +14,7 @@
 use super::*;
 use crate::age::Recipient;
 use crate::client::log_entries::{GAP_STEP_MS, REMOVER_GRACE_MS, SETTLE_GRACE_MS};
+use crate::client::log_entries_tests::home_content::{Content, Known};
 use crate::client::log_entries_tests::{fresh_two_macs, newcomer};
 use crate::client::readmit::{Book, Proven, Readmit};
 use crate::membership_log::admission::OLD_GAP_RULE;
@@ -632,12 +633,8 @@ impl<'a> GapRun<'a> {
         }
     }
 
-    /// This run as it stands, its homes copied into `dir`.
-    fn fork(&self, dir: &Path) -> Self {
-        let lab = self.lab();
-        for home in [lab.a, lab.b] {
-            copy_private_tree(&self.dir.join(home), &dir.join(home));
-        }
+    /// This run as it stands, on the homes in `dir`, which hold what its own hold.
+    fn at(&self, dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
             ..self.clone()
@@ -707,8 +704,13 @@ impl<'a> GapRun<'a> {
 
     /// Every record any Mac holds or signed, as one log.
     fn union(&self) -> Log {
-        let mut log = log_of(&self.a());
-        for record in log_of(&self.b()).records().chain(&self.signed) {
+        self.union_of(&log_of(&self.a()), &log_of(&self.b()))
+    }
+
+    /// [`GapRun::union`] from `a` and `b`, the logs A's and B's homes hold.
+    fn union_of(&self, a: &Log, b: &Log) -> Log {
+        let mut log = a.clone();
+        for record in b.records().chain(&self.signed) {
             if log.get(record.id()).is_none() {
                 log.insert(record.clone()).unwrap();
             }
@@ -1247,9 +1249,9 @@ impl<'a> GapRun<'a> {
 /// or signed (each audience the shape mints in reads the same), D's and C's standing from the
 /// log and A's records, and the harness's clocks.
 fn gap_heal_transition(run: &GapRun<'_>) -> State {
-    let union = run.union();
     let a = log_of(&run.a());
     let b = log_of(&run.b());
+    let union = run.union_of(&a, &b);
     let per: Vec<State> = run
         .audiences()
         .iter()
@@ -1336,13 +1338,14 @@ const SETTLED: [&str; 8] = [
 
 /// A3: `GapHeal` holds its laws, each mutant breaks the law it stands for, and the gap closer
 /// and the tender refine it: from every state the model reaches, every action it enables, run
-/// on a copy of A's and B's homes that realize that state (each shape built once, every state's
-/// homes forked from the state the walk first found it from), gives exactly the model's
-/// successor. `HealA` and `HealB` are a Mac's vault pass up to its re-keys: the closer
-/// ([`log_entries::close_wrap_gaps`]) and the tender's scheduling look ([`look_at_dues`]), at the
-/// injected clock; `Rotate` and `RotateByB` are its tender ([`tend_epochs_at`]); `RemoveByB` is
-/// [`test_remove_unposted`] on B, and `Remove` and `Admit` replay A's removal and B's LAN
-/// admission ([`admit_by_proof`]) run at fixture time on the records the Mac holds.
+/// on A's and B's homes as they stood when the walk first realized that state (each shape built
+/// once, and one scratch copy of the homes, each file that differs rewritten before each step),
+/// gives exactly the model's successor. `HealA` and `HealB` are a Mac's vault pass up to its
+/// re-keys: the closer ([`log_entries::close_wrap_gaps`]) and the tender's scheduling look
+/// ([`look_at_dues`]), at the injected clock; `Rotate` and `RotateByB` are its tender
+/// ([`tend_epochs_at`]); `RemoveByB` is [`test_remove_unposted`] on B, and `Remove` and `Admit`
+/// replay A's removal and B's LAN admission ([`admit_by_proof`]) run at fixture time on the
+/// records the Mac holds.
 ///
 /// NEGATIVE CONTROLS, each the real closer down a path the model takes:
 /// - `OLD_GAP_RULE`: B, at its first look past the settle, reads D, whom C knew and left out, as
@@ -1388,7 +1391,12 @@ fn the_gap_closer_conforms_to_the_gap_heal_model() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let init = model.init_state();
     let mut order = vec![init.clone()];
-    let mut realized: BTreeMap<State, GapRun<'_>> = BTreeMap::new();
+    // Each realized state's run, and what its homes held then: the homes every step from it
+    // starts on.
+    let mut realized: BTreeMap<State, (GapRun<'_>, Content)> = BTreeMap::new();
+    let scratch = root.path().join("scratch");
+    crate::fsx::ensure_private_dir(&scratch).unwrap();
+    let mut known = Known::default();
     let mut runs = 0usize;
     let mut next = 0;
     while let Some(state) = order.get(next).cloned() {
@@ -1398,31 +1406,35 @@ fn the_gap_closer_conforms_to_the_gap_heal_model() {
                 continue;
             }
             runs += 1;
-            let dir = root.path().join(format!("r{runs}"));
+            let successors = model.successors(action.name, &state);
             let run = match realized.get(&state) {
-                Some(from) => {
-                    let mut run = from.fork(&dir);
+                Some((from, homes)) => {
+                    known.put(homes, &scratch);
+                    let mut run = from.at(&scratch);
                     run.apply(action.name);
                     run
                 }
                 None => {
                     assert_eq!(state, init, "every later state is realized");
+                    let dir = root.path().join(action.name);
                     GapRun::start(&shapes, action.name, &dir)
                 }
             };
             let observed = gap_heal_transition(&run);
             assert_eq!(
-                model.successors(action.name, &state),
+                successors,
                 vec![observed.clone()],
                 "{} from {state:?}",
                 action.name
             );
-            if order.contains(&observed) {
-                drop(run);
-                let _ = std::fs::remove_dir_all(&dir);
-            } else {
+            if !order.contains(&observed) {
+                let homes = if run.dir == scratch {
+                    known.refresh(&scratch).clone()
+                } else {
+                    Content::of(&run.dir)
+                };
                 order.push(observed.clone());
-                realized.insert(observed, run);
+                realized.insert(observed, (run, homes));
             }
         }
     }

@@ -961,24 +961,36 @@ fn no_persons_line_is_ever_answered() {
             .collect()
     };
     let (parks, persons) = (needing(Row::Park), needing(Row::Person));
+    // Each person's lines at each width, read once: every park asks them again.
+    let person_lines: Vec<Vec<_>> = persons
+        .iter()
+        .map(|person| {
+            DRAWN
+                .into_iter()
+                .map(|columns| needs::needs_you(&drawn(person, columns)))
+                .collect()
+        })
+        .collect();
     // Pure reading, so one park at a time on every core.
     let (joined_parks, wrong) = aterm_spec::check::each(&parks, |park| {
         let (mut joined_parks, mut wrong) = (0, Vec::new());
-        for person in &persons {
-            for columns in DRAWN {
+        for (person, lines) in persons.iter().zip(&person_lines) {
+            for (columns, lines) in DRAWN.into_iter().zip(lines) {
                 let joined = drawn(&format!("{park}\n{person}"), columns);
                 let Some(p) = parked("", &joined) else {
                     continue;
                 };
                 joined_parks += 1;
-                for line in needs::needs_you(&drawn(person, columns)) {
-                    if p.needs.contains(&line) {
+                for line in lines {
+                    if p.needs.contains(line) {
                         wrong.push(format!("{columns:?}: {line:?} in {joined:?}"));
                     }
                 }
-                let named = needs::needs_you(&joined);
-                if columns.is_none() && !p.needs.iter().all(|l| named.contains(l)) {
-                    wrong.push(format!("not on the menu bar: {:?} of {joined:?}", p.needs));
+                if columns.is_none() {
+                    let named = needs::needs_you(&joined);
+                    if !p.needs.iter().all(|l| named.contains(l)) {
+                        wrong.push(format!("not on the menu bar: {:?} of {joined:?}", p.needs));
+                    }
                 }
             }
         }

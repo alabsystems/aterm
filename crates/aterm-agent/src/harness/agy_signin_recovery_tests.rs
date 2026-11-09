@@ -781,7 +781,7 @@ fn resumed_rejected_completion_renews_only_after_canonical_rejection() {
             |token, expected, wait| {
                 assert_eq!(token, "saved-access");
                 assert_eq!(expected, "person@example.com");
-                assert!(wait <= Duration::from_secs(30));
+                assert!(wait <= google_profile::REQUEST_HANG);
                 match case {
                     1 => return Err(google_profile::Error::Unavailable),
                     2 => return Err(google_profile::Error::RateLimited),

@@ -7,6 +7,7 @@ mod help_texts;
 mod tty;
 use commands::*;
 
+pub mod aliases;
 pub mod api;
 pub mod bundle;
 pub mod cask;
@@ -18,6 +19,7 @@ pub mod machine;
 pub mod prefix;
 pub mod stub;
 pub mod tap;
+pub mod token_generator;
 pub mod trust;
 
 use std::ffi::OsString;
@@ -108,7 +110,7 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     if let Some(w) = prefix::prefix_env_warning() {
         eprintln!("abrew: warning: {w}");
     }
-    let args = command_args(args);
+    let args = expand_user_alias(&command_args(args));
     let args: &[String] = &args;
     let first = args.first().map(String::as_str).unwrap_or("");
     if first == stub::REAL_FLAG {
@@ -319,6 +321,56 @@ fn canonical_help_command(cmd: &str) -> &str {
         .map_or(cmd, |(_, target)| target)
 }
 
+/// `brew command <cmd>…`: the file used when invoking each
+/// command. Abrew's commands live in this executable, so a
+/// known command prints its path; a tap's `cmd/brew-<name>`
+/// file prints its own path; anything else is brew's
+/// unknown-command error (earlier paths already printed).
+fn cmd_command_path(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    for name in operands(rest) {
+        let canonical = canonical_help_command(&name);
+        let known = command_names(true).contains(&name.as_str())
+            || command_names(true).contains(&canonical);
+        if known {
+            match std::env::current_exe() {
+                Ok(path) => println!("{}", path.display()),
+                Err(error) => return failed(&format!("abrew: {error}")),
+            }
+            continue;
+        }
+        let mut found: Option<std::path::PathBuf> = None;
+        for tap in tap::list(prefix) {
+            for file in [
+                format!("brew-{name}.rb"),
+                format!("brew-{name}.sh"),
+                format!("brew-{name}"),
+            ] {
+                let candidate = tap.path.join("cmd").join(file);
+                if candidate.is_file() {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        match found {
+            Some(path) => println!("{}", path.display()),
+            None => {
+                return from_install(
+                    prefix,
+                    &[],
+                    Err(InstallError::Failed(format!(
+                        "Error: Unknown command: brew {name}"
+                    ))),
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Brew's help text for a command, or the top-level help message
 /// when the command has no help of its own (brew's fallback).
 fn brew_help_text(cmd: &str) -> &'static str {
@@ -460,6 +512,9 @@ fn named_arg_types(cmd: &str) -> String {
         "desc" => &["formula", "cask", "text or regex"],
         "uses" | "dependents" | "options" => &["formula"],
         "zap" => &["cask"],
+        "command" => &["command"],
+        "formula" => &["formula"],
+        "unalias" => &["alias"],
         "untap" | "tap" | "tap-info" => &["tap"],
         _ => &["named"],
     };
@@ -472,6 +527,33 @@ fn named_arg_types(cmd: &str) -> String {
 
 /// Commands brew.sh answers itself, before Ruby's help
 /// interception and argument parser ever run.
+/// User aliases (`brew alias`) expand before dispatch when
+/// the typed command is not a real command: brew would run
+/// the alias script, abrew re-dispatches its plain
+/// `brew <words>` form natively (bounded, like a shell would
+/// eventually be by exec depth).
+fn expand_user_alias(args: &[String]) -> Vec<String> {
+    let mut args = args.to_vec();
+    for _ in 0..8 {
+        let Some(first) = args.first() else { break };
+        if command_names(true).contains(&first.as_str())
+            || COMMANDS.contains(&first.as_str())
+            || matches!(first.as_str(), "on" | "off" | "status")
+        {
+            break;
+        }
+        let Some(mut words) = aliases::expansion(first) else {
+            break;
+        };
+        if words.is_empty() {
+            break;
+        }
+        words.extend(args.drain(1..));
+        args = words;
+    }
+    args
+}
+
 fn shell_fast_path(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -1282,6 +1364,9 @@ fn native_args(
                 "--quiet",
                 "-q",
                 "--greedy",
+                "-g",
+                "--greedy-latest",
+                "--greedy-auto-updates",
                 "--no-ask",
                 "--yes",
                 "-y",
@@ -1375,6 +1460,9 @@ fn native_args(
                 "--formula",
                 "--cask",
                 "--greedy",
+                "-g",
+                "--greedy-latest",
+                "--greedy-auto-updates",
                 "--verbose",
                 "-v",
                 "--quiet",
@@ -1590,7 +1678,14 @@ fn native_args(
         ),
         "help" | "--help" | "-h" => (&[], 0, 1, false),
         "completions" => (&[], 0, 1, false),
-        "--prefix" | "--cellar" | "--caskroom" => (&[], 0, usize::MAX, true),
+        "--prefix" => (&["--installed", "--unbrewed"], 0, usize::MAX, true),
+        "--cellar" | "--caskroom" => (&[], 0, usize::MAX, true),
+        "command" => (&[], 1, usize::MAX, true),
+        "formula" => (&[], 1, usize::MAX, false),
+        "generate-cask-token" => (&[], 1, 1, false),
+        "command-not-found-init" => (&[], 0, 0, false),
+        "alias" => (&[], 0, 1, false),
+        "unalias" => (&[], 1, usize::MAX, false),
         "--cache" => (
             &["--formula", "--cask", "--os", "--arch", "--bottle-tag"],
             0,
@@ -2813,9 +2908,28 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         "--prefix" | "--cellar" | "--caskroom" => {
-            if let Some(name) = rest.first() {
+            let names = operands(rest);
+            if cmd == "--prefix" && has_flag(rest, "--unbrewed", "") {
+                if !names.is_empty() {
+                    return usage_failed(
+                        cmd,
+                        "Error: Invalid usage: `--unbrewed` does not take a formula argument.",
+                    );
+                }
+                return unsupported(
+                    "--prefix --unbrewed lists files Homebrew did not install; an abrew prefix has no Homebrew repository checkout to audit",
+                );
+            }
+            let installed_only = cmd == "--prefix" && has_flag(rest, "--installed", "");
+            if installed_only && names.is_empty() {
+                return usage_failed(
+                    cmd,
+                    "Error: Invalid usage: `--installed` requires a formula argument.",
+                );
+            }
+            if !names.is_empty() {
                 let api0 = api::Api::new(prefix.clone());
-                return commands::cmd_prefix_query(prefix, &api0, cmd, name);
+                return commands::cmd_prefix_queries(prefix, &api0, cmd, &names, installed_only);
             }
             let bare = match cmd {
                 "--prefix" => prefix.root.clone(),
@@ -2824,6 +2938,25 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             };
             println!("{}", bare.display());
             return ExitCode::SUCCESS;
+        }
+        "command" => return cmd_command_path(prefix, rest),
+        "formula" => return commands::cmd_formula_path(prefix, rest),
+        "generate-cask-token" => {
+            let api0 = api::Api::new(prefix.clone());
+            return commands::cmd_generate_cask_token(&api0, rest);
+        }
+        "command-not-found-init" => return commands::cmd_command_not_found_init(),
+        "alias" => {
+            return match aliases::add_or_show(prefix, operands(rest).first().map(String::as_str)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => failed(&message),
+            };
+        }
+        "unalias" => {
+            return match aliases::remove(prefix, &operands(rest)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => failed(&message),
+            };
         }
         "--cache" => {
             if operands(rest).is_empty() {

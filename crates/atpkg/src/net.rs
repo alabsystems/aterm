@@ -274,15 +274,33 @@ pub fn stamped_index_hint() -> Option<IndexHint> {
     IndexHint::parse(aterm_stamp::current().index_hint)
 }
 
+/// The whole optional published-run walk gets five seconds, with no transport retries.
+pub const INDEX_HINT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The shipped channel's published run, found as a store that has verified nothing finds it.
+/// This is an optional observation: every HEAD shares [`INDEX_HINT_BOUND`], with no retries.
 /// # Errors
 /// The first HEAD that said neither, or `no atpkg-index release is published`.
 pub fn published_index_run() -> Result<IndexHint, String> {
+    published_index_run_with(
+        std::time::Instant::now() + INDEX_HINT_BOUND,
+        &aterm_update_core::head_no_redirect_until,
+    )
+}
+
+fn published_index_run_with(
+    deadline: std::time::Instant,
+    head: &impl Fn(
+        &str,
+        std::time::Instant,
+    ) -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError>,
+) -> Result<IndexHint, String> {
     let mut slug = String::from(aterm_update_core::ATPKG_INDEX_OWNER);
     slug.push('/');
     slug.push_str(crate::manifest::INDEX_REPO);
     let (newest, low) = newest_index(0, &mut |build| {
-        head_verdict(&slug, build, &Wire).map_err(|(msg, _, _)| msg)
+        let url = index_head_url(&slug, build).map_err(|(msg, _, _)| msg)?;
+        read_head_answer(&url, build, head(&url, deadline)).map_err(|(msg, _, _)| msg)
     })?;
     Ok(IndexHint {
         low: Some(low),
@@ -373,7 +391,9 @@ fn fetch_run(
         match candidate {
             Ok(candidate) => out.push(candidate),
             Err(e) => {
-                if signed_index_asset_error_is_transport(&e) {
+                // Only absence permits omitting this release. A failed acquisition is not
+                // evidence that an older release is the source's current answer.
+                if !e.is_absent() {
                     return Err(e.to_string());
                 }
                 first_error.get_or_insert_with(|| e.to_string());
@@ -385,14 +405,31 @@ fn fetch_run(
 
 fn whole_quad(
     label: &str,
-    [index, index_sig, roster, roster_sig]: [Result<Vec<u8>, AssetError>; 4],
+    answers: [Result<Vec<u8>, AssetError>; 4],
 ) -> Result<Candidate, AssetError> {
+    // An absent half must not hide another half's acquisition failure. Retain the first
+    // non-absence error; no partial quad reaches selection.
+    let mut error: Option<AssetError> = None;
+    let [index_bytes, sig, roster_bytes, roster_sig] = answers.map(|answer| {
+        answer.unwrap_or_else(|next| {
+            if error
+                .as_ref()
+                .is_none_or(|held| held.is_absent() && !next.is_absent())
+            {
+                error = Some(next);
+            }
+            Vec::new()
+        })
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(Candidate {
         label: label.to_string(),
-        index_bytes: index?,
-        sig: index_sig?,
-        roster_bytes: roster?,
-        roster_sig: roster_sig?,
+        index_bytes,
+        sig,
+        roster_bytes,
+        roster_sig,
     })
 }
 
@@ -1189,9 +1226,8 @@ impl crate::flow::Fetcher for GithubFetcher {
 
 /// An immutable index asset's read failed in transport: neither route delivered it
 /// ([`AssetError::Unavailable`]), which a rate limit or an HTTP 5xx is even though a host
-/// answered. The source's 404 ([`AssetError::Absent`]) and a refusal here
-/// ([`AssetError::Refused`]: an underivable or unsafe name, an asset over its cap, a host that
-/// refuses) are verdicts.
+/// answered. An acquisition refusal also ends the candidate read, but is not a transport
+/// failure; only [`AssetError::Absent`] permits omitting that release.
 const fn signed_index_asset_error_is_transport(error: &AssetError) -> bool {
     matches!(error, AssetError::Unavailable { .. })
 }
@@ -1386,6 +1422,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_index_walk_shares_one_deadline_and_stops_on_failure() {
+        use std::cell::Cell;
+        use std::time::Instant;
+        let deadline = Instant::now() + INDEX_HINT_BOUND;
+        let calls = Cell::new(0);
+        let got = published_index_run_with(deadline, &|url, bound| {
+            assert_eq!(bound, deadline, "each probe inherits the original deadline");
+            calls.set(calls.get() + 1);
+            if walked_build(url) <= 8 {
+                published()
+            } else {
+                absent()
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            IndexHint {
+                low: Some(1),
+                newest: 8
+            }
+        );
+        assert!(calls.get() > 1);
+        calls.set(0);
+        let refused = published_index_run_with(deadline, &|_, bound| {
+            assert_eq!(bound, deadline);
+            calls.set(calls.get() + 1);
+            Err(aterm_update_core::HttpError::Transport("HTTP 504".into()))
+        })
+        .unwrap_err();
+        assert!(refused.contains("HTTP 504"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "no other probe round follows an unavailable hint"
+        );
+    }
+
+    #[test]
     fn a_repository_override_has_a_distinct_durable_artifact_namespace() {
         let official = GithubFetcher::new("alabsystems".into());
         let official_source =
@@ -1402,6 +1477,8 @@ mod tests {
 
     #[test]
     fn a_newest_exact_quad_transport_failure_never_selects_an_older_release() {
+        use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET};
+
         let slug = "alabsystems/aterm";
         let mut first_error = None;
         let fetch = |url: &str, _cap: u64| {
@@ -1416,6 +1493,45 @@ mod tests {
         let error =
             fetch_run(slug, (2, 1), &by_url(&fetch), None, None, &mut first_error).unwrap_err();
         assert!(error.contains("HTTP 504"), "{error}");
+
+        for unavailable in [false, true] {
+            for (failed_asset, earlier_absent) in [
+                ("index.toml", false),
+                ("index.toml.sig", false),
+                (ROSTER_ASSET, false),
+                (ROSTER_SIG_ASSET, false),
+                ("index.toml.sig", true),
+                (ROSTER_ASSET, true),
+                (ROSTER_SIG_ASSET, true),
+            ] {
+                let mut first_error = None;
+                let detail = if unavailable { "HTTP 504" } else { "HTTP 403" };
+                let fetch = |asset: &Named, _cap: u64| {
+                    if asset.tag == "atpkg-index-2" {
+                        if asset.name == failed_asset {
+                            return Err(if unavailable {
+                                AssetError::Unavailable {
+                                    web: detail.into(),
+                                    api: "the API route did not deliver".into(),
+                                }
+                            } else {
+                                AssetError::Refused(format!("{detail}: a proxy refused the asset"))
+                            });
+                        }
+                        if earlier_absent && asset.name == "index.toml" {
+                            return Err(AssetError::Absent("HTTP 404: no index asset".into()));
+                        }
+                    }
+                    Ok(asset.web_url().into_bytes())
+                };
+                let error = fetch_run(slug, (2, 1), &fetch, None, None, &mut first_error)
+                    .expect_err("a newest quad acquisition failure must not select an older index");
+                assert!(
+                    error.contains(detail),
+                    "{failed_asset}, earlier absence={earlier_absent}: {error}"
+                );
+            }
+        }
 
         let mut first_error = None;
         let absent = |url: &str, _cap: u64| {

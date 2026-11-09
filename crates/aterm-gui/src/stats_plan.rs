@@ -3920,11 +3920,25 @@ mod tests {
 
     /// [`legend_machine`] with the blocks' cells drawing the over mark as `over` says.
     fn legend_machine_over(
-        (form, full, folded): (DeckForm, &FullPlan, &FoldedPlan),
+        at: (DeckForm, &FullPlan, &FoldedPlan),
         totals: &[TotalsForm],
         over: [bool; 2],
         m: &FaceMetrics,
     ) -> Option<String> {
+        legend_heads_over(at, totals, over, m)
+            .into_iter()
+            .next()
+            .map(|h| h.0)
+    }
+
+    /// The legend's names and where each ends ([`heads`]) in the header [`legend_machine_over`]
+    /// reads the machine's name from.
+    fn legend_heads_over(
+        (form, full, folded): (DeckForm, &FullPlan, &FoldedPlan),
+        totals: &[TotalsForm],
+        over: [bool; 2],
+        m: &FaceMetrics,
+    ) -> Vec<(String, f64)> {
         let text = HeaderText {
             totals,
             over,
@@ -3934,7 +3948,7 @@ mod tests {
             DeckForm::Full => header_full(full, text, None, m),
             DeckForm::Folded => header_folded(folded, text, [None, None], m),
         };
-        heads(&head, m).into_iter().next().map(|h| h.0)
+        heads(&head, m)
     }
 
     /// Which of `totals` the machine's name says (`this Mac · …`), or `None` for the name alone.
@@ -4068,11 +4082,20 @@ mod tests {
             let said = |totals: &[TotalsForm], over: [bool; 2]| {
                 form_of(legend_machine_over(at, totals, over, &m).as_deref(), totals)
             };
-            let forms: Vec<Option<usize>> = overs
+            // Each reading under each over mark: its legend's names, its form read off the first.
+            let legends = overs
                 .iter()
                 .flat_map(|&over| measured.iter().map(move |t| (t, over)))
-                .map(|(t, over)| said(t, over))
-                .collect();
+                .map(|(t, over)| {
+                    let legend = legend_heads_over(at, t, over, &m);
+                    (
+                        over,
+                        form_of(legend.first().map(|h| h.0.as_str()), t),
+                        legend,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let forms: Vec<Option<usize>> = legends.iter().map(|(_, form, _)| *form).collect();
             assert!(
                 forms.windows(2).all(|p| p[0] == p[1]),
                 "{form:?} {w} pt: {forms:?}"
@@ -4085,17 +4108,8 @@ mod tests {
                     (folded.blocks[0].meter.bar, folded.blocks[1].meter.end())
             {
                 let hi = b_end.min(folded.blocks[1].at.end());
-                for (totals, over) in overs
-                    .iter()
-                    .flat_map(|&over| measured.iter().map(move |t| (t, over)))
-                {
-                    let text = HeaderText {
-                        totals,
-                        over,
-                        ..TEXT
-                    };
-                    let head = header_folded(&folded, text, [None, None], &m);
-                    if let Some(&(_, end)) = heads(&head, &m).last() {
+                for (over, _, legend) in &legends {
+                    if let Some(&(_, end)) = legend.last() {
                         assert!(
                             (end - hi).abs() < 1e-9,
                             "W {w} {over:?}: the legend ends at {end}"

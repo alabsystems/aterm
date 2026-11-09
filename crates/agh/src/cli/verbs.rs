@@ -421,7 +421,7 @@ pub static VERBS: &[Verb] = &[
         path: &["asset", "fetch-public"],
         class: Class::Read,
         usage: "agh --anonymous asset fetch-public REPO TAG NAME",
-        summary: "stream at most 2 GiB from the public release URL without REST quota",
+        summary: "stream at most 2 GiB from the release URL, else the anonymous API route",
         example: "agh --anonymous asset fetch-public alabsystems/aterm v1 SHA256SUMS",
         noun: Noun::Asset,
         gh: "curl",

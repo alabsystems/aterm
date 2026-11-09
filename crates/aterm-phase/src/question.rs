@@ -981,11 +981,51 @@ pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Opt
 /// The widest row on the screen, in the cells the grid lays it out in ([`cells`]): what the grid
 /// stores in a cell with the character before it (a combining mark, a joiner, a variation
 /// selector) widens no row, so a row drawn to the pane's edge measures the pane, whatever it holds.
+/// One read of a screen asks this of the same rows many times, and the width is a function of the
+/// rows' words alone, so each thread keeps the last [`MEASURED_SCREENS`] it measured.
 pub(crate) fn screen_width(rows: &[String]) -> usize {
+    if rows.iter().map(String::len).sum::<usize>() > MEASURED_SCREEN_BYTES {
+        return widest(rows);
+    }
+    let known = MEASURED.with_borrow(|measured| {
+        measured
+            .iter()
+            .find(|(seen, _)| seen.as_slice() == rows)
+            .map(|&(_, width)| width)
+    });
+    known.unwrap_or_else(|| {
+        let width = widest(rows);
+        MEASURED.with_borrow_mut(|measured| {
+            if measured.len() == MEASURED_SCREENS {
+                measured.pop_front();
+            }
+            measured.push_back((rows.to_vec(), width));
+        });
+        width
+    })
+}
+
+/// [`screen_width`], measured row by row.
+fn widest(rows: &[String]) -> usize {
     rows.iter()
         .map(|r| cells(crate::text::trim_end(r)))
         .max()
         .unwrap_or(0)
+}
+
+/// How many screens each thread keeps its [`screen_width`] of.
+const MEASURED_SCREENS: usize = 4;
+
+/// The most bytes a screen [`MEASURED`] holds has, so that a thread's memory stays small.
+const MEASURED_SCREEN_BYTES: usize = 64 * 1024;
+
+/// A screen's rows, and its width as [`widest`] measured it.
+type MeasuredScreen = (Vec<String>, usize);
+
+thread_local! {
+    /// This thread's last [`MEASURED_SCREENS`] screens [`screen_width`] measured, oldest first.
+    static MEASURED: std::cell::RefCell<std::collections::VecDeque<MeasuredScreen>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// A dialog's head over its options: the question's rows and the tab bar

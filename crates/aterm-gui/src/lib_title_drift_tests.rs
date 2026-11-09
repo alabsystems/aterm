@@ -19,6 +19,43 @@ fn timeline_events(app: &App, session: u64) -> Vec<(&'static str, String)> {
 }
 
 #[test]
+fn a_contended_terminal_keeps_the_last_title_wake_owed() {
+    let mut app = App::headless_for_test();
+    let first = Instant::now();
+    app.observe_title_drift(0, first);
+    let term = app.pool.get(0).unwrap().term.clone();
+    let mut writer = term.lock().unwrap();
+    writer.process(b"\x1b]0;owed-native-title\x07\x1b]7;file://localhost/tmp/owed-native-cwd\x07");
+    let observed = first + DRIFT_REFRESH_MIN_INTERVAL;
+    app.observe_title_drift(0, observed);
+    assert!(
+        app.title_drift.pending.contains(&0),
+        "the last PTY wake must leave its title observation owed while the native writer holds the terminal"
+    );
+    assert!(app.title_drift.due_at(0).is_some());
+    drop(writer);
+    assert!(app.flush_title_drift(0, observed + DRIFT_REFRESH_MIN_INTERVAL));
+    assert!(!app.title_drift.pending.contains(&0));
+    let timeline = app.pool.get(0).unwrap().ctx.timeline.lock().unwrap();
+    let content: Vec<_> = timeline
+        .slog()
+        .log()
+        .window()
+        .map(|row| aterm_slog::encode(row, aterm_slog::Tier::Content).unwrap())
+        .collect();
+    assert!(
+        content.iter().any(|row| row.contains("owed-native-title")),
+        "the actual native title must reach its content row: {content:?}"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|row| row.contains("/tmp/owed-native-cwd")),
+        "the actual native directory must reach its content row: {content:?}"
+    );
+}
+
+#[test]
 fn quiet_cwd_change_flushes_instantly_and_records_before_the_refresh() {
     let mut app = App::headless_for_test();
     let t0 = Instant::now();

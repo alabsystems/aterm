@@ -1833,7 +1833,7 @@ pub fn run_tests(
 ) {
     let mut progress = Progress::new(ctx.events.as_ref(), check);
     progress.enter(Phase::Preparation);
-    if let Err(why) = crate::release_test_env::prepare(ctx) {
+    if let Err(why) = crate::test_env::prepare(ctx) {
         r.cannot_run(format!(
             "cannot prepare release test environment: {why}; no test was run"
         ));
@@ -1898,7 +1898,7 @@ pub fn run_tests(
         |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
     );
     let checkers = check == crate::checks::Check::Checkers || ctx.checkers_in_tests;
-    serial = crate::release_test_env::command(ctx, crate::stages::with_checkers(serial, checkers))
+    serial = crate::test_env::command(ctx, crate::stages::with_checkers(serial, checkers))
         .env(SUBPROCESS_SLOTS_ENV, slots.path());
     let serial = &serial;
     match configured_build_targets(ctx, serial) {
@@ -2584,10 +2584,7 @@ fn run_planned_observed(
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(b.spec.clone(), sha);
             }
-            let cmd = crate::release_test_env::command(
-                ctx,
-                binary_cmd(b, planned.width, checkers, watch),
-            );
+            let cmd = crate::test_env::command(ctx, binary_cmd(b, planned.width, checkers, watch));
             let mut run = exec::run_test(&cmd, env, local_halt);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
@@ -3149,11 +3146,11 @@ mod tests {
     }
 
     #[test]
-    fn broken_subprocess_pool_initialization_refuses_before_test_dispatch() {
+    fn broken_test_home_preparation_refuses_before_test_dispatch() {
         let tmp = aterm_tempfile::tempdir().expect("scratch");
         let events = tmp.path().join("phases.events");
         let scratch = tmp.path().join("not-a-directory");
-        std::fs::write(&scratch, b"retained").expect("block pool initialization");
+        std::fs::write(&scratch, b"retained").expect("block home preparation");
         let ctx = crate::Ctx::new(
             tmp.path().to_path_buf(),
             crate::Scope::workspace(),
@@ -3172,7 +3169,7 @@ mod tests {
         assert!(
             matches!(&report.entries[..], [crate::ladder::Entry::Ladder {
             outcome: crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun), label, ..
-        }] if label.starts_with("cannot initialize shared subprocess pool:"))
+        }] if label.starts_with("cannot prepare release test environment:"))
         );
         assert_eq!(
             std::fs::read(&scratch).expect("retained blocker"),
@@ -3186,7 +3183,7 @@ mod tests {
             .collect();
         assert_eq!(
             phases.last().unwrap()["phase"].as_str(),
-            Some("recording-setup")
+            Some("preparation")
         );
         assert_eq!(
             phases.last().unwrap()["scope_exit"].as_str(),

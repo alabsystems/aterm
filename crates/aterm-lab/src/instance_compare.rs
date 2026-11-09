@@ -104,6 +104,102 @@ pub(super) fn run(args: &[String]) -> Res {
     }
     std::fs::create_dir(&output).map_err(|e| format!("fresh output {}: {e}", output.display()))?;
     let output = std::fs::canonicalize(output).map_err(|e| e.to_string())?;
+    write_receipt(&output, None)
+        .map_err(|error| format!("initialize comparison receipt: {error}"))?;
+    finish(&output, measure(&before, &after, &aterm, &output, samples))
+}
+
+fn write_receipt(output: &Path, result: Option<&Res>) -> std::io::Result<()> {
+    let (state, code, signal, detail) = match result {
+        None => ("running", None, None, None),
+        Some(Ok(code)) => (
+            if *code == 0 { "passed" } else { "failed" },
+            Some(*code),
+            None,
+            None,
+        ),
+        Some(Err(fail)) => (
+            if fail.stopped.is_some() {
+                "interrupted"
+            } else {
+                "failed"
+            },
+            Some(fail.code),
+            fail.stopped,
+            fail.msg.as_deref(),
+        ),
+    };
+    let receipt = aterm_json::json!({
+        "schema": 1, "state": state, "code": code, "signal": signal, "detail": detail,
+    });
+    crate::util::atomic_write(
+        &output.join("result.json"),
+        format!("{receipt}\n").as_bytes(),
+    )
+}
+
+fn finish(output: &Path, result: Res) -> Res {
+    if let Err(error) = write_receipt(output, Some(&result)) {
+        return match result {
+            Ok(_) => Err(Fail::die(format!(
+                "cannot record comparison result: {error}"
+            ))),
+            Err(mut fail) => {
+                fail.msg = Some(format!(
+                    "{}; cannot record comparison result: {error}",
+                    fail.msg.as_deref().unwrap_or("comparison interrupted")
+                ));
+                Err(fail)
+            }
+        };
+    }
+    result
+}
+
+struct Input<'a> {
+    path: &'a Path,
+    sha256: String,
+}
+
+impl<'a> Input<'a> {
+    fn read(path: &'a Path) -> Result<Self, String> {
+        let sha256 = aterm_update_core::sha256_file(path)
+            .map_err(|error| format!("identify {}: {error}", path.display()))?;
+        Ok(Self { path, sha256 })
+    }
+
+    fn record(&self) -> aterm_json::Value {
+        aterm_json::json!({ "path": self.path, "sha256": self.sha256 })
+    }
+
+    fn recheck(&self) -> Result<(), String> {
+        let current = Self::read(self.path)?;
+        if current.sha256 != self.sha256 {
+            return Err(format!(
+                "comparison input changed during measurement: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u32) -> Res {
+    let before_input = Input::read(before)?;
+    let after_input = Input::read(after)?;
+    let aterm_input = Input::read(aterm)?;
+    let inputs = aterm_json::json!({
+        "schema": 1,
+        "before": before_input.record(),
+        "after": after_input.record(),
+        "aterm": aterm_input.record(),
+        "samples": samples,
+    });
+    crate::util::atomic_write(
+        &output.join("inputs.json"),
+        format!("{inputs}\n").as_bytes(),
+    )
+    .map_err(|error| format!("record comparison inputs: {error}"))?;
     let scratch = aterm_tempfile::Builder::new()
         .prefix("ic-")
         .suffix(".noindex")
@@ -131,9 +227,9 @@ pub(super) fn run(args: &[String]) -> Res {
         };
         for sample in 0..trials {
             let arms = if sample % 2 == 0 {
-                [("before", &before), ("after", &after)]
+                [("before", before), ("after", after)]
             } else {
-                [("after", &after), ("before", &before)]
+                [("after", after), ("before", before)]
             };
             for (arm, runner) in arms {
                 crate::stop::check()?;
@@ -152,7 +248,7 @@ pub(super) fn run(args: &[String]) -> Res {
                 command
                     .arg("instance")
                     .arg("--aterm")
-                    .arg(&aterm)
+                    .arg(aterm)
                     .arg("--world")
                     .arg(&world)
                     .arg("--image")
@@ -164,7 +260,7 @@ pub(super) fn run(args: &[String]) -> Res {
                 let start = Instant::now();
                 let ran =
                     aterm_uds::deadline::output_within(&mut command, Duration::from_secs(120))
-                        .map_err(|e| format!("{stem}: {e}"))?;
+                        .map_err(|e| format!("{stem} ({}): {e}", runner.display()))?;
                 crate::stop::check()?;
                 let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
                 std::fs::write(output.join(format!("{stem}.stdout.txt")), &ran.stdout)
@@ -201,18 +297,94 @@ pub(super) fn run(args: &[String]) -> Res {
             }
         }
     }
+    crate::stop::check()?;
     if failed {
         Err(Fail::die(
             "instance compare: candidate violates a capture scenario; see measurements.tsv",
         ))
     } else {
+        for input in [before_input, after_input, aterm_input] {
+            crate::stop::check()?;
+            input.recheck()?;
+        }
+        crate::stop::check()?;
         Ok(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Scenario, dimensions};
+    use super::{Input, Scenario, dimensions, finish, run};
+
+    #[test]
+    fn replacing_input_bytes_without_changing_length_invalidates_the_identity() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("runner");
+        std::fs::write(&path, b"before").unwrap();
+        let input = Input::read(&path).unwrap();
+        assert!(input.recheck().is_ok());
+        std::fs::write(&path, b"after!").unwrap();
+        assert!(input.recheck().is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(input.recheck().is_err());
+    }
+
+    #[test]
+    fn a_receipt_write_failure_keeps_the_original_failure() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let output = scratch.path().join("not-a-directory");
+        std::fs::write(&output, b"occupied").unwrap();
+        let result = finish(&output, Err(crate::Fail::exit(7, "original cause")));
+        let fail = result.err().unwrap();
+        assert_eq!(fail.code, 7);
+        assert!(fail.msg.unwrap().contains("original cause"));
+    }
+
+    #[test]
+    fn a_runner_that_cannot_start_leaves_a_failed_result_receipt() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let runner = scratch.path().join("not-executable");
+        std::fs::write(&runner, b"not an executable\n").unwrap();
+        let after = scratch.path().join("candidate");
+        std::fs::write(&after, b"candidate bytes\n").unwrap();
+        let app = scratch.path().join("app");
+        std::fs::write(&app, b"shared app bytes\n").unwrap();
+        let output = scratch.path().join("results");
+        let args = [
+            "--before".into(),
+            runner.to_string_lossy().into_owned(),
+            "--after".into(),
+            after.to_string_lossy().into_owned(),
+            "--aterm".into(),
+            app.to_string_lossy().into_owned(),
+            "--output".into(),
+            output.to_string_lossy().into_owned(),
+            "--samples".into(),
+            "1".into(),
+        ];
+        assert!(run(&args).is_err());
+        let text = std::fs::read_to_string(output.join("result.json")).unwrap();
+        let receipt: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+        assert_eq!(receipt["state"].as_str(), Some("failed"));
+        let inputs: aterm_json::Value =
+            aterm_json::from_str(&std::fs::read_to_string(output.join("inputs.json")).unwrap())
+                .unwrap();
+        assert_eq!(inputs["samples"].as_u64(), Some(1));
+        for (arm, path) in [("before", &runner), ("after", &after), ("aterm", &app)] {
+            let canonical_path = std::fs::canonicalize(path).unwrap();
+            assert_eq!(inputs[arm]["path"].as_str(), canonical_path.to_str());
+            assert_eq!(
+                inputs[arm]["sha256"].as_str(),
+                Some(aterm_update_core::sha256_file(path).unwrap().as_str())
+            );
+        }
+        assert!(
+            receipt["detail"]
+                .as_str()
+                .unwrap()
+                .contains("warmup-before-0")
+        );
+    }
 
     #[test]
     fn a_corrupt_image_is_not_an_absent_image() {

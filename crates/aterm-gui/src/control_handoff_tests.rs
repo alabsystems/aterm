@@ -190,8 +190,10 @@ impl LaneService for Captures {
 
 fn lanes(limits: LaneLimits, stub: &Arc<Captures>) -> Arc<Lanes> {
     let lanes = Lanes::new(limits);
-    assert_eq!(lanes.start().rpc, limits.rpc, "every request lane started");
+    let started = lanes.start();
+    assert_eq!(started.rpc, limits.rpc, "every request lane started");
     lanes.publish(Arc::clone(stub) as Arc<dyn LaneService>);
+    started.activate();
     lanes
 }
 

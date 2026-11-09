@@ -182,15 +182,16 @@ impl WindowLights {
 }
 
 impl App {
-    /// `aterm ctl chrome`'s `a11y` lines (a development build's): each window's Autopilot chip
-    /// nodes as its grid's accessibility tree is built for the adapter
-    /// ([`crate::a11y_tree::harness_node_lines`] over [`App::grid_a11y_tree`], the tree
-    /// `push_a11y_tree_with_plan` hands a terminal tab's window), so a check reads the node a
-    /// screen reader is handed, not the words beside it. A window with an overlay open, whose tree
-    /// is the overlay's, says none.
+    /// `aterm ctl chrome`'s `a11y` lines (a development build's): first, once, the kinds of node
+    /// this build reports ([`crate::a11y_tree::harness_kinds_line`], whatever any window shows),
+    /// then each window's Autopilot and Account chip nodes as its grid's accessibility tree is
+    /// built for the adapter ([`crate::a11y_tree::harness_node_lines`] over
+    /// [`App::grid_a11y_tree`], the tree `push_a11y_tree_with_plan` hands a terminal tab's window),
+    /// so a check reads the node a screen reader is handed, not the words beside it. A window with
+    /// an overlay open, whose tree is the overlay's, says no node; the kinds line stands.
     #[cfg(all(a11y_tree, any(test, debug_assertions)))]
     pub(crate) fn harness_a11y_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+        let mut lines = vec![crate::a11y_tree::harness_kinds_line()];
         for (&wid, ws) in &self.windows {
             if ws.overlay.is_some() {
                 continue;

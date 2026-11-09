@@ -2725,3 +2725,36 @@ fn a_row_the_grid_reads_back_is_counted_in_the_cells_it_paints() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// A SCREEN IS MEASURED BY ITS OWN ROWS, HOWEVER MANY SCREENS A THREAD MEASURED BEFORE: two screens
+/// alike but for a later row's width each get their own width, a screen measured again gets the
+/// width it got, and so does each once more screens than the thread keeps came between, or once
+/// it is too big to keep.
+#[test]
+fn a_screen_is_measured_by_its_own_rows_however_often_it_is_read() {
+    let screen = |last: &str| -> Vec<String> {
+        ["╭─────╮", "│ ✻ a │", "╰─────╯", last]
+            .map(str::to_owned)
+            .to_vec()
+    };
+    let (narrow, wide) = (screen("❯ b"), screen("❯ a reply that runs past the box"));
+    let (n, w) = (widest(&narrow), widest(&wide));
+    assert_ne!(n, w, "PRECONDITION: the screens");
+    for _ in 0..2 {
+        assert_eq!(screen_width(&narrow), n);
+        assert_eq!(screen_width(&wide), w);
+    }
+    let others: Vec<Vec<String>> = (0..=MEASURED_SCREENS)
+        .map(|n| screen(&"─".repeat(n + 1)))
+        .collect();
+    for other in &others {
+        assert_eq!(screen_width(other), widest(other));
+    }
+    assert_eq!(screen_width(&wide), w);
+    assert_eq!(screen_width(&narrow), n);
+    let big = vec!["│ ✻ ─".to_owned(); MEASURED_SCREEN_BYTES / 4];
+    for big in [big.clone(), [big, wide].concat()] {
+        assert_eq!(screen_width(&big), widest(&big));
+        assert_eq!(screen_width(&big), widest(&big));
+    }
+}

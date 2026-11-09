@@ -4531,7 +4531,7 @@ const AUTHOR_OBSERVE: Duration = Duration::from_secs(60);
 /// records under [`StateLock`], re-drafting up to 3 times if concurrent peer ingress extended
 /// `paths.records_file()` while signing. A batch that cannot be held whole is not written.
 ///
-/// The snapshot and the draft's reads share one observation of the state ([`super::Drafting`]),
+/// The snapshot and the draft's reads share one observation of the state ([`super::Observing`]),
 /// which waits up to [`AUTHOR_OBSERVE`] for a vault pass that holds it. A removal, an undo or a
 /// re-key that meets its own Mac's subscriber applying waits for the pass. Otherwise its draft's
 /// signer read would find the state busy and refuse the act. The observation ends before the
@@ -4576,13 +4576,13 @@ pub(super) fn author_and_commit_records<T>(
 fn draft_observation(
     paths: &Paths,
     deadline: Option<Instant>,
-) -> crate::Result<Option<super::Drafting>> {
+) -> crate::Result<Option<super::Observing>> {
     // A lock an older build left wide is narrowed first, as the draft's own signer read narrows
     // it: the observation refuses a wide lock.
     StateLock::narrow_owned(paths)?;
     let until = deadline.unwrap_or_else(|| Instant::now() + AUTHOR_OBSERVE);
     match StateLock::observe_until(paths, until)? {
-        Some(lock) => Ok(Some(super::Drafting::new(lock, paths))),
+        Some(lock) => Ok(Some(super::Observing::new(lock, paths))),
         None if !paths.lock_file().exists() => Ok(None),
         None if deadline.is_some() => Err(Error::new(
             "a vault pass still held this Mac's state at the deadline: run it again",
@@ -4683,7 +4683,7 @@ pub(super) fn author_and_commit_records_until<T>(
         let Some(observation) = StateLock::observe_until(paths, deadline)? else {
             return Ok(None);
         };
-        let observation = super::Drafting::new(observation, paths);
+        let observation = super::Observing::new(observation, paths);
         let raw = super::load_records(paths)?;
         let before = raw.inventory();
         let snapshot = author_snapshot(paths, raw)?;
@@ -7791,10 +7791,10 @@ pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<R
 pub(super) fn look_until(
     paths: &Paths,
     deadline: Instant,
-) -> crate::Result<Option<Option<super::Drafting>>> {
+) -> crate::Result<Option<Option<super::Observing>>> {
     StateLock::narrow_owned(paths)?;
     match StateLock::observe_until(paths, deadline)? {
-        Some(lock) => Ok(Some(Some(super::Drafting::new(lock, paths)))),
+        Some(lock) => Ok(Some(Some(super::Observing::new(lock, paths)))),
         None if paths.lock_file().exists() => Ok(None),
         None => Ok(Some(None)),
     }

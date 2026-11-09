@@ -124,7 +124,7 @@ impl MemberCustody for Fixture {
     fn return_producer(
         &mut self,
         retirement: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
+    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
         let returned = (|| {
             self.validate()?;
             retirement.check_fixture(&mut self.root, &binding())?;
@@ -135,7 +135,7 @@ impl MemberCustody for Fixture {
                 self.producer_returns += 1;
                 Ok(retirement.returned_fixture())
             }
-            Err(_) => Err(retirement),
+            Err(error) => Err((error, retirement)),
         }
     }
     fn before_arm(&mut self) -> io::Result<()> {
@@ -930,8 +930,13 @@ fn native_producer_return_control(lose_owner: bool) {
         fixture.input.take();
         fixture.root.child_mut().wait().unwrap();
         fixture.defer_return = false;
+        member.failure = None;
         let progress = member.poll(&mut fixture, None);
         assert!(!progress.retired && progress.uncertain);
+        assert!(
+            member.failure().is_some(),
+            "retain the original return error"
+        );
         assert!(member.producer_retirement.is_some());
         assert_eq!(fixture.producer_returns, 0);
         drop(member);

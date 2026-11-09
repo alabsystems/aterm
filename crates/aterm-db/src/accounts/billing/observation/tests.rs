@@ -16,7 +16,31 @@ pub(crate) struct Fixture {
     serial: Cell<u8>,
 }
 
+/// A fixture built once for a walk whose steps each take a copy ([`Self::fork`]): its lab and
+/// its next serial, which a walk's threads can share.
+pub(crate) struct Built {
+    lab: Lab,
+    serial: u8,
+}
+
+impl Built {
+    /// A fixture of its own, on a copy of this one's lab, that goes on from this one's serial.
+    fn fork(&self) -> Fixture {
+        Fixture {
+            lab: self.lab.fork(),
+            serial: Cell::new(self.serial),
+        }
+    }
+}
+
 impl Fixture {
+    fn built(self) -> Built {
+        Built {
+            lab: self.lab,
+            serial: self.serial.get(),
+        }
+    }
+
     fn new(machines: usize) -> Self {
         let lab = Lab::new(&vec![Role::Writer; machines]);
         let f = Self {

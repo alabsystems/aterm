@@ -209,9 +209,9 @@ pub use steward::{
 };
 pub use subscriber::mend_subscriber;
 pub use vault_memo::{
-    DeskInputs, acknowledged_commons_log_now, desk_inputs, local_swarm_roster_for_log_now,
-    swarm_denial_snapshot_now, swarm_denied_nodes_now, swarm_roster_now_until,
-    trusted_commons_log_now,
+    DeskInputs, VaultLook, acknowledged_commons_log_now, desk_inputs,
+    local_swarm_roster_for_log_now, swarm_denial_snapshot_now, swarm_denied_nodes_now,
+    swarm_roster_now_until, trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
     local_recipient_denied_under, observe_commons_now, observe_commons_quiet,
@@ -962,44 +962,51 @@ enum StateObservation {
 
 #[cfg(debug_assertions)]
 std::thread_local! {
-    /// The state lock files a local author on this thread observes across its draft
-    /// ([`Drafting`]).
-    static DRAFTING: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The state lock files this thread observes across reads that must see one state
+    /// ([`Observing`]).
+    static OBSERVING: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A shared observation of this Mac's state a local author holds across its snapshot and draft
-/// (`log_entries::author_and_commit_records` and its bounded variant): no vault pass takes the
-/// state mid-draft, so the draft's own reads of it (its signer, its roster) see the state its
-/// snapshot was read from rather than finding it busy. The author drops it before any exclusive
-/// take of the same lock. flock(2) grants this thread neither lock while it holds the other, so
-/// in a build with debug assertions an exclusive take of the lock on this thread under it panics
-/// rather than wait on it for good.
-pub(crate) struct Drafting {
-    _lock: StateLock,
+/// A shared observation of this Mac's state a thread holds across reads that must see one state:
+/// a local author's, across its snapshot and draft (`log_entries::author_and_commit_records`, its
+/// bounded variant and a publish's draft), so no vault pass takes the state mid-draft and the
+/// draft's own reads of it (its signer, its roster) see the state its snapshot was read from
+/// rather than finding it busy; a pass's look, until it is done reading
+/// (`log_entries::look_until`); and a vault look's, across the memos it asks ([`VaultLook`]). The
+/// holder drops it before any exclusive take of the same lock. flock(2) grants this thread neither lock while it holds the
+/// other, so in a build with debug assertions an exclusive take of the lock on this thread under
+/// it panics rather than wait on it for good.
+pub(crate) struct Observing {
+    lock: StateLock,
     #[cfg(debug_assertions)]
     path: PathBuf,
 }
 
-impl Drafting {
+impl Observing {
     fn new(lock: StateLock, paths: &Paths) -> Self {
         #[cfg(debug_assertions)]
         let path = paths.lock_file();
         #[cfg(debug_assertions)]
-        DRAFTING.with(|held| held.borrow_mut().push(path.clone()));
+        OBSERVING.with(|held| held.borrow_mut().push(path.clone()));
         #[cfg(not(debug_assertions))]
         let _ = paths;
         Self {
-            _lock: lock,
+            lock,
             #[cfg(debug_assertions)]
             path,
         }
     }
+
+    /// The observation itself.
+    const fn lock(&self) -> &StateLock {
+        &self.lock
+    }
 }
 
 #[cfg(debug_assertions)]
-impl Drop for Drafting {
+impl Drop for Observing {
     fn drop(&mut self) {
-        DRAFTING.with(|held| {
+        OBSERVING.with(|held| {
             let mut held = held.borrow_mut();
             if let Some(at) = held.iter().rposition(|path| *path == self.path) {
                 held.remove(at);
@@ -1027,14 +1034,14 @@ impl StateLock {
     }
 
     /// Panics where an exclusive take of the lock at `path` would wait on this thread's own
-    /// [`Drafting`] observation of it for good.
+    /// observation of it ([`Observing`]) for good.
     #[cfg(debug_assertions)]
-    fn not_under_own_draft(path: &Path) {
-        DRAFTING.with(|held| {
+    fn not_under_own_observation(path: &Path) {
+        OBSERVING.with(|held| {
             assert!(
-                !held.borrow().iter().any(|drafting| drafting == path),
-                "an exclusive take of {} under this thread's own draft observation of it waits \
-                 for good: drop the observation first",
+                !held.borrow().iter().any(|observing| observing == path),
+                "an exclusive take of {} under this thread's own observation of it waits for \
+                 good: drop the observation first",
                 path.display()
             );
         });
@@ -1070,7 +1077,7 @@ impl StateLock {
     /// [`StateLock::take`] of the lock file at `path` in `paths.dir` ([`publish_lock`]).
     fn take_at(paths: &Paths, path: &Path) -> crate::Result<StateLock> {
         #[cfg(debug_assertions)]
-        Self::not_under_own_draft(path);
+        Self::not_under_own_observation(path);
         loop {
             let file: std::fs::File = Self::open_lock_file(paths, path)?;
             #[expect(
@@ -1100,7 +1107,7 @@ impl StateLock {
 
     fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
         #[cfg(debug_assertions)]
-        Self::not_under_own_draft(path);
+        Self::not_under_own_observation(path);
         publication_current(Some(deadline))?;
         let lock = loop {
             let file: std::fs::File = Self::open_lock_file(paths, path)?;
@@ -1125,7 +1132,7 @@ impl StateLock {
     fn try_take(paths: &Paths) -> crate::Result<Option<StateLock>> {
         let path = paths.lock_file();
         #[cfg(debug_assertions)]
-        Self::not_under_own_draft(&path);
+        Self::not_under_own_observation(&path);
         loop {
             let file: std::fs::File = Self::open_lock_file(paths, &path)?;
             #[expect(
@@ -1151,7 +1158,7 @@ impl StateLock {
     fn try_take_existing(paths: &Paths) -> crate::Result<Option<StateLock>> {
         use std::os::unix::fs::MetadataExt as _;
         #[cfg(debug_assertions)]
-        Self::not_under_own_draft(&paths.lock_file());
+        Self::not_under_own_observation(&paths.lock_file());
         let Some((file, metadata)) = Self::open_existing(paths, true)? else {
             return Ok(None);
         };
@@ -2617,6 +2624,15 @@ fn source_identity(config: &Config) -> [u8; 32] {
         identity.push(0);
     }
     sha256(&identity)
+}
+
+/// The source identity a Mac's `state.toml` binds its applied version to, for a test fixture in
+/// another crate that moves a Mac's vault and binds its state to the new path (aterm-db's
+/// `Lab::fork`).
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn test_source_identity(config: &Config) -> [u8; 32] {
+    source_identity(config)
 }
 
 fn source_bound(config: &Config, state: &State) -> bool {

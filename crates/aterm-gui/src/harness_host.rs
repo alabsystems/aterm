@@ -10623,10 +10623,15 @@ fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bo
             }
         );
     }
-    if snap
-        .as_ref()
-        .and_then(|snap| snap.session.as_deref())
-        .is_some_and(lost_session)
+    // Only a publish that moved changes what [`held_again`] reads (the pid and the conversation,
+    // both of the carried restore `moved` compares), and a word that stands after the publish
+    // rings as it stands ([`lose`]). A ring on every republish would wake the host into another
+    // follow and republish for as long as the word stood.
+    if moved
+        && snap
+            .as_ref()
+            .and_then(|snap| snap.session.as_deref())
+            .is_some_and(lost_session)
     {
         ring();
     }
@@ -12675,6 +12680,9 @@ fn lose(sid: &str, job: &WorkerJob, lost: Lost) -> Option<Lost> {
     {
         forget_lost(stale, sid);
     }
+    // The conversation may be held already, by a publish that rang before the word stood: the
+    // host's next pass ends the word then ([`end_lost_words`]), not at some later wake.
+    ring();
     before
 }
 

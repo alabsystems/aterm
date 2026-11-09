@@ -291,6 +291,7 @@ impl Rig {
         );
         let stub = Arc::new(Stub::default());
         lanes.publish(Arc::clone(&stub) as Arc<dyn LaneService>);
+        started.activate();
         Self { lanes, stub }
     }
 

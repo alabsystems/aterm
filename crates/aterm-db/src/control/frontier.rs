@@ -247,7 +247,7 @@ impl View {
         let (outcome, held, why) = match custody {
             super::Custody::None => (Read::Absent, None, None),
             super::Custody::Log(paths) | super::Custody::Journal(paths) => {
-                match super::held_records(paths) {
+                match super::held_records(&aterm_secrets::client::VaultLook::new(paths)) {
                     Err(error) => (
                         Read::Unread,
                         None,

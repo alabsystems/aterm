@@ -1445,6 +1445,10 @@ impl Backend for World {
         self.calls.push("verify-line".into());
         self.line_verify.clone()
     }
+    fn failure_hints(&mut self, line: &Line, _evidence: &str, _logs: &[String]) -> Vec<String> {
+        self.calls.push(format!("failure-hints {}", line.head()));
+        vec![format!("fixture main fix hint for {}", line.head())]
+    }
     fn sync(&mut self) -> Result<String, Refusal> {
         self.calls.push("sync".into());
         Ok("engine synced".into())
@@ -5460,6 +5464,13 @@ fn a_red_leaves_an_export_whose_push_began_to_finish() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
     assert!(
+        w.out
+            .iter()
+            .any(|row| row.contains("fixture main fix hint")),
+        "{:#?}",
+        w.out
+    );
+    assert!(
         last.starts_with("REFUSED at 4/10 qualify") && last.contains("FAILED test"),
         "{last}"
     );
@@ -6018,6 +6029,13 @@ fn a_fail_is_never_rerolled_into_a_pass() {
         "names the check and its log: {last}"
     );
     assert!(last.contains("a new hop changes the tree"), "{last}");
+    assert!(
+        w.calls
+            .iter()
+            .any(|call| call.starts_with("failure-hints ")),
+        "a stored FAIL on resume also searches main: {:?}",
+        w.calls
+    );
     assert!(
         last.contains("--fix") && !last.contains("--commit origin/main"),
         "the FAIL's remedy carries a landed fix onto the line: {last}"

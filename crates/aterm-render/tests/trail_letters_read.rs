@@ -443,6 +443,11 @@ pub struct Coat {
     /// col)`: the box read as `aterm-lab trail-companion` reads a gallery frame's (its
     /// `on_letters`), whatever of the box the body's art fills.
     pub box_cells: Vec<(usize, usize)>,
+    /// How far across into those cells the box reaches, px: of each, its overlap across the
+    /// cell's width, and of them the most (`0`: it meets none). Read as the effects replay reads
+    /// it (`steam_tests::reach_of`): a box a pixel down into a lettered row reaches across every
+    /// cell of it under its width.
+    pub box_reach: usize,
     /// The caret cell's pixels the body covers.
     pub caret_px: usize,
     /// The word icons on glass, frame px, and the pixels of the pet's box that meet them.
@@ -667,10 +672,21 @@ impl Replay {
         style: &str,
         look: Look,
         trail_color: TrailColor,
-        (rows, cols): (u16, u16),
+        grid: (u16, u16),
     ) -> Self {
         let rend = Renderer::from_system(px, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature");
+        Self::gridded_on(rend, style, look, trail_color, grid)
+    }
+
+    /// [`Replay::gridded`] drawn by `rend`: in its face, on the cell it lays.
+    pub fn gridded_on(
+        rend: Renderer,
+        style: &str,
+        look: Look,
+        trail_color: TrailColor,
+        (rows, cols): (u16, u16),
+    ) -> Self {
         let (cw, ch) = rend.cell_size();
         let mut term = Terminal::new(rows, cols);
         let rgb = |c: u32| Rgb {
@@ -917,6 +933,8 @@ impl Replay {
                             && (y0 + ch) as i32 > qy0
                         {
                             coat.box_cells.push((row, col));
+                            let across = ((x0 + cw) as i32).min(qx1) - (x0 as i32).max(qx0);
+                            coat.box_reach = coat.box_reach.max(across as usize);
                         }
                         // `on_body` holds nowhere outside the box.
                         let mut n = 0usize;

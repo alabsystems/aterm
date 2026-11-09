@@ -1058,12 +1058,6 @@ fn aterms_own_stopped_sync_asks_no_press_and_is_mended_by_itself() {
 #[test]
 fn no_text_is_cut_at_any_real_window_size() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    let field = |line: &str, name: &str| -> usize {
-        line.split_whitespace()
-            .find_map(|part| part.strip_prefix(&format!("{name}=")))
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0)
-    };
     let mut cut = Vec::new();
     for name in FIXTURES {
         let mut app = reading(&status_of(name));
@@ -1075,19 +1069,14 @@ fn no_text_is_cut_at_any_real_window_size() {
                 }
                 for (open, view) in &views {
                     let compiled = compile_in(&app, view, width, height);
-                    let audit = compiled.paint_audit_lines();
-                    let head = &audit[0];
-                    let (overflow, overlaps) = (field(head, "overflow"), field(head, "overlaps"));
-                    if overflow + overlaps > 0 {
-                        let what: Vec<String> = compiled
-                            .fit_failures()
-                            .into_iter()
-                            .filter(|line| !line.starts_with("paint-node"))
-                            .take(3)
-                            .collect();
-                        cut.push(format!(
-                            "{name} {width}x{height} open={open}: overflow={overflow} overlaps={overlaps} {what:?}"
-                        ));
+                    let what: Vec<String> = compiled
+                        .fit_failures()
+                        .into_iter()
+                        .filter(|line| !line.starts_with("paint-node"))
+                        .take(3)
+                        .collect();
+                    if !what.is_empty() {
+                        cut.push(format!("{name} {width}x{height} open={open}: {what:?}"));
                     }
                 }
             }

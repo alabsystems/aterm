@@ -4,17 +4,20 @@
 //! Idle-capacity main sampling. The controller renews a remote lease while a disposable
 //! process group judges one immutable tree with that tree's tools. Only journal records leave it.
 
-use crate::judged::{self, Decision, Record, Row, git};
-use aterm_uds::spawnfd::{Stdio, Tether as _};
+use crate::judged::{self, Decision, Record, Row};
+use aterm_uds::spawnfd::Tether as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "watch_census.rs"]
+mod census;
 #[path = "watch_service.rs"]
 mod service;
 
 const HELP: &str = "verify watch [--workspace DIR] [--remote NAME] [--branch BRANCH] [--once] [--interval SECONDS]\n\
+verify watch --census REF reads terminal states and causes from a fetched journal snapshot.\n\
 verify watch --install [--workspace DIR] [--interval SECONDS] installs a persistent macOS main lane.\n\
 Samples origin/main in a dedicated persistent clone at Background rank. Claims and verdicts\n\
 are appended to refs/aterm/judged (14 days of records). A release ends the sample; Ordinary\n\
@@ -57,7 +60,12 @@ fn background_entry_with(
         command.spawn()?.wait()
     };
     Some(match run() {
-        Ok(status) => background_status(status),
+        Ok(status) => {
+            if !status.success() {
+                eprintln!("verify background child: {status}");
+            }
+            background_status(status)
+        }
         Err(why) => {
             eprintln!("verify: --background could not enter its dedicated process group: {why}");
             crate::exit::COULD_NOT_RUN
@@ -129,9 +137,26 @@ fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    judged::git(root, args).map_err(|why| format!("git {}: {why}", args.join(" ")))
+}
+
 /// The lane controller. An internal sample bootstrap is always launched in its own process group;
 /// it replaces itself with the verifier built from the sampled head before orchestration begins.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
+    if args.first().is_some_and(|s| s == "--census") {
+        return match args
+            .get(1)
+            .ok_or("--census requires a fetched journal ref".into())
+            .and_then(|head| census::run(cwd, head))
+        {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("verify watch census: {why}");
+                3
+            }
+        };
+    }
     if args.first().is_some_and(|s| s == "--install") {
         return match options(&args[1..], cwd).and_then(|o| service::install(&o, cwd)) {
             Ok(()) => 0,
@@ -286,6 +311,7 @@ fn attempt(opts: &Options) -> Result<(), String> {
         inputs: String::new(),
         token: aterm_uds::rand::hex_token::<16>().map_err(|e| e.to_string())?,
         state: "judging".into(),
+        cause: String::new(),
         started,
         updated: started,
         lease_until: started + judged::LEASE,
@@ -307,6 +333,7 @@ fn attempt(opts: &Options) -> Result<(), String> {
     let result = judge(root, &mut record);
     if let Err(why) = result {
         record.state = "could-not-run".into();
+        record.cause = why.clone();
         record.rows.push(Row {
             id: "lane".into(),
             outcome: "could-not-run".into(),
@@ -321,11 +348,12 @@ fn attempt(opts: &Options) -> Result<(), String> {
     record.lease_until = 0;
     publish_owned(root, &record, judged::deadline()).map_err(|e| e.to_string())?;
     println!(
-        "verify watch: {} {} elapsed_s={} (journal {})",
+        "verify watch: {} {} elapsed_s={} (journal {}) cause={:?}",
         record.state,
         record.commit,
         record.updated.saturating_sub(record.started),
-        judged::REF
+        judged::REF,
+        record.cause
     );
     Ok(())
 }
@@ -572,8 +600,9 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
     cmd.current_dir(root)
         .args(["watch", "--sample"])
         .arg(&result);
-    cmd.stdout(File::create(log).map_err(|e| e.to_string())?)
-        .stderr(Stdio::inherit());
+    let output = File::create(&log).map_err(|e| e.to_string())?;
+    cmd.stderr(output.try_clone().map_err(|e| e.to_string())?)
+        .stdout(output);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let began = Instant::now();
     let mut renewal = Renewal::new(
@@ -586,9 +615,10 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        if stopped.caught().is_some() {
+        if let Some(signal) = stopped.caught() {
             stop_sample(&mut child)?;
             record.state = "cancelled".into();
+            record.cause = format!("controller signal={signal}; sender unavailable");
             return Ok(());
         }
         let proposed = Instant::now();
@@ -615,10 +645,22 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
     };
     if !status.success() {
         if status.code().is_none() || status.code() == Some(75) {
-            record.state = "cancelled".into();
+            cancel_record(
+                record,
+                status,
+                &fs::read_to_string(&log).unwrap_or_default(),
+            );
             return Ok(());
         }
-        return Err(format!("sample exited {status}; see .git/watch-sample.log"));
+        return Err(format!(
+            "sample exited {status}: {}",
+            row(
+                "sample",
+                status.code(),
+                &fs::read_to_string(&log).unwrap_or_default()
+            )
+            .log
+        ));
     }
     let text = fs::read_to_string(result).map_err(|error| error.to_string())?;
     accept_sample_result(&text, record)
@@ -635,7 +677,24 @@ fn accept_sample_result(text: &str, record: &mut Record) -> Result<(), String> {
     record.verifier = sample.verifier;
     record.inputs = sample.inputs;
     record.rows = sample.rows;
+    record.cause = record
+        .rows
+        .iter()
+        .filter(|row| row.outcome == "could-not-run")
+        .map(|row| format!("{}: {}", row.id, row.log))
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(())
+}
+
+fn cancel_record(record: &mut Record, status: std::process::ExitStatus, log: &str) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let log = row("sample", Some(75), log).log;
+    record.state = "cancelled".into();
+    record.cause = match status.signal() {
+        Some(signal) => format!("sample signal={signal}; sender unavailable\n{log}"),
+        None => format!("sample exit=75; refusal or cooperative stop\n{log}"),
+    };
 }
 
 fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
@@ -798,7 +857,10 @@ fn run_candidate_build(
         aterm_capacity::Admit::Preemptible,
     ) {
         Ok(claim) => claim,
-        Err(aterm_capacity::Error::Stopped { .. }) => return Ok(None),
+        Err(why @ aterm_capacity::Error::Stopped { .. }) => {
+            eprintln!("watch candidate admission stopped: {why}");
+            return Ok(None);
+        }
         Err(why) => return Err(why.to_string()),
     };
     let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
@@ -889,7 +951,10 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
             aterm_capacity::Admit::Preemptible,
         ) {
             Ok(claim) => claim,
-            Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+            Err(why @ aterm_capacity::Error::Stopped { .. }) => {
+                eprintln!("watch bootstrap admission stopped: {why}");
+                return Ok(false);
+            }
             Err(why) => return Err(why.to_string()),
         };
         let env = crate::EnvSnapshot::capture();
@@ -917,6 +982,10 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         fs::write(root.join(".git/watch-candidate.log"), &built.ran.output)
             .map_err(|e| e.to_string())?;
         if built.ran.code == Some(75) || crate::exec::group::stopping() {
+            eprintln!(
+                "watch bootstrap stopped: code={:?}\n{}",
+                built.ran.code, built.ran.output
+            );
             return Ok(false);
         }
         if !built.ran.ok {
@@ -950,9 +1019,13 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         next
     };
     if !is_test_handoff && running_should_stop(root)? {
+        eprintln!(
+            "watch bootstrap handoff: Release capacity or live line claim requested preemption"
+        );
         return Ok(false);
     }
     if !crate::exec::group::default_interrupts_for_exec() {
+        eprintln!("watch bootstrap handoff: pending interrupt prevented exec");
         return Ok(false);
     }
     let error = next.exec();
@@ -1053,7 +1126,10 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
         aterm_capacity::Admit::Preemptible,
     ) {
         Ok(claim) => claim,
-        Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+        Err(why @ aterm_capacity::Error::Stopped { .. }) => {
+            eprintln!("watch sample lifecycle admission stopped: {why}");
+            return Ok(false);
+        }
         Err(why) => return Err(why.to_string()),
     };
     let env = crate::EnvSnapshot::capture();
@@ -1085,6 +1161,9 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
     ];
     for (id, args) in stages {
         if running_should_stop(root)? {
+            eprintln!(
+                "watch before stage={id}: Release capacity or live line claim requested preemption"
+            );
             return Ok(false);
         }
         let admitted_at = Instant::now();
@@ -1097,7 +1176,10 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
                     aterm_capacity::Admit::Preemptible,
                 ) {
                     Ok(claim) => claim,
-                    Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+                    Err(why @ aterm_capacity::Error::Stopped { .. }) => {
+                        eprintln!("watch stage={id} admission stopped: {why}");
+                        return Ok(false);
+                    }
                     Err(why) => return Err(why.to_string()),
                 },
             )
@@ -1174,6 +1256,10 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
         };
         fs::write(&log, &ran.output).map_err(|e| e.to_string())?;
         if ran.code == Some(75) || crate::exec::group::stopping() {
+            eprintln!(
+                "watch stage={id} stopped: code={:?}\n{}",
+                ran.code, ran.output
+            );
             return Ok(false);
         }
         let mut row = row(id, ran.code, &ran.output);
@@ -1630,6 +1716,43 @@ fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTre
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_planted_signal_is_named_in_the_portable_cause() {
+        const CHILD: &str = "ATERM_VERIFY_CAUSE_SIGNAL_CHILD";
+        const TEST: &str = "watch::tests::a_planted_signal_is_named_in_the_portable_cause";
+        if std::env::var_os(CHILD).is_some() {
+            aterm_uds::process::kill_self_now();
+        }
+        let status = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap()
+            .wait()
+            .unwrap();
+        let mut record: Record = aterm_toml::from_str("commit='c'\ntree='t'\nhost='h'\nverifier=''\ninputs=''\ntoken='k'\nstate='judging'\nstarted=0\nupdated=1\nlease_until=0\nrows=[]").unwrap();
+        cancel_record(&mut record, status, "planted signal control");
+        let portable = aterm_toml::to_string(&record).unwrap();
+        let record: Record = aterm_toml::from_str(&portable).unwrap();
+        assert_eq!(record.state, "cancelled");
+        let cause = record.cause.clone();
+        assert!(
+            cause.starts_with(&format!("sample signal={};", libc::SIGKILL)),
+            "{cause}"
+        );
+        assert!(cause.contains("planted signal control"));
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut record = record;
+        cancel_record(
+            &mut record,
+            std::process::ExitStatus::from_raw(75 << 8),
+            "stage=tree: Release preemption",
+        );
+        let refused = record.cause;
+        assert!(refused.contains("exit=75"));
+        assert!(refused.contains("stage=tree: Release preemption"));
+        assert_ne!(cause, refused);
+    }
     #[test]
     fn a_rehomed_candidates_signal_remains_a_cancellation() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -2128,6 +2251,7 @@ mod tests {
             inputs: "test".into(),
             token: commit.into(),
             state: state.into(),
+            cause: String::new(),
             started: updated,
             updated,
             lease_until: 0,
@@ -2608,6 +2732,7 @@ mod tests {
             inputs: String::new(),
             token: "token".into(),
             state: "judging".into(),
+            cause: String::new(),
             started: 1,
             updated: 1,
             lease_until: 2,

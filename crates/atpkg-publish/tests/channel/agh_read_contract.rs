@@ -1020,13 +1020,24 @@ fn published_reads_need_no_writer() {
             assert!(matches!(result, Fetched::Invalid(_)), "{label}: {result:?}");
         }
     }
+    // A download host that fails in transit leaves the read to the API asset route, still
+    // with no credential; only both routes failing is unreachable.
+    let failing = || Fault::Status {
+        status: 500,
+        body: String::new(),
+        headers: Vec::new(),
+    };
     package_world.fake.fault_always(
         Match::web("/fixture-dev/packs/releases/download/atpkg-git-12/").method("GET"),
-        Fault::Status {
-            status: 500,
-            body: String::new(),
-            headers: Vec::new(),
-        },
+        failing(),
+    );
+    assert!(
+        matches!(fetch("git", 12, "api-route"), Fetched::Present { .. }),
+        "the API asset route serves a package the download host fails on"
+    );
+    package_world.fake.fault_always(
+        Match::api("/repos/fixture-dev/packs/releases/").method("GET"),
+        failing(),
     );
     assert!(matches!(
         fetch("git", 12, "unreachable"),

@@ -1241,6 +1241,7 @@ struct Inbox {
 /// The whole lane set of one control socket.
 pub(super) struct Lanes {
     limits: LaneLimits,
+    startup: OnceLock<Startup>,
     rpc: BoundedDispatch<Job>,
     waits: GrowPool<(Conn, Request)>,
     subscriptions: GrowPool<Push>,
@@ -1305,17 +1306,80 @@ pub(super) struct Census {
     pub(super) subscription_threads: usize,
 }
 
-/// The lanes [`Lanes::start`] started: request lanes, and subscription lanes (the one reserved up front).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum StartDecision {
+    #[default]
+    Pending,
+    Activate,
+    Abandon,
+}
+
+#[derive(Default)]
+struct Startup {
+    decision: Mutex<StartDecision>,
+    ready: Condvar,
+}
+
+impl Startup {
+    fn finish(&self, decision: StartDecision) {
+        let mut current = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        if *current == StartDecision::Pending {
+            *current = decision;
+            self.ready.notify_all();
+        }
+    }
+
+    fn activated(&self) -> bool {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        while *decision == StartDecision::Pending {
+            decision = self
+                .ready
+                .wait(decision)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *decision == StartDecision::Activate
+    }
+}
+
+/// Prepared workers. Activate after publishing the service and listener; dropping
+/// this guard first abandons startup and releases every prepared worker.
+#[must_use = "activate the prepared lanes, or drop them to abandon startup"]
 pub(super) struct Started {
     pub(super) rpc: usize,
     pub(super) subscriptions: usize,
+    lanes: Arc<Lanes>,
+}
+
+impl Started {
+    pub(super) fn activate(self) {
+        self.lanes.rpc.set_capacity(self.rpc);
+        #[cfg(unix)]
+        if let Some(parker) = self.lanes.parker.get() {
+            parker.running.store(true, Ordering::Release);
+        }
+        self.lanes
+            .startup
+            .get()
+            .unwrap()
+            .finish(StartDecision::Activate);
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        self.lanes
+            .startup
+            .get()
+            .unwrap()
+            .finish(StartDecision::Abandon);
+    }
 }
 
 impl Lanes {
     pub(super) fn new(limits: LaneLimits) -> Arc<Self> {
         Arc::new(Self {
             limits,
+            startup: OnceLock::new(),
             rpc: BoundedDispatch::with_resume_room(limits.rpc, limits.open),
             waits: GrowPool::new("aterm-control-wait", limits.wait),
             subscriptions: GrowPool::new("aterm-subscribe", limits.subscriptions),
@@ -1374,34 +1438,51 @@ impl Lanes {
         Duration::from_millis(self.handshake_ms.load(Ordering::Acquire))
     }
 
-    /// Start the request lanes, the parker and one subscription lane.
+    /// Prepare the request lanes, parker and one subscription lane once. The
+    /// returned guard activates them, or abandons them when preparation fails.
+    ///
+    /// # Panics
+    /// Panics if these lanes were already prepared.
     pub(super) fn start(self: &Arc<Self>) -> Started {
-        let mut started = 0;
+        assert!(
+            self.startup.set(Startup::default()).is_ok(),
+            "lanes start once"
+        );
+        let mut prepared = Started {
+            rpc: 0,
+            subscriptions: 0,
+            lanes: Arc::clone(self),
+        };
         for index in 0..self.limits.rpc {
             let lanes = Arc::clone(self);
             match crate::qos::spawn_lane_thread(
                 format!("aterm-control-{index}"),
                 crate::qos::Role::Responsive,
                 move || {
-                    lanes.rpc_lane();
+                    if lanes.await_start() {
+                        lanes.rpc_lane();
+                    }
                 },
             ) {
-                Ok(_) => started += 1,
+                Ok(_) => prepared.rpc += 1,
                 Err(error) => aterm_log::warn!("control worker {index} could not start: {error}"),
             }
         }
-        self.rpc.set_capacity(started);
         #[cfg(unix)]
         if self.limits.open > 0 {
             self.start_parker();
         }
-        let subscriptions = self
+        prepared.subscriptions = self
             .subscriptions
             .reserve(1, |name, first| self.grow(name, first, Self::push_lane));
-        Started {
-            rpc: started,
-            subscriptions,
-        }
+        prepared
+    }
+
+    fn await_start(&self) -> bool {
+        self.startup
+            .get()
+            .expect("lane preparation precedes worker spawn")
+            .activated()
     }
 
     /// Publish what the lanes serve with.
@@ -1590,7 +1671,9 @@ impl Lanes {
     ) -> std::io::Result<()> {
         let lanes = Arc::clone(self);
         crate::qos::spawn_lane_thread(name, crate::qos::Role::Responsive, move || {
-            lane(&lanes, first);
+            if lanes.await_start() {
+                lane(&lanes, first);
+            }
         })
         .map(drop)
     }
@@ -1996,7 +2079,7 @@ impl Lanes {
             spared: AtomicUsize::new(0),
             #[cfg(test)]
             pause: Mutex::new(()),
-            running: AtomicBool::new(true),
+            running: AtomicBool::new(false),
             bell,
             #[cfg(test)]
             faults: AtomicUsize::new(0),
@@ -2007,7 +2090,9 @@ impl Lanes {
             "aterm-control-parker".to_string(),
             crate::qos::Role::Responsive,
             move || {
-                lanes.parker_thread(&polled, &listen);
+                if lanes.await_start() {
+                    lanes.parker_thread(&polled, &listen);
+                }
             },
         ) {
             Ok(_) => {
@@ -2663,6 +2748,38 @@ impl Drop for Serving<'_> {
 #[cfg(all(test, unix))]
 #[path = "control_lanes_conformance.rs"]
 mod conformance;
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_start_releases_its_worker_state() {
+        for (rpc, subscriptions, open) in [(1, 1, 1), (0, 1, 1), (1, 0, 0)] {
+            let lanes = Lanes::new(LaneLimits {
+                rpc,
+                wait: 1,
+                inline: 1,
+                open,
+                subscriptions,
+            });
+            let weak = Arc::downgrade(&lanes);
+            let started = lanes.start();
+            assert_eq!((started.rpc, started.subscriptions), (rpc, subscriptions));
+            drop(started);
+            drop(lanes);
+            assert!(
+                aterm_spec::wait::within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    Duration::from_millis(5),
+                    || weak.upgrade().is_none().then_some(())
+                )
+                .is_some(),
+                "abandoned startup retained its idle workers"
+            );
+        }
+    }
+}
 
 #[cfg(all(test, unix))]
 mod outbox_spill_tests {

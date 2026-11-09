@@ -3610,6 +3610,7 @@ pub(crate) fn spawn(
             ) else {
                 return;
             };
+            started.activate();
             aterm_log::info!(
                 "control socket listening at {sock_path} ({workers} RPC lanes, up to {CONTROL_WAIT_WORKERS} wait lanes and {CONTROL_INLINE_WAITS} waits on RPC lanes, up to {connections_cap} connections, up to {subscriptions_cap} subscription lanes; excess peers, waits and subscriptions get retry)"
             );
@@ -8422,9 +8423,10 @@ mod final_reply_tests {
             open: 4,
             subscriptions: 1,
         });
-        let _ = lanes.start();
+        let started = lanes.start();
         let service = Arc::new(Service::default());
         lanes.publish(service.clone());
+        started.activate();
         let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
         assert!(lanes.admit(server).is_ok(), "admitted");
         client

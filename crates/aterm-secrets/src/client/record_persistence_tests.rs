@@ -540,12 +540,34 @@ impl MacRun {
         }
     }
 
-    /// The store its file holds, read as a pass reads it.
+    /// The store its file holds, read as a pass reads it: the file read, and recovered
+    /// ([`crate::membership_log::Store::recover`]) unless this thread recovered the same bytes
+    /// within the same budgets before, as a run's write does the bytes its read-back recovered
+    /// and every run the base file, which then is that recovery's store.
     fn store(&self) -> crate::membership_log::Store {
+        use crate::membership_log::{RecordBudgets, Store};
+        type Recovered = Vec<(RecordBudgets, Vec<u8>, Store)>;
+        thread_local! {
+            static RECOVERED: std::cell::RefCell<Recovered> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
         let bytes = std::fs::read(self.paths.records_data_file().expect("the records layout"))
             .expect("the file");
-        crate::membership_log::Store::recover(crate::crossing::fixture::VAULT, &bytes)
-            .expect("store")
+        let budgets = RecordBudgets::current();
+        let kept = RECOVERED.with_borrow(|recovered| {
+            recovered
+                .iter()
+                .find(|(within, from, _)| *within == budgets && *from == bytes)
+                .map(|(.., store)| store.clone())
+        });
+        kept.unwrap_or_else(|| {
+            let store = Store::recover(crate::crossing::fixture::VAULT, &bytes).expect("store");
+            RECOVERED.with_borrow_mut(|recovered| {
+                recovered.push((budgets, bytes, store.clone()));
+            });
+            store
+        })
     }
 
     /// How many of the removal batch's records its file holds.
@@ -679,10 +701,12 @@ fn mac_budgets(model: &aterm_spec::derive::Model) -> crate::membership_log::Reco
 /// S8: a Mac's records file and crossed mark refine `SwarmRecordsCapacity`'s `Mac` writes in
 /// each configuration the model declares (the legacy held total, where its file takes the batch
 /// up to the bound; the activation's, past it): from every state the model reaches by them,
-/// every write it enables, replayed on a real Mac (a fresh home each), gives the state the
-/// model's walk found by that path. A legacy database peer's exchange changes neither file nor
-/// mark and these writes read neither of its variables, so the walk leaves it to `aterm-db`'s
-/// conformance, which judges it from every state.
+/// every write it enables, replayed on a real Mac down the walk's path to that state (a fresh
+/// home each run, which goes on from the state a write took it to, by the walk's path, to judge
+/// that state's next write), gives the state the model's walk found by that path. A legacy
+/// database peer's exchange changes neither file nor mark and these writes read neither of its
+/// variables, so the walk leaves it to `aterm-db`'s conformance, which judges it from every
+/// state.
 ///
 /// NEGATIVE CONTROLS, `Faults::mark_after_take` (the file before the mark): at the legacy held
 /// total a pull that dies between them leaves the file holding what a crossed log's server sent
@@ -719,31 +743,56 @@ fn a_macs_records_file_conforms_to_the_capacity_model() {
             }
         }
         let budgets = mac_budgets(model);
+        let found_by: std::collections::BTreeMap<&[&str], &aterm_spec::interp::State> = paths
+            .iter()
+            .map(|(state, path)| (path.as_slice(), state))
+            .collect();
+        // The writes each state enables that no run has judged from it yet, by the walk's path
+        // to the state.
+        let mut pending: std::collections::BTreeMap<&[&str], Vec<&str>> = paths
+            .iter()
+            .map(|(state, path)| {
+                let enabled = writes
+                    .into_iter()
+                    .filter(|action| model.action_enabled(action, state))
+                    .collect();
+                (path.as_slice(), enabled)
+            })
+            .collect();
+        let mut froms: Vec<&[&str]> = pending.keys().copied().collect();
+        froms.sort_by_key(|path| path.len());
+        let mut runs = 0;
         budgets.within(|| {
-            let run = MacRun::start(crate::crossing::Faults::default());
-            assert_eq!(records_capacity_mac(&run), start[0], "after Mac");
-            for (state, path) in &paths {
-                for action in writes {
-                    if !model.action_enabled(action, state) {
-                        continue;
-                    }
+            for from in froms {
+                while !pending[from].is_empty() {
+                    runs += 1;
                     let mut run = MacRun::start(crate::crossing::Faults::default());
-                    for step in path {
+                    assert_eq!(records_capacity_mac(&run), start[0], "after Mac");
+                    for step in from {
                         run.apply(step);
                     }
-                    run.apply(action);
-                    let observed = records_capacity_mac(&run);
-                    assert_eq!(
-                        model.successors(action, state),
-                        vec![observed],
-                        "{action} after {path:?}"
-                    );
-                    judged_all += 1;
+                    let mut path = from.to_vec();
+                    loop {
+                        let state = found_by[path.as_slice()];
+                        let action = pending.get_mut(path.as_slice()).expect("a state").remove(0);
+                        run.apply(action);
+                        let observed = records_capacity_mac(&run);
+                        assert_eq!(
+                            model.successors(action, state),
+                            vec![observed],
+                            "{action} after {path:?}"
+                        );
+                        judged_all += 1;
+                        path.push(action);
+                        if pending.get(path.as_slice()).is_none_or(Vec::is_empty) {
+                            break;
+                        }
+                    }
                 }
             }
         });
         eprintln!(
-            "SwarmRecordsCapacity Mac (held {}): {} states",
+            "SwarmRecordsCapacity Mac (held {}): {} states on {runs} runs",
             budgets.held,
             paths.len()
         );

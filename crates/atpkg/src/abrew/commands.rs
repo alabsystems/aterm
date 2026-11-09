@@ -5206,28 +5206,59 @@ fn strip_bottle_block(text: &str) -> String {
 }
 
 /// `brew --prefix/--cellar/--caskroom <name>`: validate package existence and print its path.
-pub(super) fn cmd_prefix_query(prefix: &Prefix, api: &Api, cmd: &str, name: &str) -> ExitCode {
-    let short = Formula::short_name(name);
+/// `brew --prefix/--cellar/--caskroom <name>…`: brew resolves
+/// every name first, then prints one path per name. With
+/// `--installed` (prefix only) uninstalled formulae print
+/// nothing and fail the command with brew's NotAKeg list.
+pub(super) fn cmd_prefix_queries(
+    prefix: &Prefix,
+    api: &Api,
+    cmd: &str,
+    names: &[String],
+    installed_only: bool,
+) -> ExitCode {
     if cmd == "--caskroom" {
-        return match api.cask(short) {
-            Ok(c) => {
-                println!("{}", prefix.caskroom().join(&c.token).display());
-                ExitCode::SUCCESS
+        let mut tokens: Vec<String> = Vec::new();
+        for name in names {
+            let short = Formula::short_name(name);
+            match api.cask(short) {
+                Ok(c) => tokens.push(c.token),
+                Err(_) => return failed(&format!("Error: {}", cask_unavailable(short))),
             }
-            Err(_) => failed(&format!("Error: {}", cask_unavailable(short))),
-        };
-    }
-    let resolved = api.formula(name).ok().or_else(|| tap::lookup(prefix, name));
-    match resolved {
-        Some(_) => {
-            if cmd == "--prefix" {
-                println!("{}", prefix.opt(short).display());
-            } else {
-                println!("{}", prefix.cellar().join(short).display());
-            }
-            ExitCode::SUCCESS
         }
-        None => failed(&format!("Error: {}", formula_unavailable(api, name))),
+        for token in tokens {
+            println!("{}", prefix.caskroom().join(token).display());
+        }
+        return ExitCode::SUCCESS;
+    }
+    let mut formulae: Vec<Formula> = Vec::new();
+    for name in names {
+        match api.formula(name).ok().or_else(|| tap::lookup(prefix, name)) {
+            Some(f) => formulae.push(f),
+            None => return failed(&format!("Error: {}", formula_unavailable(api, name))),
+        }
+    }
+    if cmd == "--cellar" {
+        for f in &formulae {
+            println!("{}", prefix.cellar().join(&f.name).display());
+        }
+        return ExitCode::SUCCESS;
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for f in &formulae {
+        if installed_only && prefix.optlinked_version(&f.name).is_none() {
+            missing.push(f.name.clone());
+            continue;
+        }
+        println!("{}", prefix.opt(&f.name).display());
+    }
+    if missing.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        failed(&format!(
+            "Error: The following formulae are not installed:\n{}",
+            missing.join(" ")
+        ))
     }
 }
 
@@ -5933,6 +5964,79 @@ fn indented(items: &[String]) -> String {
         .map(|item| format!("\n  {item}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// `brew generate-cask-token`: propose a token for an app
+/// name or bundle, warning like brew (a duplicate fails).
+pub(super) fn cmd_generate_cask_token(api: &Api, rest: &[String]) -> ExitCode {
+    let app = operands(rest).into_iter().next().unwrap_or_default();
+    let app_name = super::token_generator::simplified_app_name(&app);
+    let Some(token) = super::token_generator::token_for(&app_name) else {
+        return super::usage_failed(
+            "generate-cask-token",
+            &format!("Error: Invalid usage: Could not determine a token from '{app_name}'."),
+        );
+    };
+    if has_flag(rest, "--debug", "-d") {
+        println!("Proposed Simplified App name: {app_name}");
+    }
+    println!("Proposed token:               {token}");
+    println!("Proposed file name:           {token}.rb");
+    println!("Cask Header Line:             cask \"{token}\" do");
+    let mut warnings = super::token_generator::warnings(&token);
+    let duplicate = api
+        .index(true)
+        .is_ok_and(|rows| rows.iter().any(|(name, _)| name == &token));
+    if duplicate {
+        warnings.push(format!(
+            "A cask named '{token}' already exists. Prepend the vendor name if this is not a duplicate."
+        ));
+    }
+    for warning in warnings {
+        super::tty::opoo!("Warning: {warning}");
+    }
+    if duplicate {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `brew command-not-found-init`: on a terminal, the setup
+/// instructions; piped, brew's handler script for the shell
+/// (embedded verbatim; it drives `brew which-formula`).
+pub(super) fn cmd_command_not_found_init() -> ExitCode {
+    use std::io::IsTerminal as _;
+    let shell = crate::caller_shell::invoking_shell().unwrap_or_default();
+    let base = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&shell)
+        .trim_start_matches('-');
+    let tty = std::io::stdout().is_terminal();
+    match base {
+        "bash" | "zsh" => {
+            if tty {
+                println!(
+                    "# To enable command-not-found\n# Add the following lines to ~/.{base}rc\n\nHOMEBREW_COMMAND_NOT_FOUND_HANDLER=\"$(brew --repository)/Library/Homebrew/command-not-found/handler.sh\"\nif [ -f \"$HOMEBREW_COMMAND_NOT_FOUND_HANDLER\" ]; then\n  source \"$HOMEBREW_COMMAND_NOT_FOUND_HANDLER\";\nfi"
+                );
+            } else {
+                print!("{}", include_str!("data/handler.sh"));
+            }
+            ExitCode::SUCCESS
+        }
+        "fish" => {
+            if tty {
+                println!(
+                    "# To enable command-not-found\n# Add the following line to ~/.config/fish/config.fish\n\nset HOMEBREW_COMMAND_NOT_FOUND_HANDLER (brew --repository)/Library/Homebrew/command-not-found/handler.fish\nif test -f $HOMEBREW_COMMAND_NOT_FOUND_HANDLER\n  source $HOMEBREW_COMMAND_NOT_FOUND_HANDLER\nend"
+                );
+            } else {
+                print!("{}", include_str!("data/handler.fish"));
+            }
+            ExitCode::SUCCESS
+        }
+        other => failed(&format!("Error: Unsupported shell type {other}")),
+    }
 }
 
 pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
@@ -8619,20 +8723,185 @@ fn formula_outdated(prefix: &Prefix, inst: &super::prefix::Installed, f: &Formul
     true
 }
 
+/// Brew's cask greediness for outdated/upgrade: the
+/// `--greedy` switch (or its env), the per-token env list,
+/// and the two narrower switches for `:latest` and
+/// `auto_updates` casks.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Greedy {
+    greedy: bool,
+    latest: bool,
+    auto_updates: bool,
+}
+
+impl Greedy {
+    pub(super) fn from_rest(rest: &[String]) -> Greedy {
+        Greedy {
+            greedy: has_flag(rest, "--greedy", "-g") || super::env_set("HOMEBREW_UPGRADE_GREEDY"),
+            latest: has_flag(rest, "--greedy-latest", ""),
+            auto_updates: has_flag(rest, "--greedy-auto-updates", ""),
+        }
+    }
+
+    /// Whether this cask counts as greedy (switch, env, or
+    /// the `HOMEBREW_UPGRADE_GREEDY_CASKS` token list).
+    fn for_cask(self, token: &str) -> bool {
+        if self.greedy {
+            return true;
+        }
+        std::env::var("HOMEBREW_UPGRADE_GREEDY_CASKS")
+            .is_ok_and(|list| list.split_whitespace().any(|t| t == token))
+    }
+}
+
+/// Brew's `Version` comparison restricted to same-shaped
+/// dotted strings (`compare_version_strings`): `None` when
+/// either side is blank or the dot counts differ.
+fn compare_version_strings(first: Option<&str>, second: &str) -> Option<Ordering> {
+    let first = first?;
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    if first.split('.').count() != second.split('.').count() {
+        return None;
+    }
+    Some(version_cmp(first, second))
+}
+
+/// Brew's `Cask#auto_updates_bundle_outdated?`: the staged
+/// app's bundle versions against the cask version's CSV
+/// parts, used only under `HOMEBREW_UPGRADE_AUTO_UPDATES_CASKS`.
+fn cask_bundle_outdated(
+    prefix: &Prefix,
+    inst: &super::prefix::Installed,
+    c: &super::formula::Cask,
+) -> bool {
+    if !c.auto_updates || c.version == "latest" {
+        return false;
+    }
+    let (short, long) = cask_bundle_versions(&prefix.cask_dir(&inst.name, &inst.version));
+    let bad = |v: &Option<String>| v.as_deref().is_some_and(|x| x == "0" || x == "0.0");
+    let short = if bad(&short) { None } else { short };
+    let long = if bad(&long) { None } else { long };
+    if short.is_none() && long.is_none() {
+        return false;
+    }
+    let csv: Vec<&str> = c.version.split(',').collect();
+    let tap_short = csv.first().copied().unwrap_or(&c.version);
+    if let (Some(s), Some(l)) = (&short, &long) {
+        let combined = format!("{s}-{l}");
+        let comparisons: Vec<Ordering> = csv
+            .iter()
+            .filter_map(|cand| compare_version_strings(Some(&combined), cand))
+            .collect();
+        if comparisons.contains(&Ordering::Equal) {
+            return false;
+        }
+        if !comparisons.is_empty() && !comparisons.contains(&Ordering::Less) {
+            return false;
+        }
+        if comparisons.is_empty() {
+            // brew compares against everything before the last '-'
+            let head = tap_short.rsplit_once('-').map_or(tap_short, |(h, _)| h);
+            if s.as_str() == head {
+                return false;
+            }
+        }
+    }
+    for candidate in [short.as_deref(), long.as_deref()] {
+        if compare_version_strings(candidate, tap_short) == Some(Ordering::Equal) {
+            return false;
+        }
+    }
+    match compare_version_strings(short.as_deref(), tap_short) {
+        Some(Ordering::Less) => return true,
+        Some(Ordering::Greater) => return false,
+        _ => {}
+    }
+    if csv.len() == 1 && short.as_deref() == Some(inst.version.as_str()) {
+        return true;
+    }
+    let builds: Vec<Ordering> = csv
+        .iter()
+        .filter_map(|cand| compare_version_strings(long.as_deref(), cand))
+        .collect();
+    !builds.is_empty() && !builds.contains(&Ordering::Equal) && builds.contains(&Ordering::Less)
+}
+
+/// Brew's `Cask#outdated_version`: whether (and at what
+/// recorded version) an installed cask is outdated.
+fn cask_outdated(
+    prefix: &Prefix,
+    inst: &super::prefix::Installed,
+    c: &super::formula::Cask,
+    greedy: Greedy,
+) -> bool {
+    let g_latest = greedy.latest;
+    let g_auto = greedy.auto_updates;
+    let greedy = greedy.for_cask(&inst.name);
+    if c.version == "latest" {
+        if !(greedy || g_latest) {
+            return false;
+        }
+        // outdated_download_sha?: a recorded download hash
+        // that still matches the declared one is current;
+        // anything else (no URL, no record) counts outdated,
+        // as brew's missing-record case does.
+        if c.url.is_empty() {
+            return true;
+        }
+        let recorded = find_download_sha(prefix, inst);
+        return match (recorded.as_deref(), c.sha256.as_deref()) {
+            (Some(have), Some(want)) => have.trim() != want,
+            _ => true,
+        };
+    }
+    if inst.version == c.version {
+        return false;
+    }
+    if c.auto_updates && !greedy && !g_auto {
+        let env_allows = super::env_set("HOMEBREW_UPGRADE_AUTO_UPDATES_CASKS")
+            && !super::env_set("HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS");
+        return env_allows && cask_bundle_outdated(prefix, inst, c);
+    }
+    // Brew flags any version mismatch (equality returned
+    // above), even an install ahead of the catalog.
+    true
+}
+
+/// The recorded `LATEST_DOWNLOAD_SHA256` under a cask's
+/// `.metadata`, when a previous install left one.
+fn find_download_sha(prefix: &Prefix, inst: &super::prefix::Installed) -> Option<String> {
+    fn walk(dir: &std::path::Path, depth: usize) -> Option<String> {
+        if depth == 0 {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, depth - 1) {
+                    return Some(found);
+                }
+            } else if entry.file_name() == "LATEST_DOWNLOAD_SHA256" {
+                return crate::metadata_io::read_bounded_regular_utf8(&path, 4096).ok();
+            }
+        }
+        None
+    }
+    walk(&prefix.caskroom().join(&inst.name).join(".metadata"), 3)
+}
+
 fn outdated_rows(
     prefix: &Prefix,
     api: &Api,
     casks: bool,
-    greedy: bool,
+    greedy: Greedy,
 ) -> Result<Vec<(String, String, String)>, String> {
     let mut out = Vec::new();
     if casks {
         for i in prefix.installed(Kind::Cask) {
             let c = api.cask(&i.name)?;
-            if c.auto_updates && !greedy {
-                continue;
-            }
-            if version_cmp(&i.version, &c.version) == Ordering::Less {
+            if cask_outdated(prefix, &i, &c, greedy) {
                 out.push((i.name, i.version, c.version));
             }
         }
@@ -8816,7 +9085,7 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         if has_flag(rest, "--formula", "") && casks {
             continue;
         }
-        match outdated_rows(prefix, api, casks, has_flag(rest, "--greedy", "")) {
+        match outdated_rows(prefix, api, casks, Greedy::from_rest(rest)) {
             Ok(mut rows) => {
                 if !scope.is_empty() {
                     rows.retain(|(name, _, _)| {
@@ -9101,7 +9370,15 @@ pub(super) fn cmd_upgrade(
     }
     let names = operands_without_flag_values(rest, &["--minimum-version", "--min-version"]);
     let Some(_name) = names.first() else {
-        let rows = match outdated_rows(prefix, api, false, true) {
+        let rows = match outdated_rows(
+            prefix,
+            api,
+            false,
+            Greedy {
+                greedy: true,
+                ..Default::default()
+            },
+        ) {
             Ok(rows) => rows,
             Err(error) => return failed(&error),
         };
@@ -9112,7 +9389,7 @@ pub(super) fn cmd_upgrade(
         // one combined preview and prompt for both kinds.
         let want_casks = !has_flag(rest, "--formula", "");
         let (cask_pinned, cask_rows): (Vec<_>, Vec<_>) = if want_casks {
-            match outdated_rows(prefix, api, true, has_flag(rest, "--greedy", "")) {
+            match outdated_rows(prefix, api, true, Greedy::from_rest(rest)) {
                 Ok(all) => all
                     .into_iter()
                     .partition(|(name, _, _)| prefix.cask_is_pinned(name)),
@@ -10246,7 +10523,7 @@ fn cmd_upgrade_casks(
     minimum: Option<&str>,
 ) -> ExitCode {
     let mut failures = 0;
-    let greedy = has_flag(rest, "--greedy", "");
+    let greedy = Greedy::from_rest(rest);
     // Resolve every candidate up front, partition like brew's
     // outdated_casks: unknown-name errors, current-version and
     // :latest notices (named only), then pinned, then the summary.
@@ -10363,7 +10640,7 @@ fn cmd_upgrade_casks(
         }
         return ExitCode::FAILURE;
     }
-    if names.is_empty() && !greedy && !super::no_env_hints() {
+    if names.is_empty() && !greedy.greedy && !super::no_env_hints() {
         println!(
             "Some casks with `auto_updates true` or `version :latest` may still require `--greedy`,"
         );
@@ -15094,6 +15371,102 @@ fn collect_rb_stems(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) 
     }
 }
 
+/// `brew formula <name>…`: the tap file each name resolves
+/// to, without the API. A two-part name is the tap itself.
+/// Only existing paths print; when only casks match, brew
+/// dies with its found-casks error.
+pub(super) fn cmd_formula_path(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    let taps = tap::list(prefix);
+    let mut printed = false;
+    let mut cask_found = false;
+    for name in operands(rest) {
+        let parts: Vec<&str> = name.split('/').collect();
+        if parts.len() == 2 {
+            if let Some(t) = taps.iter().find(|t| t.name() == name.to_lowercase()) {
+                println!("{}", t.path.display());
+                printed = true;
+            }
+            continue;
+        }
+        let (scope, leaf): (Vec<&tap::Tap>, String) = if parts.len() >= 3 {
+            let wanted = format!("{}/{}", parts[0], parts[1]).to_lowercase();
+            (
+                taps.iter().filter(|t| t.name() == wanted).collect(),
+                parts[2].to_string(),
+            )
+        } else {
+            (taps.iter().collect(), name.clone())
+        };
+        let mut hit = false;
+        for t in &scope {
+            if let Some(path) = tap_formula_file(t, &leaf) {
+                println!("{}", path.display());
+                printed = true;
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            for t in &scope {
+                if tap_file_in(&t.path.join("Casks"), &leaf).is_some() {
+                    cask_found = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !printed && cask_found {
+        return failed("Error: Found casks but did not find formulae!");
+    }
+    ExitCode::SUCCESS
+}
+
+/// A formula's file inside one tap: sharded or flat Formula
+/// dirs, with `Aliases/` symlinks resolved to their target.
+fn tap_formula_file(tap: &tap::Tap, name: &str) -> Option<std::path::PathBuf> {
+    for base in ["Formula", "HomebrewFormula", "."] {
+        if let Some(path) = tap_file_in(&tap.path.join(base), name) {
+            return Some(path);
+        }
+    }
+    let alias = tap.path.join("Aliases").join(name);
+    let target = std::fs::read_link(&alias).ok()?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        alias.parent()?.join(target)
+    };
+    let leaf = resolved.file_stem()?.to_str()?.to_string();
+    if resolved.is_file() {
+        // Print the path as the tap spells it, not a
+        // canonicalised detour through `..` segments.
+        let mut clean = std::path::PathBuf::new();
+        for part in resolved.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    clean.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => clean.push(other),
+            }
+        }
+        return Some(clean);
+    }
+    let _ = leaf;
+    None
+}
+
+/// `<name>.rb` directly in `dir` or in its first-letter shard.
+fn tap_file_in(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let direct = dir.join(format!("{name}.rb"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let first = name.chars().next()?;
+    let sharded = dir.join(first.to_string()).join(format!("{name}.rb"));
+    sharded.is_file().then_some(sharded)
+}
+
 fn tap_formula_names(tap: &tap::Tap) -> Vec<String> {
     let names = rb_stems(&tap.path.join("Formula"));
     if names.is_empty() {
@@ -17411,6 +17784,70 @@ mod tests {
         assert!(!formula_outdated(&p, &inst, &f), "stable has not passed");
         std::fs::write(keg.join("INSTALL_RECEIPT.json"), receipt("0.74.0")).unwrap();
         assert!(formula_outdated(&p, &inst, &f), "stable moved past the tab");
+    }
+
+    #[test]
+    fn cask_outdated_greedy_matrix() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        let inst = |version: &str| super::super::prefix::Installed {
+            name: "app".into(),
+            version: version.into(),
+            versions: vec![version.into()],
+            kind: Kind::Cask,
+        };
+        let cask = |version: &str, auto_updates: bool| super::super::formula::Cask {
+            token: "app".into(),
+            version: version.into(),
+            auto_updates,
+            url: "https://example.invalid/app.zip".into(),
+            ..Default::default()
+        };
+        let plain = Greedy::default();
+        let greedy = Greedy {
+            greedy: true,
+            ..Default::default()
+        };
+        let latest = Greedy {
+            latest: true,
+            ..Default::default()
+        };
+        let auto = Greedy {
+            auto_updates: true,
+            ..Default::default()
+        };
+        // auto_updates casks need a greedy signal.
+        assert!(!cask_outdated(&p, &inst("1.0"), &cask("2.0", true), plain));
+        assert!(cask_outdated(&p, &inst("1.0"), &cask("2.0", true), greedy));
+        assert!(cask_outdated(&p, &inst("1.0"), &cask("2.0", true), auto));
+        assert!(!cask_outdated(&p, &inst("1.0"), &cask("2.0", true), latest));
+        // Any mismatch counts, even ahead of the catalog.
+        assert!(cask_outdated(&p, &inst("3.0"), &cask("2.0", false), plain));
+        assert!(!cask_outdated(
+            &p,
+            &inst("2.0"),
+            &cask("2.0", false),
+            greedy
+        ));
+        // :latest casks need greedy or greedy-latest.
+        assert!(!cask_outdated(
+            &p,
+            &inst("latest"),
+            &cask("latest", false),
+            plain
+        ));
+        assert!(cask_outdated(
+            &p,
+            &inst("latest"),
+            &cask("latest", false),
+            latest
+        ));
+        assert!(cask_outdated(
+            &p,
+            &inst("latest"),
+            &cask("latest", false),
+            greedy
+        ));
     }
 
     #[test]

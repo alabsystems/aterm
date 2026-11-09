@@ -187,6 +187,21 @@ impl World {
         world
     }
 
+    /// A world of its own whose home holds what `template`'s holds, each directory and file with
+    /// its mode, beside the same fixture: what a process that restarted there would reopen.
+    fn cloned_from(template: &World) -> Self {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        crate::test_tree::clone_or_copy(&template.paths.home, &home);
+        Self {
+            _home: tmp,
+            paths: Paths::for_home(&home),
+            parent: template.parent.clone(),
+            binding: template.binding.clone(),
+            phase: template.phase,
+        }
+    }
+
     fn seed(&self, limits: Limits, phased: bool) {
         record_event_at_limits(
             &self.paths,

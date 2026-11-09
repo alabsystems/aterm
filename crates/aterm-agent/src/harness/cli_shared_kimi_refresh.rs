@@ -13,12 +13,9 @@ use std::time::Instant;
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 
-/// The longest one token refresh request may take. Its wait is what the refresh's budget leaves
-/// when it starts, up to a sign-in's whole budget (a Google federation recovery a sign-in resumes,
-/// `google_federation_recovery`'s `renew_recorded`), and the HTTP client measures it on the clock
-/// that stops in sleep, so a request in flight while the host sleeps ends this long at most after
-/// the host wakes (KI-1105-14), as Codex's code exchange and Google's token requests do.
-const REFRESH_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
+/// Hang detector for one required refresh response inside its original recovery deadline.
+/// The HTTP clock stops in sleep; native lease and caller authority keep their own expiry.
+const REFRESH_REQUEST: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[path = "cli_shared_kimi_completion.rs"]
 mod completion;
@@ -239,32 +236,50 @@ fn verify_target(
         guard,
         |now, guard| verify_native_guarded(staging, region, expected, now, deadline, Some(guard)),
         |url, form, guard| {
-            let wait = deadline
-                .remaining()
-                .map_err(|_| NativeError::Temporary)?
-                .min(REFRESH_REQUEST);
-            let client = Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait)
-                .with_connector(connector);
-            let reply = client
-                .post(url)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .header("Accept", "application/json")
-                .header(
-                    "User-Agent",
-                    &format!("aterm/{}", aterm_stamp::app_version()),
-                )
-                .guard(guard.clone())
-                .limit(REPLY_MAX)
-                .backstop(wait)
-                .send(form)
-                .map_err(|_| NativeError::Temporary)?;
-            Ok((
-                reply.status(),
-                aterm_secrets::SecretBytes::from(reply.into_body()),
-            ))
+            token_response_started(url, form, guard, deadline, connector, Instant::now())
         },
     )
 }
+
+fn token_response_started(
+    url: &str,
+    form: &[u8],
+    guard: Arc<dyn Authority>,
+    deadline: login_drive::Deadline<'_>,
+    connector: Arc<dyn aterm_http::Connect>,
+    started: Instant,
+) -> Result<(u16, aterm_secrets::SecretBytes), NativeError> {
+    let now = Instant::now();
+    let by = (started + REFRESH_REQUEST)
+        .min(now + deadline.remaining().map_err(|_| NativeError::Temporary)?);
+    let wait = by.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return Err(NativeError::Temporary);
+    }
+    let client =
+        Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait).with_connector(connector);
+    let reply = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            &format!("aterm/{}", aterm_stamp::app_version()),
+        )
+        .guard(guard)
+        .limit(REPLY_MAX)
+        .backstop(by.saturating_duration_since(Instant::now()))
+        .send(form)
+        .map_err(|_| NativeError::Temporary)?;
+    Ok((
+        reply.status(),
+        aterm_secrets::SecretBytes::from(reply.into_body()),
+    ))
+}
+
+#[cfg(test)]
+#[path = "cli_shared_kimi_refresh/native_wait_tests.rs"]
+mod native_wait_tests;
 
 fn coordinated_using(
     staging: &Path,

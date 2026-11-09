@@ -158,7 +158,7 @@ pub(super) fn recover(paths: &Paths, config: Option<&Path>) -> Result<bool, Stri
         "native intake is busy",
     )
     .map_err(|e| e.to_string())?;
-    recover_locked(paths, config, Instant::now() + STEP_BUDGET, None)
+    recover_locked(paths, config, step_deadline(Instant::now()), None)
 }
 
 pub(super) fn recover_root(
@@ -333,7 +333,7 @@ pub(super) fn set_after_pending(
     raw: &[u8],
     after: impl FnOnce() -> Result<(), String>,
 ) -> Result<Value, String> {
-    let deadline = Instant::now() + STEP_BUDGET;
+    let deadline = step_deadline(Instant::now());
     // Opening root authority precedes reading/writing the selected entry.
     let admin = client::admin_cached_until(paths, deadline)
         .map_err(|_| "native key intake requires current root admin authority")?;

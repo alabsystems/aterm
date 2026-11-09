@@ -302,7 +302,11 @@ impl Owner {
             ))
             .and_then(|job| job.bootstrap_graph.as_mut())
         else {
-            self.faulted = true;
+            self.journal.fault(
+                &mut self.faulted,
+                "query-root",
+                "original root disappeared while its completion was held",
+            );
             std::mem::forget(completed);
             return Err(refused("completed SDK query lost its original Root"));
         };
@@ -363,7 +367,11 @@ impl Owner {
             ))
             .and_then(|job| job.bootstrap_graph.as_mut())
         else {
-            self.faulted = true;
+            self.journal.fault(
+                &mut self.faulted,
+                "query-root",
+                "original root disappeared while its completion was held",
+            );
             std::mem::forget(failed);
             return Err(refused("failed SDK query lost its original Root"));
         };
@@ -454,8 +462,9 @@ impl Owner {
         // Actual tokens retain their active guards while moving out of the
         // loop. No Root can settle between polling and consuming that owner.
         for token in closed {
-            if self.consume_bootstrap_query(token).is_err() {
-                self.faulted = true;
+            if let Err(error) = self.consume_bootstrap_query(token) {
+                self.journal
+                    .fault(&mut self.faulted, "query-consume", error);
             }
         }
     }
@@ -514,6 +523,7 @@ impl Owner {
                 CompletionCause::ResourceLimit => {
                     trust_resource_controller::CompletionCause::ResourceLimit
                 }
+                CompletionCause::HostFault => trust_resource_controller::CompletionCause::HostFault,
                 _ => trust_resource_controller::CompletionCause::Cancelled,
             })
         } else {

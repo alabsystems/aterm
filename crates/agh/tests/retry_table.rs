@@ -428,8 +428,22 @@ fn public_body_resumes_from_the_completed_prefix() {
     assert_eq!(gh.fx().retry_notes().len(), 1);
 }
 
+/// `request`'s Range header.
+fn range_of(request: &agh::wire::scripted::SeenRequest) -> Option<&str> {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// The web route's endless short progress stops at the progress bound, and the API asset route
+/// then resumes from the 17 bytes the web route left: its request and the CDN hop both carry
+/// `Range: bytes=17-`, and the file is the web prefix plus the CDN tail. Negative controls: a
+/// fetch that restarted the body on the API route would send no Range; one that kept to the web
+/// route would stop at the bound with nothing written.
 #[test]
-fn endless_short_public_progress_stops_at_the_progress_bound() {
+fn endless_short_public_progress_stops_at_the_progress_bound_and_resumes_on_the_api_route() {
     let transport = Arc::new(ScriptedTransport::new());
     transport.answer_body_fault(200, &[], b"x", WireKind::Truncated);
     for offset in 1..=16 {
@@ -441,11 +455,22 @@ fn endless_short_public_progress_stops_at_the_progress_bound() {
             WireKind::Truncated,
         );
     }
-    transport.answer(200, &[], b"whole");
+    transport.answer(
+        200,
+        &[],
+        br#"{"id":1,"tag_name":"v1","assets":[{"id":7,"name":"a.bin","size":1024,"state":"uploaded"}]}"#,
+    );
+    let cdn = format!("http://127.0.0.1:{}/assets/7", API + 3);
+    transport.answer(302, &[("location", cdn.as_str())], b"");
+    transport.answer(
+        206,
+        &[("Content-Range", "bytes 17-1023/1024")],
+        &[b'y'; 1024 - 17],
+    );
     let gh = common::scripted(&transport, API);
     let root = aterm_tempfile::tempdir().expect("scratch");
     let dest = root.path().join("a.bin");
-    let error = gh
+    let written = gh
         .public()
         .fetch(
             &common::slug("fixture-dev/repo"),
@@ -454,14 +479,89 @@ fn endless_short_public_progress_stops_at_the_progress_bound() {
             &dest,
             1024,
         )
-        .expect_err("the body never completes");
+        .expect("the API route completes the body");
+    assert_eq!(written, 1024);
+    let bytes = std::fs::read(&dest).expect("the completed file");
+    assert!(bytes[..17].iter().all(|b| *b == b'x'));
+    assert!(bytes[17..].iter().all(|b| *b == b'y'));
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 20);
+    assert!(requests[..17].iter().all(|r| {
+        r.url
+            .contains("/fixture-dev/repo/releases/download/v1/a.bin")
+    }));
     assert!(
-        error.why.contains("16 progress-earned resumes"),
+        requests[17]
+            .url
+            .ends_with("/repos/fixture-dev/repo/releases/tags/v1"),
+        "{}",
+        requests[17].url
+    );
+    assert!(
+        requests[18]
+            .url
+            .ends_with("/repos/fixture-dev/repo/releases/assets/7"),
+        "{}",
+        requests[18].url
+    );
+    assert_eq!(requests[19].url, cdn);
+    assert_eq!(range_of(&requests[18]), Some("bytes=17-"));
+    assert_eq!(range_of(&requests[19]), Some("bytes=17-"));
+    assert!(requests.iter().all(|r| r.auth_profile.is_none()));
+    assert_eq!(gh.fx().retry_notes().len(), 16);
+    assert!(gh.fx().slept().is_empty());
+}
+
+/// A round in which neither route reached a host ends the fetch at once, naming both. Negative
+/// control: a round in which the API host answered (a 504) pauses and goes on to another round.
+#[test]
+fn a_round_that_reaches_no_host_on_either_route_ends_the_fetch_at_once() {
+    let refused = || {
+        Scripted::Fail(WireError {
+            phase: Phase::NotSent,
+            kind: WireKind::Connect,
+            detail: "connection refused".into(),
+        })
+    };
+    let fetch = |gh: &agh::Github| {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        gh.public()
+            .fetch(
+                &common::slug("fixture-dev/repo"),
+                "v1",
+                "a.bin",
+                &root.path().join("a.bin"),
+                1024,
+            )
+            .expect_err("nothing serves")
+    };
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.push(refused());
+    transport.push(refused());
+    let gh = common::scripted(&transport, API);
+    let error = fetch(&gh);
+    assert!(
+        error.why.contains("the download host:")
+            && error.why.contains("the API asset route:")
+            && error.why.contains("neither route reached a host"),
         "{}",
         error.why
     );
-    assert_eq!(transport.requests().len(), 17);
-    assert_eq!(transport.remaining(), 1);
-    assert_eq!(gh.fx().retry_notes().len(), 16);
-    assert!(!dest.exists());
+    assert_eq!(transport.requests().len(), 2);
+    assert!(gh.fx().slept().is_empty());
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.push(refused());
+    transport.answer(504, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    let error = fetch(&gh);
+    assert!(
+        error.why.contains("no answer queued"),
+        "the second round's web leg ends the script: {}",
+        error.why
+    );
+    assert_eq!(transport.requests().len(), 3);
+    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(2)]);
+    assert_eq!(gh.fx().retry_notes().len(), 1);
 }

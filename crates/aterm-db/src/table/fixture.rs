@@ -396,6 +396,57 @@ impl Lab {
                 .unwrap();
         }
     }
+    /// A copy of this lab, its Macs and its vault, in a home of its own: for a walk that needs one
+    /// built world per step, which a clone makes for next to nothing. Each Mac's `source.toml`
+    /// names the copy's vault and its `state.toml` the source identity that path gives, so the
+    /// copy publishes to and syncs from its own vault and shares no file with this lab or another
+    /// copy; no file of it holds a path under this lab's home, the hex of a Mac's old source
+    /// identity, an old custody identity or an old claimed directory. Each table's enrollment claim
+    /// binds the copy of its directory, as the table's first open there would have. Equal Macs
+    /// share the content-keyed process caches of `aterm-secrets`, which answer equal bytes alike
+    /// (`tests::frontier::wide_lab` relies on the same).
+    #[cfg(test)]
+    pub fn fork(&self) -> Self {
+        aterm_spec::fs_lane::join();
+        let home = aterm_tempfile::tempdir().unwrap();
+        // The clone takes the temporary folder's own name, so `_home` is the copy's home as it is
+        // a built lab's.
+        std::fs::remove_dir(home.path()).unwrap();
+        copy_tree(self._home.path(), home.path());
+        let (from, to) = (self._home.path(), home.path());
+        let at = |path: &std::path::Path| to.join(path.strip_prefix(from).unwrap());
+        let source = at(&self.source);
+        let paths: Vec<_> = self
+            .paths
+            .iter()
+            .map(|paths| Paths::for_home(&at(&paths.home)))
+            .collect();
+        let old: Vec<_> = paths
+            .iter()
+            .map(|paths| rebind(paths, from, to, &source))
+            .collect();
+        let mut needles = vec![format!("{}/", from.display())];
+        needles.extend(old);
+        let mut tables = std::collections::BTreeMap::new();
+        directories(from, &mut |dir| {
+            let identity = super::store::directory_identity(dir).unwrap();
+            tables.insert(identity, dir.strip_prefix(from).unwrap().to_path_buf());
+        });
+        let copied = |claimed| {
+            to.join(
+                tables
+                    .get(&claimed)
+                    .expect("a claim's table directory is in the lab"),
+            )
+        };
+        settle_copy(to, &copied, &needles);
+        Self {
+            _home: home,
+            paths,
+            signer: self.signer.clone(),
+            source,
+        }
+    }
     pub fn rotate(&self, roles: &[Role]) {
         let admin = client::admin_open(&self.paths[0]).unwrap();
         let bootstraps: Vec<_> = (0..self.paths.len()).map(|n| self.bootstrap(n)).collect();
@@ -423,4 +474,175 @@ impl Lab {
                 .unwrap();
         }
     }
+}
+
+/// Copy the tree at `from` to the new name `to`: a clone where the volume makes one, one call
+/// whatever the tree holds; elsewhere each directory made again with its mode (as the umask
+/// allows) and each regular file copied with its mode, any other kind of entry refused.
+#[cfg(test)]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    if aterm_tempfile::clone_tree(from, to).is_ok() {
+        return;
+    }
+    let mode = std::fs::metadata(from).unwrap().permissions().mode();
+    std::fs::DirBuilder::new()
+        .mode(mode & 0o7777)
+        .create(to)
+        .unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            assert!(kind.is_file(), "a lab makes no link: {}", target.display());
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Point the copied Mac at `paths`, whose `source.toml` still names the vault under `from`, at
+/// `source`, the copy's vault under `to`, and bind its `state.toml` to that source: the source
+/// identity `aterm_secrets::client` keeps for the applied version, which this replaces where it
+/// names the old source. Returns the old identity's hex, which no file of the copy may hold.
+#[cfg(test)]
+fn rebind(
+    paths: &Paths,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    source: &std::path::Path,
+) -> String {
+    let before = client::config(paths).unwrap().unwrap();
+    let source_file = paths.dir.join("source.toml");
+    let text = std::fs::read_to_string(&source_file).unwrap();
+    std::fs::write(
+        &source_file,
+        text.replace(
+            &format!("{}/", from.display()),
+            &format!("{}/", to.display()),
+        ),
+    )
+    .unwrap();
+    let after = client::config(paths).unwrap().unwrap();
+    assert_eq!(
+        after.source,
+        aterm_secrets::transport::Source::Path(source.to_path_buf()),
+        "the copy's Mac names the copy's vault"
+    );
+    let state_file = paths.dir.join("state.toml");
+    let state = std::fs::read_to_string(&state_file).unwrap();
+    let old = aterm_codec::hex::encode_lower(&client::test_source_identity(&before));
+    assert_eq!(
+        state.matches(&old).count(),
+        1,
+        "the Mac's state.toml binds its source identity once"
+    );
+    let new = aterm_codec::hex::encode_lower(&client::test_source_identity(&after));
+    std::fs::write(&state_file, state.replace(&old, &new)).unwrap();
+    old
+}
+
+/// `visit` each directory under `root`, `root` among them.
+#[cfg(test)]
+fn directories(root: &std::path::Path, visit: &mut impl FnMut(&std::path::Path)) {
+    visit(root);
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            directories(&entry.path(), visit);
+        }
+    }
+}
+
+/// Settle `root`, a copy of a lab: bind each table claim to `copied` of the directory it claims,
+/// put the custody identity each claim then has where its old one stood (a table's application
+/// pins hold it), and check that no file holds any of `needles`, any old custody identity or
+/// any old claimed directory.
+#[cfg(test)]
+fn settle_copy(root: &std::path::Path, copied: &dyn Fn([u8; 16]) -> PathBuf, needles: &[String]) {
+    let mut files = Vec::new();
+    files_under(root, &mut files);
+    let mut needles: Vec<Vec<u8>> = needles
+        .iter()
+        .map(|needle| needle.clone().into_bytes())
+        .collect();
+    let mut moved = Vec::new();
+    for path in &files {
+        if path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_none_or(|name| name != "table-claims")
+        {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            !name.ends_with(".volume"),
+            "a lab's claims carry no volume witness: {name}"
+        );
+        if !name.ends_with(".claim") {
+            continue;
+        }
+        let mut claim = std::fs::read(path).unwrap();
+        let Some(claimed) = super::store::claimed_directory(&claim) else {
+            continue;
+        };
+        let (old, new) = super::store::rebind_claim(&mut claim, &copied(claimed)).unwrap();
+        std::fs::write(path, &claim).unwrap();
+        needles.push(claimed.to_vec());
+        for (old, new) in [
+            (old.to_vec(), new.to_vec()),
+            (
+                aterm_codec::hex::encode_lower(&old).into_bytes(),
+                aterm_codec::hex::encode_lower(&new).into_bytes(),
+            ),
+        ] {
+            needles.push(old.clone());
+            moved.push((old, new));
+        }
+    }
+    for path in &files {
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut changed = false;
+        for (old, new) in &moved {
+            while let Some(at) = find(&bytes, old) {
+                bytes[at..at + old.len()].copy_from_slice(new);
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::write(path, &bytes).unwrap();
+        }
+        for needle in &needles {
+            assert!(
+                find(&bytes, needle).is_none(),
+                "{} names the lab it was copied from: {}",
+                path.display(),
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+}
+
+/// Each file under `root`, into `files`.
+#[cfg(test)]
+fn files_under(root: &std::path::Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files_under(&entry.path(), files);
+        } else {
+            files.push(entry.path());
+        }
+    }
+}
+
+/// Where `needle` first stands in `bytes`.
+#[cfg(test)]
+fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
 }

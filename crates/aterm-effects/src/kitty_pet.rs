@@ -1812,8 +1812,8 @@ pub enum OldPath {
     GapReadAboutTheBody = 1 << 41,
     /// A body standing off the line of the caret's row, clear of its letters and of the caret,
     /// keeps where it stands while the stand by a caret walked back into the line lies on them
-    /// ([`PetBrain::kept_off_the_line`]); reverted, it follows the caret onto the letters
-    /// (ATERM-KI-1107-4).
+    /// (or in a gap between them, [`Self::GapIsTheLines`]) ([`PetBrain::kept_off_the_line`]);
+    /// reverted, it follows the caret onto the letters (ATERM-KI-1107-4).
     KeptOffTheLine = 1 << 42,
     /// A flight re-aimed in the air keeps the box's top a held body took off with
     /// ([`PetBrain::left_top`]) only while its way has never gone up ([`PetBrain::rebase`]).
@@ -1966,11 +1966,26 @@ pub enum OldPath {
     /// the cat by `less`'s last line turned its back on the prompt for the seat past the line
     /// above, stood so 1.4 s, and turned again to walk to the prompt.
     NewScreenSettlesFirst = 1 << 61,
+    /// A body slid up off a row it is still drawn down into ([`PetBrain::slide_to_row`], the
+    /// margin's seat over a line whose row over it cleared) grows to a larger fit only once its
+    /// sink has come down to the head law's on its new row ([`PetBrain::head_eased`]): out of the
+    /// row it left where that law draws it on its own row, and no deeper into it than
+    /// [`SINK_ROWS`] where the law sinks it into a blank row under it; reverted, it grew as it
+    /// rose, and the wall holding its right edge widened its box leftward over the line's last
+    /// letters (ATERM-KI-1107-4).
+    FitWaitsForTheFeet = 1 << 62,
+    /// A gap between the letters of the caret's row is the line's, as its letters are: a body
+    /// standing off the line keeps where it stands while the stand by a caret walked back into
+    /// the line lies in such a gap, letters read on the row both short of the stand and past it
+    /// ([`PetBrain::kept_off_the_line`]); reverted, it left its stand across the line's last
+    /// letters and the caret for the gap, and followed the caret from there onto the letters
+    /// (ATERM-KI-1107-4).
+    GapIsTheLines = 1 << 63,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 62] = [
+    pub const EVERY: [Self; 64] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -2033,6 +2048,8 @@ impl OldPath {
         Self::StallIsLived,
         Self::NewScreenEasesTheHead,
         Self::NewScreenSettlesFirst,
+        Self::FitWaitsForTheFeet,
+        Self::GapIsTheLines,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
@@ -3941,8 +3958,9 @@ impl PetBrain {
 
     /// The body stands on `row` from this frame, drawn where it is drawn now: the head law's ease
     /// goes on from here ([`Self::head_eased`]), its sink counted from the new row, and takes it
-    /// to the law's place on that row, at [`SINK_RATE`]. It reads as a step down or up on the
-    /// paws, not a flight.
+    /// to the law's place on that row, at [`SINK_RATE`]; stepped up to a larger fit, it grows
+    /// there only once its sink is down to the law's on that row. It reads as a step down or up
+    /// on the paws, not a flight.
     #[inline]
     const fn slide_to_row(&mut self, row: f32) {
         let (sink, fit) = self.head_eased(false);
@@ -5253,10 +5271,12 @@ impl PetBrain {
     /// cell or after it, and the stand by it (`stand`, on the caret's row) still lays the body on
     /// that row's letters (nothing took it off them: no clear stand along the row or on a row
     /// beside, [`Self::ink_stand_for`], and no seat within reach,
-    /// [`Self::clear_of_letters_above`]), a body standing on the caret's row keeps where it stands
-    /// while the box it draws at rest there ([`Self::rest_box_cols`]) lies on none of that row's
-    /// ink, off the line (past its last letter with the stand short of the body, or short of its
-    /// first with the stand past it), and clears the caret by [`STATION_LEAD`] as every stand
+    /// [`Self::clear_of_letters_above`]) or in a gap between them, letters read on that row both
+    /// short of the stand and past it (A GAP IN THE LINE IS THE LINE'S,
+    /// [`OldPath::GapIsTheLines`]), a body standing on the caret's row keeps where it
+    /// stands while the box it draws at rest there ([`Self::rest_box_cols`]) lies on none of that
+    /// row's ink, off the line (past its last letter with the stand short of the body, or short of
+    /// its first with the stand past it), and clears the caret by [`STATION_LEAD`] as every stand
     /// [`Self::ink_safe_col_for`] offers does; until the caret's stand comes clear of the letters
     /// (the caret back at the line's end, the line erased short of the stand, an Enter or a wrap
     /// that takes the caret off the row). So it never keeps a body over the caret to keep it off
@@ -5275,7 +5295,20 @@ impl PetBrain {
     /// blank cells at the wall, a line ending in five spaces and 2, 4, 8 or 12 letters, the caret
     /// walked back through the gap and out again, it stood over the caret's cell in 28 to 75 frames
     /// at full alpha on 14 x 26 px cells, where reverted it stood there in 5 to 18
-    /// (`a_body_kept_off_the_line_clears_the_caret_on_every_face`).
+    /// (`a_body_kept_off_the_line_clears_the_caret_on_every_face`). Kept only from a stand on the
+    /// letters, a body at the wall on that row left it for the gap once the fitted body fitted
+    /// there clear of the caret (14 x 26 px cells, whose fitted body is 2.82 cells across): across
+    /// the line's last letters and the caret's cell, then from the gap, on the line, after the
+    /// caret's stand onto the letters before it and back onto the last ones as the caret came
+    /// out, its box more than 2 px into them in 38 to 237 frames from the first arrow to the
+    /// Enter and over the caret's cell in up to 16
+    /// (`a_gap_in_the_line_is_the_line_s_on_every_face`, Linux arm64, 2026-11-08). The gap is
+    /// read off the letters, not off the row's span ([`Self::ink_span`]), which can still hold
+    /// letters a Ctrl+U or an Enter has just cleared: taken off the span, any blank stand inside
+    /// it was the line's, and the body bound for the prompt past a Ctrl+U came down short of it
+    /// and flew again (`every_flight_after_a_caret_jump_is_one_brisk_bound`), and the cat resting
+    /// over a line lettered to the margin lay on a letter under the veil 15 ms past the Enter
+    /// (`a_cat_under_a_line_lettered_to_the_margin_is_veiled_once`).
     #[inline]
     fn kept_off_the_line(&self, stand: (f32, f32), (cr, cc): (u16, u16), width: f32) -> (f32, f32) {
         let row = f32::from(cr);
@@ -5296,9 +5329,22 @@ impl PetBrain {
         let Some((first, end)) = self.ink_span(row) else {
             return stand;
         };
-        if end <= caret + 0.5
-            || !matches!(self.observed_ink_overlaps(stand.0, row, width), Some(true))
-        {
+        // On the line: on its letters, or in a gap between them, letters read on the row both
+        // short of the stand and past it ([`OldPath::GapIsTheLines`]), within what the map
+        // reads about the stand ([`Self::read_about`]: the line whole where the map covers it).
+        let on_the_line = match self.observed_ink_overlaps(stand.0, row, width) {
+            Some(true) => true,
+            Some(false) if !self.old_path(OldPath::GapIsTheLines) => {
+                let (a, b) = self.read_about(row, (first, end), (stand.0, stand.0 + width));
+                matches!(self.observed_ink_in_span(row, a, stand.0), Some(true))
+                    && matches!(
+                        self.observed_ink_in_span(row, stand.0 + width, b),
+                        Some(true)
+                    )
+            }
+            Some(false) | None => false,
+        };
+        if end <= caret + 0.5 || !on_the_line {
             return stand;
         }
         let cells = ((self.last_cell_w, self.last_cell_h), self.last_grid);
@@ -13363,6 +13409,19 @@ impl PetBrain {
     /// spans ([`Self::rest_box_inked`]): its fit, at its place in its whole box by the wall
     /// ([`Self::fitted_to_the_wall`]), no pose's stretch, on `cell_w x cell_h` px cells of a
     /// `cols x rows` grid. `None` on a cell of no size.
+    ///
+    /// Each edge is its px over the cell's width, a division, so an edge on a cell's edge is
+    /// that column exactly. Taken as px times the width's reciprocal, an edge on the grid's end
+    /// fell a rounding past it at 158 of the widths 20 to 256 on 14 px cells and 94 on 13 px
+    /// (1456 x (1/14) is 104.0000076 in `f32`), a read of a box flush with the wall
+    /// ([`Self::observed_ink_in_span`]) took in a column past the grid and read nothing, and the
+    /// wall's law, the seat kept off the line and a gap's keep read nothing at that wall: on
+    /// 14 x 26 px cells, the line 100 and 104 cells long (grids of 99 to 108 columns,
+    /// `last_row_after`), the body stood on the line's last letters through its rest in 188 to
+    /// 194 frames where the line left no seat, where the law fades it in 28, and walked after the
+    /// caret onto them from the first of ten Left arrows in 213 and 215 where the line seated it,
+    /// where the seat keeps it in none (13 x 29 and 11 x 28 the same there as at the gallery's
+    /// width, Linux arm64, 2026-11-08).
     #[inline]
     fn rest_box_cols(
         &self,
@@ -13387,8 +13446,8 @@ impl PetBrain {
             (cell_w, cell_h),
             (cols, rows),
         );
-        let inv_cw = 1.0 / f32::from(cell_w);
-        Some((x0 as f32 * inv_cw, x1 as f32 * inv_cw))
+        let cw = f32::from(cell_w);
+        Some((x0 as f32 / cw, x1 as f32 / cw))
     }
 
     /// The sense the tick goes on with ([`Self::wall_seat`]), and the stand a body the law hid
@@ -13882,6 +13941,22 @@ impl PetBrain {
     /// Where the head law's ease ([`Self::ease_head`]) stands at the clock: each of the sink
     /// and the fit from where it was when its target last changed, at its rate, by the time
     /// since; at its target under reduced motion.
+    ///
+    /// THE BOX GROWS ONCE IT HAS RISEN TO ITS ROW. A body drawn further down into the row under
+    /// its own than the head law draws it there, rising (its sink coming down to `sink_to`)
+    /// while it grows to a larger fit, grows only once the sink is down to `sink_to`: out of the
+    /// row under where the law draws it on its own row, and no deeper into it than
+    /// [`SINK_ROWS`] where the law sinks it, which it does only where that row is blank under
+    /// the body ([`head_law`]). A body slid up off the line ([`Self::slide_to_row`]) is drawn
+    /// where it stood, its feet in the line's row, and the wall holds a fitted box's right edge
+    /// at the grid's end ([`Self::fitted_to_the_wall`]), so grown as it rose, its box widened
+    /// leftward over the line's last letters. On a full page's last row whose row over the line
+    /// was cleared over a line that seats the body at the wall, the margin's seat on the cleared
+    /// row ([`Self::margin_seat_off_the_line`]) had the box on those letters at full alpha in 6
+    /// frames on 13 x 29 px cells, 4 and 7 at four and three blank cells on 14 x 26, and 7 on
+    /// 11 x 28, reaching 11 to 14 px into them (Linux arm64, 2026-11-08); there the law draws it
+    /// on its own row, and with the wait it grows from the frame its box's foot reaches the
+    /// line's row's top. Reverted by [`OldPath::FitWaitsForTheFeet`].
     #[inline]
     const fn head_eased(&self, reduced_motion: bool) -> (f32, f32) {
         #[inline]
@@ -13894,9 +13969,19 @@ impl PetBrain {
             }
         }
         let t = ((self.clock - self.sink_since) as f32).max(0.0);
+        let fit_t = if self.fit_to > self.fit_from
+            && self.sink_from > 0.0
+            && self.sink_from > self.sink_to
+            && !self.old_path(OldPath::FitWaitsForTheFeet)
+        {
+            let off = self.sink_from - self.sink_to.max(0.0);
+            (t - off * (1.0 / SINK_RATE)).max(0.0)
+        } else {
+            t
+        };
         (
             eased(self.sink_from, self.sink_to, SINK_RATE, t, reduced_motion),
-            eased(self.fit_from, self.fit_to, FIT_RATE, t, reduced_motion),
+            eased(self.fit_from, self.fit_to, FIT_RATE, fit_t, reduced_motion),
         )
     }
 

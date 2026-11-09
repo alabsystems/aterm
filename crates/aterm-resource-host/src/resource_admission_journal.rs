@@ -34,6 +34,7 @@ pub(super) struct Journal {
     identity: (u64, u64),
     debt: ExternalDebt,
     readiness: Value,
+    faults: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 fn private(path: &std::path::Path, directory: bool) -> io::Result<File> {
     let file = std::fs::OpenOptions::new()
@@ -136,6 +137,7 @@ impl Journal {
             identity: identity(&directory)?,
             debt: debt.clone(),
             readiness: expected,
+            faults: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
     /// Called only while preparing a fresh, unadopted namespace. Runtime open
@@ -183,6 +185,45 @@ impl Journal {
             }
         }
         Ok(true)
+    }
+    /// Failure data never authorizes recovery or settlement. Retain the first
+    /// observation at each site for this owner, including when damaged storage
+    /// cannot record it.
+    pub(super) fn fault(&self, faulted: &mut bool, site: &str, detail: impl std::fmt::Debug) {
+        *faulted = true;
+        self.record_fault(site, detail);
+    }
+    pub(super) fn record_fault(&self, site: &str, detail: impl std::fmt::Debug) {
+        let mut faults = self
+            .faults
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if faults.contains_key(site) {
+            return;
+        }
+        let detail: String = format!("{detail:?}").chars().take(4096).collect();
+        faults.insert(site.into(), detail.clone());
+        let record = aterm_json::json!({"version":1,"owner_pid":std::process::id(),"site":site,"detail":detail});
+        let result: io::Result<()> = (|| {
+            self.validate()?;
+            let nonce = aterm_uds::rand::hex_token::<16>()?;
+            let stage = self.root.join(format!(".fault-{nonce}"));
+            write_new(&stage, &record)?;
+            // A later owner must not overwrite the evidence from this one.
+            std::fs::rename(stage, self.root.join(format!("fault-{site}-{nonce}.json")))?;
+            aterm_durable::durable(&private(&self.root, true)?)
+        })();
+        if let Err(error) = result {
+            faults.insert("diagnostic-storage".into(), format!("{error:?}"));
+        }
+    }
+    pub(super) fn fault_summary(&self) -> String {
+        format!(
+            "{:?}",
+            self.faults
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        )
     }
     pub(super) fn create(&self, binding: &Binding) -> io::Result<()> {
         if !self.fresh(binding)? {

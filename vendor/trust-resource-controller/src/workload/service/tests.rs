@@ -197,6 +197,11 @@ fn sample_checkpoint_retains_optional_measurements_and_exact_67_action_plan() {
     let measured = checkpoint.encode(&invocation).unwrap();
     assert_ne!(bytes, measured);
     assert_eq!(Checkpoint::decode(&measured, &binding(), &invocation).unwrap(), checkpoint);
+    let Body::Harness { capture, .. } = &mut checkpoint.body else { unreachable!() };
+    capture.cause = Some(crate::CompletionCause::HostFault);
+    let fault = checkpoint.encode(&invocation).unwrap();
+    assert_ne!(measured, fault);
+    assert_eq!(Checkpoint::decode(&fault, &binding(), &invocation).unwrap(), checkpoint);
     checkpoint.sequence = 66;
     assert!(checkpoint.encode(&invocation).is_err());
     checkpoint.sequence = 2;

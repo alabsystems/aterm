@@ -359,7 +359,7 @@ impl Member {
             }
             State::Active(active) => {
                 let cause = if faulted {
-                    Some(CompletionCause::ResourceLimit)
+                    Some(CompletionCause::HostFault)
                 } else if job.reaped || job.cleanup_at.is_some() {
                     Some(if job.cause == CompletionCause::Exited {
                         CompletionCause::Cancelled
@@ -390,7 +390,7 @@ impl Member {
                     || (progress.launched && !progress.go_attempted)
                     || active.attempt.binding() != &self.binding
                 {
-                    if let Some(reason) = active.attempt.launch_failure() {
+                    if let Some(reason) = active.attempt.failure() {
                         // Failure DATA only. This cannot supply NoChild,
                         // retirement or a release; originals stay retained.
                         let prefix: String = reason.chars().take(2048).collect();
@@ -398,7 +398,14 @@ impl Member {
                             .journal
                             .patch(&self.binding, aterm_json::json!({"launch_failure":prefix}));
                     }
-                    return Err(refused("produced original native custody became unknown"));
+                    return Err(refused(&format!(
+                        "produced original native custody became unknown: uncertain={} launched={} go_attempted={} binding_matches={} detail={:?}",
+                        progress.uncertain,
+                        progress.launched,
+                        progress.go_attempted,
+                        active.attempt.binding() == &self.binding,
+                        active.attempt.failure(),
+                    )));
                 }
                 if progress.ready_to_start && !faulted {
                     let (pid, birth) = active
@@ -649,10 +656,11 @@ impl Owner {
             );
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
             job.cleanup_at.get_or_insert_with(Instant::now);
-            job.cause = CompletionCause::ResourceLimit;
-            self.faulted = true;
+            job.cause = CompletionCause::HostFault;
+            self.journal
+                .fault(&mut self.faulted, "produced-admission", error);
         }
         self.jobs.insert(root, job);
         result

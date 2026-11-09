@@ -165,8 +165,8 @@ impl Owner {
                     CompletionCause::Cancelled
                 };
                 job.cleanup_at = Some(Instant::now());
-                if job.child.request_group(CohortSignal::Kill).is_err() {
-                    self.faulted = true;
+                if let Err(error) = job.child.request_group(CohortSignal::Kill) {
+                    self.journal.fault(&mut self.faulted, "root-kill", error);
                     let _ = job.child.child_mut().kill();
                 }
             }

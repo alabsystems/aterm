@@ -96,7 +96,59 @@ struct Laid {
     cap: Limits,
 }
 
-fn lay(state: &aterm_spec::interp::State) -> Laid {
+/// What a laying of `state` reads: the room, the chain and its tail. Two states with one key are
+/// laid alike, whatever else of them differs (`ack`).
+type LaidKey = [i64; 7];
+
+fn laid_key(state: &aterm_spec::interp::State) -> LaidKey {
+    [
+        "slots",
+        "byte_limit",
+        "depth",
+        "one",
+        "two",
+        "three",
+        "tail",
+    ]
+    .map(|name| state[name])
+}
+
+impl Laid {
+    /// A laying of its own whose home holds what `template`'s holds, each directory and file with
+    /// its mode, sidecars of its claims included: what a process that restarted there would reopen.
+    fn cloned_from(template: &Self) -> Self {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        crate::test_tree::clone_or_copy(&template.paths.home, &home);
+        Self {
+            _home: tmp,
+            paths: Paths::for_home(&home),
+            root: template.root.clone(),
+            root_pair: template.root_pair.clone(),
+            chain: template.chain.clone(),
+            cap: template.cap,
+        }
+    }
+}
+
+/// An unused laying of `state`: a clone of the one [`lay_fresh`] laid into `templates` for its
+/// [`LaidKey`] the first time it was asked for, which nothing acts on, proved to project to `state`
+/// again.
+fn laid(templates: &mut BTreeMap<LaidKey, Laid>, state: &aterm_spec::interp::State) -> Laid {
+    let laid = Laid::cloned_from(
+        templates
+            .entry(laid_key(state))
+            .or_insert_with(|| lay_fresh(state)),
+    );
+    assert_eq!(
+        project(&laid.paths, &laid.root_pair, state),
+        *state,
+        "cloned storage"
+    );
+    laid
+}
+
+fn lay_fresh(state: &aterm_spec::interp::State) -> Laid {
     let (home, paths, root, binding) = fixture();
     let cap = Limits {
         bytes: state["byte_limit"] as usize,
@@ -209,7 +261,7 @@ pub(crate) fn transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    act(&lay(state), state, action)
+    act(&lay_fresh(state), state, action)
 }
 
 #[test]
@@ -220,6 +272,9 @@ fn atomic_successors_refine_three_link_races_retries_and_capacity() {
     aterm_spec::interp::prove_and_catch(&model);
     let states = aterm_spec::interp::reachable_states(&model);
     assert!(states.iter().any(|state| state["depth"] == 3));
+    // The layings made so far, which each later one with the same key is a clone of, and the
+    // actions [`transition`] has taken on a laying of its own.
+    let (mut templates, mut fresh) = (BTreeMap::new(), std::collections::BTreeSet::new());
     for state in states {
         let (mut stay, moving): (Vec<_>, Vec<_>) = model
             .actions
@@ -253,7 +308,7 @@ fn atomic_successors_refine_three_link_races_retries_and_capacity() {
                 .position(|refused| *refused == action.name)
                 .unwrap_or(REFUSED.len())
         });
-        let shared = lay(&state);
+        let shared = laid(&mut templates, &state);
         for action in stay {
             holds(action.name, act(&shared, &state, action.name));
         }
@@ -262,8 +317,15 @@ fn atomic_successors_refine_three_link_races_retries_and_capacity() {
         if let Some(action) = moving.next() {
             holds(action.name, act(&shared, &state, action.name));
         }
+        // Each later one takes an unused laying of its own: the first time an action comes here,
+        // the anchor projection's own ([`transition`]), and after that a clone of its key's.
         for action in moving {
-            holds(action.name, transition(&state, action.name));
+            let next = if fresh.insert(action.name) {
+                transition(&state, action.name)
+            } else {
+                act(&laid(&mut templates, &state), &state, action.name)
+            };
+            holds(action.name, next);
         }
     }
     // Negative implementation: publish success after separately preparing the

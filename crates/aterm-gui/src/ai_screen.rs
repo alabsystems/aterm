@@ -804,7 +804,11 @@ fn look_now(fetch: bool) -> Result<AiReading, String> {
     env.vars
         .retain(|(name, _)| !aterm_types::domain::is_ai_env_var(name));
     env.harness_state = crate::harness_host::harness_state();
-    let _ = aterm_agent::ai::cli::fleet_fetch(&env, &aterm_agent::ai::fleet::LiveFetcher, fetch);
+    let _ = aterm_agent::ai::cli::fleet_fetch(
+        &env,
+        &aterm_agent::ai::fleet::LiveFetcher::default(),
+        fetch,
+    );
     let look = aterm_agent::ai::cli::look(&env);
     Ok(AiReading::of(
         &look,

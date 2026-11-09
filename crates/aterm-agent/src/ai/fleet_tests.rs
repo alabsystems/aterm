@@ -73,6 +73,70 @@ fn a_fetch_verifies_holds_and_reads_back() {
     let h = held_state(dir.path()).expect("state");
     assert_eq!((h.seq, h.fetched_at, h.error), (Some(2), Some(NOW), None));
     assert!(held(dir.path(), URL, &signer().public, NOW).is_err());
+
+    // A release-host outage still delivers the signed pair, with one listing for both assets.
+    use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+    let wire = FakeGithub::start();
+    wire.add_repo("fixture-dev/fleet", RepoSpec::public());
+    let release = wire.add_release(
+        "fixture-dev/fleet",
+        ReleaseSpec::published("v1", "2026-10-01T00:00:00Z"),
+    );
+    let text = "schema = 1\nseq = 2\npreferred = \"codex\"\n";
+    let signature = sign(&a.secret, text.as_bytes()).expect("sign release");
+    wire.add_asset(release, AssetSpec::uploaded("fleet.toml", text.as_bytes()));
+    wire.add_asset(
+        release,
+        AssetSpec::uploaded("fleet.toml.sig", signature.as_bytes()),
+    );
+    wire.fault_always(
+        Match::web("/fixture-dev/fleet/releases/"),
+        Fault::Status {
+            status: 504,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    let ports = wire.ports();
+    let live = LiveFetcher {
+        reader: aterm_update_core::release_asset::Reader::loopback(
+            aterm_update_core::github_rest::Origins::loopback(
+                ports.api,
+                ports.uploads,
+                ports.web,
+                ports.cdn,
+            ),
+            None,
+            std::time::Duration::from_secs(60),
+        ),
+    };
+    let url = "https://github.com/fixture-dev/fleet/releases/download/v1/fleet.toml";
+    assert_eq!(
+        fetch(dir.path(), url, &a.public, NOW, &live, false),
+        Fetched::Fresh(2)
+    );
+    assert_eq!(held(dir.path(), url, &a.public, NOW).as_deref(), Ok(text));
+    let api: Vec<_> = wire
+        .seen()
+        .into_iter()
+        .filter(|r| r.origin == FakeOrigin::Api)
+        .map(|r| r.path_and_query)
+        .collect();
+    assert_eq!(api.len(), 3, "{api:?}");
+    assert_eq!(
+        api.iter()
+            .filter(|p| p.as_str() == "/repos/fixture-dev/fleet/releases/tags/v1")
+            .count(),
+        1,
+        "one release listing serves the signed pair: {api:?}"
+    );
+    assert_eq!(
+        api.iter()
+            .filter(|p| p.starts_with("/repos/fixture-dev/fleet/releases/assets/"))
+            .count(),
+        2,
+        "each asset is read by its own id: {api:?}"
+    );
 }
 
 #[test]

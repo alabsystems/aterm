@@ -126,19 +126,16 @@ impl Owner {
             drop(pending.claim.take());
             drop(pending.waiter.take());
             if !retained
-                && self
-                    .journal
-                    .settle(&pending.submission.request.binding)
-                    .is_err()
+                && let Err(error) = self.journal.settle(&pending.submission.request.binding)
             {
-                self.faulted = true;
+                self.journal.fault(&mut self.faulted, "queue-settle", error);
             }
             return;
         }
         match self.advance(&mut pending) {
             Ok(Advance::Wait) => self.pending.push_front(pending),
             Ok(Advance::Launch(custody)) => self.launch(pending, *custody),
-            Ok(Advance::Retain) => {
+            Ok(Advance::Retain(error)) => {
                 // No ARM has occurred, but CPU publication may be uncertain.
                 // Preserve the prepared recovery record instead of certifying
                 // settlement from a failed write or dropped capability.
@@ -150,7 +147,8 @@ impl Owner {
                     });
                 }
                 drop(pending.claim.take());
-                self.faulted = true;
+                self.journal
+                    .fault(&mut self.faulted, "queue-publication", error);
             }
             Err(error) => {
                 let reason = if workload::purpose(&pending.submission.request)
@@ -182,12 +180,10 @@ impl Owner {
                 drop(pending.waiter.take());
                 let retained = self.retain_unlaunched(&mut pending);
                 if !retained
-                    && self
-                        .journal
-                        .settle(&pending.submission.request.binding)
-                        .is_err()
+                    && let Err(error) = self.journal.settle(&pending.submission.request.binding)
                 {
-                    self.faulted = true;
+                    self.journal
+                        .fault(&mut self.faulted, "queue-refusal-settle", error);
                 }
             }
         }
@@ -517,7 +513,7 @@ fn memory_decided(owed: Owed, decided: Result<Claim, aterm_capacity::Error>) -> 
 }
 pub(super) enum Advance {
     Wait,
-    Retain,
+    Retain(io::Error),
     Launch(Box<Custody>),
 }
 
@@ -590,7 +586,7 @@ impl Owner {
             .try_reserve_recoverable(prepared, self.pool.slots().get())
         {
             Ok(None) => Ok(Advance::Wait),
-            Err(_) => Ok(Advance::Retain),
+            Err(error) => Ok(Advance::Retain(error)),
             Ok(Some(cpu)) => {
                 let claim = pending
                     .claim
@@ -599,10 +595,10 @@ impl Owner {
                 match RetainedCohort::new_bundle(&self.fence, claim, cpu) {
                     Ok(custody) => Ok(Advance::Launch(Box::new(Custody::Fixed(custody)))),
                     Err(error) => {
-                        let (_, claim, cpu) = error.into_parts();
+                        let (error, claim, cpu) = error.into_parts();
                         pending.claim = Some(claim);
                         drop(cpu); // Durable debt, not capacity, survives dropped caps.
-                        Ok(Advance::Retain)
+                        Ok(Advance::Retain(error))
                     }
                 }
             }

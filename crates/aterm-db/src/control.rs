@@ -2147,18 +2147,34 @@ impl<T: Clone> LastRead<T> {
 pub(crate) fn roster_or_last(
     paths: &aterm_secrets::client::Paths,
 ) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
-    roster_or_last_until(paths, Instant::now() + Duration::from_millis(250))
+    roster_or_last_until(paths, Instant::now() + ROSTER_WAIT)
 }
+
+/// How long a roster read waits out a writer that holds the vault.
+const ROSTER_WAIT: Duration = Duration::from_millis(250);
+
+/// The rosters [`roster_or_last`] and [`roster_or_last_in`] keep ([`roster_after`]).
+static ROSTERS: LastRead<Option<aterm_secrets::swarm_roster::SwarmRoster>> = LastRead::new();
 
 fn roster_or_last_until(
     paths: &aterm_secrets::client::Paths,
     deadline: Instant,
 ) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
-    static LAST: LastRead<Option<aterm_secrets::swarm_roster::SwarmRoster>> = LastRead::new();
     roster_after(
-        &LAST,
+        &ROSTERS,
         &paths.dir,
         aterm_secrets::client::swarm_roster_now_until(paths, deadline),
+    )
+}
+
+/// [`roster_or_last`] through a peer check's `look` ([`aterm_secrets::client::VaultLook`]).
+fn roster_or_last_in(
+    look: &aterm_secrets::client::VaultLook<'_>,
+) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
+    roster_after(
+        &ROSTERS,
+        &look.paths().dir,
+        look.swarm_roster_until(Instant::now() + ROSTER_WAIT),
     )
 }
 
@@ -2185,15 +2201,12 @@ pub(crate) fn roster_after(
     }
 }
 
-/// This vault's deny list ([`aterm_secrets::client::swarm_denied_nodes_now`]), as
-/// [`denied_after`] keeps it for this process.
-fn denied_or_last(paths: &aterm_secrets::client::Paths) -> Option<Vec<String>> {
+/// This vault's deny list, read through a peer check's `look`
+/// ([`aterm_secrets::client::VaultLook::swarm_denied_nodes`]), as [`denied_after`] keeps it for
+/// this process.
+fn denied_or_last(look: &aterm_secrets::client::VaultLook<'_>) -> Option<Vec<String>> {
     static LAST: LastRead<Vec<String>> = LastRead::new();
-    denied_after(
-        &LAST,
-        &paths.dir,
-        aterm_secrets::client::swarm_denied_nodes_now(paths),
-    )
+    denied_after(&LAST, &look.paths().dir, look.swarm_denied_nodes())
 }
 
 /// The deny list to add to the roster after `read`, a read of `dir`'s: a list read now, kept in
@@ -2298,13 +2311,14 @@ impl Endpoint {
 }
 
 /// Every membership record this Mac holds ([`aterm_secrets::client::load_records`]), as a peer
-/// check reads them.
+/// check reads them: through `look` ([`aterm_secrets::client::VaultLook::records`]), which reads
+/// them again when a vault file it stamps moved, and afresh while a writer holds the vault.
 fn held_records(
-    paths: &aterm_secrets::client::Paths,
+    look: &aterm_secrets::client::VaultLook<'_>,
 ) -> aterm_secrets::Result<aterm_secrets::membership_log::Store> {
     #[cfg(test)]
     faults::records_read()?;
-    aterm_secrets::client::load_records(paths)
+    look.records()
 }
 
 /// Check the authenticated `peer_req` against this device's own membership records and

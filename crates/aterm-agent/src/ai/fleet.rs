@@ -289,16 +289,25 @@ pub trait Fetcher {
 }
 
 /// The shipped [`Fetcher`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LiveFetcher;
+#[derive(Debug)]
+pub struct LiveFetcher {
+    /// One invocation's asset reads share their release listings and outage patience.
+    reader: aterm_update_core::release_asset::Reader,
+}
+
+impl Default for LiveFetcher {
+    fn default() -> Self {
+        Self {
+            reader: aterm_update_core::release_asset::Reader::anonymous(),
+        }
+    }
+}
 
 impl Fetcher for LiveFetcher {
     fn get(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
         // A fleet document published as a release asset rides the download host's outages on
         // the API route; anonymous either way.
-        aterm_update_core::release_asset::Reader::anonymous()
-            .bytes_at(url, max)
-            .map_err(|e| e.to_string())
+        self.reader.bytes_at(url, max).map_err(|e| e.to_string())
     }
 }
 

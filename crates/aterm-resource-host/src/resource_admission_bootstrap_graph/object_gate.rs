@@ -237,7 +237,11 @@ impl Owner {
             ))
             .and_then(|job| job.bootstrap_graph.as_mut())
         else {
-            self.faulted = true;
+            self.journal.fault(
+                &mut self.faulted,
+                "object-root",
+                "original root disappeared while its completion was held",
+            );
             std::mem::forget(token);
             return Err(refused("closed object lost original Root"));
         };
@@ -302,8 +306,9 @@ impl Owner {
             }
         }
         for token in closed {
-            if self.consume_bootstrap_object(token).is_err() {
-                self.faulted = true;
+            if let Err(error) = self.consume_bootstrap_object(token) {
+                self.journal
+                    .fault(&mut self.faulted, "object-consume", error);
             }
         }
     }
@@ -346,6 +351,7 @@ impl Owner {
                 CompletionCause::ResourceLimit => {
                     trust_resource_controller::CompletionCause::ResourceLimit
                 }
+                CompletionCause::HostFault => trust_resource_controller::CompletionCause::HostFault,
                 _ => trust_resource_controller::CompletionCause::Cancelled,
             })
         } else {

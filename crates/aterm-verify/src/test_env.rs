@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Release conditions belong to test children, never to a Background verifier's admission.
+//! One declared environment for dev and release test children, never verifier admission.
 //! A nonempty release history catches tests that assume a Mac has never cut a release.
 
 use crate::{Ctx, exec::Cmd};
@@ -15,9 +15,6 @@ fn home(ctx: &Ctx) -> PathBuf {
 /// Prepare a disposable home, including a persisted successful release's footprint shape.
 /// The deliberately large record also catches assumptions about the warm disk floor.
 pub(crate) fn prepare(ctx: &Ctx) -> std::io::Result<()> {
-    if !ctx.checkers_in_tests {
-        return Ok(());
-    }
     let state = home(ctx).join(".local/state/aterm-release");
     std::fs::create_dir_all(&state)?;
     let mut history = aterm_capacity::Footprints::default();
@@ -111,38 +108,38 @@ fn declared(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     cmd
 }
 
-/// Explicit release policy, shared by Cargo's recording pass, replayed binaries and doctests.
+/// Test policy shared by dev and release, Cargo's recording pass, replays and doctests.
 /// Cache locations stay those selected before HOME is replaced; no credentials are copied.
+/// `ATERM_RELEASE_RUN` exercises release conditions at landing too. Checker execution is
+/// separately selected by `stages::with_checkers`: only qualification owes the golden suite.
 pub(crate) fn command(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     cmd.envs
         .retain(|(key, _)| key != aterm_capacity::RELEASE_RUN_ENV);
-    if ctx.checkers_in_tests {
-        let disposable_home = home(ctx);
-        cmd = home_variables(
-            declared(ctx, cmd).env(aterm_capacity::RELEASE_RUN_ENV, "1"),
-            &disposable_home,
-        )
-        .env(
-            "ATERM_TEST_TOOL_HOME",
-            ctx.env
-                .tool_home
-                .clone()
-                .unwrap_or_else(|| ctx.env.home.clone()),
-        )
-        .env(
-            "CARGO_HOME",
-            ctx.env
-                .cargo_home
-                .clone()
-                .unwrap_or_else(|| ctx.env.home.join(".cargo")),
-        )
-        .env(
-            "RUSTUP_HOME",
-            aterm_toolchain::rustup::rustup_home(ctx.env.rustup_home.as_deref(), &ctx.env.home),
-        );
-        if let Some(prefix) = &ctx.env.test_package_prefix {
-            cmd = cmd.env("ATERM_TEST_PACKAGE_PREFIX", prefix);
-        }
+    let disposable_home = home(ctx);
+    cmd = home_variables(
+        declared(ctx, cmd).env(aterm_capacity::RELEASE_RUN_ENV, "1"),
+        &disposable_home,
+    )
+    .env(
+        "ATERM_TEST_TOOL_HOME",
+        ctx.env
+            .tool_home
+            .clone()
+            .unwrap_or_else(|| ctx.env.home.clone()),
+    )
+    .env(
+        "CARGO_HOME",
+        ctx.env
+            .cargo_home
+            .clone()
+            .unwrap_or_else(|| ctx.env.home.join(".cargo")),
+    )
+    .env(
+        "RUSTUP_HOME",
+        aterm_toolchain::rustup::rustup_home(ctx.env.rustup_home.as_deref(), &ctx.env.home),
+    );
+    if let Some(prefix) = &ctx.env.test_package_prefix {
+        cmd = cmd.env("ATERM_TEST_PACKAGE_PREFIX", prefix);
     }
     cmd
 }
@@ -167,9 +164,6 @@ mod tests {
     #[test]
     fn a_nonempty_history_is_injected_without_reading_the_owners_state() {
         let dir = aterm_tempfile::tempdir().unwrap();
-        let ordinary = context(dir.path(), false);
-        prepare(&ordinary).unwrap();
-        assert!(!home(&ordinary).exists());
         let mut release = context(dir.path(), true);
         release.env.cargo_build_jobs = Some("3".into());
         release.env.build_slot_held = Some("1".into());
@@ -222,13 +216,16 @@ mod tests {
             value("RUSTUP_HOME"),
             Some(release.env.home.join(".rustup").into_os_string())
         );
+        release.checkers_in_tests = false;
+        prepare(&release).unwrap();
+        assert_eq!(command(&release, Cmd::new("probe")), cmd);
     }
 
-    /// NEGATIVE CONTROL: a planted child fails only in release conditions. Removing the
+    /// NEGATIVE CONTROL: a planted child fails in dev and release conditions. Removing the
     /// explicit policy makes it pass, which must fail this test rather than hide the red.
     #[cfg(unix)]
     #[test]
-    fn a_planted_release_only_red_is_seen_by_the_lanes_test_policy() {
+    fn a_planted_red_is_seen_in_dev_and_release() {
         const PROBE: &str = "ATERM_RELEASE_POLICY_PROBE";
         if let Some(mode) = std::env::var_os(PROBE) {
             let marker = std::env::var_os(aterm_capacity::RELEASE_RUN_ENV);
@@ -241,7 +238,8 @@ mod tests {
         }
         let dir = aterm_tempfile::tempdir().unwrap();
         for (release, mode, passes) in [
-            (false, "red", true),
+            (false, "red", false),
+            (false, "fixed", true),
             (true, "red", false),
             (true, "fixed", true),
         ] {
@@ -249,7 +247,10 @@ mod tests {
             std::fs::create_dir_all(&ctx.scratch).unwrap();
             prepare(&ctx).unwrap();
             let probe = Cmd::new(std::env::current_exe().unwrap())
-                .args(["--exact", "release_test_env::tests::a_planted_release_only_red_is_seen_by_the_lanes_test_policy"])
+                .args([
+                    "--exact",
+                    "test_env::tests::a_planted_red_is_seen_in_dev_and_release",
+                ])
                 .env(PROBE, mode)
                 .env(aterm_capacity::RELEASE_RUN_ENV, "poisoned inherited policy");
             let out = exec::run(&command(&ctx, probe), ctx.exec_env());
@@ -267,13 +268,71 @@ mod tests {
         }
     }
 
-    /// NEGATIVE CONTROL: the cutter's configuration is present in the caller, while the
-    /// release-shaped test child receives only the verifier's explicit test policy.
+    /// A provisioned tool belongs to the real tool home, never the disposable account.
+    /// The inherited-HOME run is the negative control: reverting the boundary makes the
+    /// planted broken lookup pass and this test fail, in both dev and release mode.
     #[cfg(unix)]
     #[test]
-    fn release_test_children_do_not_inherit_the_cutters_configuration() {
+    fn provisioned_tools_require_tool_home_in_dev_and_release() {
+        const PROBE: &str = "ATERM_TOOL_HOME_PROBE";
+        const TEST: &str =
+            "test_env::tests::provisioned_tools_require_tool_home_in_dev_and_release";
+        const TOOL: &str = "Library/Caches/aterm/probe.noindex/tool";
+        if let Ok(mode) = std::env::var(PROBE) {
+            let root = if mode == "fixed" {
+                aterm_uds::host::tool_home().unwrap()
+            } else {
+                PathBuf::from(std::env::var_os("HOME").unwrap())
+            };
+            assert!(root.join(TOOL).is_file(), "provisioned tool is absent");
+            return;
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        for release in [false, true] {
+            let ctx = context(dir.path(), release);
+            prepare(&ctx).unwrap();
+            let tool_home = ctx.env.tool_home.as_ref().unwrap();
+            let tool = tool_home.join(TOOL);
+            std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+            std::fs::write(tool, "provisioned").unwrap();
+            for (declared, mode, passes) in [
+                (false, "broken", true),
+                (true, "broken", false),
+                (true, "fixed", true),
+            ] {
+                let probe = Cmd::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST])
+                    .env("HOME", tool_home)
+                    .env(PROBE, mode);
+                let probe = if declared {
+                    command(&ctx, probe)
+                } else {
+                    probe
+                };
+                let out = exec::run(&probe, ctx.exec_env());
+                assert_eq!(
+                    out.ok, passes,
+                    "release={release}, mode={mode}: {}",
+                    out.output
+                );
+                assert!(
+                    out.output
+                        .contains(if passes { "1 passed" } else { "1 failed" }),
+                    "{}",
+                    out.output
+                );
+            }
+        }
+    }
+
+    /// NEGATIVE CONTROL: the cutter's configuration is present in the caller, while every
+    /// test child receives only the verifier's explicit test policy.
+    #[cfg(unix)]
+    #[test]
+    fn test_children_do_not_inherit_the_cutters_configuration() {
         const PROBE: &str = "ATERM_RELEASE_ENV_PROBE";
-        const TEST: &str = "release_test_env::tests::release_test_children_do_not_inherit_the_cutters_configuration";
+        const TEST: &str =
+            "test_env::tests::test_children_do_not_inherit_the_cutters_configuration";
         match std::env::var(PROBE).as_deref() {
             Ok("subject") => {
                 assert!(std::env::var_os("PUBLISH_AGH").is_none());
@@ -283,14 +342,15 @@ mod tests {
             }
             Ok("driver") => {
                 let dir = aterm_tempfile::tempdir().unwrap();
-                let ctx = context(dir.path(), true);
-                std::fs::create_dir_all(&ctx.scratch).unwrap();
-                prepare(&ctx).unwrap();
-                let subject = Cmd::new(std::env::current_exe().unwrap())
-                    .args(["--exact", TEST])
-                    .env(PROBE, "subject");
-                let out = exec::run(&command(&ctx, subject), ctx.exec_env());
-                assert!(out.ok && out.output.contains("1 passed"), "{}", out.output);
+                for release in [false, true] {
+                    let ctx = context(dir.path(), release);
+                    prepare(&ctx).unwrap();
+                    let subject = Cmd::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST])
+                        .env(PROBE, "subject");
+                    let out = exec::run(&command(&ctx, subject), ctx.exec_env());
+                    assert!(out.ok && out.output.contains("1 passed"), "{}", out.output);
+                }
                 return;
             }
             _ => {}

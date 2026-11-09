@@ -18,6 +18,118 @@ use ledger::testing::Git;
 const VERSION: &str = "0.26.0";
 
 #[test]
+fn qualify_hints_rank_test_file_then_crate_and_judge_each_patch() {
+    let f = Fixture::merging("qualify-hints");
+    let base = commit(
+        &f.rival,
+        "red base",
+        &[
+            (
+                "crates/red/src/tests.rs",
+                "#[test]\nfn broken() { assert!(super::value()); }\n",
+            ),
+            ("crates/red/src/lib.rs", "fn value() -> bool { false }\n"),
+            ("docs/note.md", "base\n"),
+            ("crates/other/src/lib.rs", "fn unrelated() {}\n"),
+        ],
+    );
+    let head = commit(&f.rival, "line doc change", &[("docs/note.md", "line\n")]);
+    run(&f.rival, &["checkout", "-q", "--detach", &base]);
+    let clean = commit(
+        &f.rival,
+        "fix test",
+        &[(
+            "crates/red/src/tests.rs",
+            "#[test]\nfn broken() { let _ = super::value(); }\n",
+        )],
+    );
+    let conflict = commit(
+        &f.rival,
+        "fix crate with docs",
+        &[
+            ("crates/red/src/lib.rs", "fn value() -> bool { true }\n"),
+            ("docs/note.md", "main\n"),
+        ],
+    );
+    let unrelated = commit(
+        &f.rival,
+        "unrelated",
+        &[("crates/other/src/lib.rs", "fn unrelated() { }\n")],
+    );
+    let git = Git::new(&f.rival);
+    run(
+        &f.rival,
+        &["update-ref", "refs/remotes/origin/main", &unrelated],
+    );
+    let mut line = Line::start(VERSION, &base, 1);
+    line.hops.push(Hop {
+        commit: head.clone(),
+        ..Hop::default()
+    });
+    let before = rev(&f.rival, "HEAD");
+    let hints =
+        line::failure_hints(&git, &line, "test tests::broken ... FAILED\nFAIL red --lib").unwrap();
+    let mut checks = crate::check_record::Checks::default();
+    checks.tree = base.clone();
+    checks.failed.push(crate::check_record::Failed {
+        check: "test".into(),
+        log: "fixture-tree.log".into(),
+        unrecorded: false,
+    });
+    let mut refusal = checks.fail_refusal(&head).unwrap();
+    let count = |rows: &[String]| {
+        rows.iter()
+            .filter(|row| row.starts_with(&clean) || row.starts_with(&conflict))
+            .count()
+    };
+    assert_eq!(
+        count(&refusal.detail),
+        0,
+        "baseline FAIL has no commit hints"
+    );
+    refusal.detail.extend(hints.clone());
+    assert_eq!(count(&refusal.detail), 2);
+    println!(
+        "fixture refusal candidates: before=0 after=2; carry verdicts: clean=1 docs_conflict=1; unrelated=0"
+    );
+    assert!(
+        hints[1].contains(&clean) && hints[1].contains("[test file]: carries cleanly"),
+        "{hints:?}"
+    );
+    assert!(
+        hints[2].contains(&conflict) && hints[2].contains("[crate]: conflicts in docs/note.md"),
+        "{hints:?}"
+    );
+    assert!(hints[3].contains("re-make plan only") && hints[3].contains(&head));
+    assert!(!hints.join("\n").contains(&unrelated));
+    assert_eq!(rev(&f.rival, "HEAD"), before, "hints never carry a patch");
+    // Negative control: neither main fix touches this failing crate.
+    let control = line::failure_hints(&git, &line, "FAIL other --lib").unwrap();
+    assert!(control.iter().any(|s| s.contains(&unrelated)));
+    run(
+        &f.rival,
+        &["update-ref", "refs/remotes/origin/main", &conflict],
+    );
+    let control = line::failure_hints(&git, &line, "FAIL other --lib").unwrap();
+    assert_eq!(control[1], "no main commit since the base touches it");
+    // Negative control for the doc-only plan: a source conflict needs an authored fix.
+    run(&f.rival, &["checkout", "-q", "--detach", &head]);
+    let source_head = commit(
+        &f.rival,
+        "line source change",
+        &[("crates/red/src/lib.rs", "fn value() -> bool { panic!() }\n")],
+    );
+    line.hops[0].commit = source_head;
+    let conflict = line::failure_hints(&git, &line, "FAIL red --lib").unwrap();
+    assert!(
+        conflict
+            .iter()
+            .any(|s| s.contains("conflicts in crates/red/src/lib.rs"))
+    );
+    assert!(!conflict.iter().any(|s| s.contains("re-make plan")));
+}
+
+#[test]
 fn supersession_is_durable_ordered_and_keeps_mains_tree() {
     let fixture = Fixture::new("supersede");
     let git = fixture.git();

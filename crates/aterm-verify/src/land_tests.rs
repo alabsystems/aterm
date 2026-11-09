@@ -401,6 +401,7 @@ fn landing_reads_the_watch_journal_for_its_exact_base_tree() {
             inputs: "fixture-seal".into(),
             token: "fixture".into(),
             state: state.into(),
+            cause: String::new(),
             started: 1,
             updated: 2,
             lease_until: 0,
@@ -646,6 +647,52 @@ fn a_check_row_reads_verifys_own_check_finished_event() {
         })
     );
     assert_eq!(CheckRow::of_event(line.trim_end()), None);
+}
+
+#[test]
+fn land_requires_a_completed_terminal_line_but_preserves_later_partial_diagnostics() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("verify.events");
+    let events = crate::event_log::EventLog::open(&path).unwrap();
+    let result = crate::report::CheckResult {
+        check: crate::Check::Fmt,
+        outcome: crate::Outcome::Ok,
+        seconds: 1.0,
+        detail: String::new(),
+        findings: Vec::new(),
+        rerun: "targo --unverified verify fmt".into(),
+        stopped: false,
+    };
+    events.write(&crate::report::check_event(&result, &[]));
+    events.write(&crate::report::run_event(&[result], exit::PASS));
+    let complete = std::fs::read_to_string(&path).unwrap();
+    let baseline = Judged::from_events(&complete, exit::PASS, 7);
+    assert!(baseline.whole());
+    assert_eq!(baseline.checks.len(), 1);
+    assert_eq!(baseline.secs, 7);
+    assert_eq!(
+        decide(&baseline, &Lane::Pass, &crates(&["a"])),
+        Decision::default()
+    );
+
+    let unframed = complete.strip_suffix('\n').unwrap();
+    let missing = Judged::from_events(unframed, exit::PASS, 7);
+    assert_eq!(missing.checks, baseline.checks);
+    assert!(missing.finished.is_none());
+    assert!(!missing.whole());
+    let decision = decide(&missing, &Lane::Pass, &crates(&["a"]));
+    assert!(!decision.not_run.is_empty());
+    assert!(decision.inherited.is_empty());
+
+    let crlf = Judged::from_events(&complete.replace('\n', "\r\n"), exit::PASS, 7);
+    assert_eq!(crlf, baseline);
+    let partial_tail = format!("{complete}verify-event: {{\"schema\":1,\"event\":\"disk\"");
+    let with_tail = Judged::from_events(&partial_tail, exit::PASS, 7);
+    assert_eq!(with_tail, baseline);
+    assert_eq!(
+        decide(&with_tail, &Lane::Pass, &crates(&["a"])),
+        Decision::default()
+    );
 }
 
 /// A green branch lands as one merge of main into it, stating its judgment: the tree judged, the
@@ -1256,6 +1303,332 @@ fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged()
         git(&control.work, &["show", &format!("{landing}:shared.txt")]),
         "one\n2\n3\n4\n5\n6\n7\neight"
     );
+
+    // A product-version move does not change the branch's independent lock entry.
+    // The real merge must retain both edits; other metadata and uncertain identity do
+    // not receive this exception, even when their textual merge is clean.
+    const WORKSPACE: &str =
+        "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nversion = \"0.1.0\"\n";
+    const PRODUCT: &str = "[package]\nname = \"aterm\"\nversion.workspace = true\n\
+        [[bin]]\nname = \"aterm\"\npath = \"src/main.rs\"\n\
+        [dependencies]\nagent = { path = \"../agent\" }\n";
+    const AGENT: &str =
+        "[package]\nname = \"agent\"\nversion = \"0.0.0\"\n[dependencies]\nbase = \"1.0.0\"\n";
+    const LOCK: &str = "version = 4\n\n\
+        [[package]]\nname = \"aterm\"\nversion = \"0.1.0\"\ndependencies = [\"agent\"]\n\n\
+        [[package]]\nname = \"agent\"\nversion = \"0.0.0\"\ndependencies = [\"base\"]\n\n\
+        [[package]]\nname = \"agh-fake\"\nversion = \"0.0.0\"\n\n\
+        [[package]]\nname = \"base\"\nversion = \"1.0.0\"\n\
+        source = \"registry+https://example.invalid/index\"\nchecksum = \"old-checksum\"\n";
+    for change in [
+        "version",
+        "dependency",
+        "checksum",
+        "format",
+        "trivia",
+        "mismatch",
+        "inheritor",
+        "mode",
+        "unknown",
+        "symlink-member",
+        "root-package",
+        "workspace-override",
+        "build-disabled",
+        "build-override",
+        "build-default",
+        "path-member",
+        "nested-workspace",
+        "nested-override",
+        "escaping-path",
+        "gitlink-workspace",
+        "gitlink-override",
+    ] {
+        let world = self::world();
+        let workspace = if change == "root-package" {
+            format!("{WORKSPACE}\n[package]\nname = \"root\"\nversion.workspace = true\n")
+        } else if matches!(change, "gitlink-workspace" | "gitlink-override") {
+            WORKSPACE.replace(
+                "[workspace.package]",
+                "exclude = [\"vendor/sub\"]\n[workspace.package]",
+            )
+        } else {
+            WORKSPACE.to_owned()
+        };
+        let product = match change {
+            "build-disabled" => PRODUCT.replace("[package]\n", "[package]\nbuild = false\n"),
+            "build-override" => PRODUCT.replace("[package]\n", "[package]\nbuild = \"other.rs\"\n"),
+            "build-default" => PRODUCT.replace("[package]\n", "[package]\nbuild = \"build.rs\"\n"),
+            _ => PRODUCT.to_owned(),
+        };
+        for (file, text) in [
+            ("Cargo.toml", workspace.as_str()),
+            ("Cargo.lock", LOCK),
+            ("crates/aterm/Cargo.toml", product.as_str()),
+            ("crates/aterm/src/main.rs", "fn main() {}\n"),
+            ("crates/aterm/build.rs", "// the fixed identity writer\n"),
+            ("crates/aterm-stamp/src/lib.rs", "// runtime identity\n"),
+            (
+                "crates/aterm-census/src/guards/identity_read.rs",
+                "// the unchanged identity boundary\n",
+            ),
+            (
+                "crates/agent/Cargo.toml",
+                if change == "inheritor" {
+                    "[package]\nname = \"agent\"\nversion.workspace = true\n\
+                     [dependencies]\nbase = \"1.0.0\"\n"
+                } else if change == "workspace-override" {
+                    "[package]\nname = \"agent\"\nversion = \"0.0.0\"\nworkspace = \"../..\"\n\
+                     [dependencies]\nbase = \"1.0.0\"\n"
+                } else {
+                    AGENT
+                },
+            ),
+            (
+                "crates/agh-fake/Cargo.toml",
+                "[package]\nname = \"agh-fake\"\nversion = \"0.0.0\"\n",
+            ),
+        ] {
+            write(&world.rival, file, text);
+        }
+        if change == "symlink-member" {
+            // Exercise Git's immutable symlink shape without requiring OS symlink
+            // privileges. The target member would otherwise evade the manifest scan.
+            for dir in [&world.rival, &world.work] {
+                git(dir, &["config", "core.symlinks", "false"]);
+            }
+            write(&world.rival, "crates/linked", "../outside");
+            write(
+                &world.rival,
+                "outside/Cargo.toml",
+                "[package]\nname = \"hidden\"\nversion.workspace = true\n",
+            );
+        }
+        if matches!(change, "gitlink-workspace" | "gitlink-override") {
+            let child = world._dir.path().join("child");
+            git(&world.rival, &["init", "-q", "-b", "main", path(&child)]);
+            write(
+                &child,
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/helper\"]\n[workspace.package]\nversion = \"7.0.0\"\n",
+            );
+            write(
+                &child,
+                "crates/helper/Cargo.toml",
+                if change == "gitlink-override" {
+                    "[package]\nname = \"helper\"\nversion.workspace = true\nworkspace = \"../../../..\"\n"
+                } else {
+                    "[package]\nname = \"helper\"\nversion.workspace = true\n"
+                },
+            );
+            write(&child, "crates/helper/src/lib.rs", "pub fn helper() {}\n");
+            // Like astream's negative fixture corpus, this manifest is inspected
+            // but its deliberately absent target is not in the dependency closure.
+            write(
+                &child,
+                "fixtures/unused/Cargo.toml",
+                "[package]\nname = \"unused\"\nversion = \"0.0.0\"\n[dependencies]\nmissing = { path = \"missing\" }\n",
+            );
+            git(&child, &["add", "-A"]);
+            git(&child, &["commit", "-qm", "an independent child workspace"]);
+            git(
+                &world.rival,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    path(&child),
+                    "vendor/sub",
+                ],
+            );
+        }
+        git(&world.rival, &["add", "-A"]);
+        if change == "symlink-member" {
+            let target = git(&world.rival, &["rev-parse", ":crates/linked"]);
+            git(
+                &world.rival,
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    "120000",
+                    &target,
+                    "crates/linked",
+                ],
+            );
+        }
+        git(
+            &world.rival,
+            &["commit", "-q", "-m", "the versioned product"],
+        );
+        git(&world.rival, &["push", "-q", "origin", "main"]);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        git(&world.work, &["merge", "--ff-only", "origin/main"]);
+        if matches!(change, "gitlink-workspace" | "gitlink-override") {
+            git(
+                &world.work,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--no-fetch",
+                ],
+            );
+        }
+        if change == "symlink-member" {
+            assert!(
+                git(&world.work, &["ls-tree", "HEAD", "crates/linked"]).starts_with("120000 blob ")
+            );
+        }
+        let mut own_lock = LOCK.replace(
+            "dependencies = [\"base\"]",
+            "dependencies = [\"base\", \"agh-fake\"]",
+        );
+        let mut agent = git(&world.work, &["show", "HEAD:crates/agent/Cargo.toml"]);
+        if matches!(
+            change,
+            "path-member"
+                | "nested-workspace"
+                | "nested-override"
+                | "escaping-path"
+                | "gitlink-workspace"
+                | "gitlink-override"
+        ) {
+            let target = match change {
+                "escaping-path" => "../../../outside",
+                "path-member" => "../../support/helper",
+                "gitlink-workspace" | "gitlink-override" => "../../vendor/sub/crates/helper",
+                _ => "../../support/workspace/helper",
+            };
+            agent.push_str(&format!("\n[dependencies.helper]\npath = \"{target}\"\n"));
+            own_lock = own_lock.replace(
+                "dependencies = [\"base\", \"agh-fake\"]",
+                "dependencies = [\"base\", \"agh-fake\", \"helper\"]",
+            );
+            own_lock.push_str(&format!(
+                "\n[[package]]\nname = \"helper\"\nversion = \"{}\"\n",
+                if matches!(change, "path-member" | "gitlink-override") {
+                    "0.1.0"
+                } else if change == "gitlink-workspace" {
+                    "7.0.0"
+                } else {
+                    "0.0.0"
+                }
+            ));
+            if change == "path-member" {
+                write(
+                    &world.work,
+                    "support/helper/Cargo.toml",
+                    "[package]\nname = \"helper\"\nversion.workspace = true\n",
+                );
+            } else if matches!(change, "nested-workspace" | "nested-override") {
+                write(
+                    &world.work,
+                    "support/workspace/Cargo.toml",
+                    "[workspace]\nmembers = [\"helper\"]\n[workspace.package]\nversion = \"0.0.0\"\n",
+                );
+                write(
+                    &world.work,
+                    "support/workspace/helper/Cargo.toml",
+                    if change == "nested-override" {
+                        "[package]\nname = \"helper\"\nversion.workspace = true\nworkspace = \"../../..\"\n"
+                    } else {
+                        "[package]\nname = \"helper\"\nversion.workspace = true\n"
+                    },
+                );
+            }
+        }
+        write(
+            &world.work,
+            "crates/agent/Cargo.toml",
+            &format!("{agent}\n[dev-dependencies]\nagh-fake = {{ path = \"../agh-fake\" }}\n"),
+        );
+        commit(&world.work, "Cargo.lock", &own_lock);
+        let moved = RefCell::new(None);
+        let (code, said, bases) = land_with(&world, crates(&["agent"]), Lane::Pass, |_, n| {
+            if n == 0 {
+                git(&world.rival, &["fetch", "-q", "origin"]);
+                git(
+                    &world.rival,
+                    &["checkout", "-q", "-B", "main", "origin/main"],
+                );
+                let workspace = workspace.replace(
+                    "0.1.0",
+                    if change == "mismatch" {
+                        "0.3.0"
+                    } else {
+                        "0.2.0"
+                    },
+                );
+                let mut lock = LOCK.replacen("0.1.0", "0.2.0", 1);
+                match change {
+                    "dependency" => {
+                        lock = lock.replace(
+                            "dependencies = [\"agent\"]",
+                            "dependencies = [\"agent\", \"base\"]",
+                        );
+                    }
+                    "checksum" => lock = lock.replace("old-checksum", "new-checksum"),
+                    "format" => lock = lock.replacen("version = 4", "version = 3", 1),
+                    "trivia" => lock.insert_str(0, "# another change\n"),
+                    "unknown" => lock.push_str("future-policy = true\n"),
+                    _ => {}
+                }
+                write(&world.rival, "Cargo.toml", &workspace);
+                write(&world.rival, "Cargo.lock", &lock);
+                git(&world.rival, &["add", "-A"]);
+                if change == "mode" {
+                    git(&world.rival, &["update-index", "--chmod=+x", "Cargo.lock"]);
+                }
+                git(
+                    &world.rival,
+                    &["commit", "-q", "-m", "move product identity"],
+                );
+                let tip = git(&world.rival, &["rev-parse", "HEAD"]);
+                git(&world.rival, &["push", "-q", "origin", "main"]);
+                *moved.borrow_mut() = Some(tip);
+            }
+            green()
+        });
+        assert_eq!(code, exit::PASS, "{change}: {said:#?}");
+        let composed = matches!(
+            change,
+            "version" | "build-default" | "nested-workspace" | "gitlink-workspace"
+        );
+        assert_eq!(
+            bases.len(),
+            if composed { 1 } else { 2 },
+            "{change}: {said:#?}"
+        );
+        let moved = moved.into_inner().unwrap();
+        let landing = origin_main(&world);
+        let receipt = stated(&world, &landing).unwrap();
+        assert_eq!(
+            receipt.composed_onto.as_deref(),
+            composed.then_some(moved.as_str()),
+            "{change}"
+        );
+        let lock = git(&world.work, &["show", &format!("{landing}:Cargo.lock")]);
+        assert!(lock.contains(
+            if matches!(
+                change,
+                "path-member"
+                    | "nested-workspace"
+                    | "nested-override"
+                    | "escaping-path"
+                    | "gitlink-workspace"
+                    | "gitlink-override"
+            ) {
+                "dependencies = [\"base\", \"agh-fake\", \"helper\"]"
+            } else {
+                "dependencies = [\"base\", \"agh-fake\"]"
+            }
+        ));
+        assert!(lock.contains("version = \"0.2.0\""));
+        assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
+    }
 }
 
 #[cfg(unix)]

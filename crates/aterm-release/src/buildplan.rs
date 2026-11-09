@@ -1550,6 +1550,10 @@ pub(crate) fn pilot_host_checks(
 
 /// The shipped channel's published index run now, as a store that has verified nothing finds it ([`atpkg::net::published_index_run`]), for a release build to compile in.
 pub(crate) fn index_hint_now() -> Option<String> {
+    println!(
+        "==> optional index hint: {}s total deadline across all HEADs; no retries",
+        atpkg::net::INDEX_HINT_BOUND.as_secs()
+    );
     match atpkg::net::published_index_run() {
         Ok(run) => {
             println!(

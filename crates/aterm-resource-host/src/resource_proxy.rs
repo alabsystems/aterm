@@ -391,6 +391,7 @@ fn completed(done: Terminal) -> wire::Status {
                 admission::CompletionCause::Timeout => wire::CompletionCause::Timeout,
                 admission::CompletionCause::Cancelled => wire::CompletionCause::Cancelled,
                 admission::CompletionCause::ResourceLimit => wire::CompletionCause::ResourceLimit,
+                admission::CompletionCause::HostFault => wire::CompletionCause::HostFault,
             },
             runtime_ns: value.runtime_ns,
         },

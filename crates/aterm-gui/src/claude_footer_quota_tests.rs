@@ -1067,6 +1067,47 @@ fn no_midnight_strikes_a_letter() {
 /// painted glass and the tap's words past them blank glass, so it never takes Claude's hidden
 /// letters there for ink. NEGATIVE CONTROL (the write held whole as painted, as every write
 /// before line E was): the blanked cells would read as chrome.
+/// LINE E'S `↺`S ARE THE GLASS'S MARKS (§4.3, §7 step 2's judgement, 2026-11-08): on Claude
+/// Code 2.1.318's screen at 170 columns, case (b) says `↺` on the chart and in its tail, and each
+/// is drawn as the glass's icon (`BandIcon::Reset`) over its own cell, as line D's marks are, the
+/// cell keeping its character. The font's `↺` is a stroke thinner than a pixel at 1x: in §7's
+/// gallery its darkest pixel read 3.49:1 on Aterm Day under an ink solved to 14.35:1.
+/// NEGATIVE CONTROL: leaving `↺` out of the marks `claude_card::glass_marks` draws leaves line E
+/// with no icon there (run once, restored).
+#[test]
+fn line_es_resets_are_drawn_as_the_glasss_marks() {
+    use aterm_core::render::BandIcon;
+
+    let view = case("b");
+    let (app, wid, _session, rows) = claimed("claude-2.1.318-tap-row-week", &view);
+    let tap = bottom(&rows) + 1;
+    let row = frame_row(&app, wid, tap);
+    let ws = &app.windows[&wid];
+    let resets: Vec<u16> = ws.input_scratch.cells[row]
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.ch == '\u{21ba}')
+        .map(|(col, _)| u16::try_from(col).expect("a column"))
+        .collect();
+    assert_eq!(
+        resets.len(),
+        2,
+        "case (b) says ↺ on the chart and in the tail: {:?}",
+        glass(&app, wid, tap)
+    );
+    let mut drawn: Vec<u16> = ws
+        .input_scratch
+        .chrome_rasters
+        .iter()
+        .filter(|raster| usize::from(raster.row) == row)
+        .flat_map(|raster| raster.icons.iter())
+        .filter(|icon| icon.icon == BandIcon::Reset)
+        .map(|icon| icon.col)
+        .collect();
+    drawn.sort_unstable();
+    assert_eq!(drawn, resets, "each ↺ is drawn as the glass's icon");
+}
+
 #[test]
 fn the_kitty_keeps_off_the_painted_cells() {
     use aterm_effects::pet_world::PetRect;

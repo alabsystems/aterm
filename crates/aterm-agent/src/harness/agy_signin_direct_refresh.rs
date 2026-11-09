@@ -72,7 +72,7 @@ pub(super) fn run_with(
             binding.expected_email(),
             remaining(deadline)
                 .map_err(GoogleLoginError::Native)?
-                .min(GOOGLE_REQUEST),
+                .min(crate::harness::google_profile::REQUEST_HANG),
         );
         remaining(deadline).map_err(GoogleLoginError::Native)?;
         journal.unchanged().map_err(GoogleLoginError::Recovery)?;

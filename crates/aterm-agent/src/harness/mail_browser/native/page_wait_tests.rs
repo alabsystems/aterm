@@ -19,17 +19,27 @@ struct Page {
 impl Page {
     fn new() -> Self {
         let home = aterm_uds::host::tool_home();
-        let pin = aterm_uds::host::chrome::host_pin().expect("native browser platform pin");
-        let path = browser::browser_cache_roots(home.as_deref())
-            .into_iter()
-            .map(|root| {
-                aterm_uds::host::chrome::pinned_binary(
-                    &aterm_uds::host::chrome::pinned_dir(&root, pin.platform),
-                    pin.platform,
-                )
-            })
-            .find(|path| path.is_file())
-            .expect("run targo --unverified verify provision for the pinned headless browser");
+        // The browser its tool row's variable names, else the pinned one `verify provision`
+        // placed; a host with neither refuses the case (COULD NOT RUN, naming both), since the
+        // machine and not the tree lacks it.
+        let shell = aterm_uds::host::tool("chrome-headless-shell");
+        let pinned = || {
+            let pin = aterm_uds::host::chrome::host_pin()?;
+            browser::browser_cache_roots(home.as_deref())
+                .into_iter()
+                .map(|root| {
+                    aterm_uds::host::chrome::pinned_binary(
+                        &aterm_uds::host::chrome::pinned_dir(&root, pin.platform),
+                        pin.platform,
+                    )
+                })
+                .find(|path| path.is_file())
+        };
+        let path = std::env::var_os(shell.var())
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(pinned)
+            .unwrap_or_else(|| aterm_uds::host::could_not_run(shell.refusal()));
         let root = aterm_tempfile::tempdir().unwrap();
         let home = root.path().join("child-home");
         let profile = root.path().join("profile");

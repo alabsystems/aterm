@@ -3291,9 +3291,90 @@ fn airtimes(shots: &[Shot]) -> Vec<(u64, u64)> {
 /// past it.
 const WRAP_BOUND_MS_MAX: u64 = 850;
 
+/// How long before a wrap [`wraps_met`] looks for a frame of the cat below full alpha, ms: well
+/// past any hide the letters meeting the cat's box begin ([`WRAP_HIDE_LEAD_MAX_MS`]), short of
+/// the fade's 0.45 s, so a hide begun too soon is seen as begun at the window's start.
+const WRAP_HIDE_LEAD_MS: u64 = 400;
+
+/// The earliest a hide may begin before its wrap, ms: the letters meet the cat's box at the wall
+/// within the last keys of the line (measured 37 to 67 ms before the program's lines' wraps, 86
+/// to 112 before the hand's).
+const WRAP_HIDE_LEAD_MAX_MS: u64 = 150;
+
+/// A take's wrap as the cat met it ([`the_writings_wrap_is_a_brisk_bound`]): when (ms), whether
+/// the caret stayed on its row, the first frame (ms) of the [`WRAP_HIDE_LEAD_MS`] before it that
+/// drew the cat below full alpha, and the bound that left within 1.5 s of it (leave ms, ms in the
+/// air). From that frame, the frames whose alpha rose over the frame before's to the first frame
+/// off the glass, that frame (ms), and the first frame back on glass past it (ms, and how far its
+/// body stood from the caret, cells).
+#[derive(Debug, PartialEq)]
+struct WrapMet {
+    at: u64,
+    on_its_row: bool,
+    hid: Option<u64>,
+    flight: Option<(u64, u64)>,
+    rose: usize,
+    gone: Option<u64>,
+    back: Option<(u64, f32)>,
+}
+
+/// Each wrap of `shots` on a pane of `cols` ([`WrapMet`]): the caret from within six cells of the
+/// margin to the first twelve of the same row (a composer at the screen's foot grows up) or the
+/// next.
+fn wraps_met(shots: &[Shot], cols: u16) -> Vec<WrapMet> {
+    let flights = airtimes(shots);
+    shots
+        .windows(2)
+        .filter(|w| {
+            let ((pr, pc), (r, c)) = (w[0].caret, w[1].caret);
+            (r == pr || r == pr + 1) && pc + 6 >= cols && c <= 12
+        })
+        .map(|w| {
+            let at = w[1].ms;
+            let hid = shots
+                .iter()
+                .filter(|s| s.ms + WRAP_HIDE_LEAD_MS >= at && s.ms < at)
+                .find(|s| s.frame.alpha < u8::MAX)
+                .map(|s| s.ms);
+            let gone = hid.and_then(|h| {
+                shots
+                    .iter()
+                    .find(|s| s.ms >= h && s.frame.alpha == 0)
+                    .map(|s| s.ms)
+            });
+            WrapMet {
+                at,
+                on_its_row: w[1].caret.0 == w[0].caret.0,
+                hid,
+                flight: flights
+                    .iter()
+                    .copied()
+                    .find(|&(leave, _)| leave >= at && leave <= at + 1_500),
+                rose: hid.map_or(0, |h| {
+                    shots
+                        .windows(2)
+                        .filter(|p| {
+                            p[0].ms >= h
+                                && gone.is_none_or(|g| p[1].ms <= g)
+                                && p[1].frame.alpha > p[0].frame.alpha
+                        })
+                        .count()
+                }),
+                gone,
+                back: gone.and_then(|g| {
+                    shots
+                        .iter()
+                        .find(|s| s.ms > g && s.frame.alpha > 0)
+                        .map(|s| (s.ms, (s.frame.col - f32::from(s.caret.1)).abs()))
+                }),
+            }
+        })
+        .collect()
+}
+
 /// THE WRITING'S WRAP IS A BRISK BOUND. In the generating take Claude Code's composer
-/// word-wraps the writing at 19.9, 30.7 and 61.1 s (a program types the first two lines into
-/// it, the hand the third): the caret goes from the margin back to the next line's start,
+/// word-wraps the writing at 19.9, 30.7, 61.1 and 93.4 s (a program types the first two lines
+/// into it, the hand the others): the caret goes from the margin back to the next line's start,
 /// 110 cells, and the writing runs on at 20 keys a second. The cat it left at the margin
 /// expected the wrap: it goes at once, no notice beat (it leaves within 200 ms), and crosses
 /// in the bound the animal's own pace makes, in the air no longer than the big bound's longest
@@ -3304,6 +3385,25 @@ const WRAP_BOUND_MS_MAX: u64 = 850;
 /// (a present a vsync, two or three after the one before, late by up to 3 ms): the long insert
 /// on schedule 3 at each rate and echo, the generating take on schedule 3 at 60 Hz with the
 /// echo as recorded, and on schedules 1 and 2 at 60 Hz with the echo 150 ms late.
+///
+/// But the wall's. At the margin the composer's rules over and under the line leave the cat at
+/// the wall no seat, so from the key whose letter meets its box it fades out where it stands
+/// (`OldPath::NoSeatHidesTheBody`, ATERM-KI-1107-4): no hide begins more than
+/// [`WRAP_HIDE_LEAD_MAX_MS`] before its wrap (the program's lines meet the box 37 to 67 ms before
+/// theirs, down to alpha 218 of 255; the hand's 86 to 112 ms). A wrap that takes the caret to the
+/// next row ends that hide at once, and the cat bounds as above. One that leaves the caret on its
+/// row (the composer at the screen's foot grows up, carrying the line up a row) leaves the cat to
+/// the wall, as an Enter or a wrap on a full page's last row does
+/// (`companion_off_letters::a_last_row_that_holds_no_seat_hides_the_companion`): the hide holds
+/// to its fade's end, its alpha never rising, off the glass within the fade (0.45 s) and two
+/// frames of the frame it began, and back on glass within a second of the wrap, 12 cells or nearer
+/// the caret. The wall's wraps are the hand's, at 61.1 and 93.4 s, off the glass 318 to 353 ms
+/// past the wrap and back 16 to 85 ms later; with the harness on, the cat sits at the margin over
+/// the composer's lines before the one at 61.1 s, a seat off the line, and that one is a bound,
+/// as is every other wrap. At 120 columns of 15 px cells the wall's law read nothing before
+/// 2026-11-08 (the box's columns, `PetBrain::rest_box_cols`, fell a rounding past the grid's
+/// end), so every wrap here was a bound; on 16 px cells this take hid the cat at 61.1 s then too
+/// (Linux arm64, 2026-11-08).
 ///
 /// Why these schedules. A schedule moves which present shows the wrap and how many presents the
 /// flight spans, so it spreads a wrap's leave and its time aloft around the on-time cell's. Of
@@ -3324,7 +3424,12 @@ const WRAP_BOUND_MS_MAX: u64 = 850;
 /// far margin crossed 101 cells in 0.96 s at 60 Hz whenever a present showed the step before the
 /// cat sprang (the step's reading alone no longer fails: every quiet bound is brisk now). With
 /// `CROUCH_DUR` at 0.16 s (0.15 s passes), the generating take's bound on schedule 2 at 60 Hz,
-/// the echo 150 ms late, left 205 ms after the wrap at 30.9 s.
+/// the echo 150 ms late, left 205 ms after the wrap at 30.9 s. With `OldPath::NoSeatHidesTheBody`
+/// reverted (the generating take, no chips or harness, at each rate and echo), no hide begins
+/// before a wrap, and each wrap the wall had is a bound again: the cat stands on the hand's last
+/// letters to the wrap and crosses. With `PetBrain::wall_seat` holding no seat wherever the head
+/// law seats the cat nowhere at the wall, a letter under its box or not (built to measure, not
+/// kept), a hide began 240 ms before the program's wrap at 30.7 s (Linux arm64, 2026-11-09).
 #[test]
 fn the_writings_wrap_is_a_brisk_bound() {
     let hosts = [
@@ -3351,7 +3456,7 @@ fn the_writings_wrap_is_a_brisk_bound() {
         for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
             runs.push((
                 0,
-                3,
+                4,
                 Knobs {
                     frame_ms,
                     echo_ms,
@@ -3373,7 +3478,7 @@ fn the_writings_wrap_is_a_brisk_bound() {
         }
         runs.push((
             0,
-            3,
+            4,
             Knobs {
                 frame_ms: 16,
                 present_seed: 3,
@@ -3383,7 +3488,7 @@ fn the_writings_wrap_is_a_brisk_bound() {
         for present_seed in [1u64, 2] {
             runs.push((
                 0,
-                3,
+                4,
                 Knobs {
                     frame_ms: 16,
                     echo_ms: 150,
@@ -3393,43 +3498,32 @@ fn the_writings_wrap_is_a_brisk_bound() {
             ));
         }
     }
+    for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+        runs.push((
+            0,
+            4,
+            Knobs {
+                frame_ms,
+                echo_ms,
+                reverted: Some(OldPath::NoSeatHidesTheBody),
+                ..Knobs::SHIPPED
+            },
+        ));
+    }
     let seen = crate::common::par_map(&runs, |&(take, wraps_held, knobs)| {
-        let shots = replayed(take, knobs);
-        let cols = TAKES[take].cols;
-        // A wrap: the caret from within six cells of the margin to the first twelve of the
-        // same row (a composer at the screen's foot grows up) or the next.
-        let wraps: Vec<u64> = shots
-            .windows(2)
-            .filter(|w| {
-                let ((pr, pc), (r, c)) = (w[0].caret, w[1].caret);
-                (r == pr || r == pr + 1) && pc + 6 >= cols && c <= 12
-            })
-            .map(|w| w[1].ms)
-            .collect();
-        let flights = airtimes(shots);
-        let crossings: Vec<(u64, Option<(u64, u64)>)> = wraps
-            .iter()
-            .map(|&w| {
-                (
-                    w,
-                    flights
-                        .iter()
-                        .copied()
-                        .find(|&(at, _)| at >= w && at <= w + 1_500),
-                )
-            })
-            .collect();
+        let crossings = wraps_met(replayed(take, knobs), TAKES[take].cols);
         (
             format!(
                 "{}: {} ms a frame, echo +{} ms, chips {}, harness {}, chrome late {}, present \
-                 schedule {}",
+                 schedule {}, law reverted {:?}",
                 TAKES[take].name,
                 knobs.frame_ms,
                 knobs.echo_ms,
                 knobs.chips,
                 knobs.brand,
                 knobs.chrome_lag,
-                knobs.present_seed
+                knobs.present_seed,
+                knobs.reverted
             ),
             wraps_held,
             crossings,
@@ -3452,20 +3546,70 @@ fn the_writings_wrap_is_a_brisk_bound() {
             "{label}: its schedule moved no present its wraps read"
         );
     }
-    for (label, wraps_held, crossings) in seen {
+    let bound = |label: &str, w: &WrapMet| {
+        let Some((at, aloft)) = w.flight else {
+            panic!("{label}: no bound for the wrap at {} ms ({w:?})", w.at);
+        };
         assert!(
-            crossings.len() >= wraps_held,
+            at - w.at <= 200 && aloft <= WRAP_BOUND_MS_MAX,
+            "{label}: the wrap at {} ms: the bound left {} ms after it and was {aloft} ms in the \
+             air",
+            w.at,
+            at - w.at
+        );
+    };
+    for (&(take, _, knobs), (label, wraps_held, crossings)) in runs.iter().zip(&seen) {
+        assert!(
+            crossings.len() >= *wraps_held,
             "{label}: the take's {wraps_held} wraps, seen {crossings:?}"
         );
-        for &(wrap, flight) in &crossings {
-            let Some((at, aloft)) = flight else {
-                panic!("{label}: no bound for the wrap at {wrap} ms");
+        // The wraps the wall's law leaves to the wall: the generating take's third and fourth
+        // (the hand's, at 61.1 and 93.4 s), the third not with the harness on, which seats the
+        // cat off the line before it. None with the law reverted (the negative control).
+        let walls: &[usize] = match (take, knobs.reverted, knobs.brand) {
+            (0, None, false) => &[2, 3],
+            (0, None, true) => &[3],
+            _ => &[],
+        };
+        for (i, w) in crossings.iter().enumerate() {
+            if let Some(hid) = w.hid {
+                assert!(
+                    knobs.reverted.is_none(),
+                    "negative control, {label}: the cat faded before the wrap ({w:?})"
+                );
+                assert!(
+                    w.at - hid <= WRAP_HIDE_LEAD_MAX_MS,
+                    "{label}: a hide began {} ms before the wrap at {} ms, before the line's last \
+                     letters could meet the cat's box ({w:?})",
+                    w.at - hid,
+                    w.at
+                );
+            }
+            if !walls.contains(&i) {
+                bound(label, w);
+                continue;
+            }
+            let Some(hid) = w.hid.filter(|_| w.on_its_row) else {
+                panic!(
+                    "{label}: the wrap at {} ms, which leaves the caret on its row past the hand's \
+                     line, was not the wall's ({w:?})",
+                    w.at
+                );
             };
+            let gone = w.gone.unwrap_or_else(|| {
+                panic!("{label}: the wall's hide from {hid} ms never left the glass ({w:?})")
+            });
             assert!(
-                at - wrap <= 200 && aloft <= WRAP_BOUND_MS_MAX,
-                "{label}: the wrap at {wrap} ms: the bound left {} ms after it and was {aloft} ms \
-                 in the air",
-                at - wrap
+                w.rose == 0 && gone <= hid + 450 + 32,
+                "{label}: the wall's hide from {hid} ms rose in {} frames or ran to {gone} ms \
+                 ({w:?})",
+                w.rose
+            );
+            assert!(
+                w.back
+                    .is_some_and(|(back, off)| back <= w.at + 1_000 && off <= 12.0),
+                "{label}: not back on glass by the caret a second past the wrap at {} ms ({w:?})",
+                w.at
             );
         }
     }

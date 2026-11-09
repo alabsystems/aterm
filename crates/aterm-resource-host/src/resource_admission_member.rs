@@ -58,8 +58,8 @@ pub(super) trait MemberCustody {
     fn return_producer(
         &mut self,
         original: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
-        Err(original)
+    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
+        Err((io::ErrorKind::Unsupported.into(), original))
     }
     /// Called only after lexical NoLaunch, authenticated NoChild cancellation,
     /// or successful actual scope retirement. Retry bookkeeping without
@@ -194,7 +194,7 @@ pub(super) struct OwnedAttempt<D> {
     retired: bool,
     scope_closed: bool,
     uncertain: bool,
-    launch_failure: Option<String>,
+    failure: Option<String>,
     producer_retirement: Option<Box<ProducerRetirement>>,
     producer_returned: Option<Box<ReturnedProducer>>,
 }
@@ -222,7 +222,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
             retired: false,
             scope_closed: false,
             uncertain: false,
-            launch_failure: None,
+            failure: None,
             producer_retirement: None,
             producer_returned: None,
         };
@@ -244,12 +244,13 @@ impl<D: MemberResources> OwnedAttempt<D> {
         self.state = match result {
             Ok(child) => State::Bound(Box::new(Bound::new(child, self.wake))),
             Err(LaunchError::NotSpawned(proof)) => State::NoChild(Some(proof)),
-            Err(LaunchError::Unbound { spawned, .. }) => {
+            Err(LaunchError::Unbound { spawned, error }) => {
+                self.failure = Some(format!("bind: {error:?}"));
                 self.uncertain = true;
                 State::Unbound(Some(spawned))
             }
             Err(LaunchError::Refused(error)) => {
-                self.launch_failure = Some(error.to_string());
+                self.failure = Some(format!("launch: {error:?}"));
                 self.uncertain = true;
                 self.events.abandon();
                 State::Unknown
@@ -259,8 +260,8 @@ impl<D: MemberResources> OwnedAttempt<D> {
     pub fn binding(&self) -> &Binding {
         &self.binding
     }
-    pub(super) fn launch_failure(&self) -> Option<&str> {
-        self.launch_failure.as_deref()
+    pub(super) fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
     pub(super) fn contained(&self) -> bool {
         self.events.is_contained()
@@ -439,7 +440,8 @@ impl<D: MemberResources> OwnedAttempt<D> {
                     self.uncertain = false;
                 }
                 Err(error) => {
-                    let (_, proof) = error.into_parts();
+                    let (error, proof) = error.into_parts();
+                    self.failure = Some(format!("cancel no child: {error:?}"));
                     self.state = match proof {
                         Some(proof) => State::NoChild(Some(Box::new(proof))),
                         None => State::Unknown,
@@ -450,7 +452,11 @@ impl<D: MemberResources> OwnedAttempt<D> {
             }
         }
         if let State::Bound(bound) = &mut self.state {
-            self.uncertain = poll_bound(bound, &mut self.events, self.timeout, cause);
+            let failure = poll_bound(bound, &mut self.events, self.timeout, cause);
+            self.uncertain = failure.is_some();
+            if let Some(failure) = failure {
+                self.failure = Some(failure);
+            }
             if bound.reaped && !self.scope_closed {
                 // Retain actual CPU and original memory until input recheck.
                 if let Some(result) = self
@@ -468,7 +474,10 @@ impl<D: MemberResources> OwnedAttempt<D> {
                             self.producer_retirement = Some(Box::new(retirement));
                             self.scope_closed = true;
                         }
-                        Err(_) => self.uncertain = true,
+                        Err(error) => {
+                            self.failure = Some(format!("retire producer: {error:?}"));
+                            self.uncertain = true;
+                        }
                     }
                 } else if custody.retire(&bound.child).is_ok() {
                     self.scope_closed = true;
@@ -509,7 +518,8 @@ impl<D: MemberResources> OwnedAttempt<D> {
         if let Some(retirement) = self.producer_retirement.take() {
             match custody.return_producer(retirement) {
                 Ok(returned) => self.producer_returned = Some(returned),
-                Err(original) => {
+                Err((error, original)) => {
+                    self.failure = Some(format!("return producer: {error:?}"));
                     self.producer_retirement = Some(original);
                     self.uncertain = true;
                     return;
@@ -623,16 +633,16 @@ fn poll_bound(
     events: &mut Events,
     timeout: Option<Duration>,
     cause: Option<CompletionCause>,
-) -> bool {
+) -> Option<String> {
     if bound.reaped {
-        return false;
+        return None;
     }
     let exited = match bound.child.child_mut().exited() {
         Ok(exited) => exited,
-        Err(_) => {
+        Err(error) => {
             bound.stop(cause.unwrap_or(CompletionCause::Cancelled));
             events.abandon();
-            return true;
+            return Some(format!("observe child exit: {error:?}"));
         }
     };
     if bound.ended.is_none() {
@@ -675,22 +685,24 @@ fn poll_bound(
     {
         // Escalate even if a TERM-ignoring leader is still alive. A failed
         // group signal never justifies losing its original unreaped pin.
-        if bound.child.request_group(CohortSignal::Kill).is_err() && !others_exited {
-            return true;
+        if let Err(error) = bound.child.request_group(CohortSignal::Kill)
+            && !others_exited
+        {
+            return Some(format!("kill member group: {error:?}"));
         }
     }
     if bound.cleanup_at.is_none() || !others_exited || (bound.launched && bound.ended.is_none()) {
-        return false;
+        return None;
     }
     let (status, accounting) = match crate::resource_accounting::try_reap(
         bound.child.child_mut(),
         events.collect_accounting(),
     ) {
         Ok(Some(value)) => value,
-        Ok(None) => return false,
-        Err(_) => {
+        Ok(None) => return None,
+        Err(error) => {
             events.abandon();
-            return true;
+            return Some(format!("reap member: {error:?}"));
         }
     };
     bound.reaped = true;
@@ -715,7 +727,7 @@ fn poll_bound(
     } else {
         events.abandon();
     }
-    false
+    None
 }
 fn cause_priority(cause: CompletionCause) -> u8 {
     if cause == CompletionCause::Exited {

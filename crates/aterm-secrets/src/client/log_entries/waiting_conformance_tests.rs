@@ -52,17 +52,19 @@
 //! publish (which holds its turn and claim from its draft to its pending set), each event that
 //! takes no claim, and a pass: `signPass`, at most one landing or another Mac's write, then
 //! `settlePass`, the event between run by the pass's own hook between its commit and its settle
-//! ([`log_entries::PASS_COMMITTED`]). The search is depth first over the steps, keyed on the
+//! ([`log_entries::PASS_COMMITTED`]). The search is breadth first over the steps, keyed on the
 //! World, the lab's place in the removal and the epoch, and m22's state up to record ids, times,
-//! nonces and the log's history ([`WLab::canon`]); each state is explored once with as many steps
-//! left, and each step's real calls run on m22's home as it was at that state ([`Home`]).
+//! nonces and the log's history ([`WLab::canon`]); each state is explored once, at the fewest
+//! steps that reach it, and each step's real calls run on m22's home as the step that first
+//! reached that state left it ([`Home`]).
 
 use super::*;
+use crate::client::log_entries_tests::home_content::{Content as Home, Known};
 use crate::membership_log::RecordId;
 use aterm_digest::Sha256;
 use aterm_mesh_core::no_lost_edit as nle;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Versions 0 to 11 (0 the one m22 opened, on a server from the start).
@@ -861,73 +863,6 @@ fn project(ghost: &WWorld, obs: &Obs) -> Result<WWorld, String> {
     Ok(r)
 }
 
-/// A home's content: each directory and regular file by its path under the home, with its mode,
-/// and each file's bytes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Home {
-    dirs: BTreeMap<PathBuf, u32>,
-    files: BTreeMap<PathBuf, (u32, Vec<u8>)>,
-}
-
-impl Home {
-    fn of(home: &Path) -> Self {
-        let mut content = Self::default();
-        content.read(home, Path::new(""));
-        content
-    }
-
-    fn read(&mut self, dir: &Path, at: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = at.join(entry.file_name());
-            let kind = entry.file_type().unwrap();
-            let mode = entry.metadata().unwrap().permissions().mode() & 0o7777;
-            if kind.is_dir() {
-                self.dirs.insert(path.clone(), mode);
-                self.read(&entry.path(), &path);
-            } else if kind.is_file() {
-                let bytes = std::fs::read(entry.path()).unwrap();
-                self.files.insert(path, (mode, bytes));
-            }
-        }
-    }
-
-    /// Make `home`, which holds `self`, hold `to`.
-    fn turn_into(&self, to: &Self, home: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for path in self
-            .files
-            .keys()
-            .filter(|path| !to.files.contains_key(*path))
-        {
-            std::fs::remove_file(home.join(path)).unwrap();
-        }
-        for path in self
-            .dirs
-            .keys()
-            .rev()
-            .filter(|path| !to.dirs.contains_key(*path))
-        {
-            std::fs::remove_dir(home.join(path)).unwrap();
-        }
-        for (path, &mode) in &to.dirs {
-            if self.dirs.get(path) != Some(&mode) {
-                fsx::ensure_private_dir(&home.join(path)).unwrap();
-                std::fs::set_permissions(home.join(path), std::fs::Permissions::from_mode(mode))
-                    .unwrap();
-            }
-        }
-        for (path, file) in &to.files {
-            if self.files.get(path) != Some(file) {
-                std::fs::write(home.join(path), &file.1).unwrap();
-                std::fs::set_permissions(home.join(path), std::fs::Permissions::from_mode(file.0))
-                    .unwrap();
-            }
-        }
-    }
-}
-
 /// A member's key: its bootstrap, actor and incarnation.
 type MemberKey = (crate::commons::bootstrap::Bootstrap, MemberId, [u8; 16]);
 
@@ -1033,6 +968,22 @@ struct Divergence {
     fail: Fail,
 }
 
+/// What m22's records and journal hold, read once for an observation and the state beside it
+/// ([`WLab::observe_with`], [`WLab::canon`]): its log, what m22 opens of it, and its journal of
+/// overtaken writes.
+struct Reads {
+    log: Log,
+    opened: crate::membership_log::OpenedAudienceEntries,
+    overtaken: Vec<log_entries::Overtaken>,
+}
+
+/// Whether `log` has a rotation of `[everyone]` due.
+fn due(log: &Log) -> bool {
+    log.rekey_dues()
+        .iter()
+        .any(|due| due.audience == EpochAudience::Everyone && due.rotation)
+}
+
 /// The real side: m22 of the removal lab, its home as it is at the start ([`Home`]), its identity
 /// and member key, m7's removal of m42 (its `Remove` first), which m22 takes for `due`, and m7's
 /// epoch that leaves m22 out, then its `Wrap` to m22.
@@ -1047,6 +998,11 @@ struct WLab {
     m22_key: MemberKey,
     me: MemberId,
     start: Home,
+    /// What the lab last read or wrote of m22's home.
+    known: RefCell<Known>,
+    /// The other Macs' homes as they are at the start, which no step writes: the searches and
+    /// runs of a test share one lab.
+    others: Vec<Home>,
     chain: Vec<Record>,
     /// m7's `[everyone]` epoch after the rotation, with its `Wrap`s to every Mac but m22 and m42.
     left_out: Vec<Record>,
@@ -1055,7 +1011,8 @@ struct WLab {
     clock: Cell<u64>,
     /// How many steps ran on the real functions.
     calls: Cell<usize>,
-    /// Whether an event ran on m22 since the search last took or put back its home.
+    /// Whether m22's home may differ from the home the search's next step must start on: an
+    /// event ran on m22 since the search last put a state's home back.
     touched: Cell<bool>,
     /// Whether the last event was made on m22: a publish that kept its set, a direct draft that
     /// drafted.
@@ -1080,13 +1037,17 @@ impl WLab {
         // m22's home back never removes one a held lock is on.
         drop(log_entries::draft_turn(m22, None).expect("a turn"));
         drop(log_entries::claim_draft(m22, None).expect("a claim"));
+        let mut known = Known::default();
+        known.refresh(&m22.dir);
         let lab = Self {
             identity: read_identity(m22).unwrap().unwrap(),
             m7_identity: read_identity(m7).unwrap().unwrap(),
             m7: m7_key,
             m22_key: member_key(m22),
             me: member_key(m22).1,
-            start: Home::of(&m22.dir),
+            start: known.content.clone(),
+            known: RefCell::new(known),
+            others: Self::others(&six),
             six,
             chain,
             left_out,
@@ -1100,10 +1061,28 @@ impl WLab {
             turn: RefCell::new(None),
         };
         assert!(
-            !lab.observe_due(),
+            !due(&log_of(lab.m22())),
             "CONTROL: no rotation is due on m22 at the start"
         );
         lab
+    }
+
+    /// Each Mac's home but m22's, as it is now.
+    fn others(six: &convergence::Six) -> Vec<Home> {
+        six.all[1..]
+            .iter()
+            .map(|paths| Home::of(&paths.home))
+            .collect()
+    }
+
+    /// m22's home now ([`Known::refresh`]), which the lab then knows.
+    fn home(&self) -> Home {
+        self.known.borrow_mut().refresh(&self.m22().dir).clone()
+    }
+
+    /// Make m22's home hold `to`, writing what differs from what it holds now ([`Known::put`]).
+    fn put_back(&self, to: &Home) {
+        self.known.borrow_mut().put(to, &self.m22().dir);
     }
 
     /// m7's `[everyone]` epoch after its rotation, wrapped to every Mac but m22 and m42, and its
@@ -1161,13 +1140,6 @@ impl WLab {
         self.m22().dir.join("records.drafts")
     }
 
-    fn observe_due(&self) -> bool {
-        log_of(self.m22())
-            .rekey_dues()
-            .iter()
-            .any(|due| due.audience == EpochAudience::Everyone && due.rotation)
-    }
-
     /// Who signed `record`, as [`By`] reads it.
     fn by(&self, log: &crate::membership_log::Log, record: &RecordId) -> By {
         match log.get(record) {
@@ -1182,8 +1154,29 @@ impl WLab {
         }
     }
 
+    /// What m22's records and journal hold now ([`Reads`]).
+    fn reads(&self) -> Result<Reads, String> {
+        let m22 = self.m22();
+        let log = log_of(m22);
+        let opened = log
+            .open_audience_entries(&self.identity)
+            .map_err(|e| e.to_string())?
+            .ok_or("no epoch opens")?;
+        let overtaken = log_entries::read_overtaken(m22).map_err(|e| e.to_string())?;
+        Ok(Reads {
+            log,
+            opened,
+            overtaken,
+        })
+    }
+
     /// What m22 holds, as [`Obs`].
     fn observe(&self) -> Result<Obs, String> {
+        self.observe_with(&self.reads()?)
+    }
+
+    /// What m22 holds, as [`Obs`], its records and journal as `reads` read them.
+    fn observe_with(&self, reads: &Reads) -> Result<Obs, String> {
         let m22 = self.m22();
         let identity = &self.identity;
         let (waiting, sets) = log_entries::waiting_shapes(m22, identity);
@@ -1194,26 +1187,28 @@ impl WLab {
                 .ok_or("a pending set of no version of the universe")?;
             pending.push((v, set));
         }
-        let log = log_of(m22);
-        let open = |identity: &Identity| -> Result<_, String> {
-            log.open_audience_entries(identity)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "no epoch opens".to_owned())
-        };
-        let mut opened = open(identity)?;
-        let newest = opened
+        let log = &reads.log;
+        let newest = reads
+            .opened
             .maximal_epochs
             .get(&EpochAudience::Everyone)
             .cloned()
             .unwrap_or_default();
-        if !newest
+        let m7_opened;
+        let opened = if newest
             .iter()
-            .all(|epoch| opened.unwrapped_keys.contains_key(epoch))
+            .all(|epoch| reads.opened.unwrapped_keys.contains_key(epoch))
         {
+            &reads.opened
+        } else {
             // m22 is left out of the newest epoch and reads no `[everyone]` value: the log holds
             // them still, as a Mac that opens it reads them.
-            opened = open(&self.m7_identity)?;
-        }
+            m7_opened = log
+                .open_audience_entries(&self.m7_identity)
+                .map_err(|e| e.to_string())?
+                .ok_or("no epoch opens")?;
+            &m7_opened
+        };
         let everyone = opened.by_audience.get(&Audience::Everyone);
         let mut values = BTreeMap::new();
         for n in 1..N {
@@ -1224,17 +1219,17 @@ impl WLab {
                     .ok_or("a value no op wins")?;
                 values.insert(
                     name(n),
-                    (entry.value.as_slice().to_vec(), self.by(&log, winner)),
+                    (entry.value.as_slice().to_vec(), self.by(log, winner)),
                 );
             }
         }
         let mut overtaken: BTreeMap<String, Vec<By>> = BTreeMap::new();
-        for record in log_entries::read_overtaken(m22).map_err(|e| e.to_string())? {
+        for record in &reads.overtaken {
             let by = record
                 .by
                 .as_ref()
-                .map_or(By::Other, |by| self.by(&log, &by.record));
-            overtaken.entry(record.name).or_default().push(by);
+                .map_or(By::Other, |by| self.by(log, &by.record));
+            overtaken.entry(record.name.clone()).or_default().push(by);
         }
         let mut holds = BTreeSet::new();
         let mut hold_unread = false;
@@ -1267,7 +1262,7 @@ impl WLab {
             conflicts,
             unread: self.unread_file().exists(),
             hold_unread,
-            due: self.observe_due(),
+            due: due(log),
         })
     }
 
@@ -1275,8 +1270,8 @@ impl WLab {
     /// function driven here reads but as the winning values, the conflicts and the epochs: the
     /// pending sets' files in their order (by rank) with their servers, the journal's records
     /// with each overtaker's kind and whether it deleted, the conflicted names, the files of the
-    /// holds, and the newest epochs; as a digest.
-    fn canon(&self, obs: &Obs) -> Result<[u8; 32], String> {
+    /// holds, and the newest epochs; as a digest, its records and journal as `reads` read them.
+    fn canon(&self, obs: &Obs, reads: &Reads) -> [u8; 32] {
         let m22 = self.m22();
         let mut text = format!("{obs:?}\n");
         let mut files: Vec<String> = std::fs::read_dir(m22.dir.join("everyone.pending"))
@@ -1297,21 +1292,17 @@ impl WLab {
                 ));
             }
         }
-        let log = log_of(m22);
-        for record in log_entries::read_overtaken(m22).map_err(|e| e.to_string())? {
+        for record in &reads.overtaken {
             let by = record
                 .by
                 .as_ref()
-                .map(|by| (self.by(&log, &by.record), by.deleted));
+                .map(|by| (self.by(&reads.log, &by.record), by.deleted));
             text.push_str(&format!(
                 "overtaken {} {by:?} {}\n",
                 record.name, record.shown
             ));
         }
-        let opened = log
-            .open_audience_entries(&self.identity)
-            .map_err(|e| e.to_string())?
-            .ok_or("m22 opens no epoch")?;
+        let opened = &reads.opened;
         text.push_str(&format!("conflicts {:?}\n", opened.conflicts));
         let newest = opened
             .maximal_epochs
@@ -1333,7 +1324,7 @@ impl WLab {
             .collect();
         holds.sort();
         text.push_str(&format!("holds {holds:?}\n"));
-        Ok(Sha256::digest(text.as_bytes()))
+        Sha256::digest(text.as_bytes())
     }
 
     /// A divergence of the functions' own refusals: an error, or nothing where it is let through.
@@ -1717,10 +1708,14 @@ impl WLab {
         }
         // Where nothing ran on m22, its files are as the comparison before found them: the step's
         // World before this step's.
-        let real = if ran {
-            self.observe().map_err(|e| Fail::of("io", e))?
+        let reads = if ran {
+            Some(self.reads().map_err(|e| Fail::of("io", e))?)
         } else {
-            observe(w)
+            None
+        };
+        let real = match &reads {
+            Some(reads) => self.observe_with(reads).map_err(|e| Fail::of("io", e))?,
+            None => observe(w),
         };
         let model = observe(&x);
         let fields = real.differs(&model);
@@ -1731,10 +1726,9 @@ impl WLab {
             });
         }
         laws(&project(&x, &real).map_err(|e| Fail::of("projection", e))?).map_err(Fail::law)?;
-        let canon = if ran {
-            self.canon(&real).map_err(|e| Fail::of("io", e))?
-        } else {
-            canon
+        let canon = match &reads {
+            Some(reads) => self.canon(&real, reads),
+            None => canon,
         };
         Ok((x, at, canon))
     }
@@ -1743,7 +1737,7 @@ impl WLab {
     fn reset(&self) {
         *self.turn.borrow_mut() = None;
         *self.directs.borrow_mut() = Default::default();
-        Home::of(&self.m22().dir).turn_into(&self.start, &self.m22().dir);
+        self.put_back(&self.start);
     }
 
     /// `steps` from the start on both sides; the World, the environment and m22's state at the
@@ -2103,85 +2097,86 @@ fn steps(w: &WWorld, env: Env, u: &Universe) -> Vec<Step> {
     out
 }
 
-/// Every sequence of `u` after `prefix` from the start, depth first, each step on both sides
-/// ([`WLab::check`]), a state of both sides the search reached before with as many steps left
-/// explored once; the first divergence, with the sequence that reached it.
+/// A state of both sides: the World, the environment and m22's state ([`WLab::canon`]).
+type State = (WWorld, Env, [u8; 32]);
+
+/// A state a search reached, with m22's home and direct drafts as the step that first reached it
+/// left them, and its index among the states the search reached.
+struct Reached {
+    state: State,
+    home: Home,
+    directs: [Option<DirectRec>; D],
+    at: usize,
+}
+
+impl WLab {
+    /// `state`, reached now, the `at`th state of a search.
+    fn reached(&self, state: State, at: usize) -> Reached {
+        Reached {
+            state,
+            home: self.home(),
+            directs: self.directs.borrow().clone(),
+            at,
+        }
+    }
+}
+
+/// Every sequence of `u` after `prefix` from the start, breadth first, each step on both sides
+/// ([`WLab::check`]) and each state of both sides explored once, at the fewest steps that reach
+/// it, each of its steps on m22's home as the step that first reached it left it; the first
+/// divergence, with the shortest sequence that reaches it.
 fn search(lab: &Rc<WLab>, u: &Universe, prefix: &[Step]) -> Result<Covered, String> {
-    let (w, env, canon) = lab
+    let start = lab
         .replay(prefix)
         .map_err(|d| format!("the prefix diverges at step {}: {}", d.at, d.fail))?;
     lab.calls.set(0);
     let mut covered = Covered::default();
-    let mut seen: HashMap<(WWorld, Env, [u8; 32]), usize> = HashMap::new();
+    let mut seen: HashSet<State> = HashSet::from([start.clone()]);
     let mut models: HashSet<(WWorld, Env)> = HashSet::new();
-    let mut path = prefix.to_vec();
-    explore(
-        lab,
-        u,
-        (&w, env, canon),
-        u.depth,
-        (&mut seen, &mut models),
-        &mut path,
-        &mut covered,
-    )?;
+    // Each reached state's predecessor and the step between them; the start has none.
+    let mut before: Vec<Option<(usize, Step)>> = vec![None];
+    let path_to = |before: &[Option<(usize, Step)>], mut at: usize, step: &Step| {
+        let mut path = vec![step.clone()];
+        while let Some((prior, step)) = &before[at] {
+            path.push(step.clone());
+            at = *prior;
+        }
+        path.extend(prefix.iter().rev().cloned());
+        path.reverse();
+        path
+    };
+    let mut level = vec![lab.reached(start, 0)];
+    for depth in 1..=u.depth {
+        let mut next = Vec::new();
+        for reached in level {
+            let (w, env, canon) = &reached.state;
+            // m22's home holds what the last step left.
+            lab.touched.set(true);
+            for step in steps(w, *env, u) {
+                if lab.touched.replace(false) {
+                    lab.put_back(&reached.home);
+                    lab.directs.borrow_mut().clone_from(&reached.directs);
+                }
+                lab.sync_turn(w)?;
+                let state = lab.check(w, *env, *canon, &step).map_err(|fail| {
+                    format!("after {:?}: {fail}", path_to(&before, reached.at, &step))
+                })?;
+                covered.steps += 1;
+                models.insert((state.0.clone(), state.1));
+                if !seen.contains(&state) {
+                    seen.insert(state.clone());
+                    before.push(Some((reached.at, step)));
+                    next.push(lab.reached(state, before.len() - 1));
+                    covered.deepest = depth;
+                }
+            }
+        }
+        level = next;
+    }
     covered.states = seen.len();
     covered.model_states = models.len();
     covered.calls = lab.calls.get();
     Ok(covered)
-}
-
-/// What a search has seen: each state of both sides with the most steps left it was explored
-/// with, and each state of the World and the environment.
-type Seen<'a> = (
-    &'a mut HashMap<(WWorld, Env, [u8; 32]), usize>,
-    &'a mut HashSet<(WWorld, Env)>,
-);
-
-fn explore(
-    lab: &Rc<WLab>,
-    u: &Universe,
-    (w, env, canon): (&WWorld, Env, [u8; 32]),
-    left: usize,
-    (seen, models): Seen<'_>,
-    path: &mut Vec<Step>,
-    covered: &mut Covered,
-) -> Result<(), String> {
-    covered.deepest = covered.deepest.max(u.depth - left);
-    if left == 0 {
-        return Ok(());
-    }
-    let here = Home::of(&lab.m22().dir);
-    lab.touched.set(false);
-    for step in steps(w, env, u) {
-        if lab.touched.replace(false) {
-            Home::of(&lab.m22().dir).turn_into(&here, &lab.m22().dir);
-        }
-        lab.sync_turn(w)?;
-        path.push(step.clone());
-        let (next, next_env, next_canon) = lab
-            .check(w, env, canon, &step)
-            .map_err(|fail| format!("after {path:?}: {fail}"))?;
-        covered.steps += 1;
-        models.insert((next.clone(), next_env));
-        let key = (next, next_env, next_canon);
-        if (key.0 != *w || key.1 != env || key.2 != canon)
-            && seen.get(&key).is_none_or(|&had| had < left - 1)
-        {
-            seen.insert(key.clone(), left - 1);
-            explore(
-                lab,
-                u,
-                (&key.0, key.1, key.2),
-                left - 1,
-                (seen, models),
-                path,
-                covered,
-            )?;
-            lab.touched.set(true);
-        }
-        path.pop();
-    }
-    Ok(())
 }
 
 /// A publish of version `v` of `writes` (name, value, bases), opening no version.
@@ -2548,11 +2543,12 @@ const OPENS: Universe = Universe {
     depth: 4,
 };
 
-/// The search of `u` after `prefix`, its numbers printed; the first divergence fails the test.
-fn conforms(u: &Universe, prefix: &[Step], name: &str) -> Rc<WLab> {
-    let lab = Rc::new(WLab::new());
+/// The search of `u` after `prefix` on `lab`, its numbers printed; the first divergence fails the
+/// test. The search starts from m22's home at the start ([`WLab::replay`]) and writes no other
+/// Mac's, so the searches and runs of a test share one lab.
+fn conforms(lab: &Rc<WLab>, u: &Universe, prefix: &[Step], name: &str) {
     let started = Instant::now();
-    let covered = search(&lab, u, prefix).unwrap_or_else(|why| panic!("{why}"));
+    let covered = search(lab, u, prefix).unwrap_or_else(|why| panic!("{why}"));
     eprintln!(
         "P3 waiting conformance, {name}: {} states of both sides ({} of the World alone), {} \
          steps, {} real calls, deepest {}, in {:?}",
@@ -2567,7 +2563,10 @@ fn conforms(u: &Universe, prefix: &[Step], name: &str) -> Rc<WLab> {
         covered.deepest, u.depth,
         "the search reaches its depth: {covered:?}"
     );
-    lab
+    assert!(
+        WLab::others(&lab.six) == lab.others,
+        "{name}: the search leaves every other Mac's home as it was"
+    );
 }
 
 /// A run that conforms, its World at the end.
@@ -2605,7 +2604,8 @@ fn run(lab: &Rc<WLab>, steps: &[Step], name: &str) -> WWorld {
 /// landing that drops every other set) name rules no switch restores; their runs conform here.
 #[test]
 fn waiting_writes_follow_p3s_step_through_every_sequence_of_the_universe() {
-    let lab = conforms(&UNIVERSE, &[], "from the start");
+    let lab = Rc::new(WLab::new());
+    conforms(&lab, &UNIVERSE, &[], "from the start");
 
     let w = run(&lab, &two_publishes(), "twoPublishes");
     assert!(
@@ -2705,7 +2705,8 @@ fn waiting_writes_follow_p3s_step_through_every_sequence_of_the_universe() {
 /// next pass drops its 3 as overtaken by m22's own pass (`OvertakenByAnother`).
 #[test]
 fn waiting_writes_follow_p3s_step_from_two_waiting_writes() {
-    let lab = conforms(&WAITING, &two_waiting(), "from two waiting writes");
+    let lab = Rc::new(WLab::new());
+    conforms(&lab, &WAITING, &two_waiting(), "from two waiting writes");
     let mut due = vec![one(WEvent::Due(true))];
     due.extend(two_waiting());
     due.push(pass());
@@ -2744,9 +2745,14 @@ fn waiting_writes_follow_p3s_step_from_two_waiting_writes() {
         "CONTROL: v1's 1 signed under v2's pending 3, which a pass then drops as overtaken"
     );
 
-    conforms(&THREE_SETS, &three_pending(), "from three pending sets");
+    conforms(
+        &lab,
+        &THREE_SETS,
+        &three_pending(),
+        "from three pending sets",
+    );
 
-    let lab = conforms(&OPENS, &after_rotation(), "after the rotation");
+    conforms(&lab, &OPENS, &after_rotation(), "after the rotation");
     let mut closed = after_rotation();
     closed.extend([
         one(WEvent::Opens(false)),
@@ -2792,9 +2798,10 @@ fn waiting_writes_follow_p3s_step_from_two_waiting_writes() {
 /// (`LaterKept`).
 #[test]
 fn direct_drafts_follow_p3s_step() {
-    let lab = conforms(&DIRECTS, &[], "direct drafts from the start");
+    let lab = Rc::new(WLab::new());
+    conforms(&lab, &DIRECTS, &[], "direct drafts from the start");
     let held = [one(WEvent::DirectDraft(1, 41)), one(WEvent::DirectHold(1))];
-    conforms(&HELD, &held, "from a held direct draft");
+    conforms(&lab, &HELD, &held, "from a held direct draft");
 
     for (steps, name) in [
         (held_before_write(), "held_values_are_among_the_bases"),

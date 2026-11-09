@@ -7,10 +7,13 @@
 //! the three aterm supervises (Claude Code, agy, Muse Code) it drives the forever lab's
 //! own chains against its stub ([`crate::forever`]: cruise-n's two needs, land-b's open hold,
 //! land-c's repository hold, land-e's landing, Off, same-land's stop, and on Claude Code
-//! switch-over-held's ask at the switch to Land); on codex-alab, which supervises itself, it
-//! drives `codex-alab-proof`'s legs against its fake model ([`crate::codex_alab_proof`]: Cruise,
-//! Land, landed, Off, a need). A scene this tree cannot show is a named skip ([`Plan::Skip`]).
-//! After each scene settles it takes an `image` at rest, points at the chip for its hovered title,
+//! switch-over-held's ask at the switch to Land), Claude Code on an owner's own login with the
+//! usage tap on its line, so its glass shows line E ([`scene_launcher`]); on codex-alab, which
+//! supervises itself, it drives `codex-alab-proof`'s legs against its fake model
+//! ([`crate::codex_alab_proof`]: Cruise, Land, landed, Off, a need). A scene this tree cannot
+//! show is a named skip ([`Plan::Skip`]).
+//! After each scene settles (Claude Code's once its line E says what its pane allows,
+//! [`line_e_unsaid`]) it takes an `image` at rest, points at the chip for its hovered title,
 //! and writes `chrome` and `status` beside each png, then `manifest.tsv` ([`Row`]). [`missing`]
 //! names a row the plan wants and the manifest lacks, and [`faults`] a png row that shows something
 //! wrong. With `--baseline` it also takes one paired agy typing take ([`typing_pair`]).
@@ -720,10 +723,17 @@ off, and same-land (the same-reply hold, the stop said); beside same-land's, lan
 land-repo's shots the Overview, Settings ▸ Harness turned to its row (the state line) and the
 Messages rows it raised; Claude Code also switch-asked (switch-over-held's repeat under Cruise,
 switched to Land by the person's press on Settings ▸ Harness, shot while Land's one ask stands,
-its shots beside it as same-land's), which agy and Muse Code name a skip. codex-alab runs
-codex-alab-proof's legs against its fake model: cruise, land, landed, off and need; its holds are
-named skips. codex-alab needs the package
-codex-alab-proof would pick.
+its shots beside it as same-land's), which agy and Muse Code name a skip. Claude Code runs as an
+owner's managed session does (`lab claude --own`): on the default home's own claude.ai login with
+aterm's usage tap on its line and a roster naming it `main` (its lab up with LAB_ROUTE_SEAM=1),
+the stub reporting the week 80% used, resetting 41 h after the launch, on every reply, so every
+scene shows the whole glass, line E's quota row included, in its palette (under Off the week's
+reading alone, as Off's recovery refuses forecasts); each is shot once line E's Account node
+says that row's projection, or Off's reading (on an aterm whose chrome reports no Account node,
+a release build or an older one under LAB_ATERM, at once, its caption saying line E was not
+judged). codex-alab runs codex-alab-proof's legs against its fake model: cruise, land, landed,
+off and need; its holds are named skips. codex-alab needs the package codex-alab-proof would
+pick.
 
 After each scene settles it takes an image at rest (<harness>-<scene>-<look>-<scale>x-rest.png),
 then points at the chip and takes its hovered title (…-title.png, the rule's band beside it as
@@ -1141,13 +1151,7 @@ fn agent_scenes(
 ) -> Result<(), Fail> {
     let tag = format!("apcap-{}-{}-{}x", h.name(), look.name(), a.scale);
     clear_lab(&tag)?;
-    let mut u = crate::lab::UpOpts::from_env();
-    u.trust = true;
-    u.lifeline = true;
-    u.cols = a.cols.to_string();
-    u.lines = a.lines.to_string();
-    u.scale = Some(a.scale.to_string());
-    u.aterm_toml = themed(&u.aterm_toml, look.theme());
+    let u = up_opts(crate::lab::UpOpts::from_env(), h, look, a);
     if let Some(why) = crate::lab::opts_refused(&u) {
         return Err(Fail::usage(format!("autopilot-captures: {why}")));
     }
@@ -1164,6 +1168,65 @@ fn agent_scenes(
     let shot = agent_lab(&tag, (who, h, look), a, out, rows);
     let _ = crate::lab::down(&tag, false);
     shot
+}
+
+/// The lab `h`'s scenes in `look` come up in: `env`'s (`LAB_*`) with the trust and the lifeline,
+/// the verb's grid and scale, and `look`'s theme. Claude Code's also admits the stub's base URL
+/// as its default route (`LAB_ROUTE_SEAM=1`), which its own login needs ([`scene_launcher`]).
+fn up_opts(env: crate::lab::UpOpts, h: Harness, look: Look, a: &Asked) -> crate::lab::UpOpts {
+    let mut u = env;
+    u.trust = true;
+    u.lifeline = true;
+    u.cols = a.cols.to_string();
+    u.lines = a.lines.to_string();
+    u.scale = Some(a.scale.to_string());
+    u.aterm_toml = themed(&u.aterm_toml, look.theme());
+    u.route_seam |= h == Harness::Claude;
+    u
+}
+
+/// Claude Code's week as its scenes' stub reports it on every reply
+/// (`anthropic-ratelimit-unified-7d-*`): its utilization, and its reset this many seconds after
+/// the launch. 80% used 127 h into the week runs out about 32 h on at the week's own pace, 9 h
+/// before its reset, so line E lays every part of its chart (the measured step, `▕`, the projected
+/// line, `╳` and `↺`) and its tail says the gap in the warn ink: one row that judges each of the
+/// glass's tokens under each palette (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step 5).
+/// Under Autopilot Off, whose recovery refuses forecasts, the row lays the reading alone: the
+/// step, `▕`, `┄` ahead and the reset ([`line_e_due`]).
+pub const WEEK: (&str, i64) = ("0.80", 41 * 3600);
+
+/// Claude Code's 5-hour window as its scenes' stub reports it: its utilization and its reset
+/// after the launch, half-used at its reset at the window's own pace, so it walls nothing.
+pub const FIVE: (&str, i64) = ("0.20", 3 * 3600);
+
+/// The script every scene's tab of `h` runs. Claude Code's runs as an owner's managed session
+/// does: on the default home's own claude.ai login with aterm's usage tap on its line and a roster
+/// naming it (`lab claude --own`, [`crate::lab::ready_own`]), the scenes' folders trusted in that
+/// home's profile, and its stub reporting [`FIVE`] and [`WEEK`] from `now_s` (Unix seconds) on
+/// every reply, so the glass claims Claude Code's statusLine row as line E and every scene shows
+/// the whole glass in its palette. On the forever lab's own launch (an API key) Claude Code draws
+/// no statusLine row and its footer names no account, so line E never showed. agy's and Muse
+/// Code's are the forever lab's.
+/// # Errors
+/// The run cannot take an own login ([`crate::lab::own_refused`]: a usage error), or a file
+/// could not be written.
+fn scene_launcher(
+    run: &mut Run,
+    h: Harness,
+    dirs: &[PathBuf],
+    now_s: i64,
+) -> Result<PathBuf, Fail> {
+    if h != Harness::Claude {
+        return forever::launcher(run, h, dirs, false);
+    }
+    let launch = crate::lab::ready_own(run)?;
+    forever::trust_for_claude(run, dirs)?;
+    crate::verbs::write_headers(
+        &run.w,
+        crate::stub::chosen_resets((FIVE.0, now_s + FIVE.1), (WEEK.0, now_s + WEEK.1)),
+        true,
+    )?;
+    forever::Launcher::Claude(launch).shared(run)
 }
 
 /// Lab `tag` cleared for a capture run to bring up: a lab of that name a run that died left is
@@ -1236,7 +1299,7 @@ fn agent_lab(
             forever::lay_repo(&run, c).map_err(|e| Fail::exit(3, format!("{}: {e}", c.name())))?,
         );
     }
-    let script = forever::launcher(&run, h, &dirs, false)?;
+    let script = scene_launcher(&mut run, h, &dirs, crate::util::now_secs())?;
     crate::verbs::set_custom_mode(&run, forever::MODE, &forever::spec_on(&chains, h, &dirs))?;
     let door = Door::new(&run)?;
     println!(
@@ -1952,6 +2015,17 @@ impl Shots<'_> {
         }
         let _ = lab.said(&["pointer", "leave"]);
         stop::sleep(Duration::from_secs(2))?;
+        let undrawn = if who == Who::Agent(Harness::Claude) {
+            let probe = format!("{}-{}-line-e-probe.png", who.name(), look.name());
+            line_e_unsaid(lab, sid, LINE_E_HANG, || {
+                stop::sleep(Duration::from_millis(500))?;
+                let _ = self.shoot(lab, sid, &probe);
+                let _ = std::fs::remove_file(self.out.join(&probe));
+                Ok(())
+            })?
+        } else {
+            None
+        };
         let rest_png = png_name(who, scene, look, scale, Kind::Rest);
         let Some(rest) = self.shoot(lab, sid, &rest_png) else {
             return Ok(vec![row(
@@ -1972,6 +2046,9 @@ impl Shots<'_> {
                 hovered: None,
             },
         );
+        if let Some(unsaid) = &undrawn {
+            caption.push_str(&unsaid.noted());
+        }
         if who == Who::CodexAlab {
             self.pad_band(lab, sid, scene, &rest);
         }
@@ -2583,6 +2660,185 @@ fn raise(lab: &dyn Lab, label: &str) -> Result<String, String> {
             r.trim(),
             if front { "selects" } else { "does not select" }
         ))
+    }
+}
+
+/// What line E's quota row says once its projection is drawn: the week's chain, as its Account
+/// chip's node speaks it (`quota_view`'s `work_said`: `Next 7 days at 15 percent a day: …`).
+/// Before it, just after Claude Code's first reading, the row says the lead's figure alone, or
+/// the reset with `┄` ahead: the outlook's memo replays at the store's next look.
+pub const LINE_E_PROJECTED: &str = "Next 7 days";
+
+/// What line E's quota row says once the outlook's replay has read this tab's week: the reset
+/// that reading carries, in the this-tab clause of its Account node (`quota_view`'s
+/// `named_said`: `main, this tab, 80 percent of its week used, resets Tuesday 16:28.`). The
+/// lead's figure alone, which the footer reads off the tap before the replay, says none.
+pub const LINE_E_READ: &str = ", resets ";
+
+/// How long a Claude Code scene's line E may take to say what its pane allows once its tab is in
+/// front ([`line_e_due`]): a hang detector. The footer reads the tap's row every 2 s and the
+/// outlook replays at the store's next look, every 10 s, so the projection stands about 15 s
+/// after the first reply (measured 2026-11-08: a scene shot 12 s after it showed none, one shot
+/// 16 s after it did).
+pub const LINE_E_HANG: Duration = Duration::from_secs(60);
+
+/// What tab's Account node says once its line E has said what its pane allows, by the tab's
+/// `status`: under Autopilot Off the pane's recovery refuses forecasts
+/// (`FooterFacts::account_forecast_refusal`, `Refusal::SessionPaused`; the glass design's §5.1),
+/// so the row shows the replay's reading alone, the reset with `┄` ahead ([`LINE_E_READ`]);
+/// any other pane draws the week's projection ([`LINE_E_PROJECTED`]).
+#[must_use]
+pub fn line_e_due(status: &str) -> &'static str {
+    if forever::word(status, "autopilot").as_deref() == Some("off") {
+        LINE_E_READ
+    } else {
+        LINE_E_PROJECTED
+    }
+}
+
+/// How line E's Account node's label begins: its quota view's spoken head (`QuotaView::spoken`,
+/// `Accounts. main, this tab, …`). Line D's fallback unit, drawn where line E is not, is an Account
+/// node too and can carry the same sentences, its projection's `Next 7 days` included, but its
+/// label is the account fact's (`claude_facts::fact_spoken_of`: `Account: main, this tab, …`), so
+/// a node whose label begins otherwise is not line E's.
+pub const LINE_E_HEAD: &str = "Accounts. ";
+
+/// A caption's note where a Claude Code scene's line E could not be judged
+/// ([`Unsaid::NotJudged`]): why follows. It is no [`FINDING`].
+pub const LINE_E_NOT_JUDGED: &str = "line E not judged: ";
+
+/// Why a Claude Code scene's line E was not seen to say what its pane allows
+/// ([`line_e_unsaid`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unsaid {
+    /// Line E drew nothing due within the hang, or a projection under Autopilot Off: what, with
+    /// what its node said last. The caption carries it as a [`FINDING`].
+    Finding(String),
+    /// This aterm's `chrome` reports no Account node ([`reports_account_nodes`] of a read that
+    /// answered for the tab, [`answered_for`]), so no read tells what line E drew: the caption
+    /// says so plainly ([`LINE_E_NOT_JUDGED`]), and the scene is shot without a wait.
+    NotJudged(String),
+}
+
+impl Unsaid {
+    /// What a scene's caption carries for it, from its `; `.
+    #[must_use]
+    pub fn noted(&self) -> String {
+        match self {
+            Self::Finding(why) => format!("; {FINDING}{why}"),
+            Self::NotJudged(why) => format!("; {LINE_E_NOT_JUDGED}{why}"),
+        }
+    }
+}
+
+/// Whether a `chrome` read's aterm reports Account nodes: its `a11y kinds=…` line, which a
+/// development build prints once per read whatever any window shows (an overlay's included),
+/// names `account`. A release build prints no `a11y` line, and one from before the glass
+/// design's §7 step 5 no Account node; another aterm under `LAB_ATERM` may be either. Judge it
+/// only of a read that answered ([`answered_for`]): a failed one says neither.
+#[must_use]
+pub fn reports_account_nodes(chrome: &str) -> bool {
+    chrome
+        .lines()
+        .filter_map(|l| l.strip_prefix("a11y kinds="))
+        .any(|kinds| kinds.split(',').any(|k| k == "account"))
+}
+
+/// Whether a `chrome` read answered for tab `sid`: it carries the tab's `autopilot sid=<sid>`
+/// line ([`forever::surfaces::chip_of`]), which every aterm this verb drives prints for a
+/// supervised pane, a release build's included. A read that failed (the client's error words, or
+/// `ERR …` from the main thread) carries none, and says nothing of what the build reports.
+#[must_use]
+pub fn answered_for(chrome: &str, sid: &str) -> bool {
+    forever::surfaces::chip_of(chrome, sid).is_some()
+}
+
+/// Tab `sid`'s Account chip nodes in a `chrome` read (a development build's `a11y window=…
+/// account sid=<sid> role=… label="…" description=…` lines), each from its `role=`, in the tree's
+/// order: line E's ([`LINE_E_HEAD`]) or line D's fallback unit.
+fn account_nodes<'a>(chrome: &'a str, sid: &str) -> impl Iterator<Item = &'a str> {
+    let head = format!("account sid={sid} ");
+    chrome
+        .lines()
+        .filter_map(|l| l.strip_prefix("a11y "))
+        .filter_map(move |l| l.split_once(' ')?.1.strip_prefix(head.as_str()))
+}
+
+/// Tab `sid`'s line E node in a `chrome` read: its Account node whose label begins
+/// [`LINE_E_HEAD`], from its `role=`; `None` where `chrome` printed none (line E not drawn, line
+/// D's unit standing alone, or an aterm that reports no Account node).
+#[must_use]
+pub fn line_e_node(chrome: &str, sid: &str) -> Option<String> {
+    account_nodes(chrome, sid)
+        .find(|node| {
+            node.split_once(" label=\"")
+                .is_some_and(|(_, label)| label.starts_with(LINE_E_HEAD))
+        })
+        .map(str::to_string)
+}
+
+/// Wait, looking at `lab`'s `chrome` after each `draw`, until tab `sid`'s line E says what its
+/// pane allows ([`line_e_due`] of its `status`, read once: a scene's mode is set before it
+/// settles). `draw` paces the looks and draws the frame each one reads: the Account node is
+/// laid by the window's last frame (`claude_chips_a11y` reads its hits), and a headless window
+/// draws none of its own, so a look with no frame drawn since the tab came to the front finds no
+/// node of it. Only line E's node counts ([`line_e_node`]): line D's fallback unit says the same
+/// sentences where line E never showed. `None` once that node says it, and the pane is not Off
+/// with a projection drawn. Else why: [`Unsaid::NotJudged`] at the first look that answered for
+/// the tab ([`answered_for`]) and whose aterm reports no Account node ([`reports_account_nodes`]),
+/// with no wait (a look that failed is a look with no node yet); or an [`Unsaid::Finding`], with
+/// what line E's node said last (`-` for none, and line D's unit where it stood instead): nothing due
+/// within `hang`, or a projection under Autopilot Off, whose recovery refuses forecasts.
+/// # Errors
+/// `draw`'s (an interrupt).
+fn line_e_unsaid(
+    lab: &dyn Lab,
+    sid: &str,
+    hang: Duration,
+    mut draw: impl FnMut() -> Result<(), Fail>,
+) -> Result<Option<Unsaid>, Fail> {
+    let due = line_e_due(&on(lab, sid, &["status"]));
+    let end = Instant::now() + hang;
+    loop {
+        draw()?;
+        let chrome = lab.said(&["chrome"]);
+        if answered_for(&chrome, sid) && !reports_account_nodes(&chrome) {
+            return Ok(Some(Unsaid::NotJudged(
+                "this aterm's `chrome` reports no Account node (no `a11y kinds=` line names \
+                 `account`: a release build, or one from before the glass design's §7 step 5), \
+                 so nothing reads what line E drew"
+                    .to_string(),
+            )));
+        }
+        let node = line_e_node(&chrome, sid);
+        match node.as_deref() {
+            Some(n) if due == LINE_E_READ && n.contains(LINE_E_PROJECTED) => {
+                return Ok(Some(Unsaid::Finding(format!(
+                    "line E drew a projection under Autopilot Off, whose recovery refuses \
+                     forecasts (its Account node: {n})"
+                ))));
+            }
+            Some(n) if n.contains(due) => return Ok(None),
+            _ => {}
+        }
+        if Instant::now() >= end {
+            let what = if due == LINE_E_READ {
+                "no reading of its week"
+            } else {
+                "no projection"
+            };
+            let unit = node
+                .is_none()
+                .then(|| account_nodes(&chrome, sid).next())
+                .flatten()
+                .map(|n| format!("; line D's account unit stood instead: {n}"))
+                .unwrap_or_default();
+            return Ok(Some(Unsaid::Finding(format!(
+                "line E drew {what} within {} s of its tab in front (its Account node: {}{unit})",
+                hang.as_secs(),
+                node.as_deref().unwrap_or("-")
+            ))));
+        }
     }
 }
 

@@ -150,7 +150,7 @@ fn concurrent_ingress_at_a_full_held_store() {
 /// holds across it, panics at once in a build with debug assertions rather than wait on that
 /// observation for good, which flock(2) would.
 ///
-/// NEGATIVE CONTROL: without `StateLock::not_under_own_draft` in `take_at`, the take waits on
+/// NEGATIVE CONTROL: without `StateLock::not_under_own_observation` in `take_at`, the take waits on
 /// the author's own observation and the hang detector fails "the take refuses at once".
 #[test]
 fn a_draft_that_takes_its_own_state_lock_panics_rather_than_wait_on_itself() {
@@ -177,7 +177,7 @@ fn a_draft_that_takes_its_own_state_lock_panics_rather_than_wait_on_itself() {
         .expect("the take refuses at once rather than wait on its own observation")
         .expect("the take panics");
     assert!(
-        message.contains("under this thread's own draft observation"),
+        message.contains("under this thread's own observation"),
         "{message}"
     );
 }

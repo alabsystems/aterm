@@ -1310,11 +1310,34 @@ pub(crate) fn grid_tree(
     }
 }
 
+/// The chips whose nodes [`harness_node_lines`] reports, each under its kind's word.
+#[cfg(any(test, debug_assertions))]
+const REPORTED_CHIPS: [(HarnessChip, &str); 2] = [
+    (HarnessChip::Autopilot, "autopilot"),
+    (HarnessChip::Account, "account"),
+];
+
+/// The kinds of chip node this build reports in `aterm ctl chrome`'s `a11y` lines (a development
+/// build's): `a11y kinds=autopilot,account`, printed once per read before every window's nodes,
+/// whatever any window has drawn or has open (an overlay's included), so a reader tells a kind
+/// this build does not print from a chip no window has drawn yet. It is a fact of the build, not
+/// of a window ([`harness_node_lines`] prints a window's nodes).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn harness_kinds_line() -> String {
+    let kinds: Vec<&str> = REPORTED_CHIPS.iter().map(|&(_, kind)| kind).collect();
+    format!("a11y kinds={}", kinds.join(","))
+}
+
 /// THE HARNESS'S NODES AS A SCREEN READER IS HANDED THEM (`aterm ctl chrome`'s `a11y` lines, a
-/// development build's): of `update`, window `window`'s tree as [`grid_tree`] builds it for the
-/// adapter, each Autopilot chip's node (`a11y window=<id> autopilot sid=<sid> role=<role>
-/// label="…" description="…"|-`, its session named by `sid_of`), in the tree's order. Every other
-/// node is left out.
+/// development build's, after [`harness_kinds_line`]): of `update`, window `window`'s tree as
+/// [`grid_tree`] builds it for the adapter, each Autopilot chip's node (`a11y window=<id>
+/// autopilot sid=<sid> role=<role> label="…" description="…"|-`, its session named by `sid_of`)
+/// and each Account chip's (`a11y window=<id> account sid=<sid> …`), in the tree's order. Every other node is left out. Two chips are Account chips: line E's quota row, whose
+/// label is its quota view's sentences (`Accounts. main, this tab, …`, `QuotaView::spoken`),
+/// and line D's fallback unit, drawn where line E is not, whose label is the account fact's
+/// (`Account: main, this tab, …`, `claude_facts::fact_spoken_of`, which can carry the same
+/// sentences); a lab reads line E's by that head
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step 5).
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn harness_node_lines(
     window: u64,
@@ -1335,12 +1358,11 @@ pub(crate) fn harness_node_lines(
         .nodes
         .iter()
         .filter_map(|(id, node)| {
-            let (session, HarnessChip::Autopilot) = chip_for(*id)? else {
-                return None;
-            };
+            let (session, chip) = chip_for(*id)?;
+            let &(_, kind) = REPORTED_CHIPS.iter().find(|&&(c, _)| c == chip)?;
             let sid = sid_of(session).unwrap_or_else(|| "-".to_string());
             Some(format!(
-                "a11y window={window} autopilot sid={sid} {}",
+                "a11y window={window} {kind} sid={sid} {}",
                 said(node)
             ))
         })
@@ -2299,11 +2321,21 @@ mod tests {
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
     }
 
-    /// `chrome`'s `a11y` lines read the built tree's Autopilot chip node, its role, label and
-    /// description as the adapter is handed them, and nothing else: a Team chip, a chrome message
-    /// and the grid itself are left out.
+    /// `chrome`'s `a11y` lines read the built tree's Autopilot and Account chip nodes, each with
+    /// its role, label and description as the adapter is handed them, in the tree's order, and
+    /// nothing else: a Team chip, a chrome message and the grid itself are left out, and a tree with
+    /// no chip says nothing. The build says which kinds it reports once per read, apart from any
+    /// window ([`harness_kinds_line`]), so a window with an overlay open, whose tree is the
+    /// overlay's, cannot take that line with it. The Account lines
+    /// are what `lab autopilot-captures` waits on before it shoots a Claude Code scene: line E's
+    /// quota row, its label its view's sentences (`Accounts. …`, the week's chain once its
+    /// projection is drawn), and line D's fallback unit, its label the account fact's (`Account:
+    /// …`); the lab reads line E's by that head and judges nothing where no kind is `account`.
+    /// CONTROLS (run by hand, 2026-11-08): the Autopilot chip alone kept, as before, fails it, and
+    /// so does the kinds line left out (2026-11-08, after review) or printed per window again
+    /// (2026-11-09, after recheck).
     #[test]
-    fn the_harness_node_lines_read_the_autopilot_chip_off_the_built_tree() {
+    fn the_harness_node_lines_read_the_autopilot_and_account_chips_off_the_built_tree() {
         let snap = live_grid(3, 60, b"hi", Some((0, 2)));
         let chip = |chip, label: &str, description: Option<&str>| GridChip {
             session: 4,
@@ -2325,6 +2357,11 @@ mod tests {
                 HarnessChip::Team,
                 "Worker of fmt",
                 Some("Goes to its manager."),
+            ),
+            chip(
+                HarnessChip::Account,
+                "Accounts. main, this tab, 80 percent of its week used. Next 7 days: main",
+                Some("Activate for the accounts outlook."),
             ),
         ];
         let messages = [GridMessage {
@@ -2348,10 +2385,21 @@ mod tests {
             [
                 "a11y window=2 autopilot sid=s-4 role=Button label=\"Autopilot: land.\" \
                  description=\"Stopped typing: the same reply twice, with no work.\"",
+                "a11y window=2 account sid=s-4 role=Button label=\"Accounts. main, this tab, 80 \
+                 percent of its week used. Next 7 days: main\" description=\"Activate for the \
+                 accounts outlook.\"",
             ]
         );
         let bare = grid_tree(&snap, Some(GEOM), &GridFrame::default());
-        assert!(harness_node_lines(2, &bare, |_| None).is_empty());
+        assert!(
+            harness_node_lines(2, &bare, |_| None).is_empty(),
+            "a window with no chip drawn says nothing"
+        );
+        assert_eq!(
+            harness_kinds_line(),
+            "a11y kinds=autopilot,account",
+            "the build says what it reports, once per read, apart from any window"
+        );
     }
 
     /// A SUPERVISED CODEX SESSION'S ACCOUNT CHIP names the CLI and the account

@@ -1021,15 +1021,40 @@ fn completed_row(text: &str) -> Option<String> {
         return None;
     }
     let kind = event.remove("event")?;
+    // This is the producer's reported name, possibly clipped, not a full case identity.
+    let case = match event.remove("case") {
+        Some(value @ aterm_json::Value::String(_)) => value,
+        _ => aterm_json::Value::Null,
+    };
+    // Stage verdicts live in these reported decisions, not a top-level outcome.
+    let decisions = match event.remove("decisions") {
+        Some(aterm_json::Value::Array(rows)) if kind.as_str() == Some("stage-finished") => {
+            aterm_json::Value::Array(
+                rows.into_iter()
+                    .map(
+                        |row| match (row["outcome"].as_str(), row["detail"].as_str()) {
+                            (Some(outcome), Some(detail)) => aterm_json::json!({
+                                "outcome": outcome, "detail": detail,
+                            }),
+                            _ => aterm_json::Value::Null,
+                        },
+                    )
+                    .collect(),
+            )
+        }
+        _ => aterm_json::Value::Null,
+    };
     let mut take = |key: &str| event.remove(key).unwrap_or(aterm_json::Value::Null);
     let summary = aterm_json::Value::Object(aterm_json::Map::from([
         ("event".to_string(), kind),
         ("stage".to_string(), take("stage")),
         ("check".to_string(), take("check")),
         ("test".to_string(), take("test")),
+        ("case".to_string(), case),
         ("outcome".to_string(), take("outcome")),
         ("detail".to_string(), take("detail")),
         ("findings".to_string(), take("findings")),
+        ("decisions".to_string(), decisions),
     ]));
     Some(summary.to_string())
 }
@@ -1042,8 +1067,15 @@ fn red_items(state: &State) -> String {
             let event: aterm_json::Value = aterm_json::from_str(row).ok()?;
             // A `test-case-failed` is a red by its outcome: a case its block spares (refused,
             // out of disk) reads NOT RUN.
-            matches!(event["outcome"].as_str(), Some("FAIL" | "fail" | "failed"))
-                .then(|| event.to_string())
+            let top_level_red =
+                matches!(event["outcome"].as_str(), Some("FAIL" | "fail" | "failed"));
+            let stage_red = event["event"].as_str() == Some("stage-finished")
+                && event["decisions"].as_array().is_some_and(|decisions| {
+                    decisions
+                        .iter()
+                        .any(|decision| decision["outcome"].as_str() == Some("FAIL"))
+                });
+            (top_level_red || stage_red).then(|| event.to_string())
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -1209,6 +1241,105 @@ mod tests {
             rows.read(dir.path()).is_empty(),
             "a poll is not another boundary"
         );
+    }
+
+    #[test]
+    fn reported_failed_cases_survive_remote_history_without_inventing_names() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let cases = [
+            Some(aterm_json::json!("first::case")),
+            Some(aterm_json::json!("second::case")),
+            None,
+            Some(aterm_json::Value::Null),
+            Some(aterm_json::json!({"unsupported": "name"})),
+        ];
+        let mut events = String::new();
+        for case in &cases {
+            let mut event = aterm_json::json!({
+                "event": "test-case-failed", "test": "-p sample --lib",
+                "outcome": "FAIL", "detail": "its block decides its binary a FAIL",
+            });
+            if let Some(case) = case {
+                event
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("case".into(), case.clone());
+            }
+            events.push_str(&format!("verify-event: {event}\n"));
+        }
+        events.push_str(
+            "verify-event: {\"event\":\"test-case-failed\",\"test\":\"-p sample --lib\",\"case\":\"spared\",\"outcome\":\"NOT RUN\"}\n",
+        );
+        std::fs::write(dir.path().join("verify.events"), events).unwrap();
+        let mut original = state("holder", 123);
+        original.rows = Rows::default().read(dir.path());
+        assert_eq!(original.rows.len(), 6);
+        let encoded = aterm_toml::to_string(&original).unwrap();
+        let decoded = parse_state(&encoded, &reference("0.156.0").unwrap()).unwrap();
+        assert_eq!(decoded, original);
+        let red = red_items(&decoded);
+        let red: Vec<aterm_json::Value> = red
+            .split("; ")
+            .map(|row| aterm_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(red.len(), 5);
+        assert_eq!(red[0]["case"].as_str(), Some("first::case"));
+        assert_eq!(red[1]["case"].as_str(), Some("second::case"));
+        assert_ne!(red[0], red[1]);
+        assert!(red[2..].iter().all(|row| row["case"].is_null()));
+        assert!(
+            red.iter()
+                .all(|row| row["outcome"].as_str() == Some("FAIL"))
+        );
+    }
+
+    #[test]
+    fn reported_stage_failures_are_red_before_the_aggregate_check_finishes() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut failed = aterm_verify::Report::new("finished stage with sibling pending");
+        failed.fail("reported failure");
+        failed.cannot_run("unavailable sibling work");
+        let mut passed = aterm_verify::Report::new("passing stage");
+        passed.pass("checked");
+        passed.raw("error: raw text alone is not a verdict");
+        let mut unavailable = aterm_verify::Report::new("unavailable stage");
+        unavailable.cannot_run("not executed");
+        let mut events = String::new();
+        for report in [&failed, &passed, &unavailable] {
+            events.push_str(&aterm_verify::report::stage_event(
+                0,
+                Some(aterm_verify::checks::Check::Test),
+                report,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                None,
+            ));
+        }
+        events.push_str("verify-event: {\"event\":\"stage-finished\",\"decisions\":[{\"outcome\":\"FAIL\",\"detail\":12}]}\n");
+        std::fs::write(dir.path().join("verify.events"), events).unwrap();
+        let mut original = state("holder", 123);
+        original.rows = Rows::default().read(dir.path());
+        assert_eq!(original.rows.len(), 4);
+        let decoded = parse_state(
+            &aterm_toml::to_string(&original).unwrap(),
+            &reference("0.156.0").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, original);
+        let red: aterm_json::Value = aterm_json::from_str(&red_items(&decoded)).unwrap();
+        assert_eq!(red["event"].as_str(), Some("stage-finished"));
+        assert!(red["outcome"].is_null());
+        assert_eq!(red["decisions"][0]["outcome"].as_str(), Some("FAIL"));
+        assert_eq!(
+            red["decisions"][0]["detail"].as_str(),
+            Some("reported failure")
+        );
+        assert_eq!(red["decisions"][1]["outcome"].as_str(), Some("NOT RUN"));
+        // An unsupported neighbor cannot erase a separately reported failure.
+        let mixed = completed_row(r#"{"event":"stage-finished","decisions":[null,{"outcome":"FAIL","detail":"observed"}]}"#).unwrap();
+        let mut state = original;
+        state.rows = vec![mixed];
+        assert!(!red_items(&state).is_empty());
     }
 
     #[test]

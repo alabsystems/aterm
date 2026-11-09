@@ -23,6 +23,9 @@ impl Drop for FileLock {
 /// Poll cadence for [`FileLock::acquire_within`] while a lock is held.
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(any(windows, all(test, unix)))]
+const WINDOWS_LOCK_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl FileLock {
     /// Open the lock file at `path` (created `0600` if absent).
     #[cfg(unix)]
@@ -143,10 +146,70 @@ impl FileLock {
         }
     }
 
-    /// Windows: [`acquire_within`](Self::acquire_within) with a 5 s limit.
+    /// Windows: [`acquire_within`](Self::acquire_within) with a minute hang detector.
     #[cfg(windows)]
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        Self::acquire_within(path, std::time::Duration::from_secs(5))
+        Self::acquire_required(path, std::time::Instant::now(), Self::acquire_within)
+    }
+
+    #[cfg(any(windows, all(test, unix)))]
+    fn acquire_required(
+        path: &Path,
+        started: std::time::Instant,
+        take: impl FnOnce(&Path, std::time::Duration) -> io::Result<Self>,
+    ) -> io::Result<Self> {
+        let left = WINDOWS_LOCK_HANG.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "required update lock wait expired",
+            ));
+        }
+        take(path, left)
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod required_lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_windows_required_lock_policy_waits_for_its_native_writer() {
+        for age in [Duration::from_secs(6), Duration::from_secs(61)] {
+            let expired = age >= Duration::from_secs(60);
+            let root = crate::test_scratch_dir("required-lock-policy");
+            let path = root.path().join("apply.lock");
+            let mut held = Some(FileLock::acquire(&path).unwrap());
+            let busy = FileLock::acquire_within(&path, Duration::ZERO)
+                .err()
+                .unwrap();
+            assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+            let mut observed = 0;
+            let result = FileLock::acquire_required(&path, Instant::now() - age, |path, left| {
+                let entered = Instant::now();
+                let busy = FileLock::acquire_within(path, Duration::ZERO)
+                    .err()
+                    .expect("the actual native writer is held");
+                assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+                observed += 1;
+                drop(held.take());
+                FileLock::acquire_within(path, left.saturating_sub(entered.elapsed()))
+            });
+            assert_eq!(observed, usize::from(!expired));
+            assert_eq!(held.is_some(), expired);
+            assert_eq!(result.is_err(), expired);
+            assert_eq!(
+                FileLock::acquire_within(&path, Duration::ZERO)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            drop(result);
+            drop(held);
+            FileLock::acquire_within(&path, Duration::ZERO).unwrap();
+        }
     }
 }
 

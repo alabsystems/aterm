@@ -19762,12 +19762,14 @@ fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by
         open: 4,
         subscriptions: 0,
     });
-    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
+    let started = lanes.start();
+    assert_eq!(started.rpc, 1, "the request lane starts");
     lanes.publish(Arc::new(LogService {
         active: active_for(&h),
         ctx: Arc::clone(&h.ctx),
         denials: control_denials::AuthDenials::new(),
     }));
+    started.activate();
     let path = sock.to_string_lossy().into_owned();
     let harness = HarnessToken::new(control_auth::harness_token().expect("entropy"));
     let client = std::thread::spawn(move || {

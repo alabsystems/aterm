@@ -428,6 +428,9 @@ impl Events {
                     aterm_types::resource_admission::CompletionCause::ResourceLimit => {
                         wire::CompletionCause::ResourceLimit
                     }
+                    aterm_types::resource_admission::CompletionCause::HostFault => {
+                        wire::CompletionCause::HostFault
+                    }
                 },
                 runtime_ns,
             },

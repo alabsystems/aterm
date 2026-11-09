@@ -24,6 +24,9 @@ trust-resource-provenance = { path = "../trust-resource-provenance", optional = 
 jobserver_utils = { path = "../trust-jobserver-utils", default-features = false, optional = true }
 sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false, optional = true }
 
+[dev-dependencies]
+aterm-tempfile = { path = "../../crates/aterm-tempfile" }
+
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"

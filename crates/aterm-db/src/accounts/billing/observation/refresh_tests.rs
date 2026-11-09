@@ -18,18 +18,20 @@ fn broker(f: &Fixture) -> Broker {
 }
 
 pub(crate) fn refresh_transition(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(template, before, action, false)
 }
 
 fn transition_with(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
     reset_producer: bool,
 ) -> aterm_spec::interp::State {
-    let (f, b, _, old) = super::broker_tests::setup();
+    let (f, b, _, old) = super::broker_tests::fork(template);
     let other = Grant {
         id: [71; 16],
         producer: [72; 32],
@@ -191,8 +193,9 @@ fn grant_refresh_conforms_and_resetting_producer_replays_a_request() {
     let model = aterm_models_db::broker_refresh_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = super::broker_tests::template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::refresh_transition(&initial, action.name);
+        let next = super::refresh_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -200,7 +203,7 @@ fn grant_refresh_conforms_and_resetting_producer_replays_a_request() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "Retry", true);
+    let unsafe_next = transition_with(&template, &initial, "Retry", true);
     assert!(!model.check_invariant("IdentityStable", &unsafe_next));
     assert!(!model.check_invariant("NoReplay", &unsafe_next));
 }

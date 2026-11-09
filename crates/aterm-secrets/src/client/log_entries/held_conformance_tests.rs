@@ -51,6 +51,7 @@
 //! island's `lstep`, and `LegacyKept` and `GoesOnlyStored` hold of the home.
 
 use super::*;
+use crate::client::log_entries_tests::home_content::{Content, Known};
 use crate::commons::binding::Request;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -98,7 +99,7 @@ enum Reach {
 }
 
 /// The island's held-draft `World`, its functions over the universe's versions and places.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct World {
     seq: [u64; VERSIONS],
     spine: [Vec<Ver>; VERSIONS],
@@ -117,6 +118,84 @@ struct World {
     /// passes to [`forget_landed_draft`]: the driver's, not a field of the island's World, whose
     /// `kept` is also set by an adoption, after which a keep answers false.
     answered: [bool; VERSIONS],
+}
+
+/// A World's fields as bytes, written to the hasher once per [`Packed::buf`]'s length rather than
+/// once per field: the search hashes a World at every step. Equal Worlds write equal bytes; a value
+/// past a byte writes 255, which only lets Worlds that differ there hash alike.
+impl std::hash::Hash for World {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut packed = Packed {
+            state,
+            buf: [0; 256],
+            len: 0,
+        };
+        for v in 0..VERSIONS {
+            for byte in self.seq[v].to_le_bytes() {
+                packed.byte(byte);
+            }
+            packed.list(&self.spine[v]);
+            packed.list(&self.reach[v]);
+            packed.byte(
+                u8::from(self.mine[v])
+                    | u8::from(self.recs[v]) << 1
+                    | u8::from(self.kept[v]) << 2
+                    | u8::from(self.answered[v]) << 3,
+            );
+            packed.byte(self.phase[v]);
+            for x in 0..PLACES {
+                packed.byte(self.via[v][x].map_or(u8::MAX, small));
+                packed.byte(u8::from(self.inflight[v][x]));
+                packed.byte(self.res[v][x].map_or(2, u8::from));
+            }
+            match &self.hold[v] {
+                None => packed.byte(0),
+                Some(Reach::Unknown) => packed.byte(1),
+                Some(Reach::Known(places)) => {
+                    packed.byte(2);
+                    packed.list(places);
+                }
+            }
+        }
+        packed.list(&self.head);
+        packed.list(&self.srv);
+        packed.finish();
+    }
+}
+
+/// `x` as a byte, 255 past one.
+fn small(x: usize) -> u8 {
+    u8::try_from(x).unwrap_or(u8::MAX)
+}
+
+/// A hasher's input gathered into one write per `buf`'s length ([`World`]'s `Hash`).
+struct Packed<'a, H> {
+    state: &'a mut H,
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl<H: std::hash::Hasher> Packed<'_, H> {
+    fn byte(&mut self, byte: u8) {
+        if self.len == self.buf.len() {
+            self.state.write(&self.buf);
+            self.len = 0;
+        }
+        self.buf[self.len] = byte;
+        self.len += 1;
+    }
+
+    /// `xs`, after its length.
+    fn list(&mut self, xs: &[usize]) {
+        self.byte(small(xs.len()));
+        for &x in xs {
+            self.byte(small(x));
+        }
+    }
+
+    fn finish(self) {
+        self.state.write(&self.buf[..self.len]);
+    }
 }
 
 /// The island's held-draft `Event`.
@@ -553,38 +632,7 @@ fn founder() -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     (seed, incarnation, actor, entrant)
 }
 
-/// A home's content: each directory and file by its path under the home, with its mode, and each
-/// file's bytes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Content {
-    dirs: BTreeMap<PathBuf, u32>,
-    files: BTreeMap<PathBuf, (u32, Vec<u8>)>,
-}
-
 impl Content {
-    /// What is under `home` now.
-    fn of(home: &Path) -> Self {
-        let mut content = Self::default();
-        content.read(home, Path::new(""));
-        content
-    }
-
-    fn read(&mut self, dir: &Path, at: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = at.join(entry.file_name());
-            let mode = entry.metadata().unwrap().permissions().mode() & 0o7777;
-            if entry.file_type().unwrap().is_dir() {
-                self.dirs.insert(path.clone(), mode);
-                self.read(&entry.path(), &path);
-            } else {
-                let bytes = std::fs::read(entry.path()).unwrap();
-                self.files.insert(path, (mode, bytes));
-            }
-        }
-    }
-
     /// The content's digest, which names its tree.
     fn digest_without(&self, sealed: impl Fn(&Path) -> bool) -> [u8; 32] {
         let mut bytes = Vec::new();
@@ -602,41 +650,6 @@ impl Content {
             bytes.extend_from_slice(file);
         }
         Sha256::digest(&bytes)
-    }
-
-    /// Make `home`, which holds `self`, hold `to`: each file and directory `to` has not removed,
-    /// each it has or has otherwise made.
-    fn turn_into(&self, to: &Self, home: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for path in self
-            .files
-            .keys()
-            .filter(|path| !to.files.contains_key(*path))
-        {
-            std::fs::remove_file(home.join(path)).unwrap();
-        }
-        for path in self
-            .dirs
-            .keys()
-            .rev()
-            .filter(|path| !to.dirs.contains_key(*path))
-        {
-            std::fs::remove_dir(home.join(path)).unwrap();
-        }
-        for (path, &mode) in &to.dirs {
-            if self.dirs.get(path) != Some(&mode) {
-                fsx::ensure_private_dir(&home.join(path)).unwrap();
-                std::fs::set_permissions(home.join(path), std::fs::Permissions::from_mode(mode))
-                    .unwrap();
-            }
-        }
-        for (path, file) in &to.files {
-            if self.files.get(path) != Some(file) {
-                std::fs::write(home.join(path), &file.1).unwrap();
-                std::fs::set_permissions(home.join(path), std::fs::Permissions::from_mode(file.0))
-                    .unwrap();
-            }
-        }
     }
 }
 
@@ -706,7 +719,8 @@ struct Files {
 /// run once on each tree it is made on: a second event that makes the same call on the same tree
 /// (another order of the environment's events before it) gets the tree the first left. The
 /// functions read nothing but the home's files and their arguments, so that run stands for every
-/// later one; each tree's files are read once, when first seen.
+/// later one; each tree's files are read once, when first seen. The home is read and put back by
+/// what the lab last read or wrote of it ([`Known`]), opening only the files a call changed.
 struct Lab {
     /// The home's folder, removed with the lab.
     _root: aterm_tempfile::TempDir,
@@ -721,6 +735,8 @@ struct Lab {
     calls: RefCell<HashMap<(Tree, Call), Result<Tree, String>>>,
     /// The tree the home holds now.
     current: std::cell::Cell<Tree>,
+    /// What the lab last read or wrote of the home.
+    known: RefCell<Known>,
     /// How many steps landed a pending set, and how many dropped one ([`Lab::sets_follow_holds`]).
     sets: std::cell::Cell<(usize, usize)>,
 }
@@ -752,6 +768,7 @@ impl Lab {
             files: RefCell::new(Vec::new()),
             calls: RefCell::new(HashMap::new()),
             current: std::cell::Cell::new(0),
+            known: RefCell::new(Known::default()),
             sets: std::cell::Cell::new((0, 0)),
         };
         fsx::ensure_private_dir(&lab.work.dir).unwrap();
@@ -766,7 +783,8 @@ impl Lab {
 
     /// The home's tree now, read and kept the first time the lab sees it.
     fn seen(&self) -> Result<Tree, String> {
-        let content = Content::of(&self.work.dir);
+        let mut known = self.known.borrow_mut();
+        let content = known.refresh(&self.work.dir);
         // The pending sets and the waiting writes are sealed with a fresh nonce each write: the
         // tree is what they hold, read through the lab's identity, not their bytes.
         let mut text = content
@@ -774,30 +792,32 @@ impl Lab {
                 path.starts_with("everyone.pending") || path == Path::new("everyone.waiting")
             })
             .to_vec();
-        text.extend_from_slice(
-            format!(
-                "{:?}",
-                (
-                    waiting_shapes(&self.work, &self.identity),
-                    pending_reach(&self.work, &self.identity)
-                )
-            )
-            .as_bytes(),
+        let sealed = (
+            waiting_shapes(&self.work, &self.identity),
+            pending_reach(&self.work, &self.identity),
         );
+        text.extend_from_slice(format!("{sealed:?}").as_bytes());
         let digest = Sha256::digest(&text);
         if let Some(&tree) = self.trees.borrow().get(&digest) {
             return Ok(tree);
         }
-        let files = self.read_files()?;
+        let ((waiting, sets), reach) = sealed;
+        let files = self.read_files(waiting, sets, reach)?;
         let tree = self.files.borrow().len();
-        self.contents.borrow_mut().push(content);
+        self.contents.borrow_mut().push(content.clone());
         self.files.borrow_mut().push(files);
         self.trees.borrow_mut().insert(digest, tree);
         Ok(tree)
     }
 
-    /// The holds' files and the records store of the home now.
-    fn read_files(&self) -> Result<Files, String> {
+    /// The holds' files and the records store of the home now, beside what waits there, its
+    /// pending sets and their servers ([`waiting_shapes`], [`pending_reach`]).
+    fn read_files(
+        &self,
+        waiting: Shapes,
+        sets: Vec<([u8; 32], Shapes)>,
+        reach: Vec<([u8; 32], Vec<String>)>,
+    ) -> Result<Files, String> {
         let mut holds = Vec::new();
         for (seq, digest, path) in held_drafts(&self.work) {
             let held = read_held(&path)
@@ -809,10 +829,7 @@ impl Lab {
             holds.push((seq, digest, held.reach.clone(), ids));
         }
         let store = super::super::load_records(&self.work).map_err(|e| format!("store: {e}"))?;
-        let (waiting, sets) = waiting_shapes(&self.work, &self.identity);
-        let reach: BTreeMap<[u8; 32], Vec<String>> = pending_reach(&self.work, &self.identity)
-            .into_iter()
-            .collect();
+        let reach: BTreeMap<[u8; 32], Vec<String>> = reach.into_iter().collect();
         Ok(Files {
             holds,
             unversioned: unversioned_held_draft_file(&self.work).exists(),
@@ -835,14 +852,16 @@ impl Lab {
         }
         if self.current.get() != tree {
             let contents = self.contents.borrow();
+            let mut known = self.known.borrow_mut();
             match contents.get(self.current.get()) {
                 // The home as it is: a tree stands for every home whose sealed files hold what
                 // its do, whatever their bytes.
-                Some(_) => Content::of(&self.work.dir).turn_into(&contents[tree], &self.work.dir),
+                Some(_) => known.put(&contents[tree], &self.work.dir),
                 None => {
                     std::fs::remove_dir_all(&self.work.dir).unwrap();
                     fsx::ensure_private_dir(&self.work.dir).unwrap();
                     Content::default().turn_into(&contents[tree], &self.work.dir);
+                    *known = Known::default();
                 }
             }
         }

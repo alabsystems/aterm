@@ -3531,12 +3531,13 @@ impl Canvas {
     }
 
     fn with_origin(origin_x: i32, origin_y: i32, w: u32, h: u32, backdrop: [u8; 4]) -> Self {
-        let mut px = vec![0u8; (w * h * 4) as usize];
-        if backdrop != [0, 0, 0, 0] {
-            for chunk in px.as_chunks_mut::<4>().0 {
-                chunk.copy_from_slice(&backdrop);
-            }
-        }
+        let len = (w * h * 4) as usize;
+        // `repeat` fills by doubling copies, not one store a pixel.
+        let px = if backdrop == [0, 0, 0, 0] {
+            vec![0u8; len]
+        } else {
+            backdrop.repeat(len / 4)
+        };
         Self {
             origin_x,
             origin_y,
@@ -8640,6 +8641,21 @@ mod tests {
         }
         let untouched = Canvas::with_origin(4, 3, 12, 10, backdrop).px;
         assert_ne!(blitted(None, (4, 3)), untouched);
+    }
+
+    #[test]
+    fn a_canvas_starts_as_its_backdrop_in_every_pixel() {
+        for (w, h) in [(0, 0), (1, 1), (3, 5), (40, 17), (1_280, 40)] {
+            for backdrop in [[0, 0, 0, 0], [40, 50, 60, 255], [1, 2, 3, 4]] {
+                let canvas = Canvas::with_origin(4, 3, w, h, backdrop);
+                let (pixels, rest) = canvas.px.as_chunks::<4>();
+                assert_eq!((pixels.len(), rest.len()), ((w * h) as usize, 0), "{w}x{h}");
+                assert!(
+                    pixels.iter().all(|pixel| *pixel == backdrop),
+                    "{w}x{h} {backdrop:?}"
+                );
+            }
+        }
     }
 
     #[test]

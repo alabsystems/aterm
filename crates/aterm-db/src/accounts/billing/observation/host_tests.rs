@@ -49,18 +49,20 @@ fn poll_until(host: &mut Host, ready: impl Fn(&Host) -> bool) {
 }
 
 pub(crate) fn host_transition(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, true)
+    transition_with(template, before, action, true)
 }
 
 fn transition_with(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
     check_stop: bool,
 ) -> aterm_spec::interp::State {
-    let (f, broker, token, grant) = super::broker_tests::setup();
+    let (f, broker, token, grant) = super::broker_tests::fork(template);
     let dir = transport::tests::socket_dir();
     aterm_uds::private_file::create_private_dir(dir.path()).unwrap();
     let entered = Arc::new(AtomicUsize::new(0));
@@ -260,8 +262,9 @@ fn broker_host_lifecycle_conforms_and_stop_gate_is_necessary() {
     let model = aterm_models_db::broker_host_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = super::broker_tests::template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::host_transition(&initial, action.name);
+        let next = super::host_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -269,7 +272,7 @@ fn broker_host_lifecycle_conforms_and_stop_gate_is_necessary() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "StopAtGate", false);
+    let unsafe_next = transition_with(&template, &initial, "StopAtGate", false);
     assert!(!model.check_invariant("StopBeforeEntry", &unsafe_next));
 }
 

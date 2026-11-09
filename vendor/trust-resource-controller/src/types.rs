@@ -152,6 +152,8 @@ pub enum CompletionCause {
     Timeout,
     Cancelled,
     ResourceLimit,
+    /// The host lost execution or custody integrity; diagnostics retain the fault.
+    HostFault,
 }
 
 /// Finished is delivered only after authenticated scope retirement and resource

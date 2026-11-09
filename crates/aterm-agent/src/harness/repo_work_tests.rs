@@ -536,9 +536,9 @@ fn a_gitmodules_git_cannot_read_is_never_a_clean_reading() {
     assert_eq!(probe(&work, Some(&work), PROBE_LIMIT), RepoRead::Unread);
 }
 
-/// `vendor/<name>` added to `app` from `url` (a path: a local clone) and committed.
+/// `vendor/<name>` added to `app` from `url` (a path: a local clone), its record staged.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn add_submodule(app: &Path, url: &str, name: &str) {
+fn stage_submodule(app: &Path, url: &str, name: &str) {
     let path = format!("vendor/{name}");
     scratch_git(
         app,
@@ -552,7 +552,6 @@ fn add_submodule(app: &Path, url: &str, name: &str) {
             &path,
         ],
     );
-    scratch_git(app, &["commit", "-q", "-m", &path]);
 }
 
 /// A commit made in `dir`, writing `name`.
@@ -580,9 +579,14 @@ fn every_submodule_is_read_however_many() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let (_lib, app) = app_with_lib(tmp.path());
     let url = tmp.path().join("lib/remote.git").display().to_string();
+    // Their records in one commit: what is read is each checkout and its record, not their history.
     for n in 1..=32 {
-        add_submodule(&app, &url, &format!("lib{n:02}"));
+        stage_submodule(&app, &url, &format!("lib{n:02}"));
     }
+    scratch_git(
+        &app,
+        &["commit", "-q", "-m", "vendor/lib01 to vendor/lib32"],
+    );
     scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
     let all = probe(&app, Some(&app), PROBE_LIMIT);
     assert!(

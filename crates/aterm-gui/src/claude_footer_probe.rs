@@ -84,7 +84,13 @@ fn screen_dimensions(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
         });
     }
     s.push(rule);
-    s.extend(live.under.iter().map(|row| (*row).to_owned()));
+    // The rows under the composer are cut to the pane: the last row painted past the right
+    // margin would wrap and scroll the whole screen up a row, the caret onto the bottom rule.
+    s.extend(
+        live.under
+            .iter()
+            .map(|row| row.chars().take(cols).collect::<String>()),
+    );
     assert_eq!(s.len(), rows);
     s
 }
@@ -399,4 +405,48 @@ pub(crate) fn footer_pass_cost(passes: usize) -> Vec<PassCost> {
         });
     }
     out
+}
+
+/// A screen narrower than its mode row keeps its layout: at 40 columns, where Claude's bypass
+/// row is 46 characters, the fed grid's last row is that row cut to the pane, the composer's
+/// bottom rule sits over it and the caret stays on the composer (`❯`). NEGATIVE CONTROL: feeding
+/// the bypass row whole wraps it onto a row of its own, scrolling the screen up a row and
+/// leaving the caret on the bottom rule (run once, restored).
+#[cfg(test)]
+#[test]
+fn a_narrow_screen_keeps_the_caret_on_the_composer() {
+    let (rows, cols) = (40u16, 40u16);
+    assert!(
+        BYPASS.chars().count() > usize::from(cols),
+        "control: the row is wider"
+    );
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, rows, cols));
+    feed(&app, session, &screen_at(&AT_REST, rows, cols));
+    let term = app.pool.get(session).expect("session").term.clone();
+    let term = crate::term_lock(&term);
+    let text = |row: u16| term.row_text(usize::from(row)).expect("the row");
+    let last = rows - 1;
+    assert_eq!(
+        text(last).trim_end(),
+        BYPASS
+            .chars()
+            .take(usize::from(cols))
+            .collect::<String>()
+            .trim_end(),
+        "the bypass row is the last, cut to the pane"
+    );
+    assert!(
+        text(last - 1).starts_with('\u{2500}'),
+        "the bottom rule is over it: {:?}",
+        text(last - 1)
+    );
+    let caret = term.cursor().row;
+    assert!(
+        text(caret).starts_with('\u{276F}'),
+        "the caret is on the composer, row {caret}: {:?}",
+        text(caret)
+    );
 }

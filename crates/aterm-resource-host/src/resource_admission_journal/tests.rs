@@ -5,6 +5,86 @@ use super::*;
 use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt as _;
 
+fn faults(journal: &Journal, site: &str) -> Vec<Value> {
+    std::fs::read_dir(&journal.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("fault-")
+        })
+        .map(|path| read(&path).unwrap())
+        .filter(|record| record["site"].as_str() == Some(site))
+        .collect()
+}
+
+#[test]
+fn fault_diagnostics_keep_io_and_condition_causes_without_changing_custody() {
+    let world = World::new();
+    let binding = world.binding(41);
+    world.journal.create(&binding).unwrap();
+    let mut faulted = false;
+    world.journal.fault(
+        &mut faulted,
+        "member-io",
+        io::Error::from_raw_os_error(libc::ENOTCONN),
+    );
+    world
+        .journal
+        .fault(&mut faulted, "member-progress", "launched without GO");
+    assert!(faulted);
+    let io = faults(&world.journal, "member-io").pop().unwrap();
+    assert_eq!(io["site"].as_str(), Some("member-io"));
+    assert!(io["detail"].as_str().unwrap().contains("NotConnected"));
+    let condition = faults(&world.journal, "member-progress").pop().unwrap();
+    assert!(
+        condition["detail"]
+            .as_str()
+            .unwrap()
+            .contains("launched without GO")
+    );
+    // Repeated cleanup observations cannot erase the triggering error.
+    world
+        .journal
+        .fault(&mut faulted, "member-io", "later cleanup");
+    assert_eq!(faults(&world.journal, "member-io"), vec![io]);
+    assert_eq!(world.journal.outstanding().unwrap().len(), 1);
+    assert!(!world.journal.fresh(&binding).unwrap());
+}
+
+#[test]
+fn reopening_keeps_the_previous_owners_fault_evidence() {
+    let world = World::new();
+    world.journal.record_fault("same-site", "first owner");
+    let reopened = Journal::open(&world.namespace, &world.debt).unwrap();
+    reopened.record_fault("same-site", "next owner");
+    let records = faults(&reopened, "same-site");
+    assert_eq!(records.len(), 2);
+    for detail in ["first owner", "next owner"] {
+        assert!(
+            records
+                .iter()
+                .any(|record| record["detail"].as_str().unwrap().contains(detail))
+        );
+    }
+}
+
+#[test]
+fn fault_diagnostics_survive_unwritable_journal_in_the_live_owner() {
+    let world = World::new();
+    std::fs::remove_file(world.journal.root.join("ready")).unwrap();
+    let mut faulted = false;
+    world
+        .journal
+        .fault(&mut faulted, "owner-fence", "original leadership lost");
+    assert!(faulted);
+    let summary = world.journal.fault_summary();
+    assert!(summary.contains("original leadership lost"));
+    assert!(summary.contains("diagnostic-storage"));
+}
+
 struct World {
     journal: Journal,
     namespace: Namespace,

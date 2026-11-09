@@ -359,7 +359,7 @@ fn host() {
         if mutated {
             // The real root exits successfully after the expected refusal;
             // final SDK integrity still independently fails the original job.
-            aterm_types::resource_admission::CompletionCause::ResourceLimit
+            aterm_types::resource_admission::CompletionCause::HostFault
         } else {
             aterm_types::resource_admission::CompletionCause::Exited
         }

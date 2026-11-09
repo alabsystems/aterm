@@ -82,6 +82,11 @@ fn coverage(d: f32) -> u8 {
 /// The most of an icon's half height its stroke may take (about a fifth of the icon), whole pixels: [`Shape::fit`] holds the face's stem to it at the icon's own half height (the capitals', held to the cell's width, or `⤓`'s [`Shape::tall`]) and [`Shape::mark_t`] at the ring family's own radius.
 const STROKE_SHARE: f32 = 0.44;
 
+/// Where `↺` ([`Shape::reset`]) is open, in degrees on the raster (`y` down, so `-90` is the
+/// top): from a little above its left side round the top left to a little right of its top, the
+/// end that carries the head.
+const RESET_GAP: [f32; 2] = [-175.0, -70.0];
+
 /// One icon's frame on its raster: its centre, half height, stroke, the horizontal room it may use on each side of the centre, the row it stands on and the highest row it may ink.
 struct Shape {
     cx: f32,
@@ -468,6 +473,7 @@ impl Shape {
             }
             BandIcon::Fork => self.fork(px, py),
             BandIcon::Enter => self.enter(px, py),
+            BandIcon::Reset => self.reset(px, py),
             BandIcon::Lock => self.lock(px, py),
             BandIcon::Hourglass => self.hourglass(px, py),
             BandIcon::Drive => self.drive(px, py),
@@ -634,6 +640,50 @@ impl Shape {
         self.mark_outline(diamond)
             .min(stem.min(head).max(diamond))
             .max(self.mark_box(px, py))
+    }
+
+    /// `↺` in the family's box ([`Self::mark_box`]): `○`'s line ([`Self::mark_ring`]'s band,
+    /// one [`Self::mark_t`] across, pushed out by [`Self::ring_lack`]) open across its top left
+    /// ([`RESET_GAP`]), each open end a round cap on the line's centre, and at the end just right
+    /// of the top an arrowhead pointing back along the line, leftward: [`BandIcon::Update`]'s
+    /// turning arrow mirrored and drawn at the family's size. The head is `t + 1.5` pixels long
+    /// or seven tenths of the radius, whichever is more, and `t + 1` each side of the line's
+    /// centre, held to stop a fifth of a pixel short of the ring's centre so the mark stays
+    /// hollow on the smallest rings, and never under half a pixel; its outer half reaches past
+    /// the box, which cuts it, so its barb lies inside the line. Below its centre row the mark is
+    /// `○` exactly.
+    fn reset(&self, px: f32, py: f32) -> f32 {
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let (dx, dy) = (px - self.cx, py - cyr);
+        let mid = r - t * 0.5;
+        let on_line = |a: f32| (self.cx + mid * a.cos(), cyr + mid * a.sin());
+        let [g0, g1] = RESET_GAP.map(f32::to_radians);
+        let angle = dy.atan2(dx);
+        let line = if angle > g0 && angle < g1 {
+            let cap = |a: f32| {
+                let (x, y) = on_line(a);
+                (px - x).hypot(py - y) - t * 0.5
+            };
+            cap(g0).min(cap(g1))
+        } else {
+            let d = dx.hypot(dy);
+            (d - r - self.ring_lack()).max(r - t - d)
+        };
+        let (ex, ey) = on_line(g1);
+        let (tx, ty) = (g1.sin(), -g1.cos());
+        let (nx, ny) = (g1.cos(), g1.sin());
+        let long = (t + 1.5).max(r * 0.7);
+        let wide = (t + 1.0).min(mid - 0.2).max(0.5);
+        let head = polygon_sd(
+            px,
+            py,
+            &[
+                (ex + tx * long, ey + ty * long),
+                (ex + nx * wide, ey + ny * wide),
+                (ex - nx * wide, ey - ny * wide),
+            ],
+        );
+        line.min(head).max(self.mark_box(px, py))
     }
 
     /// The ring family's radius ([`ring_radius`]) and centre row: the face's `●` on the capitals' centre line, its sides and its top on pixel boundaries.
@@ -1287,10 +1337,10 @@ mod tests {
     }
 
     /// The glass's ring family is one set: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂`,
-    /// `◆`, `⎇` and `⎆` drawn in their box, share one ink box on every face, inside their own cell
-    /// on either raster, no taller than the face's own `●` ([`IconMetrics::disc`]) where it is
-    /// under the capitals. Each mark's own shape (hollow, struck, dotted, halved, roofed, forked,
-    /// entered) is asserted. NEGATIVE CONTROL: drawing `⎆` as `◆`'s filled diamond, or `⎇`
+    /// `◆`, `⎇`, `⎆` and `↺` drawn in their box, share one ink box on every face, inside their
+    /// own cell on either raster, no taller than the face's own `●` ([`IconMetrics::disc`]) where
+    /// it is under the capitals. Each mark's own shape (hollow, struck, dotted, halved, roofed,
+    /// forked, entered) is asserted, `↺`'s in its own test. NEGATIVE CONTROL: drawing `⎆` as `◆`'s filled diamond, or `⎇`
     /// without its second foot, fails the entered and forked shapes (run once, restored).
     #[test]
     fn the_ring_family_shares_one_outline() {
@@ -1323,6 +1373,7 @@ mod tests {
                     draw(BandIcon::Fork),
                     draw(BandIcon::Enter),
                 );
+                let reset = draw(BandIcon::Reset);
                 let at = format!("{cw}x{ch} stem {} disc {} spill {spill}", m.stem, m.disc);
                 let outline = ink_box(&disc, w);
                 assert_eq!(ink_box(&ring, w), outline, "{at}: ○ is ●'s size");
@@ -1335,6 +1386,7 @@ mod tests {
                 assert_eq!(ink_box(&filled, w), outline, "{at}: ◆ is ●'s size");
                 assert_eq!(ink_box(&fork, w), outline, "{at}: ⎇ is ●'s size");
                 assert_eq!(ink_box(&enter, w), outline, "{at}: ⎆ is ●'s size");
+                assert_eq!(ink_box(&reset, w), outline, "{at}: ↺ is ●'s size");
                 let (x0, x1, y0, y1) = outline;
                 let own = if spill { cw } else { 0 };
                 assert!(
@@ -1698,6 +1750,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `↺` on every measured face (1x and 2x, regular and bold), in a cell of its own and
+    /// spilled: hollow (its centre under half ink, as `○`'s), `○` exactly below its centre row,
+    /// open across its top left (that quarter lighter than its top right and than `○`'s own),
+    /// and, on a ring 5 px or more across, its head's barb at half ink or more inside the line,
+    /// where `○` is under half. The ring of 4 px (Menlo 8) has no pixel inside its line for a barb.
+    /// NEGATIVE CONTROL: drawing `↺` without its head fails the barb on every face that has
+    /// room for one (run once, restored).
+    #[test]
+    fn the_reset_mark_is_the_ring_opened_at_its_top_left_with_a_head() {
+        let faces = SMALLEST_FACES
+            .into_iter()
+            .chain(SMALL_FACES)
+            .chain(BOLD_FACES.map(|(name, face, _)| (name, face)))
+            .chain(THIN_2X_FACES)
+            .chain([WIDE_STROKE_2X_FACE])
+            .map(|(name, [cw, ch, baseline, cap, stem, head, disc])| {
+                let m = IconMetrics {
+                    baseline,
+                    cap,
+                    stem,
+                    head,
+                    disc,
+                };
+                (name.to_string(), cw as usize, ch as usize, m)
+            })
+            .chain(
+                FACES
+                    .into_iter()
+                    .map(|(cw, ch, m)| (format!("2x stem {}", m.stem), cw, ch, m)),
+            );
+        let mut barbed = 0;
+        for (name, cw, ch, m) in faces {
+            for spill in [false, true] {
+                let w = band_icon_width(cw, spill);
+                let draw = |icon| band_icon_coverage(icon, cw, ch, m, spill);
+                let (reset, ring, disc) = (
+                    draw(BandIcon::Reset),
+                    draw(BandIcon::Ring),
+                    draw(BandIcon::Disc),
+                );
+                let at = format!("{name} {cw}x{ch} spill {spill}");
+                let (x0, x1, y0, y1) = ink_box(&disc, w);
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                assert!(reset[cy * w + cx] < 128, "{at}: ↺ is hollow");
+                for y in cy + 1..y1 {
+                    assert_eq!(
+                        reset[y * w..(y + 1) * w],
+                        ring[y * w..(y + 1) * w],
+                        "{at}: below its centre row ↺ is ○ (row {y})"
+                    );
+                }
+                let ink = |buf: &[u8], xs: std::ops::Range<usize>| {
+                    (y0..cy)
+                        .flat_map(|y| xs.clone().map(move |x| u32::from(buf[y * w + x])))
+                        .sum::<u32>()
+                };
+                let (left, right) = (x0..cx, cx + (x1 - x0) % 2..x1);
+                let open = ink(&reset, left.clone());
+                assert!(
+                    open < ink(&reset, right) && open < ink(&ring, left),
+                    "{at}: ↺ is open across its top left"
+                );
+                let barb = (y0..cy)
+                    .flat_map(|y| (x0..x1).map(move |x| y * w + x))
+                    .any(|i| reset[i] >= 128 && ring[i] < 128);
+                if x1 - x0 >= 5 {
+                    assert!(barb, "{at}: ↺'s head has its barb inside the line");
+                    barbed += 1;
+                }
+            }
+        }
+        assert!(
+            barbed > 60,
+            "control: the barb is judged on most faces ({barbed})"
+        );
     }
 
     /// On the small faces `⏸` and `!` between blanks are `[3cap/4, cap + 1]` rows and `⤓` is the

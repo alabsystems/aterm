@@ -179,8 +179,10 @@ fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {
         open: 4,
         subscriptions: 0,
     });
-    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
+    let started = lanes.start();
+    assert_eq!(started.rpc, 1, "the request lane starts");
     lanes.publish(service.clone());
+    started.activate();
     let own = crate::harness_host::holder();
     let mut child = aterm_uds::spawnfd::command("/usr/bin/perl")
         .env_clear()

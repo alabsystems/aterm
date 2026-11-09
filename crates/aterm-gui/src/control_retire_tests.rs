@@ -136,9 +136,10 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
         open: 8,
         subscriptions: 1,
     });
-    lanes.start();
+    let started = lanes.start();
     let verbs = Arc::new(MainThreadVerbs::default());
     lanes.publish(verbs.clone());
+    started.activate();
     let endpoint = Endpoint::default();
     let mut expected = socket_file_id(&published);
     let supervisor = Supervisor::new(

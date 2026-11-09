@@ -8,6 +8,14 @@ use aterm_secrets::commons::bootstrap::Bootstrap;
 
 pub(crate) type World = (Fixture, Broker, Token, Grant);
 
+/// A [`World`] before its broker: built once for a walk whose steps each take a copy
+/// ([`fork`]). Grants and tokens have lifetimes, so a walk builds its own and never keeps one
+/// for later tests.
+pub(crate) struct Template {
+    built: super::Built,
+    grant: Grant,
+}
+
 pub(super) fn setup() -> World {
     setup_on(1)
 }
@@ -20,6 +28,27 @@ fn setup_on_with_lease_clock(
     machines: usize,
     lease_clock: Option<Instant>,
 ) -> (Fixture, Broker, Token, Grant) {
+    let (f, grant) = granted(machines);
+    issued(f, grant, lease_clock)
+}
+
+/// One Mac's world before its broker, for [`fork`].
+pub(super) fn template() -> Template {
+    let (f, grant) = granted(1);
+    Template {
+        built: f.built(),
+        grant,
+    }
+}
+
+/// A [`setup`] world of its own on a copy of `template`, whose broker issues its token now.
+pub(super) fn fork(template: &Template) -> World {
+    issued(template.built.fork(), template.grant.clone(), None)
+}
+
+/// `machines` Macs with account 31's decision prepared, its resources initialized and its
+/// grant published.
+fn granted(machines: usize) -> (Fixture, Grant) {
     let f = Fixture::new(machines);
     f.issue(
         31,
@@ -37,6 +66,12 @@ fn setup_on_with_lease_clock(
     };
     prepared.resources().initialize().unwrap();
     publish(&f, vec![grant.clone()]);
+    (f, grant)
+}
+
+/// `f`'s world with a broker of its own, whose leases run on `lease_clock` where one is given,
+/// and the token it issues for `grant`.
+fn issued(f: Fixture, grant: Grant, lease_clock: Option<Instant>) -> World {
     let mut broker = broker(&f);
     if let Some(now) = lease_clock {
         broker.test_set_lease_time(now);
@@ -228,18 +263,20 @@ fn observe(
 }
 
 pub(crate) fn broker_transition(
+    template: &Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(template, before, action, false)
 }
 
 fn transition_with(
+    template: &Template,
     before: &aterm_spec::interp::State,
     action: &str,
     bypass: bool,
 ) -> aterm_spec::interp::State {
-    let (f, broker, token, grant) = setup();
+    let (f, broker, token, grant) = fork(template);
     let entered = Cell::new(0);
     let mut scenario = 0;
     let accepted;
@@ -657,8 +694,9 @@ fn broker_capabilities_conform_and_final_revocation_check_is_necessary() {
     let model = aterm_models_db::broker_capability_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::broker_transition(&initial, action.name);
+        let next = super::broker_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -666,7 +704,7 @@ fn broker_capabilities_conform_and_final_revocation_check_is_necessary() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "RevokedAfter", true);
+    let unsafe_next = transition_with(&template, &initial, "RevokedAfter", true);
     assert!(!model.check_invariant("Authorization", &unsafe_next));
 }
 

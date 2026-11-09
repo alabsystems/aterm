@@ -119,6 +119,28 @@ fn edit(items: &mut [Item], i: usize, edit: impl FnOnce(&mut EffectRecord)) {
     }
 }
 
+/// A RECORDED RUN REPLAYS THE SAME WAY TWICE IN STRICT MODE, a watch's and a supervise run's:
+/// `assert_replays` holds each run's strict replay to its acts-mode one, so a difference only two
+/// strict replays show (a path acts mode does not take, or what one strict replay leaves the next)
+/// is caught here.
+///
+/// NEGATIVE CONTROL (2026-11-08): with every second strict replay in the process counting one
+/// record more consumed, this fails at the watch, and `assert_replays` passes.
+#[test]
+fn a_recorded_run_replays_the_same_way_twice_in_strict_mode() {
+    let (watch, watched) = recorded();
+    let (supervise, supervised, _) = recorded_supervise();
+    for (header, items) in [(&watch, &watched), (&supervise, &supervised)] {
+        let first = replayed(header, items);
+        assert_eq!(first.verdict, Verdict::Reproduced, "{}", first.render());
+        assert_eq!(
+            replayed(header, items),
+            first,
+            "a recorded run replays the same way twice"
+        );
+    }
+}
+
 #[test]
 fn a_recorded_watch_replays_in_either_form() {
     let (header, items) = recorded();

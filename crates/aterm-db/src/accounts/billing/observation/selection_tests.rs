@@ -5,18 +5,20 @@ use super::*;
 use crate::accounts::broker::{Broker, Selection, command};
 
 pub(crate) fn selection_transition(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(template, before, action, false)
 }
 
 fn transition_with(
+    template: &super::broker_tests::Template,
     before: &aterm_spec::interp::State,
     action: &str,
     pick_first: bool,
 ) -> aterm_spec::interp::State {
-    let (f, broker, _, grant) = super::broker_tests::setup();
+    let (f, broker, _, grant) = super::broker_tests::fork(template);
     let mut grants = vec![grant.clone()];
     let mut selection = Selection::Account {
         account: grant.binding.account,
@@ -134,8 +136,9 @@ fn account_selection_conforms_and_choosing_first_breaks_ambiguity() {
     let model = aterm_models_db::broker_selection_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
+    let template = super::broker_tests::template();
     aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::selection_transition(&initial, action.name);
+        let next = super::selection_transition(&template, &initial, action.name);
         assert!(
             model.successors(action.name, &initial).contains(&next),
             "{}: {next:?}",
@@ -143,7 +146,7 @@ fn account_selection_conforms_and_choosing_first_breaks_ambiguity() {
         );
         next
     });
-    let unsafe_next = transition_with(&initial, "Ambiguous", true);
+    let unsafe_next = transition_with(&template, &initial, "Ambiguous", true);
     assert!(!model.check_invariant("ExactSelection", &unsafe_next));
 }
 

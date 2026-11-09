@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const RESPONSE_MAX: usize = 256 * 1024;
-pub const CHECK_BUDGET: Duration = Duration::from_secs(10);
+/// Hang detector for a required native preparation and its credential-access checks.
+pub const CHECK_BUDGET: Duration = Duration::from_secs(60);
 
 pub mod policy;
 mod schedule;

@@ -4541,6 +4541,23 @@ impl CompiledUi {
             .map(|audit| text_fit_line(&audit))
     }
 
+    /// Each painted node's `paint-text` record where `cut` holds of its text-fit audit (its kind,
+    /// whether its words overflow, whether its clip truncates them), in paint order.
+    #[cfg(test)]
+    pub(crate) fn text_fit_cuts(
+        &self,
+        cut: impl Fn(&str, bool, bool) -> bool,
+    ) -> Vec<(&UiKey, String)> {
+        self.paint
+            .iter()
+            .filter_map(|paint| {
+                let audit = text_fit_audit(paint)?;
+                cut(audit.kind, audit.overflow, audit.clip_truncated)
+                    .then(|| (&paint.key, text_fit_line(&audit)))
+            })
+            .collect()
+    }
+
     fn paint_node_audit(&self, paint: &PaintNode) -> String {
         let semantic = self.semantic(&paint.key);
         let role = semantic.map_or_else(|| "-".to_string(), |node| format!("{:?}", node.role));

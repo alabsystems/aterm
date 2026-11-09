@@ -37,17 +37,19 @@ fn painted_list(
     top: usize,
 ) -> Option<LogicalRect> {
     let height = plan.screen(top.min(plan.limit())).height;
+    // A list is a node some painted `{key}/thumb` scrolls.
+    let thumbed: BTreeSet<&str> = compiled
+        .paint
+        .iter()
+        .filter_map(|thumb| thumb.key.as_str().strip_suffix("/thumb"))
+        .collect();
     let lists: Vec<_> = compiled
         .paint
         .iter()
         .filter(|node| {
             let key = node.key.as_str();
             // Never the sidebar, whose thumb is `settings/navigation/thumb`.
-            !key.starts_with("settings/navigation")
-                && compiled
-                    .paint
-                    .iter()
-                    .any(|thumb| thumb.key.as_str() == format!("{key}/thumb"))
+            !key.starts_with("settings/navigation") && thumbed.contains(key)
         })
         .map(|node| node.rect)
         .collect();
@@ -131,6 +133,16 @@ fn screen_now(
     view: crate::native_app::ViewId,
     cx: &ViewCx<'_>,
 ) -> Option<(Turned, scroll::ScrollPlan)> {
+    screen_drawn(runtime, instance, view, cx).map(|(turned, plan, _)| (turned, plan))
+}
+
+/// [`screen_now`], with the frame it was read from.
+fn screen_drawn(
+    runtime: &NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+) -> Option<(Turned, scroll::ScrollPlan, crate::native_ui::CompiledUi)> {
     let compiled = compile_settings_view(runtime, instance, view, cx);
     let state = messages_view_state(runtime, view);
     let plan = state.scroll_plan()?;
@@ -141,7 +153,7 @@ fn screen_now(
         .map_or(0, |record| record.top());
     let whole = shown_whole(&compiled, &plan, top);
     let offset = plan.screen(top).offset;
-    Some((Turned { top, offset, whole }, plan))
+    Some((Turned { top, offset, whole }, plan, compiled))
 }
 
 #[test]
@@ -2430,49 +2442,45 @@ fn no_page_down_only_moves_the_list() {
         |&(source, route, width, height)| {
             let cx = view_cx_at(width, height);
             let (mut runtime, instance, view) = paging_view(source, route);
-            let Some((mut before, plan)) = screen_now(&runtime, instance, view, &cx) else {
+            let Some((mut before, plan, drawn)) = screen_drawn(&runtime, instance, view, &cx)
+            else {
                 return;
             };
             if plan.limit() == 0 {
                 return;
             }
-            let end_drawn = |runtime: &NativeRuntime| {
-                let compiled = compile_settings_view(runtime, instance, view, &cx);
+            // Each reading of a screen is of the frame Page Down drew.
+            let end_drawn = |runtime: &NativeRuntime, compiled: &crate::native_ui::CompiledUi| {
                 let state = messages_view_state(runtime, view);
                 let plan = state.scroll_plan()?;
                 let top = state.page_scroll.min(plan.limit());
-                let list = painted_list(&compiled, &plan, top)?;
+                let list = painted_list(compiled, &plan, top)?;
                 let band = plan.drawn_bands(top).pop()?;
                 (band.stop + 1 == plan.len() && band.end <= list.height + 0.5).then_some(())
             };
-            let caption_drawn = |runtime: &NativeRuntime| {
-                compile_settings_view(runtime, instance, view, &cx)
-                    .paint
-                    .iter()
-                    .any(|node| {
-                        node.key.as_str().ends_with("/heading")
-                            && !node.peek
-                            && node.fade.is_none()
-                            && (node.clip.height - node.rect.height).abs() < 0.5
-                    })
+            let caption_drawn = |compiled: &crate::native_ui::CompiledUi| {
+                compiled.paint.iter().any(|node| {
+                    node.key.as_str().ends_with("/heading")
+                        && !node.peek
+                        && node.fade.is_none()
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                })
             };
-            let mut end_before = end_drawn(&runtime);
+            let mut end_before = end_drawn(&runtime, &drawn);
             for _ in 0..4 * (plan.limit() + 2) {
                 runtime
                     .dispatch(instance, view, AppEvent::ScrollPage(1))
                     .unwrap();
-                let (now, _) = screen_now(&runtime, instance, view, &cx).expect("a list");
+                let (now, _, drawn) = screen_drawn(&runtime, instance, view, &cx).expect("a list");
                 if now.place() == before.place() {
                     break;
                 }
                 turned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let end_now = end_drawn(&runtime);
+                let end_now = end_drawn(&runtime, &drawn);
                 let new = now.whole.difference(&before.whole).count() > 0;
                 if !new
                     && !(end_now.is_some() && end_before.is_none())
-                    && !(now.whole.is_empty()
-                        && !before.whole.is_empty()
-                        && caption_drawn(&runtime))
+                    && !(now.whole.is_empty() && !before.whole.is_empty() && caption_drawn(&drawn))
                 {
                     let fault = format!(
                         "{route:?} {width}x{height}{}: Page Down from {} to {} shows {:?} \

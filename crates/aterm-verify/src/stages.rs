@@ -124,7 +124,7 @@ pub const UNIT_GRAPH: [&str; 3] = ["--unit-graph", "-Z", "unstable-options"];
 /// # Errors
 /// As above.
 pub fn unit_graph(ctx: &Ctx, piece: &crate::shape::Piece) -> Result<String, String> {
-    crate::release_test_env::prepare(ctx)
+    crate::test_env::prepare(ctx)
         .map_err(|why| format!("cannot prepare release test environment: {why}"))?;
     let mut args = piece_compile_args(piece);
     args.extend(UNIT_GRAPH.map(String::from));
@@ -712,7 +712,7 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
 }
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
-    if let Err(why) = crate::release_test_env::prepare(ctx) {
+    if let Err(why) = crate::test_env::prepare(ctx) {
         r.cannot_run(format!(
             "cannot prepare release test environment: {why}; no test was run"
         ));
@@ -1101,7 +1101,7 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
     {
         keep_refusals(ctx, part);
     }
-    if let Err(why) = crate::release_test_env::prepare(ctx) {
+    if let Err(why) = crate::test_env::prepare(ctx) {
         r.cannot_run(format!(
             "cannot prepare release test environment: {why}; no test was compiled"
         ));
@@ -1313,7 +1313,7 @@ fn test_compile_cmd(ctx: &Ctx, bind: bool, args: Vec<String>) -> Cmd {
     } else {
         cmd
     };
-    crate::release_test_env::command(ctx, cmd.demoted())
+    crate::test_env::command(ctx, cmd.demoted())
 }
 
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
@@ -1324,7 +1324,7 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     }
     [
         test_compile_cmd(ctx, bind, compile),
-        crate::release_test_env::command(
+        crate::test_env::command(
             ctx,
             with_checkers(
                 main_targo(ctx, test_run_args(&ctx.scope)),
@@ -1859,7 +1859,7 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
 }
 
 fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Result<Cmd, String> {
-    let cmd = crate::release_test_env::command(
+    let cmd = crate::test_env::command(
         ctx,
         with_checkers(
             main_targo(ctx, doctest_args(&ctx.scope)),
@@ -3993,16 +3993,16 @@ mod tests {
             assert_eq!(env_of(&compile, CHECKERS_ENV), None);
             let want = Some(if context.checkers_in_tests { "1" } else { "0" }.into());
             assert_eq!(env_of(&run, CHECKERS_ENV), want);
-            let marker = context.checkers_in_tests.then(|| "1".into());
+            let marker = Some("1".into());
             assert_eq!(env_of(&compile, aterm_capacity::RELEASE_RUN_ENV), marker);
             assert_eq!(
                 env_of(&shaped_compile, aterm_capacity::RELEASE_RUN_ENV),
                 marker
             );
             assert_eq!(env_of(&run, aterm_capacity::RELEASE_RUN_ENV), marker);
-            assert_eq!(compile.exact_env, context.checkers_in_tests);
-            assert_eq!(shaped_compile.exact_env, context.checkers_in_tests);
-            assert_eq!(run.exact_env, context.checkers_in_tests);
+            assert!(compile.exact_env);
+            assert!(shaped_compile.exact_env);
+            assert!(run.exact_env);
             assert_eq!(
                 env_of(
                     &doctest_cmd(context, &DocDriver::Stage2, &[]).expect("the stage2 doc driver"),
@@ -4051,8 +4051,7 @@ mod tests {
             Scope::workspace(),
             EnvSnapshot::default(),
             scratch,
-        )
-        .with_checkers_in_tests(true);
+        );
         c.tools.targo = targo;
         assert!(!record.exists());
 

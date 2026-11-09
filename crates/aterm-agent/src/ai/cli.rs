@@ -2215,7 +2215,14 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let env = Env::from_process();
     let mut out = io::stdout().lock();
     let mut err = io::stderr();
-    run(&env, &LiveRunner, &LiveFetcher, &args, &mut out, &mut err)
+    run(
+        &env,
+        &LiveRunner,
+        &LiveFetcher::default(),
+        &args,
+        &mut out,
+        &mut err,
+    )
 }
 
 #[cfg(test)]
