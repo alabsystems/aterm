@@ -1290,6 +1290,8 @@ pub trait PendingSign: Send {
 
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
+    /// Best-effort preparation for the next cut, after this run's windowed checks ended.
+    fn start_prefreeze(&mut self) {}
     fn prepare_sign(
         &mut self,
         args: &[String],
@@ -1778,6 +1780,10 @@ impl Run<'_> {
         }
         if self.opts.prepare {
             self.prepare_stop()?;
+        }
+
+        if !self.dry {
+            self.b.start_prefreeze();
         }
 
         self.begin(Step::Publish)?;

@@ -3710,17 +3710,26 @@ pub enum HereOutput {
     Plain,
 }
 
+/// The baseline's authority: an explicit file or one of setup's compiled root plans.
+#[derive(Clone, Copy, Debug)]
+pub enum HereBaseline<'a> {
+    /// A person's explicitly named baseline.
+    File(&'a Path),
+    /// Setup's compiled plan; no account-writable file is read.
+    BuiltIn(crate::init_clt::RootPlan),
+}
+
 /// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac; with
-/// [`HereOutput::Plain`], the Command Line Tools' own baseline (`baseline_path` unread).
+/// [`HereOutput::Plain`], setup's compiled root plan; a file source is refused.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn here(
     sys: &dyn System,
     mode: Mode,
-    baseline_path: Option<&Path>,
+    source: HereBaseline<'_>,
     name: Option<&str>,
     output: HereOutput,
 ) -> ExitCode {
-    match here_report(sys, mode, baseline_path, name, output) {
+    match here_report(sys, mode, source, name, output) {
         Ok(Some((host, report))) => {
             print_report(
                 &Env {
@@ -3756,7 +3765,7 @@ pub fn here(
 fn here_report(
     sys: &dyn System,
     mode: Mode,
-    baseline_path: Option<&Path>,
+    source: HereBaseline<'_>,
     name: Option<&str>,
     output: HereOutput,
 ) -> Result<Option<(Host, HostReport)>, ExitCode> {
@@ -3780,9 +3789,11 @@ fn here_report(
     }
     // The root half trusts nothing the person's account can write: a plain run applies the
     // tools' own baseline, built in.
-    let text = match (plain, baseline_path) {
-        (true, _) => crate::init_clt::CommandLineTools::baseline_named(name),
-        (false, Some(path)) => match sys.read_file(path) {
+    let text = match (plain, source) {
+        (true, HereBaseline::BuiltIn(plan)) => {
+            crate::init_clt::CommandLineTools::baseline_named(plan, name)
+        }
+        (false, HereBaseline::File(path)) => match sys.read_file(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => refuse!(
                 ExitCode::FAILURE,
@@ -3790,7 +3801,7 @@ fn here_report(
                 path.display()
             ),
         },
-        (false, None) => refuse!(
+        _ => refuse!(
             ExitCode::from(2),
             "aterm machines here: takes plan|apply <baseline.toml>"
         ),
@@ -3858,10 +3869,15 @@ fn here_report(
         Ok(journal) => journal,
         Err(why) => refuse!(ExitCode::FAILURE, "aterm machines here: {why}"),
     };
-    let remedy = aterm_converge::Remedy::Command(baseline_path.map_or_else(
-        || "sudo aterm machines here apply --plain".to_owned(),
-        |path| format!("sudo aterm machines here apply {}", path.display()),
-    ));
+    let remedy = aterm_converge::Remedy::Command(match source {
+        HereBaseline::BuiltIn(crate::init_clt::RootPlan::WithTools) => {
+            "sudo aterm machines here apply --plain".into()
+        }
+        HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly) => {
+            "sudo aterm machines here apply --plain --root-steps-only".into()
+        }
+        HereBaseline::File(path) => format!("sudo aterm machines here apply {}", path.display()),
+    });
     let started = sys.now();
     let rows = match crate::engine::run_with(
         &items,
@@ -6555,7 +6571,15 @@ mod tests {
             )
         };
         let catalog = "/usr/sbin/softwareupdate -l";
-        let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, None, HereOutput::Plain);
+        let plain = |sys: &Fake| {
+            here_report(
+                sys,
+                Mode::Apply,
+                HereBaseline::BuiltIn(crate::init_clt::RootPlan::WithTools),
+                None,
+                HereOutput::Plain,
+            )
+        };
         let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
 
         let with_tools = |sys: &Fake| {
@@ -6584,6 +6608,32 @@ mod tests {
         let done = mac();
         with_tools(&done);
         assert!(matches!(plain(&done), Ok(None)));
+
+        // Independent work must not install or select CLT, even with no tools present.
+        let independent = mac();
+        assert!(matches!(
+            here_report(
+                &independent,
+                Mode::Apply,
+                HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly),
+                None,
+                HereOutput::Plain
+            ),
+            Ok(None)
+        ));
+        assert!(
+            independent
+                .written(crate::items::developer::PLACEHOLDER)
+                .is_none()
+        );
+        assert!(
+            !independent
+                .calls()
+                .iter()
+                .any(|call| call.contains("softwareupdate") || call.contains("xcode-select")),
+            "{:?}",
+            independent.calls()
+        );
 
         // Apple's catalog out of reach waits in the same process until an explicit Stop.
         let unreached = mac();
@@ -6631,7 +6681,7 @@ mod tests {
             here_report(
                 &user,
                 Mode::Apply,
-                Some(Path::new(baseline)),
+                HereBaseline::File(Path::new(baseline)),
                 None,
                 HereOutput::Report
             )
@@ -7164,7 +7214,15 @@ mod tests {
                 .filter(|call| call.contains("scutil --set"))
                 .collect()
         };
-        let plain = |sys: &Fake, name| here_report(sys, Mode::Apply, None, name, HereOutput::Plain);
+        let plain = |sys: &Fake, name| {
+            here_report(
+                sys,
+                Mode::Apply,
+                HereBaseline::BuiltIn(crate::init_clt::RootPlan::WithTools),
+                name,
+                HereOutput::Plain,
+            )
+        };
         let journal =
             |sys: &Fake| String::from_utf8(sys.written(Fake::JOURNAL).unwrap_or_default()).unwrap();
 
@@ -7309,7 +7367,7 @@ mod tests {
             here(
                 &sys,
                 Mode::Apply,
-                Some(Path::new(baseline)),
+                HereBaseline::File(Path::new(baseline)),
                 None,
                 HereOutput::Json
             ),
@@ -7342,7 +7400,7 @@ mod tests {
             here(
                 &sys,
                 Mode::Apply,
-                Some(Path::new(baseline)),
+                HereBaseline::File(Path::new(baseline)),
                 None,
                 HereOutput::Json
             ),

@@ -116,7 +116,7 @@ impl Recovery {
             waiting,
             decisions: Mutex::new(Vec::new()),
         });
-        let service = AutomaticJoins::with_backend(member.clone()).unwrap();
+        let service = AutomaticJoins::with_backend(member.clone(), Arc::new(|| {})).unwrap();
         ready.recv_timeout(HANG).unwrap();
         Self {
             _root: root,

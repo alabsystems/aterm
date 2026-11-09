@@ -71,6 +71,8 @@ pub(crate) fn spawn_alone_with(env: &[(&str, &OsStr)]) -> Running {
 }
 
 /// A helper test of this binary, about to run as a process of its own: the test binary with `--exact <helper> --test-threads=1`, its output in files, and whatever the caller adds ([`Self::command`]).
+///
+/// It starts with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their default actions, set between its fork and exec, not this test binary's: a `&` or `nohup` runner starts the binary with some ignored, which every exec keeps, and a stand-in that is sent one, sends itself one, or arms only the ones it was not started ignoring would never end by it. One that should ignore one sets it itself.
 pub(crate) struct StandIn {
     test: String,
     how: &'static str,
@@ -110,6 +112,20 @@ impl StandIn {
             .stdin(Stdio::null())
             .stdout(output.file("stdout"))
             .stderr(output.file("stderr"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // SAFETY: the hook runs in the forked child before its exec and makes only
+            // async-signal-safe `signal` calls, each setting a default action (no handler).
+            unsafe {
+                command.pre_exec(|| {
+                    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
+                    Ok(())
+                });
+            }
+        }
         Self {
             test: test.to_string(),
             how,

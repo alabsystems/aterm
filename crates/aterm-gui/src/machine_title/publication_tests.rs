@@ -154,8 +154,9 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
     ));
     let backup = scratch.config.with_file_name("aterm.toml.bak");
     assert_eq!(std::fs::read(&backup).unwrap(), prior_config);
-    // Keep both original inodes alive, so a replacement cannot pass through inode reuse.
-    let held_files = [&scratch.config, &backup].map(|path| {
+    let fleet_name = scratch.state.join(aterm_net::fleet_member::NAME_FILE);
+    // Keep each original inode alive, so a replacement cannot pass through inode reuse.
+    let held_files = [&scratch.config, &backup, &fleet_name].map(|path| {
         (
             path,
             std::fs::File::open(path).unwrap(),
@@ -233,6 +234,14 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         )
         .unwrap(),
         publish::Publication::Current,
+    );
+
+    // Matching bytes do not replace the writer's exact private-file permission contract.
+    std::fs::set_permissions(&fleet_name, std::fs::Permissions::from_mode(0o400)).unwrap();
+    naming::synchronize(&scratch.state, &scratch.config, requested.num, &names).unwrap();
+    assert_eq!(
+        std::fs::metadata(&fleet_name).unwrap().mode() & 0o7777,
+        0o600
     );
 
     let newer = change_number(

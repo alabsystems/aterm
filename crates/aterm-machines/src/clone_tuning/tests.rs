@@ -1569,7 +1569,7 @@ fn a_git_that_neither_takes_the_option_nor_obeys_the_variable_tunes_nothing() {
     assert_eq!(sys.calls(), [asked.display()], "asked nothing more");
 
     let (sys, who) = fake(false);
-    sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, true));
+    sys.simulate(|sys, command| crate::init_github::git_before_no_lazy_fetch(sys, command, true));
     let Scope::Clones { git, .. } = guarded(&sys, &who, tops()).unwrap() else {
         panic!("a git seen to obey the variable reads the clones");
     };
@@ -1577,7 +1577,9 @@ fn a_git_that_neither_takes_the_option_nor_obeys_the_variable_tunes_nothing() {
 
     for (linux, machine) in [(false, "Mac"), (true, "machine")] {
         let (sys, who) = fake(linux);
-        sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, false));
+        sys.simulate(|sys, command| {
+            crate::init_github::git_before_no_lazy_fetch(sys, command, false)
+        });
         let Scope::Out(why) = guarded(&sys, &who, tops()).unwrap() else {
             panic!("a git that fetched the question's object lazily reads no clone");
         };

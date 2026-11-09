@@ -143,7 +143,6 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
         title: "Downloading aterm v0.95.0",
         detail0: Some("from github.com over the office network, resumed where it stopped"),
         step: false,
-        step_short: None,
         meter: Some((Some(500), "74 MB")),
         busy: false,
         animated: true,
@@ -448,120 +447,28 @@ fn an_asks_step_stands_whole_where_the_title_can_pay_for_it() {
 #[test]
 fn an_asks_step_too_long_for_any_title_is_cut_not_dropped() {
     let title = "Claude usage limit reached in tab 1";
-    let step = "Run aterm harness accounts renew pool-with-a-rather-long-label";
-    let narrow = revealed(step_first(title, step), 70);
-    let cut = excerpt_of(&narrow).expect("the step stands");
-    assert!(cut.ends_with('\u{2026}'), "{cut}");
-    assert!(step.starts_with(cut.trim_end_matches('\u{2026}')), "{cut}");
-    assert!(at_floor(&narrow.title.1, title), "{narrow:?}");
-    narrowing_holds(&|cols| excerpt_of(&revealed(step_first(title, step), cols)));
-    let whole = (70..=200)
-        .find(|&cols| excerpt_of(&revealed(step_first(title, step), cols)).as_deref() == Some(step))
-        .expect("a width shows it whole");
-    assert!(whole > 70);
-    assert_eq!(
-        excerpt_of(&revealed(step_first(title, step), whole + 1)).as_deref(),
-        Some(step)
-    );
-}
-
-const SHORT: &str = "Run the command under Details.";
-
-fn step_or_short(title: &str, step: &str, short: Option<&str>) -> Message {
-    let then = Then::step(step);
-    let then = match short {
-        Some(words) => then.or_short(words),
-        None => then,
-    };
-    Message::new(tags::HARNESS, Severity::Warn, title)
-        .line(step)
-        .line(LOST)
-        .action(Intent::ShowTab { tab: 1, window: 1 })
-        .now(Ask::standing(StandingWhy::OnlyYou(Reason::new(LOST)), then))
-        .key("harness.resume-ask.s-1.lr")
-}
-
-#[test]
-fn a_step_with_a_short_form_is_whole_or_replaced_never_cut() {
-    let title = "Claude usage limit reached in tab 1";
-    let long = "Run aterm harness accounts renew pool-with-a-rather-long-label";
-    let short = SHORT;
-    let ask = |step: &str, short: Option<&str>| step_or_short(title, step, short);
-    for step in [long, "Run aterm harness accounts."] {
-        let (mut whole, mut replaced) = (0, 0);
-        for cols in 20..=200 {
-            match excerpt_of(&revealed(ask(step, Some(short)), cols)) {
-                Some(shown) if shown == step => whole += 1,
-                Some(shown) if shown == short => replaced += 1,
-                Some(shown) => {
-                    let said = shown.trim_end_matches('\u{2026}');
-                    assert!(
-                        short.starts_with(said) && !said.contains("aterm"),
-                        "{step} at {cols}: a cut of the step: {shown:?}"
-                    );
-                }
-                None => {}
-            }
-        }
-        assert!(whole > 0, "{step}: {whole} whole, {replaced} replaced");
-        assert!(
-            step != long || replaced > 0,
-            "{step}: {whole} whole, {replaced} replaced"
+    for step in [
+        "Run aterm harness accounts renew pool-with-a-rather-long-label",
+        "Run aterm harness accounts renew client-acme-research-024",
+    ] {
+        let narrow = revealed(step_first(title, step), 70);
+        let cut = excerpt_of(&narrow).expect("the step stands");
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
+        assert!(step.starts_with(cut.trim_end_matches('\u{2026}')), "{cut}");
+        assert!(cut.contains("aterm harness"), "{cut}");
+        assert!(at_floor(&narrow.title.1, title), "{narrow:?}");
+        narrowing_holds(&|cols| excerpt_of(&revealed(step_first(title, step), cols)));
+        let whole = (70..=200)
+            .find(|&cols| {
+                excerpt_of(&revealed(step_first(title, step), cols)).as_deref() == Some(step)
+            })
+            .expect("a width shows it whole");
+        assert!(whole > 70);
+        assert_eq!(
+            excerpt_of(&revealed(step_first(title, step), whole + 1)).as_deref(),
+            Some(step)
         );
     }
-    assert_eq!(
-        excerpt_of(&revealed(ask(long, Some(short)), 70)).as_deref(),
-        Some(short)
-    );
-    let cut = excerpt_of(&revealed(ask(long, None), 70)).expect("the step stands");
-    assert!(
-        cut.ends_with('\u{2026}') && cut.contains("aterm harness"),
-        "{cut}"
-    );
-}
-
-#[test]
-fn a_steps_short_form_gives_back_the_cells_the_step_took() {
-    let title = "Claude usage limit reached in tab 1";
-    let step = "Run aterm harness accounts renew client-acme-research-024";
-    let blank = |row: &RowLayout| {
-        let (at, words) = row.detail.as_ref().expect("an excerpt");
-        let end = at + char_width(words);
-        let first = row.capsules.first().expect("Show tab 1").col;
-        first.saturating_sub(end + crate::BEFORE_CAPSULES)
-    };
-    let mut replaced = 0;
-    for cols in [70, 80] {
-        let row = revealed(step_or_short(title, step, Some(SHORT)), cols);
-        let shown = excerpt_of(&row);
-        if shown.as_deref() == Some(step) {
-            assert!(at_floor(&row.title.1, title), "{cols}: {row:?}");
-        } else {
-            assert_eq!(shown.as_deref(), Some(SHORT), "{cols}: {row:?}");
-            replaced += 1;
-            let details = row.capsules.iter().any(|c| c.text == "Details \u{203a}");
-            assert!(
-                details || char_width(&row.title.1) > crate::TITLE_MIN,
-                "{cols}: the title at its floor and no Details: {row:?}"
-            );
-        }
-        if row.title.1 != title {
-            let next = next_cut_cells(&row.title.1, title).expect("a cut of the title");
-            assert!(
-                char_width(&row.title.1) + blank(&row) < next,
-                "{cols}: a cut title beside blank cells its next word fits: {row:?}"
-            );
-        }
-    }
-    assert!(replaced > 0, "the short form stood at neither width");
-    let wide = revealed(step_or_short(title, step, Some(SHORT)), 120);
-    assert_eq!(excerpt_of(&wide).as_deref(), Some(step), "{wide:?}");
-    let cut = revealed(step_or_short(title, step, None), 70);
-    assert!(at_floor(&cut.title.1, title), "{cut:?}");
-    assert!(
-        excerpt_of(&cut).is_some_and(|d| d.ends_with('\u{2026}')),
-        "{cut:?}"
-    );
 }
 
 #[test]
@@ -683,26 +590,20 @@ fn a_title_reads_whole_or_cut_after_a_word_and_comes_back_only_where_the_step_gi
     ] {
         for label in ["main", "client-acme-research-024"] {
             let commands = [
-                (
-                    format!("Type /login in the tab and sign in as {label}."),
-                    None,
-                ),
-                (
-                    format!("Run aterm harness accounts renew {label}"),
-                    Some(SHORT),
-                ),
+                format!("Type /login in the tab and sign in as {label}."),
+                format!("Run aterm harness accounts renew {label}"),
             ];
-            for (step, step_short) in &commands {
-                let row = |cols| revealed(step_or_short(title, step, *step_short), cols);
+            for step in &commands {
+                let row = |cols| revealed(step_first(title, step), cols);
                 let (mut wholes, mut cuts, mut drops) = (0, 0, 0);
-                let mut prev = None::<(u8, bool, bool, String)>;
+                let mut prev = None::<(u8, bool, String)>;
                 for cols in (22..=200).rev() {
                     let r = row(cols);
                     let at = format!("{title:?} {label} {cols}");
                     let tier = title_tier(&r, title)
                         .unwrap_or_else(|| panic!("{at}: a stub of the title: {r:?}"));
                     let shown = excerpt_of(&r);
-                    if shown.as_ref().is_some_and(|d| d != step && d != SHORT) {
+                    if shown.as_ref().is_some_and(|d| d != step) {
                         assert!(
                             at_floor(&r.title.1, title),
                             "{at}: the step cut beside a title above its floor: {r:?}"
@@ -710,24 +611,22 @@ fn a_title_reads_whole_or_cut_after_a_word_and_comes_back_only_where_the_step_gi
                     }
                     wholes += usize::from(tier == 1);
                     cuts += usize::from(tier == 0);
-                    let replaced = shown.as_deref() == Some(SHORT);
                     let stands = r.detail.is_some();
                     // The title beside the step a column wider, where the step drops here.
                     let dropped = prev
                         .as_ref()
-                        .filter(|(_, _, stood, _)| *stood && !stands)
+                        .filter(|(_, stood, _)| *stood && !stands)
                         .map(|(.., words)| words.as_str());
                     assert!(
-                        prev.as_ref().is_none_or(|(p, was, ..)| {
-                            tier <= *p || (replaced && !was) || dropped.is_some()
-                        }),
+                        prev.as_ref()
+                            .is_none_or(|(p, ..)| tier <= *p || dropped.is_some()),
                         "{at}: the title came back whole as the row narrowed: {r:?}"
                     );
                     if let Some(stood) = dropped {
                         drops += 1;
                         ways[where_the_steps_cells_went(&r, title, stood, &at)] += 1;
                     }
-                    prev = Some((tier, replaced, stands, r.title.1.clone()));
+                    prev = Some((tier, stands, r.title.1.clone()));
                 }
                 assert!(
                     wholes > 0 && cuts > 0,

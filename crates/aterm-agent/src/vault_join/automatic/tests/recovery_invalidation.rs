@@ -111,7 +111,7 @@ fn a_transient_home_read_cannot_promote_an_offhome_proof() {
         inner: Arc::clone(&f.fake),
         before: Mutex::new(None),
     });
-    f.service = Some(AutomaticJoins::with_backend(backend.clone()).unwrap());
+    f.service = Some(AutomaticJoins::with_backend(backend.clone(), Arc::new(|| {})).unwrap());
     f.waits.recv_timeout(HANG).unwrap();
     let now = f.fake.now();
     *f.fake.frozen.lock_or_recover() = Some(now);

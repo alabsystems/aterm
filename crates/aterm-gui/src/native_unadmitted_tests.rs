@@ -46,6 +46,26 @@ pub(super) struct Host {
 }
 
 impl Host {
+    /// Data-only shape for the absence theorem, never a fabricated settled predecessor.
+    fn ask(&mut self, relaunch: bool) {
+        self.request.asked = Some(if relaunch {
+            AskedIntent::Relaunch(aterm_agent::harness::native_act::AskedRelaunchIntent {
+                predecessor: "de".repeat(16),
+                ask: "memory:unadmitted-control".into(),
+            })
+        } else {
+            AskedIntent::Upgrade(aterm_agent::harness::native_act::AskedUpgradeIntent {
+                predecessor: "de".repeat(16),
+            })
+        });
+        self.request.duty = if relaunch {
+            Scope::Relaunch
+        } else {
+            Scope::Upgrade
+        };
+        assert!(self.request.asked_restart_shape());
+    }
+
     /// A built-in restart prepare whose deadline is still too far for admission.
     fn new(local: u64, configure: impl FnOnce(&mut Facts)) -> Self {
         let (handle, mut facts, mut request, actor) = closed_restart::fixture(local);
@@ -106,6 +126,16 @@ impl Host {
             (
                 "own",
                 i64::from(matches!(self.request.plan, NativePlan::OwnImage { .. })),
+            ),
+            (
+                "asked",
+                if self.request.asked.is_none() {
+                    0
+                } else if self.request.asked_restart_shape() {
+                    1
+                } else {
+                    2
+                },
             ),
             ("answered", i64::from(self.answered)),
             ("admitted", i64::from(self.admitted)),
@@ -173,6 +203,62 @@ impl Host {
             .unwrap()
             .reclaim(now);
         drop(retired);
+    }
+}
+
+#[test]
+fn expired_supported_asked_shapes_share_only_the_never_admitted_answer() {
+    let model = aterm_models_harness::native_unadmitted_prepare_model();
+    for relaunch in [false, true] {
+        let mut host = Host::new(8120 + u64::from(relaunch), |_| {});
+        host.ask(relaunch);
+        let mut state = model.init_state();
+        fire(&model, &mut state, &["Ask"]);
+        assert_eq!(host.probe(&model), state);
+        host.approach();
+        host.expire();
+        fire(&model, &mut state, &["Approach", "Expire"]);
+        assert_eq!(host.send(&model), host.unadmitted());
+        fire(&model, &mut state, &["Answer"]);
+        assert_eq!(host.probe(&model), state);
+        for law in &model.invariants {
+            assert!(model.check_invariant(law.name, &state), "{}", law.name);
+        }
+        assert_eq!(host.facts.watch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(host.facts.signals.load(Ordering::SeqCst), 0);
+        assert!(host.facts.prepared_history.lock().unwrap().is_empty());
+        let mut malformed = Host::new(8122 + u64::from(relaunch), |_| {});
+        malformed.ask(relaunch);
+        malformed.request.duty = if relaunch {
+            Scope::Upgrade
+        } else {
+            Scope::Relaunch
+        };
+        malformed.approach();
+        malformed.expire();
+        let mut unsupported = model.init_state();
+        fire(
+            &model,
+            &mut unsupported,
+            &["UnsupportedAsk", "Approach", "Expire"],
+        );
+        assert_eq!(malformed.probe(&model), unsupported);
+        assert!(!model.action_enabled("Answer", &unsupported));
+        assert_eq!(
+            unadmitted_after_deadline(
+                &malformed.handle.ctx,
+                &malformed.request,
+                &malformed.actor,
+                None,
+                None,
+                &malformed.facts,
+            ),
+            DEADLINE
+        );
+        // Negative control: merely deleting the asked guard would answer the unsupported shape.
+        let reply = malformed.unadmitted();
+        malformed.note(&unsupported, &reply);
+        assert!(!model.check_invariant("SupportedShape", &malformed.probe(&model)));
     }
 }
 

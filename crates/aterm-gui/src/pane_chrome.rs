@@ -984,6 +984,7 @@ impl App {
             .filter(|_| {
                 self.band_banner_at(wid, x, y).is_none()
                     && self.find_bar_cell_at(wid, x, y).is_none()
+                    && !self.stats_lens_at(wid, x, y)
             })
     }
 

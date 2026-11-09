@@ -749,8 +749,17 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
         let reader = std::thread::spawn(move || {
             let _ = std::io::copy(&mut terminal_output, &mut std::io::sink());
         });
-        // The "signal" mode's actor and its cat keep the SIGINT they inherit: ^C must end them.
-        let mut actor = OwnedChild(crate::platform::spawn_outside_a_stand_aside(|| {
+        // The actor and the jobs it runs keep the signals they inherit, and the ones they are
+        // sent must reach them: the "signal" mode's cat dies of ^C, a live mode's root of its
+        // cancellation's SIGTERM. So the actor starts with the signals that end a process at
+        // their defaults, set here, not the runner's (a `&` job's SIGINT, a `nohup`'s SIGHUP).
+        let start = crate::platform::Starting::at_defaults(&[
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+        ]);
+        let mut actor = OwnedChild(start.spawning(|| {
             spawnfd::command(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -767,6 +776,7 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
                 .spawn()
                 .unwrap()
         }));
+        drop(start);
         let mut last = String::new();
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,

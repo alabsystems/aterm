@@ -922,9 +922,9 @@ mod tests {
             .any(|path| command.program == std::path::Path::new(path))
         };
         let old_native = move |obeys: bool| {
-            move |_: &Fake, command: &aterm_machines::port::Cmd| {
+            move |sys: &Fake, command: &aterm_machines::port::Cmd| {
                 if native(command) {
-                    aterm_machines::init_github::git_before_no_lazy_fetch(command, obeys)
+                    aterm_machines::init_github::git_before_no_lazy_fetch(sys, command, obeys)
                 } else {
                     command
                         .args
@@ -998,7 +998,7 @@ mod tests {
             "a probe that could not run is not an install instruction"
         );
         let selected_home = home.clone();
-        sys.simulate(move |_, command| {
+        sys.simulate(move |sys, command| {
             if command.program.starts_with(&selected_home) {
                 command
                     .args
@@ -1006,7 +1006,7 @@ mod tests {
                     .any(|arg| arg == "--no-lazy-fetch")
                     .then(|| Ran::ok("capable Git"))
             } else {
-                aterm_machines::init_github::git_before_no_lazy_fetch(command, false)
+                aterm_machines::init_github::git_before_no_lazy_fetch(sys, command, false)
             }
         });
         online.store(true, Ordering::SeqCst);

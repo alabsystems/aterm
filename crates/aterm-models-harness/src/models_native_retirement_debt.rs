@@ -6,6 +6,7 @@ use aterm_spec::derive::Model;
 /// The client's durable hold preserves debt; it is never authority for a successor.
 /// A record whose admission reply was lost keeps only its wire (`bound` 0); the host's
 /// positive unadmitted answer clears that wire alone, never a binding or a hold.
+/// A typed asked recipe has the same debt boundary; its passive history is not a new grant.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_retirement_debt_model() -> Model {
@@ -13,7 +14,8 @@ pub fn native_retirement_debt_model() -> Model {
         NativeRetirementDebt {
             const Buggy = 0;
             var held = 0; var observed = 0; var kept = 1;
-            var owed = 1; var dispatched = 0; var finished = 0; var bound = 1;
+            var owed = 1; var dispatched = 0; var finished = 0; var bound = 1; var asked = 0;
+            action Ask when (asked == 0 && kept == 1 && observed == 0 && finished == 0) { asked = 1; }
             action NotGranted when (observed == 0 && finished == 0 && kept == 1) {
                 held = 1; observed = 1; kept = if Buggy == 1 {0} else {1};
             }
@@ -45,7 +47,7 @@ pub fn native_retirement_debt_model() -> Model {
             bound Finite: 0 <= held && held <= 1 && 0 <= observed && observed <= 1
                 && 0 <= kept && kept <= 1 && 0 <= owed && owed <= 1
                 && 0 <= dispatched && dispatched <= 1 && 0 <= finished && finished <= 1
-                && 0 <= bound && bound <= 1;
+                && 0 <= bound && bound <= 1 && 0 <= asked && asked <= 1;
         }
     }
 }

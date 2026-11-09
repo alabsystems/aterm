@@ -517,15 +517,12 @@ const LOCK_POLL: Duration = Duration::from_millis(20);
 /// Hang detector for a sign-in's write waiting for the login's refresh ([`AuthLock`]).
 const SIGN_IN_LOCK_HANG: Duration = Duration::from_secs(60);
 
-/// The longest a sign-in's code exchange request may take: a request in flight while the host
-/// sleeps measures it on the clock that stops in sleep, so it holds a sign-in that sleep ended
-/// this long at most.
-#[cfg(not(test))]
-const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
-/// The longest a sign-in's code exchange request may take: the unit tests' token servers answer
-/// on loopback, so an answer a loaded machine holds is waited for by the hang detector.
-#[cfg(test)]
-const EXCHANGE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for one required token response, bounded by the original authorization.
+const EXCHANGE_WAIT: Duration = Duration::from_secs(60);
+
+fn exchange_wait(parent: Duration, started: Instant) -> Duration {
+    parent.min(EXCHANGE_WAIT.saturating_sub(started.elapsed()))
+}
 
 /// The least time a refresh must have left when it would send its request
 /// ([`refresh_admitted`]). The provider spends the refresh token once the request reaches it,
@@ -535,56 +532,9 @@ const EXCHANGE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// left for the provider. With less, nothing is sent and the next read refreshes.
 const MIN_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 
-/// How long a read that found its login refused looks for another program's rotation of it
-/// before it says the login is signed out ([`confirmed_signed_out`]). `codex-alab` (`b09caa8d7`,
-/// `codex_alab_core::auth_lock`) takes the same `flock` on `auth.json.lock` as [`AuthLock`] and
-/// keeps it through its request and the write of the answer, so an aterm refresh that waited for
-/// it reads the rotation it wrote and sends nothing. The pause is for a refresh made without the
-/// lock: a vendor `codex` binary's, or a `codex-alab` one that went on without it (the lock still
-/// held after its 30 s `auth_lock::WAIT`, or refused). Where such a writer spent the refresh token
-/// first, aterm's refresh is refused as reused, and the other writer writes the rotated login as
-/// soon as it has read the provider's answer, an answer that left the provider before aterm's
-/// refusal did. The gap is one network jitter and one file write, well under a second on a link
-/// that answered at all; two seconds holds twice that. A refresh token spent by a refresh whose
-/// answer was lost (`docs/KNOWN_ISSUES.md` ATERM-KI-1027-12) is refused with no rotation to find.
-const SIGNED_OUT_CONFIRM: Duration = Duration::from_secs(2);
-
-#[cfg(test)]
-thread_local! {
-    static SIGNED_OUT_LOOK: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// While held, this thread's [`confirmed_signed_out`] looks for another writer's rotation for the
-/// time it was set with, in place of [`SIGNED_OUT_CONFIRM`]: the hang detector, for a test whose
-/// own writer lands the rotation, which a loaded machine can hold past the shipped look. Its
-/// drop, a panic's unwind included, puts back the look it replaced.
-#[cfg(test)]
-struct SignedOutLook(Option<Duration>);
-
-#[cfg(test)]
-impl SignedOutLook {
-    fn set(look: Duration) -> Self {
-        Self(SIGNED_OUT_LOOK.replace(Some(look)))
-    }
-}
-
-#[cfg(test)]
-impl Drop for SignedOutLook {
-    fn drop(&mut self) {
-        SIGNED_OUT_LOOK.set(self.0);
-    }
-}
-
-/// How long [`confirmed_signed_out`] looks for a rotation: [`SIGNED_OUT_CONFIRM`], or the look a
-/// test set on this thread ([`SignedOutLook`]).
-fn signed_out_look() -> Duration {
-    #[cfg(test)]
-    if let Some(look) = SIGNED_OUT_LOOK.get() {
-        return look;
-    }
-    SIGNED_OUT_CONFIRM
-}
+/// Hang detector for a valid rotation another writer may still be publishing after a
+/// single-use refresh was refused. Its absence at expiry is not a sign-out proof.
+const ROTATION_HANG: Duration = Duration::from_secs(60);
 
 /// `auth.json`'s name in `home` with `suffix` after it, in the same directory.
 fn beside_auth(home: &Path, suffix: &str) -> PathBuf {
@@ -2352,14 +2302,14 @@ impl LoginSnapshot {
 pub enum Reading {
     /// The login's usage.
     Usage(Usage),
-    /// The provider refused the login itself: `/wham/usage` refused its access token (`401`)
-    /// and the refresh token was refused for good, or there was none to refresh it with, and a
-    /// look for another writer's rotation (`SIGNED_OUT_CONFIRM`) found none and a second ask was
-    /// refused too. It stays signed out until it signs in again.
+    /// The provider refused a nonrefreshable access credential twice (`401`), and no newer
+    /// rotation was read. A rejected single-use refresh whose rotation remains unresolved
+    /// yields [`Self::Unread`] instead.
     SignedOut,
     /// Nothing was learned: no login file, no reader for the CLI, a login that names another
     /// user than its row expects, the network, a timeout (a refusal with no time left to
-    /// confirm among them), a refused refreshed token, or an answer it could not read.
+    /// confirm among them), an unresolved single-use refresh, a refused refreshed token,
+    /// or an answer it could not read.
     Unread,
 }
 
@@ -2510,6 +2460,36 @@ fn read_login_snapshot_using(
     expected_email: Option<&str>,
     usage_client: Option<&Client>,
 ) -> LoginSnapshot {
+    read_login_snapshot_confirming(
+        home,
+        (usage_url, fallback_token_url),
+        wait,
+        now,
+        expected_email,
+        usage_client,
+        |stored, deadline| {
+            confirmed_signed_out(
+                home,
+                stored,
+                (usage_url, fallback_token_url),
+                (deadline, Instant::now(), || {}),
+                now,
+                expected_email,
+                usage_client,
+            )
+        },
+    )
+}
+
+fn read_login_snapshot_confirming(
+    home: &Path,
+    (usage_url, fallback_token_url): (&str, &str),
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+    usage_client: Option<&Client>,
+    confirm: impl FnOnce(&StoredAuth, Instant) -> LoginSnapshot,
+) -> LoginSnapshot {
     if !legacy_reader_allowed(home) {
         return LoginSnapshot::unread();
     }
@@ -2565,15 +2545,7 @@ fn read_login_snapshot_using(
     }
     if status == 401 {
         if stored.refresh_token.is_none() {
-            return confirmed_signed_out(
-                home,
-                &stored,
-                (usage_url, fallback_token_url),
-                deadline,
-                now,
-                expected_email,
-                usage_client,
-            );
+            return confirm(&stored, deadline);
         }
         match refresh_outcome(
             home,
@@ -2590,18 +2562,9 @@ fn read_login_snapshot_using(
                 (status, body) = again;
                 stored = *refreshed;
             }
-            // Confirmed before it says signed out: a rotation another writer lands meanwhile
-            // is a login, not a refusal.
+            // A rejected single-use refresh can race another writer's valid rotation.
             Refreshed::Rejected => {
-                return confirmed_signed_out(
-                    home,
-                    &stored,
-                    (usage_url, fallback_token_url),
-                    deadline,
-                    now,
-                    expected_email,
-                    usage_client,
-                );
+                return confirm(&stored, deadline);
             }
             Refreshed::Failed => return LoginSnapshot::unread(),
         }
@@ -2628,28 +2591,33 @@ fn usage_reading(status: u16, body: &[u8], now: i64) -> Reading {
         .into()
 }
 
-/// `home`'s login `stored`, which the provider refused once ([`read_login_with`]), read again
-/// before anything says it is signed out, since one refusal can be a race lost to another
-/// program's refresh made without the login's lock ([`AuthLock`], [`SIGNED_OUT_CONFIRM`]).
-/// Within that pause, a rotation another writer lands in the file is the login: its usage is
-/// read. With none, the usage is asked once more with the refused access token (no refresh is
-/// sent again: the provider refused its refresh token for good, or it has none), and a second
-/// `401` is [`Reading::SignedOut`]. Unread where the read's `deadline` comes first, or the second
-/// ask says nothing.
+/// Recheck a refused login without replaying its refresh. A published rotation is read
+/// as the new login. An unresolved single-use refresh remains Unread even after another
+/// access refusal: a missing response is not account sign-out. With no refresh token,
+/// two actual access refusals identify the nonrefreshable credential as signed out.
+/// The original deadline bounds every observation and request.
 fn confirmed_signed_out(
     home: &Path,
     stored: &StoredAuth,
     (usage_url, fallback_token_url): (&str, &str),
-    deadline: Instant,
+    (deadline, started, mut observing): (Instant, Instant, impl FnMut()),
     now: i64,
     expected_email: Option<&str>,
     usage_client: Option<&Client>,
 ) -> LoginSnapshot {
-    let Some(end) = Instant::now()
-        .checked_add(signed_out_look())
-        .filter(|end| *end < deadline)
-    else {
+    if Instant::now() >= deadline {
         return LoginSnapshot::unread();
+    }
+    let end = if stored.refresh_token.is_none() {
+        started
+    } else {
+        let Some(end) = started
+            .checked_add(ROTATION_HANG)
+            .filter(|end| *end < deadline)
+        else {
+            return LoginSnapshot::unread();
+        };
+        end
     };
     let rotated = loop {
         if !legacy_reader_allowed(home) {
@@ -2662,11 +2630,12 @@ fn confirmed_signed_out(
         if left.is_zero() {
             break None;
         }
+        observing();
         std::thread::sleep(LOCK_POLL.min(left));
     };
     let login = rotated.as_ref().unwrap_or(stored);
     let left = deadline.saturating_duration_since(Instant::now());
-    if !legacy_reader_allowed(home) {
+    if left.is_zero() || !legacy_reader_allowed(home) {
         return LoginSnapshot::unread();
     }
     let response = match usage_client {
@@ -2680,6 +2649,9 @@ fn confirmed_signed_out(
         return LoginSnapshot::unread();
     }
     if status == 401 && rotated.is_none() {
+        if stored.refresh_token.is_some() {
+            return LoginSnapshot::unread();
+        }
         return LoginSnapshot::read(Reading::SignedOut, login, usage_url, fallback_token_url);
     }
     LoginSnapshot::read(
@@ -3743,9 +3715,27 @@ impl CodeExchange<'_> {
     fn persist_capturing_inner<C: CodeGrantCapture>(
         self,
         owner: Option<&str>,
+        capture: Option<C>,
+        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
+        #[cfg(test)] cut: Option<EnrollmentCut>,
+    ) -> (Result<Option<String>, ExchangeError>, Option<C::Output>) {
+        self.persist_capturing_with_request_clock(
+            owner,
+            capture,
+            take_lock,
+            #[cfg(test)]
+            cut,
+            Instant::now,
+        )
+    }
+
+    fn persist_capturing_with_request_clock<C: CodeGrantCapture>(
+        self,
+        owner: Option<&str>,
         mut capture: Option<C>,
         take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
         #[cfg(test)] cut: Option<EnrollmentCut>,
+        request_started: impl FnOnce() -> Instant,
     ) -> (Result<Option<String>, ExchangeError>, Option<C::Output>) {
         let mut retained = None;
         let mut response_sealed = false;
@@ -3855,7 +3845,7 @@ impl CodeExchange<'_> {
             }
             // Scope observation can wait on its lifetime state mutex. Only
             // the budget left after that wait can admit this single POST.
-            let wait = deadline.remaining().min(EXCHANGE_WAIT);
+            let wait = exchange_wait(deadline.remaining(), request_started());
             if wait.is_zero() {
                 return None;
             }

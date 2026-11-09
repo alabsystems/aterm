@@ -3359,6 +3359,40 @@ impl App {
         }
     }
 
+    /// A pointer's release on control `key`: one the live semantic tree holds
+    /// ([`Self::dispatch_native_control_action`]), or one a scrolling list's strip draws whole
+    /// under its fade ([`crate::native_ui::CompiledUi::picture_hits`]), which the pointer alone
+    /// works: the strip stays out of the semantic tree and the Tab order, so the keyboard and
+    /// assistive technology reach nothing a status bar that comes would cover. The press on it
+    /// is the list's to reveal, as any press is (a strip's style row saves and comes whole into
+    /// the room).
+    pub(crate) fn dispatch_native_pointer_action(
+        &mut self,
+        wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
+        key: crate::native_ui::UiKey,
+        invocation: crate::native_app::ActionInvocation,
+    ) -> Result<EventResult, String> {
+        let picture = {
+            let compiled = self.current_native_ui(wid)?;
+            compiled.semantic(&key).is_none()
+                && compiled
+                    .picture_hits
+                    .iter()
+                    .any(|hit| hit.key == key && hit.action == invocation.id)
+        };
+        if !picture {
+            return self.dispatch_native_control_action(wid, expected_view, key, invocation, false);
+        }
+        let (_, active_view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        if active_view != expected_view {
+            return Err("native app target is stale or no longer active".to_string());
+        }
+        self.dispatch_native_view_event(wid, expected_view, AppEvent::Action(invocation))
+    }
+
     fn note_native_handled_dispatch(&mut self, wid: WindowId) {
         if let Some(window) = self.windows.get_mut(&wid) {
             window.native_dispatch_serial = window.native_dispatch_serial.saturating_add(1);
@@ -11029,12 +11063,15 @@ pub(crate) fn native_tab_target(
     {
         key = beyond;
     }
-    if let Some(state) = settings
-        && let Some(target) = state.tab_past_options(current, &key, !backwards, focus_order)
-    {
-        key = target;
-    }
-    Some(key)
+    // The single-choice rule: over a Settings list's every row where the list holds the stop,
+    // else over what the page draws (a choice picker's options).
+    let listed = settings.is_some_and(|state| state.lists_control(&key));
+    let choice = if listed {
+        settings.and_then(|state| state.tab_past_options(current, &key, !backwards, focus_order))
+    } else {
+        compiled.tab_past_choices(current, &key, !backwards)
+    };
+    Some(choice.unwrap_or(key))
 }
 
 #[cfg(test)]

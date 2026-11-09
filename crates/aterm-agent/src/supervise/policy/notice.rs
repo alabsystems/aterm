@@ -49,8 +49,6 @@ pub struct Notice {
     pub expect: String,
     /// [`Filled::command`]: the command the step runs, whole, where the step points at Details for it.
     pub command: Option<String>,
-    /// [`Filled::short`]: what the band shows in the step's place where it cannot show the step whole.
-    pub short: Option<&'static str>,
     /// [`Filled::undo`]: how to end what the step starts, a line of Details after the expectation.
     pub undo: Option<String>,
     /// [`NoticeText::back`].
@@ -650,8 +648,6 @@ pub struct Filled {
     pub expect: String,
     /// The command the step runs, whole, where it would not fit the step with its label whole: the step is then [`COMMAND_UNDER_DETAILS`], and whoever shows the notice puts this on a line of its Details.
     pub command: Option<String>,
-    /// What the band shows in the step's place where it cannot show the step whole: [`COMMAND_UNDER_DETAILS`] for a step that runs a command (the band shows a command whole or not at all, and Details shows it whole); `None` for a sentence, which the band cuts at its end.
-    pub short: Option<&'static str>,
     /// [`NoticeText::undo`], filled: how to end what the step starts.
     pub undo: Option<String>,
 }
@@ -700,14 +696,12 @@ impl NoticeText {
             (Some(text), Some(reset)) => fill_one(text, named, why).replace(RESET, reset),
             _ => fill_one(self.expect, named, why),
         };
-        let short = todo.contains(COMMAND).then_some(COMMAND_UNDER_DETAILS);
         Filled {
             happened: fill_one(self.happened, named, why),
             did: fill_one(self.did, named, why),
             todo,
             expect,
             command,
-            short,
             undo: self.undo.map(|undo| fill_one(undo, named, why)),
         }
     }

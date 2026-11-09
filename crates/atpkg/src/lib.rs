@@ -170,6 +170,17 @@ mod test_programs;
 /// Unit-test scratch directories, removed when the test ends however it ends.
 #[cfg(test)]
 pub(crate) mod testdir;
+/// What `thread` returned, once it ends, which it must: within the one-minute hang detector
+/// ([`aterm_spec::wait::MUST_HAPPEN`]), so a thread that never ends (an admission that never
+/// comes, a wait that never gets its turn) fails its test instead of hanging it.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn joined<T>(thread: std::thread::JoinHandle<T>, what: &str) -> T {
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+        thread.is_finished().then_some(())
+    });
+    thread.join().expect(what)
+}
 /// THE toolchain resolution order (`aterm help rust`, `verify`, the release cutter), re-exported from `aterm-toolchain`, where its tests run.
 pub mod toolchain;
 pub mod tree;

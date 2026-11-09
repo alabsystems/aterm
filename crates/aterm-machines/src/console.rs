@@ -57,9 +57,8 @@ impl Presence {
     /// at the console.
     #[must_use]
     pub fn needs_person(self) -> Option<String> {
-        self.why().map(|why| {
-            format!("needs a person at this Mac's console ({why}): run aterm init there")
-        })
+        self.why()
+            .map(|why| format!("needs a person at this Mac's console ({why})"))
     }
 }
 

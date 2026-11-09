@@ -373,9 +373,9 @@ fn policy_accepts_only_canonical_nonoverlapping_relative_paths() {
 fn unsupported_git_refuses_dependency_work_without_an_ordinary_fallback() {
     for answered in [true, false] {
         let (sys, who, repo, parent) = fixture(&["vendor/library"]);
-        sys.simulate(move |_, command| {
+        sys.simulate(move |sys, command| {
             if answered {
-                crate::init_github::git_before_no_lazy_fetch(command, false)
+                crate::init_github::git_before_no_lazy_fetch(sys, command, false)
             } else {
                 command
                     .args
@@ -442,7 +442,9 @@ fn a_git_that_obeys_the_variable_alone_reads_dependencies_without_the_option() {
         );
         existing_as(&sys, &who, &path, "alice", "library", PIN, off);
         if off == NoLazyFetch::Variable {
-            sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, true));
+            sys.simulate(|sys, command| {
+                crate::init_github::git_before_no_lazy_fetch(sys, command, true)
+            });
         }
         assert!(ready(&sys, &who, &parent, &repo).unwrap(), "{off:?}");
         repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();

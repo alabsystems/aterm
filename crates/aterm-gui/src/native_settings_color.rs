@@ -164,8 +164,11 @@ pub(super) fn unset_color_swatch(state: &SettingsViewState, key: &str) -> Option
         prefs::EDIT_CURSOR_TRAIL_COLOR => {
             let style = crate::app_config::resolve_trail_style(&saved_cursor_style(state)).style?;
             let pinned = state.is_explicit(prefs::EDIT_CURSOR_COLOR);
-            let (color, _) = aterm_effects::cursor_fx::own_trail_color(style, pinned)?;
-            Some(rgb(color))
+            match aterm_effects::cursor_fx::unset_trail_color(style, pinned) {
+                aterm_effects::cursor_fx::UnsetTrailColor::Own(color, _) => Some(rgb(color)),
+                aterm_effects::cursor_fx::UnsetTrailColor::Cursor
+                | aterm_effects::cursor_fx::UnsetTrailColor::Shifting => None,
+            }
         }
         prefs::EDIT_CURSOR_TRAIL_ACCENT => {
             use aterm_effects::cursor_fx::AccentBase;

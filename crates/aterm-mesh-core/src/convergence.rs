@@ -81,11 +81,6 @@ contract! {
     { !same_op }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "convergence_island.rs"]
-mod island;
-
 /// The kernels a [`Register`] asks: the compiled ones ([`KERNELS`]), or a test's mutant (the
 /// island's `Kernels`).
 #[cfg(any(test, debug_assertions))]

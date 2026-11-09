@@ -1081,12 +1081,12 @@ mod tests {
     }
 
     /// A quiet memo asked under its caller's shared observation of the state lock gives what it
-    /// kept without opening the lock again, and reads a changed file as `read_keyed` does.
+    /// kept without observing the lock again, and reads a changed file as `read_keyed` does.
     ///
     /// NEGATIVE CONTROL (2026-11-08): with `read_keyed_under` making `read_keyed`'s call (the
-    /// shape before), each kept answer opens the lock again (`left: 2, right: 0`).
+    /// shape before), each kept answer observes the lock again (`left: 2, right: 0`).
     #[test]
-    fn a_quiet_memo_under_its_callers_observation_opens_no_lock_of_its_own() {
+    fn a_quiet_memo_under_its_callers_observation_takes_none_of_its_own() {
         let home = aterm_tempfile::tempdir().unwrap();
         let paths = vault(home.path());
         drop(StateLock::take(&paths).unwrap());
@@ -1099,10 +1099,10 @@ mod tests {
         let lock = StateLock::observe(&paths).unwrap().expect("no writer");
         let under = || memo.read_keyed_under(&paths, &(), &lock, |p| lines(p, &reads));
 
-        let opens = super::super::lock_opens_of(&paths);
+        let observations = super::super::lock_observations_of(&paths);
         assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
         assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
-        assert_eq!(super::super::lock_opens_of(&paths) - opens, 0);
+        assert_eq!(super::super::lock_observations_of(&paths) - observations, 0);
         assert_eq!(reads.load(Ordering::SeqCst), 1, "read once");
 
         fsx::write_atomic(&paths.records_file(), b"m61-longer\n", 0o600).unwrap();
@@ -1162,6 +1162,98 @@ mod tests {
             reads.load(Ordering::SeqCst),
             5,
             "a lock renamed away guards nothing"
+        );
+    }
+
+    /// An observation takes the descriptor an earlier one left idle instead of opening the lock
+    /// file again, and holds no lock once it drops: a writer takes the lock at once.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-08): with `StateLock::open_observed` opening every time (the
+    /// shape before), each observation opens the lock (`left: 2, right: 0`, `observed on the
+    /// idle descriptor`); with the drop putting the descriptor back before its unlock, a writer
+    /// finds the lock held (`a writer takes the lock an observation left`).
+    #[test]
+    fn an_observation_takes_the_descriptor_an_earlier_one_left_unlocked() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        drop(StateLock::take(&paths).unwrap());
+        drop(StateLock::observe(&paths).unwrap().expect("no writer"));
+        let opens = super::super::lock_opens_of(&paths);
+        for _ in 0..2 {
+            let lock = StateLock::observe(&paths).unwrap().expect("no writer");
+            assert!(lock.observes(&paths));
+        }
+        assert_eq!(
+            super::super::lock_opens_of(&paths) - opens,
+            0,
+            "observed on the idle descriptor"
+        );
+        assert!(
+            StateLock::try_take(&paths).unwrap().is_some(),
+            "a writer takes the lock an observation left"
+        );
+    }
+
+    /// An idle descriptor is judged as a file just opened is: a lock given a mode others can read
+    /// or a second link is refused, a lock file another was renamed over is observed by its new
+    /// file, and a vault folder made a symlink to itself moved aside is refused, each as a fresh
+    /// open finds it.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-08): with `open_observed` taking an idle descriptor without
+    /// comparing it with the file at the lock's path, the observation after a lock file was
+    /// renamed over judges the old one and refuses it (`has 0 hard links`); without judging the
+    /// folder, the symlinked folder is observed (`a symlinked folder is refused`).
+    #[test]
+    fn an_idle_descriptor_is_judged_as_a_file_just_opened() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        drop(StateLock::take(&paths).unwrap());
+        let idle = || drop(StateLock::observe(&paths).unwrap().expect("no writer"));
+
+        idle();
+        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(
+            StateLock::observe(&paths).is_err(),
+            "a wide lock is refused"
+        );
+        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        idle();
+        let second = home.path().join("second-link");
+        std::fs::hard_link(paths.lock_file(), &second).unwrap();
+        assert!(
+            StateLock::observe(&paths).is_err(),
+            "a linked lock is refused"
+        );
+        std::fs::remove_file(&second).unwrap();
+
+        idle();
+        fsx::write_atomic(&paths.lock_file(), b"", 0o600).unwrap();
+        let renamed_over = StateLock::observe(&paths).unwrap();
+        assert!(
+            renamed_over.is_some_and(|lock| lock.observes(&paths)),
+            "a lock file renamed over is observed by its new file"
+        );
+
+        idle();
+        let aside = home.path().join("vault-aside");
+        std::fs::rename(&paths.dir, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &paths.dir).unwrap();
+        assert!(
+            StateLock::observe(&paths).is_err(),
+            "a symlinked folder is refused"
+        );
+        std::fs::remove_file(&paths.dir).unwrap();
+        std::fs::rename(&aside, &paths.dir).unwrap();
+
+        idle();
+        std::fs::rename(&paths.dir, &aside).unwrap();
+        assert!(
+            StateLock::observe(&paths).unwrap().is_none(),
+            "a missing folder is no observation"
         );
     }
 }

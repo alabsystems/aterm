@@ -862,9 +862,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn closing_the_tether_ends_the_watcher() {
+        // The watcher starts with the signals that end a process at their defaults, set here,
+        // not this test binary's: one started ignoring the tether's signal (a `nohup` or `&`
+        // runner's choice, which every exec keeps) outlives its tether.
+        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
         let mut watcher =
             super::desktop::tethered("/bin/sh", &["-c", "while :; do echo tick; sleep 0.1; done"])
                 .expect("spawn a tethered watcher");
+        drop(start);
         for _ in 0..11 {
             let line = watcher.lines.next().expect("a line").expect("utf-8");
             assert_eq!(line, "tick", "the watcher runs while tethered");

@@ -7438,7 +7438,10 @@ fn work_walks() -> Vec<WorkWalk> {
                 (None, [1, 1, 0, 1, 2]),
                 (step(Status), [1, 0, 0, 0, 1]),
                 (step(Warning), [1, 1, 0, 0, 2]),
-                (step(Down), [1, 0, 0, 0, 1]),
+                // Down from Follow System enters the theme list at the theme in use, as an arrow
+                // enters every single-choice list ([`crate::native_ui::tab_past_choices`]): the
+                // list is measured to land on its row, where the arrow used to scroll it a line.
+                (step(Down), [1, 1, 0, 0, 1]),
             ],
         ),
         // Openings timed against main: Pack telling no rung, a field under a status, Follow System.

@@ -2121,8 +2121,8 @@ fn prepare(
 /// never admitted this prepare and can admit no replay of it, and otherwise today's deadline
 /// refusal. It writes, reserves and reclaims nothing.
 ///
-/// The proof is read for a plain restart from the built-in harness, on this host epoch (checked
-/// before this), with no renewal seal, account relation or asked intent:
+/// The proof is read for a plain or supported typed asked restart from the built-in harness,
+/// on this host epoch (checked before this), with no renewal seal or account relation:
 /// - the deadline was read on this epoch's monotonic clock, which every admission reads too,
 ///   and nothing publishes once it has passed (the final check under the table lock);
 /// - admission writes the issuer record and has it acknowledged before `Phase::Started`
@@ -2132,9 +2132,11 @@ fn prepare(
 /// So, read after the clock, an id no table entry, reservation, seal or fence holds and no
 /// issuer record names was never started, and no later replay of this prepare can start it (a
 /// prepare naming the id with a fresh deadline is a new admission). A self-exec plan
-/// writes no issuer record, and the other relations (a renewal seal, an account continuation,
-/// an asked intent's predecessor) are not argued here, so they keep the refusal
-/// (`ATERM-KI-1107-2`). Rollback of the whole custody tree stays outside this claim, as it does
+/// writes no issuer record; renewal seals and account continuations keep the refusal.
+/// A supported asked predecessor changes only at accepted publication, which leaves an
+/// unrecorded table entry. Absence grants no predecessor authority: a replacement must
+/// qualify its current predecessor and producer anew. Rollback of the whole custody tree
+/// stays outside this claim, as it does
 /// for every journal read (`native_receipts`).
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2176,6 +2178,22 @@ fn prepare(
         reason = "A committed issuer append can lose its acknowledgement without informing the writer"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "Ask",
+        reason = "The incoming recipe selects supported typed asked data without qualifying its predecessor or producer"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "UnsupportedAsk",
+        reason = "The incoming recipe selects unsupported asked data that cannot satisfy the answer's shape premise"
+    )
+)]
 fn unadmitted_after_deadline(
     ctx: &crate::SessionCtx,
     request: &Prepare,
@@ -2187,7 +2205,7 @@ fn unadmitted_after_deadline(
     if caller.principal != crate::control::Principal::Harness
         || renewal.is_some()
         || account.is_some()
-        || request.asked.is_some()
+        || (request.asked.is_some() && !asked_upgrade::shape(request))
         || !matches!(request.plan, NativePlan::Restart { .. })
     {
         return DEADLINE.into();

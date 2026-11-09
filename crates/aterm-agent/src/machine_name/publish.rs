@@ -24,9 +24,13 @@ pub const SYSTEM_RENAME_WAIT: Duration = Duration::from_secs(600);
 /// macOS's three system names, in the order they are read and set: one operation, one approval.
 pub const SYSTEM_NAMES: [&str; 3] = ["ComputerName", "LocalHostName", "HostName"];
 
-/// How long one `scutil --get` or `--set` may take.
+/// Bound for an optional `scutil --get` observation.
 #[cfg(target_os = "macos")]
-const SCUTIL_WAIT: Duration = Duration::from_secs(10);
+const SCUTIL_READ_WAIT: Duration = Duration::from_secs(10);
+
+/// Hang detector for the required system-name setter.
+#[cfg(target_os = "macos")]
+const SCUTIL_SET_HANG: Duration = Duration::from_secs(60);
 
 /// What a request a newer set replaced says (`aterm name set`'s words).
 const SUPERSEDED: &str = "a newer machine name replaced this request";
@@ -261,27 +265,50 @@ pub fn read_system_names() -> [Option<String>; 3] {
 fn read_system_name(field: &str) -> Option<String> {
     let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
     command.args(["--get", field]);
-    aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT)
+    aterm_uds::deadline::output_within(&mut command, SCUTIL_READ_WAIT)
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// Read each of [`SYSTEM_NAMES`] and set an unaccepted projection to `number` with Apple's
-/// fixed `/usr/sbin/scutil --set`, within 10 seconds per read or set, reading no configuration,
+/// fixed `/usr/sbin/scutil --set`, with a bounded read and a required setter hang detector,
+/// reading no configuration,
 /// registry or user path: `aterm name apply-system`'s root half, once it has checked that it
 /// runs as root. Answers the fields scutil did not set.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn set_as_root(number: Number) -> Vec<&'static str> {
-    set_system_names(number, read_system_name, |field, number| {
-        let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
-        command.args(["--set", field, number]);
-        matches!(
-            aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT),
-            Ok(out) if out.status.success()
-        )
-    })
+    set_system_names(number, read_system_name, set_system_name)
+}
+
+#[cfg(target_os = "macos")]
+fn set_system_name(field: &str, number: &str) -> bool {
+    set_system_name_with(
+        field,
+        number,
+        std::time::Instant::now(),
+        aterm_uds::deadline::output_until,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn set_system_name_with(
+    field: &str,
+    number: &str,
+    started: std::time::Instant,
+    run: impl FnOnce(
+        &mut aterm_uds::spawnfd::Command,
+        std::time::Instant,
+    ) -> Result<std::process::Output, aterm_uds::deadline::RunError>,
+) -> bool {
+    let deadline = started + SCUTIL_SET_HANG;
+    if std::time::Instant::now() >= deadline {
+        return false;
+    }
+    let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
+    command.args(["--set", field, number]);
+    matches!(run(&mut command, deadline), Ok(out) if out.status.success())
 }
 
 #[cfg(any(target_os = "macos", test))]

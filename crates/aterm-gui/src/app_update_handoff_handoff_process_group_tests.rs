@@ -1067,11 +1067,16 @@ fn a_candidate_we_never_forked_is_still_proven_terminated() {
 #[test]
 fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled() {
     use std::os::unix::process::ExitStatusExt as _;
+    // The bystander starts with the signals that end a process at their defaults, set here, not
+    // this test binary's: one started ignoring SIGTERM would outlive a stray one, and this test's
+    // own.
+    let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
     let mut bystander = aterm_uds::spawnfd::command("/bin/sh")
         .arg("-c")
         .arg("sleep 30")
         .spawn()
         .expect("spawn a stand-in for whoever recycled the pid");
+    drop(start);
     let candidate = HandoffCandidate {
         pid: bystander.id(),
         birth: Some(super::HandoffCandidateBirth {

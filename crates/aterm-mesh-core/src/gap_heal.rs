@@ -86,11 +86,6 @@ contract! {
     { !holder_left && !remover_mints }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "gap_heal_island.rs"]
-mod island;
-
 /// The island's `wrapsRev`: whether an epoch wraps a revoked recipient, P1's `wraps_removed`
 /// folded over `(revoked, wrapped)` per recipient, every one asked.
 pub fn wraps_revoked(recipients: impl IntoIterator<Item = (bool, bool)>) -> bool {

@@ -4,16 +4,16 @@
 //! How a git keeps a read from fetching an object a partial clone lacks ([`NoLazyFetch`]), told
 //! by what the git does rather than by its version.
 
-use super::git;
+use super::{NO_SIDE_RUNS, git};
 use crate::model::User;
 use crate::port::{Cmd, Ran, Scratch, System};
 use std::ffi::OsString;
 use std::path::Path;
 
-/// What git says on standard error, in English (`LC_ALL=C`), where `GIT_NO_LAZY_FETCH` stops a
-/// lazy fetch: `promisor-remote.c`'s `fetch_objects`, the one place every lazy fetch passes,
-/// says it before it would start the fetch, and returns instead.
-const REFUSED: &str = "lazy fetching disabled";
+mod trace;
+
+/// The probe's small local-object trace is bounded before decoding.
+const TRACE_LIMIT: usize = 256 * 1024;
 
 /// The label of the scratch folder [`asked`] makes.
 const LABEL: &str = "git-lazy-fetch";
@@ -34,15 +34,14 @@ pub(crate) enum NoLazyFetch {
 impl NoLazyFetch {
     /// How `user`'s git ([`git`]) keeps a read from fetching lazily: [`NoLazyFetch::Flag`] where
     /// `git --no-lazy-fetch --version` succeeds; otherwise [`NoLazyFetch::Variable`] where git
-    /// was seen to obey the variable ([`obeys_variable`]); otherwise `None`, where git's read did
-    /// not show it ([`obeyed`]: it fetched the object, failed without saying it would not fetch
-    /// lazily, or a signal ended it). Only a git that refuses the option is asked more than the
-    /// one `--version`.
+    /// was seen to obey the variable ([`obeys_variable`]); otherwise `None`, where git's read
+    /// fetched or attempted to fetch the object, or a signal ended it. Only a git that refuses
+    /// the option is asked more than the one `--version`.
     ///
     /// # Errors
     /// git could not be asked: a run did not start or finish, the scratch folder its question
-    /// needs could not be made, or a step setting the question up failed ([`asked`]), so
-    /// nothing shows what git's read would do.
+    /// needs could not be made, a setup step failed, its trace was unavailable or incomplete,
+    /// or the local-fetch control did not establish the observation ([`asked`]).
     pub(crate) fn of(sys: &dyn System, user: &User) -> Result<Option<Self>, String> {
         Self::of_git(sys, &|| git(sys, user, None))
     }
@@ -52,13 +51,14 @@ impl NoLazyFetch {
     /// # Errors
     /// As [`NoLazyFetch::of`].
     pub(crate) fn of_git(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Option<Self>, String> {
+        let command = git();
         let flag = sys
-            .run_complete_stdout(&git().args(["--no-lazy-fetch", "--version"]))
+            .run_complete_stdout(&command.clone().args(["--no-lazy-fetch", "--version"]))
             .map_err(|_| "cannot ask Git whether it takes --no-lazy-fetch")?;
         if flag.success() {
             return Ok(Some(Self::Flag));
         }
-        Ok(obeys_variable(sys, git)?.then_some(Self::Variable))
+        Ok(obeys_variable(sys, &|| command.clone())?.then_some(Self::Variable))
     }
 
     /// [`git`] for `user` in `path`, with `--no-lazy-fetch` where git takes it
@@ -72,21 +72,18 @@ impl NoLazyFetch {
     }
 }
 
-/// Whether the git `git` names obeys `GIT_NO_LAZY_FETCH=1` alone ([`asked`], [`obeyed`]).
+/// Whether the git `git` names obeys `GIT_NO_LAZY_FETCH=1` alone ([`asked`]).
 ///
 /// # Errors
 /// As [`asked`].
 fn obeys_variable(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<bool, String> {
-    Ok(obeyed(&asked(sys, git)?))
+    let probe = asked(sys, git)?;
+    Ok(probe.read.status.is_some_and(|code| code != 0) && probe.no_fetch)
 }
 
-/// Whether `read`, [`asked`]'s, shows a git that obeys `GIT_NO_LAZY_FETCH`: it failed, so the
-/// object never arrived, and git said it would not fetch lazily ([`REFUSED`]). A git that ignores
-/// the variable fetches the object from the promisor and succeeds; one that tried the promisor
-/// and failed says nothing of the kind.
-fn obeyed(read: &Ran) -> bool {
-    read.status.is_some_and(|code| code != 0)
-        && String::from_utf8_lossy(&read.stderr).contains(REFUSED)
+struct Probe {
+    read: Ran,
+    no_fetch: bool,
 }
 
 /// The read that shows whether the git `git` names obeys `GIT_NO_LAZY_FETCH=1`, in a scratch
@@ -94,23 +91,40 @@ fn obeyed(read: &Ran) -> bool {
 /// (the blob of its own `HEAD` file), and `partial.git`, which lacks it and names `promisor.git`
 /// (a local path, so no fetch leaves this machine) as its promisor remote (`-c`
 /// `remote.origin.promisor=true`); then `partial.git` asked for the object's type under the
-/// variable. Neither the system's nor the person's git config is read (`GIT_CONFIG_NOSYSTEM`,
+/// variable. A complete Trace2 session must show no child or exec attempt. A second read of the
+/// same object with the variable disabled must fetch it and expose that attempt in a complete
+/// trace of the same format. Both reads concern only this private local promisor. Neither the system's nor the person's git config is read (`GIT_CONFIG_NOSYSTEM`,
 /// `GIT_CONFIG_GLOBAL=/dev/null`), so none of their settings (a `url.<base>.insteadOf`, a
-/// `protocol.file.allow`) changes what the read does: the question is the program's. Four
-/// short git runs, writing nothing outside the scratch folder.
+/// `protocol.file.allow`) changes what the read does: the question is the program's. Automatic
+/// side runs are disabled. Trace files are private, bounded, and removed with the scratch owner.
 ///
 /// # Errors
 /// The question could not be asked, so nothing shows what git's read would do: the scratch
 /// folder could not be made, a run did not start or finish, or a step setting the question up
 /// failed (where the temporary folder is full or unwritable, say), named with the first line
-/// git said, or `hash-object` named no object. Only the read itself is git's answer.
-fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Ran, String> {
+/// git said, or `hash-object` named no object. Missing, oversized or incomplete traces and an
+/// unsuccessful local-fetch control also establish no capability and return an error.
+fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
     const WHY: &str = "cannot see whether Git obeys GIT_NO_LAZY_FETCH";
-    let scratch = Scratch::new(sys, LABEL).map_err(|_| WHY)?;
+    let base = git();
+    let other_user = base.user.as_ref().filter(|user| user.uid != sys.euid());
+    // A privileged process's TMPDIR can itself be private to root. The shared temporary
+    // root permits traversal to the private allocation transferred to the Git actor.
+    let scratch = if cfg!(unix) && other_user.is_some() {
+        Scratch::new_in(sys, Path::new("/tmp"), LABEL)
+    } else {
+        Scratch::new(sys, LABEL)
+    }
+    .map_err(|_| WHY)?;
     let promisor = scratch.path().join("promisor.git");
     let partial = scratch.path().join("partial.git");
+    if let Some(user) = other_user {
+        sys.chown(scratch.path(), user.uid, user.gid)
+            .map_err(|error| format!("{WHY}: cannot own scratch directory ({error})"))?;
+    }
     let isolated = || {
-        git()
+        base.clone()
+            .args(NO_SIDE_RUNS)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("LC_ALL", "C")
@@ -150,13 +164,65 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Ran, String> {
     }
     let mut url = OsString::from("remote.origin.url=");
     url.push(promisor.as_os_str());
-    run(isolated()
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .args(["-c", "remote.origin.promisor=true", "-c"])
-        .arg(url)
-        .arg("--git-dir")
-        .arg(&partial)
-        .args(["cat-file", "-t", object]))
+    let read = |value: &str, name: &str| -> Result<(Ran, std::path::PathBuf, u32), String> {
+        let path = scratch.path().join(name);
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| format!("{WHY}: non-UTF-8 trace path"))?;
+        let uid = base.user.as_ref().map_or(sys.euid(), |user| user.uid);
+        sys.write_file(&path, b"", 0o600)
+            .map_err(|error| format!("{WHY}: cannot prepare trace ({error})"))?;
+        if let Some(user) = base.user.as_ref().filter(|user| user.uid != sys.euid()) {
+            sys.chown(&path, user.uid, user.gid)
+                .map_err(|error| format!("{WHY}: cannot own trace ({error})"))?;
+        }
+        let ran = run(isolated()
+            .env("GIT_NO_LAZY_FETCH", value)
+            .env("GIT_TRACE2_EVENT", path_text)
+            .args(["-c", "remote.origin.promisor=true", "-c"])
+            .arg(&url)
+            .arg("--git-dir")
+            .arg(&partial)
+            .args(["cat-file", "-t", object]))?;
+        Ok((ran, path, uid))
+    };
+    let observe = |path: &Path, uid: u32, code: i32| {
+        let bytes = sys
+            .read_owned_file(path, uid, TRACE_LIMIT, true)
+            .map_err(|error| format!("{WHY}: cannot read trace ({error})"))?;
+        trace::observe(&bytes, object, code).map_err(|why| format!("{WHY}: {why}"))
+    };
+    let (subject, path, uid) = read("1", "subject.trace")?;
+    let Some(code) = subject.status.filter(|code| *code != 0) else {
+        return Ok(Probe {
+            read: subject,
+            no_fetch: false,
+        });
+    };
+    let subject_trace = observe(&path, uid, code)?;
+    if subject_trace.attempted {
+        return Ok(Probe {
+            read: subject,
+            no_fetch: false,
+        });
+    }
+    let (control, path, uid) = read("0", "control.trace")?;
+    if !control.success() || control.out().trim() != "blob" {
+        return Err(format!(
+            "{WHY}: local-fetch control failed ({})",
+            control.describe()
+        ));
+    }
+    let control_trace = observe(&path, uid, 0)?;
+    if !control_trace.attempted || control_trace.format != subject_trace.format {
+        return Err(format!(
+            "{WHY}: local-fetch control did not establish the trace"
+        ));
+    }
+    Ok(Probe {
+        read: subject,
+        no_fetch: true,
+    })
 }
 
 /// The object [`before_the_option`]'s `hash-object` names.
@@ -165,12 +231,12 @@ const OBJECT_NAMED: &str = "4444444444444444444444444444444444444444";
 
 /// How a git before 2.44 answers [`NoLazyFetch::of`] on a test double: `--no-lazy-fetch`
 /// refused as unknown (129); in the question's scratch folder ([`LABEL`]), its repositories
-/// made and its object hashed; and its read failed, saying lazy fetching is off ([`REFUSED`]),
+/// made and its object hashed; and its read failed quietly with no fetch attempt,
 /// where it `obeys` the variable, or the object fetched from the promisor and named where it
 /// does not. `None` for every other command.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn before_the_option(command: &Cmd, obeys: bool) -> Option<Ran> {
+pub fn before_the_option(sys: &crate::port::Fake, command: &Cmd, obeys: bool) -> Option<Ran> {
     let has = |word: &str| command.args.iter().any(|arg| arg == word);
     if has("--no-lazy-fetch") {
         return Some(Ran::exit(129, "unknown option: --no-lazy-fetch"));
@@ -187,17 +253,65 @@ pub fn before_the_option(command: &Cmd, obeys: bool) -> Option<Ran> {
         Some(Ran::ok(""))
     } else if has("hash-object") {
         Some(Ran::ok(&format!("{OBJECT_NAMED}\n")))
-    } else if has("cat-file") && obeys {
-        Some(Ran::exit(
-            128,
-            "warning: lazy fetching disabled; some objects may not be available\n\
-             fatal: git cat-file: could not get object info\n",
-        ))
     } else if has("cat-file") {
-        Some(Ran::ok("blob\n"))
+        let disabled = command
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "GIT_NO_LAZY_FETCH")
+            .is_some_and(|(_, value)| value == "1");
+        let attempted = !obeys || !disabled;
+        let ran = if attempted {
+            Ran::ok("blob\n")
+        } else {
+            Ran::exit(128, "fatal: git cat-file: could not get object info\n")
+        };
+        record_trace(sys, command, &ran, attempted);
+        Some(ran)
     } else {
         None
     }
+}
+
+/// The fake Git's trace, including the same query and terminal status as its answer.
+#[cfg(any(test, debug_assertions))]
+fn record_trace(sys: &crate::port::Fake, command: &Cmd, ran: &Ran, attempted: bool) {
+    let Some((_, path)) = command
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "GIT_TRACE2_EVENT")
+    else {
+        return;
+    };
+    let argv: Vec<_> = std::iter::once(command.program.as_os_str())
+        .chain(command.args.iter().map(OsString::as_os_str))
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let mut events = vec![
+        aterm_json::json!({"event":"version", "sid":"probe", "evt":"4"}),
+        aterm_json::json!({"event":"start", "sid":"probe", "argv":argv}),
+        aterm_json::json!({"event":"cmd_name", "sid":"probe", "name":"cat-file"}),
+    ];
+    if attempted {
+        events.push(aterm_json::json!({"event":"child_start", "sid":"probe"}));
+    }
+    for event in ["exit", "atexit"] {
+        events.push(aterm_json::json!({"event":event, "sid":"probe", "code":ran.status}));
+    }
+    let bytes = format!(
+        "{}\n",
+        events
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    sys.file(path, bytes.as_bytes());
+    let mut stat = sys.stat(Path::new(path)).expect("fake trace exists");
+    stat.uid = command.user.as_ref().map_or(sys.euid(), |user| user.uid);
+    stat.mode = 0o600;
+    sys.stat_of(path, stat);
 }
 
 #[cfg(test)]

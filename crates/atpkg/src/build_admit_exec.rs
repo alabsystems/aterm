@@ -238,11 +238,14 @@ mod tests {
         );
     }
 
-    /// The report of a front started by `sh` with `trap` set (empty for none).
+    /// The report of a front started by `sh` with `trap` set (empty for none), from this process
+    /// with SIGINT at its default action, set here, not the runner's (a `&` job's is ignored): the
+    /// shell, and through it the front, inherit it. (SIGPIPE, which this process's runtime
+    /// ignores, the spawn puts back to its default in the shell.)
     fn report(trap: &str) -> String {
         let exe = std::env::current_exe().expect("test binary");
-        // The report is of what the front inherits.
-        let mut child = crate::platform::spawn_outside_a_stand_aside(|| {
+        let start = crate::platform::Starting::at_defaults(&[libc::SIGINT]);
+        let mut child = start.spawning(|| {
             aterm_uds::spawnfd::command("/bin/sh")
                 .args([
                     "-c",
@@ -261,6 +264,7 @@ mod tests {
                 .spawn()
                 .expect("the front")
         });
+        drop(start);
         let status = until_within(MUST_HAPPEN, "the stand-ins' end", || {
             child.try_wait().ok().flatten()
         });
@@ -277,7 +281,8 @@ mod tests {
 
     /// A BUILD STARTS WITH THE SIGNAL STATE ITS FRONT WAS STARTED WITH: a front started ignoring
     /// SIGPIPE and SIGINT, which caught SIGINT itself, hands its build both ignored; one started
-    /// at the defaults hands both at the defaults, not the SIGPIPE its runtime ignored.
+    /// at the defaults hands both at the defaults, not the SIGPIPE its runtime ignored. Both start
+    /// from a state the test sets ([`report`]), whatever the runner was started with.
     /// NEGATIVE CONTROL (by hand: `become_build` with `put_back` skipped, std's exec): the first
     /// build is started with both at their defaults.
     #[test]

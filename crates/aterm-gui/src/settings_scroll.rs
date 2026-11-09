@@ -592,6 +592,9 @@ pub(super) struct ScrollPlan {
     /// Each segmented control's segments in order, the chosen one under the control's key
     /// ([`Self::segment_place`]).
     segment_sets: Shared<Vec<UiKey>>,
+    /// Every control of a single-choice list's options with the option it is or is held by,
+    /// and whether that option is the checked one ([`Self::choice_of`]).
+    choices: Shared<(UiKey, UiKey, bool)>,
     foot: ListFoot,
     /// The pinned keyboard's control: how tall, and what a status's bar leaves ([`Left::pinned`]).
     pin: Option<(f32, f32)>,
@@ -1616,27 +1619,118 @@ impl ScrollPlan {
         let Some(anchor) = anchor else {
             return self.view(top).end >= n;
         };
+        self.anchored_last_seat(top, anchor).is_some() || self.plain_last_seat(top).is_some()
+    }
+
+    /// The last screen whose first stop is `top` seated with the list's end at `anchor`
+    /// ([`Self::last_seat`]), where that shows `top` and every stop after it
+    /// ([`Self::ends_on_at`]). Seated bare where `top`'s own screen keeps its run's caption, it
+    /// is the last only where that screen draws everything to the list's end already
+    /// ([`Self::draws_rest_at`]), `top` is no first stop of its run (the screens before it drew
+    /// the caption), and the caption it drops leaves no more blank under the end than the stop
+    /// before the screen would fill: refused there, the screen at `top` drew the end whole, its
+    /// last words in the strip kept for a bar, and the Page Down after it only moved the list,
+    /// dropping the caption (Cursor Styles at 100x27: Advanced tuning's card whole, then 40pt
+    /// higher).
+    fn anchored_last_seat(&self, top: usize, anchor: f32) -> Option<LastSeat> {
+        let n = self.len();
         let seat = self.last_seat(top, anchor);
         if seat.bare && !self.starts_bare(top) {
-            return false;
+            let first = seat.drawn.start;
+            let spare = seat.offset - (self.span(first..n) - anchor).max(0.0);
+            let fills = spare <= 0.5 || (first > 0 && spare < self.heights[first - 1] - 0.01);
+            if !(fills && !self.starts_run(top) && self.draws_rest_at(top)) {
+                return None;
+            }
         }
         let first = seat.drawn.start;
         let head = self.groups[first].map_or(0.0, |group| self.leads[group]);
         if self.stop_leads[first] > 0.01 && seat.offset > head + 0.01 {
-            return false;
+            return None;
         }
         let shown = self.shown_on(&seat.drawn, seat.offset, seat.caption);
-        !shown.is_empty() && shown.start <= top && shown.end >= n
+        (!shown.is_empty() && shown.start <= top && shown.end >= n).then_some(seat)
+    }
+
+    /// THE LAST SCREEN IS THE FIRST THAT SHOWS THE LIST'S END WHOLE: the screen whose first stop
+    /// is `top`, seated as any screen there is ([`Self::view`]), where it shows `top` and every
+    /// stop after it whole, its last stop's blank alone past the room's edge into the strip a
+    /// bar is kept. Seated with the list's end on the room's edge it would cut into `top`, no
+    /// last screen ([`Self::anchored_last_seat`]): the screen after it would be the last, seated
+    /// alike over `top` cut, and the Page Down to it would show nothing new. A stop of a row's
+    /// words starts it only under the row's name, as it starts any last screen.
+    fn plain_last_seat(&self, top: usize) -> Option<LastSeat> {
+        let n = self.len();
+        if self.foot == ListFoot::Whole || top >= n || self.view(top).end < n {
+            return None;
+        }
+        let drop = self.seat_drop(top);
+        let head = self.groups[top].map_or(0.0, |group| self.leads[group]);
+        if self.stop_leads[top] > 0.01 && drop > head + 0.01 {
+            return None;
+        }
+        let bare = drop > 0.0;
+        let caption = if bare {
+            self.top_caption(top..n, drop).map(|caption| TopCaption {
+                kept: false,
+                ..caption
+            })
+        } else {
+            None
+        };
+        let shown = self.shown_on(&(top..n), drop, caption);
+        (!shown.is_empty() && shown.start <= top && shown.end >= n).then_some(LastSeat {
+            top,
+            drawn: top..n,
+            offset: drop,
+            caption,
+            bare,
+        })
+    }
+
+    /// Whether the screen whose first stop is `top`, seated as any screen there is
+    /// ([`Self::view`]), draws `top` and every stop after it whole, some of their words past the
+    /// room's edge in the strip under it kept for a bar: each control in the room, every word
+    /// within the strip ([`Self::shows_at`] holds words to the room). The blank under the last
+    /// words, its card's closing, may fall past the strip (a card cut 1pt under its last note in
+    /// a window 100x28 drew everything).
+    fn draws_rest_at(&self, top: usize) -> bool {
+        let n = self.len();
+        if self.foot == ListFoot::Whole || top >= n {
+            return false;
+        }
+        let reach = self.room + self.overhang;
+        let mut at = self.stop_top(top, top) - self.seat_drop(top);
+        let mut past = false;
+        for index in top..n {
+            if index > top {
+                at = self.next_top(at, index);
+            }
+            if !self.control_rows[index].is_empty()
+                && at + self.controls_of(index).1 > self.room + 0.01
+            {
+                return false;
+            }
+            if at + self.ink[index] > reach + 0.01 {
+                return false;
+            }
+            past |= at + self.ink[index] > self.room + 0.01;
+        }
+        past
     }
 
     fn last_screen(&self, top: usize) -> Screen {
+        let anchor = self.last_anchor();
         let LastSeat {
             top,
             drawn,
             offset,
             caption,
             bare,
-        } = self.last_seat(top, self.last_anchor());
+        } = self
+            .anchored_last_seat(top, anchor)
+            .or_else(|| self.plain_last_seat(top))
+            .unwrap_or_else(|| self.last_seat(top, anchor));
         let reach = self.room + self.overhang;
         let bottom = self.span(drawn.clone());
         let height = (bottom - offset).min(reach).max(self.room.min(bottom));
@@ -1687,10 +1781,15 @@ impl ScrollPlan {
         while start > 0 && self.span(start..n) + 0.5 < anchor {
             start -= 1;
         }
+        // A FLUSH INTO NO MORE THAN THE BLANK OVER THE FIRST STOP'S INK (its run's caption's,
+        // [`Self::peek_padding`]) LEAVES THE SCREEN WHOLE: taken for a bare seat, it barred the
+        // first stop that shows the list's end from starting the last screen, so the screen
+        // after it, seated alike, was the last, and the Page Down to it only moved the list
+        // (Cursor Styles at 102x29: Adjust's card 5pt into the padding over its caption).
         let seat = |start: usize| {
             let flush = (self.span(start..n) - anchor).max(0.0);
-            let bare =
-                start == top && (self.starts_bare(start) || flush > self.ink_top[start] + 0.01);
+            let bare = start == top
+                && (self.starts_bare(start) || flush > self.peek_padding(start) + 0.01);
             let caption = self.top_caption(start..n, flush).map(|caption| TopCaption {
                 kept: caption.kept && !bare,
                 ..caption
@@ -1973,6 +2072,16 @@ impl ScrollPlan {
             std::sync::Arc::make_mut(&mut self.segments),
             std::sync::Arc::make_mut(&mut self.segment_sets),
         );
+        add_choices(node, std::sync::Arc::make_mut(&mut self.choices));
+    }
+
+    /// The option of a single-choice list control `key` is, or is held by, and whether that
+    /// option is the checked one ([`crate::native_ui::tab_past_choices`]).
+    pub(super) fn choice_of(&self, key: &UiKey) -> Option<(&UiKey, bool)> {
+        self.choices
+            .iter()
+            .find(|(control, _, _)| control == key)
+            .map(|(_, option, checked)| (option, *checked))
     }
 
     /// Where segment `key` stands among its segmented control's segments: the control's key
@@ -5782,6 +5891,68 @@ impl SettingsViewState {
         (order.contains(&selected) && selected != *next).then_some(selected)
     }
 
+    /// Whether this page's list holds control `key`, on its screen or off it.
+    pub(crate) fn lists_control(&self, key: &UiKey) -> bool {
+        self.scroll_plan()
+            .is_some_and(|plan| plan.controls().any(|(_, control)| control == key))
+    }
+
+    /// The single-choice rule over this page's list ([`crate::native_ui::tab_past_choices`]):
+    /// Themes' theme rows, Cursor Styles' style rows.
+    pub(crate) fn tab_past_options(
+        &self,
+        current: Option<&UiKey>,
+        next: &UiKey,
+        forward: bool,
+        order: &[UiKey],
+    ) -> Option<UiKey> {
+        if self.route == SettingsRoute::Themes && self.showcase.sheet_open {
+            return None;
+        }
+        let plan = self.scroll_plan()?;
+        let controls: Vec<UiKey> = plan.controls().map(|(_, key)| key.clone()).collect();
+        crate::native_ui::tab_past_choices(
+            &controls,
+            |key| {
+                plan.choice_of(key)
+                    .map(|(option, checked)| (option.clone(), checked))
+            },
+            current,
+            next,
+            forward,
+            order,
+        )
+    }
+
+    /// The checked option of the single-choice list this page's list holds, where an arrow from
+    /// outside the list enters it ([`crate::native_ui::tab_past_choices`]): its first option
+    /// where none is checked. `None` where the keyboard is in the list already, the list holds
+    /// no single-choice list, or the page list stands over it.
+    pub(super) fn arrow_into_choices(&self) -> Option<UiKey> {
+        if self.compact_navigation {
+            return None;
+        }
+        let plan = self.scroll_plan()?;
+        if self
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|focus| plan.stop_of(focus).is_some())
+        {
+            return None;
+        }
+        let option = |key: &UiKey| plan.choice_of(key).filter(|(of, _)| *of == key);
+        let first = plan
+            .controls()
+            .map(|(_, key)| key)
+            .find(|key| option(key).is_some())?;
+        let checked = plan
+            .controls()
+            .map(|(_, key)| key)
+            .find(|key| option(key).is_some_and(|(_, checked)| checked));
+        Some(checked.unwrap_or(first).clone())
+    }
+
     /// Tab enters a list whose screen shows none of its controls
     /// ([`crate::native_ui::tab_into_unshown_list`] over this page's list).
     pub(crate) fn tab_into_unshown_list(&self, forward: bool, order: &[UiKey]) -> Option<UiKey> {
@@ -6425,6 +6596,29 @@ pub(super) fn focus_keys(node: &UiNode) -> Vec<UiKey> {
     let mut out = Vec::new();
     walk(node, &mut out);
     out
+}
+
+/// Record the options of a single-choice list under `node` ([`ScrollPlan::choice_of`]): each
+/// control a person can focus in an option ([`SemanticRole::ListBoxOption`]), the option itself
+/// among them, with the option and whether it is checked.
+fn add_choices(node: &UiNode, out: &mut Vec<(UiKey, UiKey, bool)>) {
+    if node.paint_only {
+        return;
+    }
+    if let UiContent::Button(control) = &node.content
+        && control.role == Some(SemanticRole::ListBoxOption)
+    {
+        let checked = control.state.selected;
+        out.extend(
+            focus_keys(node)
+                .into_iter()
+                .map(|key| (key, node.key.clone(), checked)),
+        );
+        return;
+    }
+    for child in &node.children {
+        add_choices(child, out);
+    }
 }
 
 /// Give `plan` its `room` and the strip under it a page keeps for a status bar ([`Overhang`]).

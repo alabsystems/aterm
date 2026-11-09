@@ -36,11 +36,18 @@ fn cleanup_distinguishes_an_accepted_signal_from_a_kernel_refusal() {
     use aterm_uds::spawnfd::{self, Stdio};
     use std::os::unix::process::ExitStatusExt as _;
     for (signal, accepted) in [(i32::MAX, false), (libc::SIGTERM, true)] {
-        let mut child = spawnfd::command("/bin/cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        // The cat must die of the SIGTERM it is sent: it starts with SIGTERM at its default, set
+        // here, not this test binary's (a `nohup` or `&` runner's ignored one, which every exec
+        // keeps).
+        let start = crate::platform::Starting::at_defaults(&[libc::SIGTERM]);
+        let mut child = start.spawning(|| {
+            spawnfd::command("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        });
+        drop(start);
         let input = aterm_uds::deadline::cat_echoes(&mut child);
         let start =
             aterm_uds::process::read_process_start(i32::try_from(child.id()).unwrap()).unwrap();
@@ -74,6 +81,13 @@ fn no_forwarder_actor_if_requested() {
         return;
     };
     let world = PathBuf::from(world);
+    // SIGTERM at its default action, whatever this test binary was started with: the root this
+    // actor sends one must die of it, and a shell started ignoring it can neither trap nor die of
+    // it.
+    // SAFETY: SIG_DFL is a disposition, no handler of ours; this actor runs alone.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
     let machine = machine();
     let seat = seat(&world, &machine, std::process::id().wrapping_add(94));
     let Admission::Claimed(held) = admit(&test_build(), &world, &seat, &mut |_| {}) else {

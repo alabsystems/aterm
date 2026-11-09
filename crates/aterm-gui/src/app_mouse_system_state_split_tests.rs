@@ -686,4 +686,103 @@ mod presses {
         assert_eq!(app.active_native_view(wid).unwrap().1, native_view);
         assert!(app.structural_invariants_ok());
     }
+
+    #[test]
+    fn split_subtab_header_and_divider_are_shielded_by_banner_and_stats_lens() {
+        let mut split = page_beside_terminal();
+        let wid = split.window;
+        let plan = split.app.active_visible_leaf_plan(wid).unwrap();
+        let header = plan
+            .leaf(split.page)
+            .unwrap()
+            .header
+            .expect("the split page has a host-owned title row");
+        let (hx, hy) = split
+            .app
+            .cell_centre_px(wid, header.origin.y as u16, header.origin.x as u16 + 4)
+            .unwrap();
+        let div_col = plan.dividers[0].rect.origin.x as u16;
+        let (dx, dy) = split
+            .app
+            .cell_centre_px(wid, header.origin.y as u16, div_col)
+            .unwrap();
+
+        let rows = usize::from(split.app.windows[&wid].rows);
+        split
+            .app
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .input_scratch
+            .cells
+            .resize(rows, Vec::new());
+        split.app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+            wid,
+            Some(split.terminal),
+            "one\ntwo\n".to_owned(),
+            crate::input::Source::Controller,
+            crate::input::PasteFraming::Gesture { bracketed: true },
+        ));
+        split.app.windows.get_mut(&wid).unwrap().last_cursor_px = (hx, hy);
+        assert!(
+            !split.app.pointer_is_over_pane_header(wid),
+            "paste banner shields split pane header on row 0 even before terminal chrome_rows renders"
+        );
+        split.app.paste_banner = None;
+
+        {
+            let ws = split.app.windows.get_mut(&wid).unwrap();
+            ws.pane_overlay.hover = Some(split.terminal);
+            ws.stats_lens.open = Some(crate::stats_lens::Lens {
+                focus: crate::stats_paint::Instrument::Cpu,
+                bar: crate::stats_paint::Bar::Global,
+                how: crate::stats_lens::Opened::Hover,
+            });
+            ws.stats_lens.rect = Some((0, 0, 2_000, 300));
+        }
+        assert!(
+            !split.app.pointer_is_over_pane_header(wid),
+            "open stats lens card shields split pane header under the card"
+        );
+        split.app.on_cursor_moved(wid, dx, dy);
+        assert_eq!(
+            split.app.windows[&wid].pane_overlay.hover, None,
+            "moving pointer onto open stats lens clears hovered scrollbar"
+        );
+        assert_eq!(
+            split.app.divider_cursor_under_pointer(wid),
+            None,
+            "open stats lens shields split divider cursor"
+        );
+
+        split.app.on_cursor_moved(wid, hx, hy);
+        click(&mut split, MouseButton::Left);
+        assert_eq!(
+            split.app.windows[&wid].stats_lens.open.map(|l| l.how),
+            Some(crate::stats_lens::Opened::Pinned),
+            "clicking open hover stats lens over split pane header pins lens instead of focusing pane"
+        );
+        assert!(
+            split.app.active_native_view(wid).is_none(),
+            "terminal pane stays focused when click lands on stats lens card"
+        );
+
+        split.app.windows.get_mut(&wid).unwrap().stats_lens.rect = Some((1_500, 0, 200, 200));
+        assert!(
+            split.app.pointer_is_over_pane_header(wid),
+            "uncovered split pane header is hit-testable outside stats lens card"
+        );
+        split.app.on_cursor_moved(wid, hx, hy);
+        click(&mut split, MouseButton::Left);
+        assert!(
+            split.app.windows[&wid].stats_lens.open.is_none(),
+            "clicking uncovered split pane header closes open stats lens"
+        );
+        assert_eq!(
+            split.app.active_native_view(wid).unwrap().1,
+            split.page,
+            "clicking uncovered split pane header focuses the page leaf"
+        );
+        assert!(split.app.structural_invariants_ok());
+    }
 }

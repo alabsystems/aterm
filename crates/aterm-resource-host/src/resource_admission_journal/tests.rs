@@ -123,8 +123,12 @@ fn durable_journal_settlement_retries_real_rename_without_cpu_authority() {
     let bytes_before = std::fs::read(&done).unwrap();
     let ready_before = std::fs::read(world.journal.root.join("ready")).unwrap();
     for _ in 0..2 {
+        let flushes = aterm_durable::seam::Recording::start();
         world.journal.settle(&binding).unwrap();
         world.journal.finish(&binding).unwrap();
+        // Each acknowledgment covers the original file and both rename parents, including
+        // a done-only retry. The test flush mode must not remove any durability request.
+        assert_eq!(flushes.take(), vec![aterm_durable::Flush::Durable; 6]);
         assert!(!active.exists());
         assert_eq!(
             identity(&private(&done, false).unwrap()).unwrap(),

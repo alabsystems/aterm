@@ -284,7 +284,7 @@ fn a_readers_child_ends_with_the_verify_run() {
     crate::exec::ends::when(Arc::clone(&end), Arc::new(AtomicBool::new(false)));
     let child = || {
         let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("sh"));
-        cmd.args(["-c", "sleep 2; printf ran"]);
+        cmd.args(["-c", "printf ran"]);
         cmd
     };
     let ran = bounded(&mut child())

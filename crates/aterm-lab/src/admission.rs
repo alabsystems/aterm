@@ -858,8 +858,8 @@ mod tests {
     }
 
     /// Run by [`an_interrupt_ends_the_runs_quiet_claims`] in a process of its own, its
-    /// interrupts the lab's own ([`crate::stop::install`]) with SIGINT at its default action, as
-    /// a foreground run has it: waits for the quiet machine, writing `waiting` at its first
+    /// interrupts the lab's own ([`crate::stop::install`]) with SIGINT and SIGTERM at their
+    /// default actions, as a foreground run has them: waits for the quiet machine, writing `waiting` at its first
     /// wait line; once an interrupt ends that wait, a later quiet claim of the run is refused
     /// without a wait, and it exits as the lab's main would ([`crate::stop::status`]), saying
     /// what a FAIL found before, and a refusal, would have exited.
@@ -869,6 +869,9 @@ mod tests {
             return;
         };
         crate::sys::start_signal(libc::SIGINT, false);
+        // SIGTERM starts at its default, set here, not this test binary's: `install` leaves an
+        // ignored one ignored, and the SIGTERM leg sends it.
+        crate::sys::start_signal(libc::SIGTERM, false);
         crate::stop::install();
         let waiting = dir.join("waiting");
         let first = gui_rows(&dir, &mut |line| {

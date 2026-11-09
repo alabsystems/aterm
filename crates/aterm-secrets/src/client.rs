@@ -845,10 +845,111 @@ fn read_toml(
 /// A lock this process holds on the vault's state lock file (or, for a peer cursor, another lock
 /// file), released when it drops.
 pub(crate) struct StateLock {
-    file: std::fs::File,
+    /// The locked descriptor, until this drops.
+    file: Option<std::fs::File>,
     /// Whether this is a shared observation ([`StateLock::classify`]): no writer holds the lock
     /// while it does. Every other take is a writer's own, exclusive.
     shared: bool,
+    /// The device and inode of the lock file an observation's descriptor (opened read-only)
+    /// goes back to [`IDLE_LOCKS`] as once it is unlocked. A writer's take has none.
+    idle_as: Option<(u64, u64)>,
+}
+
+/// Descriptors of vault state lock files that shared observations opened and that hold no lock,
+/// each by its file's device and inode ([`IdleLocks`]). A quiet Commons round observes its vault's
+/// state lock at every check of an access (`commons::roster::Access::is_current_observed`) and
+/// every access a table session asks (`Bootstrap::access_in`), and each observation opened and
+/// closed the lock file again: the `open` most of 14.6% of a sustained long round's on-CPU samples
+/// and 17.9% of a short one's (2026-11-08). An observation takes one for the file at its lock's
+/// path and judges it by the checks a file it opens gets ([`StateLock::open_observed`]), and puts
+/// it back once unlocked. Each was opened read-only, close-on-exec and without following a final
+/// symlink ([`StateLock::open_existing`]). In this crate's test process each test thread keeps
+/// its own.
+#[cfg(not(test))]
+static IDLE_LOCKS: std::sync::Mutex<IdleLocks> = std::sync::Mutex::new(IdleLocks::new());
+
+#[cfg(test)]
+std::thread_local! {
+    static THREAD_IDLE_LOCKS: std::cell::RefCell<IdleLocks> =
+        const { std::cell::RefCell::new(IdleLocks::new()) };
+}
+
+/// How many idle lock descriptors [`IDLE_LOCKS`] keeps: a few for each of the one or two vaults a
+/// process observes at once.
+const IDLE_LOCKS_KEPT: usize = 8;
+
+/// One idle descriptor: its lock file's device and inode, which name that file while the
+/// descriptor holds it open (an open file's inode is not given to another), and when it came back.
+struct IdleLock {
+    id: (u64, u64),
+    file: std::fs::File,
+    returned: u64,
+}
+
+/// [`IDLE_LOCKS`]' descriptors, in fixed slots: taking or keeping one allocates and frees no
+/// memory, so a read measured for what its thread allocates (`tests/denial_entry_memory.rs`)
+/// frees nothing another read allocated.
+struct IdleLocks {
+    slots: [Option<IdleLock>; IDLE_LOCKS_KEPT],
+    returns: u64,
+}
+
+impl IdleLocks {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; IDLE_LOCKS_KEPT],
+            returns: 0,
+        }
+    }
+
+    /// An idle descriptor of the file `id` names, taken out.
+    fn take(&mut self, id: (u64, u64)) -> Option<std::fs::File> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|idle| idle.id == id))?
+            .take()
+            .map(|idle| idle.file)
+    }
+
+    /// Keep `file`, an unlocked descriptor of the file `id` names, in an empty slot or in place of
+    /// the one that came back longest ago, which closes.
+    fn keep(&mut self, id: (u64, u64), file: std::fs::File) {
+        let returned = self.returns;
+        self.returns = self.returns.wrapping_add(1);
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .min_by_key(|slot| slot.as_ref().map(|idle| idle.returned))
+        {
+            *slot = Some(IdleLock { id, file, returned });
+        }
+    }
+}
+
+/// An idle descriptor of the lock file `id` names, taken out of [`IDLE_LOCKS`].
+fn idle_lock(id: (u64, u64)) -> Option<std::fs::File> {
+    #[cfg(not(test))]
+    return IDLE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take(id);
+    #[cfg(test)]
+    THREAD_IDLE_LOCKS
+        .try_with(|idle| idle.borrow_mut().take(id))
+        .ok()
+        .flatten()
+}
+
+/// Put `file`, an unlocked descriptor of the lock file `id` names, back into [`IDLE_LOCKS`].
+fn keep_idle_lock(id: (u64, u64), file: std::fs::File) {
+    #[cfg(not(test))]
+    IDLE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keep(id, file);
+    // A lock dropped while its thread's store is torn down closes its descriptor with the closure.
+    #[cfg(test)]
+    let _ = THREAD_IDLE_LOCKS.try_with(|idle| idle.borrow_mut().keep(id, file));
 }
 
 /// A missing observation place and a writer holding it are different read outcomes.
@@ -910,8 +1011,9 @@ impl StateLock {
     /// A writer's take of `file`, which this process has locked exclusively.
     fn exclusive(file: std::fs::File) -> Self {
         Self {
-            file,
+            file: Some(file),
             shared: false,
+            idle_as: None,
         }
     }
 
@@ -990,8 +1092,9 @@ impl StateLock {
     fn guards(&self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt as _;
         self.file
-            .metadata()
-            .is_ok_and(|held| fsx::file_id(path) == Some((held.dev(), held.ino())))
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .is_some_and(|held| fsx::file_id(path) == Some((held.dev(), held.ino())))
     }
 
     fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
@@ -1091,30 +1194,65 @@ impl StateLock {
         }
     }
 
+    /// Whether the vault folder is there to observe: `false` where it is missing; an error where
+    /// it is a symlink or no directory.
+    fn folder_present(paths: &Paths) -> crate::Result<bool> {
+        match fsx::kind(&paths.dir)? {
+            fsx::Kind::Missing => Ok(false),
+            fsx::Kind::Dir => Ok(true),
+            fsx::Kind::Symlink => Err(Error::new(format!(
+                "{}: is a symlink; refusing to keep secrets through it",
+                paths.dir.display()
+            ))),
+            fsx::Kind::File | fsx::Kind::Other => Err(Error::new(format!(
+                "{}: not a directory",
+                paths.dir.display()
+            ))),
+        }
+    }
+
+    /// [`Self::open_existing`] for an observation, which takes an idle descriptor of the file at
+    /// the lock's path ([`IDLE_LOCKS`], by the device and inode an `lstat` of the path names)
+    /// once the folder is judged as an open judges it, and judges one `fstat` of the descriptor
+    /// afresh ([`fsx::judge_lock`]), as a file just opened is: a folder made a symlink and a lock
+    /// given another owner, a second link or (in [`Self::classify`]) a mode others can use are
+    /// refused as after an open, and a lock file renamed over the lock, or a folder moved, names
+    /// another file, which is opened. The kernel's access check of an open is not made again: a
+    /// lock its owner made unreadable is still observed through a descriptor opened before, as it
+    /// was while one observation held it, since only its `flock` is used, never its bytes.
+    fn open_observed(paths: &Paths) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+        if !Self::folder_present(paths)? {
+            return Ok(None);
+        }
+        let path = paths.lock_file();
+        if let Some(id) = fsx::file_id(&path)
+            && let Some(file) = idle_lock(id)
+            && let Ok(metadata) = file.metadata()
+        {
+            return Ok(Some((file, fsx::judge_lock(metadata, &path)?)));
+        }
+        Self::open_present(paths, false)
+    }
+
     fn open_existing(
         paths: &Paths,
         writable: bool,
     ) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        match fsx::kind(&paths.dir)? {
-            fsx::Kind::Missing => return Ok(None),
-            fsx::Kind::Dir => {}
-            fsx::Kind::Symlink => {
-                return Err(Error::new(format!(
-                    "{}: is a symlink; refusing to keep secrets through it",
-                    paths.dir.display()
-                )));
-            }
-            fsx::Kind::File | fsx::Kind::Other => {
-                return Err(Error::new(format!(
-                    "{}: not a directory",
-                    paths.dir.display()
-                )));
-            }
+        if !Self::folder_present(paths)? {
+            return Ok(None);
         }
+        Self::open_present(paths, writable)
+    }
+
+    /// [`Self::open_existing`] in a vault folder [`Self::folder_present`] found.
+    fn open_present(
+        paths: &Paths,
+        writable: bool,
+    ) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = paths.lock_file();
         #[cfg(test)]
-        count_lock_open(&path);
+        count_lock_use(LockUse::Opened, &path);
         let file = match aterm_uds::kept_out(|| {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -1203,14 +1341,14 @@ impl StateLock {
 
     /// Classify one nonblocking read without another filesystem probe or permission repair.
     fn observe_classified(paths: &Paths) -> crate::Result<StateObservation> {
-        Self::classify(paths, Self::open_existing(paths, false)?)
+        Self::classify(paths, Self::open_observed(paths)?)
     }
 
     /// [`Self::narrow_owned`] and then [`Self::observe_classified`], on one open of the lock
     /// unless it needs narrowing.
     fn observe_narrowed(paths: &Paths) -> crate::Result<StateObservation> {
         use std::os::unix::fs::MetadataExt as _;
-        let opened = Self::open_existing(paths, false)?;
+        let opened = Self::open_observed(paths)?;
         if opened
             .as_ref()
             .is_some_and(|(_, metadata)| metadata.mode() & 0o6077 != 0)
@@ -1232,6 +1370,8 @@ impl StateLock {
         };
         let file: std::fs::File = file;
         let path = paths.lock_file();
+        #[cfg(test)]
+        count_lock_use(LockUse::Observed, &path);
         if metadata.mode() & 0o077 != 0 || metadata.mode() & 0o6000 != 0 {
             return Err(Error::new(format!(
                 "{}: mode {:o} lets other users read it; run chmod 600 on it",
@@ -1245,7 +1385,11 @@ impl StateLock {
         )]
         match file.try_lock_shared() {
             Ok(()) => {
-                let lock = StateLock { file, shared: true };
+                let lock = StateLock {
+                    file: Some(file),
+                    shared: true,
+                    idle_as: Some((metadata.dev(), metadata.ino())),
+                };
                 // A lock file renamed away since it was opened guards nothing here: busy, and a
                 // wait opens the one at the path again.
                 Ok(if lock.guards(&path) {
@@ -1286,30 +1430,50 @@ impl StateLock {
     }
 }
 
-/// How many times this test process opened each state lock file to observe it
-/// ([`StateLock::open_existing`]; each tempdir path is one test's).
+/// What this test process did with a state lock file, counted for each path (each tempdir path is
+/// one test's).
 #[cfg(test)]
-static LOCK_OPENS: std::sync::Mutex<BTreeMap<PathBuf, usize>> =
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LockUse {
+    /// Opened it to observe it ([`StateLock::open_existing`]).
+    Opened,
+    /// Observed it, by an open or an idle descriptor ([`StateLock::classify`]).
+    Observed,
+}
+
+#[cfg(test)]
+static LOCK_USES: std::sync::Mutex<BTreeMap<(LockUse, PathBuf), usize>> =
     std::sync::Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
-fn count_lock_open(path: &Path) {
-    *LOCK_OPENS
+fn count_lock_use(what: LockUse, path: &Path) {
+    *LOCK_USES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(path.to_path_buf())
+        .entry((what, path.to_path_buf()))
         .or_default() += 1;
+}
+
+#[cfg(test)]
+fn lock_uses_of(what: LockUse, paths: &Paths) -> usize {
+    LOCK_USES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(what, paths.lock_file()))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// How many times this test process opened the state lock file of `paths` to observe it.
 #[cfg(test)]
 pub(crate) fn lock_opens_of(paths: &Paths) -> usize {
-    LOCK_OPENS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&paths.lock_file())
-        .copied()
-        .unwrap_or(0)
+    lock_uses_of(LockUse::Opened, paths)
+}
+
+/// How many times this test process observed the state lock file of `paths`.
+#[cfg(test)]
+pub(crate) fn lock_observations_of(paths: &Paths) -> usize {
+    lock_uses_of(LockUse::Observed, paths)
 }
 
 #[cfg(test)]
@@ -1322,7 +1486,16 @@ std::thread_local! {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        // Only a descriptor that holds no lock goes back; one whose unlock failed closes, which
+        // releases it.
+        if file.unlock().is_ok()
+            && let Some(id) = self.idle_as.take()
+        {
+            keep_idle_lock(id, file);
+        }
     }
 }
 

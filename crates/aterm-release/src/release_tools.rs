@@ -715,6 +715,66 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    /// A /1 freezer cannot supply /2's built_from binding. Repair the old proof once;
+    /// a failed repair is not permission for another compile/exec cycle.
+    #[test]
+    fn a_v1_cutter_record_gets_one_v2_repair() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let source = tool_source(temp.path(), "skew-cutter", CUTTER_VERSION, 0);
+        let cutter = stage_cutter(
+            &release,
+            COMMIT,
+            &source,
+            &release.with_extension("events"),
+            None,
+        )
+        .unwrap();
+        let mut legacy = aterm_toml::to_string(&cutter).unwrap();
+        legacy = legacy
+            .lines()
+            .filter(|line| !line.starts_with("built_from ="))
+            .map(|line| {
+                if line == "schema = 2" {
+                    "schema = 1"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(cutter_record_path(&release), legacy).unwrap();
+        assert!(recorded_cutter(&release, COMMIT).is_err());
+        let old_launch = |name: &str| match name {
+            RECORD_ENV => Some(cutter_record_path(&release).to_string_lossy().into_owned()),
+            FREEZER_ENV => Some(COMMIT.into()),
+            CONTRACT_ENV => Some("cutter.toml/1".into()),
+            _ => None,
+        };
+        assert_eq!(
+            Recovery::from_launch(COMMIT, false, old_launch),
+            Recovery::Refreeze
+        );
+
+        // The new writer supplies the missing binding. This is usable evidence, rather
+        // than a default value invented by the reader of an incompatible proof.
+        publish_cutter(&release, &cutter).unwrap();
+        assert_eq!(recorded_cutter(&release, COMMIT).unwrap(), cutter);
+        let mut repaired = aterm_uds::spawnfd::command("/usr/bin/true");
+        Recovery::Refreeze.hand(&mut repaired, COMMIT, COMMIT, None);
+        let handed = repaired.get_envs().collect::<Vec<_>>();
+        let read = |name: &str| {
+            handed
+                .iter()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| *value)
+                .map(|value| value.to_string_lossy().into_owned())
+                .or_else(|| old_launch(name))
+        };
+        assert_eq!(Recovery::from_launch(COMMIT, false, read), Recovery::Refuse);
+        assert_eq!(Recovery::from_launch(COMMIT, true, read), Recovery::Initial);
+    }
+
     #[test]
     fn a_local_phase_is_recorded_when_its_operation_returns_an_error() {
         let temp = aterm_tempfile::tempdir().unwrap();

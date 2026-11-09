@@ -9,7 +9,8 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 pub use crate::fleet_member::prove_discovery_address;
@@ -794,6 +795,32 @@ pub struct AlabTcpAdvertiser {
     inner: Mutex<AdvertiserInner>,
 }
 
+/// A listener generation's permission to announce a newly usable automatic desk.
+/// Closing it makes retained callbacks inert before that generation releases its listener.
+pub struct AdmissionAnnouncer {
+    active: Arc<AtomicBool>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl AdmissionAnnouncer {
+    /// The admission worker calls this only after publishing usable current policy.
+    #[must_use]
+    pub fn notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::clone(&self.notify)
+    }
+
+    /// End this generation before stopping its responder or joining its admission worker.
+    pub fn close(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for AdmissionAnnouncer {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 struct AdvertiserInner {
     held: Option<(aterm_uds::lan::Registration, aterm_uds::lan::Advert)>,
     #[cfg(unix)]
@@ -807,6 +834,52 @@ impl Default for AlabTcpAdvertiser {
 }
 
 impl AlabTcpAdvertiser {
+    /// Keep the fixture's real loopback responder under the ordinary advertiser owner.
+    #[cfg(test)]
+    pub(crate) fn holding_responder_for_test(
+        mut self,
+        responder: crate::lan_members::Responder,
+    ) -> Self {
+        self.inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lan = Some(responder);
+        self
+    }
+
+    /// Own a capability wake for exactly this listener generation. Neither the callback nor
+    /// its queued hint keeps an advertiser or a closed generation alive.
+    #[must_use]
+    pub fn admission_announcer(self: &Arc<Self>, port: u16) -> AdmissionAnnouncer {
+        let active = Arc::new(AtomicBool::new(true));
+        let live = Arc::downgrade(&active);
+        let advertiser = Arc::downgrade(self);
+        let notify = Arc::new(move || {
+            let Some(active) = live
+                .upgrade()
+                .filter(|active| active.load(Ordering::Acquire))
+            else {
+                return;
+            };
+            let Some(advertiser) = advertiser.upgrade() else {
+                return;
+            };
+            let guard = advertiser
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(unix)]
+            if active.load(Ordering::Acquire)
+                && let Some(lan) = guard.lan.as_ref().filter(|lan| lan.port == port)
+            {
+                lan.announce_ready(Arc::downgrade(&active));
+            }
+            #[cfg(not(unix))]
+            let _ = (active, guard, port);
+        });
+        AdmissionAnnouncer { active, notify }
+    }
+
     /// Create a tender using `instance` as the opaque Bonjour service instance name.
     #[must_use]
     pub fn new(instance: String) -> Self {

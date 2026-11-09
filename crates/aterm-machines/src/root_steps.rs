@@ -42,8 +42,8 @@
 //! root.
 //!
 //! What the person's account can read of each step without root ([`owed`]) decides whether the
-//! elevation is owed on a Mac that already has the tools: an unreadable step is not owed, so no
-//! password is asked for want of a reading.
+//! independent root work is owed, including when the compiler refuses or cannot be read:
+//! an unreadable root step is not owed, so no password is asked for want of a reading.
 
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, Read};

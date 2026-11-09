@@ -686,6 +686,12 @@ fn child() {
     let Ok(how) = std::env::var(CHILD) else {
         return;
     };
+    // SIGTERM and SIGTSTP at their default actions, whatever this test binary was started with:
+    // the guard and the wake leave an ignored one ignored.
+    for sig in [libc::SIGTERM, libc::SIGTSTP] {
+        // SAFETY: the default action, no handler of ours.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
     if how == "baseline" {
         let expected = std::env::var("ATERM_TTY_EXPECTED_SETTINGS").expect("parent's baseline");
         let current = Termios::read(0).expect("the attached controlling terminal");

@@ -64,6 +64,7 @@ struct Fake {
     fail_read: AtomicBool,
     waiting: Sender<Instant>,
     reads: AtomicUsize,
+    notifications: AtomicUsize,
     /// Each proof this member decided, by whether it came from its home ALab LAN.
     proved: Mutex<Vec<bool>>,
     refusals: AtomicUsize,
@@ -143,10 +144,25 @@ impl Fixture {
             fail_read: AtomicBool::new(false),
             waiting,
             reads: AtomicUsize::new(0),
+            notifications: AtomicUsize::new(0),
             proved: Mutex::new(Vec::new()),
             refusals: AtomicUsize::new(0),
         });
-        let service = AutomaticJoins::with_backend(fake.clone()).unwrap();
+        let owner = Arc::new(std::sync::OnceLock::<std::sync::Weak<Shared>>::new());
+        let ready = {
+            let fake = Arc::clone(&fake);
+            let owner = Arc::clone(&owner);
+            Arc::new(move || {
+                if let Some(shared) = owner.get().and_then(std::sync::Weak::upgrade) {
+                    // The real notifier may re-enter its current generation's local state.
+                    // The fixture's existing completion wait detects an owner-lock cycle.
+                    drop(shared.state.lock_or_recover());
+                }
+                fake.notifications.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let service = AutomaticJoins::with_backend(fake.clone(), ready).unwrap();
+        assert!(owner.set(Arc::downgrade(&service.handle.shared)).is_ok());
         // This observes completion of the initial read, without a sleep.
         waits.recv_timeout(HANG).unwrap();
         Self {
@@ -365,6 +381,15 @@ fn an_invalidated_proof_does_not_start_the_vault_preflight() {
         worker.join().unwrap();
         assert_eq!(f.fake.refusals.load(Ordering::SeqCst), 0, "{change:?}");
         assert!(f.fake.proved.lock_or_recover().is_empty(), "{change:?}");
+        if matches!(change, PolicyChange::Expired) {
+            f.ready_on("home-a");
+            f.waits.recv_timeout(HANG).unwrap();
+            assert_eq!(
+                f.fake.notifications.load(Ordering::SeqCst),
+                2,
+                "an expiry refused at a proof phase must announce recovery without reviving that proof"
+            );
+        }
     }
 }
 
@@ -421,7 +446,8 @@ fn an_unconfigured_node_refuses_before_the_greeting_and_a_nonhome_node_refuses_a
 
 #[test]
 fn membership_arrival_and_policy_replacement_wake_without_a_network_move() {
-    let f = Fixture::new(None);
+    let mut f = Fixture::new(None);
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 0);
     // The periodic refresh can never become due: only an input-change wake can make progress.
     let now = f.fake.now();
     *f.fake.frozen.lock_or_recover() = Some(now);
@@ -435,6 +461,7 @@ fn membership_arrival_and_policy_replacement_wake_without_a_network_move() {
     handle.observe_membership(Some(&keys));
     f.ready_on("home-a");
     f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 1);
 
     // Ordinary watcher ticks reuse the cached allocation and must not invalidate admission.
     let epoch = handle.shared.state.lock_or_recover().epoch;
@@ -447,12 +474,117 @@ fn membership_arrival_and_policy_replacement_wake_without_a_network_move() {
     handle.observe_membership(Some(&replacement));
     f.ready_on("home-a");
     assert!(f.fake.reads.load(Ordering::SeqCst) > reads);
+    f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(*f.fake.advance.lock_or_recover(), Duration::ZERO);
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 2);
+
+    // An unavailable read invalidates admission, but is not a healthy policy snapshot.
+    // Its owner must retry sooner without another network or membership change.
+    let healthy_until = handle.shared.state.lock_or_recover().valid_until.unwrap();
+    PolicyChange::Unavailable.apply(&mut f);
+    refused(&handle, "192.168.1.40");
+    assert!(handle.shared.state.lock_or_recover().valid_until.is_none());
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 2);
+    let reads = f.fake.reads.load(Ordering::SeqCst);
+    let epoch = handle.shared.state.lock_or_recover().epoch;
+    handle.observe_membership(Some(&replacement));
+    assert_eq!(handle.shared.state.lock_or_recover().epoch, epoch);
+    {
+        let _state = handle.shared.state.lock_or_recover();
+        handle.shared.changed.notify_all();
+    }
+    let retry_at = f.waits.recv_timeout(HANG).unwrap();
+    assert!(
+        retry_at < healthy_until,
+        "unavailable state kept a healthy deadline"
+    );
+    assert_eq!(f.fake.reads.load(Ordering::SeqCst), reads);
+    let first_delay = retry_at.saturating_duration_since(f.fake.now());
+    let advance_to = |deadline: Instant| {
+        let _state = handle.shared.state.lock_or_recover();
+        let left = deadline.saturating_duration_since(f.fake.now());
+        *f.fake.advance.lock_or_recover() += left;
+        handle.shared.changed.notify_all();
+    };
+    f.fake.fail_read.store(true, Ordering::SeqCst);
+    advance_to(retry_at);
+    let later_retry = f.waits.recv_timeout(HANG).unwrap();
+    assert!(later_retry.saturating_duration_since(f.fake.now()) > first_delay);
+    refused(&handle, "192.168.1.40");
+    let mut retry_at = later_retry;
+    for _ in 0..3 {
+        f.fake.fail_read.store(true, Ordering::SeqCst);
+        advance_to(retry_at);
+        retry_at = f.waits.recv_timeout(HANG).unwrap();
+        assert!(
+            retry_at.saturating_duration_since(f.fake.now()) <= REFRESH_EVERY,
+            "repeated unavailable reads waited longer than healthy refreshes"
+        );
+        assert_eq!(handle.shared.state.lock_or_recover().epoch, epoch);
+    }
+    refused(&handle, "192.168.1.40");
+
+    // A distinct policy context gets its own first retry, not the old failure streak.
+    let next = Arc::new(aterm_net::fleet_member::MemberKeys::default());
+    f.fake.fail_read.store(true, Ordering::SeqCst);
+    handle.observe_membership(Some(&next));
+    let retry_at = f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(
+        retry_at.saturating_duration_since(f.fake.now()),
+        first_delay
+    );
+    let epoch = handle.shared.state.lock_or_recover().epoch;
+    handle.observe_membership(Some(&next));
+    assert_eq!(handle.shared.state.lock_or_recover().epoch, epoch);
+    refused(&handle, "192.168.1.40");
+    advance_to(retry_at);
+    f.ready_on("home-a");
+    let healthy_until = f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(
+        healthy_until.saturating_duration_since(f.fake.now()),
+        REFRESH_EVERY
+    );
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 3);
+    let reads = f.fake.reads.load(Ordering::SeqCst);
+    {
+        let _state = handle.shared.state.lock_or_recover();
+        handle.shared.changed.notify_all();
+    }
+    assert_eq!(f.waits.recv_timeout(HANG).unwrap(), healthy_until);
+    assert_eq!(f.fake.reads.load(Ordering::SeqCst), reads);
+    advance_to(healthy_until);
+    let next_healthy = f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(
+        next_healthy.saturating_duration_since(f.fake.now()),
+        REFRESH_EVERY
+    );
+    assert_eq!(
+        f.fake.notifications.load(Ordering::SeqCst),
+        3,
+        "healthy policy renewal must not announce another capability edge"
+    );
+    // No input changed, and no explicit refresh is sent. A greeting actually observing
+    // expiry clears that cached deadline once and wakes the same owner's in-flight/due read.
+    let epoch = handle.shared.state.lock_or_recover().epoch;
+    {
+        let _state = handle.shared.state.lock_or_recover();
+        let left = next_healthy.saturating_duration_since(f.fake.now());
+        *f.fake.advance.lock_or_recover() += left;
+    }
+    refused(&handle, "192.168.1.40");
+    f.ready_on("home-a");
+    let recovered = f.waits.recv_timeout(HANG).unwrap();
+    assert_eq!(
+        recovered.saturating_duration_since(f.fake.now()),
+        REFRESH_EVERY
+    );
+    assert_eq!(handle.shared.state.lock_or_recover().epoch, epoch);
+    assert_eq!(f.fake.notifications.load(Ordering::SeqCst), 4);
 
     *f.fake.place.lock_or_recover() = None;
     handle.observe_membership(None);
     refused(&handle, "192.168.1.40");
     assert!(handle.shared.state.lock_or_recover().valid_until.is_none());
-    assert_eq!(*f.fake.advance.lock_or_recover(), Duration::ZERO);
 }
 
 #[test]

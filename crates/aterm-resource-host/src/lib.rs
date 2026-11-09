@@ -6,6 +6,11 @@
 //! Production serving must run in an independent custodian process so GUI
 //! handoff cannot discard original unreaped-child control.
 
+// The lifecycle fixtures judge custody and journal ordering. The durable crate's own
+// tests judge the full hardware flush; these private worlds keep every flush call as fsync.
+#[cfg(all(test, unix))]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 #[cfg(all(test, unix))]
 mod fixture_wait;
 #[cfg(all(test, unix))]

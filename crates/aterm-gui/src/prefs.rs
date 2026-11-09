@@ -143,8 +143,20 @@ pub(crate) fn trail_color_note(style_raw: &str, block: bool, cursor_color_pinned
                  cursor, a color tints its rod."
             )
         } else {
+            let rod = match aterm_effects::cursor_fx::unset_trail_color(style, cursor_color_pinned)
+            {
+                aterm_effects::cursor_fx::UnsetTrailColor::Own(_, own) => {
+                    format!("keeps its own {}", own.to_lowercase())
+                }
+                aterm_effects::cursor_fx::UnsetTrailColor::Shifting => {
+                    "shifts through colors".to_string()
+                }
+                aterm_effects::cursor_fx::UnsetTrailColor::Cursor => {
+                    "follows the cursor color".to_string()
+                }
+            };
             format!(
-                "Blank: {name}\u{2019}s rod keeps its own color on a bar cursor; any color, \
+                "Blank: {name}\u{2019}s rod {rod} on a bar cursor; any color, \
                  {TRAIL_COLOR_CURSOR_LABEL} among them, tints it."
             )
         };
@@ -8620,6 +8632,12 @@ enabled = true
                     if !style.draws_trail_color() {
                         assert_eq!(note.contains("does not use these"), block, "{case}");
                         assert!(!note.contains("follows the cursor color"), "{case}");
+                        let rod = match trail_color_default_name(style, pinned) {
+                            Some("Shifting colors") => "shifts through colors".to_string(),
+                            Some(own) => own.to_lowercase(),
+                            None => panic!("{case}: a rod of its own"),
+                        };
+                        assert_eq!(note.contains(&rod), !block, "{case}");
                     } else if style == GlowStyle::Classic {
                         assert_eq!(
                             trail_color_default_name(style, pinned),

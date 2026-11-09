@@ -290,6 +290,14 @@ mod imp {
                     }
                 }
                 "actor" => {
+                    // HUP, INT and TERM start at their default actions, set here, not inherited
+                    // from the test's runner: a probe started ignoring TERM (a `nohup` or `&`
+                    // runner's choice, which every exec keeps) discards the TERM it queues, and
+                    // the observer's `install` keeps an ignored one ignored.
+                    for sig in EXEC_SIGNALS {
+                        // SAFETY: SIG_DFL is a disposition, no handler of ours.
+                        unsafe { libc::signal(sig, libc::SIG_DFL) };
+                    }
                     let hup = signal_set([SIGHUP]).map_err(|error| error.to_string())?;
                     // SAFETY: `hup` is initialized and changes only this single-threaded startup.
                     let rc = unsafe {
@@ -1176,6 +1184,10 @@ mod tests {
         aterm_uds::deadline::prints(&mut proof, "ran", aterm_uds::deadline::ECHO_HANG);
         let _ = proof.wait();
         kept.ran();
+        // The group starts with the signals that end a process at their defaults, set here, not
+        // this test binary's: a shell started ignoring SIGTERM (a `nohup` or `&` runner's
+        // choice, which every exec keeps) can trap none, and neither ends nor says `TERM`.
+        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
         let mut leader = command("/bin/sh")
             .args([
                 "-c",
@@ -1188,6 +1200,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        drop(start);
         let group = i32::try_from(leader.id()).unwrap();
         let from_group = lines(leader.stdout.take().unwrap());
         let up = next(&from_group, "the grandchild").expect("the grandchild's first line");
@@ -1197,6 +1210,7 @@ mod tests {
         let grandchild_pid = grandchild
             .parse::<i32>()
             .expect("the grandchild says its pid");
+        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
         let mut standin = command(&trustd)
             .args(["-c", "echo up; /bin/cat; echo \"cat $?\""])
             .process_group(group)
@@ -1205,6 +1219,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        drop(start);
         let from_standin = lines(standin.stdout.take().unwrap());
         let mut to_standin = standin.stdin.take().unwrap();
         assert_eq!(next(&from_standin, "the stand-in").as_deref(), Some("up"));

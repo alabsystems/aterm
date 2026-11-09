@@ -464,6 +464,17 @@ pub(crate) fn lock_metadata(file: &File, path: &Path) -> crate::Result<std::fs::
     let metadata = file
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    judge_lock(metadata, path)
+}
+
+/// [`lock_metadata`] of `metadata`, which one `fstat` of the lock file at `path` found.
+///
+/// # Errors
+/// It fails one of [`lock_metadata`]'s checks.
+pub(crate) fn judge_lock(
+    metadata: std::fs::Metadata,
+    path: &Path,
+) -> crate::Result<std::fs::Metadata> {
     if !metadata.file_type().is_file() {
         return Err(Error::new(format!(
             "{}: not a regular file",

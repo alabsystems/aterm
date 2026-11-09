@@ -3739,6 +3739,9 @@ pub(crate) struct CompiledUi {
     pub(crate) default_action: Option<(UiKey, ActionId)>,
     pub(crate) segment_groups: Vec<SegmentGroup>,
     pub(crate) list_pictures: Vec<ListPicture>,
+    /// The pointer's target over each picture a list draws whole in its strip
+    /// ([`Self::list_pictures`]), where no live control answers ([`Self::hit_test`]).
+    pub(crate) picture_hits: Vec<HitRegion>,
     /// The tab stops of a list that holds every row ([`ListRoom::lists_all`]), in reading
     /// order, on its screen or off it: what Tab walks through that list
     /// ([`Self::tab_past_screen`]), where [`Self::focus_order`] holds only the stops its screen
@@ -3821,6 +3824,80 @@ pub(crate) fn tab_past_screen(
     (*target != next).then(|| (*target).clone())
 }
 
+/// THE SINGLE-CHOICE RULE: a single-choice list (its options [`SemanticRole::ListBoxOption`]
+/// controls, each holding the controls under it) is one Tab stop, as a radio group is: Tab and
+/// Shift-Tab enter it at its checked option (its first option where none is checked, as
+/// WAI-ARIA's radio group and listbox say) and leave it from any of its options, so Tab passing
+/// through tries nothing the person did not move to; the arrows move within it. Its options
+/// stand together in the list's `controls` (top to bottom); a run of them that does not hold the
+/// checked option is passed over. `option_of` names the option a control is or is held by, and
+/// whether that option is checked. Tab (`forward`) or Shift-Tab from `current` goes to `next`,
+/// the window's next stop in Tab `order`: the stop this rule takes instead, or `None` to keep
+/// `next`.
+pub(crate) fn tab_past_choices(
+    controls: &[UiKey],
+    option_of: impl Fn(&UiKey) -> Option<(UiKey, bool)>,
+    current: Option<&UiKey>,
+    next: &UiKey,
+    forward: bool,
+    order: &[UiKey],
+) -> Option<UiKey> {
+    let at = controls.iter().position(|key| key == next)?;
+    let (option, _) = option_of(next)?;
+    let mut start = at;
+    while start > 0 && option_of(&controls[start - 1]).is_some() {
+        start -= 1;
+    }
+    let mut end = at;
+    while controls
+        .get(end + 1)
+        .is_some_and(|key| option_of(key).is_some())
+    {
+        end += 1;
+    }
+    let run = &controls[start..=end];
+    let leave = || {
+        let past = if forward {
+            controls.get(end + 1)
+        } else {
+            start.checked_sub(1).and_then(|index| controls.get(index))
+        };
+        past.cloned().or_else(|| {
+            let inside = |key: &UiKey| run.contains(key);
+            let target = if forward {
+                let last = order.iter().rposition(inside)?;
+                order.get(last + 1).or_else(|| order.first())
+            } else {
+                let first = order.iter().position(inside)?;
+                first
+                    .checked_sub(1)
+                    .and_then(|index| order.get(index))
+                    .or_else(|| order.last())
+            }?;
+            (!inside(target)).then(|| target.clone())
+        })
+    };
+    if let Some(current) = current.filter(|current| run.contains(current)) {
+        // Tab within an option walks the controls it holds; from any of them it leaves the list.
+        if option_of(current).is_some_and(|(of, _)| of == option) {
+            return None;
+        }
+        return leave().filter(|target| target != next);
+    }
+    let is_option = |key: &UiKey| option_of(key).is_some_and(|(of, _)| of == *key);
+    let is_checked =
+        |key: &UiKey| option_of(key).is_some_and(|(of, checked)| of == *key && checked);
+    let stop = match run.iter().find(|key| is_checked(key)) {
+        Some(key) => key,
+        // The list's checked option stands in another run of it: Tab takes that run alone.
+        None if controls.iter().any(is_checked) => {
+            return leave().filter(|target| target != next);
+        }
+        None => run.iter().find(|key| is_option(key))?,
+    };
+    (stop != next).then(|| stop.clone())
+}
+
 impl CompiledUi {
     /// Where `key` stands among [`Self::list_stops`]: a segment where its
     /// control's stop does.
@@ -3837,6 +3914,35 @@ impl CompiledUi {
                     .iter()
                     .position(|stop| group.segments.contains(stop))
             })
+    }
+
+    /// The single-choice rule ([`tab_past_choices`]) over this page's Tab order: the options it
+    /// draws ([`SemanticRole::ListBoxOption`]) and the controls under them, a choice picker's
+    /// among them.
+    pub(crate) fn tab_past_choices(
+        &self,
+        current: Option<&UiKey>,
+        next: &UiKey,
+        forward: bool,
+    ) -> Option<UiKey> {
+        let option_of = |key: &UiKey| {
+            let mut node = self.semantic(key)?;
+            while node.role != SemanticRole::ListBoxOption {
+                node = self.semantic(node.parent.as_ref()?)?;
+            }
+            Some((
+                node.key.clone(),
+                node.state.is_some_and(|state| state.selected),
+            ))
+        };
+        tab_past_choices(
+            &self.focus_order,
+            option_of,
+            current,
+            next,
+            forward,
+            &self.focus_order,
+        )
     }
 
     /// [`tab_into_unshown_list`] over the list that holds every row
@@ -3979,7 +4085,16 @@ impl CompiledUi {
 
     /// Topmost enabled control at the point, matching paint order.
     pub(crate) fn hit_test(&self, x: f32, y: f32) -> Option<&HitRegion> {
-        self.hits.iter().rev().find(|hit| hit.rect.contains(x, y))
+        self.hits
+            .iter()
+            .rev()
+            .find(|hit| hit.rect.contains(x, y))
+            .or_else(|| {
+                self.picture_hits
+                    .iter()
+                    .rev()
+                    .find(|hit| hit.rect.contains(x, y))
+            })
     }
 
     pub(crate) fn semantic(&self, key: &UiKey) -> Option<&SemanticNode> {
@@ -9758,6 +9873,24 @@ impl Compiler {
                 key: key.clone(),
                 rect: LogicalRect::new(visible.x, top, visible.width, visible.bottom() - top),
             });
+            // A CONTROL THE STRIP DRAWS WHOLE ACTS AS ITSELF UNDER THE POINTER: the strip stays
+            // dead (no semantics, no Tab stop, so a bar that comes takes nothing the keyboard
+            // reaches), but a row drawn whole there looked like one and was none: pointing at a
+            // style previewed nothing and a click only scrolled it into the room (Cursor Styles
+            // at 150x48: Flying kitty under the fade). A press on it works it as a press in the
+            // room does, and the press's reveal brings it whole into the room; a picture the
+            // list's foot cuts is still only scrolled in.
+            let whole = live.is_none()
+                && (visible.y - rect.y).abs() <= CLIP_EDGE_EPSILON
+                && (visible.height - rect.height).abs() <= CLIP_EDGE_EPSILON;
+            if whole && let Some(action) = projection.action.clone() {
+                self.output.picture_hits.push(HitRegion {
+                    key: key.clone(),
+                    rect: visible,
+                    action,
+                    look_first,
+                });
+            }
         }
         let listed = live.is_none() && !paint_only && list.is_some_and(|list| list.lists_all);
         if listed {

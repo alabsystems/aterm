@@ -57,25 +57,7 @@ impl Qualification {
 }
 
 pub(super) fn shape(request: &Prepare) -> bool {
-    matches!(
-        (&request.asked, request.duty),
-        (Some(AskedIntent::Upgrade(_)), Scope::Upgrade)
-            | (Some(AskedIntent::Relaunch(_)), Scope::Relaunch)
-    ) && request
-        .asked
-        .as_ref()
-        .is_some_and(|asked| aterm_codec::hex::is_lower(asked.predecessor(), 32))
-        && matches!(
-            request.plan,
-            NativePlan::Restart {
-                observation: None,
-                cold: None,
-                ..
-            }
-        )
-        && (!matches!(request.asked, Some(AskedIntent::Relaunch(_)))
-            || matches!(&request.plan, NativePlan::Restart { forward, .. }
-                if forward.settles.is_none() && !matches!(forward.account_intent.as_deref(), Some(aterm_agent::harness::accounts_pool::ExecutionIntent::Token { .. }))))
+    request.asked_restart_shape()
 }
 
 impl Operations {

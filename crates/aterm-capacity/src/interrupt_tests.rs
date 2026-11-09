@@ -133,6 +133,9 @@ fn standin_waits_for_capacity() {
     // SAFETY: SIG_DFL is a disposition; `tool_handler` is an `extern "C" fn(c_int)` that lives
     // for the whole program and stores one atomic, which is async-signal-safe.
     unsafe {
+        // SIGTERM at its default action, whatever this test binary was started with: the wait's
+        // watch leaves an ignored one ignored, and the SIGTERM legs send it.
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
         if std::env::var_os(STANDIN_SIGINT).is_some() {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }

@@ -330,6 +330,16 @@ pub struct CommandLineTools {
     /// Whether this run's root half ran: what it left owed then goes to the journal, and the
     /// row's read-back says the tools alone.
     asked: std::sync::atomic::AtomicBool,
+    root_plan: Mutex<RootPlan>,
+}
+
+/// The compiled root work admitted by the functional developer-tools probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootPlan {
+    /// Missing tools: install them along with the independent root steps.
+    WithTools,
+    /// Preserve developer-tool selection and run only the independent root steps.
+    StepsOnly,
 }
 
 /// The reader of what the elevation still owes ([`CommandLineTools::with_owed`]).
@@ -363,6 +373,7 @@ impl CommandLineTools {
             name: Box::new(|| None),
             owed: Box::new(|_| Vec::new()),
             asked: std::sync::atomic::AtomicBool::new(false),
+            root_plan: Mutex::new(RootPlan::WithTools),
         }
     }
 
@@ -425,7 +436,7 @@ impl CommandLineTools {
     /// The baseline the root half applies.
     #[must_use]
     pub fn baseline() -> String {
-        Self::baseline_named(None)
+        Self::baseline_named(RootPlan::WithTools, None)
     }
 
     /// [`Self::baseline`], with the Mac's Computer Name, Local hostname and host name set to
@@ -434,13 +445,15 @@ impl CommandLineTools {
     /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
     /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
     /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
-    /// one password does every root step setup has.
+    /// one password does every root step setup has. [`RootPlan::StepsOnly`] omits CLT
+    /// installation and selection while retaining these independent steps.
     #[must_use]
-    pub fn baseline_named(name: Option<&str>) -> String {
+    pub fn baseline_named(plan: RootPlan, name: Option<&str>) -> String {
         let mut text = format!(
-            "schema = {}\n\n[developer]\ncommand_line_tools = true\ndebugger = true\n\n\
+            "schema = {}\n\n[developer]\ncommand_line_tools = {}\ndebugger = true\n\n\
              [lan]\nbroker = true\n\n[names]\nadmitted_name_rule = true\n",
-            crate::SCHEMA
+            crate::SCHEMA,
+            plan == RootPlan::WithTools
         );
         if let Some(name) = name.and_then(plain_name) {
             text.push_str(&format!(
@@ -459,10 +472,49 @@ impl CommandLineTools {
     /// gave this Mac its label by now ([`Self::with_name`]), `--name` carries it.
     #[must_use]
     pub fn command(&self) -> Cmd {
+        self.command_for(self.root_plan())
+    }
+
+    fn root_plan(&self) -> RootPlan {
+        *self
+            .root_plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Root work is re-read before launch. Independent work never acquires installation
+    /// authority from a later reading and no longer owed work needs no password episode;
+    /// a new compiler failure is not missing tools.
+    fn apply_plan(&self, sys: &dyn System) -> Result<Option<RootPlan>, (String, Unfinished)> {
+        if self.root_plan() == RootPlan::StepsOnly {
+            return Ok((!(self.owed)(sys).is_empty()).then_some(RootPlan::StepsOnly));
+        }
+        let (why, unfinished) = match (self.found)(sys) {
+            Found::Missing(_) => return Ok(Some(RootPlan::WithTools)),
+            Found::Present(_) => {
+                return Ok((!(self.owed)(sys).is_empty()).then_some(RootPlan::StepsOnly));
+            }
+            Found::NotHere(_) => return Ok(None),
+            Found::Refuses(why) => (why, Unfinished::Refuses),
+            Found::Unknown(why) => (why, Unfinished::Unread),
+        };
+        if (self.owed)(sys).is_empty() {
+            Err((why, unfinished))
+        } else {
+            Ok(Some(RootPlan::StepsOnly))
+        }
+    }
+
+    fn command_for(&self, plan: RootPlan) -> Cmd {
         let root = Cmd::new(SUDO)
             .args(["-k", "-p", TAB_PROMPT])
             .arg(self.aterm.as_os_str())
             .args(["machines", "here", "apply", "--plain"]);
+        let root = if plan == RootPlan::StepsOnly {
+            root.arg("--root-steps-only")
+        } else {
+            root
+        };
         match (self.name)().as_deref().and_then(plain_name) {
             Some(name) => root.args(["--name", name.as_str()]),
             None => root,
@@ -501,10 +553,10 @@ impl CommandLineTools {
 
     /// The line said right before `sudo` asks: [`TAB_INTRO`] or [`INTRO`] while the tools are
     /// missing, else the setup's own ([`TAB_INTRO_SETUP`], [`INTRO_SETUP`]).
-    fn intro(&self, sys: &dyn System, in_tab: bool) -> &'static str {
-        match ((self.found)(sys), in_tab) {
-            (Found::Present(_), true) => TAB_INTRO_SETUP,
-            (Found::Present(_), false) => INTRO_SETUP,
+    fn intro(in_tab: bool, plan: RootPlan) -> &'static str {
+        match (plan == RootPlan::StepsOnly, in_tab) {
+            (true, true) => TAB_INTRO_SETUP,
+            (true, false) => INTRO_SETUP,
             (_, true) => TAB_INTRO,
             (_, false) => INTRO,
         }
@@ -758,6 +810,9 @@ impl Item for CommandLineTools {
         if !sys.has_tty() {
             return Err(NO_TTY.to_owned());
         }
+        let Some(plan) = self.apply_plan(sys).map_err(|(why, _)| why)? else {
+            return Ok(());
+        };
         // Persist the episode before sudo can ask. Explicit retries bypass its withholding
         // decision, but consume the same record so a later update never retries unsolicited.
         let mut claimed = false;
@@ -766,7 +821,7 @@ impl Item for CommandLineTools {
         // the root half has finished its step and aterm's own ask is kept or taken back, then
         // sent again, so the run still stops as it would have.
         let stops = sys.defer_stops();
-        let ran = sys.run_tty(&self.command(), &mut || {
+        let ran = sys.run_tty(&self.command_for(plan), &mut || {
             // A vault question can own the terminal first. Re-read Stop and the automatic
             // ask's current holds only after acquiring that terminal, immediately before
             // claiming and starting this root episode.
@@ -800,7 +855,7 @@ impl Item for CommandLineTools {
                     }
                 }
             }
-            (self.say)(&format!("{}\n", self.intro(sys, false)));
+            (self.say)(&format!("{}\n", Self::intro(false, plan)));
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         });
@@ -842,10 +897,20 @@ impl CommandLineTools {
     /// names the steps left for setup's one password, so no pass blocks on them. Once this run's
     /// root half ran, its read-back says the tools alone: what that left owed is in the journal.
     /// A refusing or unanswered compiler also defers to confirmed installer custody; without
-    /// that custody it retains its blocked or unknown classification.
+    /// that custody known independent root work may proceed once, while read-back retains
+    /// the compiler's blocked or unknown classification.
     fn read(&self, sys: &dyn System) -> (Probe, Option<Unfinished>) {
-        let (from, unready) = match (self.found)(sys) {
-            Found::Present(now) => return self.read_present(sys, now),
+        let found = (self.found)(sys);
+        *self
+            .root_plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = if matches!(&found, Found::Missing(_)) {
+            RootPlan::WithTools
+        } else {
+            RootPlan::StepsOnly
+        };
+        let (from, unready) = match found {
+            Found::Present(now) => return self.read_root_steps(sys, now),
             Found::Refuses(why) => (why, Some(Unfinished::Refuses)),
             Found::Unknown(why) => (why, Some(Unfinished::Unread)),
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
@@ -879,6 +944,10 @@ impl CommandLineTools {
             crate::items::developer::Holder::Unread | crate::items::developer::Holder::Nothing => {}
         }
         if let Some(unfinished) = unready {
+            let independent = self.read_root_steps(sys, from.clone());
+            if matches!(&independent.0, Probe::Change { .. }) {
+                return independent;
+            }
             let probe = if unfinished == Unfinished::Refuses {
                 Probe::Blocked { why: from }
             } else {
@@ -901,8 +970,9 @@ impl CommandLineTools {
         )
     }
 
-    /// [`Self::read`] with the tools present (`now`).
-    fn read_present(&self, sys: &dyn System, now: String) -> (Probe, Option<Unfinished>) {
+    /// Independent root work. An `Ok` here does not establish compiler health; callers
+    /// with a refusing or unread compiler must retain that separate result.
+    fn read_root_steps(&self, sys: &dyn System, now: String) -> (Probe, Option<Unfinished>) {
         if self.asked.load(std::sync::atomic::Ordering::Relaxed) {
             return (Probe::Ok { now }, None);
         }
@@ -928,7 +998,7 @@ impl CommandLineTools {
                 Probe::Change {
                     from,
                     to: format!(
-                        "done as root by `{} machines here apply --plain` (one password prompt)",
+                        "done as root by `{} machines here apply --plain --root-steps-only` (one password prompt)",
                         Cmd::new(SUDO).arg(self.aterm.as_os_str()).display()
                     ),
                 },
@@ -1005,14 +1075,17 @@ impl CommandLineTools {
         if !sys.has_tty() {
             return Err(tab.note(Unfinished::Other));
         }
+        let Some(plan) = self.apply_plan(sys).map_err(|(_, why)| tab.note(why))? else {
+            return Ok(());
+        };
         let stops = sys.catch_stops();
-        let ran = sys.run_tty(&self.command(), &mut || {
+        let ran = sys.run_tty(&self.command_for(plan), &mut || {
             if sys.stopped().is_some() {
                 return Err(crate::port::RunFailed::Refused(
                     "setup was stopped before the root command started".into(),
                 ));
             }
-            tab.line(self.intro(sys, true));
+            tab.line(Self::intro(true, plan));
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             tab.entered
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1142,6 +1215,177 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_installation_plan_is_narrowed_when_tools_change_before_apply() {
+        for (later, owed, suffix, failed) in [
+            (
+                Found::Missing("still missing".into()),
+                false,
+                Some(""),
+                false,
+            ),
+            (Found::Present("Xcode works".into()), false, None, false),
+            (
+                Found::Present("Xcode works".into()),
+                true,
+                Some(" --root-steps-only"),
+                false,
+            ),
+            (Found::Refuses("compiler refuses".into()), false, None, true),
+            (Found::Unknown("compiler unread".into()), false, None, true),
+            (Found::NotHere("not applicable".into()), false, None, false),
+            (
+                Found::Refuses("compiler refuses".into()),
+                true,
+                Some(" --root-steps-only"),
+                false,
+            ),
+            (
+                Found::Unknown("compiler unread".into()),
+                true,
+                Some(" --root-steps-only"),
+                false,
+            ),
+        ] {
+            let state = Arc::new(Mutex::new(Found::Missing("missing at plan".into())));
+            let reader = state.clone();
+            let item = CommandLineTools::new(
+                Box::new(move |_| reader.lock().unwrap().clone()),
+                ATERM.into(),
+            )
+            .with_owed(Box::new(move |_| {
+                if owed {
+                    vec![crate::root_steps::Owed::Debugger]
+                } else {
+                    Vec::new()
+                }
+            }))
+            .saying(Arc::new(|_| {}));
+            let sys = console();
+            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+            *state.lock().unwrap() = later;
+            let expected: Vec<String> = suffix
+                .map(|suffix| format!("{}{suffix}", argv()))
+                .into_iter()
+                .collect();
+            for command in &expected {
+                sys.on(command, Ran::ok(""));
+            }
+            let result = item.apply(&sys, &ctx(&[]));
+            assert_eq!(result.is_err(), failed, "{result:?}");
+            assert_eq!(asked(&sys), expected);
+        }
+        // Losing tools after an independent plan cannot admit installation.
+        let state = Arc::new(Mutex::new(Found::Present("Xcode works".into())));
+        let reader = state.clone();
+        let item = CommandLineTools::new(
+            Box::new(move |_| reader.lock().unwrap().clone()),
+            ATERM.into(),
+        )
+        .with_owed(Box::new(|_| vec![crate::root_steps::Owed::Debugger]))
+        .saying(Arc::new(|_| {}));
+        let sys = console();
+        assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+        *state.lock().unwrap() = Found::Missing("lost before apply".into());
+        let root = format!("{} --root-steps-only", argv());
+        sys.on(&root, Ran::ok(""));
+        assert!(item.apply(&sys, &ctx(&[])).is_ok());
+        assert_eq!(asked(&sys), [root]);
+    }
+
+    #[test]
+    fn independent_work_completed_before_apply_spends_no_password_episode() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for found in [
+            Found::Present("healthy".into()),
+            Found::Refuses("broken".into()),
+            Found::Unknown("unread".into()),
+        ] {
+            let owed = Arc::new(AtomicBool::new(true));
+            let reader = owed.clone();
+            let said = Arc::new(Mutex::new(String::new()));
+            let sink = said.clone();
+            let item = item(found)
+                .with_owed(Box::new(move |_| {
+                    if reader.load(Ordering::Relaxed) {
+                        vec![crate::root_steps::Owed::Debugger]
+                    } else {
+                        Vec::new()
+                    }
+                }))
+                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
+                    crate::init::Holds::NONE
+                }))
+                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
+            let sys = console();
+            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+            owed.store(false, Ordering::Relaxed);
+            assert!(item.apply(&sys, &ctx(&[])).is_ok());
+            assert!(asked(&sys).is_empty());
+            assert!(said.lock().unwrap().is_empty());
+            assert!(!marked(&sys));
+            // Skipping obsolete work leaves the one episode available for genuinely owed work.
+            owed.store(true, Ordering::Relaxed);
+            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+            let root = format!("{} --root-steps-only", argv());
+            sys.on(&root, Ran::ok(""));
+            assert!(item.apply(&sys, &ctx(&[])).is_ok());
+            assert_eq!(asked(&sys), [root]);
+            assert!(marked(&sys));
+        }
+    }
+
+    #[test]
+    fn independent_root_work_preserves_a_refusing_or_unread_compiler() {
+        use crate::root_steps::Owed;
+        for found in [
+            Found::Refuses("broken compiler".into()),
+            Found::Unknown("unread compiler".into()),
+        ] {
+            let mut away = console();
+            away.tty = false;
+            let held = item(found.clone()).with_owed(Box::new(|_| vec![Owed::Debugger]));
+            assert!(!matches!(held.read(&away).0, Probe::Change { .. }));
+            let _ = run(&away, &held, Mode::Apply);
+            assert!(asked(&away).is_empty());
+            let settled = item(found.clone());
+            assert!(!matches!(settled.read(&console()).0, Probe::Change { .. }));
+            let sys = console();
+            let item = item(found.clone()).with_owed(Box::new(|_| {
+                vec![Owed::Debugger, Owed::NameRule, Owed::LanBroker]
+            }));
+            let root = format!("{} --root-steps-only", argv());
+            let marker = Path::new("/independent-root-step");
+            sys.on(&root, Ran::ok("")).on_write(&root, marker, b"done");
+            assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+            // A successful independent root command is not a compiler repair.
+            let _ = run(&sys, &item, Mode::Apply);
+            assert_eq!(asked(&sys), std::slice::from_ref(&root));
+            assert_eq!(sys.read_file(marker).unwrap(), b"done");
+            assert!(sys.read_file(Path::new(CC)).is_err());
+            let expected = match found {
+                Found::Refuses(_) => matches!(item.read(&sys).0, Probe::Blocked { .. }),
+                Found::Unknown(_) => matches!(item.read(&sys).0, Probe::Unusable { .. }),
+                _ => unreachable!(),
+            };
+            assert!(expected);
+            let _ = run(&sys, &item, Mode::Apply);
+            assert_eq!(
+                asked(&sys),
+                [root],
+                "independent work consumes only one root episode"
+            );
+        }
+        let parsed =
+            crate::baseline::parse(&CommandLineTools::baseline_named(RootPlan::StepsOnly, None))
+                .unwrap();
+        let developer = parsed.developer.unwrap();
+        assert_eq!(developer.command_line_tools, Some(false));
+        assert_eq!(developer.debugger, Some(true));
+        assert_eq!(parsed.names.unwrap().admitted_name_rule, Some(true));
+        assert_eq!(parsed.lan.unwrap().broker, Some(true));
+    }
+
     /// On a Mac that has the tools, the elevation still runs where its other root steps are
     /// owed: a person's run at the console asks for the one password, saying the setup's own
     /// line, and its read-back reads the tools in place whatever the root half left owed; the
@@ -1168,18 +1412,19 @@ mod tests {
         }));
         let sys = console();
         assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-        sys.on(&argv(), Ran::ok(""));
+        let root = format!("{} --root-steps-only", argv());
+        sys.on(&root, Ran::ok(""));
         let before = owed_reads.load(std::sync::atomic::Ordering::Relaxed);
         let row = run(&sys, &item, Mode::Apply);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
         assert_eq!(
             owed_reads.load(std::sync::atomic::Ordering::Relaxed) - before,
-            1,
-            "only the pre-prompt probe reads other root steps; the read-back reports the tools"
+            2,
+            "the probe and launch admission read root work; the read-back reports the tools"
         );
         assert_eq!(
             asked(&sys),
-            [argv()],
+            std::slice::from_ref(&root),
             "one password prompt: {:?}",
             sys.calls()
         );
@@ -1190,7 +1435,7 @@ mod tests {
         assert_eq!(parsed.lan.and_then(|t| t.broker), Some(true));
 
         let refused = console();
-        refused.on(&argv(), Ran::exit(1, "Sorry, try again."));
+        refused.on(&root, Ran::exit(1, "Sorry, try again."));
         let row = run(&refused, &owing(present()), Mode::Apply);
         assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
 
@@ -1229,8 +1474,11 @@ mod tests {
             "one password prompt: {:?}",
             sys.calls()
         );
-        let parsed =
-            crate::baseline::parse(&CommandLineTools::baseline_named(Some("m42"))).unwrap();
+        let parsed = crate::baseline::parse(&CommandLineTools::baseline_named(
+            RootPlan::WithTools,
+            Some("m42"),
+        ))
+        .unwrap();
         let names = parsed.names.expect("a [names] table");
         assert_eq!(names.computer_name.as_deref(), Some("m42"));
         assert_eq!(names.local_host_name.as_deref(), Some("m42"));
@@ -1246,7 +1494,7 @@ mod tests {
             run(&sys, &item, Mode::Apply);
             assert_eq!(asked(&sys), [argv()], "{word:?}: {:?}", sys.calls());
             assert_eq!(
-                CommandLineTools::baseline_named(Some(word)),
+                CommandLineTools::baseline_named(RootPlan::WithTools, Some(word)),
                 CommandLineTools::baseline(),
                 "{word:?}"
             );

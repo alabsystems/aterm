@@ -8,10 +8,19 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 
+/// Set in the process [`isolated_lifecycle`] starts, to the exact test name it runs.
+#[cfg(all(unix, any(test, debug_assertions)))]
+const LIFECYCLE_CASE: &str = "ATERM_ISOLATED_LIFECYCLE_CASE";
+
 /// Run a lifecycle body only in its fresh, exact-test owned process. The outer
 /// test waits for actual body entry and a successful child exit, then returns
 /// false; the child returns true. Stores created afterward cannot be inherited
 /// by unrelated parallel tests between fork and exec. No lease retry is involved.
+/// The body starts with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their default
+/// actions, set in its process before it returns true, not the runner's: a
+/// test binary run as a `&` job or under `nohup` starts with some ignored, and
+/// an exec keeps an ignored signal ignored, so a body whose subject catches only
+/// what it was not started ignoring (an armed front) would never hear one.
 ///
 /// # Panics
 /// The owned child cannot start, exceeds its hang detector, fails, or does not
@@ -22,9 +31,13 @@ pub fn isolated_lifecycle(case: &str) -> bool {
         !case.is_empty() && !case.starts_with('-'),
         "an exact test name is required"
     );
-    const CHILD: &str = "ATERM_ISOLATED_LIFECYCLE_CASE";
+    const CHILD: &str = LIFECYCLE_CASE;
     let marker = format!("entered isolated lifecycle: {case}");
     if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+            // SAFETY: SIG_DFL is a disposition, no handler; this process runs this body alone.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
         println!("{marker}");
         return true;
     }
@@ -387,6 +400,43 @@ mod tests {
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
+
+    /// AN ISOLATED BODY STARTS WITH THE SIGNALS THAT END A PROCESS AT THEIR DEFAULTS, whatever
+    /// its process had: the body's process ignores the four first, as one a `nohup` `&` runner
+    /// started would, and the body reads each at its default once [`super::isolated_lifecycle`]
+    /// says it runs. Only the body's process moves them; this binary's own stay as they were.
+    /// NEGATIVE CONTROL (by hand: the reset in `isolated_lifecycle` removed): the body reads
+    /// SIGHUP ignored, and its outer test fails on the body's failed run.
+    #[cfg(unix)]
+    #[test]
+    fn an_isolated_body_starts_with_the_signals_that_end_a_process_at_their_defaults() {
+        const CASE: &str = "test_binary::tests::an_isolated_body_starts_with_the_signals_that_end_a_process_at_their_defaults";
+        const TERMINATING: [libc::c_int; 4] =
+            [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+        if std::env::var_os(super::LIFECYCLE_CASE).as_deref() == Some(std::ffi::OsStr::new(CASE)) {
+            for sig in TERMINATING {
+                // SAFETY: SIG_IGN is a disposition, no handler; this process runs this body alone.
+                unsafe { libc::signal(sig, libc::SIG_IGN) };
+            }
+        }
+        if !super::isolated_lifecycle(CASE) {
+            return;
+        }
+        for sig in TERMINATING {
+            // SAFETY: all-zero is a valid `sigaction`; a null new action only reads the current
+            // one into `now`, which outlives the call.
+            let now = unsafe {
+                let mut now: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(sig, std::ptr::null(), &raw mut now), 0);
+                now.sa_sigaction
+            };
+            assert_eq!(
+                now,
+                libc::SIG_DFL,
+                "signal {sig} at its default in the body"
+            );
+        }
+    }
 
     #[test]
     fn only_a_cargo_test_binary_is_one() {

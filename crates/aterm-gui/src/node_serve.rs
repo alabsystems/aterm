@@ -37,6 +37,9 @@ use aterm_uds::{CtlListener, CtlStream};
 
 #[path = "node_serve/health.rs"]
 mod health;
+#[cfg(target_os = "linux")]
+#[path = "node_serve/window_start.rs"]
+mod window_start;
 
 use super::{
     CENSUS_REFRESH_EVERY, DENY_LIST_UNREAD, DeniedCache, FACTS_HEARTBEAT_EVERY, HeartbeatClock,
@@ -121,7 +124,8 @@ pub trait WindowLauncher: Send + Sync {
 }
 
 /// Production [`WindowLauncher`] checking `/dev/console` ownership on macOS (or `DISPLAY` /
-/// `WAYLAND_DISPLAY` elsewhere) and running `open -g -a <bundle>` (or `aterm --window`).
+/// `WAYLAND_DISPLAY` elsewhere) and running `open -g -a <bundle>` (or `aterm --window`, which on
+/// Linux lives in a systemd scope of its own where a systemd user manager runs the node).
 pub struct LiveWindowLauncher {
     last_launch: Mutex<Option<Instant>>,
 }
@@ -185,18 +189,32 @@ impl WindowLauncher for LiveWindowLauncher {
             );
         }
 
-        use aterm_uds::spawnfd::Stdio;
-        let mut window = aterm_uds::spawnfd::command(&exe);
-        window.envs(crate::descriptor_limit::window_launcher_limit());
-        let _child = window
-            .arg("--window")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("{} --window: {e}", exe.display()))?;
-        Ok(())
+        spawn_window(&exe)
     }
+}
+
+/// Start `exe --window` where Launch Services does not take it, in a systemd scope of its own
+/// when a systemd user manager runs the node ([`window_start`]), so a stop or restart of the
+/// node's unit never ends the window or its shells; else as the node's own child.
+#[cfg(target_os = "linux")]
+fn spawn_window(exe: &Path) -> Result<(), String> {
+    window_start::start(exe, &[std::ffi::OsStr::new("--window")]).map(drop)
+}
+
+/// Start `exe --window` as the node's own child where Launch Services does not take it.
+#[cfg(not(target_os = "linux"))]
+fn spawn_window(exe: &Path) -> Result<(), String> {
+    use aterm_uds::spawnfd::Stdio;
+    let mut window = aterm_uds::spawnfd::command(exe);
+    window.envs(crate::descriptor_limit::window_launcher_limit());
+    let _child = window
+        .arg("--window")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{} --window: {e}", exe.display()))?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3576,32 +3594,52 @@ fn serve_one_node_generation(
     maintenance: Option<&NodeMaintenance>,
 ) -> bool {
     // Announcements belong to this listener generation. Stop them before its
-    // socket is released, including every early return while starting workers.
-    struct Announcing<'a>(&'a AlabTcpAdvertiser);
-    impl Drop for Announcing<'_> {
-        fn drop(&mut self) {
-            self.0.stop();
+    // socket is released, including every early return while starting workers. Closing the
+    // admission callback also precedes joining its worker on an early return or unwind.
+    struct Announcing<'a> {
+        advertiser: &'a AlabTcpAdvertiser,
+        admission: aterm_agent::node_service::AdmissionAnnouncer,
+        automatic_joins: Option<aterm_agent::vault_join::AutomaticJoins>,
+    }
+    impl Announcing<'_> {
+        fn stop(&self) {
+            self.admission.close();
+            self.advertiser.stop();
         }
     }
-    let _announcing = Announcing(advertiser);
+    impl Drop for Announcing<'_> {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+    let mut announcing = Announcing {
+        advertiser,
+        admission: advertiser.admission_announcer(addr.port()),
+        automatic_joins: None,
+    };
     let running = Arc::new(AtomicBool::new(true));
     let open_table = Arc::new(NodeOpenTable::default());
     let windows = WindowRelays::new(cfg.relay_dir.clone(), Arc::clone(&cfg.launcher));
-    let automatic_joins = match cfg
+    announcing.automatic_joins = match cfg
         .vault_paths
         .clone()
-        .map(aterm_agent::vault_join::AutomaticJoins::start)
+        .map(|paths| {
+            aterm_agent::vault_join::AutomaticJoins::start(paths, announcing.admission.notifier())
+        })
         .transpose()
     {
         Ok(joins) => joins,
         Err(error) => {
             aterm_log::warn!("node: the automatic admission worker did not start: {error}");
-            advertiser.stop();
+            announcing.stop();
             sleep_interruptible(&cfg.stop, cfg.tick_every);
             return false;
         }
     };
-    let automatic_handle = automatic_joins.as_ref().map(|joins| joins.handle());
+    let automatic_handle = announcing
+        .automatic_joins
+        .as_ref()
+        .map(|joins| joins.handle());
     // Where this generation notes each peer the mesh proves (B6): its listener's handshakes, its
     // table's dials and its links' re-proofs, with the mesh on; nowhere with it off.
     let heard = cfg
@@ -3929,6 +3967,7 @@ fn serve_one_node_generation(
             aterm_log::warn!(
                 "aterm node serve: the watch thread did not start ({err}); not serving"
             );
+            announcing.stop();
             sleep_interruptible(&cfg.stop, cfg.tick_every);
             return false;
         }
@@ -4210,7 +4249,7 @@ fn serve_one_node_generation(
     );
 
     running.store(false, Ordering::Release);
-    advertiser.stop();
+    announcing.stop();
     drop(neighbours);
     if let Some(sharing) = sharing {
         let _ = sharing.join();
@@ -4218,7 +4257,7 @@ fn serve_one_node_generation(
     if let Some(watch) = watch_handle {
         let _ = watch.join();
     }
-    drop(automatic_joins);
+    drop(announcing.automatic_joins.take());
     true
 }
 

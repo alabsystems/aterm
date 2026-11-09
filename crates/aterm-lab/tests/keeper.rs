@@ -30,20 +30,24 @@ impl Kept {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let (lifeline, far) = Lifeline::open(&dir).expect("lifeline FIFO");
-        let mut child = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"))
-            .args([
-                "keeper",
-                "--",
-                "/bin/sh",
-                "-c",
-                "echo $$; exec /bin/sleep 600",
-            ])
-            .setsid(true)
-            .stdin(Stdio::from(far))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start the keeper");
+        let mut cmd = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"));
+        cmd.args([
+            "keeper",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $$; exec /bin/sleep 600",
+        ])
+        .setsid(true)
+        .stdin(Stdio::from(far))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+        // The keeper catches SIGTERM, SIGINT and SIGHUP only where it was not started ignoring
+        // them (`SignalPipe::install`), so it starts with them at their defaults, set here, not
+        // this test binary's: a signalled keeper ends.
+        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
+        let mut child = cmd.spawn().expect("start the keeper");
+        drop(start);
         let keeper = i32::try_from(child.id()).expect("pid");
         let mut line = String::new();
         BufReader::new(child.stdout.take().expect("piped stdout"))

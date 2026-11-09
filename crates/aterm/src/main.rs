@@ -10,6 +10,9 @@ use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::process::ExitCode;
 
+// The proofs of the mesh kernels this binary ships: a build of it checks them (Cargo.toml).
+use aterm_mesh_core_islands as _;
+
 mod lab_window;
 
 #[cfg(target_os = "macos")]

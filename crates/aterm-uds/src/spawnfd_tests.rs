@@ -428,14 +428,22 @@ fn release_held() {
 /// probes and a child), so a stage whose own wait hangs fails by its own message first.
 const STAGE_HANG: Duration = Duration::from_secs(10 * crate::deadline::ECHO_HANG.as_secs());
 
+/// Runs `launch` as the staged child for `stage` and returns its stdout. The launcher, and the
+/// stage it execs, start with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their defaults, set between
+/// its fork and exec, not this test binary's: a `&` or `nohup` runner starts the binary with some
+/// ignored, which every exec keeps, and a stage's child sent one would never end by it. A
+/// launcher that ignores one itself ([`run_staged_hup_ignored`]) still does so after this.
 fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     launch.env(STAGE_ENV, stage);
     let strip = InheritStrip::prepare();
-    // SAFETY: the closure runs between fork and exec and calls only `InheritStrip::apply`, which is
-    // async-signal-safe.
+    // SAFETY: the closure runs between fork and exec and calls only `InheritStrip::apply` and
+    // `signal`, both async-signal-safe; `signal` with SIG_DFL installs no handler.
     unsafe {
         launch.pre_exec(move || {
             strip.apply();
+            for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
             Ok(())
         });
     }

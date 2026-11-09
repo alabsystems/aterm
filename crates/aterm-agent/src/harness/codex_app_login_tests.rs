@@ -3855,33 +3855,103 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
             json!({"id_token":access, "access_token":access, "refresh_token":"new-refresh"}),
         )
     });
-    assert_eq!(
-        CodeExchange {
-            native_scope: None,
-            publication: None,
-            enrollment: None,
-            home: &home,
-            endpoints: &Endpoints {
-                issuer: format!("http://127.0.0.1:{port}"),
-                token_url: format!("http://127.0.0.1:{port}/oauth/token"),
-                callback_ports: vec![],
-            },
-            redirect_uri: "http://127.0.0.1/callback",
-            code: "code",
-            code_verifier: "verifier",
-            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
-            work: None,
-            now
-        }
-        .exchange(),
-        Ok(Some("owner@example.test".into()))
-    );
-    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    let result = CodeExchange {
+        native_scope: None,
+        publication: None,
+        enrollment: None,
+        home: &home,
+        endpoints: &Endpoints {
+            issuer: format!("http://127.0.0.1:{port}"),
+            token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+            callback_ports: vec![],
+        },
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "code",
+        code_verifier: "verifier",
+        deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        work: None,
+        now,
+    }
+    .exchange();
+    let seen = provider_seen(port, server);
+    assert_eq!(result, Ok(Some("owner@example.test".into())));
+    assert_eq!(seen, ["POST /oauth/token"]);
     assert_eq!(
         load_stored_auth(&home).unwrap().refresh_token.as_deref(),
         Some("new-refresh")
     );
     assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn required_token_response_keeps_code_exchange_work() {
+    let now = 1_790_000_000;
+    for age in [Duration::from_secs(31), Duration::from_secs(61)] {
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        hour_login(&home, now, Some("previous-refresh"));
+        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let journal = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).ok();
+        let provider_home = home.clone();
+        let (port, server) = provider(move |_, _| {
+            assert!(
+                AuthLock::try_take(&provider_home.join(AUTH_FILE))
+                    .unwrap()
+                    .is_none()
+            );
+            let token = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+            (
+                "200 OK",
+                json!({"id_token":token, "access_token":token, "refresh_token":"native-response-refresh"}),
+            )
+        });
+        let endpoints = Endpoints {
+            issuer: format!("http://127.0.0.1:{port}"),
+            token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+            callback_ports: vec![],
+        };
+        let (result, captured) = CodeExchange {
+            native_scope: None,
+            publication: None,
+            enrollment: None,
+            home: &home,
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "one-use-native-code",
+            code_verifier: "native-verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN * 2),
+            work: None,
+            now,
+        }
+        .persist_capturing_with_request_clock(
+            Some("native-response-owner"),
+            None::<NoGrantCapture>,
+            |home, deadline| AuthLock::within(home, deadline.instant()),
+            None,
+            || Instant::now() - age,
+        );
+        assert!(captured.is_none());
+        let seen = provider_seen(port, server);
+        assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+        if expired {
+            assert_eq!(result, Err(ExchangeError::Unsealed));
+            assert!(seen.is_empty(), "an expired native request sends no POST");
+            assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
+            assert_eq!(
+                std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).ok(),
+                journal
+            );
+        } else {
+            assert_eq!(result, Ok(Some("owner@example.test".into())));
+            assert_eq!(seen, ["POST /oauth/token"]);
+            assert_eq!(
+                load_stored_auth(&home).unwrap().refresh_token.as_deref(),
+                Some("native-response-refresh")
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -4414,26 +4484,29 @@ fn credential_context_tracks_semantic_material_and_route_without_read_side_effec
 }
 
 #[test]
-fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_nothing() {
+fn a_rejected_refresh_stays_unknown_and_a_nonrefreshable_login_can_be_signed_out() {
     let now = 1_790_000_000;
-    for (token_status, token_body, refresh, want) in [
+    for (token_status, token_body, refresh, want, asked_twice) in [
         (
             "400 Bad Request",
             json!({"error":"invalid_grant"}),
             Some("spent"),
-            Reading::SignedOut,
+            Reading::Unread,
+            true,
         ),
         (
             "401 Unauthorized",
             json!({"error":{"code":"refresh_token_expired"}}),
             Some("spent"),
-            Reading::SignedOut,
+            Reading::Unread,
+            true,
         ),
         (
             "400 Bad Request",
             json!({"code":"refresh_token_reused"}),
             Some("spent"),
-            Reading::SignedOut,
+            Reading::Unread,
+            true,
         ),
         // No refresh token: the refused access token is the whole login, and nothing is posted.
         (
@@ -4441,6 +4514,7 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             json!({}),
             None,
             Reading::SignedOut,
+            true,
         ),
         // CONTROL: an outage or another refusal says nothing of the login.
         (
@@ -4448,12 +4522,14 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             json!({"error":"server_error"}),
             Some("kept"),
             Reading::Unread,
+            false,
         ),
         (
             "400 Bad Request",
             json!({"error":"invalid_request"}),
             Some("kept"),
             Reading::Unread,
+            false,
         ),
     ] {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -4463,13 +4539,26 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             "/oauth/token" => (token_status, token_body.clone()),
             _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
         });
-        let snapshot = read_login_snapshot(
+        let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+        let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+        let snapshot = read_login_snapshot_confirming(
             &home,
-            &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
-            &format!("http://127.0.0.1:{port}/oauth/token"),
+            (&usage_url, &token_url),
             aterm_spec::wait::MUST_HAPPEN,
             now,
             None,
+            None,
+            |stored, deadline| {
+                confirmed_signed_out(
+                    &home,
+                    stored,
+                    (&usage_url, &token_url),
+                    (deadline, Instant::now() - Duration::from_secs(61), || {}),
+                    now,
+                    None,
+                    None,
+                )
+            },
         );
         let expected = (want == Reading::SignedOut).then(|| {
             CredentialContext::for_login(
@@ -4487,11 +4576,11 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             usize::from(refresh.is_some()),
             "{seen:?}"
         );
-        // A login is signed out only on a second refusal, asked after a look for another
-        // writer's rotation; an outage asks once.
+        // Rejected refreshes get a second access read without replaying the refresh.
+        // An absent rotation remains unknown; a transport outage asks once.
         assert_eq!(
             seen.iter().filter(|r| r.starts_with("GET")).count(),
-            if want == Reading::SignedOut { 2 } else { 1 },
+            if asked_twice { 2 } else { 1 },
             "{seen:?}"
         );
     }
@@ -4503,11 +4592,9 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
 /// refusal, while it looks for one, and the provider serves the usage to the rotated access
 /// token alone, as the real one does: the refused token still reads `401`. Its usage is read
 /// with the rotation, and the spent token is not sent again. The writer is this test's own
-/// thread, so the look waits the hang detector for it ([`SignedOutLook`]), inside a read deadline
-/// past that look.
+/// thread. The product's minute hang detector waits for it inside the original read deadline.
 #[test]
 fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
-    let _look = SignedOutLook::set(aterm_spec::wait::MUST_HAPPEN);
     let now = 1_790_000_000;
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("login");
@@ -4620,14 +4707,28 @@ fn a_refusal_the_second_ask_does_not_repeat_leaves_the_login_signed_in() {
             ),
         }
     });
-    let got = read_login_with(
+    let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+    let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+    let got = read_login_snapshot_confirming(
         &home,
-        &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
-        &format!("http://127.0.0.1:{port}/oauth/token"),
+        (&usage_url, &token_url),
         aterm_spec::wait::MUST_HAPPEN,
         now,
         None,
-    );
+        None,
+        |stored, deadline| {
+            confirmed_signed_out(
+                &home,
+                stored,
+                (&usage_url, &token_url),
+                (deadline, Instant::now() - Duration::from_secs(61), || {}),
+                now,
+                None,
+                None,
+            )
+        },
+    )
+    .reading;
     let seen = provider_seen(port, server);
     let Reading::Usage(usage) = got else {
         panic!("one refusal does not sign the login out: {got:?} {seen:?}");
@@ -4638,6 +4739,146 @@ fn a_refusal_the_second_ask_does_not_repeat_leaves_the_login_signed_in() {
         1,
         "{seen:?}"
     );
+}
+
+#[test]
+fn a_required_rotation_wait_does_not_invent_a_sign_out() {
+    for age in [Duration::from_secs(3), Duration::from_secs(61)] {
+        let expired = age >= Duration::from_secs(60);
+        let now = 1_790_000_000;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("login");
+        hour_login(&home, now, Some("spent"));
+        let original = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let fresh = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200);
+        let bearer = format!("Bearer {fresh}");
+        let (port, server) = provider_by_request(move |request| {
+            if request.target == "/oauth/token" {
+                return ("400 Bad Request", json!({"code":"refresh_token_reused"}));
+            }
+            if request
+                .headers
+                .iter()
+                .any(|(key, value)| key == "authorization" && value == &bearer)
+            {
+                (
+                    "200 OK",
+                    json!({"plan_type":"pro", "rate_limit":{"allowed":true, "primary_window":{
+                        "used_percent":42.0, "limit_window_seconds":18_000, "reset_at":1_790_010_800
+                    }}}),
+                )
+            } else {
+                ("401 Unauthorized", json!({"error":"unauthorized"}))
+            }
+        });
+        let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+        let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+        let publish = || {
+            write_auth_doc(
+                &home,
+                &json!({"auth_mode":"chatgpt", "tokens":{
+                    "id_token":fresh, "access_token":fresh,
+                    "refresh_token":"rotated", "account_id":"acct_native_test"
+                }}),
+            )
+            .unwrap()
+        };
+        let mut held = None;
+        let mut observed = 0;
+        let snapshot = read_login_snapshot_confirming(
+            &home,
+            (&usage_url, &token_url),
+            aterm_spec::wait::MUST_HAPPEN * 2,
+            now,
+            None,
+            None,
+            |stored, deadline| {
+                held = Some(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap());
+                confirmed_signed_out(
+                    &home,
+                    stored,
+                    (&usage_url, &token_url),
+                    (deadline, Instant::now() - age, || {
+                        assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_none());
+                        observed += 1;
+                        publish();
+                        drop(held.take());
+                    }),
+                    now,
+                    None,
+                    None,
+                )
+            },
+        );
+        let still_held = held.is_some();
+        let unchanged = std::fs::read(home.join(AUTH_FILE)).unwrap() == original;
+        drop(held);
+        // A rotation published after expiry is still usable by the next actual read.
+        if expired {
+            let _writer = AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap();
+            publish();
+        }
+        let recovered = read_login_snapshot(
+            &home,
+            &usage_url,
+            &token_url,
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        );
+        let seen = provider_seen(port, server);
+        assert_eq!(observed, usize::from(!expired));
+        assert_eq!(still_held, expired);
+        assert_eq!(unchanged, expired);
+        if expired {
+            assert_eq!(snapshot.reading, Reading::Unread);
+            assert!(snapshot.context.is_none());
+        } else {
+            assert_eq!(
+                snapshot.reading.usage().unwrap().sample.session_pct,
+                Some(42)
+            );
+            assert_eq!(snapshot.context, recovered.context);
+        }
+        assert_eq!(
+            recovered.reading.usage().unwrap().sample.session_pct,
+            Some(42)
+        );
+        assert_eq!(seen.iter().filter(|r| r.starts_with("POST")).count(), 1);
+        assert_eq!(seen.iter().filter(|r| r.starts_with("GET")).count(), 3);
+    }
+}
+
+#[test]
+fn a_rotation_wait_keeps_its_original_parent_deadline() {
+    let now = 1_790_000_000;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+    let (port, server) = provider(|_, _| ("200 OK", json!({})));
+    let usage_url = format!("http://127.0.0.1:{port}/backend-api/wham/usage");
+    let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+    let mut observed = 0;
+    let snapshot = confirmed_signed_out(
+        &home,
+        &stored,
+        (&usage_url, &token_url),
+        (
+            Instant::now() + Duration::from_secs(5),
+            Instant::now(),
+            || observed += 1,
+        ),
+        now,
+        None,
+        None,
+    );
+    let seen = provider_seen(port, server);
+    assert_eq!(snapshot.reading, Reading::Unread);
+    assert!(snapshot.context.is_none());
+    assert_eq!(observed, 0);
+    assert!(seen.is_empty());
+    assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
 }
 
 #[test]

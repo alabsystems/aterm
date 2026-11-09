@@ -49,10 +49,5 @@ contract! {
     { !off_known && !was_known }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "inbox_move_island.rs"]
-mod island;
-
 #[cfg(test)]
 mod tests;

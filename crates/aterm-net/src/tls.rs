@@ -392,7 +392,8 @@ where
     aterm_uds::hangup::hang_up(&stream.sock);
 }
 
-const RELAY_DRAIN_MAX: Duration = Duration::from_secs(5);
+/// Hang detector for required queued and in-flight answer bytes after local EOF.
+const RELAY_DRAIN_HANG: Duration = Duration::from_secs(60);
 
 struct RelayState<C> {
     conn: C,
@@ -450,12 +451,29 @@ where
 
 /// Relay between an authenticated TLS stream and a local `CtlStream` whose end ANSWERS.
 /// # Errors
-/// On setup failure (a socket clone, a thread that cannot start) or an unexpected mid-stream I/O
-/// error (a normal peer close — EOF, `close_notify`, a reset — is not an error).
+/// On setup failure (a socket clone, a thread that cannot start), an unexpected mid-stream I/O
+/// error, or an unfinished required answer drain past its minute hang detector.
+/// A normal peer close — EOF, `close_notify`, a reset — is not an error.
 pub fn relay_answers<C, S, G>(
     transport: TlsTransport<C>,
     local: CtlStream,
     guard: G,
+) -> io::Result<()>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
+    S: rustls::SideData + 'static,
+    G: Send + 'static,
+{
+    relay_answers_with::<C, S, G>(transport, local, guard, |_| {}, Instant::now, || {})
+}
+
+fn relay_answers_with<C, S, G>(
+    transport: TlsTransport<C>,
+    local: CtlStream,
+    guard: G,
+    mut writing: impl FnMut(&[u8]) + Send + 'static,
+    drain_started: impl FnOnce() -> Instant + Send + 'static,
+    mut draining: impl FnMut() + Send + 'static,
 ) -> io::Result<()>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
@@ -507,6 +525,7 @@ where
                 }
                 g.inflight = true;
                 drop(g);
+                writing(&out);
                 let sent = tcp_wr.write_all(&out).and_then(|()| tcp_wr.flush());
                 let mut g = shared.lock();
                 g.inflight = false;
@@ -586,13 +605,18 @@ where
                     }
                 }
             }
-            let deadline = Instant::now() + RELAY_DRAIN_MAX;
+            let deadline = drain_started() + RELAY_DRAIN_HANG;
             let mut g = shared.lock();
             while !g.done && (g.conn.wants_write() || g.inflight) {
                 let now = Instant::now();
                 if now >= deadline {
+                    g.record_err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "required TLS answer drain did not finish",
+                    ));
                     break;
                 }
+                draining();
                 g = shared
                     .cv
                     .wait_timeout(g, deadline - now)
@@ -1102,6 +1126,84 @@ mod tests {
             client_exporter, [0u8; EXPORTER_LEN],
             "exporter is real key material"
         );
+    }
+
+    #[test]
+    fn a_required_native_tls_answer_waits_for_its_inflight_writer() {
+        let _serial = serialize_loopback();
+        for age in [
+            Duration::from_secs(6),
+            Duration::from_secs(61),
+            Duration::ZERO,
+        ] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let (mut client, transport) = completed_pair();
+            client
+                .stream()
+                .sock
+                .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
+                .unwrap();
+            let (local, mut responder) = CtlStream::pair().unwrap();
+            let expected = b"required native TLS response\n";
+            responder.write_all(expected).unwrap();
+            responder.shutdown(std::net::Shutdown::Write).unwrap();
+            let (proceed, waited) = std::sync::mpsc::sync_channel(1);
+            let rescue = proceed.clone();
+            let mut waited = Some(waited);
+            let mut proceed = Some(proceed);
+            let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let blocked = Arc::clone(&observed);
+            let relayed = std::thread::spawn(move || {
+                relay_answers_with(
+                    transport,
+                    local,
+                    (),
+                    move |wire| {
+                        assert!(
+                            !wire.is_empty(),
+                            "the native TLS writer extracted a real record"
+                        );
+                        if let Some(waited) = waited.take() {
+                            waited.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                        }
+                    },
+                    move || Instant::now() - age,
+                    move || {
+                        if let Some(proceed) = proceed.take() {
+                            blocked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            proceed.send(()).unwrap();
+                        }
+                    },
+                )
+            });
+            let mut bytes = Vec::new();
+            let read = client.stream().read_to_end(&mut bytes);
+            // A truly expired drain never releases the writer; cleanup does so only after
+            // the actual TLS peer has observed closure, before joining and asserting.
+            let _ = rescue.try_send(());
+            drop(client);
+            drop(responder);
+            let outcome = relayed.join().unwrap();
+            assert_eq!(
+                observed.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(!expired)
+            );
+            if expired {
+                assert!(read.is_err());
+                assert!(
+                    bytes.is_empty(),
+                    "a cancelled native writer emits no answer later"
+                );
+                assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            } else {
+                assert!(
+                    read.is_ok(),
+                    "a scheduled native writer is not a truncated answer: {read:?}"
+                );
+                assert!(outcome.is_ok(), "{outcome:?}");
+                assert_eq!(bytes, expected);
+            }
+        }
     }
 
     #[test]

@@ -617,7 +617,6 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
         title: "Installing Homebrew",
         detail0: None,
         step: false,
-        step_short: None,
         meter: Some((None, "~3 GB")),
         busy: true,
         animated: false,

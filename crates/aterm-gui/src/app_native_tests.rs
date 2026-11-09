@@ -8129,6 +8129,70 @@ fn space_types_into_a_font_list_search_once_a_name_is_begun() {
     );
 }
 
+/// A CHOICE PICKER'S OPTIONS ARE ONE TAB STOP, AS EVERY SINGLE-CHOICE LIST'S ARE
+/// ([`crate::native_ui::tab_past_choices`]): Tab from the option the font list opened on leaves
+/// the options, and Shift-Tab comes back to the chosen one. Each option was a stop of its own,
+/// so Tab walked the font list a font at a time.
+#[test]
+fn tab_takes_a_choice_pickers_options_as_one_stop() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/font-picker/font_family"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let tab = |app: &mut App, shift: bool| {
+        let mods = if shift {
+            Modifiers::SHIFT
+        } else {
+            Modifiers::empty()
+        };
+        assert!(app.native_input_event(
+            wid,
+            &crate::input::InputEvent::Key {
+                key: Key::Named(NamedKey::Tab),
+                mods,
+                base_layout: None,
+                layout_text: None,
+                event_type: KeyEventType::Press,
+            }
+        ));
+    };
+    let focus = |app: &App| {
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+            .map(|key| key.as_str().to_string())
+            .unwrap_or_default()
+    };
+    let option = |key: &str| key.starts_with("settings/choice/font_family/");
+    let opened = focus(&app);
+    assert!(
+        option(&opened),
+        "the font list takes the keyboard: {opened}"
+    );
+    tab(&mut app, false);
+    let after = focus(&app);
+    assert!(
+        !option(&after),
+        "Tab leaves the font list's options: {after}"
+    );
+    tab(&mut app, true);
+    assert_eq!(
+        focus(&app),
+        opened,
+        "Shift-Tab comes back to the chosen font"
+    );
+}
+
 #[test]
 fn keypad_digit_and_delete_reach_a_focused_settings_field() {
     use aterm_window::event::{ElementState, KeyEvent};
@@ -10522,10 +10586,89 @@ fn page_down_before_a_pages_first_frame_steps_by_that_page() {
     );
 }
 
+/// EVERY PAGE DOWN SHOWS SOMETHING NEW UNTIL THE LIST'S LAST SCREEN, WHICH IS THE FIRST TO SHOW
+/// ITS END WHOLE ([`crate::settings_scroll`]'s `ScrollPlan::limit`): from the top of Cursor Styles
+/// in windows about 102x29, each Page Down that moves the list draws a line of words or a control
+/// whole that the screen before did not. At 102x29 the sixth screen drew Advanced tuning's card
+/// whole, its foot in the strip kept for a bar, and was no last screen: the seventh Page Down
+/// only moved the card 5pt (the end seated on the room's edge flushed into the padding over the
+/// card's caption, which the plan took for a cut first stop); at 100x27 the tenth drew it whole
+/// and the eleventh moved it 40pt, dropping its caption.
+#[test]
+fn every_page_down_on_cursor_styles_shows_something_new() {
+    use crate::native_settings::SettingsRoute;
+    let mut turned = 0;
+    for rows in 27..=31_u16 {
+        for cols in [100_u16, 102, 104] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            if let Some(ws) = app.windows.get_mut(&wid) {
+                ws.cols = cols;
+                ws.rows = rows;
+            }
+            assert!(app.open_settings_tab(SettingsRoute::CursorStyles));
+            let screen = |app: &mut App| {
+                let compiled = app.compiled_native_ui(wid).unwrap();
+                let list = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/list")
+                    .map(|node| node.rect)
+                    .expect("the page lists its styles");
+                let mut whole = std::collections::BTreeSet::new();
+                let mut place = Vec::new();
+                for node in &compiled.paint {
+                    use crate::native_ui::UiContent;
+                    let leaf = matches!(
+                        node.content,
+                        UiContent::Text(_)
+                            | UiContent::Button(_)
+                            | UiContent::Switch(_)
+                            | UiContent::Slider(_)
+                            | UiContent::TextField(_)
+                    );
+                    if !leaf {
+                        continue;
+                    }
+                    let key = node.key.as_str().to_string();
+                    place.push((key.clone(), node.rect.y.to_bits()));
+                    if (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                        && node.rect.y >= list.y - 0.5
+                        && node.rect.bottom() <= list.bottom() + 0.5
+                    {
+                        whole.insert(key);
+                    }
+                }
+                (whole, place)
+            };
+            let (mut whole, mut place) = screen(&mut app);
+            for page in 1..=40 {
+                app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1))
+                    .unwrap();
+                let (now_whole, now_place) = screen(&mut app);
+                if now_place == place {
+                    break;
+                }
+                turned += 1;
+                assert!(
+                    now_whole.difference(&whole).next().is_some(),
+                    "{cols}x{rows}: Page Down {page} only moved the list, all it draws whole \
+                     drawn so before: {now_whole:?}"
+                );
+                (whole, place) = (now_whole, now_place);
+            }
+        }
+    }
+    assert!(turned > 0, "the sweep turns pages");
+}
+
 /// AT 220x12 WITH 2x TEXT TAB ENTERS EVERY SETTINGS LIST AND REACHES EVERY CONTROL IT DRAWS:
 /// the window shows a list a row or two tall beside a sidebar whose cut rows take no focus;
 /// from the search field, Tab and Shift-Tab each reach every control some screen of the page's
-/// list draws (Page Down by Page Down), the list scrolling to each in turn.
+/// list draws (Page Down by Page Down), the list scrolling to each in turn. A single-choice
+/// list is one stop, its checked option ([`crate::native_ui::tab_past_choices`]): the arrows
+/// reach its other options.
 #[test]
 fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
     use crate::native_settings::SettingsRoute;
@@ -10573,11 +10716,17 @@ fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
             if screen_before.as_ref() == Some(&screen) {
                 break;
             }
+            let unchecked_option = |key: &crate::native_ui::UiKey| {
+                compiled.semantic(key).is_some_and(|node| {
+                    node.role == crate::native_ui::SemanticRole::ListBoxOption
+                        && node.state.is_none_or(|state| !state.selected)
+                })
+            };
             drawn.extend(
                 compiled
                     .focus_order
                     .iter()
-                    .filter(|key| !chrome(key))
+                    .filter(|key| !chrome(key) && !unchecked_option(key))
                     .map(|key| key.as_str().to_string()),
             );
             screen_before = Some(screen);

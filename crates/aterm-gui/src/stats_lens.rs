@@ -6229,6 +6229,19 @@ impl crate::App {
         rows
     }
 
+    /// Whether window pixel `(x, y)` lies inside `wid`'s open stats lens card.
+    pub(crate) fn stats_lens_at(&self, wid: crate::WindowId, x: f64, y: f64) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let (Some((dx, dy, w, h)), Some(_)) = (ws.stats_lens.rect, ws.stats_lens.open) else {
+            return false;
+        };
+        let (ox, oy) = self.frame_origin(wid);
+        let (fx, fy) = (x - ox as f64 - f64::from(dx), y - oy as f64 - f64::from(dy));
+        (0.0..f64::from(w)).contains(&fx) && (0.0..f64::from(h)).contains(&fy)
+    }
+
     /// The pointer in `wid`'s lens card pixels, while it is over the lens.
     fn lens_card_point(&self, wid: crate::WindowId) -> Option<(f64, f64)> {
         let ws = self.windows.get(&wid)?;

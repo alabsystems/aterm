@@ -7,7 +7,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Typed AppKit and Carbon exports loaded only by native UI features."
+description = "AppKit, Carbon and ServiceManagement loaded only by native UI features."
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-objc = { workspace = true }

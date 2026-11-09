@@ -4,12 +4,19 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+/// A sleep in a session of its own, started with the signals that end a process at their
+/// defaults, set here, not this test binary's: one started ignoring SIGHUP or SIGTERM (a `nohup`
+/// or `&` runner's choice, which every exec keeps) would outlive a stray hang-up or this test's
+/// own SIGTERM.
 fn setsid_sleep() -> aterm_uds::spawnfd::Child {
-    aterm_uds::spawnfd::command("/bin/sleep")
+    let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
+    let sleep = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
         .setsid(true)
         .spawn()
-        .expect("the bystander sleep must spawn")
+        .expect("the bystander sleep must spawn");
+    drop(start);
+    sleep
 }
 
 fn running(child: &mut aterm_uds::spawnfd::Child) -> bool {

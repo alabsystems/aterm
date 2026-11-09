@@ -7280,7 +7280,11 @@ fn cursor_style_rows_preview_unsaved_and_save_in_one_patch() {
         "the check stays on the saved style while others are tried"
     );
     let comet = compiled.semantic(&UiKey::new(comet_row.as_str())).unwrap();
-    assert_eq!(comet.role, SemanticRole::Button);
+    assert_eq!(
+        comet.role,
+        SemanticRole::ListBoxOption,
+        "an option of the styles' single-choice list"
+    );
     assert_eq!(comet.label, "Comet");
     assert!(
         comet
@@ -8558,7 +8562,6 @@ fn trail_colour_rows_name_the_style_s_real_default() {
         ("comet", "Pale blue (default)"),
         ("beam", "Ice blue (default)"),
         ("sparkle", "Gold (default)"),
-        ("phaser", "Cursor color (default)"),
     ] {
         let toml = format!("cursor_trail_style = \"{style}\"\n");
         assert_eq!(
@@ -8566,6 +8569,51 @@ fn trail_colour_rows_name_the_style_s_real_default() {
             own,
             "{style}"
         );
+    }
+    // A style that colours a block from its own palette takes the colour on a bar cursor's rod
+    // alone, and that rod keeps its own colour while the colour is blank: the row named blank
+    // "Cursor color" over Fire's amber rod. On a block the row is idle and names the same.
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    for (style, own, chip) in [
+        ("fire", "Amber (default)", Some(rgb(0x00FF_9632))),
+        ("water", "Aqua (default)", Some(rgb(0x0032_DCDE))),
+        ("rainbow kitty", "Pink (default)", Some(rgb(0x00FF_66CC))),
+        ("phaser", "Shifting colors (default)", None),
+    ] {
+        for shape in ["bar", "block"] {
+            let toml = format!("cursor_style = \"{shape}\"\ncursor_trail_style = \"{style}\"\n");
+            let at = format!("{style} on a {shape}");
+            assert_eq!(
+                placeholder(&toml, prefs::EDIT_CURSOR_TRAIL_COLOR),
+                own,
+                "{at}"
+            );
+            assert_eq!(
+                color_picker::unset_color_swatch(&state(&toml), prefs::EDIT_CURSOR_TRAIL_COLOR),
+                chip,
+                "{at}"
+            );
+            // The preview's caption names it as the row does; read off the default config's
+            // fields, it named Rainbow kitty's ("Trail color: Pink" over Fire).
+            let mut shown = state(&toml);
+            shown.navigate(SettingsRoute::CursorStyles);
+            let caption = renderer_preview_spec_for_key_with_font(
+                &shown,
+                prefs::EDIT_CURSOR_TRAIL_COLOR,
+                0,
+                crate::native_app::ViewMotionCx::default(),
+                13.0,
+                1.0,
+                None,
+            )
+            .expect("the preview")
+            .focused_value;
+            assert_eq!(
+                Some(caption.as_str()),
+                own.strip_suffix(" (default)"),
+                "{at}: the preview's caption"
+            );
+        }
     }
     let chosen = 0x00E0_218A;
     let brighter = aterm_effects::cursor_fx::brighten(chosen, 1.5);
@@ -8848,11 +8896,23 @@ fn tuning_a_style_does_not_read_says_so() {
         )
         .is_empty()
     );
+    // Fire's trail color tints its rod on a bar cursor alone: idle on a block for that reason,
+    // never "not used by Fire", which denied the rod the row's note names. Its accent it never
+    // reads.
+    let fire = format!("{on}cursor_trail_style = \"fire\"\n");
     assert_eq!(
+        note(&fire, prefs::EDIT_CURSOR_TRAIL_COLOR),
+        vec!["Inactive: bar cursor only".to_string()]
+    );
+    assert!(
         note(
-            &format!("{on}cursor_trail_style = \"fire\"\n"),
+            &format!("cursor_style = \"bar\"\n{fire}"),
             prefs::EDIT_CURSOR_TRAIL_COLOR
-        ),
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        note(&fire, prefs::EDIT_CURSOR_TRAIL_ACCENT),
         vec!["Inactive: not used by Fire".to_string()]
     );
     assert!(note(on, prefs::EDIT_CURSOR_TRAIL_INTENSITY).is_empty());
@@ -25391,6 +25451,9 @@ fn a_box_says_why_its_rows_are_idle_only_where_all_of_them_are() {
         None,
         "Rainbow kitty reads the duration and intensity"
     );
+    // Rainbow kitty's rod takes the trail color on a bar cursor, idle on a block for that
+    // reason, while it never reads the accent: no reason is the box's. "Rainbow kitty does not
+    // use these." denied the rod its color.
     assert_eq!(
         shared_inactive_reason(
             &rainbow,
@@ -25398,9 +25461,20 @@ fn a_box_says_why_its_rows_are_idle_only_where_all_of_them_are() {
                 prefs::EDIT_CURSOR_TRAIL_COLOR,
                 prefs::EDIT_CURSOR_TRAIL_ACCENT
             ],
+        ),
+        None
+    );
+    assert_eq!(
+        shared_inactive_reason(
+            &rainbow,
+            &[
+                prefs::EDIT_CURSOR_TRAIL_LENGTH,
+                prefs::EDIT_CURSOR_TRAIL_ACCENT
+            ],
         )
         .map(|(_, sentence)| sentence),
-        Some("Rainbow kitty does not use these.".to_string())
+        Some("Rainbow kitty does not use these.".to_string()),
+        "CONTROL: rows it reads on no cursor share the reason"
     );
 
     let (mut runtime, instance, view) = setup();
@@ -26942,6 +27016,12 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
             assert!(
                 effect_note_contains(&fallback, "no HDR display here"),
                 "{fallback:?}"
+            );
+        } else if *key == prefs::EDIT_CURSOR_TRAIL_COLOR {
+            // Rainbow kitty's rod takes the colour on a bar cursor alone.
+            assert!(
+                effect_note_contains(&fallback, "bar cursor only"),
+                "{key}: {fallback:?}"
             );
         } else {
             assert!(

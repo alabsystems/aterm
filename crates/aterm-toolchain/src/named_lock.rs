@@ -870,8 +870,9 @@ mod tests {
     const STANDIN: &str = "ATERM_TOOLCHAIN_NAMED_LOCK_STANDIN";
 
     /// Run by [`an_interrupt_ends_a_wait_for_a_held_lock`] in a process of its own: waits for the
-    /// lock [`STANDIN`] names, with SIGINT at its default action as a foreground process has it,
-    /// writing `waiting` beside it once it waits, and exits 3, a tool's NOT RUN, naming what
+    /// lock [`STANDIN`] names, with SIGINT and SIGTERM at their default actions as a foreground
+    /// process has them (set here, not inherited from the runner), writing `waiting` beside it
+    /// once it waits, and exits 3, a tool's NOT RUN, naming what
     /// ended the wait and the holder.
     #[cfg(unix)]
     #[test]
@@ -881,6 +882,9 @@ mod tests {
         };
         // SAFETY: SIG_DFL is a disposition, no handler of ours.
         unsafe {
+            // SIGTERM at its default action too, whatever this test binary was started with: a
+            // watch leaves an ignored one ignored, and the SIGTERM leg sends it.
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
         let waiting = path.with_file_name("waiting");

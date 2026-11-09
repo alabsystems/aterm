@@ -21,38 +21,63 @@ enum Damage {
     SourceAfterProbe,
 }
 
+static HARNESS_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn harness_world(label: &str) -> World {
     let mut w = world(label);
-    w.checkout = w.root.join("claude-code-alab");
-    fixture_checkout(
-        &w.checkout,
-        &[
-            (
-                "Cargo.toml",
-                b"[package]\nname = \"claude-code-alab\"\nversion = \"0.1.0\"\n",
-            ),
-            (".gitignore", b"/target/\n/hidden\n"),
-        ],
-    );
-    let bare = w
-        .root
+    let root = w.root.join("harness");
+    w.checkout = root.join("claude-code-alab");
+    let bare = root
         .join("remotes")
         .join(&w.ctx.accounts.staging)
         .join("claude-code-alab.git");
-    super::super::fixture::bare_origin(&bare);
-    git(
-        &w.checkout,
-        &["remote", "add", "origin", &bare.to_string_lossy()],
-    );
-    git(
-        &w.checkout,
-        &["push", "-q", "origin", "HEAD:refs/heads/main"],
-    );
+    static MADE: crate::shared::Made<String, ()> = Mutex::new(std::collections::BTreeMap::new());
+    crate::shared::made_once(&MADE, &w.ctx.accounts.staging, &root, |_| {
+        HARNESS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fixture_checkout(
+            &w.checkout,
+            &[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"claude-code-alab\"\nversion = \"0.1.0\"\n",
+                ),
+                (".gitignore", b"/target/\n/hidden\n"),
+            ],
+        );
+        super::super::fixture::bare_origin(&bare);
+        git(
+            &w.checkout,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        git(
+            &w.checkout,
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+    });
     w.host.add_clone_source(
         &Slug::new(&w.ctx.accounts.staging, "claude-code-alab"),
         &bare,
     );
     w
+}
+
+/// NEGATIVE CONTROLS: rebuilding each seed increments the count; reusing an origin or leaving
+/// its old absolute path in config lets the first push change the second copy's main.
+#[test]
+fn cached_harness_repositories_build_once_and_isolate_pushes() {
+    let a = harness_world("harness-copy-a");
+    let b = harness_world("harness-copy-b");
+    let before = git(&b.checkout, &["rev-parse", "origin/main"]);
+    put(&a.checkout.join("private"), b"one copy\n");
+    git(&a.checkout, &["add", "private"]);
+    git(&a.checkout, &["commit", "-qm", "private copy"]);
+    git(&a.checkout, &["push", "-q", "origin", "HEAD:main"]);
+    git(&b.checkout, &["fetch", "-q", "origin"]);
+    assert_eq!(git(&b.checkout, &["rev-parse", "origin/main"]), before);
+    assert!(!b.checkout.join("private").exists());
+    let c = harness_world("harness-copy-c");
+    assert_eq!(git(&c.checkout, &["rev-parse", "HEAD"]), before);
+    assert_eq!(HARNESS_BUILDS.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 fn request(w: &World) -> Request {

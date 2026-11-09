@@ -553,9 +553,7 @@ fn write_world(tmp: &Path) {
          # with nothing drawn, and after a *.type screen ONE bounded read takes\n\
          # what was written, logged text:. A *.over one is a *.look\n\
          # drawn with no clear first, its own bytes homing the cursor and\n\
-         # erasing each row's tail, as a real program moves its screen. A\n\
-         # *.hold's seconds start once $log.go exists (the test says when: the\n\
-         # host has attached).\n\
+         # erasing each row's tail, as a real program moves its screen.\n\
          # It first clears what the shell printed between its fork and this\n\
          # exec, then writes a cell and erases it in place, as a real Claude\n\
          # Code moves the screen as it starts (start_fake says why).\n\
@@ -570,7 +568,7 @@ fn write_world(tmp: &Path) {
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 case \"$scene\" in\n\
-         \x20 *.hold) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {HOLD_S}; continue ;;\n\
+         \x20 *.hold) sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
          \x20 *.gate) while [ ! -e \"$log.release\" ]; do sleep 0.1; done; continue ;;\n\
          \x20 *.look|*.over) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
@@ -610,7 +608,6 @@ fn write_world(tmp: &Path) {
         ("drafts-busy.txt", body(DRAFTS_BUSY)),
         ("ask-busy.txt", body(ASK_BUSY)),
         ("web-setup-busy.txt", body(WEB_SETUP_BUSY)),
-        ("busy.hold", body(SPINNER)),
         ("busy.gate", body(SPINNER)),
         (
             "wall.hold",
@@ -694,26 +691,6 @@ fn write_world(tmp: &Path) {
     }
 }
 
-fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
-    std::fs::write(inst.tmp.join(format!("{keys}.go")), b"").expect("start the fake's clock");
-    start_fake(inst, keys, screens);
-}
-
-fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
-    no_earlier_claim(inst);
-    let go = inst.tmp.join(format!("{keys}.go"));
-    let _ = std::fs::remove_file(&go);
-    let mark = timeline_since(inst, 0).last().map_or(0, |e| e.0);
-    let started = Instant::now();
-    start_fake(inst, keys, screens);
-    until_attached(inst, keys, mark);
-    eprintln!(
-        "measured, not judged: the host attached to {keys} {:?} after its start",
-        started.elapsed()
-    );
-    std::fs::write(&go, b"").expect("start the fake's clock");
-}
-
 /// Waits for the host to attach to `keys`' fake: a `supervisor=aterm-harness` meta change on
 /// the timeline after `mark`.
 fn until_attached(inst: &Instance, keys: &str, mark: u64) {
@@ -755,7 +732,7 @@ fn run_fake_looked(inst: &Instance, keys: &str, screens: &[&str]) -> usize {
     no_earlier_claim(inst);
     let mut mark = journal_records(inst).len();
     let attach = timeline_since(inst, 0).last().map_or(0, |e| e.0);
-    start_fake(inst, keys, screens);
+    run_fake(inst, keys, screens);
     for scene in screens
         .iter()
         .take_while(|s| s.ends_with(".late") || s.ends_with(".look"))
@@ -795,7 +772,7 @@ fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize) -> usize {
     }
 }
 
-fn start_fake(inst: &Instance, keys: &str, screens: &[&str]) {
+fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
     start_fake_in(inst, &inst.sid, keys, screens);
 }
 
@@ -1297,7 +1274,18 @@ fn the_host_answers_what_the_policy_proves_safe() {
         harness_lines(&inst)
     );
 
-    run_fake_attached(&inst, "k2", &["busy.hold", "survey.txt"]);
+    no_earlier_claim(&inst);
+    run_fake(&inst, "k2", &["busy.gate", "survey.txt"]);
+    until(
+        HANG,
+        "the host attached to the busy agent",
+        || status(&inst),
+        |s| {
+            field(s, "agent") == Some("busy")
+                && field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness@"))
+        },
+    );
+    std::fs::write(inst.tmp.join("k2.release"), b"").expect("show the survey");
     keys_until(&inst, "k2", &["0"], HANG);
     program_is(&inst, "sh", HANG);
 

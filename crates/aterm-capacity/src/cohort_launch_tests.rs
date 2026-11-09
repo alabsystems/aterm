@@ -110,7 +110,13 @@ fn group_requests_keep_full_custody_and_require_the_original_unreaped_birth() {
     use std::os::unix::process::ExitStatusExt as _;
     let fixture = CohortFixture::new();
     let mut claim = fixture.claim();
-    let mut leader = Leader::new(claim.launch_cohort(&mut cat()).unwrap());
+    // The leader must end by the Terminate request's SIGTERM: it starts with SIGTERM at its
+    // default, set here, not this test binary's (a `nohup` or `&` runner's ignored one, which
+    // every exec keeps).
+    let start = aterm_spec::start::at_defaults(&[libc::SIGTERM]);
+    let launched = claim.launch_cohort(&mut cat()).unwrap();
+    drop(start);
+    let mut leader = Leader::new(launched);
     let mut deaf = spawnfd::command("/bin/sh");
     deaf.args(["-c", "trap '' TERM; exec /bin/cat"])
         .stdin(Stdio::piped())
@@ -166,7 +172,13 @@ fn group_requests_keep_full_custody_and_require_the_original_unreaped_birth() {
         .request_group(CohortSignal::Terminate)
         .unwrap();
     // Observation does NOT reap: the original leader still pins its group even
-    // after its terminal exit, so a surviving member can be continued/cancelled.
+    // after its terminal exit, so a surviving member can be continued/cancelled. Its exit must
+    // come: within the one-minute hang detector.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the leader's exit by its SIGTERM",
+        || leader.launched.child_mut().exited().unwrap().then_some(()),
+    );
     leader.launched.child_mut().wait_exited().unwrap();
     assert!(!leader.launched.child_mut().is_reaped());
     leader

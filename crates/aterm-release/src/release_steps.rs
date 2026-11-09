@@ -298,6 +298,7 @@ pub struct Real {
     pool: Option<Pool>,
     warming: Option<WarmingVerifier>,
     warm_verifier: Option<PathBuf>,
+    automatic_prefreeze: Option<aterm_uds::spawnfd::Child>,
 }
 
 struct WarmingVerifier {
@@ -606,6 +607,19 @@ impl Drop for Forwarded {
 
 impl Drop for Real {
     fn drop(&mut self) {
+        if let Some(mut child) = self.automatic_prefreeze.take() {
+            // The supervisor handles TERM and settles its worker before exiting. Reap
+            // it here, after the step timers, only once that cleanup has completed.
+            if child.terminate().is_err() || child.wait().is_err() {
+                aterm_uds::deadline::settle_child(&mut child);
+            }
+            self.say(&format!(
+                "release-event: {}",
+                aterm_json::json!({
+                    "schema":1,"event":"prefreeze-ended","timing_scope":"next-cut",
+                })
+            ));
+        }
         drop(self.warming.take());
         if self.scratch_logs {
             let _ = std::fs::remove_dir_all(&self.logs);
@@ -671,6 +685,7 @@ impl Real {
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
         Ok(Self {
             prefreeze_claim: None,
+            automatic_prefreeze: None,
             build_inputs: crate::build_inputs::current,
             arm_inputs: crate::build_inputs::arm,
             handed_inputs: crate::build_inputs::handed_path,
@@ -2180,18 +2195,134 @@ impl Real {
         commit: &str,
         prover: &Prover,
     ) -> Result<crate::release_tools::Cutter, String> {
-        let log = self.step_log(self.step);
-        {
-            let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-check");
-            crate::release_tools::clean_at(&self.repo, commit)?;
-        }
+        crate::release_tools::clean_at(&self.repo, commit)?;
         if crate::release_tools::Recovery::read(commit) != crate::release_tools::Recovery::Refreeze
             && let Ok(cutter) = crate::release_tools::recorded_cutter(&self.release, commit)
         {
             return Ok(cutter);
         }
+        let cache = self.release.join("cutter-cache");
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        let pid = std::process::id();
+        let started = started_of(pid).ok_or("cannot identify cutter workspace holder")?;
+        let _lease = crate::release::RunClaim::take(
+            &cache.join("workspace-running"),
+            (pid, &started),
+            &self.logs,
+            &mut started_of,
+        )
+        .map_err(|why| format!("cutter workspace unavailable: {why:?}"))?;
+        let compiler = self.cutter_workspace_at(&cache, commit)?;
+        let built = compiler.frozen_cutter_here(commit, prover)?;
+        let mut cutter = crate::release_tools::stage_cutter(
+            &self.release,
+            commit,
+            &built.tool.path,
+            &self.step_log(self.step),
+            built.inputs,
+        )?;
+        cutter.built_from = built.built_from;
+        crate::release_tools::clean_at(&self.repo, commit)?;
+        crate::release_tools::publish_cutter(&self.release, &cutter)?;
+        Ok(cutter)
+    }
+
+    /// One stable compiler checkout for this clone, shared by preparation and freeze 1.
+    /// Its own proof never replaces the proof of the cutter running the current cut.
+    fn cutter_workspace_at(&self, cache: &Path, commit: &str) -> Result<Real, String> {
+        let key = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(
+            cache.as_os_str().as_encoded_bytes(),
+        ));
+        let source = self
+            .state
+            .join(".ubd")
+            .join(format!("cutter-{key}.noindex"));
+        std::fs::create_dir_all(source.parent().ok_or("no cutter source parent")?)
+            .map_err(|e| e.to_string())?;
+        // Only the exclusive workspace holder changes this regenerable checkout. An
+        // interrupted Git transaction may leave locks or a partially populated index;
+        // reconstruct those sources, retaining the separately placed compiler cache.
+        let synchronized = cache.join("source-ready");
+        if source.exists() && !synchronized.exists() {
+            std::fs::remove_dir_all(&source).map_err(|e| e.to_string())?;
+        }
+        match std::fs::remove_file(&synchronized) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if !source.exists() {
+            crate::ledger::git_ok(
+                &self.git(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    self.repo.to_str().ok_or("non-UTF8 repository")?,
+                    source.to_str().ok_or("non-UTF8 compiler checkout")?,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let git = GitCli::new(&source);
+        let run = |args: &[&str]| {
+            crate::ledger::git_ok(&git, args)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        run(&[
+            "fetch",
+            "--quiet",
+            self.repo.to_str().ok_or("non-UTF8 repository")?,
+            commit,
+        ])?;
+        run(&["checkout", "--quiet", "--detach", commit])?;
+        if source.join(".gitmodules").exists() {
+            run(&[
+                "config",
+                "submodule.vendor/astream.url",
+                self.repo
+                    .join("vendor/astream")
+                    .to_str()
+                    .ok_or("non-UTF8 submodule")?,
+            ])?;
+            run(&[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "vendor/astream",
+            ])?;
+        }
+        crate::release_tools::clean_at(&source, commit)?;
+        crate::durable::write_atomic_durable(&synchronized, commit.as_bytes(), 0o600)
+            .map_err(|e| e.to_string())?;
+        let mut compiler = Real::new(&source, Some(&self.engine_source), true, false)?;
+        let _ = std::fs::remove_dir_all(&compiler.logs);
+        compiler.release = cache.to_owned();
+        compiler.state = cache.join("state");
+        compiler.build_inputs = self.build_inputs;
+        compiler.arm_inputs = self.arm_inputs;
+        compiler.logs = self.logs.clone();
+        compiler.scratch_logs = false;
+        compiler.step = self.step;
+        Ok(compiler)
+    }
+
+    fn frozen_cutter_here(
+        &self,
+        commit: &str,
+        prover: &Prover,
+    ) -> Result<crate::release_tools::Cutter, String> {
+        let log = self.step_log(self.step);
+        {
+            let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-check");
+            crate::release_tools::clean_at(&self.repo, commit)?;
+        }
         // The build supplies both the authoritative freshness decision and the selected
-        // graph. It reuses the same persistent gate units as the launching ship alias.
+        // graph. Preparation and freeze 1 share these persistent gate units.
         let seal = if cfg!(target_os = "macos") {
             let _timing = crate::cut_timing::Timer::start(&log, "cutter-inputs-seal");
             (self.arm_inputs)(&self.state, Some(&self.transcript()));
@@ -5423,6 +5554,55 @@ impl Backend for Real {
         }
     }
 
+    fn start_prefreeze(&mut self) {
+        #[cfg(unix)]
+        {
+            let start = || -> Result<aterm_uds::spawnfd::Child, String> {
+                let line = self
+                    .line_priority
+                    .as_ref()
+                    .ok_or("release line claim absent")?;
+                let log = crate::durable::open_append(&self.logs.join("prefreeze.log"), true)
+                    .map_err(|e| e.to_string())?;
+                let mut cmd = command(std::env::current_exe().map_err(|e| e.to_string())?);
+                cmd.args(["release", "--prefreeze"])
+                    .current_dir(&self.repo)
+                    .env(AUTO_PREFREEZE, line.record().cover_marker())
+                    .env(aterm_capacity::RELEASE_RUN_ENV, "1")
+                    .env_remove("TRUST_STAGE2_BIN")
+                    .env_remove(crate::build_inputs::SEAL_ENV)
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                    .stderr(log)
+                    .setsid(true)
+                    .default_signals()
+                    .enter_background_band()
+                    .tether();
+                cmd.spawn().map_err(|e| e.to_string())
+            };
+            match start() {
+                Ok(child) => {
+                    self.say(&format!(
+                        "release-event: {}",
+                        aterm_json::json!({
+                            "schema":1,"event":"prefreeze-started","pid":child.id(),
+                            "timing_scope":"next-cut",
+                        })
+                    ));
+                    // Do not poll/reap this child inside a step: RUSAGE_CHILDREN would
+                    // charge its preparation to whichever step happened to reap it.
+                    self.automatic_prefreeze = Some(child);
+                }
+                Err(why) => self.say(&format!(
+                    "release-event: {}",
+                    aterm_json::json!({
+                        "schema":1,"event":"prefreeze-unavailable","why":why,
+                    })
+                )),
+            }
+        }
+    }
+
     fn fleet_line(&mut self, line: &Line, continued: bool) -> Result<Line, String> {
         let prefix =
             crate::line::recorded_prefix(&self.git(), line).map_err(|error| error.to_string())?;
@@ -7472,8 +7652,8 @@ fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
     Ok(Some(claim))
 }
 
-/// A standalone preparation, with no release rank, journal, authority or publication work.
-/// The caller refreshes origin/main and its clean checkout before invoking this verb.
+/// Preparation without publication work. Standalone callers refresh origin/main;
+/// the automatic supervisor refreshes it and owns the worker under the cut's rank.
 fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), String> {
     #[cfg(not(unix))]
     {
@@ -7482,6 +7662,9 @@ fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), S
     }
     #[cfg(unix)]
     {
+        if let Ok(line) = std::env::var(AUTO_PREFREEZE) {
+            return supervise_prefreeze(repo, &line);
+        }
         // The capacity guard cancels its own dedicated group. The parent waits, so a
         // targo launcher never exits leaving an unowned compiler behind.
         // SAFETY: getpgrp only reads this process's group.
@@ -7505,7 +7688,7 @@ fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), S
         let tip = real
             .git_out(&["rev-parse", "origin/main"])
             .ok_or("cannot resolve local origin/main")?;
-        let cutter = prepare_cutter(&mut real, tip.trim())?;
+        let cutter = prepare_cached_cutter(&mut real, tip.trim())?;
         println!(
             "prefrozen: {} {}",
             cutter.commit,
@@ -7515,10 +7698,165 @@ fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), S
     }
 }
 
-/// The production preparation path, also exercised by the offline launch instrument.
 #[cfg(unix)]
-fn prepare_cutter(real: &mut Real, tip: &str) -> Result<crate::release_tools::Cutter, String> {
-    if std::env::var_os(aterm_capacity::RELEASE_RUN_ENV).is_some() {
+const AUTO_PREFREEZE: &str = "ATERM_RELEASE_AUTO_PREFREEZE";
+#[cfg(unix)]
+const PREFREEZE_WORKER: &str = "ATERM_RELEASE_PREFREEZE_WORKER";
+
+#[cfg(unix)]
+struct PrefreezeWorker(Option<aterm_uds::spawnfd::Child>);
+
+#[cfg(unix)]
+impl Drop for PrefreezeWorker {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            aterm_uds::deadline::settle_child(&mut child);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_cached_cutter(
+    real: &mut Real,
+    tip: &str,
+) -> Result<crate::release_tools::Cutter, String> {
+    real.prefreeze_claim = Some(prefreeze_admission()?);
+    let tip = if std::env::var_os(PREFREEZE_WORKER).is_some() {
+        let mut fetch = real.child(aterm_uds::os_path!("git"), None);
+        fetch.args(["fetch", "origin"]).env_remove("GITHUB_TOKEN");
+        if !fetch
+            .spawn()
+            .and_then(|mut child| child.wait())
+            .map_err(|e| e.to_string())?
+            .success()
+        {
+            return Err("cannot refresh origin/main for preparation".into());
+        }
+        real.git_out(&["rev-parse", "origin/main"])
+            .ok_or("cannot resolve refreshed origin/main")?
+    } else {
+        tip.to_owned()
+    };
+    let cache = real.release.join("cutter-cache");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let pid = std::process::id();
+    let started = started_of(pid).ok_or("cannot identify pre-freeze holder")?;
+    let _lease = crate::release::RunClaim::take(
+        &cache.join("workspace-running"),
+        (pid, &started),
+        &real.logs,
+        &mut started_of,
+    )
+    .map_err(|why| format!("cutter workspace unavailable: {why:?}"))?;
+    let mut compiler = real.cutter_workspace_at(&cache, &tip)?;
+    compiler.prefreeze_claim = real.prefreeze_claim.take();
+    // This standalone worker has not selected a prover yet. Resolve from the new
+    // source's lock, independently of the ongoing cut's working directory and seal.
+    std::env::set_current_dir(&compiler.repo).map_err(|e| e.to_string())?;
+    crate::gates::arm_toolchain_lease();
+    let prover = compiler.prover(None)?;
+    compiler.frozen_cutter_here(&tip, &prover)
+}
+
+/// The supervisor is a separate, unreaped child until the run ends. Its reaped compiler
+/// children therefore never enter the current cut's step counters.
+#[cfg(unix)]
+fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
+    interrupt::install();
+    let ledger = aterm_capacity::Ledger::user().ok_or("capacity ledger unavailable")?;
+    let mut worker = PrefreezeWorker(None);
+    loop {
+        if interrupt::caught().is_some() {
+            return Ok(());
+        }
+        let rows = ledger.list().map_err(|e| e.to_string())?;
+        let own = worker.0.as_ref().map(aterm_uds::spawnfd::Child::id);
+        let state = prefreeze_traffic(&rows, line, own);
+        if state != PrefreezeTraffic::Free {
+            if let Some(mut child) = worker.0.take() {
+                aterm_uds::deadline::settle_child(&mut child);
+                println!(
+                    "release-event: {}",
+                    aterm_json::json!({
+                        "schema":1,"event":"prefreeze-yielded",
+                    })
+                );
+            }
+            if state == PrefreezeTraffic::End {
+                return Ok(());
+            }
+        } else if let Some(child) = worker.0.as_mut() {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                println!(
+                    "release-event: {}",
+                    aterm_json::json!({
+                        "schema":1,"event":"prefreeze-finished","success":status.success(),
+                    })
+                );
+                return Ok(());
+            }
+        } else {
+            let mut cmd = command(std::env::current_exe().map_err(|e| e.to_string())?);
+            cmd.args(["release", "--prefreeze"])
+                .current_dir(repo)
+                .env_remove(AUTO_PREFREEZE)
+                .env(PREFREEZE_WORKER, "1")
+                .env(aterm_capacity::RELEASE_RUN_ENV, "1")
+                .setsid(true)
+                .default_signals()
+                .enter_background_band()
+                .tether();
+            worker.0 = Some(cmd.spawn().map_err(|e| e.to_string())?);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefreezeTraffic {
+    Free,
+    Yield,
+    End,
+}
+
+#[cfg(unix)]
+fn prefreeze_traffic(
+    rows: &[aterm_capacity::Record],
+    line: &str,
+    worker: Option<u32>,
+) -> PrefreezeTraffic {
+    let Some(owner) = rows.iter().find(|row| row.cover_marker() == line) else {
+        return PrefreezeTraffic::End;
+    };
+    let mut result = PrefreezeTraffic::Free;
+    for row in rows {
+        if row.cover_marker() == line || Some(row.pid) == worker {
+            continue;
+        }
+        if row.need.rank == aterm_capacity::Rank::Release {
+            if row.need.what == owner.need.what
+                && row.need.mem == 0
+                && row.need.cores == 0
+                && row.need.disk == 0
+                && row.need.quiet.is_none()
+            {
+                return PrefreezeTraffic::End;
+            }
+            result = PrefreezeTraffic::Yield;
+        } else if row.need.quiet.is_some() {
+            result = PrefreezeTraffic::Yield;
+        }
+    }
+    result
+}
+
+/// Admit before source synchronization, so Git's work excludes windowed/timed checks too.
+#[cfg(unix)]
+fn prefreeze_admission() -> Result<aterm_capacity::Claim, String> {
+    if std::env::var_os(aterm_capacity::RELEASE_RUN_ENV).is_some()
+        && std::env::var_os(PREFREEZE_WORKER).is_none()
+    {
         return Err("pre-freeze must run outside a cut".into());
     }
     // Darwin's published PRIO_DARWIN_PROCESS and PRIO_DARWIN_BG apply the
@@ -7529,26 +7867,10 @@ fn prepare_cutter(real: &mut Real, tip: &str) -> Result<crate::release_tools::Cu
         return Err(std::io::Error::last_os_error().to_string());
     }
     interrupt::install();
-    crate::release_tools::clean_at(&real.repo, tip)?;
     // The quiet resource excludes windowed/timed checks. Its load ceiling is
     // deliberately unbounded: this is exclusion, not a quiet-machine measurement.
-    real.prefreeze_claim = Some(
-        aterm_capacity::admit(prefreeze_need(), aterm_capacity::Admit::Preemptible)
-            .map_err(|e| e.to_string())?,
-    );
-    let pid = std::process::id();
-    let started = started_of(pid).ok_or("cannot identify pre-freeze worker")?;
-    std::fs::create_dir_all(&real.release).map_err(|e| e.to_string())?;
-    let _run = crate::release::RunClaim::take(
-        &real.release.join(crate::release::RUNNING_FILE),
-        (pid, &started),
-        &real.logs,
-        &mut started_of,
-    )
-    .map_err(|why| format!("clone already held or unavailable: {why:?}"))?;
-    crate::gates::arm_toolchain_lease();
-    let prover = real.prover(None)?;
-    real.frozen_cutter(tip, &prover)
+    aterm_capacity::admit(prefreeze_need(), aterm_capacity::Admit::Preemptible)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(unix)]
@@ -7575,6 +7897,12 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
         return match prefreeze(repo, opts) {
             Ok(()) => 0,
             Err(why) => {
+                eprintln!(
+                    "release-event: {}",
+                    aterm_json::json!({
+                        "schema":1,"event":"prefreeze-unavailable","why":why,
+                    })
+                );
                 eprintln!("release prefreeze: {why}");
                 2
             }
@@ -7895,6 +8223,235 @@ pub(crate) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Dura
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_interrupted_cutter_checkout_is_reconstructed_at_the_same_path() {
+        use super::*;
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("input"), "committed input").unwrap();
+        let git = GitCli::new(&repo);
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            crate::ledger::git_ok(&git, &args).unwrap();
+        }
+        let commit = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+            .unwrap()
+            .stdout_utf8()
+            .trim()
+            .to_owned();
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.state = temp.path().join("state");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let compiler = real.cutter_workspace_at(&cache, &commit).unwrap();
+        let source = compiler.repo.clone();
+        drop(compiler);
+        std::fs::write(source.join(".git/index.lock"), "interrupted checkout").unwrap();
+        std::fs::write(source.join("input"), "partial checkout").unwrap();
+        std::fs::remove_file(cache.join("source-ready")).unwrap();
+        let compiler = real.cutter_workspace_at(&cache, &commit).unwrap();
+        assert_eq!(compiler.repo, source);
+        assert!(!source.join(".git/index.lock").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.join("input")).unwrap(),
+            "committed input"
+        );
+        crate::release_tools::clean_at(&source, &commit).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_prefreeze_yields_to_stages_and_windows_and_ends_with_its_line() {
+        use super::*;
+        let row = |pid, need| aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::default(),
+            pid,
+            start_ms: 1,
+            seq: 1,
+            checkout: String::new(),
+            need,
+            timing: Default::default(),
+            held: None,
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        let line = row(
+            1,
+            aterm_capacity::Need::new("line").rank(aterm_capacity::Rank::Release),
+        );
+        let marker = line.cover_marker();
+        let worker = row(2, prefreeze_need().rank(aterm_capacity::Rank::Release));
+        assert_eq!(
+            prefreeze_traffic(&[line.clone(), worker.clone()], &marker, Some(2)),
+            PrefreezeTraffic::Free
+        );
+        let mut stage = row(
+            1,
+            aterm_capacity::Need::new("stage")
+                .rank(aterm_capacity::Rank::Release)
+                .mem_gib(1),
+        );
+        stage.seq = 2;
+        assert_eq!(
+            prefreeze_traffic(&[line.clone(), worker.clone(), stage], &marker, Some(2)),
+            PrefreezeTraffic::Yield
+        );
+        let window = row(3, aterm_capacity::Need::new("window").quiet(f64::MAX));
+        assert_eq!(
+            prefreeze_traffic(&[line.clone(), worker.clone(), window], &marker, Some(2)),
+            PrefreezeTraffic::Yield
+        );
+        let next = row(
+            3,
+            aterm_capacity::Need::new("line").rank(aterm_capacity::Rank::Release),
+        );
+        assert_eq!(
+            prefreeze_traffic(&[line, worker.clone(), next], &marker, Some(2)),
+            PrefreezeTraffic::End
+        );
+        assert_eq!(
+            prefreeze_traffic(&[worker], &marker, Some(2)),
+            PrefreezeTraffic::End
+        );
+    }
+
+    /// Small real Cargo graph, no release, credential, service or product execution.
+    /// The instrument counts compiled units, rather than interpreting elapsed time as a gain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit local pre-freeze timeline measurement"]
+    fn measure_automatic_prefreeze_timeline() {
+        use super::*;
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("crates/aterm-release/src")).unwrap();
+        std::fs::create_dir_all(repo.join("dep/src")).unwrap();
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            "[unstable]\nchecksum-freshness=true\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers=['dep','crates/aterm-release']\nresolver='2'\n[profile.gate]\ninherits='dev'\n").unwrap();
+        std::fs::write(repo.join("crates/aterm-release/Cargo.toml"), "[package]\nname='aterm-release'\nversion='0.0.0'\nedition='2021'\n[dependencies]\ncutter-dep={path='../../dep'}\n").unwrap();
+        std::fs::write(
+            repo.join("dep/Cargo.toml"),
+            "[package]\nname='cutter-dep'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("dep/src/lib.rs"),
+            "pub fn marker() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let program =
+            "fn main() { let _ = cutter_dep::marker(); println!(\"aterm-release tool 1\"); }\n";
+        std::fs::write(repo.join("crates/aterm-release/src/main.rs"), program).unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "version=4\n[[package]]\nname='aterm-release'\nversion='0.0.0'\ndependencies=['cutter-dep']\n[[package]]\nname='cutter-dep'\nversion='0.0.0'\n").unwrap();
+        let git = GitCli::new(&repo);
+        let git_run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
+        git_run(&["init", "-q"]);
+        let commit = || {
+            git_run(&["add", "."]);
+            git_run(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ]);
+            git_run(&["rev-parse", "HEAD"])
+                .stdout_utf8()
+                .trim()
+                .to_owned()
+        };
+        let base = commit();
+        let bin = crate::gates::trust_stage2_bin().unwrap();
+        let prover = Prover {
+            bin,
+            commit: "0".repeat(40),
+            source: "fixture pinned Trust".into(),
+        };
+        for prepared in [false, true] {
+            git_run(&["checkout", "--quiet", "--detach", &base]);
+            let state = temp.path().join(if prepared { "after" } else { "before" });
+            let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+            real.scratch_logs = false;
+            real.release = state.join("release");
+            real.state = state.join("state");
+            real.logs = state.join("logs");
+            std::fs::create_dir_all(&real.logs).unwrap();
+            real.build_inputs = || Ok("f".repeat(64));
+            real.arm_inputs = |_, _| {};
+            let n = real.frozen_cutter(&base, &prover).unwrap();
+            std::fs::write(
+                repo.join("crates/aterm-release/src/main.rs"),
+                format!("{program}// main moves during cut N\n"),
+            )
+            .unwrap();
+            let moved = commit();
+            if prepared {
+                let compiler = real
+                    .cutter_workspace_at(&real.release.join("cutter-cache"), &moved)
+                    .unwrap();
+                compiler.frozen_cutter_here(&moved, &prover).unwrap();
+                assert_eq!(
+                    crate::release_tools::recorded_cutter(&real.release, &base).unwrap(),
+                    n,
+                    "preparation must not overwrite the current cut's proof"
+                );
+            }
+            std::fs::write(repo.join("notes"), "unrelated main movement\n").unwrap();
+            let next = commit();
+            let log = real.step_log(real.step);
+            std::fs::write(&log, "").unwrap();
+            let next_cutter = real.frozen_cutter(&next, &prover).unwrap();
+            let compiled = |log: &Path| -> u64 {
+                std::fs::read_to_string(log)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("release-event: "))
+                    .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+                    .filter(|event| event["event"].as_str() == Some("frozen-tool-compile"))
+                    .map(|event| event["compiled_units"].as_u64().unwrap())
+                    .sum()
+            };
+            let first = compiled(&log);
+            assert_eq!(first, if prepared { 0 } else { 1 });
+            if prepared {
+                assert_eq!(next_cutter.built_from, moved);
+                std::fs::write(
+                    repo.join("crates/aterm-release/src/main.rs"),
+                    format!("{program}// another cutter delta\n"),
+                )
+                .unwrap();
+                let delta = commit();
+                std::fs::write(&log, "").unwrap();
+                let delta_cutter = real.frozen_cutter(&delta, &prover).unwrap();
+                assert_eq!(compiled(&log), 1, "unchanged dependency stays fresh");
+                assert_eq!(delta_cutter.built_from, delta);
+                assert_ne!(delta_cutter.inputs, next_cutter.inputs);
+            }
+            println!("prefreeze-timeline prepared={prepared} next_freeze_compiled_units={first}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn prefreeze_reserves_background_build_and_timing_exclusion() {
@@ -8264,10 +8821,10 @@ mod tests {
     }
 
     /// NEGATIVE CONTROL: omitting settlement, or ending only the direct child, leaves the
-    /// output pipe open. EOF proves the owned build and its inherited-pipe descendant ended.
+    /// output pipe open. EOF proves each owned build and its inherited-pipe descendant ended.
     #[cfg(unix)]
     #[test]
-    fn an_early_refusal_settles_the_warming_verifier_and_its_group() {
+    fn an_early_refusal_settles_owned_warmups_and_their_groups() {
         use super::*;
         use std::io::Read as _;
         use std::os::fd::AsFd as _;
@@ -8278,44 +8835,51 @@ mod tests {
             "#!/bin/sh\n/bin/sh -c 'printf \"ready\\n\"; while :; do /bin/sleep 60; done' &\nwait\n",
         )
         .unwrap();
-        let mut command = command(&program);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut child = command.spawn().unwrap();
-        let mut output = child.stdout.take().unwrap();
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert!(
-            !aterm_uds::ready::any_until(&[output.as_fd()], end)
-                .unwrap()
-                .is_empty()
-        );
-        let mut line = [0; 6];
-        output.read_exact(&mut line).unwrap();
-        assert_eq!(&line, b"ready\n");
-        let forwarded = Forwarded {
-            _running: interrupt::Running::enter(child.id()),
-            note: None,
-        };
-        drop(WarmingVerifier {
-            commit: "a".repeat(40),
-            child,
-            _forwarded: forwarded,
-            stdout: temp.path().join("out"),
-            stderr: temp.path().join("err"),
-        });
-        assert!(
-            !aterm_uds::ready::any_until(&[output.as_fd()], end)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            output.read(&mut [0]).unwrap(),
-            0,
-            "no build descendant retains the pipe"
-        );
+        for warming in [true, false] {
+            let mut command = command(&program);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            let mut output = child.stdout.take().unwrap();
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            assert!(
+                !aterm_uds::ready::any_until(&[output.as_fd()], end)
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut line = [0; 6];
+            output.read_exact(&mut line).unwrap();
+            assert_eq!(&line, b"ready\n");
+            let forwarded = Forwarded {
+                _running: interrupt::Running::enter(child.id()),
+                note: None,
+            };
+            if warming {
+                drop(WarmingVerifier {
+                    commit: "a".repeat(40),
+                    child,
+                    _forwarded: forwarded,
+                    stdout: temp.path().join("out"),
+                    stderr: temp.path().join("err"),
+                });
+            } else {
+                drop(forwarded);
+                drop(PrefreezeWorker(Some(child)));
+            }
+            assert!(
+                !aterm_uds::ready::any_until(&[output.as_fd()], end)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                output.read(&mut [0]).unwrap(),
+                0,
+                "no build descendant retains the pipe"
+            );
+        }
     }
 
     /// Local instrument for the launch boundary only. It never starts a release, reads a
@@ -8425,7 +8989,7 @@ mod tests {
         std::fs::create_dir_all(&real.logs).unwrap();
         if mode == "prepare" {
             #[cfg(unix)]
-            prepare_cutter(&mut real, &base).unwrap();
+            prepare_cached_cutter(&mut real, &base).unwrap();
             return;
         }
         let prover = real.prover(None).unwrap();
@@ -11793,9 +12357,12 @@ not json
             fn signal(sig: i32, handler: usize) -> usize;
         }
         if let Some(mode) = std::env::var_os(PROBE) {
-            if mode == "control" {
-                // SAFETY: SIG_DFL is a disposition, no handler of ours.
-                unsafe {
+            // SAFETY: SIG_DFL is a disposition, no handler of ours.
+            unsafe {
+                // SIGTERM, which the probe sends itself, at its default action whatever this
+                // test binary was started with: an ignored one stays ignored.
+                signal(interrupt::SIGTERM, SIG_DFL);
+                if mode == "control" {
                     signal(interrupt::SIGHUP, SIG_DFL);
                 }
             }
@@ -11813,12 +12380,12 @@ not json
             };
             println!("PROBE hup={hup}");
             interrupt::send(std::process::id().cast_signed(), interrupt::SIGTERM);
-            let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while interrupt::caught().is_none() {
-                assert!(std::time::Instant::now() < bound, "SIGTERM never caught");
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            println!("PROBE term={}", interrupt::caught().unwrap_or(0));
+            let term = aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the probe's own SIGTERM caught",
+                interrupt::caught,
+            );
+            println!("PROBE term={term}");
             std::process::exit(0);
         }
         let probe = |nohup: bool, mode: &str| {
@@ -11830,17 +12397,18 @@ not json
             } else {
                 command(exe)
             };
-            let out = cmd
-                .args([
-                    "--exact",
-                    "release_steps::tests::an_inherited_sig_ign_is_kept_and_the_others_are_caught",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(PROBE, mode)
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
+            cmd.args([
+                "--exact",
+                "release_steps::tests::an_inherited_sig_ign_is_kept_and_the_others_are_caught",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, mode);
+            // Its stdin closed, within twice the hang detector: the probe's own detector says
+            // first what never came.
+            let out =
+                aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN * 2)
+                    .expect("hang detector: the probe never ended");
             assert!(out.status.success(), "{out:?}");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };

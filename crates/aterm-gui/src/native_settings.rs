@@ -2524,18 +2524,6 @@ impl SettingsViewState {
         }
     }
 
-    fn enters_cursor_style_list(&self) -> bool {
-        self.route == SettingsRoute::CursorStyles
-            && self.search.trim().is_empty()
-            && !self.compact_navigation
-            && self.scroll_plan().is_some_and(|plan| {
-                self.common
-                    .last_focus
-                    .as_ref()
-                    .is_none_or(|focus| plan.stop_of(focus).is_none())
-            })
-    }
-
     /// Publish the installed fonts the font pickers offer.
     pub(crate) fn replace_font_families(
         &mut self,
@@ -8751,6 +8739,8 @@ impl SettingsApp {
                 | AppEvent::ScrollPage(_)
                 | AppEvent::TextInput(TextInputEvent::Home { .. } | TextInputEvent::End { .. })
         );
+        // The keys that move the page under a still pointer whether or not they move the keyboard.
+        let keyboard_scroll = keyboard_move && !matches!(event, AppEvent::FocusChanged(_));
         let handled = match event {
             AppEvent::Action(invocation) => {
                 let pressed = UiKey::new(invocation.id.as_str());
@@ -9055,8 +9045,7 @@ impl SettingsApp {
                 }
                 true
             }
-            AppEvent::StepFocus(_) if view.enters_cursor_style_list() => {
-                let key = UiKey::new(cursor_style_row_key(&saved_cursor_style(view)));
+            AppEvent::StepFocus(_) if let Some(key) = view.arrow_into_choices() => {
                 view.common.last_focus = Some(key.clone());
                 view.common.focus_visible = true;
                 view.reveal_control(key);
@@ -9256,7 +9245,12 @@ impl SettingsApp {
             }
             _ => false,
         };
-        if keyboard_move && view.common.last_focus != focus_before {
+        // THE KEYBOARD'S POINT WINS OVER A RESTING POINTER: a key that moves the keyboard or the
+        // page lets go of the style row the still pointer rested on. Kept through a Page Down
+        // that moved no focus, the hover went on trying a style scrolled off under the pointer
+        // ("Trying: Rainbow underline · Click to save" over Flat kitty, Cursor Styles at
+        // 102x29), whose click would save another.
+        if keyboard_scroll || (keyboard_move && view.common.last_focus != focus_before) {
             view.drop_resting_style_hover();
         }
         view.reveal_moved_focus(focus_before, false);
@@ -10618,6 +10612,18 @@ fn merge_theme_options(user_names: impl IntoIterator<Item = String>) -> Vec<Stri
     options
 }
 
+/// What the preview names an unset `key` by: a trail colour by what the saved style draws for it
+/// ([`prefs::trail_color_default_words`], as its row does), every other key by its default.
+/// Read off the default config's fields, Fire's blank trail color was "Pink", Rainbow kitty's.
+fn preview_default_words(state: &SettingsViewState, key: &str) -> String {
+    match key {
+        prefs::EDIT_CURSOR_TRAIL_COLOR | prefs::EDIT_CURSOR_TRAIL_ACCENT => {
+            modified_default_words(state, key).unwrap_or_else(|| effective_default_for_field(key))
+        }
+        _ => effective_default_for_field(key),
+    }
+}
+
 fn effective_default_for_field(key: &str) -> String {
     let fields = prefs::editable_fields(&Config::default());
     fields.iter().find(|field| field.key == key).map_or_else(
@@ -11745,7 +11751,7 @@ fn renderer_preview_spec_for_key_with_font(
         {
             font_automatic_label(state, focused_key)
         } else if value.is_empty() {
-            effective_default_for_field(focused_key)
+            preview_default_words(state, focused_key)
         } else if focused_key == prefs::EDIT_THEME
             && prefs::theme_mode(Some(&value)) == prefs::ThemeMode::FollowSystem
         {
@@ -11762,7 +11768,7 @@ fn renderer_preview_spec_for_key_with_font(
             state
                 .raw_value(focused_key)
                 .filter(|saved| aterm_types::scheme::parse_hex(saved).is_some())
-                .unwrap_or_else(|| effective_default_for_field(focused_key))
+                .unwrap_or_else(|| preview_default_words(state, focused_key))
         } else if let Some(field) = state
             .field_by_key(focused_key)
             .filter(|field| prefs::range_of(field.key).is_some())
@@ -21057,6 +21063,8 @@ fn choice_option_node(
     if selected {
         spec = spec.trailing_icon(ButtonIcon::Check);
     }
+    // An option of the picker's single-choice list: one Tab stop, entered at the chosen option
+    // ([`crate::native_ui::tab_past_choices`]).
     let button = UiNode::new(
         key.clone(),
         UiContent::Button(
@@ -21067,7 +21075,8 @@ fn choice_option_node(
                     enabled: !disabled,
                     ..ControlState::default()
                 })
-                .style(StyleRef::Secondary),
+                .style(StyleRef::Secondary)
+                .role(SemanticRole::ListBoxOption),
         ),
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill));
@@ -24013,13 +24022,16 @@ fn cursor_style_row(
     let button = (
         UiNode::new(
             key.clone(),
+            // An option of the styles' single-choice list: one Tab stop, entered at the saved
+            // style ([`crate::native_ui::tab_past_choices`]).
             UiContent::Button(
                 Control::new(spec, ActionId::new(key.clone()))
                     .state(ControlState {
                         selected: saved,
                         ..ControlState::default()
                     })
-                    .style(StyleRef::Secondary),
+                    .style(StyleRef::Secondary)
+                    .role(SemanticRole::ListBoxOption),
             ),
         )
         .layout(
@@ -29113,7 +29125,11 @@ fn parent_or_motion_inactivity(
                 && let Some(glow) = trail_resolution.style
             {
                 let ctx = trail_knob_context(state, patch, motion);
-                if !trail_style_uses(&trail_resolution, key, ctx.bar) {
+                // Unused by the style on every cursor shape; one it uses on a bar alone (Fire's
+                // trail color, which tints its rod) is idle on a block for that reason
+                // ([`trail_knob_idle_reason`]): "not used by Fire" there denied the rod the
+                // row's own note names.
+                if !trail_style_uses(&trail_resolution, key, true) {
                     let name = cursor_style_name(trail_resolution.canonical.unwrap_or_default());
                     // The ribbon has no life to lengthen: it follows the typing
                     // (`TrailKnob::Duration`), and the row says so, not just that it is unused.

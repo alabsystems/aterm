@@ -5816,6 +5816,7 @@ mod tests {
         backlog: Backlog,
         asked: [AtomicU64; 3],
         pgid: AtomicU64,
+        release_on_second_look: std::sync::Mutex<Option<File>>,
     }
 
     #[cfg(unix)]
@@ -5858,6 +5859,7 @@ mod tests {
                 },
                 asked: Default::default(),
                 pgid: AtomicU64::new(0),
+                release_on_second_look: Default::default(),
             }
         }
 
@@ -5924,6 +5926,11 @@ mod tests {
 
         fn unstarted(&self, pgid: u32, pids: &[u32], now_us: u64) -> Vec<Unstarted> {
             let look = self.ask(Asked::Unstarted);
+            if look == 1
+                && let Some(release) = self.release_on_second_look.lock().unwrap().as_mut()
+            {
+                release.write_all(b"observed\n").expect("release the child");
+            }
             let Some(held) = self.held else {
                 return Vec::new();
             };
@@ -6117,16 +6124,28 @@ mod tests {
     fn a_slow_first_exec_under_the_running_syspolicyd_runs_on_and_passes() {
         let tmp = crate::mktemp_dir("atv-slow-exec").expect("mktemp");
         let pidfile = tmp.join("slow.pid");
+        let fifo = tmp.join("observed.fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` owns the NUL-terminated name throughout the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // Opening both ends cannot block on a child that has not started yet. The release line
+        // remains buffered until that child reads it, however late it starts.
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         let host = HeldAt::leader(
             Duration::from_secs(10 * 60 - 1),
             Some(-20 * 60),
             Some(false),
             Some(0),
-        )
-        .leaked();
+        );
+        *host.release_on_second_look.lock().unwrap() = Some(release);
+        let host = host.leaked();
         let out = ended(
             running(
-                stand_in(&pidfile, "sleep 7"),
+                stand_in(&pidfile, &format!("read observed < '{}'", fifo.display())),
                 &tmp,
                 DEFAULT_CHILD_CEILING,
                 host,
@@ -6137,6 +6156,7 @@ mod tests {
         assert!(out.ok && out.spawn_error.is_none(), "{out:?}");
         assert!(host.asked(Asked::Unstarted) >= 2, "{host:?}");
         assert_eq!(host.asked(Asked::Backlog), 0, "{host:?}");
+        host.release_on_second_look.lock().unwrap().take();
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -6162,6 +6182,15 @@ mod tests {
     #[test]
     fn a_member_under_a_test_binary_is_the_tests_to_bound() {
         let tmp = crate::mktemp_dir("atv-stranded-member").expect("mktemp");
+        // Independent groups: the negative control's ceiling can elapse while the positive
+        // control waits for its second program-check observation.
+        let under_cargo = tmp.join("under-cargo.pid");
+        let cargo_run = running(
+            stand_in(&under_cargo, "exec sleep 600"),
+            &tmp,
+            DEFAULT_CHILD_CEILING,
+            member_of(HeldAt::stranded(), &UNDER_CARGO),
+        );
         let under_test = tmp.join("under-test.pid");
         let out = ended(
             running(
@@ -6173,21 +6202,12 @@ mod tests {
             &under_test,
             "a member under a test binary",
         );
+        let cargo_out = ended(cargo_run, &under_cargo, "a member under cargo");
         assert!(
             out.spawn_error.is_none() && out.output.contains(crate::findings::CEILING_KILL),
             "{out:?}"
         );
-        let under_cargo = tmp.join("under-cargo.pid");
-        let out = ended(
-            running(
-                stand_in(&under_cargo, "exec sleep 600"),
-                &tmp,
-                DEFAULT_CHILD_CEILING,
-                member_of(HeldAt::stranded(), &UNDER_CARGO),
-            ),
-            &under_cargo,
-            "a member under cargo",
-        );
+        let out = cargo_out;
         let why = out.spawn_error.as_deref().expect("ended unrun");
         assert!(
             why.contains("build-script-build")
@@ -6411,6 +6431,8 @@ mod tests {
     fn a_child_starved_of_cores_is_not_ended_for_the_time_it_waited() {
         let tmp = crate::mktemp_dir("atv-starved").expect("mktemp");
         let ceiling = Duration::from_secs(3);
+        let control = tmp.join("control.pid");
+        let control_run = running(stand_in(&control, "exec sleep 600"), &tmp, ceiling, &INERT);
         let starved = [
             ("as it passes", Starving::at(50)),
             ("in lumps", Starving::lumpy(50, Duration::from_secs(1))),
@@ -6428,6 +6450,7 @@ mod tests {
         for (_, host, _, _) in &starved {
             host.give(1000);
         }
+        let control_out = ended(control_run, &control, "the control");
         for ((how, _, pidfile, run), held) in starved.into_iter().zip(held) {
             let out = ended(run, &pidfile, &format!("booked {how}, given every core"));
             assert!(
@@ -6452,12 +6475,7 @@ mod tests {
                 out.output
             );
         }
-        let control = tmp.join("control.pid");
-        let out = ended(
-            running(stand_in(&control, "exec sleep 600"), &tmp, ceiling, &INERT),
-            &control,
-            "the control",
-        );
+        let out = control_out;
         assert!(
             out.output.contains("of work, over the 3.0s ceiling")
                 && !out.output.contains("for a core")

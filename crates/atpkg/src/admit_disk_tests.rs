@@ -14,6 +14,7 @@ use aterm_capacity::{Admit, Fixed, Footprints, Ledger, Pace, Reading, Volume};
 use aterm_spec::wait::MUST_HAPPEN;
 
 use super::{Reclaim, Run, admit_on, dirs_tag, scope_tag, size};
+use crate::joined;
 
 /// The scratch image's volume: `total` GiB, `free` of it free, a 4 GiB floor.
 fn image(total: u64, free: u64) -> Reading {
@@ -73,14 +74,6 @@ fn names(line: &str, figures: &[&str]) {
     for f in figures {
         assert!(line.contains(f), "{line:?} does not name {f:?}");
     }
-}
-
-/// What `thread` returned, once it ends, which it must: within the one-minute hang detector, so
-/// an admission that never comes fails the test instead of hanging it.
-#[track_caller]
-fn joined<T>(thread: std::thread::JoinHandle<T>, what: &str) -> T {
-    aterm_spec::wait::until_within(MUST_HAPPEN, what, || thread.is_finished().then_some(()));
-    thread.join().expect(what)
 }
 
 /// A first run claims the 27 GiB cold budget, and says so first. On a volume 16 GiB above its

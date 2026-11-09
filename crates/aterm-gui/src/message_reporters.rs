@@ -4237,7 +4237,7 @@ pub(crate) fn disk_filling(
             disk_fill_words(free, floor, rate_bps, eta_s)
         )),
     };
-    let then = Then::step("Free up space on the home volume").or_short("Free up disk space");
+    let then = Then::step("Free up space on the home volume");
     let cause_words = Why::from(why.clone()).words();
     let message = Message::new(tags::SYSTEM, Severity::Error, "The disk is filling")
         .line(then.words())
@@ -4453,7 +4453,7 @@ pub(crate) fn program_check_stuck(workers: u64, limit: Option<u64>) -> Message {
     let why = StandingWhy::OnlyYou(Reason::new(
         "macOS's program check is deadlocked, and only a restart of the Mac ends it",
     ));
-    let then = Then::step("Restart the Mac once your work is saved").or_short("Restart the Mac");
+    let then = Then::step("Restart the Mac once your work is saved");
     let cause_words = Why::from(why.clone()).words();
     let limit = limit.map_or_else(|| "its limit".to_owned(), |l| format!("a limit of {l}"));
     Message::new(
@@ -4530,7 +4530,7 @@ fn service_name(s: &aterm_vitals::services::Seen) -> &str {
 /// an account that can take it (`admin` not known to be no); else the Mac's restart, in words.
 fn restart_press(restart: &aterm_vitals::services::Restart, admin: Option<bool>) -> Then {
     if admin == Some(false) {
-        return Then::step("Restart the Mac once your work is saved").or_short("Restart the Mac");
+        return Then::step("Restart the Mac once your work is saved");
     }
     let step = format!("Restart {}", restart.name);
     Mover::restart_service(restart.name).map_or_else(
@@ -4591,7 +4591,7 @@ pub(crate) fn service_memory_entry(
             Why::OnlyYou(Reason::new(format!(
                 "aterm knows no safe restart for {name}, and only macOS frees what it holds"
             ))),
-            Then::step("Restart the Mac once your work is saved").or_short("Restart the Mac"),
+            Then::step("Restart the Mac once your work is saved"),
         ),
     };
     let mut entry = Entry::new(
@@ -5374,7 +5374,7 @@ pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
                 "these rows name none, so no sign-in route exists for them"
             }),
         },
-        fact_then(&filled),
+        Then::step(&filled.todo),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -5391,12 +5391,6 @@ fn accounts_signed_out_lines(labels: &[String]) -> Vec<String> {
 }
 
 const NOTICE_LABEL_LINES: usize = aterm_messages::exceptions::MORE_LINES - 2;
-
-/// The step of a roster fact built from its notice (`aterm harness accounts`, which reads what
-/// aterm tried), with the short form only where the notice put its command under Details.
-fn fact_then(filled: &notice::Filled) -> Then {
-    notice_then(&filled.todo, filled.command.as_ref().and(filled.short))
-}
 
 fn notice_tail(entry: Entry, filled: notice::Filled) -> Entry {
     match filled.command {
@@ -5782,7 +5776,7 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
             tried: Reason::new("threw away a sign-in that named another account"),
             reason: Reason::new("the row's login is unchanged until it signs in as its own"),
         },
-        fact_then(&filled),
+        Then::step(&filled.todo),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -6483,17 +6477,9 @@ pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -
     message
         .now(Ask::standing(
             StandingWhy::OnlyYou(Reason::new(&exception.why)),
-            notice_then(&exception.action, notice.and_then(|n| n.short)),
+            Then::step(&exception.action),
         ))
         .key(&notice_ask_key(sid, notice.map(|n| n.code)))
-}
-
-fn notice_then(step: &str, short: Option<&str>) -> Then {
-    let then = Then::step(step);
-    match short {
-        Some(short) => then.or_short(short),
-        None => then,
-    }
 }
 
 fn resume_tab_entry(

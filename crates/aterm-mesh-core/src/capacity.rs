@@ -48,10 +48,5 @@ contract! {
     { waits_for_key && (!minted_here && rotation_due) }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "capacity_island.rs"]
-mod island;
-
 #[cfg(test)]
 mod tests;

@@ -12,10 +12,8 @@ use aterm_core::grid::ResizePolicy;
 use aterm_core::terminal::Terminal;
 use aterm_pty::ConsoleHostKind;
 
-/// How long `mainscreen` waits for the host's forwarded switch. The client
-/// starts in about 10 ms and the host forwards at once; the bound only keeps a
-/// wedged host from holding the verb.
-const MAINSCREEN_WAIT: Duration = Duration::from_secs(2);
+/// Hang detector for the required host-forwarded alternate-screen switch.
+const MAINSCREEN_HANG: Duration = Duration::from_secs(60);
 
 /// Whether a session on `host` recovers a dead app's alternate screen through the host.
 pub(crate) fn host_resyncs(host: Option<ConsoleHostKind>) -> bool {
@@ -91,7 +89,7 @@ fn mainscreen_with(
     host: Option<ConsoleHostKind>,
     client: impl FnOnce(Carry) -> io::Result<()>,
 ) -> Option<String> {
-    mainscreen_waiting(term, host, client, MAINSCREEN_WAIT)
+    mainscreen_waiting(term, host, client, MAINSCREEN_HANG)
 }
 
 fn mainscreen_waiting(
@@ -99,6 +97,16 @@ fn mainscreen_waiting(
     host: Option<ConsoleHostKind>,
     client: impl FnOnce(Carry) -> io::Result<()>,
     wait: Duration,
+) -> Option<String> {
+    mainscreen_with_clock(term, host, client, wait, Instant::now)
+}
+
+fn mainscreen_with_clock(
+    term: &Mutex<Terminal>,
+    host: Option<ConsoleHostKind>,
+    client: impl FnOnce(Carry) -> io::Result<()>,
+    wait: Duration,
+    mut now: impl FnMut() -> Instant,
 ) -> Option<String> {
     if !host_resyncs(host) {
         return None;
@@ -118,15 +126,15 @@ fn mainscreen_waiting(
         }
         _ => {}
     }
-    let now = Instant::now();
-    let deadline = now
+    let started = now();
+    let deadline = started
         .checked_add(wait)
-        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
+        .unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
     loop {
         if !crate::term_lock(term).is_alternate_screen() {
             return Some("OK left=1\n".to_string());
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             // Whichever client was meant to leave, none did: the next prompt asks again.
             crate::term_lock(term).abandon_alt_screen_resync();
             return Some(format!(
@@ -406,6 +414,87 @@ mod tests {
     }
 
     #[test]
+    fn a_required_mainscreen_waits_for_its_actual_host_switch() {
+        for age in [Duration::from_secs(3), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let term = Mutex::new(Terminal::new(ROWS as u16, 40));
+            {
+                let mut t = crate::term_lock(&term);
+                apply_posture(
+                    &mut t,
+                    ResizePolicy::ConPty,
+                    Some(ConsoleHostKind::OpenConsole),
+                );
+                t.process(b"\x1b[?1049h\x1b[?1000hpager");
+                assert!(t.is_alternate_screen());
+            }
+            let asked = Cell::new(false);
+            let mut observations = 0;
+            let reply = mainscreen_with_clock(
+                &term,
+                Some(ConsoleHostKind::OpenConsole),
+                |carry| {
+                    assert!(
+                        carry.is_none(),
+                        "a pager without a shell prompt has no prompt carry"
+                    );
+                    asked.set(true);
+                    Ok(())
+                },
+                MAINSCREEN_HANG,
+                || {
+                    observations += 1;
+                    if observations == 2 && !expired {
+                        crate::term_lock(&term).process(b"\x1b[?1049l");
+                    }
+                    Instant::now()
+                        - if observations == 1 {
+                            age
+                        } else {
+                            Duration::ZERO
+                        }
+                },
+            );
+            assert!(asked.get());
+            assert!(
+                observations >= 2,
+                "the actual first look still found the alternate screen"
+            );
+            let mut t = crate::term_lock(&term);
+            if expired {
+                assert!(
+                    reply
+                        .as_ref()
+                        .is_some_and(|reply| reply.starts_with("ERR timeout: "))
+                );
+                assert!(
+                    t.is_alternate_screen(),
+                    "a hang detector does not fabricate the host's switch"
+                );
+                assert_ne!(t.modes().mouse_mode, aterm_core::terminal::MouseMode::None);
+                t.process(b"\r\n\x1b]133;A\x07C:\\> ");
+                assert!(t.is_alternate_screen(), "there was no local fallback leave");
+                assert!(
+                    t.take_alt_screen_resync_request(),
+                    "the next prompt can request the missing host leave"
+                );
+                t.process(b"\x1b[?1049l");
+            } else {
+                assert_eq!(
+                    reply.as_deref(),
+                    Some("OK left=1\n"),
+                    "a completed host switch is not a timeout"
+                );
+            }
+            assert!(
+                !t.is_alternate_screen(),
+                "the host's actual switch reached the engine"
+            );
+            assert_eq!(t.modes().mouse_mode, aterm_core::terminal::MouseMode::None);
+        }
+    }
+
+    #[test]
     fn mainscreen_waits_on_the_sessions_running_leave_client() {
         let term = Mutex::new(Terminal::new(ROWS as u16, 40));
         crate::term_lock(&term).process(b"\x1b[?1049hpager");
@@ -434,7 +523,7 @@ mod tests {
             &term,
             Some(ConsoleHostKind::OpenConsole),
             |_| Err(io::Error::from(io::ErrorKind::ResourceBusy)),
-            Duration::from_millis(30),
+            Duration::ZERO,
         );
         assert!(reply.is_some_and(|r| r.starts_with("ERR timeout: ")));
         let mut t = crate::term_lock(&term);
@@ -531,26 +620,6 @@ mod tests {
     #[test]
     fn mainscreen_asks_a_forwarding_host_and_reports_our_screen() {
         let term = Mutex::new(Terminal::new(ROWS as u16, 40));
-        crate::term_lock(&term).process(b"\x1b[?1049hpager");
-        // The host's switch comes through the PTY reader after the client returned; the
-        // sleep makes the wait's first look find the screen still up, however late it lands.
-        let reply = std::thread::scope(|s| {
-            mainscreen_waiting(
-                &term,
-                Some(ConsoleHostKind::OpenConsole),
-                |_| {
-                    s.spawn(|| {
-                        std::thread::sleep(Duration::from_millis(50));
-                        crate::term_lock(&term).process(b"\x1b[?1049l");
-                    });
-                    Ok(())
-                },
-                aterm_spec::wait::MUST_HAPPEN,
-            )
-        });
-        assert_eq!(reply.as_deref(), Some("OK left=1\n"));
-        assert!(!crate::term_lock(&term).is_alternate_screen());
-
         let started = Cell::new(false);
         let reply = mainscreen_with(&term, Some(ConsoleHostKind::OpenConsole), |_| {
             started.set(true);
@@ -577,7 +646,7 @@ mod tests {
             &term,
             Some(ConsoleHostKind::OpenConsole),
             |_| Ok(()),
-            Duration::from_millis(30),
+            Duration::ZERO,
         );
         let reply = reply.expect("a forwarding host answers the verb itself");
         assert!(reply.starts_with("ERR timeout: "), "{reply:?}");
@@ -613,7 +682,7 @@ mod tests {
                     got = Some(carry);
                     Ok(())
                 },
-                Duration::from_millis(30),
+                Duration::ZERO,
             );
             assert!(reply.is_some_and(|r| r.starts_with("ERR timeout: ")));
             got.expect("the client was started")

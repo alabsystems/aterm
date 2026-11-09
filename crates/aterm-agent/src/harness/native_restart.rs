@@ -288,12 +288,20 @@ fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
         project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeRetirementDebt",
+        action = "Ask",
+        reason = "The retained incoming recipe selects typed asked data without granting admission or changing passive history"
+    )
+)]
 fn unadmitted(st: &mut St, id: &str) -> Result<Recovery, &'static str> {
     let prepare = retained_prepare(st).map_err(|_| "native-unknown")?;
     if st.native.is_some()
         || prepare.id != id
         || !matches!(prepare.plan, NativePlan::Restart { .. })
-        || prepare.asked.is_some()
+        || (prepare.asked.is_some() && !prepare.asked_restart_shape())
         || [&st.native_noexec_prepare, &st.native_completed_prepare]
             .into_iter()
             .flatten()

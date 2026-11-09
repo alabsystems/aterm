@@ -3325,7 +3325,6 @@ fn the_program_check_alert_leads_with_the_restart() {
         panic!("the program-check alert is a Now");
     };
     assert!(ask.is_standing());
-    assert_eq!(ask.then().short(), Some("Restart the Mac"));
     assert!(
         msg.detail[1].contains("only a restart"),
         "{}",

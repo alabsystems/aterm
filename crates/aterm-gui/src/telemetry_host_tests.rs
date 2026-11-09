@@ -566,11 +566,16 @@ fn a_watched_leader_hands_the_next_pass_its_status_decoded() {
         ("read _; exit 3", ExitOf::Code(3)),
         ("read _; kill -TERM $$", ExitOf::Signal(15)),
     ] {
+        // The leader starts with SIGTERM at its default, set here, not this test binary's: a
+        // shell started ignoring it (a `nohup` or `&` runner's choice, which every exec keeps)
+        // outlives its own `kill -TERM $$` and exits 0.
+        let defaults = aterm_spec::start::at_defaults(&[libc::SIGTERM]);
         let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", script])
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
             .expect("spawn");
+        drop(defaults);
         let pid = child.id();
         let start = birth(pid);
         let clock = pass_clock(Instant::now());

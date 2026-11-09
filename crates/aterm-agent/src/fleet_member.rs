@@ -390,7 +390,10 @@ fn followed_name(state: &Path) -> Option<String> {
 /// Write `name` (a valid primary name) as this machine's signed fleet name, refusing one the
 /// swarm roster or the book gives another machine ([`taken_by`]). A follow (`writer`) that finds
 /// the name changed under the write lock since it read it writes nothing and says so.
+/// An identical private 0600 name file is kept; the writer's ownership marker still changes.
 fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<String, Failure> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let mut notice = String::new();
     private_state(places, &mut notice)?;
     let me = member::node_identity(&places.state).map_err(failed)?;
@@ -422,7 +425,18 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
                 "{name} already names {other}; use its node alias to disambiguate"
             )));
         }
-        // All potentially blocking roster, peer and policy reads precede the final canonical
+        let bytes = format!("{name}\n");
+        let already_written = aterm_uds::private_file::read_private_with_metadata(
+            &places.state,
+            member::NAME_FILE,
+            member::NAME_FILE_MAX,
+        )
+        .is_ok_and(|(held, metadata)| {
+            held.as_slice() == bytes.as_bytes()
+                && metadata.mode() & 0o7777 == 0o600
+                && metadata.nlink() == 1
+        });
+        // All potentially blocking roster, peer, name and policy reads precede the final canonical
         // source check; a callback reads local sources only, never re-entering either lock.
         match writer {
             #[cfg(unix)]
@@ -433,12 +447,10 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
             Writer::Follow { current, .. } => current().map_err(failed)?,
             Writer::Person => {}
         }
-        aterm_uds::private_file::write_private(
-            &places.state,
-            member::NAME_FILE,
-            format!("{name}\n").as_bytes(),
-        )
-        .map_err(|e| failed(e.to_string()))?;
+        if !already_written {
+            aterm_uds::private_file::write_private(&places.state, member::NAME_FILE, bytes.as_bytes())
+                .map_err(|e| failed(e.to_string()))?;
+        }
         match writer {
             Writer::Person => {
                 aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)

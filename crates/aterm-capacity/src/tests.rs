@@ -1871,6 +1871,13 @@ fn background_standin() {
     let Some(dir) = std::env::var_os("ATERM_TEST_BACKGROUND").map(PathBuf::from) else {
         return;
     };
+    // SIGTERM at its default action, whatever this test binary was started with (a `nohup` or
+    // `&` runner's ignored one, which every exec keeps): the release claim ends this stand-in's
+    // group by it.
+    // SAFETY: SIG_DFL is a disposition, no handler of ours; this stand-in runs alone.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
     let started = std::time::Instant::now();
     let claim = admit_until(
         &Ledger::at(dir.join("ledger")),

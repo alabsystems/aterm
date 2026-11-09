@@ -1852,9 +1852,9 @@ pub(super) mod tests {
         required_repository(&sys, &item.user, "parent", &["vendor/library"]);
         existing(&sys, &item.user, &child, "library", PIN);
         // The Command Line Tools' git is one before 2.44 that ignores GIT_NO_LAZY_FETCH.
-        sys.simulate(|_, command| {
+        sys.simulate(|sys, command| {
             (command.program == Path::new(crate::items::github::CLT_GIT))
-                .then(|| crate::init_github::git_before_no_lazy_fetch(command, false))
+                .then(|| crate::init_github::git_before_no_lazy_fetch(sys, command, false))
                 .flatten()
         });
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));

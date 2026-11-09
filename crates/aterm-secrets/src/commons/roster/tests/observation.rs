@@ -190,18 +190,18 @@ fn a_warm_access_check_observes_the_state_lock_once() {
     let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
     crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
         assert!(access.is_current(&vault.journal));
-        let opens = client::lock_opens_of(&vault.paths);
+        let observations = client::lock_observations_of(&vault.paths);
         assert!(access.is_current(&vault.journal));
         assert_eq!(
-            client::lock_opens_of(&vault.paths) - opens,
+            client::lock_observations_of(&vault.paths) - observations,
             1,
             "a check's observations"
         );
         assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
-        let opens = client::lock_opens_of(&vault.paths);
+        let observations = client::lock_observations_of(&vault.paths);
         assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
         assert_eq!(
-            client::lock_opens_of(&vault.paths) - opens,
+            client::lock_observations_of(&vault.paths) - observations,
             1,
             "an access's observations"
         );

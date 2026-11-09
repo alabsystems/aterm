@@ -31,7 +31,7 @@ fn boot_sid(w: &World) -> String {
 
 /// **A KILLED BRIDGE'S LOSS LANDS AHEAD OF THE NEXT ATTACH, HOWEVER LONG ITS LANES TAKE**: the
 /// real lanes and their guard under the supervisor's own loop, each lane held past its hang-up
-/// for far longer than a relaunch's exec, read off the node log's link marks: the killed
+/// until the replacement is attached, read off the node log's link marks: the killed
 /// generation's `state=disconnected`, then the next one's `state=stalled`.
 ///
 /// The supervisor tells the loss itself at the bridge's exit, waiting on no lane: one that left
@@ -49,15 +49,14 @@ fn a_killed_bridges_loss_lands_ahead_of_the_next_attach_however_long_its_lanes_t
         &[("ATERM_TEST_PUSH_HOLD", &hold.env())],
     );
     w.wait_ready();
-    // Past the supervisor's `RELAUNCH_HEALTHY`, so no back-off stands in for the wait.
-    std::thread::sleep(Duration::from_millis(5_500));
     let cursor = node_log_cursor(&w);
     let killed = w.bridge_pid();
     hold.on("lane-loss");
     harness::kill(killed, 9);
-    std::thread::sleep(Duration::from_secs(1));
-    hold.off("lane-loss");
+    // The old lanes cannot finish before this barrier: a supervisor that waits for them
+    // cannot attach its replacement, regardless of its back-off or the machine's speed.
     w.await_bridge_back(killed);
+    hold.off("lane-loss");
 
     let moves = link_moves_since(&w, &cursor);
     let said: Vec<(&str, u64)> = moves
@@ -256,6 +255,7 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let listener = UnixListener::bind(&stub).expect("bind the stub");
     listener.set_nonblocking(true).unwrap();
     let (stop, stopping) = std::sync::mpsc::channel();
+    let (accepted, acceptance) = std::sync::mpsc::channel();
     struct Stub(
         Option<std::sync::mpsc::Sender<()>>,
         Option<std::thread::JoinHandle<()>>,
@@ -270,7 +270,10 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
         let mut streams = Vec::new();
         loop {
             match listener.accept() {
-                Ok((stream, _)) => streams.push(stream),
+                Ok((stream, _)) => {
+                    streams.push(stream);
+                    let _ = accepted.send(());
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => panic!("accept the bridge: {e}"),
             }
@@ -284,16 +287,24 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     });
     let _stub = Stub(Some(stop), Some(worker));
 
-    let w = World::boot_at("r13-stub", &[], &[], Some(&stub));
-    // Observe the product's minute hang detector, then allow a minute for the status probe.
-    let within = harness::DEADLINE + harness::DEADLINE;
-    harness::until_within(within, "the bridge to attach", || {
+    // This fixture requires a timeout, never a successful answer. Its short injected
+    // deadline exercises the same socket timeout; every event wait keeps the minute detector.
+    let w = World::boot_at(
+        "r13-stub",
+        &[],
+        &[("ATERM_LINK_ACK_DEADLINE_MS", "250")],
+        Some(&stub),
+    );
+    until("the bridge to attach", || {
         (kv(&fabric_status(&w), "state") == Some("stalled")).then_some(())
     });
-    let fs = harness::until_within(within, "stalled reason=no-ack", || {
+    let fs = until("stalled reason=no-ack", || {
         let fs = fabric_status(&w);
         (kv(&fs, "reason") == Some("no-ack")).then_some(fs)
     });
+    acceptance
+        .recv_timeout(harness::DEADLINE)
+        .expect("the silent broker accepted a real connection");
     assert_eq!(kv(&fs, "state"), Some("stalled"), "{fs}");
     assert_eq!(kv(&fs, "rtt_ms"), Some("-"), "{fs}");
     let s = status(&w);

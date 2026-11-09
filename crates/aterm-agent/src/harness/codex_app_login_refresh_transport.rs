@@ -56,6 +56,15 @@ pub(in crate::harness) fn exchange_owned_refresh(
     deadline: Deadline<'_>,
     before_send: impl FnOnce() -> Result<(), String>,
 ) -> Result<RefreshExchange, String> {
+    exchange_owned_refresh_with_clock(document, deadline, before_send, Instant::now)
+}
+
+fn exchange_owned_refresh_with_clock(
+    document: &[u8],
+    deadline: Deadline<'_>,
+    before_send: impl FnOnce() -> Result<(), String>,
+    request_started: impl FnOnce() -> Instant,
+) -> Result<RefreshExchange, String> {
     if document.is_empty() || document.len() > 16 * 1024 {
         return Err("managed refresh document unavailable".into());
     }
@@ -85,9 +94,10 @@ pub(in crate::harness) fn exchange_owned_refresh(
         return Ok(RefreshExchange::NotSent);
     }
     before_send()?;
-    let Ok(left) = deadline.capped(EXCHANGE_WAIT) else {
+    let Ok(left) = deadline.remaining() else {
         return Ok(RefreshExchange::NotSent);
     };
+    let left = exchange_wait(left, request_started());
     if left < MIN_REFRESH_BUDGET {
         return Ok(RefreshExchange::NotSent);
     }
@@ -233,17 +243,30 @@ mod tests {
     }
 
     fn response_case(status: u16, body: Option<&'static str>) -> RefreshExchange {
+        response_case_with_clock(status, body, Instant::now)
+    }
+
+    fn response_case_with_clock(
+        status: u16,
+        body: Option<&'static str>,
+        request_started: impl FnOnce() -> Instant,
+    ) -> RefreshExchange {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let armed = Arc::new(AtomicBool::new(false));
         let check = Arc::clone(&armed);
+        let finished = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&finished);
         let server = std::thread::spawn(move || {
             let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
                         assert!(
                             Instant::now() < until,
                             "refresh fixture accept did not happen"
@@ -288,17 +311,54 @@ mod tests {
                 stream.flush().unwrap();
             }
         });
-        let result = exchange_owned_refresh(
+        let result = exchange_owned_refresh_with_clock(
             &document(&issuer),
             Deadline::after(aterm_spec::wait::MUST_HAPPEN),
             || {
                 armed.store(true, Ordering::SeqCst);
                 Ok(())
             },
+            request_started,
         )
         .unwrap();
+        finished.store(true, Ordering::SeqCst);
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn required_token_response_keeps_owned_refresh_work() {
+        let RefreshExchange::Completed(received) =
+            response_case_with_clock(200, Some("native-response-canary"), || {
+                Instant::now() - Duration::from_secs(31)
+            })
+        else {
+            panic!("the required native response was abandoned");
+        };
+        assert_eq!(received.status(), 200);
+        assert_eq!(received.body(), b"native-response-canary");
+        assert!(received.received_at().is_some());
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let doc = document(&format!("http://{}", listener.local_addr().unwrap()));
+        let armed = AtomicBool::new(false);
+        let result = exchange_owned_refresh_with_clock(
+            &doc,
+            Deadline::after(aterm_spec::wait::MUST_HAPPEN * 2),
+            || {
+                armed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || Instant::now() - Duration::from_secs(61),
+        )
+        .unwrap();
+        assert!(armed.load(Ordering::SeqCst));
+        assert!(matches!(result, RefreshExchange::NotSent));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

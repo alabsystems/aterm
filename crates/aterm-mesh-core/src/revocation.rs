@@ -110,16 +110,6 @@ contract! {
     { !gate_open || wraps_revoked }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "revocation_island.rs"]
-mod island;
-// P1b, P1's Tier 2 (`spec_no_leak`), over the island above.
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "revocation_no_leak_island.rs"]
-mod no_leak_island;
-
 /// The island's `anyN`: `||` folded left over `0..n`, every index asked, no early exit.
 pub(crate) fn any_n(n: usize, mut p: impl FnMut(usize) -> bool) -> bool {
     let mut acc = false;

@@ -2507,6 +2507,70 @@ fn no_page_down_only_moves_the_list() {
     assert!(turned > 0, "the sweep turns pages");
 }
 
+/// A CONTROL THE STRIP UNDER THE ROOM DRAWS WHOLE TAKES THE POINTER
+/// ([`crate::native_ui::CompiledUi::picture_hits`]): on every screen, the pointer over a control
+/// drawn whole under the list's fade finds that control, as it finds the room's, while the strip
+/// stays dead to the keyboard and the semantic tree. Drawn whole and inert, a row looked like one
+/// and was none: Cursor Styles at 150x48 drew Flying kitty whole under the fade, pointing at it
+/// previewed nothing, and a click only scrolled it into the room.
+#[test]
+fn a_control_drawn_whole_under_the_fade_takes_the_pointer() {
+    let mut faults = Vec::new();
+    let mut weighed = 0usize;
+    for source in ["", CHANGED] {
+        for route in SettingsRoute::ALL {
+            if route == SettingsRoute::Messages {
+                continue;
+            }
+            for (width, height) in PAGING_SIZES.into_iter().chain([(444.0, 292.0)]) {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = paging_view(source, route);
+                each_screen_of(&mut runtime, instance, view, &cx, |_, compiled, top| {
+                    for node in &compiled.paint {
+                        let enabled = match &node.content {
+                            UiContent::Button(control) => control.state.enabled,
+                            UiContent::Switch(control) => control.state.enabled,
+                            UiContent::Slider(control) => control.state.enabled,
+                            _ => continue,
+                        };
+                        let whole = (node.clip.y - node.rect.y).abs() < 0.5
+                            && (node.clip.height - node.rect.height).abs() < 0.5;
+                        let faded = node.fade.is_some_and(|(from, _)| node.rect.y + 0.5 >= from);
+                        if !enabled || !whole || !faded {
+                            continue;
+                        }
+                        weighed += 1;
+                        let (x, y) = (
+                            node.rect.x + node.rect.width / 2.0,
+                            node.rect.y + node.rect.height / 2.0,
+                        );
+                        let context = format!(
+                            "{route:?} {width}x{height}{} screen {top}: {}",
+                            if source.is_empty() { "" } else { " (changed)" },
+                            node.key.as_str()
+                        );
+                        if compiled.hit_test(x, y).map(|hit| &hit.key) != Some(&node.key) {
+                            faults.push(format!(
+                                "{context} is drawn whole under the fade and takes no pointer"
+                            ));
+                        }
+                        if compiled.semantic(&node.key).is_some() {
+                            faults.push(format!("{context} under the fade is live"));
+                        }
+                    }
+                });
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+    assert!(weighed > 0, "the sweep draws controls whole under a fade");
+}
+
 #[test]
 fn the_wheel_leaves_no_note_alone_and_no_screen_draws_a_caption_twice() {
     let mut notches = 0usize;

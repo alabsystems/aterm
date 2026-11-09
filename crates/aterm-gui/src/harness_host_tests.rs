@@ -29289,6 +29289,11 @@ impl RealAgent {
             // SAFETY: a NUL-terminated path this test owns.
             assert_eq!(unsafe { libc::mkfifo(gate.as_ptr(), 0o600) }, 0, "the gate");
         }
+        // The stand-in agent starts with the signals that end a process at their defaults, set
+        // here, not this test binary's: a shell started ignoring one (a `nohup` or `&` runner's
+        // choice, which every exec keeps) neither traps it nor dies of it, and the restart act's
+        // SIGTERM would read as unheard.
+        let start = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
         let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
             let mut program = std::process::Command::new(&claude);
             program
@@ -29299,6 +29304,7 @@ impl RealAgent {
             Ok(program)
         })
         .expect("spawn the stand-in");
+        drop(start);
         drop(slave);
         let master = master.into_raw_fd();
         // SAFETY: `master` is this test's open PTY master; the duplicate fd is owned by the drain.
@@ -46809,6 +46815,7 @@ fn window_off_marks() {
 fn a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it() {
     use std::os::unix::process::ExitStatusExt as _;
     if std::env::var_os(WINDOW_OFF_MARKER).is_some() {
+        // The stand-in starts with SIGTERM at its default (`StandIn`), which the arming needs.
         arm_claims_off_as_the_window_dies(window_off_marks);
         let pid = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
         // SAFETY: a signal to this stand-in process itself.

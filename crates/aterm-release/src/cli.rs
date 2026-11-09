@@ -40,11 +40,12 @@ USAGE
       Keeps the failed report and its digest; never writes a passing verification.
 
   targo --unverified ship release --prefreeze
-      After refreshing origin/main and the clean release checkout, build and freeze
-      its cutter before the next cut. Runs at Background priority, yields to Release,
+      After refreshing origin/main, build its cutter in the persistent compiler
+      checkout. Runs at Background priority, yields to Release,
       and excludes windowed/timed checks. No cut, credentials or publication.
-      For scheduled preparation, invoke the previous cutter.toml's tool.path directly
-      with `release --prefreeze`: the ship alias can compile before parsing this flag.
+      A normal release starts this automatically after READY. For standalone work,
+      invoke the previous cutter.toml's tool.path with `release --prefreeze`:
+      the ship alias can compile before parsing this flag.
 
   targo --unverified ship release [--bump | --commit REV [--supersede] | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...

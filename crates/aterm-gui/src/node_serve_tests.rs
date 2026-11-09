@@ -2246,6 +2246,7 @@ fn off_marks() {
 fn a_sigterm_gives_up_the_node_jobs_claims_then_ends_the_job_by_it() {
     use std::os::unix::process::ExitStatusExt as _;
     if let Some(relay) = std::env::var_os(OFF_RELAY) {
+        // The stand-in starts with SIGTERM at its default (`StandIn`), which the arming needs.
         arm_claims_off_on_quit(std::path::PathBuf::from(relay), off_marks);
         let pid = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
         // SAFETY: a signal to this stand-in process itself.

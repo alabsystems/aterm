@@ -868,7 +868,9 @@ pub static FORWARDING_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// with the SIGINT and SIGQUIT dispositions this process has outside any wait: a
 /// [`wait_standing_aside`] ignores both for the whole process, only inside its turn, and a child
 /// another test of the binary spawned meanwhile would start with them ignored and keep them so.
-#[cfg(test)]
+/// A test whose child must start from a disposition the runner may not have given this process
+/// sets it first ([`Starting`]), whose [`Starting::spawning`] is this.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn spawn_outside_a_stand_aside<T>(spawn: impl FnOnce() -> T) -> T {
     let _turn = FORWARDING_TURN
         .lock()
@@ -1037,6 +1039,12 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
     }
     std::process::ExitCode::from(u8::try_from(128 + sig).unwrap_or(255))
 }
+
+#[cfg(any(test, debug_assertions))]
+#[path = "unix_starting.rs"]
+mod starting;
+#[cfg(any(test, debug_assertions))]
+pub use starting::Starting;
 
 #[cfg(test)]
 #[path = "unix_forwarding_tests.rs"]

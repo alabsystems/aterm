@@ -95,7 +95,6 @@ fn the_excerpt_never_comes_back_while_narrowing() {
         title: "aterm.toml has a problem",
         detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
         step: false,
-        step_short: None,
         meter: None,
         animated: false,
         busy: false,

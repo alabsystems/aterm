@@ -955,6 +955,31 @@ pub struct Prepare {
 }
 
 impl Prepare {
+    /// Supported asked Restart shape only. This does not qualify its predecessor,
+    /// current source, person sequence or producer, and grants no execution authority.
+    #[must_use]
+    pub fn asked_restart_shape(&self) -> bool {
+        matches!(
+            (&self.asked, self.duty),
+            (Some(AskedIntent::Upgrade(_)), Scope::Upgrade)
+                | (Some(AskedIntent::Relaunch(_)), Scope::Relaunch)
+        ) && self
+            .asked
+            .as_ref()
+            .is_some_and(|asked| aterm_codec::hex::is_lower(asked.predecessor(), 32))
+            && matches!(
+                self.plan,
+                NativePlan::Restart {
+                    observation: None,
+                    cold: None,
+                    ..
+                }
+            )
+            && (!matches!(self.asked, Some(AskedIntent::Relaunch(_)))
+                || matches!(&self.plan, NativePlan::Restart { forward, .. }
+                    if forward.settles.is_none() && !matches!(forward.account_intent.as_deref(), Some(super::accounts_pool::ExecutionIntent::Token { .. }))))
+    }
+
     /// Required constructor capability; this is not an admission qualification.
     #[must_use]
     pub const fn constructor(&self) -> Constructor {

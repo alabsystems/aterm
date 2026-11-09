@@ -114,6 +114,9 @@ pub struct CursorFx {
     /// builds only.
     #[cfg(any(test, debug_assertions))]
     pub(crate) engine_lights: [crate::cursor_glow::Light; 4],
+    /// Test-only: the colour the light rod last drew in, `None` while it drew nothing.
+    #[cfg(test)]
+    pub(crate) rod_drawn: Option<u32>,
 }
 
 /// Everything one [`CursorFx::tick`] reads besides the two folded configs.
@@ -1029,21 +1032,83 @@ pub const fn own_trail_color(
     Some((color, name))
 }
 
-/// What an unset `cursor_trail_color` draws for `style`'s trail on a block, by name, where that is
-/// not the live cursor's colour.
+/// The rod a bar cursor wears for a style that colours a block from its own palette
+/// ([`GlowStyle::draws_trail_color`] false), while no trail colour tints it: its colour, its haze
+/// and its plain name. Phaser's rod shifts through the spectrum instead, and every other style's
+/// rod wears its trail colour.
+#[inline]
+#[must_use]
+pub const fn own_rod(style: GlowStyle) -> Option<(u32, u32, &'static str)> {
+    match style {
+        GlowStyle::Water => Some((0x0032_DCDE, 0x000E_66B4, "Aqua")),
+        GlowStyle::Fire => Some((0x00FF_9632, 0x0078_1E00, "Amber")),
+        GlowStyle::RainbowKitty => Some((0x00FF_66CC, 0x0046_1E64, "Pink")),
+        GlowStyle::Lumen
+        | GlowStyle::Phaser
+        | GlowStyle::Sparkle
+        | GlowStyle::Laser
+        | GlowStyle::Beam
+        | GlowStyle::Comet
+        | GlowStyle::Classic => None,
+    }
+}
+
+/// What an unset `cursor_trail_color` draws where the colour applies ([`unset_trail_color`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsetTrailColor {
+    /// The live cursor's colour.
+    Cursor,
+    /// A colour of the style's own, `0x00RRGGBB`, with its plain name.
+    Own(u32, &'static str),
+    /// Colours that shift as it draws: Classic's trail, Phaser's rod.
+    Shifting,
+}
+
+impl UnsetTrailColor {
+    /// Settings' name for what an unset trail colour draws ("Shifting colors", a hue's name),
+    /// `None` where it is the live cursor's colour.
+    #[inline]
+    #[must_use]
+    pub const fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Cursor => None,
+            Self::Own(_, name) => Some(name),
+            Self::Shifting => Some("Shifting colors"),
+        }
+    }
+}
+
+/// What an unset `cursor_trail_color` draws for `style` where the colour applies: the trail, for
+/// a style that draws the trail colour on a block, else the bar cursor's rod, the one thing the
+/// colour tints there (the frame's rod reads [`own_rod`]). A style's own hue gives way to a
+/// pinned cursor colour as [`own_trail_color`] says; a rod's never does.
+#[inline]
+#[must_use]
+pub const fn unset_trail_color(style: GlowStyle, cursor_color_pinned: bool) -> UnsetTrailColor {
+    if matches!(style, GlowStyle::Classic) {
+        return UnsetTrailColor::Shifting;
+    }
+    if !style.draws_trail_color() {
+        return match own_rod(style) {
+            Some((color, _, name)) => UnsetTrailColor::Own(color, name),
+            None => UnsetTrailColor::Shifting,
+        };
+    }
+    match own_trail_color(style, cursor_color_pinned) {
+        Some((color, name)) => UnsetTrailColor::Own(color, name),
+        None => UnsetTrailColor::Cursor,
+    }
+}
+
+/// What an unset `cursor_trail_color` draws for `style`, by name, where that is not the live
+/// cursor's colour ([`unset_trail_color`]).
 #[inline]
 #[must_use]
 pub const fn trail_color_default_name(
     style: GlowStyle,
     cursor_color_pinned: bool,
 ) -> Option<&'static str> {
-    if matches!(style, GlowStyle::Classic) {
-        return Some("Shifting colors");
-    }
-    match own_trail_color(style, cursor_color_pinned) {
-        Some((_, name)) => Some(name),
-        None => None,
-    }
+    unset_trail_color(style, cursor_color_pinned).name()
 }
 
 /// The colour an unset accent (native `cursor_trail_accent`) brightens.
@@ -1595,14 +1660,19 @@ impl CursorFx {
                 && ((tinted && c == glow_cfg.color & 0x00FF_FFFF)
                     || matches!(pinned_base, Some(p) if (p & 0x00FF_FFFF) == c))
         };
+        // A style that colours a block from its own palette wears its own rod on a bar until a
+        // trail colour tints it: what Settings names as the unset colour ([`unset_trail_color`]).
+        let own = if tinted {
+            None
+        } else {
+            own_rod(glow_cfg.style)
+        };
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
             GlowStyle::Sparkle if let Some(gold) = sparkle_paper_rod => {
                 (gold, (gold >> 1) & 0x007F_7F7F)
             }
-            GlowStyle::Water if !tinted => (0x0032_DCDE, 0x000E_66B4),
-            GlowStyle::Fire if !tinted => (0x00FF_9632, 0x0078_1E00),
-            GlowStyle::RainbowKitty if !tinted => (0x00FF_66CC, 0x0046_1E64),
+            _ if let Some((color, haze, _)) = own => (color, haze),
             GlowStyle::Phaser if !tinted => {
                 let hue = if dark {
                     beam_hue
@@ -1811,6 +1881,12 @@ impl CursorFx {
         #[cfg(any(test, debug_assertions))]
         {
             self.engine_lights[3] = beamrod_cfg.light;
+        }
+        #[cfg(test)]
+        {
+            self.rod_drawn = beamrod_cfg
+                .enabled
+                .then_some(beamrod_cfg.color & 0x00FF_FFFF);
         }
         let beamrod_frame = self.beamrod.tick(
             cur,

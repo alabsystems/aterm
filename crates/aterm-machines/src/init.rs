@@ -8202,7 +8202,7 @@ mod tests {
 
     /// `base.clt` reads only once the base layer let its hold go, and off the console (no one
     /// logged in at its screen, no terminal) its install waits for a person there: Deferred,
-    /// naming where to run it, with nothing run.
+    /// naming the console-presence reason, with nothing run.
     #[test]
     fn base_clt_runs_after_the_base_hold_is_released_and_waits_for_a_person_off_the_console() {
         use std::sync::Arc;
@@ -8245,9 +8245,11 @@ mod tests {
         assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
         assert_eq!(row.layer, Some(Layer::Base));
         assert_eq!(row.class, Some(Class::Elevate));
+        let presence = Presence::NoConsole.needs_person().unwrap();
         assert!(
-            row.why.as_deref().is_some_and(|why| why
-                .ends_with("console (nobody is logged in at its screen): run aterm init there")),
+            row.why
+                .as_deref()
+                .is_some_and(|why| why.ends_with(&presence)),
             "{row:?}"
         );
         let saw = saw.lock().unwrap();

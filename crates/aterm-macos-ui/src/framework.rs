@@ -24,6 +24,19 @@ impl Framework {
         let _ = self.library();
     }
 
+    pub(crate) fn class(&self, name: &'static CStr) -> aterm_objc::ClassPtr {
+        self.class_using(name, aterm_objc::class)
+    }
+
+    fn class_using(
+        &self,
+        name: &'static CStr,
+        lookup: impl FnOnce(&'static CStr) -> aterm_objc::ClassPtr,
+    ) -> aterm_objc::ClassPtr {
+        self.load();
+        lookup(name)
+    }
+
     fn library(&self) -> &aterm_dl::Library {
         self.library.get_or_init(|| {
             aterm_dl::Library::open(self.names).unwrap_or_else(|why| panic!("{why}"))
@@ -104,6 +117,19 @@ macro_rules! framework_constants {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_lookup_acquires_its_framework_before_querying_the_runtime() {
+        let library = Framework::new(&[
+            c"/System/Library/Frameworks/ServiceManagement.framework/ServiceManagement",
+        ]);
+        assert!(library.library.get().is_none());
+        let class = library.class_using(c"NSObject", |name| {
+            assert!(library.library.get().is_some());
+            aterm_objc::class(name)
+        });
+        assert!(!class.is_null());
+    }
 
     #[test]
     fn a_resolved_function_executes_and_missing_exports_refuse() {

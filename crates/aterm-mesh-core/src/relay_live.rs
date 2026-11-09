@@ -83,10 +83,5 @@ contract! {
     { asked && !ingested }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "relay_live_island.rs"]
-mod island;
-
 #[cfg(test)]
 mod tests;

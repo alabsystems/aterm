@@ -507,6 +507,10 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         ));
         let mut watched = false;
+        // The command starts with SIGTERM at its default, set here, not this test binary's: one
+        // started ignoring it (a `nohup` or `&` runner's choice, which every exec keeps) sleeps
+        // through the hang-up.
+        let defaults = aterm_spec::start::at_defaults(&[libc::SIGTERM]);
         let line = run_bound(
             stand_in("exec sleep 60"),
             marker,
@@ -528,6 +532,7 @@ mod tests {
                 false
             },
         );
+        drop(defaults);
         assert_eq!(line, "OK sudo signal=15\n");
         assert!(!ticket.is_live(Instant::now()));
     }

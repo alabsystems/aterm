@@ -17,8 +17,7 @@ pub fn load() {
 /// Look up a class in a native AppKit context, loading its framework first.
 /// This registers the framework's classes without creating an application.
 pub fn class(name: &'static std::ffi::CStr) -> aterm_objc::ClassPtr {
-    load();
-    aterm_objc::class(name)
+    APPKIT.class(name)
 }
 
 /// The existing application's borrowed pointer, or nil before its creation.

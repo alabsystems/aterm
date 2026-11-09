@@ -418,23 +418,6 @@ fn no_step_says_this_tab() {
 }
 
 #[test]
-fn a_command_step_has_its_short_form() {
-    assert_eq!(Step::new(COMMAND_UNDER_DETAILS).fault(), None);
-    for n in ALL {
-        for label in [None, Some("main"), Some(longest_label().as_str())] {
-            let f = n.fill(label, longest_why(n));
-            assert_eq!(
-                f.short.is_some(),
-                f.todo.contains("aterm harness"),
-                "{}: {f:?}",
-                n.id
-            );
-        }
-    }
-    assert_eq!(LOGIN_CANCELLED.fill(Some("main"), None).short, None);
-}
-
-#[test]
 fn a_pin_names_how_it_ends() {
     let pins = |n: &NoticeText| n.todo.contains("accounts use ");
     assert!(ALL.iter().any(pins), "a notice asks for the pin");

@@ -60,12 +60,16 @@ fn hash_quads(quads: &[aterm_render::GlowQuad], hash: &mut impl Hasher) {
 
 impl Session {
     fn new(raw: &str, knobs: GlowKnobs, bar: bool, ground: (u32, u32)) -> Self {
-        let spelling = GlowSpelling::parse(raw);
         let shape = if bar {
             CursorStyle::SteadyBar
         } else {
             CursorStyle::SteadyBlock
         };
+        Self::shaped(raw, knobs, shape, ground)
+    }
+
+    fn shaped(raw: &str, knobs: GlowKnobs, shape: CursorStyle, ground: (u32, u32)) -> Self {
+        let spelling = GlowSpelling::parse(raw);
         let dark = aterm_render::theme_is_dark(ground.1);
         let mut glow = resolve_glow_config(
             knobs,
@@ -588,4 +592,114 @@ fn sparkle_s_paper_caret_is_gold_deepened_in_its_hue() {
         (hue - own).abs() <= 6.0,
         "control: a chosen trail colour keeps its hue ({chosen:06x} at {hue:.1}, its own {own:.1})"
     );
+}
+
+/// WHAT SETTINGS NAMES AS THE UNSET TRAIL COLOUR IS WHAT THE FRAME DRAWS ([`unset_trail_color`]),
+/// on every cursor shape. Where a style colours a block from its own palette, the colour tints
+/// only a bar cursor's rod, which keeps its own colour while the colour is blank: Settings named
+/// blank "Cursor color" for Fire, Water and Rainbow kitty on a bar while the frame drew an amber,
+/// aqua or pink rod (a paused A/B of blank against `cursor` differed in 63 px), and Phaser's
+/// while its rod shifted through the spectrum. On a block, an underline or a hollow block such a
+/// style reads no colour at all (Settings: "Inactive: bar cursor only"), so its default is the
+/// rod's. Every other style's trail, and its rod on a bar, wears the colour Settings names.
+#[test]
+fn the_unset_trail_colour_is_what_the_frame_draws() {
+    let styles = [
+        "lumen",
+        "phaser",
+        "sparkle",
+        "fire",
+        "laser",
+        "beam",
+        "water",
+        "comet",
+        "classic",
+        "rainbow kitty pet",
+    ];
+    let shapes = [
+        CursorStyle::SteadyBlock,
+        CursorStyle::SteadyBar,
+        CursorStyle::SteadyUnderline,
+        CursorStyle::HollowBlock,
+    ];
+    let mut wrong = Vec::new();
+    for raw in styles {
+        let style = GlowSpelling::parse(raw).style.expect("a built-in style");
+        let unset = unset_trail_color(style, false);
+        let named = match unset {
+            UnsetTrailColor::Cursor => Some(THEME_CURSOR),
+            UnsetTrailColor::Own(color, _) => Some(color),
+            UnsetTrailColor::Shifting => None,
+        };
+        for shape in shapes {
+            let bar = matches!(shape, CursorStyle::SteadyBar);
+            for ground in [DARK, LIGHT] {
+                let at = format!(
+                    "{raw} on a {shape:?}, {} ground, Settings naming {unset:?}",
+                    if ground == DARK { "dark" } else { "light" }
+                );
+                if !bar && !style.draws_trail_color() {
+                    let red = GlowKnobs {
+                        color: Some(0x00FF_2020),
+                        ..knobs()
+                    };
+                    if Session::shaped(raw, knobs(), shape, ground).script()
+                        != Session::shaped(raw, red, shape, ground).script()
+                    {
+                        wrong.push(format!("{at}: a colour changes the frame"));
+                    }
+                    continue;
+                }
+                let mut session = Session::shaped(raw, knobs(), shape, ground);
+                let mut hash = aterm_hash::FxHasher::default();
+                let mut rods = Vec::new();
+                for step in 0..12_u16 {
+                    let ms = u64::from(step) * 40;
+                    session.key(ms);
+                    session.frame(ms, (2, 4 + step), &mut hash);
+                    rods.extend(session.fx.rod_drawn);
+                }
+                if bar && rods.len() != 12 {
+                    wrong.push(format!(
+                        "{at}: the bar drew its rod on {} of 12",
+                        rods.len()
+                    ));
+                    continue;
+                }
+                if style.draws_trail_color() {
+                    if let Some(named) = named
+                        && session.glow.color & 0x00FF_FFFF != named
+                    {
+                        wrong.push(format!(
+                            "{at}: the trail wears {:06x}",
+                            session.glow.color & 0x00FF_FFFF
+                        ));
+                    }
+                    // Classic's trail shifts through colours (its own law,
+                    // [`trail_color_default_name`]); its bar is the cursor's own caret.
+                    if named.is_none() {
+                        continue;
+                    }
+                    // Sparkle's caret on paper is its gold deepened in its hue
+                    // ([`sparkle_s_paper_caret_is_gold_deepened_in_its_hue`]).
+                    let paper_gold = style == GlowStyle::Sparkle && ground == LIGHT;
+                    if bar && !paper_gold && rods.iter().any(|rod| Some(*rod) != named) {
+                        wrong.push(format!("{at}: the rod wears {rods:06x?}"));
+                    }
+                    continue;
+                }
+                let mut shifts = rods.clone();
+                shifts.dedup();
+                let drawn_as_named = match unset {
+                    UnsetTrailColor::Own(color, _) => rods.iter().all(|rod| *rod == color),
+                    UnsetTrailColor::Shifting => shifts.len() > 1,
+                    UnsetTrailColor::Cursor => false,
+                };
+                if !drawn_as_named {
+                    wrong.push(format!("{at}: the rod wears {rods:06x?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

@@ -57,6 +57,18 @@ fi
 exit "${HOP_EXIT:-0}"
 "#;
 
+/// The signals a front and its admission wait catch, at their defaults when a test starts one
+/// ([`atpkg::platform::Starting`]).
+const FRONT_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
+
+/// The front `cmd` starts. A front, and the admission wait it holds, keep an ignored signal
+/// ignored: it starts with the ones it is sent at their defaults ([`FRONT_SIGNALS`]), set here, not
+/// this test binary's, and a shell's `trap ''` then ignores the ones named.
+fn started(cmd: &mut aterm_uds::spawnfd::Command) -> aterm_uds::spawnfd::Child {
+    let start = atpkg::platform::Starting::at_defaults(&FRONT_SIGNALS);
+    start.spawning(|| cmd.spawn().expect("the front"))
+}
+
 /// Set, the suite is [`standin_touches_and_waits`]: the MiB it touches.
 const TOUCH: &str = "ATPKG_HOP_STANDIN_TOUCH";
 
@@ -203,9 +215,7 @@ impl Scratch {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> aterm_uds::spawnfd::Child {
-        self.front_command(ignored, args, env)
-            .spawn()
-            .expect("the front")
+        started(&mut self.front_command(ignored, args, env))
     }
 
     /// [`Self::front`], started in a session of its own (`setsid`), as aterm starts each tab's
@@ -215,10 +225,7 @@ impl Scratch {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> aterm_uds::spawnfd::Child {
-        self.front_command(None, args, env)
-            .setsid(true)
-            .spawn()
-            .expect("the front")
+        started(self.front_command(None, args, env).setsid(true))
     }
 
     /// The command [`Self::front_ignoring`] spawns.
@@ -732,7 +739,9 @@ fn an_ordinary_ancestors_unlocked_lock_file_cannot_force_admission() {
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(aterm_uds::spawnfd::Stdio::null())
             .stderr(aterm_uds::spawnfd::Stdio::piped());
-        let mut child = command.spawn().expect("ordinary ancestor");
+        let start = atpkg::platform::Starting::at_defaults(&FRONT_SIGNALS);
+        let mut child = start.spawning(|| command.spawn().expect("ordinary ancestor"));
+        drop(start);
         until_within(MUST_HAPPEN, "the ancestor's open descriptor", || {
             std::fs::metadata(&ready).ok()
         });

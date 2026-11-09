@@ -43,11 +43,6 @@ contract! {
     { differs && steady && follows && !asked && !off }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "relay_digest_island.rs"]
-mod island;
-
 /// The kernel a [`Trigger`] asks: [`digest_asks`], or a test's mutant of it.
 type Kernel = fn(bool, bool, bool, bool, bool) -> bool;
 

@@ -949,7 +949,6 @@ pub(crate) fn c_toolchain_entry(cause: CToolchain) -> aterm_messages::exceptions
         })),
         if mac {
             Then::step(format!("Run `{}` in a terminal", atpkg::prereq::act()))
-                .or_short("Run the command under Details")
         } else {
             Then::step("Install your distribution's C compiler")
         },

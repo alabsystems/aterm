@@ -125,10 +125,12 @@ PEOPLE
 ON A HOST
     here plan|apply <baseline.toml> [--json]
                               run a baseline on this Mac directly (apply under sudo)
-    here apply --plain [--name m<N>]
+    here apply --plain [--root-steps-only] [--name m<N>]
                               install Apple's Command Line Tools from aterm's own
                               baseline, reading no file, and with --name give the Mac
                               its registry label as Computer Name and Local hostname;
+                              --root-steps-only preserves developer-tool installation
+                              and selection while applying independent root steps;
                               prints no report and exits with why the tools did not
                               finish (`aterm init`'s root half)
     agent <cmd>               the host agent, which the controller runs over SSH
@@ -625,6 +627,10 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
 fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let plain = args.iter().any(|a| a == "--plain");
+    let steps_only = args.iter().any(|a| a == "--root-steps-only");
+    if steps_only && !plain {
+        return refuse("here: --root-steps-only requires --plain");
+    }
     if json && plain {
         return refuse("here: choose either --json or --plain");
     }
@@ -642,7 +648,7 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let mut words = args.iter();
     while let Some(arg) = words.next() {
         match arg.as_str() {
-            "--json" | "--plain" => {}
+            "--json" | "--plain" | "--root-steps-only" => {}
             "--name" => match words
                 .next()
                 .map(String::as_str)
@@ -672,14 +678,30 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     // account could write, and applies the Command Line Tools' own baseline.
     if plain {
         return match rest.as_slice() {
-            [_] if mode == Mode::Apply => commands::here(sys, mode, None, name.as_deref(), output),
+            [_] if mode == Mode::Apply => commands::here(
+                sys,
+                mode,
+                commands::HereBaseline::BuiltIn(if steps_only {
+                    crate::init_clt::RootPlan::StepsOnly
+                } else {
+                    crate::init_clt::RootPlan::WithTools
+                }),
+                name.as_deref(),
+                output,
+            ),
             _ => refuse("here: --plain takes apply alone, with no baseline file"),
         };
     }
     let [_, path] = rest.as_slice() else {
         return refuse("here: takes plan|apply <baseline.toml>");
     };
-    commands::here(sys, mode, Some(Path::new(path.as_str())), None, output)
+    commands::here(
+        sys,
+        mode,
+        commands::HereBaseline::File(Path::new(path.as_str())),
+        None,
+        output,
+    )
 }
 
 fn refuse(why: &str) -> ExitCode {
@@ -1169,7 +1191,12 @@ mod tests {
         let mut user = Fake::default();
         user.euid = 501;
         let other = ExitCode::from(crate::init_clt::Unfinished::Other.code().unwrap());
-        for words in [&["apply", "--plain"][..], &["--plain", "apply"]] {
+        for words in [
+            &["apply", "--plain"][..],
+            &["--plain", "apply"],
+            &["apply", "--plain", "--root-steps-only"],
+            &["--root-steps-only", "apply", "--plain"],
+        ] {
             assert_eq!(here(&user, &args(words)), other, "{words:?}");
         }
         for words in [
@@ -1177,6 +1204,9 @@ mod tests {
             &["apply", "/b/clt.toml", "--plain"],
             &["plan", "--plain"],
             &["apply", "--json", "--plain"],
+            &["apply", "--root-steps-only"],
+            &["apply", "--root-steps-only", "/b/clt.toml"],
+            &["apply", "--plain", "--root-steps-only", "/b/clt.toml"],
         ] {
             assert_eq!(here(&user, &args(words)), ExitCode::from(2), "{words:?}");
         }

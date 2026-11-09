@@ -8,9 +8,6 @@ use std::path::Path;
 use aterm_objc::send::{send_id_id, send_v};
 use aterm_objc::{ClassPtr, Id, Sel, autoreleasepool, class, sel};
 
-#[link(name = "ServiceManagement", kind = "framework")]
-unsafe extern "C" {}
-
 /// `SMAppServiceStatusRequiresApproval`: the switch is off.
 const REQUIRES_APPROVAL: isize = 2;
 
@@ -19,7 +16,7 @@ type StatusFn = unsafe extern "C-unwind" fn(ClassPtr, Sel, Id) -> isize;
 
 /// `SMAppService`, null before macOS 13.
 fn service() -> ClassPtr {
-    class(c"SMAppService")
+    aterm_macos_ui::service_management::class(c"SMAppService")
 }
 
 /// Whether the Login Items switch is off for the login plist `plist`.

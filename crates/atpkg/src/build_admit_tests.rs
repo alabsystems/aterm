@@ -1227,7 +1227,11 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
             .is_empty(),
         "no claim outlives its build"
     );
+    // The build inherits SIGTERM through a front that keeps an ignored one ignored: at its
+    // default, set here, not the runner's.
+    let start = crate::platform::Starting::at_defaults(&[libc::SIGTERM]);
     let killed = run("kill -TERM $$");
+    drop(start);
     assert_eq!(killed.signal(), Some(libc::SIGTERM));
 }
 
@@ -1447,7 +1451,11 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
     let spawn_front = |grace_ms: &str| {
         use std::io::BufRead as _;
         let dir = aterm_tempfile::tempdir().expect("scratch");
-        let mut front = crate::platform::spawn_outside_a_stand_aside(|| {
+        // The front must pass on the SIGTERM it is sent and die of it, and a front that inherits
+        // an ignored SIGTERM keeps it ignored: it starts with SIGTERM at its default, set here,
+        // not the runner's.
+        let start = crate::platform::Starting::at_defaults(&[libc::SIGTERM]);
+        let mut front = start.spawning(|| {
             aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
@@ -1465,6 +1473,7 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
                 .spawn()
                 .expect("the stand-in front")
         });
+        drop(start);
         let out = front.stdout.take().expect("its stdout");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1557,8 +1566,12 @@ fn a_front_passes_on(sig: libc::c_int, build: &str) {
     use std::io::BufRead as _;
     use std::os::unix::process::ExitStatusExt as _;
     let dir = aterm_tempfile::tempdir().expect("scratch");
-    // A front that inherits an ignored signal keeps it ignored.
-    let mut front = crate::platform::spawn_outside_a_stand_aside(|| {
+    // A front that inherits an ignored signal keeps it ignored, so the front starts with `sig` at
+    // its default, set here, not the runner's (a `&` job's SIGINT, a `nohup`'s SIGHUP), and is
+    // spawned in this process's forwarding turn, while no lease test of this binary stands aside
+    // ignoring SIGINT.
+    let start = crate::platform::Starting::at_defaults(&[sig]);
+    let mut front = start.spawning(|| {
         aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
             .args([
                 "--exact",
@@ -1575,6 +1588,7 @@ fn a_front_passes_on(sig: libc::c_int, build: &str) {
             .spawn()
             .expect("the stand-in front")
     });
+    drop(start);
     let out = front.stdout.take().expect("its stdout");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1900,17 +1914,23 @@ fn a_front_ends_by_the_signal_its_build_died_of() {
         ("ALRM", libc::SIGALRM),
     ] {
         let dir = aterm_tempfile::tempdir().expect("scratch");
-        let mut front = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "build_admit::tests::standin_front_ends_as_its_build",
-                "--test-threads=1",
-            ])
-            .env(END_STANDIN, format!("{}:{name}", dir.path().display()))
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("the stand-in front");
+        // The build that sends itself `sig` inherits it through a front that keeps an ignored
+        // one ignored: at its default, set here, not the runner's.
+        let start = crate::platform::Starting::at_defaults(&[sig]);
+        let mut front = start.spawning(|| {
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "build_admit::tests::standin_front_ends_as_its_build",
+                    "--test-threads=1",
+                ])
+                .env(END_STANDIN, format!("{}:{name}", dir.path().display()))
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the stand-in front")
+        });
+        drop(start);
         let status = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the front's end",

@@ -4,19 +4,29 @@
 //! Pure decision kernels of the one mesh, each held to a Clean island that proves its safety law
 //! for every size (`docs/DESIGN-one-mesh-proofs-2026-11-05.md`).
 //!
-//! The crate has no dependencies, no proc macros and no anchors, so every Trust build and every
-//! `verify` elaborates its spec islands (`cfg(clean_islands)`). A decision is a scalar `contract!`
-//! kernel whose clause cites an island definition (`ensures result == spec_k(..) by k_is_exact`);
-//! the binding islands, which prove each compiled kernel equal to its spec and close each law for
-//! the World that asks the compiled kernels, are checked where Trust imports function bodies:
-//! the Trust lane (`targo --unverified ship trust run -p aterm-mesh-core`, `cfg(trust_verify)`)
-//! until TG12 keeps them in every build. The folds over a view are plain Rust held to the island
-//! by an answer sheet that a test recomputes on every build, stock and cross builds included.
+//! The crate has no dependencies, no proc macros and no anchors (PM-1). Its spec islands are
+//! elaborated in `aterm-mesh-core-islands` (`cfg(clean_islands)`), which every build of the `aterm`
+//! package, a bare build and this crate's tests check and nothing on the mesh's compile chain waits
+//! for (its lib.rs says why): the spec islands name no Rust, so outside the Trust lane this crate's
+//! compile carries none of them. A decision is a scalar `contract!` kernel whose clause cites an
+//! island definition (`ensures result == spec_k(..) by k_is_exact`); the binding islands, which
+//! prove each compiled kernel equal to its spec and close each law for the World that asks the
+//! compiled kernels, are checked where Trust imports function bodies: the Trust lane (`targo
+//! --unverified ship trust run -p aterm-mesh-core`, `cfg(trust_verify)`), which mounts the spec
+//! islands here too, until TG12 keeps them in every build. The folds over a view are plain Rust
+//! held to the island by an answer sheet that a test recomputes on every build, stock and cross
+//! builds included; the tests depend on `aterm-mesh-core-islands`, so a test build checks the
+//! islands whose text they read.
 //!
-//! Each property owns one module, its spec island (`<prop>_island.rs`, mounted from inside the
-//! module) and its binding island (`<prop>_binding_island.rs`, mounted at the end of this file),
-//! so the steps that prove them edit disjoint files but for one mount line here.
+//! Each property owns one module, its spec island (`<prop>_island.rs`, a line of
+//! `aterm-mesh-core-islands`' `islands.rs`) and its binding island (`<prop>_binding_island.rs`,
+//! mounted at the end of this file), so the steps that prove them edit disjoint files but for that
+//! line and one mount here.
 #![forbid(unsafe_code)]
+
+// The answer-sheet tests read the islands' text: a test build checks the islands first.
+#[cfg(test)]
+use aterm_mesh_core_islands as _;
 
 #[cfg(trust_verify)]
 macro_rules! verify_island { ($($body:tt)*) => {$($body)*}; }
@@ -40,11 +50,12 @@ macro_rules! contract {
     };
 }
 
-// The temporal prelude every property's island opens (`AtermMeshTemporal`), mounted first.
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "temporal_island.rs"]
-mod temporal;
+// The spec islands on the Trust lane, where the contracts' clauses cite their spec kernels and the
+// binding islands below build on them: `aterm-mesh-core-islands`' list, mounted first, which opens
+// with the temporal prelude every property's island opens (`AtermMeshTemporal`).
+#[cfg(trust_verify)]
+#[path = "../../aterm-mesh-core-islands/src/islands.rs"]
+mod spec;
 
 pub mod revocation;
 

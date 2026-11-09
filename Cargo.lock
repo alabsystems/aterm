@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.181.0"
+version = "0.182.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -177,6 +177,7 @@ dependencies = [
  "aterm-log",
  "aterm-machines",
  "aterm-mesh",
+ "aterm-mesh-core-islands",
  "aterm-metrics",
  "aterm-models-session",
  "aterm-net",
@@ -1309,6 +1310,13 @@ dependencies = [
 
 [[package]]
 name = "aterm-mesh-core"
+version = "0.0.0"
+dependencies = [
+ "aterm-mesh-core-islands",
+]
+
+[[package]]
+name = "aterm-mesh-core-islands"
 version = "0.0.0"
 
 [[package]]

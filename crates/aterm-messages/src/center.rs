@@ -3269,10 +3269,6 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         crate::need::Need::Now(ask)
             if msg.excerpt && msg.detail.first().map(String::as_str) == Some(ask.then().words())
     );
-    let step_short = match msg.need() {
-        crate::need::Need::Now(ask) if step => ask.then().short(),
-        _ => None,
-    };
     let spec = RowSpec {
         kind,
         severity: msg.severity,
@@ -3281,7 +3277,6 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         title: &msg.title,
         detail0,
         step,
-        step_short,
         meter: msg.meter.as_ref().map(|_| (ind.fill, stats)),
         busy: ind.busy && ind.fill.is_none(),
         animated: moving_fill,

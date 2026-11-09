@@ -45,35 +45,43 @@ fn a_git_that_takes_the_option_is_asked_nothing_more() {
 
 /// A git that refuses the option is judged by its read under the variable, alone, in the
 /// question's own scratch folder, which is gone after it, with no system or personal git config
-/// and in English: one that says it will not fetch lazily obeys the variable. NEGATIVE CONTROLS:
-/// the same git whose read fetched the object is refused, and a read that failed without saying
-/// lazy fetching is off, or that a signal ended, shows nothing: a git is admitted neither for
+/// and in English: a complete trace and a working fetch control establish the quiet refusal.
+/// NEGATIVE CONTROLS: the same git whose read fetched or attempted to fetch the object is
+/// refused, as is a read a signal ended: a git is admitted neither for
 /// refusing the option nor for a failed read alone.
 #[test]
 fn a_git_that_refuses_the_option_is_judged_by_what_its_read_did() {
     for (obeys, expected) in [(true, Some(NoLazyFetch::Variable)), (false, None)] {
         let (sys, who) = fake();
-        sys.simulate(move |_, command| before_the_option(command, obeys));
+        sys.simulate(move |sys, command| before_the_option(sys, command, obeys));
         assert_eq!(NoLazyFetch::of(&sys, &who).unwrap(), expected, "{obeys}");
         let calls = sys.calls();
         let scratch = Fake::scratch_path(None, LABEL, 0);
-        assert_eq!(calls.len(), 7, "{calls:?}");
         assert!(
             calls[0].ends_with(" --no-lazy-fetch --version"),
             "{calls:?}"
         );
         assert_eq!(calls[1], format!("scratch allocated {}", scratch.display()));
-        assert_eq!(calls[6], format!("scratch closed {}", scratch.display()));
+        assert_eq!(
+            calls.last().unwrap(),
+            &format!("scratch closed {}", scratch.display())
+        );
         assert!(
-            calls[2..6].iter().all(
-                |call| call.contains(&scratch.to_string_lossy().into_owned())
-                    && call.contains("GIT_CONFIG_NOSYSTEM=1")
-                    && call.contains("GIT_CONFIG_GLOBAL=/dev/null")
-                    && call.contains("LC_ALL=C")
-            ),
+            calls[2..calls.len() - 1]
+                .iter()
+                .filter(|call| !call.starts_with("write "))
+                .all(
+                    |call| call.contains(&scratch.to_string_lossy().into_owned())
+                        && call.contains("GIT_CONFIG_NOSYSTEM=1")
+                        && call.contains("GIT_CONFIG_GLOBAL=/dev/null")
+                        && call.contains("LC_ALL=C")
+                ),
             "{calls:?}"
         );
-        let read = &calls[5];
+        let read = calls
+            .iter()
+            .find(|call| call.contains(" cat-file "))
+            .unwrap();
         assert!(
             read.contains(&format!(" cat-file -t {OBJECT_NAMED}"))
                 && read.contains("GIT_NO_LAZY_FETCH=1")
@@ -92,28 +100,13 @@ fn a_git_that_refuses_the_option_is_judged_by_what_its_read_did() {
             "the question's scratch folder is gone after it"
         );
     }
-    // A read that failed without saying lazy fetching is off (it tried the promisor and could
-    // not reach it, say), or that a signal ended, shows nothing.
-    assert!(!obeyed(&Ran::exit(
-        128,
-        "fatal: could not fetch from promisor remote"
-    )));
-    assert!(obeyed(&Ran::exit(
-        128,
-        "warning: lazy fetching disabled; some objects may not be available"
-    )));
-    assert!(!obeyed(&Ran {
-        status: None,
-        stdout: Vec::new(),
-        stderr: b"warning: lazy fetching disabled".to_vec(),
-    }));
 }
 
 /// A question git could not be asked is an error, never a verdict either way: a `--version` that
 /// did not run, a probe whose runs did not, and a probe whose setup step ran and failed (a full
 /// or unwritable temporary folder, say) or named no object, which is named with what git said
 /// and reads nothing. So a converge pass says why and tries again rather than calling the git
-/// incapable. NEGATIVE CONTROL: a read that ran and failed without saying lazy fetching is off is
+/// incapable. NEGATIVE CONTROL: a read that ran and failed while attempting a fetch is
 /// git's answer, a refusal (`None`), not an error.
 #[test]
 fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
@@ -130,11 +123,14 @@ fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
     assert!(NoLazyFetch::of(&sys, &who).is_err(), "no probe answer");
     let answering = |step: &'static str, answer: Ran| {
         let (sys, who) = fake();
-        sys.simulate(move |_, command| {
+        sys.simulate(move |sys, command| {
             if command.args.iter().any(|arg| arg == step) {
+                if step == "cat-file" {
+                    record_trace(sys, command, &answer, true);
+                }
                 return Some(answer.clone());
             }
-            before_the_option(command, true)
+            before_the_option(sys, command, true)
         });
         let of = NoLazyFetch::of(&sys, &who);
         let read = sys.calls().iter().any(|call| call.contains(" cat-file "));
@@ -182,6 +178,76 @@ fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
     assert!(read);
 }
 
+#[test]
+fn a_privileged_probe_gives_its_private_scratch_to_the_git_actor_before_running_it() {
+    let (mut sys, who) = fake();
+    sys.euid = 0;
+    sys.on_chown(|sys, path| {
+        let mut stat = sys.stat(path).unwrap();
+        stat.uid = 501;
+        stat.gid = 20;
+        sys.stat_of(path.to_str().unwrap(), stat);
+    });
+    sys.simulate(|sys, command| {
+        if command.args.iter().any(|arg| arg == "init") {
+            let scratch = Fake::scratch_path(None, LABEL, 0);
+            let stat = sys.stat(&scratch).unwrap();
+            let actor = command.user.as_ref().unwrap();
+            assert_eq!((stat.uid, stat.gid), (actor.uid, actor.gid));
+            assert_eq!(stat.mode & 0o777, 0o700);
+        }
+        before_the_option(sys, command, true)
+    });
+    assert_eq!(NoLazyFetch::of(&sys, &who), Ok(Some(NoLazyFetch::Variable)));
+}
+
+#[test]
+fn a_failed_fetch_attempt_is_refused_even_when_a_control_would_succeed() {
+    let (sys, who) = fake();
+    sys.simulate(|sys, command| {
+        let answer = before_the_option(sys, command, true)?;
+        if command.args.iter().any(|arg| arg == "cat-file") {
+            record_trace(sys, command, &answer, true);
+        }
+        Some(answer)
+    });
+    assert_eq!(NoLazyFetch::of(&sys, &who), Ok(None));
+    assert_eq!(
+        sys.calls()
+            .iter()
+            .filter(|call| call.contains(" cat-file "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn missing_trace_and_failed_controls_defer_the_capability_decision() {
+    for fault in ["subject", "control-trace", "control-fetch"] {
+        let (sys, who) = fake();
+        sys.simulate(move |sys, command| {
+            let answer = before_the_option(sys, command, true)?;
+            if command.args.iter().any(|arg| arg == "cat-file") {
+                let (_, path) = command
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "GIT_TRACE2_EVENT")
+                    .unwrap();
+                let control = path.ends_with("control.trace");
+                if (fault == "subject" && !control) || (fault == "control-trace" && control) {
+                    sys.file(path, b"");
+                }
+                if fault == "control-fetch" && control {
+                    return Some(Ran::exit(128, "local transport unavailable"));
+                }
+            }
+            Some(answer)
+        });
+        assert!(NoLazyFetch::of(&sys, &who).is_err(), "{fault}");
+    }
+}
+
 /// A stand-in for a git before 2.44 over this host's native git: `--no-lazy-fetch` refused as
 /// unknown (129), every other run handed to the native git after `prelude`.
 fn stand_in(dir: &Path, name: &str, native: &str, prelude: &str) -> PathBuf {
@@ -210,6 +276,7 @@ fn a_native_git_guard_prevents_lazy_fetch_and_reads_without_evidence_are_not_adm
     let native = crate::items::github::need_native_git();
     let live = Live::new();
     let dir = aterm_tempfile::tempdir().unwrap();
+    let obeying = stand_in(dir.path(), "variable-git", native, "");
     let ignoring = stand_in(
         dir.path(),
         "ignoring-git",
@@ -229,30 +296,38 @@ fn a_native_git_guard_prevents_lazy_fetch_and_reads_without_evidence_are_not_adm
     let of = |git: &Path| NoLazyFetch::of_git(&live, &|| Cmd::new(git)).unwrap();
     let read = |git: &Path| asked(&live, &|| Cmd::new(git)).unwrap();
 
-    let shown = asked(&live, &|| match off {
-        NoLazyFetch::Flag => Cmd::new(native).arg("--no-lazy-fetch"),
-        NoLazyFetch::Variable => Cmd::new(native),
-    })
-    .unwrap();
-    assert!(
-        shown.status.is_some_and(|code| code != 0),
-        "the selected {off:?} guard must prevent a lazy fetch: {}",
-        shown.describe()
+    assert_eq!(of(Path::new(native)), Some(off));
+    let shown = read(&obeying);
+    assert_eq!(
+        shown.no_fetch,
+        !shown.read.success(),
+        "{}",
+        shown.read.describe()
+    );
+    if off == NoLazyFetch::Variable {
+        assert!(
+            shown.no_fetch,
+            "the selected variable guard prevents fetching"
+        );
+    }
+    assert_eq!(
+        of(&obeying),
+        shown.no_fetch.then_some(NoLazyFetch::Variable)
     );
 
     assert_eq!(of(&ignoring), None);
     let fetched = read(&ignoring);
     assert!(
-        fetched.success() && fetched.out().trim() == "blob",
+        fetched.read.success() && fetched.read.out().trim() == "blob" && !fetched.no_fetch,
         "control: a git that ignores the variable fetches lazily: {}",
-        fetched.describe()
+        fetched.read.describe()
     );
 
     assert_eq!(of(&barred), None);
     let tried = read(&barred);
     assert!(
-        !tried.success() && !tried.err().contains(REFUSED) && tried.err().contains("not allowed"),
+        !tried.read.success() && !tried.no_fetch && tried.read.err().contains("not allowed"),
         "control: a git that tried the promisor and failed: {}",
-        tried.describe()
+        tried.read.describe()
     );
 }

@@ -1362,6 +1362,9 @@ impl App {
     ) -> Option<crate::tab_model::ViewId> {
         if !self.active_tab_has_multiple_visible_panes(wid)
             || self.windows.get(&wid).is_none_or(|ws| ws.overlay_open())
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+            || self.stats_lens_at(wid, x, y)
         {
             return None;
         }
@@ -1476,6 +1479,7 @@ impl App {
         let (px, py) = ws.last_cursor_px;
         if self.band_banner_at(wid, px, py).is_some()
             || self.find_bar_cell_at(wid, px, py).is_some()
+            || self.stats_lens_at(wid, px, py)
         {
             return false;
         }
@@ -2768,6 +2772,7 @@ impl App {
         let (px, py) = ws.last_cursor_px;
         if self.band_banner_at(wid, px, py).is_some()
             || self.find_bar_cell_at(wid, px, py).is_some()
+            || self.stats_lens_at(wid, px, py)
         {
             return false;
         }
@@ -3390,6 +3395,7 @@ impl App {
         let (px, py) = ws.last_cursor_px;
         if self.band_banner_at(wid, px, py).is_some()
             || self.find_bar_cell_at(wid, px, py).is_some()
+            || self.stats_lens_at(wid, px, py)
         {
             return None;
         }
@@ -3736,6 +3742,7 @@ impl App {
         self.track_strip_hover(wid, geom, x, y);
         let over_claude_chips = self.track_claude_light_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
+            self.scrollbar_pointer_left(wid);
             self.palette_pointer_motion(wid, x, y);
             return;
         }
@@ -3744,16 +3751,19 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.tab_menu.is_some())
         {
+            self.scrollbar_pointer_left(wid);
             self.refresh_mouse_cell(wid, geom, x, y);
             self.track_tab_menu_hover(wid, x, y);
             return;
         }
         if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+            self.scrollbar_pointer_left(wid);
             self.refresh_mouse_cell(wid, geom, x, y);
             self.autopilot_menu_motion(wid, x, y);
             return;
         }
         if self.overview_claims_pointer(wid) {
+            self.scrollbar_pointer_left(wid);
             self.overview_pointer_motion(wid, x, y);
             return;
         }
@@ -3764,15 +3774,18 @@ impl App {
                 || ws.pane_overlay.drag.is_some()
         }) && self.stats_pointer_motion(wid, crate::metrics::host_now())
         {
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && (ws.hover_pointer || ws.native_text_cursor)
-            {
-                ws.hover_pointer = false;
-                ws.native_text_cursor = false;
-                if let Some(w) = &ws.os_window {
-                    w.set_cursor(CursorIcon::Default);
+            self.scrollbar_pointer_left(wid);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.native_rest = None;
+                if ws.hover_pointer || ws.native_text_cursor {
+                    ws.hover_pointer = false;
+                    ws.native_text_cursor = false;
+                    if let Some(w) = &ws.os_window {
+                        w.set_cursor(CursorIcon::Default);
+                    }
                 }
             }
+            self.apply_native_hover(wid, None);
             return;
         }
         if self
@@ -5001,9 +5014,12 @@ impl App {
                     .and_then(|(_, view)| self.native_runtime.view_state(view))
                     .is_some_and(|state| state.common().pressed.is_some()));
             if pressed || !captured {
-                if pressed && !captured && self.inline_rename_edit(wid).is_some() {
-                    self.clear_strip_press(wid);
-                    self.settle_rename_edit(wid);
+                if pressed && !captured {
+                    self.close_stats_lens(wid);
+                    if self.inline_rename_edit(wid).is_some() {
+                        self.clear_strip_press(wid);
+                        self.settle_rename_edit(wid);
+                    }
                 }
                 if pressed && button == WinitMouseButton::Left && !captured {
                     let (x, y) = self.windows[&wid].last_cursor_px;
@@ -5185,7 +5201,7 @@ impl App {
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.native_rehover = true;
                     }
-                    let _ = self.dispatch_native_control_action(
+                    let _ = self.dispatch_native_pointer_action(
                         wid,
                         release_view,
                         release.key,
@@ -5193,7 +5209,6 @@ impl App {
                             id: release.action,
                             value,
                         },
-                        false,
                     );
                 }
                 return native_press;
@@ -7423,7 +7438,10 @@ mod tests {
                         .iter()
                         .find(|picture| picture.key == node.key)?
                         .rect;
+                    // In the strip and cut by the list's foot: one drawn there whole works
+                    // itself ([`crate::native_ui::CompiledUi::picture_hits`]).
                     (compiled.hits.iter().all(|hit| hit.key != node.key)
+                        && compiled.picture_hits.iter().all(|hit| hit.key != node.key)
                         && picture.y == node.rect.y
                         && picture.height > 4.0
                         && node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5))
@@ -8066,38 +8084,48 @@ mod tests {
     }
 
     #[test]
-    fn a_press_on_a_switch_drawn_in_the_lists_strip_scrolls_it_in_and_works_nothing() {
+    fn a_press_on_a_switch_cut_in_the_lists_strip_scrolls_it_in_and_works_nothing() {
         use crate::native_ui::UiContent;
         use crate::{App, WindowId};
         use aterm_window::event::{ElementState, MouseButton};
 
-        let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(760, 460));
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        let (_, view) = app.active_native_view(wid).expect("Settings active");
+        // A picture the list's foot cuts: one the strip draws whole works itself
+        // ([`crate::native_ui::CompiledUi::picture_hits`]).
         let switch_picture = |compiled: &crate::native_ui::CompiledUi| {
             compiled.list_pictures.iter().find_map(|picture| {
                 let paint = compiled.paint.iter().find(|node| node.key == picture.key)?;
                 let UiContent::Switch(control) = &paint.content else {
                     return None;
                 };
-                (picture.rect.height >= 12.0).then(|| (picture.clone(), control.value.clone()))
+                let cut = compiled
+                    .picture_hits
+                    .iter()
+                    .all(|hit| hit.key != picture.key);
+                (cut && picture.rect.height >= 12.0)
+                    .then(|| (picture.clone(), control.value.clone()))
             })
         };
-        let mut found = switch_picture(&presented_native_ui(&mut app, wid));
-        for _ in 0..40 {
-            if found.is_some() {
-                break;
+        let mut found = None;
+        'sizes: for (width, height) in [(760, 460), (760, 520), (640, 400), (1_100, 740)] {
+            let mut app = App::headless_for_test();
+            app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(width, height));
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            let (_, view) = app.active_native_view(wid).expect("Settings active");
+            for _ in 0..40 {
+                if let Some(picture) = switch_picture(&presented_native_ui(&mut app, wid)) {
+                    found = Some((app, picture));
+                    break 'sizes;
+                }
+                let _ = app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    crate::native_app::AppEvent::ScrollLines(1),
+                );
             }
-            let _ = app.dispatch_native_view_event(
-                wid,
-                view,
-                crate::native_app::AppEvent::ScrollLines(1),
-            );
-            found = switch_picture(&presented_native_ui(&mut app, wid));
         }
-        let (picture, value) = found.expect("a screen of Top Settings draws a switch in its strip");
+        let (mut app, (picture, value)) =
+            found.expect("a screen of Top Settings cuts a switch in its strip");
         let (x, y) = native_content_to_window(
             &mut app,
             wid,
@@ -8132,18 +8160,24 @@ mod tests {
     }
 
     #[test]
-    fn a_press_on_a_preview_drawn_in_the_lists_strip_scrolls_it_in_and_pauses_nothing() {
+    fn a_press_on_a_preview_cut_in_the_lists_strip_scrolls_it_in_and_pauses_nothing() {
         use crate::native_ui::UiContent;
         use crate::{App, WindowId};
         use aterm_window::event::{ElementState, MouseButton};
 
+        // A picture the list's foot cuts: one the strip draws whole works itself
+        // ([`crate::native_ui::CompiledUi::picture_hits`]).
         let preview_picture = |compiled: &crate::native_ui::CompiledUi| {
             compiled.list_pictures.iter().find_map(|picture| {
                 let paint = compiled.paint.iter().find(|node| node.key == picture.key)?;
                 let UiContent::SettingsPreview(spec) = &paint.content else {
                     return None;
                 };
-                (picture.rect.height >= 12.0).then(|| (picture.clone(), spec.paused))
+                let cut = compiled
+                    .picture_hits
+                    .iter()
+                    .all(|hit| hit.key != picture.key);
+                (cut && picture.rect.height >= 12.0).then(|| (picture.clone(), spec.paused))
             })
         };
         let wid = WindowId(0);
@@ -8201,6 +8235,97 @@ mod tests {
             unreachable!()
         };
         assert_eq!(spec.paused, paused, "the press paused nothing");
+    }
+
+    /// A STYLE ROW THE LIST'S STRIP DRAWS WHOLE IS A ROW TO THE POINTER
+    /// ([`crate::native_ui::CompiledUi::picture_hits`]): at 1074x684 Cursor Styles draws a style
+    /// whole under its fade; the pointer over it previews it, and one click saves it and brings
+    /// it whole into the room, live. It was inert: pointing previewed nothing, and a
+    /// click only scrolled it into the room, saving nothing (lab fv2-cs-d150, Flying kitty).
+    #[test]
+    fn a_style_row_whole_under_the_fade_previews_and_saves_in_one_click() {
+        use aterm_window::event::{ElementState, MouseButton};
+
+        let (mut app, wid, view) = settings_sized_in(
+            crate::App::headless_for_test(),
+            crate::native_settings::SettingsRoute::CursorStyles,
+            (1_074, 684),
+        );
+        let compiled = presented_native_ui(&mut app, wid);
+        let hit = compiled
+            .picture_hits
+            .iter()
+            .find(|hit| hit.key.as_str().starts_with("settings/cursor-style/"))
+            .cloned()
+            .expect("the landing draws a style row whole under the fade");
+        assert!(compiled.semantic(&hit.key).is_none(), "it is in the strip");
+        let style = hit
+            .key
+            .as_str()
+            .strip_prefix("settings/cursor-style/")
+            .unwrap()
+            .replace('-', " ");
+        let (x, y) = native_content_to_window(
+            &mut app,
+            wid,
+            hit.rect.x + hit.rect.width * 0.5,
+            hit.rect.y + hit.rect.height * 0.5,
+        );
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone()),
+            Some(hit.key.clone()),
+            "the pointer is on the row"
+        );
+        let tried = presented_native_ui(&mut app, wid)
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                crate::native_ui::UiContent::SettingsPreview(spec) => {
+                    Some(spec.cursor.effective_trail_style_raw().to_string())
+                }
+                _ => None,
+            })
+            .expect("the preview");
+        assert!(
+            tried.eq_ignore_ascii_case(&style),
+            "pointing previews {style:?}, the preview tries {tried:?}"
+        );
+        let writes = app.native_config_pending.len();
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        // The write goes to aterm.toml off this thread: one click asked for it.
+        assert_eq!(
+            app.native_config_pending.len(),
+            writes + 1,
+            "one click saves {style:?}"
+        );
+        let after = presented_native_ui(&mut app, wid);
+        let paint = after
+            .paint
+            .iter()
+            .find(|node| node.key == hit.key)
+            .expect("the row is drawn");
+        let live = after
+            .hits
+            .iter()
+            .find(|found| found.key == hit.key)
+            .unwrap_or_else(|| panic!("{:?} came into the room, live: {:?}", hit.key, paint.rect));
+        assert_eq!(live.rect, paint.rect, "whole in the room");
+        if let Some(bar) = after
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "settings/feedback")
+        {
+            assert!(
+                paint.rect.bottom() <= bar.rect.y + 0.5,
+                "the bar {:?} covers the row {:?}",
+                bar.rect,
+                paint.rect
+            );
+        }
     }
 
     #[test]

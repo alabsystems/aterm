@@ -99,6 +99,11 @@ aterm-log = { path = "../aterm-log" }    # the log facade (the update verb recor
 # (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its instances with
 # it.
 aterm-uds = { workspace = true }
+# aterm-mesh-core's Clean islands, which prove the laws of the mesh kernels this binary ships. Only
+# this package and the kernels' tests wait for their check, so every build of the product checks
+# them (a release's slices included) and no compile on the mesh's chain does (its lib.rs). It
+# holds no Rust: `main.rs` names it with `use … as _`.
+aterm-mesh-core-islands = { workspace = true }
 
 # `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
 # Mach-O carries it. Its astream crates come from the vendor/astream submodule (see

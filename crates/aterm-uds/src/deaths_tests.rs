@@ -37,6 +37,29 @@ fn lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Set, this process is [`a_spawnfd_child_a_signal_ends_is_journaled_and_one_that_exits_is_not`]'s
+/// child that SIGTERM ends.
+const TERMED: &str = "ATERM_UDS_DEATHS_TERMED";
+
+/// The child [`a_spawnfd_child_a_signal_ends_is_journaled_and_one_that_exits_is_not`] waits on with
+/// accounting, ended by its own SIGTERM. It sets SIGTERM's default first: a test binary a `&` or
+/// `nohup` runner started ignoring it, as some do, passes that on through every exec, and a shell
+/// started ignoring a signal can neither trap nor die of it.
+#[test]
+fn a_child_its_own_sigterm_ends_if_asked() {
+    if std::env::var_os(TERMED).is_none() {
+        return;
+    }
+    // SAFETY: SIG_DFL is a disposition, no handler; then a signal to this process itself, which
+    // runs this test alone.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::kill(libc::getpid(), libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+    panic!("SIGTERM did not end the child");
+}
+
 #[test]
 fn a_spawnfd_child_a_signal_ends_is_journaled_and_one_that_exits_is_not() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -49,7 +72,16 @@ fn a_spawnfd_child_a_signal_ends_is_journaled_and_one_that_exits_is_not() {
             Some(libc::SIGKILL)
         );
         // The wait with accounting.
-        let usage = shell("kill -15 $$")
+        let usage = crate::spawnfd::command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deaths::tests::a_child_its_own_sigterm_ends_if_asked",
+                "--test-threads=1",
+            ])
+            .env(TERMED, "1")
+            .stdin(crate::spawnfd::Stdio::null())
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
             .spawn()
             .unwrap()
             .wait_with_rusage()

@@ -1125,6 +1125,17 @@ impl crate::release::PendingSign for FakePreparingSign {
 }
 
 impl Backend for World {
+    fn start_prefreeze(&mut self) {
+        std::fs::write(
+            self.dir.path().join("prefreeze-started"),
+            format!(
+                "ready={} publish_entered={}",
+                self.complete(),
+                self.dir.path().join("publish-entered").exists(),
+            ),
+        )
+        .unwrap();
+    }
     fn prepare_sign(
         &mut self,
         args: &[String],
@@ -1782,6 +1793,24 @@ impl Backend for World {
             _ => Ok(Some("v0.5.0".into())),
         }
     }
+}
+
+#[test]
+fn automatic_prefreeze_starts_after_ready_before_publish_only_for_a_cut() {
+    let mut w = World::new();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(
+        std::fs::read_to_string(w.dir.path().join("prefreeze-started")).unwrap(),
+        "ready=true publish_entered=false"
+    );
+    let mut private = World::new();
+    let (code, last) = private.run(ReleaseOptions {
+        qualify: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(!private.dir.path().join("prefreeze-started").exists());
 }
 
 fn owner_gap() -> Vec<Finding> {
@@ -4631,6 +4660,15 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
     use std::time::{Duration, Instant};
     if let Some(dir) = std::env::var_os(INTERRUPT_PROBE) {
         let dir = PathBuf::from(dir);
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        // SAFETY: SIG_DFL (0) for SIGTERM, which the parent sends this probe, whatever this
+        // test binary was started with: `install` leaves an ignored one ignored, and the step's
+        // child would inherit it ignored too.
+        unsafe {
+            signal(crate::interrupt::SIGTERM, 0);
+        }
         crate::interrupt::install();
         let mut w = World::new();
         let real = Real::new(w.dir.path(), None, true, false).expect("a backend");
@@ -5335,6 +5373,7 @@ fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     w.build_claims_late = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(!w.dir.path().join("prefreeze-started").exists());
     assert!(
         last.starts_with("REFUSED at 4/10 qualify") && last.contains("early build failure"),
         "{last}"

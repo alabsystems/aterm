@@ -60,11 +60,6 @@ contract! {
     { key_revoked && !origin_holds }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "relay_island.rs"]
-mod island;
-
 /// What the brokers take of one read: per key, whether it has a rival, is an origin and is
 /// revoked; per principal, whether it is revoked.
 #[derive(Clone, Debug, PartialEq, Eq)]

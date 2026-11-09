@@ -784,6 +784,11 @@ pub const TOOLS: &[Tool] = &[
         "the Linux user units of aterm-link",
     ),
     os(
+        "systemd-run",
+        &["/usr/bin/systemd-run"],
+        "the Linux node job starts each window it opens in a systemd scope of its own",
+    ),
+    os(
         "systemd-analyze",
         &["/usr/bin/systemd-analyze"],
         "the Linux publishing lane checks its units",

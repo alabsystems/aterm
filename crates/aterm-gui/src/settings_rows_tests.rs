@@ -8406,6 +8406,76 @@ fn tab(lab: &mut Lab, backwards: bool, width: f32, height: f32) -> Option<UiKey>
     Some(target)
 }
 
+/// A SINGLE-CHOICE LIST IS ONE TAB STOP, ENTERED AT ITS CHECKED OPTION
+/// ([`crate::native_ui::tab_past_choices`]): Tab from the search field into Cursor Styles
+/// lands on the saved style, which tries nothing, and the next Tab leaves the styles; Shift-Tab
+/// comes back to the saved style, and an arrow, the keyboard's point, tries the next one. Every
+/// row was a stop: Tab landed on Off and tried it, then on each style after it, trying each.
+#[test]
+fn tab_takes_the_cursor_styles_as_one_stop_at_the_saved_style() {
+    let (width, height) = (738.0, 418.0);
+    let mut lab = Lab::new("cursor_trail_style = \"rainbow dog\"\n");
+    lab.state_mut().navigate(SettingsRoute::CursorStyles);
+    let saved = UiKey::new(cursor_style_row_key(&saved_cursor_style(lab.state())));
+    assert!(saved.as_str().contains("dog"), "{saved:?}");
+    lab.compile(width, height);
+    lab.dispatch(AppEvent::FocusChanged(Some(UiKey::new("settings/search"))));
+    let style = |key: &UiKey| key.as_str().starts_with("settings/cursor-style/");
+    let mut stops = Vec::new();
+    while stops.len() < 12 {
+        let key = tab(&mut lab, false, width, height).expect("a Tab stop");
+        assert_eq!(
+            cursor_style_trial(lab.state()),
+            None,
+            "Tab onto {key:?} tries a style (stops {stops:?})"
+        );
+        let left = !style(&key) && stops.iter().any(style);
+        stops.push(key);
+        if left {
+            break;
+        }
+    }
+    let styles: Vec<_> = stops.iter().filter(|key| style(key)).collect();
+    assert_eq!(styles, [&saved], "one stop, the saved style: {stops:?}");
+    assert_eq!(
+        tab(&mut lab, true, width, height),
+        Some(saved.clone()),
+        "Shift-Tab comes back to the saved style"
+    );
+    lab.dispatch(AppEvent::StepFocus(1));
+    assert!(
+        cursor_style_trial(lab.state()).is_some(),
+        "an arrow moves within the styles and tries the one it lands on"
+    );
+}
+
+/// A KEY THAT MOVES THE PAGE LETS GO OF THE STYLE THE STILL POINTER RESTED ON: the pointer on
+/// Rainbow underline tries it; a Page Down that moves no focus scrolls it away, and the preview
+/// tries nothing. The hover was kept, so the preview went on trying a style no screen showed,
+/// saying "Click to save" over the row that had scrolled in under the pointer (Cursor Styles at
+/// 102x29: "Trying: Rainbow underline" over Flat kitty).
+#[test]
+fn a_page_down_lets_go_of_the_style_a_resting_pointer_tried() {
+    let (width, height) = (738.0, 418.0);
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::CursorStyles);
+    lab.compile(width, height);
+    let row = UiKey::new("settings/cursor-style/rainbow-kitty-underline");
+    lab.state_mut().common.hovered = Some(row.clone());
+    assert_eq!(lab.state().common.last_focus, None, "no keyboard focus");
+    assert!(
+        cursor_style_trial(lab.state()).is_some(),
+        "CONTROL: the resting pointer tries the row"
+    );
+    lab.dispatch(AppEvent::ScrollPage(1));
+    lab.compile(width, height);
+    assert_eq!(
+        cursor_style_trial(lab.state()),
+        None,
+        "the Page Down let go of {row:?}"
+    );
+}
+
 #[test]
 fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
     // A STATUS'S BAR OVER THE TOP OF THE LIST IS A TAB STOP WHERE IT STANDS: after a switch or a
@@ -9384,24 +9454,32 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
                     at.1 |= whole && named;
                 }
             };
-            let mut lab = Lab::new("");
-            lab.state_mut().navigate(route);
-            let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
-            for page in 0..300 {
-                let compiled = lab.compile(width, height);
-                let place: Vec<(UiKey, LogicalRect)> = compiled
-                    .paint
-                    .iter()
-                    .map(|node| (node.key.clone(), node.rect))
-                    .collect();
-                if before.as_ref() == Some(&place) {
-                    break;
+            // Page Down and Page Up from where the page opens: a page that lands on a row
+            // (Cursor Styles on the saved style) holds rows above it, which Tab does not walk
+            // where they are a single-choice list's options
+            // ([`crate::native_ui::tab_past_choices`]).
+            for direction in [1, -1] {
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
+                for page in 0..300 {
+                    let compiled = lab.compile(width, height);
+                    let place: Vec<(UiKey, LogicalRect)> = compiled
+                        .paint
+                        .iter()
+                        .map(|node| (node.key.clone(), node.rect))
+                        .collect();
+                    if before.as_ref() == Some(&place) {
+                        break;
+                    }
+                    note(&compiled);
+                    if direction == 1 {
+                        let at = format!("{route:?} {width}x{height} screen {page}");
+                        note_words_led_by_their_name(&compiled, &at, &mut found, &led);
+                    }
+                    before = Some(place);
+                    lab.dispatch(AppEvent::ScrollPage(direction));
                 }
-                note(&compiled);
-                let at = format!("{route:?} {width}x{height} screen {page}");
-                note_words_led_by_their_name(&compiled, &at, &mut found, &led);
-                before = Some(place);
-                lab.dispatch(AppEvent::ScrollPage(1));
             }
             for backwards in [false, true] {
                 let mut lab = Lab::new("");

@@ -18,6 +18,93 @@ fn num(n: u32) -> Number {
     Number::new(n).expect("a number")
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "owned setter child; the native system-name parent invokes this exact test"]
+fn owned_system_name_setter_child() {
+    let ready = std::env::var_os("ATERM_TEST_NAME_SET_READY").expect("owned ready path");
+    std::fs::write(ready, b"the actual name setter fixture ran\n").unwrap();
+    assert!(
+        std::env::var_os("ATERM_TEST_NAME_SET_REFUSES").is_none(),
+        "native name setter refusal"
+    );
+    println!("native name setter completed");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn required_system_name_setter_waits_for_its_native_completion() {
+    for (age, refuses) in [(11, false), (61, false), (11, true)] {
+        let age = Duration::from_secs(age);
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let ready = root.path().join("native-setter");
+        let calls = Cell::new(0);
+        let failed = set_system_names(
+            num(59),
+            |field| {
+                Some(
+                    if field == "HostName" {
+                        "previous-name"
+                    } else {
+                        "m59"
+                    }
+                    .to_owned(),
+                )
+            },
+            |field, number| {
+                set_system_name_with(
+                    field,
+                    number,
+                    std::time::Instant::now() - age,
+                    |command, deadline| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(command.get_program(), "/usr/sbin/scutil");
+                        let args: Vec<_> = command.get_args().collect();
+                        assert_eq!(args, ["--set", "HostName", "m59"]);
+                        let mut child =
+                            aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+                        child
+                            .args([
+                                "machine_name::publish::tests::owned_system_name_setter_child",
+                                "--exact",
+                                "--ignored",
+                                "--nocapture",
+                            ])
+                            .env("ATERM_TEST_NAME_SET_READY", &ready);
+                        if refuses {
+                            child.env("ATERM_TEST_NAME_SET_REFUSES", "1");
+                        }
+                        aterm_uds::deadline::output_until(&mut child, deadline)
+                    },
+                )
+            },
+        );
+        if expired {
+            assert!(!ready.exists(), "an expired setter admits no new child");
+            assert_eq!(calls.get(), 0);
+        } else {
+            assert_eq!(
+                std::fs::read(&ready).unwrap(),
+                b"the actual name setter fixture ran\n"
+            );
+            assert_eq!(calls.get(), 1, "one required setter, no retry");
+        }
+        if expired || refuses {
+            assert_eq!(
+                failed,
+                ["HostName"],
+                "true expiry or a native nonzero exit remains a failed set"
+            );
+        } else {
+            assert!(
+                failed.is_empty(),
+                "a scheduled native setter did not fail: {failed:?}"
+            );
+        }
+    }
+}
+
 fn names(words: [Option<&str>; 3]) -> [Option<String>; 3] {
     words.map(|word| word.map(str::to_owned))
 }

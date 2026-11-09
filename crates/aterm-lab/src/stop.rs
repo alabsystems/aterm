@@ -302,6 +302,9 @@ mod tests {
         const TEST: &str = "stop::tests::a_hang_up_started_ignored_stays_ignored";
         if let Some(mode) = std::env::var_os(PROBE) {
             crate::sys::start_signal(libc::SIGHUP, mode == "ignored");
+            // SIGTERM starts at its default, set here, not this test binary's: `install` leaves
+            // an ignored one ignored.
+            crate::sys::start_signal(libc::SIGTERM, false);
             super::install();
             let hup = crate::sys::disposition(libc::SIGHUP).expect("HUP");
             let term = crate::sys::disposition(libc::SIGTERM).expect("TERM");

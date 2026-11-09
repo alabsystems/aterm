@@ -135,7 +135,6 @@ fn a_needs_a_person_line_names_the_reason_by_its_length() {
         did: text.did.to_string(),
         expect: text.expect.to_string(),
         command: None,
-        short: None,
         undo: None,
         back: text.back,
     };

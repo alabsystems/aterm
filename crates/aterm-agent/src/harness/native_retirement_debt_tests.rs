@@ -106,10 +106,36 @@ fn baseline(bound: bool) -> St {
     st
 }
 
-fn unchanged(st: &St, bound: bool) -> bool {
+fn asked_baseline(bound: bool) -> St {
+    let mut st = baseline(bound);
+    let mut prepare = retained_prepare(&st).unwrap();
+    // These are passive client records, not host qualifications or a CheckedSource.
+    let mut previous = *prepare.clone();
+    previous.id = "cd".repeat(16);
+    st.native_completed_prepare = Some(Box::new(previous.clone()));
+    previous.id = "de".repeat(16);
+    st.native_noexec_prepare = Some(Box::new(previous));
+    prepare.asked = Some(native_act::AskedIntent::Upgrade(
+        native_act::AskedUpgradeIntent {
+            predecessor: "cd".repeat(16),
+        },
+    ));
+    st.native_prepare = Request::prepare(*prepare).encode().unwrap();
+    st
+}
+
+fn unchanged_for(st: &St, bound: bool, asked: bool) -> bool {
     let mut copy = st.clone();
     copy.native_retired_unissued = false;
-    copy == baseline(bound)
+    copy == if asked {
+        asked_baseline(bound)
+    } else {
+        baseline(bound)
+    }
+}
+
+fn unchanged(st: &St, bound: bool) -> bool {
+    unchanged_for(st, bound, false)
 }
 
 fn unadmitted_reply(st: &mut St) -> Result<Recovery, &'static str> {
@@ -117,7 +143,12 @@ fn unadmitted_reply(st: &mut St) -> Result<Recovery, &'static str> {
 }
 
 pub(super) fn transition(state: &State, action: &str) -> State {
-    let mut st = baseline(state["bound"] == 1);
+    let mut asked = state["asked"] == 1;
+    let mut st = if asked {
+        asked_baseline(state["bound"] == 1)
+    } else {
+        baseline(state["bound"] == 1)
+    };
     if state["kept"] == 0 && state["observed"] == 0 && state["finished"] == 0 {
         assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
     }
@@ -128,6 +159,10 @@ pub(super) fn transition(state: &State, action: &str) -> State {
     }
     let mut dispatched = false;
     match action {
+        "Ask" => {
+            asked = true;
+            st = asked_baseline(state["bound"] == 1);
+        }
         "NotGranted" => reply(&mut st, Retirement::NotGranted),
         "Unknown" => {
             assert_eq!(
@@ -187,7 +222,8 @@ pub(super) fn transition(state: &State, action: &str) -> State {
     );
     let bound = st.native.is_some();
     next.insert("bound", i64::from(bound));
-    next.insert("kept", i64::from(unchanged(&st, bound)));
+    next.insert("kept", i64::from(unchanged_for(&st, bound, asked)));
+    next.insert("asked", i64::from(asked));
     next.insert("owed", i64::from(matches!(st.phase, Phase::Exiting { .. })));
     next.insert("dispatched", i64::from(dispatched));
     next.insert(
@@ -298,6 +334,61 @@ fn an_unadmitted_answer_never_drops_a_terminal_record_of_the_same_id() {
         "nothing is recorded completed; the coordination stays"
     );
     assert!(matches!(st.phase, Phase::Exiting { .. }));
+}
+
+#[test]
+fn an_unbound_typed_asked_answer_clears_only_its_exact_wire_and_rollback() {
+    for relaunch in [false, true] {
+        let mut st = asked_baseline(false);
+        if relaunch {
+            let mut prepare = retained_prepare(&st).unwrap();
+            prepare.duty = Scope::Relaunch;
+            prepare.asked = Some(native_act::AskedIntent::Relaunch(
+                native_act::AskedRelaunchIntent {
+                    predecessor: "cd".repeat(16),
+                    ask: "memory:unadmitted-client-control".into(),
+                },
+            ));
+            st.native_prepare = Request::prepare(*prepare).encode().unwrap();
+        }
+        let mut expected = st.clone();
+        expected.native_prepare.clear();
+        expected.native_rollback = false;
+        assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
+        assert_eq!(st, expected);
+        assert!(st.native_coordination);
+        assert_eq!(
+            st.native_completed_prepare.as_ref().unwrap().id,
+            "cd".repeat(16)
+        );
+        assert_eq!(
+            st.native_noexec_prepare.as_ref().unwrap().id,
+            "de".repeat(16)
+        );
+    }
+    for completed in [false, true] {
+        let mut st = asked_baseline(false);
+        let prepare = retained_prepare(&st).unwrap();
+        if completed {
+            st.native_completed_prepare = Some(prepare);
+        } else {
+            st.native_noexec_prepare = Some(prepare);
+        }
+        let before = st.clone();
+        assert_eq!(unadmitted_reply(&mut st), Err("native-unknown"));
+        assert_eq!(st, before);
+    }
+    let model = aterm_models_harness::native_retirement_debt_model();
+    let mut before = model.init_state();
+    assert!(model.fire("Ask", &mut before));
+    let mut st = asked_baseline(true);
+    let original = st.clone();
+    assert_eq!(unadmitted_reply(&mut st), Err("native-unknown"));
+    assert_eq!(st, original);
+    // The same guard-removal mutant must also falsify the asked recipe's binding law.
+    st.native_prepare.clear();
+    before.insert("kept", i64::from(unchanged_for(&st, true, true)));
+    assert!(!model.check_invariant("BindingRetained", &before));
 }
 
 #[test]

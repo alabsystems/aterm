@@ -125,6 +125,9 @@ impl Kernel for DeferredFacts {
             self.base.clock()
         }
     }
+    fn preparing(&self) {
+        self.base.preparing();
+    }
     fn process(&self, pid: u32) -> Option<Process> {
         self.base.process(pid)
     }
@@ -643,6 +646,30 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                 ));
             }
             // Even fully settled history cannot replace current conversation facts.
+            // A different never-published asked candidate may expire without consuming
+            // this genuine settlement. The live request below must still qualify afresh.
+            let mut expired = asked.clone();
+            expired.id = "ef".repeat(16);
+            expired.deadline_us = kernel.base.clock.load(Ordering::SeqCst);
+            let expected = aterm_agent::harness::native_act::unadmitted_reply(&expired.id).unwrap();
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::prepare(expired.clone()),
+                    completion_actor.clone()
+                ),
+                expected
+            );
+            {
+                let table = ctx.fenced_writes.native.lock().unwrap();
+                assert!(!table.by_id.contains_key(&expired.id));
+                assert!(!table.reservations.contains_key(&expired.id));
+                assert!(matches!(
+                    table.asked_binding,
+                    asked_upgrade::CurrentBinding::Settled(_)
+                ));
+            }
+            assert_eq!(kernel.base.signals.load(Ordering::SeqCst), 1);
             kernel
                 .base
                 .conversation_valid

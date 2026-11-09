@@ -50,7 +50,34 @@ pub(crate) fn ack_deadline() -> Duration {
 }
 
 pub(crate) fn ack_remaining(elapsed: Duration) -> Duration {
-    ACK_DEADLINE.saturating_sub(elapsed)
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    AT.get_or_init(|| ack_limit(aterm_types::dev_seam!("ATERM_LINK_ACK_DEADLINE_MS").as_deref()))
+        .saturating_sub(elapsed)
+}
+
+/// A timeout fixture may shorten an answer that must never arrive. Successful broker
+/// work keeps the production minute; an empty, malformed or zero override keeps it too.
+fn ack_limit(milliseconds: Option<&std::ffi::OsStr>) -> Duration {
+    milliseconds
+        .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
+        .filter(|ms| *ms > 0)
+        .map_or(ACK_DEADLINE, Duration::from_millis)
+}
+
+#[cfg(test)]
+mod ack_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn a_timeout_fixture_changes_only_its_explicit_positive_deadline() {
+        for input in [None, Some(""), Some("0"), Some("invalid")] {
+            assert_eq!(ack_limit(input.map(std::ffi::OsStr::new)), ACK_DEADLINE);
+        }
+        let limit = ack_limit(Some(std::ffi::OsStr::new("250")));
+        assert_eq!(limit, Duration::from_millis(250));
+        assert_eq!(limit.saturating_sub(Duration::from_secs(1)), Duration::ZERO);
+        assert_eq!(ACK_DEADLINE, Duration::from_secs(60));
+    }
 }
 
 /// How long a subscription's reader reads nothing before it takes the link for dead

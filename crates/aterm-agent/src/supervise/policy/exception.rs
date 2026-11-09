@@ -130,7 +130,6 @@ impl Exception {
                 did: filled.did,
                 expect: filled.expect,
                 command: filled.command,
-                short: filled.short,
                 undo: filled.undo,
                 back: text.back,
             }),

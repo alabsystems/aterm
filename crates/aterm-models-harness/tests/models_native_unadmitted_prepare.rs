@@ -45,6 +45,11 @@ fn each_unadmitted_answer_law_has_a_falsifying_control() {
                 "Reclaim", "Answer",
             ][..],
         ),
+        (
+            7,
+            "SupportedShape",
+            &["UnsupportedAsk", "Approach", "Expire", "Answer"][..],
+        ),
     ] {
         let mutant = aterm_spec::interp::with_buggy(&base, bug);
         let mut bad = mutant.init_state();

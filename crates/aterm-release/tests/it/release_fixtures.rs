@@ -18,6 +18,8 @@ const GUARD: &str = "// the guard\nconst PINNED_DESKS: &[(&str, &str)] = &[\n   
 
 const RELEASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
+static ORIGIN_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 const HEADER: &str = "# serde corpus `shipped-state`: one case per line.\n# ok: the value.\n# escapes.\n# FNV-1a digest and length.\n";
 
 fn corpus() -> String {
@@ -77,6 +79,17 @@ impl Origin {
     fn new() -> Self {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path();
+        static BUILT: crate::template::Template<()> = crate::template::Template::new();
+        BUILT.lay(root, Self::build);
+        let work = root.join("work").canonicalize().unwrap();
+        let rival = root.join("rival");
+        // The index binds this copy's paths and compiler, so it is never part of the template.
+        seed_index(&work, b"binary");
+        Origin { dir, work, rival }
+    }
+
+    fn build(root: &Path) {
+        ORIGIN_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         git(root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
         crate::ledger::testing::config(&root.join("origin.git"), &[]);
         git(root, &["clone", "-q", "origin.git", "rival"]);
@@ -100,8 +113,6 @@ impl Origin {
         git(root, &["clone", "-q", "origin.git", "work"]);
         let work = root.join("work").canonicalize().unwrap();
         identity(&work);
-        seed_index(&work, b"binary");
-        Origin { dir, work, rival }
     }
 
     fn stage_root(&self) -> PathBuf {
@@ -116,6 +127,36 @@ impl Origin {
             .unwrap()
             .stdout
     }
+}
+
+/// NEGATIVE CONTROLS: rebuilding every seed increments the count; sharing a mutable origin
+/// moves the second copy's main when the first pushes; retaining template paths misroutes it.
+#[test]
+fn cached_origins_build_once_and_keep_independent_git_and_index_paths() {
+    let a = Origin::new();
+    let b = Origin::new();
+    let before = git(&b.work, &["rev-parse", "origin/main"]);
+    fs::write(a.work.join("README.md"), "only this copy\n").unwrap();
+    git(&a.work, &["add", "README.md"]);
+    git(&a.work, &["commit", "-q", "-m", "private copy"]);
+    git(&a.work, &["push", "-q", "origin", "main"]);
+    git(&b.work, &["fetch", "-q", "origin"]);
+    assert_eq!(git(&b.work, &["rev-parse", "origin/main"]), before);
+    assert_eq!(
+        fs::read_to_string(b.work.join("README.md")).unwrap(),
+        "aterm\n"
+    );
+    let c = Origin::new();
+    assert_eq!(git(&c.work, &["rev-parse", "HEAD"]), before);
+    for origin in [&a, &b, &c] {
+        let index =
+            fs::read_to_string(origin.work.join("target/verify/test-executables.json")).unwrap();
+        assert!(
+            index.contains(&origin.work.to_string_lossy().to_string()),
+            "{index}"
+        );
+    }
+    assert_eq!(ORIGIN_BUILDS.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// The actual native adapter uses only this owned bare repository. Fixture

@@ -424,8 +424,6 @@ pub(crate) struct RowSpec<'a> {
     pub detail0: Option<&'a str>,
     /// `detail0` IS THE ONE STEP the row asks for.
     pub step: bool,
-    /// The step's short form ([`crate::need::Then::short`]).
-    pub step_short: Option<&'a str>,
     /// `(fill_permille, stats)` when metered; a `None` fill draws no meter and no pct (its stats alone — or, with `busy`, the track).
     pub meter: Option<(Option<u16>, &'a str)>,
     /// Work in flight with no fill ([`crate::Meter::busy`]): the whole row is its track, and the elapsed slot is part of the fixed head.
@@ -491,7 +489,6 @@ pub(crate) const fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
         title: words,
         detail0: None,
         step: false,
-        step_short: None,
         meter: None,
         busy: false,
         animated: false,
@@ -657,27 +654,6 @@ struct Fit {
     /// The row's excerpt is an action excerpt (whether or not its floor
     /// survived): the load slot is then an extra after it.
     action_excerpt: bool,
-    /// Whose words the excerpt shows: the step's, or its short form's where
-    /// the step gave way to it ([`RowSpec::step_short`]).
-    words: ExcerptWords,
-}
-
-/// Whose words a row's excerpt shows ([`Fit::words`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExcerptWords {
-    /// The row's own first detail line, the ask's step for an ask.
-    Detail,
-    /// The ask's step's short form ([`RowSpec::step_short`]).
-    Short,
-}
-
-impl ExcerptWords {
-    const fn of<'a>(self, spec: &RowSpec<'a>) -> Option<&'a str> {
-        match self {
-            Self::Detail => spec.detail0,
-            Self::Short => spec.step_short,
-        }
-    }
 }
 
 fn load_slot_width(spec: &RowSpec<'_>, width: &dyn Fn(&str) -> usize) -> usize {
@@ -817,22 +793,10 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
             + capsules_width(&spec.capsules, false, width),
     );
     let mut head = fit_head(spec, full_title, budget, a, ex, width);
-    let mut words = ExcerptWords::Detail;
     if head.fixed > budget && spec.step && ex > 3 + DETAIL_FLOOR {
         // An ask's step that the title at its floor still cannot pay for
-        // whole gives way to its short form where it has one (a command is
-        // whole or replaced, never cut: the short form, a sentence, is what
-        // a narrower band cuts). The head is fitted again around the short
-        // form, so the cells the whole step would have taken are the row's
-        // again: the `Details ›` the short form sends the reader to where it
-        // fits, the capsules' long forms, the title's words (the review of
-        // the band, ox4-3: `Claude usag… · Run the command under Details.`
-        // stood beside 25 blank cells and no `Details ›`).
-        if let Some(short) = spec.step_short {
-            words = ExcerptWords::Short;
-            ex = 3 + width(short);
-            head = fit_head(spec, full_title, budget, a, ex, width);
-        }
+        // whole takes the cells left beside the title, down to its floor
+        // (`DETAIL_FLOOR`), and is cut there; below the floor it drops.
         let left = budget.saturating_sub(2 + width(&head.title) + a + head.before + head.caps);
         ex = left.max(3 + DETAIL_FLOOR).min(ex);
         head.fixed = 2 + width(&head.title) + a + ex + head.before + head.caps;
@@ -884,7 +848,6 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         room,
         excerpt_floor: ex,
         action_excerpt,
-        words,
     }
 }
 
@@ -1012,8 +975,7 @@ fn allocate_extras(
     let excerpt = if fit.action_excerpt {
         let own = if starved { 0 } else { room };
         room -= own;
-        fit.words
-            .of(spec)
+        spec.detail0
             .filter(|_| fit.excerpt_floor > 0)
             .map(|d| (d, own + fit.excerpt_floor))
     } else {
@@ -1402,7 +1364,6 @@ pub(crate) mod tests {
                     title: "aterm closed unexpectedly last time",
                     detail0: Some(CRASH_DETAIL),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1422,7 +1383,6 @@ pub(crate) mod tests {
                     title: "File access not confirmed",
                     detail0: Some("Full Disk Access may already be enabled"),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1449,7 +1409,6 @@ pub(crate) mod tests {
                     title: "aterm v0.91.0 is ready",
                     detail0: Some(STAGED_MANUAL),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1469,7 +1428,6 @@ pub(crate) mod tests {
                     title: "aterm v0.91.0 is ready",
                     detail0: Some(STAGED_AUTO),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1489,7 +1447,6 @@ pub(crate) mod tests {
                     title: "3 keybindings in aterm.toml were skipped",
                     detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1509,7 +1466,6 @@ pub(crate) mod tests {
                     title: "Installing ALab tools",
                     detail0: Some("trust \u{00b7} extracting"),
                     step: false,
-                    step_short: None,
                     meter: Some((Some(420), "512 MB / 1.2 GB")),
                     animated: true,
                     busy: false,
@@ -1537,7 +1493,6 @@ pub(crate) mod tests {
                     title: "Downloading aterm v0.92.0",
                     detail0: None,
                     step: false,
-                    step_short: None,
                     meter: Some((Some(420), "31 MB / 74 MB")),
                     animated: true,
                     busy: false,
@@ -1557,7 +1512,6 @@ pub(crate) mod tests {
                     title: "Installing ALab tools",
                     detail0: None,
                     step: false,
-                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -1577,7 +1531,6 @@ pub(crate) mod tests {
                     title: "Installing ALab tools",
                     detail0: None,
                     step: false,
-                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -1597,7 +1550,6 @@ pub(crate) mod tests {
                     title: "Installing Command Line Tools and Homebrew",
                     detail0: Some("enter your password in the macOS dialog"),
                     step: false,
-                    step_short: None,
                     meter: Some((None, "")),
                     animated: true,
                     busy: true,
@@ -1617,7 +1569,6 @@ pub(crate) mod tests {
                     title: "Finishing aterm v0.92.0",
                     detail0: Some("keys typed now arrive in a moment"),
                     step: false,
-                    step_short: None,
                     meter: Some((None, "")),
                     animated: true,
                     busy: true,
@@ -1637,7 +1588,6 @@ pub(crate) mod tests {
                     title: "ALab tools",
                     detail0: Some("trust \u{2014} extracting 120 MB / 900 MB"),
                     step: false,
-                    step_short: None,
                     meter: Some((Some(430), "3 of 10")),
                     animated: false,
                     busy: false,
@@ -1671,7 +1621,6 @@ pub(crate) mod tests {
                     title,
                     detail0: Some(detail0),
                     step: false,
-                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -2076,7 +2025,6 @@ pub(crate) mod tests {
             title: "Installing aterm v0.92.0",
             detail0: Some("installs within a minute \u{2014} keep working"),
             step: false,
-            step_short: None,
             meter: Some((None, "")),
             busy: true,
             animated: false,
@@ -2088,14 +2036,12 @@ pub(crate) mod tests {
         let with_stats = RowSpec {
             detail0: Some("downloading"),
             step: false,
-            step_short: None,
             meter: Some((None, "45 MB")),
             ..flow.clone()
         };
         let bare = RowSpec {
             detail0: None,
             step: false,
-            step_short: None,
             ..with_stats.clone()
         };
         for spec in [&flow, &with_stats, &bare] {
@@ -2174,7 +2120,6 @@ pub(crate) mod tests {
             title: "Installing",
             detail0: Some(&detail),
             step: false,
-            step_short: None,
             meter: None,
             animated: false,
             busy: false,
@@ -2218,7 +2163,6 @@ pub(crate) mod tests {
                 title: "Installing ALab tools",
                 detail0: Some("trust \u{00b7} extracting 120 MB of 900 MB"),
                 step: false,
-                step_short: None,
                 meter: Some((fill, "")),
                 busy: false,
                 animated,
@@ -2325,7 +2269,6 @@ pub(crate) mod tests {
             title: "Building aterm and tools",
             detail0: None,
             step: false,
-            step_short: None,
             meter: Some((None, "3 of 10 targets")),
             animated: false,
             busy: true,
@@ -2366,7 +2309,6 @@ pub(crate) mod tests {
                     title: "Installing ALab tools",
                     detail0: None,
                     step: false,
-                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -2441,7 +2383,6 @@ pub(crate) mod tests {
             title: "Updating ALab tools",
             detail0: None,
             step: false,
-            step_short: None,
             meter: Some((Some(660), "1 of 2 programs")),
             animated: true,
             busy: false,
@@ -2505,7 +2446,6 @@ pub(crate) mod tests {
                     title: "Installing ALab tools",
                     detail0: None,
                     step: false,
-                    step_short: None,
                     meter: Some((None, "10 programs \u{b7} ~3 GB")),
                     animated: false,
                     busy: true,

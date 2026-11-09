@@ -496,6 +496,14 @@ const SIGTERM_LANE: &str = "ATERM_RELEASE_GITHUB_SIGTERM_LANE";
 #[cfg(unix)]
 fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     use std::time::{Duration, Instant};
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    // SAFETY: SIG_DFL (0) for SIGTERM, which the parent sends this probe, whatever this test
+    // binary was started with: `install` leaves an ignored one ignored.
+    unsafe {
+        signal(crate::interrupt::SIGTERM, 0);
+    }
     crate::interrupt::install();
     let fake = FakeGithub::start();
     let secret = token("release-lane");

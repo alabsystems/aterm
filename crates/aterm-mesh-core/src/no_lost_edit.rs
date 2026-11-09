@@ -192,11 +192,6 @@ contract! {
     { writes && (waiting_unread || held_unread) }
 }
 
-#[cfg(clean_islands)]
-#[rustfmt::skip]
-#[path = "no_lost_edit_island.rs"]
-mod island;
-
 /// What a head this Mac settled proves of one hold or pending set before its reach is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {

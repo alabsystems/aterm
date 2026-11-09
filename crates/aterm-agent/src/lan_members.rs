@@ -11,9 +11,13 @@ use aterm_net::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::fd::AsFd as _,
+    sync::{
+        Arc, Mutex, PoisonError, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -251,6 +255,20 @@ pub(crate) struct Arrivals {
 }
 
 impl Arrivals {
+    /// A fresh real solicitation on this fixture's already owned loopback network.
+    #[cfg(test)]
+    pub(crate) fn probe_for_test(&self, within: Duration) -> io::Result<Vec<Hint>> {
+        assert_eq!(self.network.scope, Scope::Loopback);
+        probe_on(
+            links(
+                &(self.network.sources)(),
+                self.network.port,
+                self.network.scope,
+            ),
+            within,
+        )
+    }
+
     pub(crate) fn start(paths: &aterm_secrets::client::Paths) -> io::Result<Self> {
         Self::on(
             Network {
@@ -463,8 +481,84 @@ impl ReplyWindow {
 pub(crate) struct Responder {
     pub port: u16,
     pub key: NodeKey,
-    stop: Option<std::io::PipeWriter>,
+    control: Arc<Control>,
     task: Option<JoinHandle<()>>,
+}
+
+struct Control {
+    state: Mutex<ControlState>,
+}
+
+struct ControlState {
+    writer: Option<std::fs::File>,
+    rung: bool,
+    stopped: bool,
+    ready: Option<Weak<AtomicBool>>,
+}
+
+enum ControlEvent {
+    Stop,
+    Ready(Option<Weak<AtomicBool>>),
+}
+
+impl ControlState {
+    fn ring(&mut self) {
+        if self.rung {
+            return;
+        }
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        // Only this mutex owns writer use. One coalesced byte is sufficient even when a
+        // producer outruns the receiver; a full or closed pipe never blocks the producer.
+        let mut output = writer;
+        let result = aterm_uds::ready::with_nonblocking(writer.as_fd(), || output.write_all(&[1]));
+        match result {
+            Ok(()) => self.rung = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => self.rung = true,
+            Err(_) => {
+                self.stopped = true;
+                self.writer = None;
+            }
+        }
+    }
+}
+
+impl Control {
+    fn announce(&self, generation: Weak<AtomicBool>) {
+        if !generation
+            .upgrade()
+            .is_some_and(|live| live.load(Ordering::Acquire))
+        {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.stopped {
+            state.ready = Some(generation);
+            state.ring();
+        }
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.stopped = true;
+        state.ready = None;
+        state.ring();
+        state.writer = None;
+    }
+
+    fn take(&self, reader: &mut std::io::PipeReader) -> ControlEvent {
+        if !matches!(reader.read(&mut [0; 64]), Ok(n) if n > 0) {
+            return ControlEvent::Stop;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.rung = false;
+        if state.stopped {
+            ControlEvent::Stop
+        } else {
+            ControlEvent::Ready(state.ready.take())
+        }
+    }
 }
 
 struct Network {
@@ -476,6 +570,30 @@ struct Network {
 }
 
 impl Responder {
+    /// The existing native transport on a private loopback group/port. The receiver exists
+    /// before the responder binds, and the returned receipt reports its actual bound links.
+    #[cfg(test)]
+    pub(crate) fn loopback_for_test(
+        port: u16,
+        key: NodeKey,
+    ) -> io::Result<(Self, Arrivals, std::sync::mpsc::Receiver<usize>)> {
+        let reservation = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback)?;
+        let discovery_port = reservation.port();
+        let network = |ready| Network {
+            scope: Scope::Loopback,
+            port: discovery_port,
+            sources: Box::new(|| vec![Ipv4Addr::LOCALHOST]),
+            ready,
+        };
+        let arrivals = Arrivals::on(network(None), None)?;
+        let (ready, bound) = std::sync::mpsc::channel();
+        let responder = Self::start_on(port, key, || true, network(Some(ready)))?;
+        Ok((responder, arrivals, bound))
+    }
+
+    pub fn announce_ready(&self, generation: Weak<AtomicBool>) {
+        self.control.announce(generation);
+    }
     pub fn finished(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
@@ -506,15 +624,26 @@ impl Responder {
         network: Network,
     ) -> io::Result<Self> {
         let (reader, writer) = std::io::pipe()?;
+        let control = Arc::new(Control {
+            state: Mutex::new(ControlState {
+                writer: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+                rung: false,
+                stopped: false,
+                ready: None,
+            }),
+        });
         let mut incarnation = [0; NONCE];
         aterm_uds::rand::fill(&mut incarnation)?;
         let task = thread::Builder::new()
             .name("aterm-member-lan".into())
-            .spawn(move || serve(reader, port, key, incarnation, allowed, network))?;
+            .spawn({
+                let control = Arc::clone(&control);
+                move || serve(reader, &control, port, key, incarnation, allowed, network)
+            })?;
         Ok(Self {
             port,
             key,
-            stop: Some(writer),
+            control,
             task: Some(task),
         })
     }
@@ -522,9 +651,7 @@ impl Responder {
 
 impl Drop for Responder {
     fn drop(&mut self) {
-        if let Some(mut stop) = self.stop.take() {
-            let _ = stop.write_all(&[1]);
-        }
+        self.control.stop();
         if let Some(task) = self.task.take() {
             let _ = task.join();
         }
@@ -532,7 +659,8 @@ impl Drop for Responder {
 }
 
 fn serve(
-    stop: std::io::PipeReader,
+    mut stop: std::io::PipeReader,
+    control: &Control,
     port: u16,
     key: NodeKey,
     incarnation: [u8; NONCE],
@@ -549,7 +677,7 @@ fn serve(
     let mut refresh = Instant::now();
     let mut replies = ReplyWindow::new(Instant::now());
     let mut generation = 0_u64;
-    loop {
+    'serving: loop {
         let now = Instant::now();
         if now >= refresh {
             let current = (network.sources)();
@@ -608,9 +736,49 @@ fn serve(
             return;
         };
         if ready.contains(&sockets.len()) {
-            return;
+            match control.take(&mut stop) {
+                ControlEvent::Stop => return,
+                ControlEvent::Ready(Some(live)) => {
+                    let mut withdrawn = false;
+                    for (_, link) in &sockets {
+                        if !live
+                            .upgrade()
+                            .is_some_and(|live| live.load(Ordering::Acquire))
+                        {
+                            break;
+                        }
+                        if !allowed() {
+                            withdrawn = true;
+                            break;
+                        }
+                        if !live
+                            .upgrade()
+                            .is_some_and(|live| live.load(Ordering::Acquire))
+                        {
+                            break;
+                        }
+                        let Some(next) = generation.checked_add(1) else {
+                            return;
+                        };
+                        generation = next;
+                        let _ = link.send(&announcement(&incarnation, generation));
+                    }
+                    if withdrawn {
+                        // Match ordinary refresh's hold semantics. A transient failed
+                        // check must not consume the capability edge while retaining
+                        // silent old bindings when permission returns.
+                        sockets.clear();
+                        refresh = Instant::now();
+                        continue 'serving;
+                    }
+                }
+                ControlEvent::Ready(None) => {}
+            }
         }
         for index in ready {
+            if index == sockets.len() {
+                continue;
+            }
             if index > sockets.len() {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 // A route socket that fails is dropped: it would poll readable again at once
@@ -887,6 +1055,18 @@ mod tests {
             assert!(
                 Instant::now() < until,
                 "the late member announced no arrival"
+            );
+            aterm_uds::ready::any_until(&arrivals.fds(), until).unwrap();
+        }
+        assert!(!arrivals.poll().unwrap());
+        // Admission becoming usable is a distinct hint on the same socket cohort. It
+        // neither restarts discovery nor supplies an identity or replaces the handshake.
+        let live = Arc::new(AtomicBool::new(true));
+        responder.announce_ready(Arc::downgrade(&live));
+        while !arrivals.poll().unwrap() {
+            assert!(
+                Instant::now() < until,
+                "the admitted member announced no capability edge"
             );
             aterm_uds::ready::any_until(&arrivals.fds(), until).unwrap();
         }

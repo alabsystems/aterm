@@ -9,8 +9,12 @@ repository.workspace = true
 authors.workspace = true
 description = "Pure decision kernels of the one mesh, with the Clean islands that prove its safety laws"
 
-# No dependencies, no proc macros and no anchors: every island here is checked by every Trust
-# build, and the Trust lane takes the crate (PM-1).
+# No dependencies, no proc macros and no anchors, so the Trust lane takes the crate (PM-1). Its
+# spec islands are checked in aterm-mesh-core-islands, which nothing on the mesh's compile chain
+# waits for; the answer-sheet tests read their text and depend on that check.
+
+[dev-dependencies]
+aterm-mesh-core-islands.workspace = true
 
 [lints]
 workspace = true

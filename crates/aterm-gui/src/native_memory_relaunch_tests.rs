@@ -9,6 +9,9 @@ use aterm_agent::harness::relaunch::{
 #[path = "native_memory_signal_fence_tests.rs"]
 mod signal_fence;
 
+#[path = "native_memory_unadmitted_tests.rs"]
+mod unadmitted;
+
 // Kernel PIDs are positive signed integers. Keep the synthetic controller outside
 // that range so inserting a real resumed child cannot replace its authority.
 const CONTROLLER_PID: u32 = u32::MAX;

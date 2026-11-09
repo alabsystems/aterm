@@ -9,6 +9,7 @@
 //! window open lets new Macs in too.
 
 use aterm_secrets::client::Paths;
+use aterm_secrets::converge::{Last, RunnerRetry};
 use aterm_secrets::members::desk::{self, Desk, Local};
 use aterm_secrets::{Error, Result, SecretBytes};
 use aterm_types::MutexExt as _;
@@ -37,6 +38,7 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     backend: Arc<dyn Backend>,
+    ready: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Default)]
@@ -132,19 +134,25 @@ fn book(proving: &desk::Proving<'_>, peer: IpAddr) -> aterm_secrets::client::Boo
 
 impl AutomaticJoins {
     /// Start the worker for this node generation. It serves asks once its first read of local
-    /// membership and network succeeds.
+    /// membership and network succeeds. `ready` signals an unusable-to-usable publication,
+    /// outside the policy lock; healthy renewals do not call it. The generation must close its
+    /// notifier before joining this worker or releasing its listener.
     ///
     /// # Errors
     /// The worker thread could not start.
-    pub fn start(paths: Paths) -> std::io::Result<Self> {
-        Self::with_backend(Arc::new(Vault { paths }))
+    pub fn start(paths: Paths, ready: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Self> {
+        Self::with_backend(Arc::new(Vault { paths }), ready)
     }
 
-    fn with_backend(backend: Arc<dyn Backend>) -> std::io::Result<Self> {
+    fn with_backend(
+        backend: Arc<dyn Backend>,
+        ready: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             backend,
+            ready,
         });
         let worker = std::thread::Builder::new()
             .name("aterm-auto-join".to_owned())
@@ -220,16 +228,12 @@ impl AutomaticJoinHandle {
     /// Current policy is unavailable, a plain ask is outside home, or the signed exchange fails.
     pub fn serve(&self, stream: &mut dyn aterm_net::fleet::Duplex, peer: IpAddr) -> Result<()> {
         let session = {
-            let state = self.shared.state.lock_or_recover();
+            let mut state = self.shared.state.lock_or_recover();
+            let available = self.shared.observe_expiry(&mut state);
             state
                 .snapshot
                 .as_ref()
-                .filter(|_| {
-                    !state.stopped
-                        && state
-                            .valid_until
-                            .is_some_and(|until| self.shared.backend.now() < until)
-                })
+                .filter(|_| available)
                 .map(|snapshot| (Arc::clone(&snapshot.desk), state.epoch))
         };
         let Some((desk, epoch)) = session else {
@@ -243,10 +247,9 @@ impl AutomaticJoinHandle {
         // also replace the desk or its home policy without a watcher invalidating the epoch.
         // Release both locks before entering the vault; its own state lock guards its writes.
         let current = || {
-            let state = self.shared.state.lock_or_recover();
-            !state.stopped
+            let mut state = self.shared.state.lock_or_recover();
+            self.shared.observe_expiry(&mut state)
                 && state.epoch == epoch
-                && state.valid_until.is_some_and(|until| backend.now() < until)
                 && state
                     .snapshot
                     .as_ref()
@@ -305,7 +308,27 @@ impl AutomaticJoinHandle {
 }
 
 impl Shared {
+    fn observe_expiry(&self, state: &mut State) -> bool {
+        if state.stopped {
+            return false;
+        }
+        let Some(until) = state.valid_until else {
+            return false;
+        };
+        if self.backend.now() < until {
+            return true;
+        }
+        // The same clock reading both rejects this phase and marks it unavailable.
+        // An unchanged in-flight read may finish and publish the recovery edge.
+        state.valid_until = None;
+        self.changed.notify_all();
+        false
+    }
+
     fn run(&self) {
+        let started = self.backend.now();
+        let mut retry = RunnerRetry::default();
+        let mut retry_epoch = None;
         loop {
             let epoch = {
                 let state = self.state.lock_or_recover();
@@ -314,8 +337,19 @@ impl Shared {
                 }
                 state.epoch
             };
+            if retry_epoch != Some(epoch) {
+                // Changed membership or place gets a fresh failure budget and an immediate
+                // read; an earlier context's unavailable state owes it no delay.
+                retry = RunnerRetry::default();
+                retry_epoch = Some(epoch);
+            }
+            retry.started();
             let current = self.backend.read();
-            let next_refresh = self.backend.now() + REFRESH_EVERY;
+            let now = self.backend.now();
+            let now_ms = u64::try_from(now.saturating_duration_since(started).as_millis())
+                .unwrap_or(u64::MAX);
+            let mut next_refresh = now + REFRESH_EVERY;
+            let became_ready;
             {
                 let mut state = self.state.lock_or_recover();
                 if state.stopped {
@@ -326,6 +360,7 @@ impl Shared {
                 }
                 match current {
                     Ok(Some((local, network))) => {
+                        became_ready = state.valid_until.is_none();
                         let same = state.snapshot.as_ref().filter(|snapshot| {
                             snapshot.network == network
                                 && snapshot.desk.lock_or_recover().local().key() == local.key()
@@ -342,15 +377,31 @@ impl Shared {
                         // the old greeting can finish only on its old desk, never into this one.
                         state.snapshot = Some(Snapshot { network, desk });
                         state.valid_until = Some(next_refresh);
+                        retry.reaped(Last::Ended, now_ms);
                         self.changed.notify_all();
                     }
                     result => {
+                        became_ready = false;
                         state.valid_until = None;
+                        // An invalid read supplies no usable policy to cache for 30 seconds.
+                        // The same owner retries it, never waiting longer than a healthy refresh.
+                        retry.reaped(Last::Unfinished, now_ms);
+                        next_refresh = now
+                            + retry
+                                .remaining(now_ms)
+                                .unwrap_or(REFRESH_EVERY)
+                                .min(REFRESH_EVERY);
                         if let Err(error) = result {
                             aterm_log::info!("node: automatic admission state will retry: {error}");
                         }
                     }
                 }
+            }
+            // A hint is not admission authority. Its generation owner decides whether it
+            // still exists, and every connection independently rechecks the current policy.
+            // Never call that owner while holding the cached policy or a desk lock.
+            if became_ready {
+                (self.ready)();
             }
             let mut state = self.state.lock_or_recover();
             loop {
