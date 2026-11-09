@@ -4694,7 +4694,8 @@ fn the_discard_question_leaves_messages_room() {
 /// the page then listed; and on Linux at 2x in the least window, in Cantarell, Noto Sans and
 /// DejaVu Sans, Security's "Allow programs to resize the window and read its title and size" took
 /// four lines where three fit over its switch, its caption ending on "and read its title…"
-/// ("window and…" in DejaVu Sans).
+/// ("window and…" in DejaVu Sans), and in DejaVu Sans Packages' "Show a note when cargo or rustc
+/// is rerouted" caption ended on "when cargo or…".
 #[test]
 fn a_split_row_s_caption_says_its_name_whole() {
     const SOURCE: &str = "agents_auto_prime = false\n[update]\nenabled = false\n\

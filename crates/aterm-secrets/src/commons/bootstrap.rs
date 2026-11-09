@@ -30,7 +30,7 @@ const PIN_LEN: usize = 4 + 16 + 32 + 32;
 const MAX_DEVICE: usize = 4096;
 
 fn custody_digest(path: &Path) -> Result<[u8; 32]> {
-    fsx::private_digest(path, MAX_DEVICE)?
+    fsx::private_digest(path, MAX_DEVICE, None)?
         .ok_or_else(|| Error::new("Commons immutable custody is missing"))
 }
 
@@ -1889,14 +1889,18 @@ impl Bootstrap {
         // cannot be read; the swarm's checks of this Mac
         // (`client::local_recipient_denied_in_roster`) read afresh and give such a Mac nothing
         // new. Both memos take the caller's own shared observation for theirs
-        // (`client::trusted_commons_log_under`).
+        // (`client::trusted_commons_log_under`), and the access looks at the vault's files once
+        // for both and for the state its log stands on (`fsx::Glance`).
+        let glance = fsx::Glance::new();
         if let Some(lock) = lock
-            && client::local_recipient_denied_under(&self.paths, lock)?
+            && client::local_recipient_denied_under(&self.paths, lock, &glance)?
         {
             return Ok(None);
         }
         let trusted = match lock {
-            Some(lock) => client::trusted_commons_log_under(&self.paths, self.trust(), lock)?,
+            Some(lock) => {
+                client::trusted_commons_log_under(&self.paths, self.trust(), lock, &glance)?
+            }
             None => client::trusted_commons_log_now(&self.paths, self.trust())?,
         };
         let maybe_access = if let Some((log, heads_digest)) = trusted {
@@ -1951,6 +1955,7 @@ impl Bootstrap {
                     &log,
                     heads_digest,
                     lock,
+                    &glance,
                 )?
             } else {
                 super::roster::current(journal, &self.device.identity)?

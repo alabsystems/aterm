@@ -771,7 +771,7 @@ fn build_slices(
                 static_crt: false,
                 units,
             };
-            run_slice_profile(take, &run, Some(&log), None, Some(pool))
+            run_slice_profile(take, &run, Some(&log), None, Some(pool), false)
         })();
         let secs = t.elapsed().as_secs();
         match built {
@@ -1242,6 +1242,44 @@ fn pilot_need(arm: crate::profile_pilot::Arm, root: &Path, cores: u32) -> aterm_
         .scratch()
 }
 
+/// Cold slices for the contention instrument: the release's drivers, wrapper, memory claims
+/// and shared pool, with separate targets so each take compiles identical inputs.
+pub(crate) fn contention_slices(
+    take: &Take,
+    root: &Path,
+    pool: &aterm_capacity::Jobserver,
+    demoted: bool,
+) -> Result<Vec<aterm_json::Value>, String> {
+    require_rustup_target(X86_64)?;
+    let units = crate::slice_units::Units::live(&[ARM64, X86_64], 2);
+    std::thread::scope(|scope| {
+        let handles = [(ARM64, None), (X86_64, Some(X86_64))].map(|(triple, target)| {
+            let units = units.iter().find(|u| u.triple() == triple);
+            scope.spawn(move || {
+                let _memory = aterm_capacity::admit(
+                    crate::slice_units::slice_need(triple, target.is_none(), units),
+                    aterm_capacity::Admit::Wait,
+                ).map_err(|e| e.to_string())?;
+                let run = SliceRun {
+                    verb: "build", pkg: "aterm", target,
+                    target_dir: root.join(triple).join("build.noindex"),
+                    build_number: 0, index_hint: None, static_crt: false, units,
+                };
+                let started = Instant::now();
+                let usage = run_slice_profile(take, &run, Some(&root.join(format!("{triple}.log"))), None, Some(pool), demoted)?;
+                Ok(aterm_json::json!({"triple":triple, "wall_s":started.elapsed().as_secs_f64(), "cpu_ns":usage.cpu_ns, "peak_bytes":usage.peak_bytes}))
+            })
+        });
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .map_err(|_| "contention slice panicked".to_owned())?
+            })
+            .collect()
+    })
+}
+
 /// Build one pilot arm with the same sealed source and environment as a cut.
 /// Each target is new: a pilot never inherits Cargo intermediates from a cut.
 pub(crate) fn pilot_build(
@@ -1283,6 +1321,7 @@ pub(crate) fn pilot_build(
             Some(&log),
             Some((trial, claim.cores())),
             None,
+            false,
         )
     })?;
     let usage = usage?;
@@ -1304,6 +1343,37 @@ pub(crate) fn pilot_build(
     let (sha256, bytes) = crate::dmg::sha256_and_size(&binary)?;
     let retained = root.join("aterm");
     std::fs::rename(&binary, &retained).map_err(|e| format!("retain pilot artifact: {e}"))?;
+    let runtime_app = if target.is_none() {
+        let manifest = crate::durable::read_text(&take.snapshot.src.join("Cargo.toml"))
+            .map_err(|e| format!("read frozen pilot version: {e}"))?;
+        let version = crate::publish::release_version_from_workspace(
+            &crate::publish::workspace_version(&manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let identity = aterm_stamp::Stamp {
+            app_version: version.leak(),
+            git_commit: take.short_commit.clone().leak(),
+            git_commit_full: take.snapshot.commit.clone().leak(),
+            build_number: build_number.to_string().leak(),
+            build_time: crate::bundle::epoch_to_rfc3339(build_number).leak(),
+            index_hint: index_hint.unwrap_or_default().to_owned().leak(),
+            release_build: true,
+            ..aterm_stamp::Stamp::UNSTAMPED
+        };
+        Some(crate::profile_pilot::runtime_app(
+            &take.snapshot.src,
+            root,
+            &retained,
+            build_number,
+            &identity,
+        )?)
+    } else {
+        None
+    };
+    let runtime_app_sha256 = runtime_app
+        .as_ref()
+        .map(|app| crate::dmg::sha256_file(&app.join("Contents/MacOS/aterm")))
+        .transpose()?;
     // Preserve evidence, not eight cold intermediate graphs. Nothing in this
     // experiment executes the image whose intermediate directory is removed.
     std::fs::remove_dir_all(&target_dir).map_err(|e| format!("clear pilot intermediates: {e}"))?;
@@ -1334,6 +1404,11 @@ pub(crate) fn pilot_build(
             aterm_json::Value::String("wait4: reaped child and waited descendants".to_string()),
         ),
         ("binary".to_string(), aterm_json::json!(retained)),
+        ("runtime_app".to_string(), aterm_json::json!(runtime_app)),
+        (
+            "runtime_app_sha256".to_string(),
+            aterm_json::json!(runtime_app_sha256),
+        ),
         (
             "binary_bytes".to_string(),
             aterm_json::Value::Number(bytes.into()),
@@ -1611,7 +1686,7 @@ fn compat_budget(cmd: &mut Command, held: Option<&str>, jobs: Option<&str>) -> R
 }
 
 fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<BuildUsage, String> {
-    run_slice_profile(take, run, log, None, None)
+    run_slice_profile(take, run, log, None, None, false)
 }
 
 fn run_slice_profile(
@@ -1620,6 +1695,7 @@ fn run_slice_profile(
     log: Option<&Path>,
     trial: Option<(crate::profile_pilot::Trial, u32)>,
     pool: Option<&aterm_capacity::Jobserver>,
+    demoted: bool,
 ) -> Result<BuildUsage, String> {
     let &SliceRun {
         verb, pkg, target, ..
@@ -1671,9 +1747,10 @@ fn run_slice_profile(
         .map(|_| std::env::current_exe())
         .transpose()
         .map_err(|e| format!("this executable, the slice's compiler wrapper: {e}"))?;
+    let (program, prefix) = crate::qualify_pilot::invocation(&driver_path, demoted);
     let mut cmd = release_build_command(
-        &driver_path,
-        args,
+        &program,
+        prefix.into_iter().chain(args).collect(),
         &ReleaseEnv {
             path,
             home: &home,
@@ -1757,11 +1834,14 @@ fn run_slice_profile(
     }
     // Cargo's messages go to a file, not a pipe: a daemon the build leaves behind holding
     // its stdout cannot keep the count from ending.
-    let messages = take.temporary_dir.join(format!(
-        "{verb}-{pkg}-{}-{}.messages.jsonl",
-        target.unwrap_or("native"),
-        std::process::id()
-    ));
+    let retained = retained_messages(log, trial.is_some(), run.units.is_some());
+    let messages = retained.clone().unwrap_or_else(|| {
+        take.temporary_dir.join(format!(
+            "{verb}-{pkg}-{}-{}.messages.jsonl",
+            target.unwrap_or("native"),
+            std::process::id()
+        ))
+    });
     let sink = crate::durable::create_fresh(&messages)
         .map_err(|e| format!("create {}: {e}", messages.display()))?;
     cmd.stdout(sink);
@@ -1776,11 +1856,7 @@ fn run_slice_profile(
         .and_then(units_of)
         .inspect_err(|e| println!("==> {pkg}: cannot read Cargo's messages: {e}"))
         .ok();
-    if let Some(log) = log.filter(|_| trial.is_some()) {
-        let retained = log.with_extension("messages.jsonl");
-        std::fs::rename(&messages, &retained)
-            .map_err(|e| format!("retain pilot Cargo messages {}: {e}", retained.display()))?;
-    } else {
+    if retained.is_none() {
         let _ = std::fs::remove_file(&messages);
     }
     let call = format!("{verb} {pkg} {}", target.unwrap_or("native"));
@@ -1799,6 +1875,13 @@ fn run_slice_profile(
     Ok(usage)
 }
 
+/// Cargo transports wrapper JSON as compiler messages on stdout, not as rendered stderr.
+/// Choose its permanent path before spawning, so even a killed driver keeps partial events.
+fn retained_messages(log: Option<&Path>, pilot: bool, wrapped: bool) -> Option<PathBuf> {
+    log.filter(|_| pilot || wrapped)
+        .map(|log| log.with_extension("messages.jsonl"))
+}
+
 /// The longest Cargo message line [`units_of`] reads; a longer one is skipped.
 const MESSAGE_LINE_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -1806,7 +1889,7 @@ const MESSAGE_LINE_LIMIT: usize = 4 * 1024 * 1024;
 /// the reading a verify run gives its own calls ([`aterm_verify::compile_account`]).
 /// # Errors
 /// The read's.
-fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
+pub(crate) fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
     let mut read = aterm_verify::compile_account::Artifacts::default();
     let mut line = Vec::new();
     let mut overflow = false;
@@ -3047,6 +3130,29 @@ fn fmt_elapsed(start: Instant) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapped_compilers_keep_cargos_stdout_in_the_run_before_the_driver_finishes() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let log = dir.path().join("native.log");
+        let path = super::retained_messages(Some(&log), false, true).unwrap();
+        assert_eq!(path, dir.path().join("native.messages.jsonl"));
+        let mut writer = crate::durable::create_fresh(&path).unwrap();
+        let message = b"{\"reason\":\"compiler-message\",\"message\":{\"event\":\"release-slice-unit\",\"phase\":\"started\"}}\n";
+        writer.write_all(message).unwrap();
+        // The run owns the file while the driver is still alive: retaining it needs no rename
+        // or completion callback, which a killed build cannot run.
+        assert_eq!(std::fs::read(&path).unwrap(), message);
+        drop(writer);
+        assert!(path.is_file());
+        // Negative controls: ordinary unwrapped calls stay temporary; pilots remain retained.
+        assert!(super::retained_messages(Some(&log), false, false).is_none());
+        assert_eq!(
+            super::retained_messages(Some(&log), true, false),
+            Some(path)
+        );
+        assert!(super::retained_messages(None, true, true).is_none());
+    }
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 

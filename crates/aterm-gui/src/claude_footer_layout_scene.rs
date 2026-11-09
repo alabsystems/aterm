@@ -16,31 +16,105 @@ const PRODUCT: &str = "2.1.305";
 /// The rows between one top-rule sample's title and the next's.
 const TOP_PITCH: usize = 3;
 
-/// The glass design's quota samples (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2,
-/// §1.3), widest first, each a title over line D and, where line E is claimed, the quota row
-/// under it: its case, its first row, its title, and whether the row under the bottom rule holds
-/// the tap's words for the case ([`quota_scenes::tap_words`]), which the glass claims (`false`:
-/// line E is not claimed, so line D carries the account unit).
-const QUOTA_SAMPLES: [(&str, usize, &str, bool); 3] = [
-    (
-        "b",
-        29,
-        "Synthetic: case (b), line E claimed: line D without the account, line E the quota row",
-        true,
-    ),
-    (
-        "c",
-        33,
-        "Synthetic: case (c), three named accounts: line D without the account, line E the quota row",
-        true,
-    ),
-    (
-        "b",
-        37,
-        "Synthetic: case (b), line E not claimed: line D carries the words-only account unit",
-        false,
-    ),
+/// One of Claude Code's notices on the tap's row: its words, and the mode row's own words under
+/// it, which with the tap's words decide whether the notice keeps that row ([`tap_row`]).
+#[derive(Clone, Copy)]
+struct Notice<'a> {
+    words: &'a str,
+    /// The mode row from column 0, Claude's indent included, without any notice of its own.
+    mode: &'a str,
+}
+
+/// Claude Code's usage-credits notice over the auto mode row, as aterm-phase's
+/// `claude-2.1.318-tap-row-week-credits` and `-credits-70col` captures show it.
+const CREDITS: Notice<'static> = Notice {
+    words: "Now using usage credits",
+    mode: "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)",
+};
+
+/// Claude Code's launch-time effort hint over the launch's mode row, which says `· ← for agents`
+/// for the same ten seconds, as aterm-phase's `claude-2.1.318-tap-row-week-launch` capture shows
+/// it.
+const EFFORT_HINT: Notice<'static> = Notice {
+    words: "\u{25d0} medium \u{b7} /effort",
+    mode: "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents",
+};
+
+/// One of the glass design's quota samples (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §1.2, §1.3): a title over line D and, where line E is claimed, the quota row under it.
+struct QuotaSample {
+    /// Its case ([`quota_scenes::cases`]).
+    case: &'static str,
+    /// Its title's row: line D lies under it, and line E under line D.
+    row: usize,
+    title: &'static str,
+    /// Whether the row under the bottom rule holds the tap's words for the case
+    /// ([`quota_scenes::tap_words`]), which the glass claims (`false`: line E is not claimed, so
+    /// line D carries the account unit).
+    claimed: bool,
+    /// Claude's own notice on that row, set where Claude sets it ([`tap_row`]); the glass's
+    /// span ends two cells before it (§5.2). A frame too narrow for it on the row lays no sample.
+    notice: Option<Notice<'static>>,
+}
+
+/// The quota samples, widest first, then the samples whose line E shares its row with one of
+/// Claude's notices (§7: "the row ends two cells before a notice").
+const QUOTA_SAMPLES: [QuotaSample; 5] = [
+    QuotaSample {
+        case: "b",
+        row: 29,
+        title: "Synthetic: case (b), line E claimed: line D without the account, line E the quota row",
+        claimed: true,
+        notice: None,
+    },
+    QuotaSample {
+        case: "c",
+        row: 33,
+        title: "Synthetic: case (c), three named accounts: line D without the account, line E the quota row",
+        claimed: true,
+        notice: None,
+    },
+    QuotaSample {
+        case: "b",
+        row: 37,
+        title: "Synthetic: case (b), line E not claimed: line D carries the words-only account unit",
+        claimed: false,
+        notice: None,
+    },
+    QuotaSample {
+        case: "b",
+        row: 41,
+        title: "Synthetic: case (b), Claude's credits notice on line E's row",
+        claimed: true,
+        notice: Some(CREDITS),
+    },
+    QuotaSample {
+        case: "b",
+        row: 45,
+        title: "Synthetic: case (b), Claude's launch effort hint on line E's row",
+        claimed: true,
+        notice: Some(EFFORT_HINT),
+    },
 ];
+
+/// The row under the bottom rule as Claude Code sets it in a pane `cols` wide: the tap's `words`
+/// from column 2 and the notice right-aligned, its last cell at `cols − 3`, where it keeps a blank
+/// after the wider of the tap's words and its mode row (§5.2), as every capture of a notice on
+/// the tap's row shows it (aterm-phase's `claude-2.1.300-tap-row-80-credits`,
+/// `claude-2.1.318-tap-row-week-credits`, `-credits-70col`, `-credits-manual-60col` and
+/// `-launch`, and `claude-2.1.319-tap-row-launch-74col`). `None` where it would not: Claude then
+/// gives the notice a row of its own (`-credits-50col`; at 59 columns under manual mode; the
+/// launch hint at 73 columns and below, beside the launch's 53-cell mode row, as
+/// `claude-2.1.319-tap-row-launch-73col` shows it under the mode row).
+fn tap_row(words: &str, notice: Option<Notice<'_>>, cols: usize) -> Option<String> {
+    let words = format!("  {words}");
+    let Some(notice) = notice else {
+        return Some(words);
+    };
+    let at = cols.checked_sub(2 + notice.words.chars().count())?;
+    let wider = words.chars().count().max(notice.mode.chars().count());
+    (at > wider).then(|| format!("{words:<at$}{}", notice.words))
+}
 
 /// The first footer of the quota samples (the top rules', the chips' and the effort's before).
 const QUOTA_FOOTER: usize = 9;
@@ -419,10 +493,11 @@ fn paint_effort_sample(
 /// The glass design's line D and line E (§1.2, §1.3) for [`QUOTA_SAMPLES`], through the production
 /// paths a live Claude pane takes: the facts a pane publishes with its case's quota view, the
 /// claim of the row under the bottom rule ([`PaneFooter::claim_quota_row`] over a scratch screen
-/// of the rule and the tap's words), line D's rule composed with line E claimed or not
+/// of the rule and that row as Claude sets it, [`tap_row`]: the tap's words and, in the notice
+/// samples, Claude's notice), line D's rule composed with line E claimed or not
 /// ([`PaneFooter::note_line_e`]), and the quota row and its midnight ticks
-/// ([`PaneFooter::compose_quota_row`]) under it. The cases' words are said at offset 0, UTC, as
-/// [`quota_scenes`] builds them.
+/// ([`PaneFooter::compose_quota_row`]) over Claude's cells on that row. The cases' words are said
+/// at offset 0, UTC, as [`quota_scenes`] builds them.
 fn paint_quota_samples(
     layouts: &mut Layouts,
     input: &mut RenderInput,
@@ -455,7 +530,14 @@ fn paint_quota_samples(
         ),
     );
     let cases = layouts.cases.get_or_insert_with(quota_scenes::cases);
-    for (i, &(case, row, title, claimed)) in QUOTA_SAMPLES.iter().enumerate() {
+    for (i, sample) in QUOTA_SAMPLES.iter().enumerate() {
+        let &QuotaSample {
+            case,
+            row,
+            title,
+            claimed,
+            notice,
+        } = sample;
         // Its title, line D and, claimed, line E: a grid too short for them ends the samples.
         let last = base + row + 1 + usize::from(claimed);
         if last >= band.end {
@@ -463,6 +545,14 @@ fn paint_quota_samples(
         }
         let Some(view) = cases.iter().find(|(name, _)| *name == case).map(|(_, v)| v) else {
             continue;
+        };
+        // The row under the bottom rule, claimed: a notice Claude would not set on it here
+        // leaves no sample.
+        let tap = match claimed.then(|| tap_row(&quota_scenes::tap_words(view), notice, input.cols))
+        {
+            Some(None) => continue,
+            Some(Some(tap)) => Some(tap),
+            None => None,
         };
         for (out, ch) in input.cells[base + row].iter_mut().zip(title.chars()) {
             out.ch = ch;
@@ -483,14 +573,23 @@ fn paint_quota_samples(
             ..FooterFacts::default()
         };
         footer.note_facts(&facts, None, true, FactMask::default());
-        // The claim reads the row under the bottom rule as a live pane's splice does.
-        let words = claimed.then(|| quota_scenes::tap_words(view));
-        let claim = words.map_or(quota::Claim::Not, |words| {
-            let rows = ["\u{2500}".repeat(input.cols), format!("  {words}")];
+        let d = base + row + 1;
+        // The claim reads the row under the bottom rule as a live pane's splice does, and the row
+        // shows Claude's cells, the tap's words and any notice in the pane's ink, under the glass.
+        let claim = tap.map_or(quota::Claim::Not, |tap| {
+            let rows = ["\u{2500}".repeat(input.cols), tap];
             let mut term = aterm_core::terminal::Terminal::new(3, cols16);
             term.process(format!("{}\r\n{}", rows[0], rows[1]).as_bytes());
             let mut scratch = term.cell_frame(3, input.cols);
             scratch.cursor_visible = false;
+            let claudes = &scratch.cells[scratch.grid_top_row + 1];
+            for (out, cell) in input.cells[d + 1].iter_mut().zip(claudes) {
+                *out = RenderCell {
+                    ch: cell.ch,
+                    wide: cell.wide,
+                    ..blank
+                };
+            }
             footer.claim_quota_row(&quota::RowAt {
                 scratch: &scratch,
                 rows: &rows,
@@ -514,7 +613,6 @@ fn paint_quota_samples(
             (glass, at),
             None,
         );
-        let d = base + row + 1;
         input.cells[d].fill(rule);
         for (out, composed) in input.cells[d]
             .iter_mut()
@@ -641,6 +739,7 @@ fn paint_mode_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_agent::harness::quota_view::QuotaLine;
 
     /// Also the glass design's line D and line E (§1.2, §1.3): line D gives up its account unit
     /// while line E is claimed, and carries it, the case's words, while not. Negative control:
@@ -817,6 +916,224 @@ mod tests {
             paint(&mut input, (7, 14));
             assert_eq!(input, painted, "a second frame does not duplicate sprites");
         }
+    }
+
+    /// The pane's width, the row under the bottom rule and the mode row's own words under it
+    /// (Claude's indent and words up to a notice of its own) in aterm-phase's capture `name`.
+    fn captured_tap_row(name: &str) -> (usize, String, String) {
+        let path = aterm_tempfile::manifest_dir()
+            .join("../aterm-phase/src/fixtures")
+            .join(format!("{name}.txt"));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        let rule = rows
+            .iter()
+            .rposition(|r| r.starts_with('\u{2500}'))
+            .expect("the bottom rule");
+        let tap = rows.get(rule + 1).copied().unwrap_or_default();
+        let mode = rows.get(rule + 2).copied().unwrap_or_default();
+        let own = mode[2..].find("  ").map_or(mode, |gap| &mode[..2 + gap]);
+        (rows[rule].chars().count(), tap.to_owned(), own.to_owned())
+    }
+
+    /// One notice sample as a frame shows it: the pane's width, the notice, the room the glass
+    /// was given, and the laid line's cells.
+    type NoticeRung = (usize, &'static str, usize, usize);
+
+    /// THE SCENE'S LINE E ENDS TWO CELLS BEFORE CLAUDE'S NOTICE (§5.2, §7): the notice samples
+    /// set Claude's own notice on line E's row where Claude sets it ([`tap_row`], held here to
+    /// eight captures of Claude Code 2.1.300, 2.1.318 and 2.1.319, each with its own mode row),
+    /// and at 170, 169, 100 and 70 columns, on a dark ground and a light one, the claim's span
+    /// ([`quota::row_span`] of the row the scene claims) ends exactly two cells before the
+    /// notice, the glass lays from column 2 the rung that fits that span, every cell from the
+    /// glass's end to the notice is the pane's blank ground, and the notice keeps its cells in
+    /// the pane's ink. The rung shows the span's end only where it fills the span: at 169
+    /// columns the credits notice leaves R2's 140 cells exactly, so that frame's glass ends two
+    /// cells before the notice; every other sample's rung is narrower than its span. That frame
+    /// catches a margin of 3 or more (R2 no longer fits); a margin of 0 or 1 still lays R2 there,
+    /// so only the `row_span` equality pins 2 against them. At 170 the
+    /// notice costs case (b) no rung; at 100 and 70 it does. At 70 the launch's mode row leaves
+    /// the hint no room on the tap's row, so that sample is not laid. NEGATIVE CONTROLS (each
+    /// run once, restored): a claim that reads the row without its notice lays the rung that
+    /// fits `cols − 4` over the notice at 100 and 70 columns and fails; a notice set one cell
+    /// further right fails the captures; a write that stops at the glass's last ink leaves the
+    /// tail of Claude's words showing past the words-only rung at 70 columns and fails; a span
+    /// one cell short of the notice (`MARGIN` 1, 2026-11-08), which lays every frame of 170,
+    /// 100 and 70 columns as before, fails the span's end.
+    #[test]
+    fn the_scenes_line_e_ends_two_cells_before_claudes_notice() {
+        let words = "week 63% used \u{b7} resets Sat 10:00";
+        for (name, notice) in [
+            ("claude-2.1.318-tap-row-week-credits", CREDITS),
+            ("claude-2.1.318-tap-row-week-credits-70col", CREDITS),
+            ("claude-2.1.318-tap-row-week-credits-manual-60col", CREDITS),
+            ("claude-2.1.318-tap-row-week-launch", EFFORT_HINT),
+        ] {
+            let (cols, row, mode) = captured_tap_row(name);
+            let captured = Notice {
+                words: notice.words,
+                mode: &mode,
+            };
+            assert_eq!(
+                tap_row(words, Some(captured), cols).as_deref(),
+                Some(row.as_str()),
+                "{name}"
+            );
+            if name.ends_with("-manual-60col") {
+                assert_eq!(
+                    tap_row(words, Some(captured), 59),
+                    None,
+                    "at 59 columns the notice has a row of its own"
+                );
+            }
+        }
+        for (name, notice) in [
+            ("claude-2.1.318-tap-row-week-credits", CREDITS),
+            ("claude-2.1.318-tap-row-week-launch", EFFORT_HINT),
+        ] {
+            assert_eq!(captured_tap_row(name).2, notice.mode, "{name}'s mode row");
+        }
+        // 2.1.300's row said the five-hour words, its notice where 2.1.318 sets it.
+        let (cols, row, mode) = captured_tap_row("claude-2.1.300-tap-row-80-credits");
+        let captured = Notice {
+            words: CREDITS.words,
+            mode: &mode,
+        };
+        assert_eq!(
+            tap_row("5h 100% \u{b7} 7d 61%", Some(captured), cols).as_deref(),
+            Some(row.as_str())
+        );
+        let (cols, row, mode) = captured_tap_row("claude-2.1.318-tap-row-week-credits-50col");
+        assert_eq!(row, format!("  {words}"), "the notice has a row of its own");
+        assert_eq!(mode, CREDITS.mode);
+        assert_eq!(tap_row(words, Some(CREDITS), cols), None);
+        // 2.1.319 at launch, before its first reading: the hint keeps the tap's row at 74
+        // columns, one blank after the launch's 53-cell mode row, and has a row of its own at 73.
+        let unread = "week \u{b7} no figure yet";
+        let (cols, row, mode) = captured_tap_row("claude-2.1.319-tap-row-launch-74col");
+        assert_eq!((cols, mode.as_str()), (74, EFFORT_HINT.mode));
+        assert_eq!(
+            tap_row(unread, Some(EFFORT_HINT), cols).as_deref(),
+            Some(row.as_str()),
+            "the hint on the tap's row at 74 columns"
+        );
+        let (cols, row, mode) = captured_tap_row("claude-2.1.319-tap-row-launch-73col");
+        assert_eq!((cols, mode.as_str()), (73, EFFORT_HINT.mode));
+        assert_eq!(row, format!("  {unread}"), "the hint has a row of its own");
+        assert_eq!(tap_row(unread, Some(EFFORT_HINT), cols), None);
+        let view = quota_scenes::cases()
+            .into_iter()
+            .find(|(name, _)| *name == "b")
+            .map(|(_, view)| view)
+            .expect("case (b)");
+        assert_eq!(
+            quota_scenes::tap_words(&view),
+            words,
+            "the captures' words are case (b)'s"
+        );
+        let mut rungs: Vec<NoticeRung> = Vec::new();
+        for (fg, bg) in [("d0d0d0", "111318"), ("202020", "ffffff")] {
+            for cols in [170_u16, 169, 100, 70] {
+                let mut term = aterm_core::terminal::Terminal::new(48, cols);
+                term.process(format!("\x1b]10;#{fg}\x07\x1b]11;#{bg}\x07x").as_bytes());
+                let mut input = term.cell_frame(48, usize::from(cols));
+                input.grid_bot_row = input.rows;
+                paint(&mut input, (7, 14));
+                let blank = RenderCell {
+                    ch: ' ',
+                    ..input.implicit_blank
+                };
+                for sample in &QUOTA_SAMPLES {
+                    let Some(notice) = sample.notice else {
+                        continue;
+                    };
+                    let top = input.grid_top_row + sample.row;
+                    if tap_row(words, Some(notice), usize::from(cols)).is_none() {
+                        assert!(
+                            input.cells[top..top + 3]
+                                .iter()
+                                .flatten()
+                                .all(|c| *c == blank),
+                            "{cols} columns: no sample for {:?}",
+                            notice.words
+                        );
+                        continue;
+                    }
+                    let cells = &input.cells[top + 2];
+                    let n = notice.words.chars().count();
+                    let at = usize::from(cols) - 2 - n;
+                    let shown: String = cells[at..at + n].iter().map(|c| c.ch).collect();
+                    assert_eq!(
+                        shown, notice.words,
+                        "{cols} columns: Claude's notice, where it sets it"
+                    );
+                    assert!(
+                        cells[at..]
+                            .iter()
+                            .all(|c| c.fg == blank.fg && c.bg == blank.bg),
+                        "{cols} columns: the notice keeps the pane's ink"
+                    );
+                    // The span the scene's claim reads off the row it set (as a live pane's
+                    // claim reads it): two cells short of the notice, whatever rung it lays.
+                    let tap = tap_row(words, Some(notice), usize::from(cols)).expect("its row");
+                    let span = quota::row_span(&tap, usize::from(cols)).expect("the tap's words");
+                    assert_eq!(
+                        quota::INDENT + span.room + 2,
+                        at,
+                        "{cols} columns: the span ends two cells before the notice"
+                    );
+                    let room = span.room;
+                    let mut line = QuotaLine::default();
+                    assert!(view.lay(room, &mut line), "a rung fits {room}");
+                    let laid: String = cells[quota::INDENT..quota::INDENT + line.cells.len()]
+                        .iter()
+                        .map(|c| c.ch)
+                        .collect();
+                    assert_eq!(
+                        laid,
+                        line.text(),
+                        "{cols} columns: the rung that fits {room}"
+                    );
+                    assert!(
+                        cells[quota::INDENT..quota::INDENT + line.cells.len()]
+                            .iter()
+                            .any(|c| c.fg != blank.fg),
+                        "{cols} columns: the row is the glass's"
+                    );
+                    // From the glass's end: Claude's own words, longer than the words-only rung
+                    // at 70 columns, do not show past it.
+                    let end = quota::INDENT + line.cells.len();
+                    assert!(
+                        end + 2 <= at,
+                        "{cols} columns: the glass ends by {}",
+                        at - 2
+                    );
+                    assert!(
+                        cells[end..at].iter().all(|c| *c == blank),
+                        "{cols} columns: blank ground from the glass's end to the notice"
+                    );
+                    rungs.push((usize::from(cols), notice.words, room, line.cells.len()));
+                }
+            }
+        }
+        let night = &rungs[..rungs.len() / 2];
+        assert_eq!(night, &rungs[rungs.len() / 2..], "Day lays as Night");
+        assert_eq!(
+            night,
+            [
+                (170, CREDITS.words, 141, 140),
+                (170, EFFORT_HINT.words, 146, 140),
+                (169, CREDITS.words, 140, 140),
+                (169, EFFORT_HINT.words, 145, 140),
+                (100, CREDITS.words, 71, 64),
+                (100, EFFORT_HINT.words, 76, 64),
+                (70, CREDITS.words, 41, 29),
+            ],
+            "case (b)'s R2 at 170 and 169 beside either notice (as with none; at 169 beside the \
+             credits it fills the span), R7 at 100 (R5 with none), and its words alone at 70 (R7 \
+             with none)"
+        );
     }
 
     /// THE SCENE DRAWS ITS GLASS MARKS AS A LIVE PANE DOES: every glass mark a composed row

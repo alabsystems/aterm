@@ -241,6 +241,9 @@ pub struct Real {
     /// How the REST calls start curl: GitHub's, and Firebase Hosting's and Google's token
     /// endpoint's for the deploy.
     pub curl: Arc<dyn Spawn>,
+    /// Reads the releases' assets anonymously, as a client does: the web route, then the API
+    /// route when the download host fails ([`aterm_update_core::release_asset`]).
+    pub reader: aterm_update_core::release_asset::Reader,
 }
 
 /// A prepared HTTP command run through the site's child owner after removing the release
@@ -289,7 +292,7 @@ impl World for Real {
             return crate::durable::read_regular_bytes(Path::new(path), limit)
                 .map_err(|e| format!("{path}: {e}"));
         }
-        aterm_update_core::download_bytes(url, limit)
+        self.reader.bytes_at(url, limit).map_err(|e| e.to_string())
     }
 
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String> {
@@ -474,6 +477,7 @@ mod tests {
             unset: vec!["RELEASE_LAUNCHER_SECRET".to_string()],
             launch: Rc::new(super::super::Plain),
             curl: recorder.clone(),
+            reader: aterm_update_core::release_asset::Reader::anonymous(),
         };
         assert_eq!(
             world.live("https://example.invalid/live").unwrap(),

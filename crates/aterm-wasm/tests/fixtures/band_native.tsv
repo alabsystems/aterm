@@ -1,15 +1,15 @@
-# band_native.tsv — THIS HOST's message band, frame by frame (design ruling 333 of
-# docs/DESIGN-unified-messages-2026-09-21.md). Written by aterm-gui's
-# `message_band_visual_tests::the_web_band_golden_is_this_hosts_band` (which also
-# asserts it; rewrite with ATERM_BAND_GOLDEN=write) and read by aterm-wasm's
-# `messages_api::tests::the_web_band_is_the_native_golden`, which replays the scenes
-# through the web module and must land on every digest. Digests are FNV-1a-64 of each
-# band row's RenderCells (Debug), its ChromeRasters (Debug) and its RGBA pixel rows,
-# the ChromeBleed (Debug) and the pixels above the grid. Both hosts draw with the
-# bundled JetBrains Mono at 20 px on the portable rasterizer, pad 6, links withheld.
-# The colour arithmetic runs on THIS host's libm (macOS libSystem here): on another
-# libm both tests would flag the same last-place difference together (ruling 326 (g)),
-# which is a platform fact, not a web defect.
+# band_native.tsv — the native message band, frame by frame (design ruling 333 of
+# docs/DESIGN-unified-messages-2026-09-21.md), as aterm-gui last wrote it. A frozen
+# recording: its writer, aterm-gui's `the_web_band_golden_is_this_hosts_band` (rewritten
+# with ATERM_BAND_GOLDEN=write), went in 1a7cad3eb5 (2026-11-01), and aterm-gui draws no
+# band since band removal S3, so nothing writes it now. aterm-wasm's
+# `messages_api::tests::the_web_band_is_the_native_golden` replays the scenes through the
+# web module and must land on every digest. Digests are FNV-1a-64 of each band row's
+# RenderCells (Debug), its ChromeRasters (Debug) and its RGBA pixel rows, the ChromeBleed
+# (Debug) and the pixels above the grid. The recording and the replay draw with the bundled
+# JetBrains Mono at 20 px on the portable rasterizer, pad 6, links withheld. The colour
+# arithmetic of the recording ran on macOS libSystem's libm: a replay on another libm can
+# differ in the last place (ruling 326 (g)), which is a platform fact, not a web defect.
 font	JetBrainsMono-Regular.ttf	20	pad	6
 theme	dark	d0d0d0	111318	50fa7b	33415e	3b8eea	00cdcd	e06c75	cdcd00
 theme	GitHub Light	1f2328	ffffff	0969da	80ccff	0969da	1b7c83	cf222e	4d2d00

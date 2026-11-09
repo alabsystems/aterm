@@ -796,10 +796,20 @@ pub(crate) fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
 
 impl App {
     /// Returns the overlay inputs for window `wid`, or `None` when nothing can draw.
+    #[cfg(test)]
     pub(crate) fn pane_overlay_inputs(
         &self,
         wid: WindowId,
         multi_pane: bool,
+    ) -> Option<OverlayInputs> {
+        self.pane_overlay_inputs_from_plan(wid, multi_pane, None)
+    }
+
+    pub(crate) fn pane_overlay_inputs_from_plan(
+        &self,
+        wid: WindowId,
+        multi_pane: bool,
+        frame_plan: Option<&VisibleLeafPlan>,
     ) -> Option<OverlayInputs> {
         let scrollbar = self.config.scrollbar_or_default();
         let hollow = multi_pane && split_chrome() == SplitChrome::Fluent;
@@ -808,11 +818,16 @@ impl App {
         }
         let ws = self.windows.get(&wid)?;
         let focus = self.motion_focus(wid, ws.focused);
-        let ring = (hollow && ws.focused && self.config.split_focus_mark_or_default())
-            .then(|| self.active_visible_leaf_plan(wid))
-            .flatten()
-            .filter(|plan| plan.leaves.len() > 1)
-            .and_then(|plan| {
+        let ring = if hollow && ws.focused && self.config.split_focus_mark_or_default() {
+            let owned_plan;
+            let plan = match frame_plan {
+                Some(plan) => Some(plan),
+                None => {
+                    owned_plan = self.active_visible_leaf_plan(wid);
+                    owned_plan.as_ref()
+                }
+            };
+            plan.filter(|plan| plan.leaves.len() > 1).and_then(|plan| {
                 plan.leaves
                     .iter()
                     .find(|leaf| leaf.focused)
@@ -820,7 +835,10 @@ impl App {
                         alloc: CellBox::of(leaf.outer_rect()),
                         header_row: leaf.header.map(|header| CellBox::of(header).row),
                     })
-            });
+            })
+        } else {
+            None
+        };
         Some(OverlayInputs {
             scrollbar,
             hollow,
@@ -890,7 +908,7 @@ impl App {
         now: Instant,
     ) {
         let multi = plan.leaves.len() > 1;
-        let Some(inputs) = self.pane_overlay_inputs(wid, multi) else {
+        let Some(inputs) = self.pane_overlay_inputs_from_plan(wid, multi, Some(plan)) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.pane_overlay.clear();
             }

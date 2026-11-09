@@ -806,17 +806,39 @@ fn fetch_public_agh() {
     on_agh(case_fetch_public);
 }
 
+/// A public read that does not deliver leaves the caller's file alone: the reader writes `dest`
+/// only by renaming a whole `.part` onto it. NEGATIVE CONTROL: removing `dest` after a read that
+/// did not deliver fails both halves; reading a failed outage as absence fails the second.
 #[test]
 fn rest_public_fetch_failure_preserves_caller_owned_bytes() {
     let w = RestWorld::new();
     let dir = scratch("rest-public-preserve");
     let dest = dir.path().join("asset.bin");
-    std::fs::write(&dest, b"caller's completed bytes").expect("the earlier fetch");
-    let result = w.host.fetch_public(&slug(), "v1", "missing.bin", &dest, 64);
-    assert!(matches!(result, Probe::Unknown(_)), "{result:?}");
+    let held = b"caller's completed bytes";
+    std::fs::write(&dest, held).expect("the earlier fetch");
+    let absent = w.host.fetch_public(&slug(), "v1", "missing.bin", &dest, 64);
+    assert_eq!(absent, Probe::Absent);
     assert_eq!(
-        std::fs::read(&dest).expect("the caller's bytes survive the failed read"),
-        b"caller's completed bytes"
+        std::fs::read(&dest).expect("the caller's bytes survive an absent asset"),
+        held
+    );
+
+    let unavailable = || Fault::Status {
+        status: 503,
+        body: String::new(),
+        headers: Vec::new(),
+    };
+    w.fake
+        .fault_always(Match::web(&format!("/{SLUG}/releases/")), unavailable());
+    w.fake.fault_always(
+        Match::api(&format!("/repos/{SLUG}/releases")),
+        unavailable(),
+    );
+    let failed = w.host.fetch_public(&slug(), "v1", "missing.bin", &dest, 64);
+    assert!(matches!(failed, Probe::Unknown(_)), "{failed:?}");
+    assert_eq!(
+        std::fs::read(&dest).expect("the caller's bytes survive a failed read"),
+        held
     );
 }
 

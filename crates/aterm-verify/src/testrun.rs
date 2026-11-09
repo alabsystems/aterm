@@ -1435,6 +1435,12 @@ pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd
             .args
             .splice(at, JSON_FLAGS.iter().map(OsString::from));
     }
+    if let Some(seed) = watch.seed.filter(|_| b.harness) {
+        if !json {
+            command.args.push("-Zunstable-options".into());
+        }
+        command.args.push(format!("--shuffle-seed={seed}").into());
+    }
     command.test_cases = Some(exec::CaseWatch {
         spec: b.spec.clone(),
         binary: b.record.exe().display().to_string(),
@@ -1833,15 +1839,11 @@ pub fn run_tests(
         ));
         return;
     }
-    let asked_cores = match crate::test_workers::share(&ctx.env, ctx.pool.as_ref()) {
-        Ok(crate::test_workers::Share::Pool(slots)) => slots,
-        Ok(crate::test_workers::Share::Claim(share)) => share.unwrap_or_else(|| ctx.cores()),
-        Err(why) => {
-            r.cannot_run(format!("{why}; no test was run"));
-            return;
-        }
+    if let Err(why) = crate::test_workers::share(&ctx.env, ctx.pool.as_ref()) {
+        r.cannot_run(format!("{why}; no test was run"));
+        return;
     }
-    .max(1);
+    let asked_cores = ctx.test_share();
     let history = ctx
         .test_history
         .as_deref()
@@ -1878,6 +1880,7 @@ pub fn run_tests(
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.pool.is_some()
         || ctx.test_threads.is_some()
+        || ctx.test_cores.is_some()
         || granted_cores < asked_cores)
         .then(|| ctx.test_threads_within(granted_cores));
     let slots = match subprocess_pool(&ctx.scratch, subprocess_slots_for_cores(granted_cores)) {
@@ -1925,7 +1928,7 @@ pub fn run_tests(
         }
         Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
     }
-    let rerun = crate::findings::Rerun::of(serial, thread_override);
+    let rerun = crate::findings::Rerun::of(serial, thread_override).with_seed(ctx.test_seed);
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
         std::process::id(),
@@ -2292,6 +2295,8 @@ pub struct Watch {
     pub json: bool,
     /// The run halts at its first red ([`crate::sched::Halt::armed`]).
     pub stop_at_red: bool,
+    /// Explicit deterministic shuffle, only for libtest binaries.
+    pub seed: Option<u64>,
 }
 
 /// Run the planned binaries: each through [`pool`], its cases read as they end ([`Watch`]), and
@@ -2519,6 +2524,7 @@ fn run_planned_observed(
     let watch = Watch {
         json: probe == Some(Probe::Took),
         stop_at_red: ctx.halt.armed(),
+        seed: ctx.test_seed,
     };
     let shas = Mutex::new(known);
     let sha_of = |b: &Binary| {
@@ -4898,6 +4904,7 @@ exit 0"#,
             Watch {
                 json: true,
                 stop_at_red: true,
+                seed: None,
             },
         );
         assert_eq!(
@@ -4930,7 +4937,8 @@ exit 0"#,
                 false,
                 Watch {
                     json: true,
-                    stop_at_red: true
+                    stop_at_red: true,
+                    seed: None,
                 }
             )
             .argv(),
@@ -4941,7 +4949,32 @@ exit 0"#,
         let armed = Watch {
             json: true,
             stop_at_red: true,
+            seed: None,
         };
+        for json in [false, true] {
+            let seeded = Watch {
+                json,
+                seed: Some(17),
+                ..armed
+            };
+            let command = binary_cmd(&b, 3, false, seeded);
+            assert!(command.args.iter().any(|arg| arg == "--shuffle-seed=17"));
+            assert!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with("-Z"))
+            );
+            assert!(
+                command
+                    .envs
+                    .iter()
+                    .any(|(k, v)| k == "RUST_TEST_THREADS" && v == "3")
+            );
+            let mut custom = b.clone();
+            custom.harness = false;
+            assert_eq!(binary_cmd(&custom, 3, false, seeded).args, cmd.args);
+        }
         for var in ["RUST_TEST_SHUFFLE", "RUST_TEST_SHUFFLE_SEED"] {
             let mut shuffled = b.clone();
             shuffled.record.env.push((var.into(), "1".into()));

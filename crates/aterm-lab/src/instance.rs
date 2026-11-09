@@ -21,6 +21,9 @@ use crate::{Fail, LAB, Res};
 mod cleanup;
 pub(crate) use cleanup::after_stop;
 
+#[path = "instance_compare.rs"]
+mod comparison;
+
 #[cfg(any(test, debug_assertions))]
 #[path = "instance_network_away.rs"]
 mod network_away;
@@ -695,6 +698,22 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// The complete absolute path in a successful plain `image` reply (`OK <w> <h> <path>`).
+    #[must_use]
+    pub fn image_path(&self) -> Option<&str> {
+        if self.code != 0 {
+            return None;
+        }
+        let mut fields = self.stdout.lines().next()?.splitn(4, ' ');
+        if fields.next()? != "OK" {
+            return None;
+        }
+        let width: u32 = fields.next()?.parse().ok()?;
+        let height: u32 = fields.next()?.parse().ok()?;
+        let path = fields.next()?;
+        (width > 0 && height > 0 && Path::new(path).is_absolute()).then_some(path)
+    }
+
     /// The first line of stdout, else of stderr: an answer's verdict line.
     #[must_use]
     pub fn first(&self) -> String {
@@ -748,6 +767,14 @@ fn terminal_selector(roster: &str) -> Option<String> {
 
 pub(crate) fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&str]) -> Reply {
     let roster = ctl(&["sessions"]);
+    terminal_request_from_roster(ctl, args, roster)
+}
+
+fn terminal_request_from_roster(
+    mut ctl: impl FnMut(&[&str]) -> Reply,
+    args: &[&str],
+    roster: Reply,
+) -> Reply {
     if roster.code != 0 {
         return roster;
     }
@@ -1684,6 +1711,9 @@ fn network_away_delay(args: &mut Vec<String>) -> Result<Option<u64>, Fail> {
 /// # Errors
 /// Usage, or the instance could not start or answer.
 pub fn cmd_instance(args: &[String]) -> Res {
+    if args.first().is_some_and(|arg| arg == "compare") {
+        return comparison::run(&args[1..]);
+    }
     stop::install();
     let mut a = args.to_vec();
     let program = a
@@ -1913,7 +1943,7 @@ struct Drive<'a> {
 
 /// Bring `inst` up and use it as `run` says: one frame (`--image`), or hold it until a signal.
 /// # Errors
-/// It did not come up or the frame failed, it exited while held, or a signal came first
+/// It did not come up, a control command or the frame failed, it exited while held, or a signal came first
 /// ([`Stopped`]).
 fn drive(inst: &mut Instance, world: &World, run: &Drive<'_>) -> Res {
     inst.await_socket(BOOT)?;
@@ -1923,28 +1953,16 @@ fn drive(inst: &mut Instance, world: &World, run: &Drive<'_>) -> Res {
     if ready.code != 0 {
         return Err(Fail::die(format!("instance: not ready: {}", ready.first())));
     }
-    run_verbs(inst, run.pre)?;
+    run_verbs(run.pre, |args| inst.ctl(args))?;
     if let Some(dest) = &run.image {
-        let _ = terminal_request(
-            |args| inst.ctl(args),
-            &["await", "idle", "500", "timeout=60000"],
-        );
-        stop::check()?;
-        let shot = inst.ctl(&["image", "frame.png"]);
-        stop::check()?;
-        let path = shot
-            .stdout
-            .split_whitespace()
-            .nth(3)
-            .unwrap_or_default()
-            .to_string();
-        if shot.code != 0 || path.is_empty() {
+        let shot = request_settled_image(|args| inst.ctl(args))?;
+        let Some(path) = shot.image_path() else {
             return Err(Fail::die(format!("instance: image: {}", shot.first())));
-        }
-        crate::util::copy_regular_file(&path, dest)
+        };
+        crate::util::copy_regular_file(path, dest)
             .map_err(|e| format!("instance: cannot write {dest}: {e}"))?;
         println!("{} -> {dest}", shot.first());
-        run_verbs(inst, run.post)?;
+        run_verbs(run.post, |args| inst.ctl(args))?;
         return Ok(0);
     }
     let aterm_pid = inst.aterm_pid();
@@ -2213,17 +2231,18 @@ pub fn with_harness_keys(config: &str, keys: &[String]) -> String {
     out
 }
 
-/// Runs each control verb against `inst` and prints its reply.
+/// Runs each control verb and prints its reply, stopping at the first failure.
 /// # Errors
+/// A control client failed; no later verb runs.
 /// A signal came ([`Stopped`]): the verbs after it are not run, and the reply of the one it
 /// came during, which it may have ended, is not printed.
-fn run_verbs(inst: &Instance, verbs: &[String]) -> Result<(), Stopped> {
+fn run_verbs(verbs: &[String], mut ctl: impl FnMut(&[&str]) -> Reply) -> Result<(), Fail> {
     for verb in verbs {
         let words: Vec<&str> = verb.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
-        let reply = inst.ctl(&words);
+        let reply = ctl(&words);
         stop::check()?;
         let answer = if reply.stdout.trim().is_empty() {
             reply.stderr.trim_end()
@@ -2231,8 +2250,205 @@ fn run_verbs(inst: &Instance, verbs: &[String]) -> Result<(), Stopped> {
             reply.stdout.trim_end()
         };
         println!("ctl {verb} -> {answer}");
+        if reply.code != 0 {
+            return Err(Fail::die(format!(
+                "instance: ctl {verb} failed (exit {}): {}",
+                reply.code,
+                reply.first()
+            )));
+        }
     }
     Ok(())
+}
+
+/// Request a frame after its terminal settles, or a successful roster proves none exists.
+/// # Errors
+/// A signal interrupted the request, the terminal did not settle, or the image command failed.
+fn request_settled_image(mut ctl: impl FnMut(&[&str]) -> Reply) -> Result<Reply, Fail> {
+    let roster = ctl(&["sessions"]);
+    stop::check()?;
+    let empty = roster.code == 0
+        && roster.stdout.trim().is_empty()
+        && roster
+            .header()
+            .strip_prefix("OK ")
+            .and_then(|body| body.split_whitespace().next())
+            == Some("0");
+    if !empty {
+        let idle = terminal_request_from_roster(
+            &mut ctl,
+            &["await", "idle", "500", "timeout=60000"],
+            roster,
+        );
+        stop::check()?;
+        if idle.code != 0 {
+            return Err(Fail::die(format!(
+                "instance: terminal did not settle (exit {}): {}",
+                idle.code,
+                idle.first()
+            )));
+        }
+    }
+    let image = ctl(&["image", "frame.png"]);
+    stop::check()?;
+    if image.code != 0 {
+        return Err(Fail::die(format!("instance: image: {}", image.first())));
+    }
+    Ok(image)
+}
+
+#[cfg(test)]
+mod control_verb_tests {
+    use super::*;
+
+    #[test]
+    fn native_capture_needs_a_proven_empty_roster_not_a_missing_reading() {
+        for (code, stdout, stderr, allowed) in [
+            (0, "", "aterm-ctl: OK 0 (sessions: no results)\n", true),
+            (1, "", "aterm-ctl: OK 0 (sessions: no results)\n", false),
+            (0, "", "", false),
+            (0, "", "aterm-ctl: OK 1\n", false),
+            (0, "unread body", "aterm-ctl: OK 0\n", false),
+        ] {
+            let mut calls = Vec::new();
+            let result = request_settled_image(|args| {
+                calls.push(args.join(" "));
+                match args {
+                    ["sessions"] => Reply {
+                        code,
+                        stdout: stdout.into(),
+                        stderr: stderr.into(),
+                    },
+                    ["image", "frame.png"] => Reply {
+                        stdout: "OK 794 462 /tmp/frame.png".into(),
+                        ..Reply::default()
+                    },
+                    _ => panic!("unexpected request: {args:?}"),
+                }
+            });
+            assert_eq!(result.is_ok(), allowed);
+            assert_eq!(
+                calls,
+                if allowed {
+                    vec!["sessions", "image frame.png"]
+                } else {
+                    vec!["sessions"]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn captures_with_a_terminal_require_a_successful_idle_wait() {
+        for code in [0, 1, 124, -1] {
+            let mut captured = false;
+            let result = request_settled_image(|args| match args {
+                ["sessions"] => Reply {
+                    stdout: "OK 1\n0 s-aa - alive shell active=1 wfocus=1\n".into(),
+                    ..Reply::default()
+                },
+                ["@s-aa", "await", "idle", "500", "timeout=60000"] => Reply {
+                    code,
+                    stderr: "idle wait result".into(),
+                    ..Reply::default()
+                },
+                ["image", "frame.png"] => {
+                    captured = true;
+                    Reply::default()
+                }
+                _ => panic!("unexpected request: {args:?}"),
+            });
+            assert_eq!(result.is_ok(), code == 0, "idle client exit {code}");
+            assert_eq!(captured, code == 0);
+        }
+    }
+
+    #[test]
+    fn failed_control_verbs_stop_the_requested_sequence() {
+        let verbs = ["first", "", "second", "third"].map(str::to_owned);
+        for code in [0, 1, 124, -1] {
+            let mut calls = Vec::new();
+            let result = run_verbs(&verbs, |args| {
+                calls.push(args.join(" "));
+                Reply {
+                    code: if args == ["second"] { code } else { 0 },
+                    stdout: if code == 0 {
+                        "OK".into()
+                    } else {
+                        String::new()
+                    },
+                    stderr: if code == 0 {
+                        String::new()
+                    } else {
+                        "control failed".into()
+                    },
+                }
+            });
+            if code == 0 {
+                assert!(result.is_ok());
+                assert_eq!(calls, ["first", "second", "third"]);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "client exit {code} must fail the instance run"
+                );
+                assert_eq!(calls, ["first", "second"]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_reply_tests {
+    use super::Reply;
+
+    #[test]
+    fn image_paths_keep_spaces_in_the_complete_path() {
+        for path in [
+            "/tmp/frame.png",
+            "/tmp/a world/run/images/frame.png",
+            "/tmp/画像 world/frame.png",
+        ] {
+            let reply = Reply {
+                stdout: format!("OK 794 462 {path}\n"),
+                ..Reply::default()
+            };
+            assert_eq!(reply.image_path(), Some(path));
+        }
+    }
+
+    #[test]
+    fn only_successful_sized_plain_images_supply_a_path() {
+        for text in [
+            "",
+            "ERR image failed",
+            "OK 0 462 /tmp/frame.png",
+            "OK 794 0 /tmp/frame.png",
+            "OK width 462 /tmp/frame.png",
+            "OK 794 462",
+            "OK 794 462 relative.png",
+            "OK 794 462 image-meta path=\"/tmp/frame.png\"",
+        ] {
+            assert_eq!(
+                Reply {
+                    stdout: text.into(),
+                    ..Reply::default()
+                }
+                .image_path(),
+                None,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            Reply {
+                code: 1,
+                stdout: "OK 794 462 /tmp/frame.png\n".into(),
+                ..Reply::default()
+            }
+            .image_path(),
+            None
+        );
+    }
 }
 
 /// Why a keeper ends its aterm.

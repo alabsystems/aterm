@@ -5,6 +5,58 @@ use super::*;
 use crate::ledger::{GitCli, GitRunner, object_git};
 
 #[test]
+fn lane_record_reads_one_file_at_the_observed_journal_without_importing_history() {
+    let fake = agh_fake::FakeGithub::start();
+    let slug = Slug::parse("fixture/app").unwrap();
+    fake.add_repo("fixture/app", agh_fake::RepoSpec::public());
+    let journal = "a".repeat(40);
+    let tree = "b".repeat(40);
+    let path = format!("verdicts/{tree}.toml");
+    fake.put_file("fixture/app", &journal, &path, b"state = 'red'");
+    fake.put_file("fixture/app", "main", &path, b"state = 'pass'");
+    let ports = fake.ports();
+    let env = Arc::new(agh::identity::MapEnv::default());
+    let client = GithubBuilder::new(Router::empty())
+        .endpoints(agh::wire::Endpoints::loopback(
+            ports.api,
+            ports.uploads,
+            ports.web,
+            ports.cdn,
+        ))
+        .transport(Arc::new(agh::wire::http::HttpTransport::direct(
+            env.clone(),
+        )))
+        .env(env)
+        .fx(Arc::new(agh::Fx::simulated(1_790_000_000)))
+        .retry(agh::retry::RetryPolicy::NONE)
+        .build();
+    assert_eq!(
+        lane_record_with(&client, &slug, &journal, &tree)
+            .unwrap()
+            .unwrap(),
+        b"state = 'red'"
+    );
+    assert_eq!(
+        lane_record_with(&client, &slug, &journal, &"c".repeat(40)).unwrap(),
+        None
+    );
+    assert!(lane_record_with(&client, &slug, "main", &tree).is_err());
+    assert!(lane_record_with(&client, &slug, &journal, "../other").is_err());
+    // A private, invisible parent is not evidence that a tree is unjudged.
+    fake.add_repo("hidden/app", agh_fake::RepoSpec::private());
+    assert!(
+        lane_record_with(
+            &client,
+            &Slug::parse("hidden/app").unwrap(),
+            &journal,
+            &tree
+        )
+        .is_err()
+    );
+    fake.assert_clean();
+}
+
+#[test]
 fn supersession_reads_private_staging_with_its_routed_identity() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = aterm_tempfile::tempdir().unwrap();
@@ -105,6 +157,62 @@ fn commit(repo: &Path, text: &str) -> String {
     git(repo, &["add", "line.toml"]);
     git(repo, &["commit", "-q", "-m", "fixture"]);
     git(repo, &["rev-parse", "HEAD"])
+}
+
+/// The name and peeled commit alone cannot bind an annotated historical tag:
+/// rewriting only its message must invalidate qualify's saved admission.
+#[test]
+fn rewritten_historical_tag_refuses_saved_commit_gates() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "remote.git", true);
+    let source = repo(root.path(), "source", false);
+    commit(&source, "release source\n");
+    git(&source, &["tag", "-a", "v1", "-m", "original"]);
+    git(
+        &source,
+        &["push", "-q", bare.to_str().unwrap(), "main", "--tags"],
+    );
+    git(
+        &source,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let remote = local(&source, &bare);
+    let runner = GitCli::new(&source);
+    let record = |tags| crate::gates::CommitGateRecord::new("source", "1.0.0", "seal".into(), tags);
+    record(remote.tag_fingerprint().unwrap())
+        .save(&runner)
+        .unwrap();
+    record(remote.tag_fingerprint().unwrap())
+        .adopt(&runner)
+        .unwrap();
+    git(
+        &source,
+        &["tag", "-a", "replacement", "-m", "rewritten message"],
+    );
+    let changed = git(&source, &["rev-parse", "replacement"]);
+    // Import the replacement body into the bare fixture before asking ls-remote
+    // to peel it. Its final commit is identical to v1's original final commit.
+    git(
+        &source,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "refs/tags/replacement",
+        ],
+    );
+    // Mutate only the owned bare fixture; no force push or real remote.
+    git(&bare, &["update-ref", "refs/tags/v1", &changed]);
+    git(&bare, &["update-ref", "-d", "refs/tags/replacement"]);
+    assert!(
+        record(remote.tag_fingerprint().unwrap())
+            .adopt(&runner)
+            .is_err()
+    );
 }
 
 fn assert_new_native_children_are_progress_bound(remote: &Remote, first: usize) {

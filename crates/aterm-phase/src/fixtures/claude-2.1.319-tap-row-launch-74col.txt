@@ -1,0 +1,11 @@
+# claude-code 2.1.319 · MEASURED 2026-11-08, `aterm ctl text` of a private headless aterm (74x30, aterm 0.183.0 debug) running the real Claude Code under `lab claude --own` (the stored claude.ai login in the scratch HOME's own `.claude` with no `CLAUDE_CONFIG_DIR`, aterm's usage tap on its line, `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, a local stub of the API, crates/aterm-lab) · at launch, before any turn, caught within a second of the tap's first row (`week · no figure yet`, no reading before Claude's first reply), while the mode row says `· ← for agents` (53 cells with Claude's indent): Claude's launch-time effort hint `◐ medium · /effort` right-aligned on the tap's row, its last cell at column 71, two cells before the edge, one blank after the mode row's words
+ ▐▛███▛█   Claude Code v2.1.319
+▝▜██████▀  Opus 5.5 · Claude Max 5x
+ ▝▝   ▝▝   /private/tmp/at.dTVi/proj
+
+
+──────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────
+  week · no figure yet                                ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

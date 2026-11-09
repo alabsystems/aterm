@@ -5,13 +5,15 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aterm_update_core::release_asset::{self, AssetError, Reader};
 use aterm_update_core::tag::{TagError, TagKind};
 use aterm_update_core::{HeadAnswer, HttpError};
 
 use crate::manifest::{Manifest, Ready};
 use crate::{Source, bundle, install, paths::Staging};
 
-/// Whether the last check ended in a deferral.
+/// Whether the last check ended in a deferral, or leaned on the metered API route
+/// ([`hold_after_api_route`]).
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
 /// Channel head whose app build the check found in flight ([`app_build_in_flight`]).
@@ -46,10 +48,25 @@ fn app_build_in_flight(head: &str, known: Option<&str>) -> bool {
 /// Whether this process has already logged which channel it reads.
 static ANNOUNCED_CHANNEL: AtomicBool = AtomicBool::new(false);
 
-/// Whether the last check was cut short by a deferral.
+/// Whether the last check was cut short by a deferral, or leaned on the metered API route.
 #[must_use]
 pub fn rate_limited() -> bool {
     RATE_LIMITED.load(Ordering::Relaxed)
+}
+
+/// A check whose reads needed the API route (`api_requests` of them) holds this machine off for
+/// the deferral window, as a deferral does: GitHub's anonymous API allows 60 requests an hour
+/// per public address, shared by every Mac behind it, so while the web route fails a machine
+/// spends about one check's worth per window instead of one every interval.
+fn hold_after_api_route(api_requests: u32) {
+    if api_requests > 0 {
+        RATE_LIMITED.store(true, Ordering::Relaxed);
+        crate::debug(&format!(
+            "this check read through the GitHub API route ({api_requests} request(s)) because \
+             the download host failed; holding this machine's next checks off for the \
+             deferral window"
+        ));
+    }
 }
 
 /// Write a deferral to the status ledger: the plain deferred record.
@@ -76,7 +93,8 @@ fn note_readable(source: &Source) {
     if !ANNOUNCED_CHANNEL.swap(true, Ordering::Relaxed) {
         crate::debug(&format!(
             "updating from github.com/{}/{} over its unmetered download host with no \
-             credential and no GitHub API request, on a {}-minute interval",
+             credential (the metered GitHub API only when that host fails), on a {}-minute \
+             interval",
             source.owner,
             source.repo,
             crate::cadence::INTERVAL_SECS / 60
@@ -117,15 +135,18 @@ fn unreadable_explanation(source: &Source) -> String {
 /// A GitHub Release synthesized from the pointer's tag ([`web_release`]).
 #[derive(Clone, Debug)]
 struct Release {
+    owner: String,
+    repo: String,
     tag_name: String,
-    assets: Vec<Asset>,
+    /// Its assets' names, each read through the release reader ([`Release::named`]).
+    assets: Vec<String>,
 }
 
-/// A release asset.
-#[derive(Clone, Debug)]
-struct Asset {
-    name: String,
-    url: String,
+impl Release {
+    /// Asset `index` as the release reader names it ([`release_asset::Asset`]).
+    fn named(&self, index: usize) -> release_asset::Asset<'_> {
+        release_asset::Asset::tagged(&self.owner, &self.repo, &self.tag_name, &self.assets[index])
+    }
 }
 
 /// Classify the channel head's tag with [`aterm_update_core::tag::parse_release_tag`].
@@ -150,7 +171,7 @@ fn unique_asset_index(release: &Release, name: &str) -> Result<Option<usize>, St
         .assets
         .iter()
         .enumerate()
-        .filter(|(_, asset)| asset.name == name)
+        .filter(|(_, asset)| *asset == name)
         .map(|(index, _)| index);
     let first = matches.next();
     if matches.next().is_some() {
@@ -302,8 +323,9 @@ struct AuthoritativeFetch {
     appcast_fetch_error: bool,
     /// The `appcast_fetch_error` was the manifest itself answering 404.
     appcast_missing: bool,
-    /// The `appcast_fetch_error` was a `github.com` 429 on an asset fetch, not a broken download.
-    asset_fetch_rate_limited: bool,
+    /// The `appcast_fetch_error` was the asset unavailable on both routes (GitHub's weather: 5xx,
+    /// timeouts, a spent allowance), not a broken download.
+    asset_unavailable: bool,
     manifest_rejected: bool,
     /// Why the manifest was rejected.
     rejection_reason: Option<String>,
@@ -376,21 +398,36 @@ const ED25519_SIGNATURE_LEN: usize = 64;
 /// Why the roster chain produced no attribution.
 enum RosterFailure {
     /// An asset could not be fetched, or what came back is not shaped like the asset.
-    Transport(String),
+    Transport {
+        why: String,
+        /// Neither route served it ([`AssetError::Unavailable`]).
+        unavailable: bool,
+    },
     /// The chain ran and refused.
     Refused(String),
 }
+
+/// A failed read of `what` as a [`RosterFailure`].
+fn not_fetched(what: &str, error: &AssetError) -> RosterFailure {
+    RosterFailure::Transport {
+        why: format!("fetch {what}: {error}"),
+        unavailable: matches!(error, AssetError::Unavailable { .. }),
+    }
+}
+
+/// The injected asset read ([`Reader::bytes`]).
+type Download<'a> = dyn FnMut(&release_asset::Asset<'_>, u64) -> Result<Vec<u8>, AssetError> + 'a;
 
 /// Verify the machine-roster chain for `candidate` and return the signing machine.
 fn authorize_by_roster(
     candidate: &AuthoritativeRelease,
     appcast: &[u8],
     policy: &RosterPolicy<'_>,
-    download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+    download: &mut Download<'_>,
     observed_roster_seq: &mut Option<u64>,
     observed_revocations: &mut Vec<String>,
 ) -> Result<aterm_update_core::roster::Attribution, RosterFailure> {
-    use RosterFailure::{Refused, Transport};
+    use RosterFailure::Refused;
     use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET, Roster, verify_roster};
 
     let signature_index = unique_asset_index(&candidate.release, APPCAST_SIG_ASSET)
@@ -418,21 +455,25 @@ fn authorize_by_roster(
             ))
         })?;
 
-    let roster_bytes = download(&candidate.release.assets[roster_index].url, 65_536)
-        .map_err(|e| Transport(format!("fetch {ROSTER_ASSET}: {e}")))?;
-    let roster_sig = download(&candidate.release.assets[roster_sig_index].url, 4096)
-        .map_err(|e| Transport(format!("fetch {ROSTER_SIG_ASSET}: {e}")))?;
-    let appcast_sig = download(&candidate.release.assets[signature_index].url, 4096)
-        .map_err(|e| Transport(format!("fetch appcast signature: {e}")))?;
+    let roster_bytes = download(&candidate.release.named(roster_index), 65_536)
+        .map_err(|e| not_fetched(ROSTER_ASSET, &e))?;
+    let roster_sig = download(&candidate.release.named(roster_sig_index), 4096)
+        .map_err(|e| not_fetched(ROSTER_SIG_ASSET, &e))?;
+    let appcast_sig = download(&candidate.release.named(signature_index), 4096)
+        .map_err(|e| not_fetched("appcast signature", &e))?;
     let signature_shaped = |asset: &str, sig: &[u8]| {
         if sig.len() == ED25519_SIGNATURE_LEN {
             Ok(())
         } else {
-            Err(Transport(format!(
-                "fetch {asset}: the download is {} bytes, not a {ED25519_SIGNATURE_LEN}-byte \
-                 signature (something other than the release host answered)",
-                sig.len()
-            )))
+            Err(RosterFailure::Transport {
+                why: format!(
+                    "fetch {asset}: the download is {} bytes, not a \
+                     {ED25519_SIGNATURE_LEN}-byte signature (something other than the release \
+                     host answered)",
+                    sig.len()
+                ),
+                unavailable: false,
+            })
         }
     };
     signature_shaped(ROSTER_SIG_ASSET, &roster_sig)?;
@@ -477,28 +518,27 @@ fn authorize_by_roster(
 /// Fetch and validate the one candidate the channel head names.
 fn fetch_authoritative_release(
     candidate: Option<AuthoritativeRelease>,
-    download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+    download: &mut Download<'_>,
     roster: &RosterPolicy<'_>,
 ) -> AuthoritativeFetch {
     let mut fetched = AuthoritativeFetch::default();
     let Some(candidate) = candidate else {
         return fetched;
     };
-    let manifest_url = candidate.release.assets[candidate.manifest_index]
-        .url
-        .clone();
-    let bytes = match download(&manifest_url, 5_000_000) {
+    let bytes = match download(
+        &candidate.release.named(candidate.manifest_index),
+        5_000_000,
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
-            fetched.appcast_missing = aterm_update_core::download_error_is_not_found(&error);
+            fetched.appcast_missing = error.is_absent();
             if fetched.appcast_missing {
                 crate::debug(&format!("fetch appcast: {error}"));
             } else {
                 crate::warn(&format!("fetch appcast: {error}"));
             }
             fetched.appcast_fetch_error = true;
-            fetched.asset_fetch_rate_limited =
-                aterm_update_core::download_error_is_rate_limit(&error);
+            fetched.asset_unavailable = matches!(error, AssetError::Unavailable { .. });
             return fetched;
         }
     };
@@ -519,14 +559,13 @@ fn fetch_authoritative_release(
         fetched.observed_revocations = observed_revocations;
         match authorized {
             Ok(who) => Some(who),
-            Err(RosterFailure::Transport(error)) => {
+            Err(RosterFailure::Transport { why, unavailable }) => {
                 crate::warn(&format!(
-                    "{error}; refusing authoritative {}",
+                    "{why}; refusing authoritative {}",
                     candidate.release.tag_name
                 ));
                 fetched.appcast_fetch_error = true;
-                fetched.asset_fetch_rate_limited =
-                    aterm_update_core::download_error_is_rate_limit(&error);
+                fetched.asset_unavailable = unavailable;
                 return fetched;
             }
             Err(RosterFailure::Refused(error)) => {
@@ -1138,6 +1177,10 @@ const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 /// The injected pointer transport ([`aterm_update_core::head_no_redirect`]).
 type HeadFetch<'a> = &'a mut dyn FnMut(&str) -> Result<HeadAnswer, HttpError>;
 
+/// The injected read of the latest release's tag once the pointer's HEAD failed
+/// ([`Reader::latest_tag`]: the web route again, then the API route).
+type LatestFetch<'a> = &'a mut dyn FnMut() -> Result<String, AssetError>;
+
 /// The evergreen pointer's channel head relative to the last authorized tag.
 enum WebHead {
     /// The pointer names the tag this ledger last authorized.
@@ -1168,16 +1211,12 @@ fn web_release(source: &Source, tag: &str) -> Result<AuthoritativeRelease, Strin
         ));
     };
     let version = canonical_authority_version(tag, &numeric)?;
-    let mut assets = Vec::with_capacity(6);
-    for name in web_asset_names(&version) {
-        let url =
-            aterm_update_core::cdn::release_download_url(&source.owner, &source.repo, tag, &name)
-                .ok_or_else(|| format!("no download URL can be derived for {name:?} of {tag}"))?;
-        assets.push(Asset { name, url });
-    }
+    let assets = Vec::from(web_asset_names(&version));
     Ok(AuthoritativeRelease {
         version,
         release: Release {
+            owner: source.owner.clone(),
+            repo: source.repo.clone(),
             tag_name: tag.to_string(),
             assets,
         },
@@ -1243,7 +1282,7 @@ fn resolve_web_head(
     current_build: u64,
     source: &Source,
     known_tag: Option<&str>,
-    head: HeadFetch<'_>,
+    (head, latest): (HeadFetch<'_>, LatestFetch<'_>),
 ) -> Result<WebHead, String> {
     use aterm_update_core::pointer::{self, PointerError};
     let pointer = pointer::resolve_with(
@@ -1253,24 +1292,51 @@ fn resolve_web_head(
         &pointer::canonical_app_tag,
         head,
     );
-    let pointer = match pointer {
-        Ok(pointer) => pointer,
+    let tag = match pointer {
+        Ok(pointer) => pointer.tag,
         Err(PointerError::NoRelease { .. }) => {
             crate::unreadable::announce(staging, current_build, &unreadable_explanation(source));
-            return Ok(WebHead::Ended);
-        }
-        Err(error @ PointerError::Transient { .. }) => {
-            record_deferral(
-                staging,
-                current_build,
-                &format!("update check deferred: {error}"),
-            );
             return Ok(WebHead::Ended);
         }
         Err(PointerError::OtherTag { tag }) => {
             note_readable(source);
             record_head_without_app(staging, current_build, &tag);
             return Ok(WebHead::Ended);
+        }
+        // The download host failed (an HTTP 429 or 5xx, a timeout, a connection that died):
+        // the latest release's tag comes from the web route again or the API route.
+        Err(web @ (PointerError::Transient { .. } | PointerError::Transport(_))) => {
+            match latest() {
+                Ok(tag) if pointer::canonical_app_tag(&tag) => tag,
+                Ok(tag) => {
+                    note_readable(source);
+                    record_head_without_app(staging, current_build, &tag);
+                    return Ok(WebHead::Ended);
+                }
+                Err(AssetError::Absent(_)) => {
+                    crate::unreadable::announce(
+                        staging,
+                        current_build,
+                        &unreadable_explanation(source),
+                    );
+                    return Ok(WebHead::Ended);
+                }
+                Err(api @ AssetError::Unavailable { .. })
+                    if matches!(web, PointerError::Transient { .. }) =>
+                {
+                    record_deferral(
+                        staging,
+                        current_build,
+                        &format!("update check deferred: {api}"),
+                    );
+                    return Ok(WebHead::Ended);
+                }
+                Err(api) => {
+                    let message = format!("{web}; then {api}");
+                    crate::health::Health::record_failure(&staging.health(), "network", &message);
+                    return Err(message);
+                }
+            }
         }
         Err(error) => {
             let message = error.to_string();
@@ -1279,12 +1345,10 @@ fn resolve_web_head(
         }
     };
     note_readable(source);
-    if known_tag == Some(pointer.tag.as_str()) {
-        return Ok(WebHead::Unchanged { tag: pointer.tag });
+    if known_tag == Some(tag.as_str()) {
+        return Ok(WebHead::Unchanged { tag });
     }
-    let candidate = web_release(source, &pointer.tag)?;
-    debug_assert_eq!(candidate.release.assets[0].url, pointer.location);
-    Ok(WebHead::New(candidate))
+    Ok(WebHead::New(web_release(source, &tag)?))
 }
 
 /// The URL cross-check.
@@ -1439,10 +1503,16 @@ fn acquire(
     staging: &Staging,
     current_build: u64,
     source: &Source,
-    head: HeadFetch<'_>,
+    pointer: (HeadFetch<'_>, LatestFetch<'_>),
 ) -> Result<Acquisition, String> {
     let known_tag = crate::status::latest_tag(staging, current_build, source);
-    match resolve_web_head(staging, current_build, source, known_tag.as_deref(), head)? {
+    match resolve_web_head(
+        staging,
+        current_build,
+        source,
+        known_tag.as_deref(),
+        pointer,
+    )? {
         WebHead::Ended => Ok(Acquisition::Ended),
         WebHead::Unchanged { tag }
             if stage_owes_roster_reconfirmation(
@@ -1623,6 +1693,9 @@ struct CheckWorld<'a> {
     installed_parent: Option<&'a std::path::Path>,
     staging: Staging,
     head: HeadFetch<'a>,
+    latest: LatestFetch<'a>,
+    /// Every release asset read of the check ([`Reader`]).
+    reader: &'a Reader,
     master_pubkeys: &'a [&'a str],
     team: &'a str,
 }
@@ -1638,14 +1711,22 @@ fn check_and_stage_inner(
     };
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
     let mut head = aterm_update_core::head_no_redirect;
+    // Anonymous, as every updater read is: one reader per check, so the check's reads share
+    // one patience and one API listing per release.
+    let reader = Reader::anonymous();
+    let mut latest = || reader.latest_tag(&source.owner, &source.repo, APPCAST_ASSET);
     let world = CheckWorld {
         installed_parent: installed.app_root.parent(),
         staging,
         head: &mut head,
+        latest: &mut latest,
+        reader: &reader,
         master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
         team: crate::effective_team_id(),
     };
-    check_and_stage_in(world, current_build, source, asked, container_download)
+    let checked = check_and_stage_in(world, current_build, source, asked, container_download);
+    hold_after_api_route(reader.api_requests());
+    checked
 }
 
 /// [`check_and_stage_inner`] in `world`; `container_download` is marked once the check begins
@@ -1661,6 +1742,8 @@ fn check_and_stage_in(
         installed_parent,
         staging,
         head,
+        latest,
+        reader,
         master_pubkeys,
         team,
     } = world;
@@ -1675,7 +1758,7 @@ fn check_and_stage_in(
     }
     let floor = floor_snapshot(&staging)?;
 
-    let authoritative = match acquire(&staging, current_build, source, head)? {
+    let authoritative = match acquire(&staging, current_build, source, (head, latest))? {
         Acquisition::Proceed(candidate) => candidate,
         Acquisition::Ended => return Ok(None),
         Acquisition::UpToDate { tag } => {
@@ -1700,7 +1783,7 @@ fn check_and_stage_in(
     };
     let web_tag = authoritative.release.tag_name.clone();
     let mut download =
-        |url: &str, max_bytes: u64| aterm_update_core::download_bytes(url, max_bytes);
+        |asset: &release_asset::Asset<'_>, max_bytes: u64| reader.bytes(asset, max_bytes);
     let floor_path = staging.floor();
     let floor_refresh = || crate::manifest::Floor::read(&floor_path).roster_seq;
     let roster_policy = RosterPolicy {
@@ -1725,7 +1808,7 @@ fn check_and_stage_in(
         );
     }
     let appcast_fetch_error = fetched.appcast_fetch_error;
-    let asset_fetch_rate_limited = fetched.asset_fetch_rate_limited;
+    let asset_unavailable = fetched.asset_unavailable;
     let manifest_rejected = fetched.manifest_rejected;
     let rejection_reason = fetched.rejection_reason.take();
     let observed_roster_seq = fetched.observed_roster_seq;
@@ -1744,12 +1827,12 @@ fn check_and_stage_in(
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
-        if appcast_fetch_error && asset_fetch_rate_limited {
+        if appcast_fetch_error && asset_unavailable {
             record_deferral(
                 &staging,
                 current_build,
-                "update check deferred: GitHub rate limit hit while fetching a release \
-                 asset — backing off, will retry on the next check",
+                "update check deferred: GitHub served a release asset on neither its download \
+                 host nor its API — backing off, will retry on the next check",
             );
             return Ok(None);
         }
@@ -1897,44 +1980,48 @@ fn check_and_stage_in(
         return Ok(None);
     }
 
-    let asset = &release.assets[artifact.asset_index];
+    let asset = release.named(artifact.asset_index);
     let container = artifact.container.label();
 
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
     sweep_download_scratch(&staging);
     container_download.mark();
-    let download_watch = crate::progress::watch_download(&part, &manifest.version, &asset.url);
-    let downloaded = aterm_update_core::download_to(
-        &asset.url,
-        &part,
+    let download_watch =
+        crate::progress::watch_download(&part, &manifest.version, &asset.web_url());
+    // Through `<container_path>.part` (`part`), which the watch reads, renamed onto
+    // `container_path` once whole; a route switch continues the same file.
+    let downloaded = reader.to_file(
+        &asset,
+        &container_path,
         aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
     );
     drop(download_watch);
     if let Err(e) = downloaded {
         let free = crate::install::free_bytes_at(&staging.download);
         let _ = std::fs::remove_file(&part);
-        if aterm_update_core::download_error_is_rate_limit(&e) {
+        if matches!(e, AssetError::Unavailable { .. }) {
             let note = format!(
-                "update check deferred: GitHub rate limit hit while downloading the \
-                 {container} — backing off, will retry on the next check"
+                "update check deferred: GitHub served the {container} on neither its \
+                 download host nor its API ({e}) — backing off, will retry on the next check"
             );
             record_deferral(&staging, current_build, &note);
             crate::progress::report(crate::progress::Progress::Deferred { detail: note });
             return Ok(None);
         }
-        return book_download_failure(&staging, current_build, &manifest, container, &e, free);
+        return book_download_failure(
+            &staging,
+            current_build,
+            &manifest,
+            container,
+            &e.to_string(),
+            free,
+        );
     }
 
     crate::progress::report(crate::progress::Progress::Verifying {
         version: manifest.version.clone(),
     });
-    if let Err(e) = std::fs::rename(&part, &container_path) {
-        let _ = std::fs::remove_file(&part);
-        let msg = format!("finalize download: {e}");
-        crate::health::Health::record_failure(&staging.health(), "stage", &msg);
-        return Err(msg);
-    }
 
     if let Some(end) = check_container_digest(
         &staging,

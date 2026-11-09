@@ -227,6 +227,27 @@ fn the_planner_reads_the_last_timed_run_and_the_most_any_run_used() {
     assert!(h.seen("-p d --lib").is_some_and(|s| s.failed));
 }
 
+/// Measured waiting survives the history read. Missing CPU has the conservative one-core
+/// fallback; it is not substituted for an actual low or zero reading.
+#[test]
+fn measured_idle_threads_are_not_replaced_by_the_missing_cpu_fallback() {
+    let mut h = History::default();
+    h.push("waits", run(1000, 100, 1, Some(100), "ok"));
+    assert_eq!(h.seen("waits").unwrap().per_thread, 0.1);
+    h.push(
+        "missing",
+        Sample {
+            cpu_ms: None,
+            ..sample(1)
+        },
+    );
+    assert_eq!(h.seen("missing").unwrap().per_thread, 1.0);
+    h.push("zero", run(1000, 0, 1, Some(100), "ok"));
+    assert_eq!(h.seen("zero").unwrap().per_thread, 0.0);
+    h.push("waits", run(1000, 250, 1, Some(100), "ok"));
+    assert_eq!(h.seen("waits").unwrap().per_thread, 0.25);
+}
+
 /// A decisive red keeps only its outcome after a timed pass: the planner retains the pass's
 /// timing and width, but sees the newest FAIL and starts that binary before prior passes.
 /// NEGATIVE CONTROL: dropping the outcome-only sample, or taking its zero wall as the latest

@@ -3954,6 +3954,14 @@ impl App {
         }
     }
 
+    /// Whether a floating or pre-frame chrome surface (stats lens, paste/close banner, or find
+    /// bar) owns window pixel `(x, y)`.
+    pub(crate) fn chrome_overlay_at(&self, wid: WindowId, x: f64, y: f64) -> bool {
+        self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+    }
+
     /// What of the chips' glass is under window pixel `(x, y)`.
     pub(crate) fn claude_chips_at(
         &self,
@@ -3961,14 +3969,11 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<Chip>)> {
-        if self.stats_lens_at(wid, x, y)
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-            || self.windows.get(&wid)?.claude_lights.hits.is_empty()
-        {
+        if self.windows.get(&wid)?.claude_lights.hits.is_empty() {
             return None;
         }
-        self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)
+        let hit = self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)?;
+        (!self.chrome_overlay_at(wid, x, y)).then_some(hit)
     }
 
     /// [`Self::claude_chips_at`] at frame cell `(row, col)` of the grid the
@@ -4025,18 +4030,17 @@ impl App {
         grid: Option<crate::app_mouse::GlassGrid>,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
-            || self.close_band(wid).is_some()
-            || self.windows.get(&wid).is_some_and(|ws| {
-                ws.pointer_position_known
-                    && (self.stats_lens_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
-                        || self
-                            .band_banner_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
-                            .is_some()
-                        || self
-                            .find_bar_cell_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
-                            .is_some())
-            });
+        let band_covered = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_lights.band_covered);
+        let band_active = band_covered
+            && (self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
+                || self.close_band(wid).is_some()
+                || self.windows.get(&wid).is_some_and(|ws| {
+                    ws.pointer_position_known
+                        && self.chrome_overlay_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+                }));
         let focused = self.focused_session_id(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -4087,19 +4091,24 @@ impl App {
         wid: WindowId,
         plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.claude_lights.selected.is_none())
-        {
+        let Some(needs_pane_span) = self.windows.get(&wid).and_then(|ws| {
+            ws.claude_lights.selected.map(|(_, target)| {
+                matches!(target, Target::Chip(_))
+                    && !ws.claude_lights.selection_painted
+                    && !ws.chrome_spans.is_empty()
+            })
+        }) else {
             return;
-        }
-        let (_, pane_col, _, pane_cols) = plan.map_or_else(
-            || self.focused_pane_rect(wid),
-            |plan| self.focused_pane_rect_from_plan(wid, plan),
-        );
-        let pane_span =
-            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1);
+        };
+        let pane_span = if needs_pane_span {
+            let (_, pane_col, _, pane_cols) = plan.map_or_else(
+                || self.focused_pane_rect(wid),
+                |plan| self.focused_pane_rect_from_plan(wid, plan),
+            );
+            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1)
+        } else {
+            0..1
+        };
         let mut had_fact = false;
         if let Some(ws) = self.windows.get_mut(&wid) {
             let stale = {
@@ -4151,26 +4160,26 @@ impl App {
         let Some((x, y)) = ws.claude_lights.glass_hover_px else {
             return;
         };
-        if self.stats_lens_at(wid, x, y)
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-        {
+        let (at, column, glass_hit) = if self.chrome_overlay_at(wid, x, y) {
             self.note_band_covered(wid);
-        }
-        let at = self.claude_glass_at(wid, x, y);
+            (None, None, None)
+        } else {
+            let at = self.claude_glass_at(wid, x, y);
+            let column = at
+                .filter(|(_, g)| matches!(g, GlassAt::Fact(Fact::Account, _)))
+                .and_then(|_| self.quota_column_at(wid, x, y));
+            let glass_hit = self.glass_hit_hover_at(wid, x, y);
+            (at, column, glass_hit)
+        };
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
             GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Label | GlassAt::Upgrade => None,
         });
-        let column = over
-            .filter(|(_, t)| *t == Target::Fact(Fact::Account))
-            .and_then(|_| self.quota_column_at(wid, x, y));
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
         let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
-        let glass_hit = self.glass_hit_hover_at(wid, x, y);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -4335,12 +4344,6 @@ impl App {
 
     /// What of the harness's glass is under window pixel `(x, y)`.
     pub(crate) fn claude_glass_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, GlassAt)> {
-        if self.stats_lens_at(wid, x, y)
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-        {
-            return None;
-        }
         let ws = self.windows.get(&wid)?;
         let lights = &ws.claude_lights;
         if lights.hits.is_empty()
@@ -4351,60 +4354,55 @@ impl App {
             return None;
         }
         let (row, col) = self.glass_cell_at(wid, x, y)?;
-        if let Some((session, chip)) = self.chips_at_cell(wid, (row, col)) {
-            return Some((session, GlassAt::Chip(chip)));
-        }
-        if let Some(b) = lights.border_toggles.iter().find(|b| {
+        let hit = if let Some((session, chip)) = self.chips_at_cell(wid, (row, col)) {
+            Some((session, GlassAt::Chip(chip)))
+        } else if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.arrow.as_ref().is_some_and(|cols| cols.contains(&col))
                 && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
-            return Some((b.session, GlassAt::Upgrade));
-        }
-        if let Some(b) = lights.border_toggles.iter().find(|b| {
+            Some((b.session, GlassAt::Upgrade))
+        } else if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.cols.contains(&col)
                 && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
-            return Some((b.session, GlassAt::Switch(b.face)));
-        }
-        if let Some(b) = lights.border_toggles.iter().find(|b| {
+            Some((b.session, GlassAt::Switch(b.face)))
+        } else if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.label.as_ref().is_some_and(|cols| cols.contains(&col))
                 && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
-            return Some((b.session, GlassAt::Label));
-        }
-        if let Some(h) = lights.fact_hits.iter().find(|h| {
+            Some((b.session, GlassAt::Label))
+        } else if let Some(h) = lights.fact_hits.iter().find(|h| {
             h.frame_row == row
                 && (h.cols.0..h.cols.1).contains(&col)
                 && !self.chrome_owns_terminal_cell(wid, h.term_row, col)
         }) {
-            return Some((h.session, GlassAt::Fact(h.fact, h.restores)));
-        }
-        lights
-            .mark_hits
-            .iter()
-            .find(|m| {
-                m.frame_row == row
-                    && m.cols.contains(&col)
-                    && !self.chrome_owns_terminal_cell(wid, m.term_row, col)
-            })
-            .map(|m| (m.session, GlassAt::Mark))
+            Some((h.session, GlassAt::Fact(h.fact, h.restores)))
+        } else {
+            lights
+                .mark_hits
+                .iter()
+                .find(|m| {
+                    m.frame_row == row
+                        && m.cols.contains(&col)
+                        && !self.chrome_owns_terminal_cell(wid, m.term_row, col)
+                })
+                .map(|m| (m.session, GlassAt::Mark))
+        }?;
+        (!self.chrome_overlay_at(wid, x, y)).then_some(hit)
     }
 
     /// The quota row's chart column under window pixel `(x, y)` ([`RowPart::Chart`]): its
     /// session, the chart's cells a day and the cell.
     fn quota_column_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, u8, usize)> {
-        if self.stats_lens_at(wid, x, y)
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-        {
+        let ws = self.windows.get(&wid)?;
+        if ws.claude_lights.fact_hits.is_empty() {
             return None;
         }
         let (row, col) = self.glass_cell_at(wid, x, y)?;
-        self.windows
-            .get(&wid)?
+        let hit = ws
             .claude_lights
             .fact_hits
             .iter()
@@ -4416,7 +4414,8 @@ impl App {
             .and_then(|h| match h.part {
                 Some(RowPart::Chart(per_day)) => Some((h.session, per_day, col - h.cols.0)),
                 _ => None,
-            })
+            })?;
+        (!self.chrome_overlay_at(wid, x, y)).then_some(hit)
     }
 
     /// Build again every fact title someone reads in window `wid` (hovered or selected). The
@@ -5302,12 +5301,16 @@ impl App {
         if ws.claude_lights.selected.is_none() && !(select_chord && walkable) {
             return false;
         }
+        let has_chrome_spans = !ws.chrome_spans.is_empty();
         let Some(session) = self.focused_session_id(wid) else {
             return false;
         };
-        let (_, pane_col, _, pane_cols) = self.focused_pane_rect(wid);
-        let pane_span =
-            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1);
+        let pane_span = if has_chrome_spans {
+            let (_, pane_col, _, pane_cols) = self.focused_pane_rect(wid);
+            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1)
+        } else {
+            0..1
+        };
         let now = Instant::now();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;

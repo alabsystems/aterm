@@ -419,7 +419,10 @@ impl HeldProgram {
     /// The sole non-system loader override comes from the same held closure.
     /// The execution adapter must clear its complete ambient environment first.
     pub fn runtime_environment(&self) -> io::Result<Vec<(OsString, OsString)>> {
-        if self.observation.loader_paths.is_empty() {
+        // Search-root custody also proves absence of sysroot shadows of OS libraries.
+        // Those actual directories stay held/rechecked even for a system-only image;
+        // their existence alone is not a reason to change that image's loader search.
+        if self.runtime.is_empty() || self.observation.loader_paths.is_empty() {
             return Ok(Vec::new());
         }
         let value = std::env::join_paths(&self.observation.loader_paths)

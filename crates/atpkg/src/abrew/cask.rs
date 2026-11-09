@@ -277,7 +277,7 @@ pub(super) fn dry_dep_names(api: &super::api::Api, prefix: &Prefix, cask: &Cask)
             }
         }
         for dep in &resolved.depends_formula {
-            let short = super::Formula::short_name(dep).to_string();
+            let short = super::formula::Formula::short_name(dep).to_string();
             if prefix.installed_one(Kind::Formula, &short).is_none() && !out.contains(&short) {
                 out.push(short);
             }
@@ -301,6 +301,80 @@ pub fn install(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Brew's cask tab `runtime_dependencies` hash: the cask's
+/// recursive formula/cask dependency graph as installed.
+/// Direct entries come from the cask's declared deps; each
+/// direct dep's own recorded closure folds in transitively.
+/// Only non-empty kinds appear (brew writes `{}` when bare).
+fn cask_runtime_deps_json(prefix: &Prefix, cask: &Cask) -> String {
+    let mut formulae: Vec<(String, bool)> = Vec::new();
+    let mut casks: Vec<(String, bool)> = Vec::new();
+    let push = |list: &mut Vec<(String, bool)>, full: &str, declared: bool| {
+        if !list.iter().any(|(n, _)| n == full) {
+            list.push((full.to_string(), declared));
+        }
+    };
+    for dep in &cask.depends_formula {
+        push(&mut formulae, dep, true);
+        let short = super::formula::Formula::short_name(dep);
+        if let Some(inst) = prefix.installed_one(Kind::Formula, short)
+            && let Some(names) =
+                super::prefix::receipt_runtime_deps(&prefix.keg(&inst.name, &inst.version))
+        {
+            for n in &names {
+                push(&mut formulae, n, false);
+            }
+        }
+    }
+    for dep in &cask.depends_cask {
+        push(&mut casks, dep, true);
+        if let Some(inst) = prefix.installed_one(Kind::Cask, dep) {
+            let (sub_formulae, sub_casks) = super::prefix::receipt_cask_runtime_deps(
+                &prefix.cask_dir(&inst.name, &inst.version),
+            );
+            for n in &sub_formulae {
+                push(&mut formulae, n, false);
+            }
+            for n in &sub_casks {
+                push(&mut casks, n, false);
+            }
+        }
+    }
+    let entry = |full: &str, declared: bool, version: &str| {
+        format!(
+            "{{\"full_name\": \"{}\", \"version\": \"{}\", \"declared_directly\": {declared}}}",
+            super::prefix::json_escape(full),
+            super::prefix::json_escape(version),
+        )
+    };
+    let mut kinds: Vec<String> = Vec::new();
+    if !casks.is_empty() {
+        let items: Vec<String> = casks
+            .iter()
+            .map(|(full, declared)| {
+                let version = prefix
+                    .installed_one(Kind::Cask, super::formula::Formula::short_name(full))
+                    .map_or_else(String::new, |i| i.version);
+                entry(full, *declared, &version)
+            })
+            .collect();
+        kinds.push(format!("\"cask\": [{}]", items.join(", ")));
+    }
+    if !formulae.is_empty() {
+        let items: Vec<String> = formulae
+            .iter()
+            .map(|(full, declared)| {
+                let version = prefix
+                    .installed_one(Kind::Formula, super::formula::Formula::short_name(full))
+                    .map_or_else(String::new, |i| i.version);
+                entry(full, *declared, &version)
+            })
+            .collect();
+        kinds.push(format!("\"formula\": [{}]", items.join(", ")));
+    }
+    format!("{{{}}}", kinds.join(", "))
+}
+
 fn install_inner(
     prefix: &Prefix,
     cask: &Cask,
@@ -610,7 +684,12 @@ fn install_inner(
     for (k, v) in &artifact_fields {
         receipt_fields.push((k, v));
     }
-    prefix.write_receipt(&payload, &receipt_fields)?;
+    let runtime_deps = cask_runtime_deps_json(prefix, cask);
+    prefix.write_receipt_raw(
+        &payload,
+        &receipt_fields,
+        &[("runtime_dependencies", &runtime_deps)],
+    )?;
     for (artifact, (path, dst, _, _)) in cask.artifacts.iter().zip(&artifacts) {
         let (label, linked) = artifact_label(artifact);
         let base = path
@@ -802,9 +881,11 @@ fn recorded_artifacts(
     prefix: &Prefix,
     payload: &Path,
 ) -> Result<Option<BTreeSet<PathBuf>>, InstallError> {
-    let bytes =
-        crate::metadata_io::read_bounded_regular(&payload.join("INSTALL_RECEIPT.json"), 64 * 1024)
-            .map_err(|e| format!("abrew: cannot read cask artifacts: {e}"))?;
+    let bytes = crate::metadata_io::read_bounded_regular(
+        &payload.join("INSTALL_RECEIPT.json"),
+        1024 * 1024,
+    )
+    .map_err(|e| format!("abrew: cannot read cask artifacts: {e}"))?;
     let value = aterm_json::from_slice(&bytes)
         .map_err(|e| format!("abrew: invalid cask artifacts: {e}"))?;
     recorded_artifact_paths(prefix, &value)
@@ -4012,7 +4093,7 @@ mod tests {
             .write_receipt(&generic_payload, &receipt)
             .unwrap();
         let saved = std::fs::read(generic_payload.join("INSTALL_RECEIPT.json")).unwrap();
-        let oversized = "x".repeat(64 * 1024);
+        let oversized = "x".repeat(1024 * 1024);
         assert!(
             generic_prefix
                 .write_receipt(&generic_payload, &[("oversized", &oversized)])

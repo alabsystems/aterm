@@ -21,7 +21,36 @@ use std::time::Duration;
 const PROOF_FD: &str = "ATERM_FIRST_LAUNCH_PROOF_FD";
 const PROOF_NONCE: &str = "ATERM_FIRST_LAUNCH_PROOF_NONCE";
 const PROOF_EXE: &str = "ATERM_FIRST_LAUNCH_PROOF_EXE";
-const PROOF_WAIT: Duration = Duration::from_secs(30);
+const PROOF_WAIT: Duration = Duration::from_secs(60);
+
+fn proof_wait_after(elapsed: Duration) -> std::io::Result<Duration> {
+    PROOF_WAIT
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "first-launch work did not finish",
+            )
+        })
+}
+
+fn bound_proof_socket(socket: &UnixStream, elapsed: Duration) -> std::io::Result<()> {
+    let remaining = proof_wait_after(elapsed)?;
+    socket.set_read_timeout(Some(remaining))?;
+    socket.set_write_timeout(Some(remaining))
+}
+
+fn first_launch_child(
+    command: &mut aterm_uds::spawnfd::Command,
+    what: &str,
+    elapsed: Duration,
+) -> Result<(std::process::ExitStatus, String), String> {
+    let remaining = proof_wait_after(elapsed).map_err(|error| error.to_string())?;
+    crate::verify::status_bounded_with_stderr_observed(command, what, remaining)
+        .map_err(|failure| failure.message)
+}
+
 /// Hang detector for required first-launch custody behind another native writer.
 const CUSTODY_HANG: Duration = Duration::from_secs(60);
 
@@ -144,6 +173,29 @@ fn arguments_digest(args: &[OsString]) -> [u8; 32] {
     digest.finalize()
 }
 
+/// Validate the actual serialized proof against this parent's exact child custody.
+fn read_successor_proof(parent: &mut UnixStream, expected: &Proof) -> Result<Proof, String> {
+    let expected_line = aterm_json::to_vec(expected).map_err(|error| error.to_string())?;
+    // Bound the read by the exact expected serialization plus its newline, not argv size.
+    let bound = expected_line
+        .len()
+        .checked_add(1)
+        .ok_or("proof size overflow")?;
+    let mut line = Vec::new();
+    std::io::BufReader::new(parent.take(bound as u64))
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("read installed successor proof: {error}"))?;
+    if line.last() != Some(&b'\n') {
+        return Err("installed successor did not write a complete proof".into());
+    }
+    let proof: Proof = aterm_json::from_slice(&line)
+        .map_err(|error| format!("invalid installed successor proof: {error}"))?;
+    if &proof != expected {
+        return Err("installed successor proof did not match its native child custody".into());
+    }
+    Ok(proof)
+}
+
 /// Admit the original parent's private socket at the earliest single-threaded entry.
 /// The installed child writes its own proof and waits for Commit before any setup/root work.
 /// EOF, cancellation or an invalid offer ends the child without consuming a setup episode.
@@ -182,12 +234,7 @@ pub fn acknowledge_relaunch(args: &[OsString]) -> Result<(), String> {
     let socket = unsafe { aterm_uds::spawnfd::adopt_inherited_socket(fd) }
         .map_err(|error| error.to_string())?;
     let mut socket = UnixStream::from(socket);
-    socket
-        .set_read_timeout(Some(PROOF_WAIT))
-        .map_err(|error| error.to_string())?;
-    socket
-        .set_write_timeout(Some(PROOF_WAIT))
-        .map_err(|error| error.to_string())?;
+    bound_proof_socket(&socket, Duration::ZERO).map_err(|error| error.to_string())?;
     let pid = std::process::id();
     let birth = aterm_uds::process::read_birth(pid as i32)
         .ok_or("successor birth unreadable")?
@@ -565,14 +612,13 @@ impl FirstLaunchHost for NativeHost {
     }
 
     fn clear_quarantine(&self, app: &Path) -> Result<(), String> {
-        crate::verify::status_bounded_with_stderr_observed(
+        first_launch_child(
             aterm_uds::spawnfd::command("/usr/bin/xattr")
                 .args(["-dr", "com.apple.quarantine"])
                 .arg(app),
             "clear verified app quarantine",
-            PROOF_WAIT,
+            Duration::ZERO,
         )
-        .map_err(|failure| failure.message)
         .and_then(|(status, stderr)| {
             if status.success() {
                 Ok(())
@@ -609,12 +655,7 @@ impl FirstLaunchHost for NativeHost {
         }
         let nonce = aterm_uds::rand::hex_token::<16>().map_err(|error| error.to_string())?;
         let (mut parent, successor) = UnixStream::pair().map_err(|error| error.to_string())?;
-        parent
-            .set_read_timeout(Some(PROOF_WAIT))
-            .map_err(|error| error.to_string())?;
-        parent
-            .set_write_timeout(Some(PROOF_WAIT))
-            .map_err(|error| error.to_string())?;
+        bound_proof_socket(&parent, Duration::ZERO).map_err(|error| error.to_string())?;
         let mut command = aterm_uds::spawnfd::command(&executable);
         command.args(&self.args).native_image(true);
         command
@@ -640,30 +681,12 @@ impl FirstLaunchHost for NativeHost {
             executable: executable.as_os_str().as_bytes().to_vec(),
             arguments_digest: arguments_digest(&self.args),
         };
-        let expected_line = aterm_json::to_vec(&expected).map_err(|error| error.to_string())?;
-        // The valid child's proof is determined by our owned child and launch words.
-        // Bound the read by that exact serialization plus its newline, not by argv size.
-        let bound = expected_line
-            .len()
-            .checked_add(1)
-            .ok_or("proof size overflow")?;
-        let mut line = Vec::new();
-        std::io::BufReader::new((&mut parent).take(bound as u64))
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("read installed successor proof: {error}"))?;
-        if line.last() != Some(&b'\n') {
-            return Err("installed successor did not write a complete proof".into());
-        }
-        let proof: Proof = aterm_json::from_slice(&line)
-            .map_err(|error| format!("invalid installed successor proof: {error}"))?;
-        if proof != expected {
-            return Err("installed successor proof did not match its native child custody".into());
-        }
+        let _proof = read_successor_proof(&mut parent, &expected)?;
         #[cfg(debug_assertions)]
         if let Some(fixture) = &self.fixture {
             fixture.record(
                 "first-launch-receipt.json",
-                &aterm_json::to_vec(&proof).map_err(|error| error.to_string())?,
+                &aterm_json::to_vec(&_proof).map_err(|error| error.to_string())?,
             )?;
         }
         parent
@@ -795,6 +818,107 @@ impl Fixture {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    fn expected_proof() -> Proof {
+        Proof {
+            nonce: "52".repeat(16),
+            pid: std::process::id(),
+            birth: aterm_uds::process::read_birth(std::process::id() as i32)
+                .unwrap()
+                .0,
+            executable: std::env::current_exe()
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            arguments_digest: arguments_digest(&[OsString::from("init")]),
+        }
+    }
+
+    #[test]
+    fn first_launch_work_waits_for_the_native_successor_proof() {
+        let expected = expected_proof();
+        let bytes = aterm_json::to_vec(&expected).unwrap();
+        let (mut parent, mut peer) = UnixStream::pair().unwrap();
+        bound_proof_socket(&parent, Duration::from_secs(31)).unwrap();
+        bound_proof_socket(&peer, Duration::ZERO).unwrap();
+        peer.write_all(&bytes).unwrap();
+        peer.write_all(b"\n").unwrap();
+        assert_eq!(
+            read_successor_proof(&mut parent, &expected).unwrap(),
+            expected
+        );
+        parent.write_all(b"G").unwrap();
+        let mut commit = [0];
+        peer.read_exact(&mut commit).unwrap();
+        assert_eq!(commit, *b"G");
+        assert!(
+            matches!(bound_proof_socket(&parent, Duration::from_secs(61)), Err(error) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+
+        for field in 0..5 {
+            let mut changed = expected_proof();
+            match field {
+                0 => changed.nonce = "53".repeat(16),
+                1 => changed.pid += 1,
+                2 => changed.birth += 1,
+                3 => changed.executable.push(b'x'),
+                _ => changed.arguments_digest[0] ^= 1,
+            }
+            let (mut parent, mut peer) = UnixStream::pair().unwrap();
+            bound_proof_socket(&parent, Duration::ZERO).unwrap();
+            peer.write_all(&aterm_json::to_vec(&changed).unwrap())
+                .unwrap();
+            peer.write_all(b"\n").unwrap();
+            drop(peer);
+            assert!(
+                read_successor_proof(&mut parent, &expected).is_err(),
+                "custody field {field}"
+            );
+        }
+        for incomplete in [&b""[..], &bytes[..]] {
+            let (mut parent, mut peer) = UnixStream::pair().unwrap();
+            bound_proof_socket(&parent, Duration::ZERO).unwrap();
+            peer.write_all(incomplete).unwrap();
+            drop(peer);
+            assert!(read_successor_proof(&mut parent, &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn first_launch_work_waits_for_the_native_quarantine_child() {
+        let executable = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let actual = first_launch_child(
+            aterm_uds::spawnfd::command(&executable)
+                .args(["-c", "echo begun >&2; echo finished >&2"]),
+            "private first-launch child",
+            Duration::from_secs(31),
+        );
+        let (status, stderr) = actual.unwrap();
+        assert!(status.success());
+        assert_eq!(stderr, "begun\nfinished");
+        let (status, stderr) = first_launch_child(
+            aterm_uds::spawnfd::command(&executable).args(["-c", "echo refused >&2; exit 7"]),
+            "private first-launch child",
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(stderr, "refused");
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("never-started");
+        assert!(
+            first_launch_child(
+                aterm_uds::spawnfd::command(&executable)
+                    .args(["-c", "echo started > \"$1\"", "fixture"])
+                    .arg(&marker),
+                "private first-launch child",
+                Duration::from_secs(61),
+            )
+            .is_err()
+        );
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn required_first_launch_custody_waits_for_its_native_writer() {

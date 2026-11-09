@@ -600,3 +600,186 @@ fn the_answer_is_only_for_a_readable_builtin_restart_on_this_host_epoch() {
     assert_eq!(own.send(&model), DEADLINE);
     assert_eq!(own.probe(&model), state);
 }
+
+#[cfg(unix)]
+#[test]
+fn an_older_epoch_prepare_is_durably_rejected_before_the_client_may_drop_it() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    for ask in 0..3 {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let mut host = Host::new(7970 + ask, |facts| {
+            facts.native_journal = Some(Journal::new(home.path()));
+        });
+        if ask > 0 {
+            host.ask(ask == 2);
+        }
+        host.request.host_epoch = "34".repeat(16);
+        let send = |request: &Prepare, actor: &SupervisorInputCaller| {
+            run(
+                &host.handle.ctx,
+                &host.facts,
+                Request::prepare(request.clone()),
+                actor.clone(),
+            )
+        };
+        let instance = SupervisorInputCaller {
+            principal: Principal::Instance,
+            ..host.actor.clone()
+        };
+        assert_eq!(
+            send(&host.request, &host.actor),
+            "ERR native host epoch changed\n"
+        );
+        assert_eq!(
+            run(
+                &host.handle.ctx,
+                &host.facts,
+                Request::RejectionDomain,
+                instance.clone()
+            ),
+            DENIED
+        );
+        let domain = run(
+            &host.handle.ctx,
+            &host.facts,
+            Request::RejectionDomain,
+            host.actor.clone(),
+        );
+        let Some(Reply::RejectionDomain(domain)) = Reply::parse(&domain) else {
+            panic!("the host did not name its rejection domain");
+        };
+        host.request.rejection_domain = Some(domain);
+        assert_eq!(
+            send(&host.request, &instance),
+            "ERR native host epoch changed\n"
+        );
+        let journal = host.facts.native_journal.as_ref().unwrap();
+        assert!(!journal.contains_operation(&host.request.id).unwrap());
+        host.facts.receipt_readable.store(false, Ordering::SeqCst);
+        assert_eq!(
+            send(&host.request, &host.actor),
+            "ERR native host epoch changed\n"
+        );
+        host.facts.receipt_readable.store(true, Ordering::SeqCst);
+        // The first reply may be lost. Reopening the journal and retrying must
+        // still give the same answer without spending another record.
+        assert_eq!(send(&host.request, &host.actor), host.unadmitted());
+        assert_eq!(send(&host.request, &host.actor), host.unadmitted());
+        assert_eq!(journal.record_count().unwrap(), 1);
+        assert!(journal.contains_operation(&host.request.id).unwrap());
+        let binding = Binding {
+            id: host.request.id.clone(),
+            capability: "ab".repeat(32),
+        };
+        assert!(
+            journal
+                .record(&host.request, &binding, Append::Prepare)
+                .is_err()
+        );
+        let mut changed = host.request.clone();
+        changed.deadline_us += 1;
+        assert_eq!(
+            send(&changed, &host.actor),
+            "ERR native host epoch changed\n"
+        );
+        assert_eq!(host.facts.signals.load(Ordering::SeqCst), 0);
+        assert!(
+            host.handle
+                .ctx
+                .fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .by_id
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_previous_epoch_admission_is_never_reinterpreted_as_unadmitted() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    for events in [
+        vec![Append::Prepare],
+        vec![Append::Prepare, Append::MayExecute],
+        vec![Append::Prepare, Append::Seal],
+        vec![Append::Prepare, Append::MayExecute, Append::Seal],
+    ] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let mut host = Host::new(7974, |facts| {
+            facts.native_journal = Some(Journal::new(home.path()));
+        });
+        host.request.host_epoch = "34".repeat(16);
+        host.request.rejection_domain = Some(
+            host.facts
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .rejection_domain()
+                .unwrap(),
+        );
+        let binding = Binding {
+            id: host.request.id.clone(),
+            capability: "ab".repeat(32),
+        };
+        let journal = host.facts.native_journal.as_ref().unwrap();
+        for event in events {
+            journal.record(&host.request, &binding, event).unwrap();
+        }
+        let before = journal.record_count().unwrap();
+        assert_eq!(
+            run(
+                &host.handle.ctx,
+                &host.facts,
+                Request::prepare(host.request.clone()),
+                host.actor.clone()
+            ),
+            "ERR native host epoch changed\n"
+        );
+        assert_eq!(journal.record_count().unwrap(), before);
+        assert_eq!(host.facts.signals.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_foreign_journal_domain_grants_neither_current_admission_nor_old_epoch_recovery() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let other_home = aterm_tempfile::tempdir().unwrap();
+    let other = Journal::new(other_home.path());
+    let mut host = Host::new(7975, |facts| {
+        facts.native_journal = Some(Journal::new(home.path()));
+    });
+    host.request.rejection_domain = Some(other.rejection_domain().unwrap());
+    assert_eq!(
+        run(
+            &host.handle.ctx,
+            &host.facts,
+            Request::prepare(host.request.clone()),
+            host.actor.clone()
+        ),
+        DENIED
+    );
+    host.request.host_epoch = "34".repeat(16);
+    assert_eq!(
+        run(
+            &host.handle.ctx,
+            &host.facts,
+            Request::prepare(host.request.clone()),
+            host.actor.clone()
+        ),
+        "ERR native host epoch changed\n"
+    );
+    let local = host.facts.native_journal.as_ref().unwrap();
+    assert!(!local.contains_operation(&host.request.id).unwrap());
+    let binding = Binding {
+        id: host.request.id.clone(),
+        capability: "ab".repeat(32),
+    };
+    other
+        .record(&host.request, &binding, Append::Prepare)
+        .unwrap();
+    assert_eq!(host.facts.signals.load(Ordering::SeqCst), 0);
+}

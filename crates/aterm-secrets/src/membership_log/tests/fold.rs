@@ -239,9 +239,10 @@ fn historical_fold_writers_are_the_epoch_s_seats() {
     assert!(log.historical_fold_writers(log.network()).is_none());
 }
 
-/// Under one history lease every epoch's writers are the ones the log names for that epoch
-/// alone, `[everyone]` and Commons epochs alike, though the lease derives what they read of the
-/// log once for all of them (`eval::HistoricalWriters`).
+/// Under one history lease every epoch's writers are the ones a log of the same records names for
+/// that epoch alone, deriving afresh, `[everyone]` and Commons epochs alike, though the lease
+/// reads what they read of the log from the log, which derives it once for all of them
+/// (`eval::Historical`).
 /// NEGATIVE CONTROL: a lease that keeps the first epoch's writers for every epoch answers the
 /// epoch after a removal with a removed Mac's binding.
 #[cfg(unix)]
@@ -279,9 +280,11 @@ fn a_lease_names_each_epochs_writers_as_the_log_does_for_it_alone() {
         let RecordState::Complete(held) = lease.record(record.id()).unwrap() else {
             panic!("a held record is complete")
         };
-        let alone = log
+        // A log of the same records, which derives what this epoch's writers read afresh.
+        let fresh = log.project_heads(&log.heads()).unwrap();
+        let alone = fresh
             .historical_commons_writers(record.id())
-            .or_else(|| log.historical_fold_writers(record.id()));
+            .or_else(|| fresh.historical_fold_writers(record.id()));
         assert_eq!(lease.historical_commons_writers(&held).unwrap(), alone);
         answered.extend(alone.map(|(_, writers)| writers));
     }
@@ -292,6 +295,81 @@ fn a_lease_names_each_epochs_writers_as_the_log_does_for_it_alone() {
     assert!(
         answered.iter().any(|writers| writers != &answered[0]),
         "the epochs after the removal name other writers"
+    );
+}
+
+/// A log derives what its epochs' historical writers read of it (`eval::Historical`) once for
+/// itself, its clones and their leases, and again only once it holds a record: each epoch's
+/// writers are then what a log of the same records names, deriving it afresh, and a clone that
+/// held nothing keeps its own.
+/// NEGATIVE CONTROLS: derived under each lease, the clone's lease derives it again; kept across a
+/// hold, the epoch a later `Wrap` admits a second Mac to keeps naming only the first.
+#[cfg(unix)]
+#[test]
+fn a_log_derives_its_epochs_writers_once_until_it_holds_a_record() {
+    use crate::membership_log::eval::HISTORICALS;
+    use crate::membership_log::history::{HistoryView, RecordState};
+    let (macs, entrants) = three_macs();
+    let (mut log, _, _) = founded(&macs, &entrants);
+    let (draft, key) = log
+        .draft_epoch(&macs[0].member, 2_000, EpochAudience::Commons, 1)
+        .unwrap();
+    let epoch = macs[0].sign(&mut log, draft);
+    let wrap = |log: &mut Log, ms: u64, to: &Mac| {
+        let draft = log
+            .draft_wrap(&macs[0].member, ms, epoch, &key, to.identity.recipient())
+            .unwrap();
+        macs[0].sign(log, draft);
+    };
+    wrap(&mut log, 2_001, &macs[0]);
+    // Every held record's writers under one lease of `log`.
+    let leased = |log: &Log| {
+        let view = HistoryView::new(log);
+        let lease = view.lease_complete().unwrap();
+        log.records()
+            .map(|record| {
+                let RecordState::Complete(held) = lease.record(record.id()).unwrap() else {
+                    panic!("a held record is complete")
+                };
+                (
+                    *record.id(),
+                    lease.historical_commons_writers(&held).unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let writes = |found: &std::collections::BTreeMap<_, Option<(u64, Vec<_>)>>, mac: &Mac| {
+        found[&epoch].as_ref().is_some_and(|(_, writers)| {
+            writers
+                .iter()
+                .any(|binding: &crate::commons::binding::Binding| {
+                    binding.recipient() == mac.identity.recipient()
+                })
+        })
+    };
+    let start = HISTORICALS.get();
+    let first = leased(&log);
+    assert!(writes(&first, &macs[0]) && !writes(&first, &macs[1]));
+    let clone = log.clone();
+    assert_eq!(leased(&clone), first);
+    assert_eq!(
+        HISTORICALS.get() - start,
+        1,
+        "the log, its clone and their leases derive once"
+    );
+    wrap(&mut log, 2_002, &macs[1]);
+    let held = leased(&log);
+    let fresh = log.project_heads(&log.heads()).unwrap();
+    assert_eq!(held, leased(&fresh), "what a fresh derivation names");
+    assert!(
+        writes(&held, &macs[1]),
+        "the later wrap admits a second writer"
+    );
+    assert_eq!(leased(&clone), first, "the clone keeps its own");
+    assert_eq!(
+        HISTORICALS.get() - start,
+        3,
+        "the log derives again after its hold, and the fresh log once"
     );
 }
 

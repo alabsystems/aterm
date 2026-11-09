@@ -4,7 +4,10 @@
 use crate::Secret;
 use aterm_http::{Client, Method, ProxyMode, Trust};
 use aterm_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Hang detector for the required ownership-verification response.
+const VERIFICATION_HANG: Duration = Duration::from_secs(60);
 
 pub struct Challenge {
     pub token: Secret,
@@ -106,11 +109,23 @@ pub(crate) fn supported(method: &str) -> bool {
     matches!(method, "ownership-email" | "ownership-sms")
 }
 fn request(method: Method, path: &str) -> Result<Value, String> {
-    let client = Client::new(
-        Trust::PlatformVerifier,
+    request_started(
+        method,
+        path,
+        Instant::now(),
+        "https://mail.proton.me/api",
         ProxyMode::Environment,
-        Duration::from_secs(30),
-    );
+    )
+}
+
+fn request_started(
+    method: Method,
+    path: &str,
+    started: Instant,
+    api: &str,
+    proxy: ProxyMode,
+) -> Result<Value, String> {
+    let client = Client::new(Trust::PlatformVerifier, proxy, VERIFICATION_HANG);
     let app_version = if cfg!(target_os = "macos") {
         "macos-bridge@3.27.1"
     } else if cfg!(target_os = "windows") {
@@ -118,12 +133,17 @@ fn request(method: Method, path: &str) -> Result<Value, String> {
     } else {
         "linux-bridge@3.27.1"
     };
+    let left = (started + VERIFICATION_HANG).saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("Proton verification request deadline expired".into());
+    }
     let response = client
-        .request(method, &format!("https://mail.proton.me/api{path}"))
+        .request(method, &format!("{api}{path}"))
         .header("x-pm-appversion", app_version)
         .header("User-Agent", crate::user_agent())
         .header("Accept", "application/json")
         .limit(65536)
+        .backstop(left)
         .send(b"")
         .map_err(|_| "Could not reach Proton verification")?;
     let value: Value =
@@ -138,8 +158,13 @@ fn request(method: Method, path: &str) -> Result<Value, String> {
     Ok(value)
 }
 #[cfg(test)]
+#[path = "human/native_wait_tests.rs"]
+mod native_wait_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn only_recovery_methods_and_valid_proofs_are_accepted() {
         assert!(supported("ownership-email"));

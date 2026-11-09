@@ -112,8 +112,8 @@ pub(crate) struct RecordLease<'a> {
 
 pub(crate) struct HistoryLease<'a> {
     view: &'a HistoryView<'a>,
-    /// What every epoch's historical writers read of the log, derived once for the lease's
-    /// epochs ([`super::eval::HistoricalWriters`]).
+    /// The log's graph, built once for the lease's epochs, with what every epoch's historical
+    /// writers read of it, which the log keeps ([`super::eval::HistoricalWriters`]).
     writers: OnceCell<super::eval::HistoricalWriters<'a>>,
     /// The records a provider gave, pinned for the lease, or `None` where they are the log's own.
     records: Option<Vec<&'a Record>>,

@@ -1581,7 +1581,10 @@ mod unix {
                 needed: "workflow".to_string(),
             }))
         } else if let Some(line) = rejected(op, &stdout) {
-            if server_rejection(&line) {
+            if ref_lock_conflict(op, &line) {
+                Error::new(Kind::Conflict, "the ref changed during the push")
+                    .with_sub(Sub::GuardFailed { what: line })
+            } else if server_rejection(&line) {
                 Error::could_not_run(format!("GitHub receive side failed: {line}"))
                     .with_side_effect(if sent {
                         SideEffect::Unknown
@@ -1654,11 +1657,63 @@ mod unix {
             .copied()
             .find(|line| {
                 !server_rejection(line)
+                    && !ref_lock_conflict(op, line)
                     && !line.ends_with("[remote rejected] (atomic push failure)")
             })
             .or_else(|| lines.iter().copied().find(|line| server_rejection(line)))
+            .or_else(|| {
+                lines
+                    .iter()
+                    .copied()
+                    .find(|line| ref_lock_conflict(op, line))
+            })
             .or_else(|| lines.first().copied())
             .map(str::to_string)
+    }
+
+    /// A receive-pack lock rejection is a conflict only for the requested ref
+    /// and expected object. Policy prose and unrelated ref failures stay refusals.
+    fn ref_lock_conflict(op: &GitOp, line: &str) -> bool {
+        let Some((spec, reason)) = line
+            .strip_prefix("!\t")
+            .and_then(|line| line.split_once("\t[remote rejected] (cannot lock ref '"))
+        else {
+            return false;
+        };
+        let Some((reference, identities)) = reason.split_once("': is at ") else {
+            return false;
+        };
+        if spec.rsplit_once(':').map(|(_, reference)| reference) != Some(reference) {
+            return false;
+        }
+        let Some((actual, expected)) = identities
+            .strip_suffix(')')
+            .and_then(|identities| identities.split_once(" but expected "))
+        else {
+            return false;
+        };
+        if !crate::path::is_sha(actual) || !crate::path::is_sha(expected) || actual == expected {
+            return false;
+        }
+        match op {
+            GitOp::PushDelete {
+                reference: asked,
+                expect,
+            } => asked == reference && expect == expected,
+            GitOp::PushRefs { batch, .. } => batch
+                .updates()
+                .iter()
+                .any(|update| update.reference == reference && update.before == expected),
+            GitOp::PushControl { transaction, .. } => transaction.changes().iter().any(|change| {
+                change.reference == reference
+                    && change
+                        .before
+                        .as_deref()
+                        .unwrap_or("0000000000000000000000000000000000000000")
+                        == expected
+            }),
+            _ => false,
+        }
     }
 
     /// Exact receive-pack infrastructure reasons; unknown and policy reasons
@@ -3071,6 +3126,10 @@ mod unix {
             let prefix = scratch
                 .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
                 .join("objects/pack/pack");
+            // The complete bounded inventory above already walked these roots
+            // against the admitted BEFORE closure. Pack those exact IDs rather
+            // than repeating that historical walk. Strict verification and the
+            // source-independent membership check below still prove every ID.
             let pack = checked_input(
                 "new-object-pack",
                 vec![
@@ -3080,12 +3139,12 @@ mod unix {
                     os("pack.useBitmaps=false"),
                     os("pack-objects"),
                     os("--quiet"),
-                    os("--revs"),
+                    os("--no-revs"),
                     os("--threads=8"),
                     os("--no-use-bitmap-index"),
                     prefix.as_os_str().to_owned(),
                 ],
-                roots.as_bytes(),
+                ids.as_bytes(),
             )?;
             let hash = std::str::from_utf8(&pack.stdout)
                 .ok()
@@ -4013,6 +4072,107 @@ mod tests {
                         aterm_json::json!({"Refused": {"class": "Http"}}),
                         "{key}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
+        use crate::error::{Kind, SideEffect};
+        use crate::fx::child::ChildOut;
+        use crate::github::refs::{AtomicRefBatch, RefUpdate};
+        let before = "b".repeat(40);
+        let actual = "c".repeat(40);
+        let redactor = crate::redact::Redactor::new();
+        let slug = crate::slug::Slug::new("fixture-dev", "app").unwrap();
+        let classify = |op: &super::GitOp, stdout: &str| {
+            super::unix::failed(
+                op,
+                &ChildOut {
+                    code: Some(1),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+                &redactor,
+                &slug,
+                true,
+            )
+        };
+        let batch = AtomicRefBatch::new(vec![
+            RefUpdate {
+                reference: "refs/heads/main".into(),
+                before: before.clone(),
+                after: "a".repeat(40),
+            },
+            RefUpdate {
+                reference: "refs/tags/other".into(),
+                before: "d".repeat(40),
+                after: "a".repeat(40),
+            },
+        ])
+        .unwrap();
+        let control = crate::git::ControlRefTransaction::new(
+            &before,
+            vec![crate::git::ControlRefChange {
+                reference: crate::git::RELEASE_LEASE_REF.into(),
+                before: Some(before.clone()),
+                after: None,
+            }],
+        )
+        .unwrap();
+        for (op, reference) in [
+            (
+                super::GitOp::PushRefs {
+                    dir: "/unused".into(),
+                    batch,
+                    dry_run: false,
+                },
+                "refs/heads/main",
+            ),
+            (
+                super::GitOp::PushDelete {
+                    reference: "refs/tags/v1".into(),
+                    expect: before.clone(),
+                },
+                "refs/tags/v1",
+            ),
+            (
+                super::GitOp::PushControl {
+                    dir: "/unused".into(),
+                    transaction: control,
+                    dry_run: false,
+                },
+                crate::git::RELEASE_LEASE_REF,
+            ),
+        ] {
+            let line = format!(
+                "!\tcommit:{reference}\t[remote rejected] (cannot lock ref '{reference}': is at {actual} but expected {before})"
+            );
+            let error = classify(&op, &line);
+            assert_eq!(
+                (error.kind, error.side_effect, error.exit()),
+                (Kind::Conflict, SideEffect::None, 9)
+            );
+            for bad in [
+                line.replace(&format!("'{reference}'"), "'refs/heads/other'"),
+                line.replace(
+                    &format!("expected {before}"),
+                    &format!("expected {}", "d".repeat(40)),
+                ),
+                line.replace(&format!("at {actual}"), "at malformed"),
+                line.replace(&format!("at {actual}"), &format!("at {before}")),
+                format!("{line} extra"),
+            ] {
+                assert_ne!(classify(&op, &bad).kind, Kind::Conflict, "{bad}");
+            }
+            for (other, expected) in [
+                ("protected branch hook declined", Kind::Refused),
+                ("failed", Kind::CouldNotRun),
+            ] {
+                let other = format!("!\tcommit:refs/heads/other\t[remote rejected] ({other})");
+                for rows in [format!("{line}\n{other}"), format!("{other}\n{line}")] {
+                    assert_eq!(classify(&op, &rows).kind, expected, "{rows}");
                 }
             }
         }

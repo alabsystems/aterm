@@ -313,8 +313,13 @@ pub(super) fn pack(
 ) -> Result<BottleOutcome> {
     can_pack(recipe, request.triple)?;
     let work = Scratch::new("pinned-upstream")?;
+    // An upstream published as a GitHub release asset rides the download host's outages on
+    // the API route; any other upstream is read from its own host.
+    let reader = aterm_update_core::release_asset::Reader::anonymous();
     let tree = prepare(request, recipe, work.path(), &|url, path, cap| {
-        aterm_update_core::download_to(url, path, cap).map_err(Error::cannot_run)
+        reader
+            .to_file_at(url, path, cap)
+            .map_err(|e| Error::cannot_run(e.to_string()))
     })?;
     if recipe.name == "cpython" {
         precompile_python(&tree, recipe, work.path())?;

@@ -18,7 +18,7 @@ fn seen(wall: f64, cpu: f64, width: u32, tests: u32) -> Seen {
         wall: secs(wall),
         width,
         tests,
-        per_thread: (cpu / wall / f64::from(width.min(tests).max(1))).max(1.0),
+        per_thread: cpu / wall / f64::from(width.min(tests).max(1)),
         peak: 0,
         failed: false,
     }
@@ -91,17 +91,9 @@ fn unseen_binaries_start_first_then_the_failed_then_the_longest() {
     );
 }
 
-/// THE WIDTHS: each binary runs at the narrowest width whose predicted wall is within the plan's
-/// target, and the target is the one, of the work's bound and the walls above it, whose schedule
-/// ends first. On four cores, a binary that takes 40 s on four threads and two that take 60 s on
-/// one: the bound is their 280 thread-seconds over four cores, 70 s, and the planner's target,
-/// 80 s, runs the first two threads wide beside the other two, all ending at 80 s. NEGATIVE
-/// CONTROLS: the target at the bound itself widens the first to three threads, which wait for the
-/// other two and end at 113 s; and target 15 s packs all three four wide and predicts 70 s, but
-/// is deliberately below the measured regularization floor. The two-binary control makes the
-/// strict-head fragmentation explicit: its below-bound plan predicts 1.5 s against the searched
-/// plans' 2 s, but the planner still excludes it because the measured every-wall search regressed
-/// real wall time.
+/// The whole-run target never narrows isolated cases below the initial width. This removes
+/// the old 80 s packing choice: the same work finishes in 70 s at four threads. The two-case
+/// control is capped by its case count, not forced to four threads.
 #[test]
 fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
     let wide = seen(40.0, 160.0, 4, 100);
@@ -114,27 +106,22 @@ fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
         .collect();
     assert_eq!(bound(&known, 4, 4), secs(70.0));
     let p = plan(&all, 4, None, 0);
-    assert_eq!(p.target, secs(80.0), "{p:?}");
     assert_eq!(
         (at(&p, 0).width, at(&p, 0).charge, at(&p, 0).predicted),
-        (2, 2, Some(secs(80.0))),
+        (4, 4, Some(secs(40.0))),
         "{p:?}"
     );
     for i in 1..3 {
-        assert_eq!((at(&p, i).width, at(&p, i).charge), (1, 1), "{p:?}");
+        assert_eq!((at(&p, i).width, at(&p, i).charge), (4, 4), "{p:?}");
     }
-    assert_eq!(schedule(&p).end, secs(80.0), "{p:?}");
+    assert_eq!(schedule(&p).end, secs(70.0), "{p:?}");
     let at_bound = Plan {
         share: 4,
         target: secs(70.0),
         order: at_target(&known, secs(70.0), 4, 4),
     };
-    assert_eq!(at(&at_bound, 0).width, 3, "{at_bound:?}");
-    assert_eq!(
-        schedule(&at_bound).end,
-        secs(60.0) + wide.wall_at(3),
-        "{at_bound:?}"
-    );
+    assert_eq!(at(&at_bound, 0).width, 4, "{at_bound:?}");
+    assert_eq!(schedule(&at_bound).end, secs(70.0), "{at_bound:?}");
     let packed = Plan {
         share: 4,
         target: secs(15.0),
@@ -159,15 +146,11 @@ fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
     assert!(below.order.iter().all(|b| b.width == 2), "{below:?}");
     assert_eq!(schedule(&below).end, pair_floor, "{below:?}");
     let regularized = plan(&pair, 2, None, 0);
-    assert_eq!(regularized.target, secs(2.0), "{regularized:?}");
-    assert_eq!(schedule(&regularized).end, secs(2.0), "{regularized:?}");
+    assert_eq!(schedule(&regularized).end, pair_floor, "{regularized:?}");
 }
 
-/// THE TIES: of the plans that end together, the narrowest. On eight cores, a binary busy on all
-/// eight for 80 s and four that each compute 80 s, 10 s at eight wide: their bound is 960
-/// thread-seconds over eight cores, 120 s, and targets of 120 s, 128 s and 160 s all end at
-/// 160 s, so the busy binary runs at the last one's four threads beside the four on one each.
-/// NEGATIVE CONTROL: the target at the bound runs it six wide.
+/// Above the initial width the target still optimizes the predicted schedule. Smaller
+/// binaries keep four threads; a long CPU-bound binary takes six of the eight cores.
 #[test]
 fn of_plans_that_end_together_the_narrowest() {
     let busy = seen(80.0, 640.0, 8, 100);
@@ -180,13 +163,13 @@ fn of_plans_that_end_together_the_narrowest() {
         Some(quick),
     ];
     let p = plan(&all, 8, None, 0);
-    assert_eq!(p.target, secs(160.0), "{p:?}");
-    assert_eq!(schedule(&p).end, secs(160.0), "{p:?}");
-    assert_eq!((at(&p, 0).width, at(&p, 0).charge), (4, 4), "{p:?}");
+    assert_eq!(p.target, secs(120.0), "{p:?}");
+    assert_eq!(schedule(&p).end, busy.wall_at(6) + secs(40.0), "{p:?}");
+    assert_eq!((at(&p, 0).width, at(&p, 0).charge), (6, 6), "{p:?}");
     for i in 1..5 {
         assert_eq!(
             (at(&p, i).width, at(&p, i).charge, at(&p, i).predicted),
-            (1, 1, Some(secs(80.0))),
+            (4, 4, Some(secs(20.0))),
             "{p:?}"
         );
     }
@@ -201,7 +184,11 @@ fn of_plans_that_end_together_the_narrowest() {
         order: at_target(&known, secs(120.0), 8, 8),
     };
     assert_eq!(at(&at_bound, 0).width, 6, "{at_bound:?}");
-    assert_eq!(schedule(&at_bound).end, secs(160.0), "{at_bound:?}");
+    assert_eq!(
+        schedule(&at_bound).end,
+        busy.wall_at(6) + secs(40.0),
+        "{at_bound:?}"
+    );
 }
 
 /// THE WALL: the threads, not the CPU, scale a wall. A binary that waits on all eight threads
@@ -251,6 +238,42 @@ fn a_binary_that_used_more_than_its_threads_is_charged_what_it_used() {
         .charge_at(4, 16),
         4
     );
+}
+
+/// The release's observed poles retain concurrent cases even when the whole-run bound is
+/// longer than either binary's serial wall. Reverting the initial-width floor makes both
+/// serial; charging waiting threads as cores makes the suite's charge four instead of one.
+#[test]
+fn unrelated_work_cannot_serialize_the_release_poles() {
+    let mut all = vec![
+        Some(seen(805.0, 122.0, 1, 250)),
+        Some(seen(392.0, 392.0, 1, 1072)),
+    ];
+    all.extend(std::iter::repeat_n(Some(seen(1262.0, 1262.0, 1, 1)), 8));
+    let p = plan(&all, 8, None, 0);
+    assert_eq!((at(&p, 0).width, at(&p, 0).charge), (4, 1), "{p:?}");
+    assert_eq!((at(&p, 1).width, at(&p, 1).charge), (4, 4), "{p:?}");
+    for share in 1..=3 {
+        let p = plan(&all[..2], share, None, 0);
+        assert!(
+            p.order
+                .iter()
+                .all(|b| b.width <= share && b.charge <= share)
+        );
+    }
+    let p = plan(&all[..2], 8, Some(2), 0);
+    assert!(p.order.iter().all(|b| b.width == 2));
+}
+
+/// Idle cases need threads but not one core each. The CPU-bound control needs four cores
+/// at the same width, and a measured zero still needs one dispatcher token.
+#[test]
+fn waiting_threads_are_charged_their_measured_cpu() {
+    let waits = seen(100.0, 10.0, 1, 100);
+    assert_eq!(waits.charge_at(4, 8), 1);
+    assert_eq!(seen(100.0, 100.0, 1, 100).charge_at(4, 8), 4);
+    assert_eq!(seen(100.0, 0.0, 1, 100).charge_at(4, 8), 1);
+    assert_eq!(waits.wall_at(4), secs(25.0));
 }
 
 /// THE WIDEST: a binary whose tests each use more than their thread (processes, a pool of their

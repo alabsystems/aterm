@@ -269,12 +269,23 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         cpu_ns: Some(42_000_000_000),
         stuck: false,
     };
-    let row = agent_call_row(&ended, 21_000, 1_793_000_001_000, "m14", facts()).expect("a row");
+    let row =
+        agent_call_row(&ended, 21_000, 1_793_000_001_000, "m14", facts(), None).expect("a row");
     assert_eq!(row.at_ms, 1_793_000_000_000);
     assert_eq!(row.wall_ms, Fig::Known(10_000));
     assert_eq!(row.cpu_ms, Fig::Known(42_000));
     assert_eq!(row.label, "targo");
-    assert_eq!(row.sid, None, "tab 3's public id was never noted");
+    assert_eq!(row.sid, None, "this reading supplied no public id");
+    let named = agent_call_row(
+        &ended,
+        21_000,
+        1_793_000_001_000,
+        "m14",
+        facts(),
+        Some("s-row-owned".to_owned()),
+    )
+    .expect("a named row");
+    assert_eq!(named.sid.as_deref(), Some("s-row-owned"));
     assert_eq!((row.outcome, row.stop), (Outcome::Unknown, Stop::Unknown));
     assert_eq!(row.meter, Meter::Sampled);
     let shell = aterm_vitals::jobs::Ended {
@@ -282,7 +293,7 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         ..ended
     };
     assert!(
-        agent_call_row(&shell, 21_000, 0, "m14", facts()).is_none(),
+        agent_call_row(&shell, 21_000, 0, "m14", facts(), None).is_none(),
         "a block's job is its command's row"
     );
 }
@@ -391,7 +402,8 @@ fn call(ended_by: Option<aterm_vitals::jobs::ExitOf>, stuck: bool) -> aterm_vita
 fn an_agent_call_row_says_how_its_leader_ended() {
     use aterm_vitals::jobs::ExitOf;
     let at = |ended_by, stuck| {
-        let r = agent_call_row(&call(ended_by, stuck), 21_000, 0, "m14", facts()).expect("row");
+        let r =
+            agent_call_row(&call(ended_by, stuck), 21_000, 0, "m14", facts(), None).expect("row");
         (r.outcome, r.stop, r.code, r.sig)
     };
     assert_eq!(
@@ -421,7 +433,7 @@ fn an_agent_call_row_says_how_its_leader_ended() {
 
 #[test]
 fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
-    let ran = agent_call_row(&call(None, false), 21_000, 0, "m14", facts()).expect("row");
+    let ran = agent_call_row(&call(None, false), 21_000, 0, "m14", facts(), None).expect("row");
     assert_eq!(ran.label, "sleep", "not the wrapper `zsh`");
     assert_eq!(
         ran.key,
@@ -432,7 +444,7 @@ fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
         ran: None,
         ..call(None, false)
     };
-    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts()).expect("row");
+    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts(), None).expect("row");
     assert_eq!(
         (row.label.as_str(), row.key),
         ("-", None),
@@ -452,7 +464,7 @@ fn a_watched_calls_row_ends_at_its_leaders_moment_not_the_pass_that_found_it_gon
         ended_ms: 74_000,
         ..call(Some(ExitOf::Code(0)), false)
     };
-    let row = agent_call_row(&late, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    let row = agent_call_row(&late, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
     assert_eq!(
         row.wall_ms,
         Fig::Known(4_000),
@@ -463,7 +475,7 @@ fn a_watched_calls_row_ends_at_its_leaders_moment_not_the_pass_that_found_it_gon
         leader_exited_ms: Some(74_003),
         ..late.clone()
     };
-    let row = agent_call_row(&past, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    let row = agent_call_row(&past, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
     assert_eq!(
         (row.wall_ms, row.at_ms),
         (Fig::Known(64_003), 1_793_000_074_003)
@@ -476,7 +488,8 @@ fn a_watched_calls_row_ends_at_its_leaders_moment_not_the_pass_that_found_it_gon
         ended_ms: 74_000,
         ..unwatched
     };
-    let row = agent_call_row(&unwatched, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    let row =
+        agent_call_row(&unwatched, 74_000, 1_793_000_074_000, "m14", facts(), None).expect("row");
     assert_eq!(
         (row.wall_ms, row.at_ms),
         (Fig::Known(64_000), 1_793_000_074_000),
@@ -496,7 +509,7 @@ fn a_hinted_calls_key_is_its_command_and_only_once_a_program_ran() {
         ran: Some("targo".to_owned()),
         ..call(None, false)
     };
-    let row = agent_call_row(&hinted, 21_000, 0, "m14", facts()).expect("row");
+    let row = agent_call_row(&hinted, 21_000, 0, "m14", facts(), None).expect("row");
     assert_eq!(
         row.key,
         Some(Digest::key(
@@ -512,7 +525,7 @@ fn a_hinted_calls_key_is_its_command_and_only_once_a_program_ran() {
         ran: None,
         ..hinted
     };
-    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts()).expect("row");
+    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts(), None).expect("row");
     assert_eq!(
         (row.label.as_str(), row.key),
         ("-", None),

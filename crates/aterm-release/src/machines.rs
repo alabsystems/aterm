@@ -115,33 +115,66 @@ impl RosterDocument {
 /// How much of the freshness window a cut must still have ahead of it.
 pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 
+/// How long the cut's channel reads go on without progress: longer than a client's
+/// ([`aterm_update_core::release_asset::PATIENCE`]), since a cut refused over a passing outage of
+/// the download host is a whole cut run again, while a client simply checks later.
+pub(crate) const CUT_READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The master-admitted roster on the public channel's latest release: its `roster_seq` and verified bytes, or `None` when that release carries no roster.
 pub(crate) fn channel_roster_document(
     slug: &str,
 ) -> std::result::Result<Option<(u64, Vec<u8>)>, String> {
-    let bytes = match latest_asset(
-        &anonymous_fetch,
-        slug,
-        aterm_update_core::roster::ROSTER_ASSET,
-        65_536,
-    ) {
-        Ok(b) => b,
-        Err(e) if is_absent(&e) => return Ok(None),
-        Err(e) => return Err(e),
+    let reader = crate::github::reader(CUT_READ_PATIENCE).map_err(|e| e.to_string())?;
+    let Some(RosterDocument { bytes, signature }) = channel_roster_pair(&reader, slug)? else {
+        return Ok(None);
     };
-    let sig = latest_asset(
-        &anonymous_fetch,
-        slug,
-        aterm_update_core::roster::ROSTER_SIG_ASSET,
-        4_096,
-    )?;
-    let verified = verify_roster(aterm_update_core::pins::PAPER_MASTER_PUBKEYS, bytes, &sig)
-        .map_err(|e| {
-            format!("the channel roster did not verify under the committed paper master ({e:?})")
-        })?;
+    let verified = verify_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        bytes,
+        &signature,
+    )
+    .map_err(|e| {
+        format!("the channel roster did not verify under the committed paper master ({e:?})")
+    })?;
     let parsed = Roster::parse(&verified)
         .map_err(|e| format!("the channel roster verified but did not parse ({e:?})"))?;
     Ok(Some((parsed.roster_seq, verified.as_slice().to_vec())))
+}
+
+/// The roster and its signature on `slug`'s latest release, both read at the one tag the latest
+/// names (so a release published between the two reads cannot pair one release's roster with
+/// another's signature), or `None` when the channel has no release or that release no roster.
+/// Through the shared reader ([`aterm_update_core::release_asset`]): the web route, then the API
+/// route when the download host fails; a 404 is the asset's absence and asks nothing more. The
+/// bytes are judged by the caller (the roster by its signature), so the route changes nothing
+/// about what is accepted.
+pub(crate) fn channel_roster_pair(
+    reader: &aterm_update_core::release_asset::Reader,
+    slug: &str,
+) -> std::result::Result<Option<RosterDocument>, String> {
+    use aterm_update_core::release_asset::{Asset, AssetError, Release};
+    use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET};
+    let (owner, repo) = slug
+        .split_once('/')
+        .ok_or_else(|| format!("the channel {slug:?} is not owner/repo"))?;
+    let tag = match reader.latest_tag(owner, repo, ROSTER_ASSET) {
+        Ok(tag) => tag,
+        Err(AssetError::Absent(_)) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let at = |name: &'static str| {
+        Asset::in_slug(slug, Release::Tag(&tag), name)
+            .ok_or_else(|| format!("{slug} {tag} {name} is not a safe release asset address"))
+    };
+    let bytes = match reader.bytes(&at(ROSTER_ASSET)?, 65_536) {
+        Ok(bytes) => bytes,
+        Err(AssetError::Absent(_)) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let signature = reader
+        .bytes(&at(ROSTER_SIG_ASSET)?, 4_096)
+        .map_err(|e| format!("the roster is present but its signature could not be read: {e}"))?;
+    Ok(Some(RosterDocument { bytes, signature }))
 }
 
 /// At equal generation the cut's roster (the pair in `dist/`) and the channel's must be the same document; otherwise two lineages exist at one number, and whichever ships later strands every client that ratcheted on the other.
@@ -165,97 +198,6 @@ pub(crate) fn roster_lineage_agrees(
         }
         _ => Ok(()),
     }
-}
-
-/// A web-route answer that means the asset is absent, never a failed route.
-fn is_absent(error: &str) -> bool {
-    aterm_update_core::download_error_is_not_found(error)
-}
-
-/// One anonymous download of `url`, at most `cap` bytes, sending `accept` as its Accept header.
-type Fetch<'a> = dyn Fn(&str, usize, Option<&str>) -> std::result::Result<Vec<u8>, String> + 'a;
-
-/// The channel's latest release asset `asset`, read anonymously.
-///
-/// GitHub's web route (`releases/latest/download/NAME`, which redirects through
-/// `releases/download/TAG/NAME`) answered 504 to about one request in eight, for over an hour,
-/// while its API asset route served the same bytes (m3, 2026-11-08, the 0.175.0 cut: four
-/// refused runs). So a web route that fails any way but 404 reads the API route; a 404 is the
-/// asset's absence and asks nothing more. The bytes are judged by the caller exactly as before
-/// (the roster by its signature), so the route changes nothing about what is accepted.
-///
-/// # Errors
-/// The web route's 404 unchanged, or both routes' failures, the web route's first.
-fn latest_asset(
-    fetch: &Fetch<'_>,
-    slug: &str,
-    asset: &str,
-    cap: usize,
-) -> std::result::Result<Vec<u8>, String> {
-    let web = format!("https://github.com/{slug}/releases/latest/download/{asset}");
-    let web_error = match fetch(&web, cap, None) {
-        Ok(bytes) => return Ok(bytes),
-        Err(error) if is_absent(&error) => return Err(error),
-        Err(error) => error,
-    };
-    api_asset(fetch, slug, asset, cap)
-        .map_err(|api_error| format!("{web_error}; the API route too: {api_error}"))
-}
-
-/// `asset` of `slug`'s latest release through the REST API: the release's asset list, then the
-/// asset by its id as an octet stream (GitHub redirects that to the same storage).
-fn api_asset(
-    fetch: &Fetch<'_>,
-    slug: &str,
-    asset: &str,
-    cap: usize,
-) -> std::result::Result<Vec<u8>, String> {
-    #[derive(serde::Deserialize)]
-    struct Release {
-        assets: Vec<Asset>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Asset {
-        name: String,
-        id: u64,
-    }
-    let listing = fetch(
-        &format!("https://api.github.com/repos/{slug}/releases/latest"),
-        4 << 20,
-        Some("application/vnd.github+json"),
-    )?;
-    let release: Release = aterm_json::from_slice(&listing)
-        .map_err(|e| format!("{slug}'s latest release listing is not the API's JSON ({e})"))?;
-    let id = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset)
-        .map(|a| a.id)
-        .ok_or_else(|| format!("{slug}'s latest release lists no asset {asset}"))?;
-    fetch(
-        &format!("https://api.github.com/repos/{slug}/releases/assets/{id}"),
-        cap,
-        Some("application/octet-stream"),
-    )
-}
-
-/// One bounded anonymous download, under the client's own roster limits (64 KiB body, 4 KiB
-/// signature): a floor read never accepts more than the fleet would.
-fn anonymous_fetch(
-    url: &str,
-    cap: usize,
-    accept: Option<&str>,
-) -> std::result::Result<Vec<u8>, String> {
-    let cap = u64::try_from(cap).map_err(|_| format!("{url}: byte cap is too large"))?;
-    let bytes = aterm_update_core::download_bytes_with_accept(
-        url,
-        cap,
-        accept.unwrap_or("application/octet-stream"),
-    )?;
-    if bytes.is_empty() {
-        return Err(format!("{url}: zero bytes"));
-    }
-    Ok(bytes)
 }
 
 /// The cut-time gate: prove that `signing_pubkey` belongs to a machine the roster authorizes, and return the attribution the manifest will carry.
@@ -395,86 +337,94 @@ pub fn attribute(manifest: &mut Manifest, who: &Attribution) {
 mod tests {
     use super::*;
 
-    /// A fetch that answers from `routes` (URL prefix → answer) and records each URL asked.
-    fn routed<'a>(
-        routes: &'a [(&'a str, std::result::Result<&'a [u8], &'a str>)],
-        asked: &'a std::cell::RefCell<Vec<(String, Option<String>)>>,
-    ) -> impl Fn(&str, usize, Option<&str>) -> std::result::Result<Vec<u8>, String> + 'a {
-        move |url, _cap, accept| {
-            asked
-                .borrow_mut()
-                .push((url.to_owned(), accept.map(str::to_owned)));
-            let (_, answer) = routes
-                .iter()
-                .find(|(prefix, _)| url.starts_with(prefix))
-                .unwrap_or_else(|| panic!("no route for {url}"));
-            answer.map(<[u8]>::to_vec).map_err(str::to_owned)
+    mod channel_roster {
+        use super::super::channel_roster_pair;
+        use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+        use aterm_update_core::github_rest::Origins;
+        use aterm_update_core::release_asset::Reader;
+        use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET};
+        use std::time::Duration;
+
+        const SLUG: &str = "fixture-dev/app";
+
+        /// agh-fake with `SLUG`'s latest release `v2`, carrying the roster pair when `roster`.
+        fn channel(roster: bool) -> FakeGithub {
+            let fake = FakeGithub::start();
+            fake.add_repo(SLUG, RepoSpec::public().push("fixture-dev-bot"));
+            let old = fake.add_release(SLUG, ReleaseSpec::published("v1", "2026-10-01T00:00:00Z"));
+            fake.add_asset(old, AssetSpec::uploaded(ROSTER_ASSET, b"old roster"));
+            let id = fake.add_release(SLUG, ReleaseSpec::published("v2", "2026-10-02T00:00:00Z"));
+            if roster {
+                fake.add_asset(id, AssetSpec::uploaded(ROSTER_ASSET, b"roster"));
+                fake.add_asset(id, AssetSpec::uploaded(ROSTER_SIG_ASSET, b"sig"));
+            }
+            fake
+        }
+
+        fn reader(fake: &FakeGithub, patience: Duration) -> Reader {
+            let p = fake.ports();
+            Reader::loopback(
+                Origins::loopback(p.api, p.uploads, p.web, p.cdn),
+                None,
+                patience,
+            )
+        }
+
+        fn gateway_timeout() -> Fault {
+            Fault::Status {
+                status: 504,
+                body: String::new(),
+                headers: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn a_web_route_504_reads_the_latest_pair_through_the_api_route() {
+            let fake = channel(true);
+            fake.fault_always(Match::web("/fixture-dev/app/releases/"), gateway_timeout());
+            let pair = channel_roster_pair(&reader(&fake, aterm_spec::wait::MUST_HAPPEN), SLUG);
+            let expected = super::super::RosterDocument {
+                bytes: b"roster".to_vec(),
+                signature: b"sig".to_vec(),
+            };
+            assert_eq!(pair, Ok(Some(expected)));
+            assert!(
+                fake.seen().iter().any(|s| s.origin == FakeOrigin::Api),
+                "the API route served it"
+            );
+        }
+
+        /// NEGATIVE CONTROL: a latest release without a roster is absence, read on the web route
+        /// alone; the API is never asked.
+        #[test]
+        fn a_latest_release_without_a_roster_is_absent_and_asks_the_api_nothing() {
+            let fake = channel(false);
+            let pair = channel_roster_pair(&reader(&fake, aterm_spec::wait::MUST_HAPPEN), SLUG);
+            assert_eq!(
+                pair,
+                Ok(None),
+                "the older release's roster is not the latest's"
+            );
+            assert!(fake.seen().iter().all(|s| s.origin != FakeOrigin::Api));
+        }
+
+        #[test]
+        fn both_routes_failing_names_both_and_never_reads_as_absence() {
+            let fake = channel(true);
+            fake.fault_always(Match::web("/fixture-dev/app/releases/"), gateway_timeout());
+            fake.fault_always(
+                Match::api("/repos/fixture-dev/app/releases"),
+                gateway_timeout(),
+            );
+            let error =
+                channel_roster_pair(&reader(&fake, Duration::from_millis(300)), SLUG).unwrap_err();
+            assert!(
+                error.contains("web route") && error.contains("API route"),
+                "{error}"
+            );
         }
     }
 
-    const WEB: &str = "https://github.com/o/r/releases/latest/download/roster";
-    const LIST: &str = "https://api.github.com/repos/o/r/releases/latest";
-    const ASSET: &str = "https://api.github.com/repos/o/r/releases/assets/7";
-    const LISTING: &[u8] = br#"{"assets":[{"name":"other","id":3},{"name":"roster","id":7}]}"#;
-
-    #[test]
-    fn a_web_route_504_reads_the_same_asset_through_the_api_route() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let fetch = routed(
-            &[
-                (WEB, Err("curl: (56) The requested URL returned error: 504")),
-                (LIST, Ok(LISTING)),
-                (ASSET, Ok(b"bytes")),
-            ],
-            &asked,
-        );
-        assert_eq!(
-            latest_asset(&fetch, "o/r", "roster", 64),
-            Ok(b"bytes".to_vec())
-        );
-        assert_eq!(
-            *asked.borrow(),
-            [
-                (WEB.to_string(), None),
-                (LIST.to_string(), Some("application/vnd.github+json".into())),
-                (ASSET.to_string(), Some("application/octet-stream".into())),
-            ]
-        );
-    }
-
-    /// NEGATIVE CONTROL: a 404 is the asset's absence, so the API route is never asked and the
-    /// caller still reads "absent".
-    #[test]
-    fn a_web_route_404_is_absence_and_asks_nothing_more() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let fetch = routed(
-            &[(WEB, Err("HTTP 404: the release does not carry this asset"))],
-            &asked,
-        );
-        let error = latest_asset(&fetch, "o/r", "roster", 64).unwrap_err();
-        assert!(is_absent(&error), "{error}");
-        assert_eq!(*asked.borrow(), [(WEB.to_string(), None)]);
-    }
-
-    #[test]
-    fn both_routes_failing_names_both() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let fetch = routed(
-            &[
-                (WEB, Err("curl: (56) The requested URL returned error: 504")),
-                (LIST, Ok(br#"{"assets":[{"name":"other","id":3}]}"#)),
-            ],
-            &asked,
-        );
-        let error = latest_asset(&fetch, "o/r", "roster", 64).unwrap_err();
-        assert!(error.contains("error: 504"), "{error}");
-        assert!(error.contains("the API route too"), "{error}");
-        assert!(error.contains("lists no asset roster"), "{error}");
-        assert!(
-            !is_absent(&error),
-            "a failed route must never read as absence: {error}"
-        );
-    }
     /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`).
     fn b64(raw: &[u8]) -> String {
         aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")

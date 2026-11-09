@@ -381,6 +381,76 @@ fn green() -> Judged {
 
 const THEIRS: &str = "-p b --lib -- old_red";
 
+#[test]
+fn landing_reads_the_watch_journal_for_its_exact_base_tree() {
+    for state in ["red", "pass"] {
+        let world = world();
+        let base = git(&world.work, &["rev-parse", "origin/main"]);
+        let tree = git(&world.work, &["rev-parse", "origin/main^{tree}"]);
+        git(&world.work, &["config", "user.name", "Andrew Yates"]);
+        git(
+            &world.work,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        assert!(matches!(live_lane(&world.work, &base), Lane::Unjudged(_)));
+        let record = crate::judged::Record {
+            commit: base.clone(),
+            tree,
+            host: "scratch-lane".into(),
+            verifier: base.clone(),
+            inputs: "fixture-seal".into(),
+            token: "fixture".into(),
+            state: state.into(),
+            started: 1,
+            updated: 2,
+            lease_until: 0,
+            rows: vec![crate::judged::Row {
+                id: "tree".into(),
+                outcome: state.into(),
+                log: String::new(),
+                red_items: if state == "red" {
+                    vec![THEIRS.into()]
+                } else {
+                    vec![]
+                },
+                suspects: vec![],
+                fixed_by: None,
+                decisions: vec![],
+            }],
+        };
+        assert!(
+            crate::judged::append(
+                &world.work,
+                "origin",
+                None,
+                &record,
+                crate::judged::deadline()
+            )
+            .unwrap()
+        );
+        commit(&world.work, "a/x.txt", "branch work\n");
+        // This new tree has no verdict: a mutation that uses HEAD rather than base fails.
+        let head = git(&world.work, &["rev-parse", "HEAD"]);
+        assert!(matches!(live_lane(&world.work, &head), Lane::Unjudged(_)));
+        let lane = live_lane(&world.work, &base);
+        assert!(match (&lane, state) {
+            (Lane::Red(items), "red") => items.contains(THEIRS),
+            (Lane::Pass, "pass") => true,
+            _ => false,
+        });
+        let (code, said, _) = land_with(&world, crates(&["a"]), lane, |_, _| green());
+        assert_eq!(code, 0, "{said:?}");
+        let expected = if state == "pass" {
+            "green"
+        } else {
+            "red (1 items)"
+        };
+        let line = format!("verify land: main's lane judged {base} {expected}");
+        assert!(said.contains(&line), "{said:?}");
+        println!("{line}");
+    }
+}
+
 /// One landing of `world`'s work: the exit, what it said, and each judged base. `judge` sees the
 /// base and how many judgments came before.
 fn land_with(
@@ -1270,5 +1340,454 @@ fn it_stops_after_three_rejudges_merged_and_judged() {
             .expect("stated")
             .rejudges(),
         2
+    );
+}
+
+/// Main's changelog before a release cut, an entry the branch writes into it, and the cut.
+const CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- **Main's fix.** Before \
+                         the cut.\n\n## [0.1.0] - 2026-11-01\n\n### Fixed\n\n- **The first fix.** \
+                         Shipped.\n";
+const ENTRY: &str = "- **The branch's fix.** Written before the cut,\n  landed after it.\n\n";
+
+fn with_entry(changelog: &str) -> String {
+    changelog.replacen("### Fixed\n\n", &format!("### Fixed\n\n{ENTRY}"), 1)
+}
+
+fn cut(changelog: &str) -> String {
+    changelog.replacen(
+        "## [Unreleased]\n\n",
+        "## [Unreleased]\n\n## [0.2.0] - 2026-11-08\n\n",
+        1,
+    )
+}
+
+/// A CHANGELOG ENTRY A RELEASE CUT STRANDED LANDS UNDER `[Unreleased]`: main cut 0.2.0 under the
+/// entry the branch wrote into `[Unreleased]`, so git's merge puts the entry under 0.2.0, and the
+/// landing moves it back to the top of `### Fixed` under `[Unreleased]`, leaving 0.2.0 as it
+/// shipped. Each place a merge meets the cut moves it: the tool's first merge (amended, so the
+/// landing is that merge restated), a re-judge's merge after main cut during the run, and a merge
+/// made by hand before the run (a commit of its own: the hand merge is the person's).
+/// NEGATIVE CONTROL (2026-11-08): with the first merge's `rehome_changelog` call removed, the
+/// first-merge and hand-merge landings each hold the entry under `## [0.2.0]`; with the
+/// re-judge's removed, the re-judge landing does.
+#[test]
+fn an_entry_a_release_cut_stranded_lands_under_unreleased() {
+    let expected = cut(CHANGELOG).replacen(
+        "## [Unreleased]\n\n",
+        &format!("## [Unreleased]\n\n### Fixed\n\n{ENTRY}"),
+        1,
+    );
+    for place in ["first merge", "re-judge merge", "hand merge"] {
+        let world = world();
+        rival_moves(&world, "CHANGELOG.md", CHANGELOG);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        git(&world.work, &["merge", "-q", "--ff-only", "origin/main"]);
+        let feature = commit(&world.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+        if place != "re-judge merge" {
+            rival_moves(&world, "CHANGELOG.md", &cut(CHANGELOG));
+        }
+        if place == "hand merge" {
+            git(&world.work, &["fetch", "-q", "origin"]);
+            git(
+                &world.work,
+                &[
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "-m",
+                    "Merge main by hand",
+                    "origin/main",
+                ],
+            );
+            assert!(
+                std::fs::read_to_string(world.work.join("CHANGELOG.md"))
+                    .expect("changelog")
+                    .contains("## [0.2.0] - 2026-11-08\n\n### Fixed\n\n- **The branch's fix.**"),
+                "{place}: git's merge strands the entry under the cut"
+            );
+        }
+        let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+            if place == "re-judge merge" && n == 0 {
+                rival_moves(&world, "CHANGELOG.md", &cut(CHANGELOG));
+            }
+            green()
+        });
+        assert_eq!(code, exit::PASS, "{place}: {said:#?}");
+        let landing = origin_main(&world);
+        assert_eq!(
+            git(&world.work, &["show", &format!("{landing}:CHANGELOG.md")]),
+            expected.trim_end(),
+            "{place}: {said:#?}"
+        );
+        assert!(
+            said.iter().any(|line| line.starts_with(
+                "verify land: moved 1 CHANGELOG entry this branch adds from under a release cut \
+                 after it was written to [Unreleased]: \"The branch's fix.\" (merging"
+            )),
+            "{place}: {said:#?}"
+        );
+        let message = git(&world.work, &["log", "-1", "--format=%B", &landing]);
+        let parents = git(&world.work, &["rev-list", "--parents", "-n", "1", &landing]);
+        match place {
+            "hand merge" => {
+                let moved = git(&world.work, &["rev-parse", &format!("{landing}^1")]);
+                assert_eq!(
+                    git(&world.work, &["log", "-1", "--format=%s", &moved]),
+                    "verify land: the CHANGELOG entries this branch adds sit under [Unreleased]"
+                );
+                assert_eq!(
+                    git(
+                        &world.work,
+                        &["log", "-1", "--format=%s", &format!("{moved}^1")]
+                    ),
+                    "Merge main by hand"
+                );
+            }
+            _ => {
+                assert!(
+                    message.starts_with(
+                        "Merge origin/main into feature\n\nverify land moved 1 CHANGELOG entry"
+                    ),
+                    "{place}: the tool's merge carries the move: {message}"
+                );
+                assert!(
+                    parents.starts_with(&format!("{landing} {feature} ")),
+                    "{place}: {parents}"
+                );
+            }
+        }
+        assert_eq!(git(&world.work, &["status", "--porcelain"]), "", "{place}");
+    }
+}
+
+/// THE LANDING MOVES ONLY WHAT A CUT STRANDED, over real git: a branch that reorders a release's
+/// entries (`diff.interHunkContext` joining its hunks) lands them as it wrote them; under git's
+/// union driver, a merge that brings back an entry's old words main rewrote at the cut moves the
+/// branch's own entry and drops those old words; and a commit of the move
+/// that fails leaves the checkout as the merge left it, committed and clean. CONTROL:
+/// [`an_entry_a_release_cut_stranded_lands_under_unreleased`], where the entry moves.
+/// NEGATIVE CONTROLS (2026-11-08): judging an entry main holds like any other lands the reorder
+/// changed; without dropping words no commit of the branch wrote, main's old words land; and
+/// without putting the file back, the refused commit leaves the checkout changed.
+#[test]
+fn a_landing_moves_only_what_a_release_cut_stranded() {
+    let released = cut(CHANGELOG).replace(
+        "- **Main's fix.** Before the cut.\n",
+        "- **Main's fix.** Before the cut.\n\n- **Main's other fix.** Also shipped.\n",
+    );
+    let world = world();
+    rival_moves(&world, "CHANGELOG.md", &released);
+    git(&world.work, &["fetch", "-q", "origin"]);
+    git(&world.work, &["merge", "-q", "--ff-only", "origin/main"]);
+    git(&world.work, &["config", "diff.interHunkContext", "3"]);
+    let reordered = released.replace(
+        "- **Main's fix.** Before the cut.\n\n- **Main's other fix.** Also shipped.\n",
+        "- **Main's other fix.** Also shipped.\n\n- **Main's fix.** Before the cut.\n",
+    );
+    commit(&world.work, "CHANGELOG.md", &reordered);
+    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(
+        git(
+            &world.work,
+            &["show", &format!("{}:CHANGELOG.md", origin_main(&world))]
+        ),
+        reordered.trim_end(),
+        "a reorder lands as written: {said:#?}"
+    );
+    assert!(
+        !said.iter().any(|l| l.contains("CHANGELOG entr")),
+        "{said:#?}"
+    );
+
+    let union = self::world();
+    let attributes = "CHANGELOG.md merge=union\n";
+    rival_moves(&union, ".gitattributes", attributes);
+    let old = "- **Main's fix.** Before the cut.";
+    rival_moves(&union, "CHANGELOG.md", CHANGELOG);
+    git(&union.work, &["fetch", "-q", "origin"]);
+    git(&union.work, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit(&union.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    rival_moves(
+        &union,
+        "CHANGELOG.md",
+        &cut(CHANGELOG).replace(old, "- **Main's fix.** Its words, rewritten at the cut."),
+    );
+    let (code, said, _) = land_with(&union, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let landed = git(
+        &union.work,
+        &["show", &format!("{}:CHANGELOG.md", origin_main(&union))],
+    );
+    let unreleased = landed
+        .split("## [0.2.0]")
+        .next()
+        .expect("the head")
+        .to_owned();
+    assert!(
+        unreleased.contains("- **The branch's fix.**") && !landed.contains(old),
+        "the branch's entry moves and main's old words, brought back, go:\n{landed}\n{said:#?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.contains("main no longer holds, which a merge brought back")),
+        "{said:#?}"
+    );
+
+    let refused = self::world();
+    rival_moves(&refused, "CHANGELOG.md", CHANGELOG);
+    git(&refused.work, &["fetch", "-q", "origin"]);
+    git(&refused.work, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit(&refused.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    rival_moves(&refused, "CHANGELOG.md", &cut(CHANGELOG));
+    // The merge commits; the amend that would carry the move is refused by a failing signer.
+    git(&refused.work, &["config", "gpg.program", "false"]);
+    // Each git command once the branch holds a merge signs its commits.
+    let refusing = |dir: &Path| {
+        let mut cmd = git_cmd(dir);
+        if !git(dir, &["rev-list", "--merges", "-n", "1", "HEAD"]).is_empty() {
+            cmd.args(["-c", "commit.gpgSign=true"]);
+        }
+        cmd
+    };
+    let said = RefCell::new(Vec::new());
+    let code = land(
+        &refused.work,
+        &mut Seams {
+            git: &refusing,
+            judge: &mut |_: &Path, _: &str| green(),
+            branch: &mut |_: &Path, _: &str| crates(&["a"]),
+            lane: &mut |_: &Path, _: &str| Lane::Pass,
+            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+        },
+    );
+    let said = said.into_inner();
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    assert!(
+        said.iter()
+            .any(|l| l.contains("CHANGELOG.md is as the merge left it")),
+        "{said:#?}"
+    );
+    assert_eq!(
+        git(&refused.work, &["status", "--porcelain"]),
+        "",
+        "{said:#?}"
+    );
+    assert_eq!(
+        git(&refused.work, &["show", "HEAD:CHANGELOG.md"]),
+        std::fs::read_to_string(refused.work.join("CHANGELOG.md"))
+            .expect("changelog")
+            .trim_end()
+    );
+}
+
+/// WHERE AN ENTRY CAME FROM IS THE BRANCH'S OWN COMMITS, NOT ONE MERGE BASE, over real git and a
+/// whole landing: a branch whose last merge is a stacked branch's (that merge's base already holds
+/// the branch's entry) lands its entry; a change landed, reverted on main and written again lands
+/// its entry again; an entry the branch restores under its release stays under it, as does one it
+/// wrote under `[Unreleased]` and then moved under a release cut before, and one under a release
+/// the branch cut itself; an entry a squash of main stranded (a commit of one parent replaying
+/// the cut) moves, as does one the branch removed after a hand merge stranded it and then brought
+/// back by a revert, one it wrote under a release by mistake and then moved up, and one written
+/// beside a release main pulled and cut again under its number (a re-spin); and main's old words
+/// that a hand merge's union kept beside its rewrite go once a cut strands them with the branch's
+/// own entry, which moves. CONTROL:
+/// [`an_entry_a_release_cut_stranded_lands_under_unreleased`], where the branch's entry moves.
+/// NEGATIVE CONTROLS (2026-11-08): with no commit's entries read, the stacked branch's entry is
+/// dropped; with every written entry read as written under `[Unreleased]`, the restored one
+/// moves; with the releases beside a write not read, the backfilled one moves back; with
+/// releases main does not name counted, the own release's entry moves; with a later write
+/// replacing an earlier one, the reverted entry stays under the release; with a move up not read
+/// as a write, the moved-up entry stays; with a release read by its version alone, the re-spun
+/// one stays; without dropping words no commit of the branch wrote, main's old words land.
+#[test]
+fn an_entrys_origin_is_the_branchs_own_commits() {
+    let landed = |world: &World| {
+        let (code, said, _) = land_with(world, crates(&["a"]), Lane::Pass, |_, _| green());
+        assert_eq!(code, exit::PASS, "{said:#?}");
+        (
+            git(
+                &world.work,
+                &["show", &format!("{}:CHANGELOG.md", origin_main(world))],
+            ),
+            said,
+        )
+    };
+    let start = |world: &World, changelog: &str| {
+        rival_moves(world, "CHANGELOG.md", changelog);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        git(&world.work, &["merge", "-q", "--ff-only", "origin/main"]);
+    };
+
+    let stacked = world();
+    start(&stacked, CHANGELOG);
+    commit(&stacked.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    git(&stacked.work, &["checkout", "-q", "-b", "stack"]);
+    commit(&stacked.work, "a/x.txt", "a2\n");
+    git(&stacked.work, &["checkout", "-q", "feature"]);
+    rival_moves(&stacked, "b/y.txt", "b2\n");
+    git(&stacked.work, &["fetch", "-q", "origin"]);
+    git(
+        &stacked.work,
+        &["merge", "-q", "--no-ff", "-m", "main", "origin/main"],
+    );
+    git(
+        &stacked.work,
+        &["merge", "-q", "--no-ff", "-m", "stack", "stack"],
+    );
+    let (changelog, said) = landed(&stacked);
+    assert_eq!(
+        changelog,
+        with_entry(CHANGELOG).trim_end(),
+        "stacked: {said:#?}"
+    );
+
+    let again = world();
+    start(&again, CHANGELOG);
+    commit(&again.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    landed(&again);
+    rival_moves(&again, "CHANGELOG.md", CHANGELOG);
+    git(&again.work, &["fetch", "-q", "origin"]);
+    git(
+        &again.work,
+        &["merge", "-q", "--no-ff", "-m", "the revert", "origin/main"],
+    );
+    commit(&again.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    let (changelog, said) = landed(&again);
+    assert_eq!(
+        changelog,
+        with_entry(CHANGELOG).trim_end(),
+        "again: {said:#?}"
+    );
+
+    let restored = world();
+    let shipped = cut(CHANGELOG);
+    let first = "- **The first fix.** Shipped.\n";
+    start(&restored, &shipped.replace(first, ""));
+    commit(&restored.work, "CHANGELOG.md", &shipped);
+    let (changelog, said) = landed(&restored);
+    assert_eq!(changelog, shipped.trim_end(), "restored: {said:#?}");
+
+    let backfilled = world();
+    start(&backfilled, CHANGELOG);
+    commit(&backfilled.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    let first = "- **The first fix.**";
+    let shipped_in = CHANGELOG.replacen(first, &format!("{ENTRY}{first}"), 1);
+    commit(&backfilled.work, "CHANGELOG.md", &shipped_in);
+    rival_moves(&backfilled, "CHANGELOG.md", &cut(CHANGELOG));
+    let (changelog, said) = landed(&backfilled);
+    assert_eq!(
+        changelog,
+        cut(&shipped_in).trim_end(),
+        "backfilled: {said:#?}"
+    );
+
+    let rehomed = cut(CHANGELOG).replacen(
+        "## [Unreleased]\n\n",
+        &format!("## [Unreleased]\n\n### Fixed\n\n{ENTRY}"),
+        1,
+    );
+    let squashed = world();
+    start(&squashed, CHANGELOG);
+    commit(&squashed.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    rival_moves(&squashed, "CHANGELOG.md", &cut(CHANGELOG));
+    git(&squashed.work, &["fetch", "-q", "origin"]);
+    git(&squashed.work, &["merge", "-q", "--squash", "origin/main"]);
+    git(&squashed.work, &["commit", "-q", "-m", "main, squashed"]);
+    assert_eq!(
+        git(&squashed.work, &["show", "HEAD:CHANGELOG.md"]),
+        cut(&with_entry(CHANGELOG)).trim_end(),
+        "the squash replays the cut over the entry"
+    );
+    let (changelog, said) = landed(&squashed);
+    assert_eq!(changelog, rehomed.trim_end(), "squashed: {said:#?}");
+
+    let moved_up = world();
+    start(&moved_up, CHANGELOG);
+    commit(&moved_up.work, "CHANGELOG.md", &shipped_in);
+    commit(&moved_up.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    rival_moves(&moved_up, "CHANGELOG.md", &cut(CHANGELOG));
+    let (changelog, said) = landed(&moved_up);
+    assert_eq!(changelog, rehomed.trim_end(), "moved up: {said:#?}");
+
+    let respun = world();
+    let next = "## [Unreleased]\n\n### Fixed\n\n- **Main's next.** After 0.2.0.\n\n";
+    let cut_then_next = cut(CHANGELOG).replacen("## [Unreleased]\n\n", next, 1);
+    start(&respun, &cut_then_next);
+    commit(&respun.work, "CHANGELOG.md", &with_entry(&cut_then_next));
+    let pulled = cut_then_next.replacen("## [0.2.0] - 2026-11-08\n\n", "", 1);
+    rival_moves(&respun, "CHANGELOG.md", &pulled);
+    let recut = pulled.replacen(
+        "## [Unreleased]\n\n",
+        "## [Unreleased]\n\n## [0.2.0] - 2026-11-10\n\n",
+        1,
+    );
+    rival_moves(&respun, "CHANGELOG.md", &recut);
+    let (changelog, said) = landed(&respun);
+    assert_eq!(
+        changelog,
+        recut
+            .replacen(
+                "## [Unreleased]\n\n",
+                &format!("## [Unreleased]\n\n### Fixed\n\n{ENTRY}"),
+                1
+            )
+            .trim_end(),
+        "respun: {said:#?}"
+    );
+
+    let reverted = world();
+    start(&reverted, CHANGELOG);
+    commit(&reverted.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    rival_moves(&reverted, "CHANGELOG.md", &cut(CHANGELOG));
+    git(&reverted.work, &["fetch", "-q", "origin"]);
+    git(
+        &reverted.work,
+        &["merge", "-q", "--no-ff", "-m", "by hand", "origin/main"],
+    );
+    commit(&reverted.work, "CHANGELOG.md", &cut(CHANGELOG));
+    git(&reverted.work, &["revert", "--no-edit", "HEAD"]);
+    let (changelog, said) = landed(&reverted);
+    assert_eq!(changelog, rehomed.trim_end(), "reverted: {said:#?}");
+
+    let own_release = world();
+    start(&own_release, CHANGELOG);
+    commit(&own_release.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    let released = with_entry(CHANGELOG).replacen(
+        "## [Unreleased]\n\n",
+        "## [Unreleased]\n\n## [0.3.0] - 2026-11-09\n\n",
+        1,
+    );
+    commit(&own_release.work, "CHANGELOG.md", &released);
+    let (changelog, said) = landed(&own_release);
+    assert_eq!(changelog, released.trim_end(), "own release: {said:#?}");
+
+    let revived = world();
+    rival_moves(&revived, ".gitattributes", "CHANGELOG.md merge=union\n");
+    start(&revived, CHANGELOG);
+    commit(&revived.work, "CHANGELOG.md", &with_entry(CHANGELOG));
+    let old = "- **Main's fix.** Before the cut.";
+    let rewritten = CHANGELOG.replace(old, "- **Main's fix.** Its words, rewritten.");
+    rival_moves(&revived, "CHANGELOG.md", &rewritten);
+    git(&revived.work, &["fetch", "-q", "origin"]);
+    git(
+        &revived.work,
+        &["merge", "-q", "--no-ff", "-m", "by hand", "origin/main"],
+    );
+    assert!(
+        std::fs::read_to_string(revived.work.join("CHANGELOG.md"))
+            .expect("changelog")
+            .contains(old),
+        "the union merge keeps main's old words beside its rewrite"
+    );
+    rival_moves(&revived, "CHANGELOG.md", &cut(&rewritten));
+    let (changelog, said) = landed(&revived);
+    assert!(
+        !changelog.contains(old)
+            && changelog
+                .split("## [0.2.0]")
+                .next()
+                .is_some_and(|unreleased| unreleased.contains("- **The branch's fix.**")),
+        "revived:\n{changelog}\n{said:#?}"
     );
 }

@@ -640,6 +640,16 @@ pub const COMMAND_LINE_TOOLS_TAB_STOPPED: u8 = 5;
 /// for a stop, and Install… (or `aterm init`) is the way on.
 pub const COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED: u8 = 6;
 
+/// The Mac Setup tab lost its own console before entering `sudo`. Only this launch's exact
+/// owned, non-recovered attempt may release its claim and keep its existing want for console
+/// return. A root child or an entered attempt never emits this preprompt disposition.
+pub const COMMAND_LINE_TOOLS_TAB_NOT_OWN_LOGIN: u8 = 7;
+
+/// A current installer took custody before this Mac Setup tab entered `sudo`. The exact
+/// owned, non-recovered attempt may keep its want behind the ordinary live installer gate.
+/// Unread custody, a stopped attempt, and an entered root child do not emit this disposition.
+pub const COMMAND_LINE_TOOLS_TAB_INSTALLER_HELD: u8 = 8;
+
 /// The tail of Apple's own installer app's executable (`Install Command Line Developer Tools`,
 /// which `xcode-select --install` and the `/usr/bin` stubs open). Read from its arm64e code on
 /// macOS 27.0 (`-[IHAppDelegate createInstallMarkerFile]` and `finishInstallRequest`): the app

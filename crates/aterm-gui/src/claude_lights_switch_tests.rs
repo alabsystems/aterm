@@ -2374,3 +2374,29 @@ fn split_pane_find_bar_and_pre_frame_banner_shield_only_covered_pane_glass() {
         "sibling left pane's switch remains hit-testable on row 0 while right pane has find bar"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn glass_selection_and_key_walk_do_not_rebuild_leaf_plan_without_chrome_spans() {
+    use super::gesture_tests::chord;
+
+    let (mut app, wid, _session, _reader, _host) = claude_pane(120);
+    assert!(app.windows[&wid].chrome_spans.is_empty());
+
+    crate::reset_visible_leaf_plan_builds();
+    chord(&mut app, wid);
+    assert!(app.windows[&wid].claude_lights.selected.is_some());
+    assert_eq!(
+        crate::visible_leaf_plan_builds(),
+        0,
+        "keyboard glass selection with no split chrome spans builds no VisibleLeafPlan"
+    );
+
+    crate::reset_visible_leaf_plan_builds();
+    app.evict_stale_glass_hover(wid);
+    assert_eq!(
+        crate::visible_leaf_plan_builds(),
+        0,
+        "evicting stale glass selection with no split chrome spans builds no VisibleLeafPlan"
+    );
+}

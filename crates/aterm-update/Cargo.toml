@@ -67,6 +67,8 @@ aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-misc = { workspace = true }
 aterm-models-update = { workspace = true }
+# A loopback GitHub (web, API and CDN origins) the check's release reads run against.
+agh-fake = { workspace = true }
 
 # Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
 [[bench]]

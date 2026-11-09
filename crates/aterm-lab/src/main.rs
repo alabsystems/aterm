@@ -497,16 +497,20 @@ usage: targo --unverified lab <command> [tag] [args]
                                  LAB_ROUTE_SEAM=1: the instance reads the stub's base URL as Claude Code's default
                                  route (ATERM_DEBUG_LAB_DEFAULT_ROUTE), so a tab launched on a roster row's stored
                                  login (no --subscriber) is that row's process to the accounts host
-  claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored] [--debug-log] [--by-name] [-- claude args]
+  claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored | --own] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
                                  fake claude.ai OAuth token, for `limit` headers; --stored: the stored login a /login
                                  leaves, in a login directory of its own, so a relaunch can admit its account;
-                                 LAB_ROUTE_SEAM=1 labs only; --debug-log: a scratch debug log;
+                                 --own: that login in the scratch HOME itself (no CLAUDE_CONFIG_DIR) with aterm's usage
+                                 tap on the line and, where none is there, a roster naming it `main`: the default home's
+                                 own account whose tap row line E claims (--subscriber's outside token, --stored's own
+                                 home and a Mac with no roster show none); --stored and --own: LAB_ROUTE_SEAM=1 labs
+                                 only; --debug-log: a scratch debug log;
                                  --by-name: types `claude` at the prompt as a person does, the lab's environment as
                                  assignment words before it; LAB_REROUTE=1 labs only)
                                  --prepare-only: write the canonical launcher and emit JSON argv/cwd for `instance --`;
                                  no typing or saved socket/PID/agent changes. Keep the headless preparation lab alive;
-                                 native input uses the native instance's own socket. No relay/subscriber/by-name;
+                                 native input uses the native instance's own socket. No relay/subscriber/stored/own/by-name;
                                  private HOME/XDG/TMP/provider values cannot be overridden with -e.
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [--prepare-only] [-- codex args]
                                  launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home, model
@@ -777,6 +781,8 @@ Outside any lab (no jail, no stub):
                                  launchd job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
                                  as this command's child, in its coalition; --image PNG: capture one settled frame, run
                                  --post, and end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
+                                 --pre and --post run in order; a failed control ends the run with an error
+                                 and later controls are not run (a failed --pre captures no image);
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
                                  managed Claude Code's store build with its twin and reroute stub, and the instance reroutes;
                                  --world DIR: run in the lab world at DIR, laid out there when DIR is new (a short path under
@@ -790,6 +796,8 @@ Outside any lab (no jail, no stub):
                                  --network-away-in-ms N seeds a fresh private world's remembered home and scripted remote
                                  route; its away entry becomes eligible in N ms (1..120000, debug Lab and checkout's default debug app
                                  only, no --aterm or LAB_ATERM fallback; no LAN proof)
+  instance compare --before LAB --after LAB --aterm PATH --output DIR [--samples N]
+                                 compare capture validity and runner wall time against another lab build, in private worlds
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the

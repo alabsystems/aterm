@@ -13229,11 +13229,26 @@ impl CommitStop<'_, '_> {
 }
 
 /// The host's handle, held by `App` and `main_entry`.
+/// The final application handle stops the host; internal activation access does
+/// not own that lifetime.
 #[derive(Clone)]
 pub(crate) struct HostHandle {
+    // Internal activation handles access the host without owning its lifetime.
+    _owner: Option<Arc<HostLifetime>>,
     shared: Arc<Shared>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     hooks: Hooks,
+}
+
+struct HostLifetime {
+    shared: Arc<Shared>,
+    thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl Drop for HostLifetime {
+    fn drop(&mut self) {
+        shutdown_host(&self.shared, &self.thread);
+    }
 }
 
 impl HostHandle {
@@ -13256,36 +13271,42 @@ impl HostHandle {
             // never does.
             net.path_from(Arc::clone(&hooks.acts.net_path));
         }
-        let handle = Self {
-            shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    cfg: effective(&cfg),
-                    admission: Admission::of(&cfg),
-                    suspended,
-                    unsupervised: !would_supervise(&effective(&cfg), headless),
-                    ..State::default()
-                }),
-                headless,
-                desk: crate::desk::Desk::of(headless),
-                faults: Mutex::default(),
-                host_faults: Mutex::default(),
-                kept: Mutex::default(),
-                switches,
-                activations: Arc::default(),
-                wake: std::sync::OnceLock::new(),
-                host_done: AtomicBool::new(false),
-                net,
-                login_latches: Arc::default(),
-                restored: Mutex::default(),
-                restored_wake: Condvar::new(),
-                landing_look_out: Arc::default(),
-                inbox_lane: crate::message_inbox::current_lane(),
-                #[cfg(test)]
-                restart_panics: AtomicBool::new(false),
-                #[cfg(test)]
-                passes_panic: AtomicBool::new(false),
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                cfg: effective(&cfg),
+                admission: Admission::of(&cfg),
+                suspended,
+                unsupervised: !would_supervise(&effective(&cfg), headless),
+                ..State::default()
             }),
-            thread: Arc::default(),
+            headless,
+            desk: crate::desk::Desk::of(headless),
+            faults: Mutex::default(),
+            host_faults: Mutex::default(),
+            kept: Mutex::default(),
+            switches,
+            activations: Arc::default(),
+            wake: std::sync::OnceLock::new(),
+            host_done: AtomicBool::new(false),
+            net,
+            login_latches: Arc::default(),
+            restored: Mutex::default(),
+            restored_wake: Condvar::new(),
+            landing_look_out: Arc::default(),
+            inbox_lane: crate::message_inbox::current_lane(),
+            #[cfg(test)]
+            restart_panics: AtomicBool::new(false),
+            #[cfg(test)]
+            passes_panic: AtomicBool::new(false),
+        });
+        let thread = Arc::default();
+        let handle = Self {
+            _owner: Some(Arc::new(HostLifetime {
+                shared: Arc::clone(&shared),
+                thread: Arc::clone(&thread),
+            })),
+            shared,
+            thread,
             hooks,
         };
         handle.ensure_thread();
@@ -13403,6 +13424,9 @@ impl HostHandle {
     }
 
     fn ensure_thread(&self) {
+        // Serialize admission with shutdown taking this slot: once shutdown has
+        // observed it empty, an internal handle cannot start a worker behind it.
+        let mut slot = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
         let state = self.shared.lock();
         if (!Shared::active(&state, self.shared.headless) && state.activation.next().is_none())
             || state.shutting_down
@@ -13410,7 +13434,6 @@ impl HostHandle {
             return;
         }
         drop(state);
-        let mut slot = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(running) = slot.as_ref() {
             // The host thread ends only at shutdown (checked above): a panic of its loop
             // restarts it in place, and a policy switched off leaves it parked. One that has
@@ -14116,40 +14139,44 @@ impl HostHandle {
 
     /// Stop every worker and the host thread, bounded.
     pub(crate) fn shutdown_and_join(&self) {
-        {
-            let mut queue = self
-                .shared
-                .restored
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            queue.closed = true;
-            for attempt in &queue.attempts {
-                attempt.revoked.store(true, Ordering::SeqCst);
-            }
-        }
-        self.shared.restored_wake.notify_all();
-        let activation = {
-            let mut state = self.shared.lock();
-            state.shutting_down = true;
-            std::mem::take(&mut state.activation)
-        };
-        drop(activation);
-        self.shared.net.stop();
-        ring();
-        if let Some(wake) = self.shared.wake.get() {
-            wake.pull();
-        }
-        let join = self
-            .thread
+        shutdown_host(&self.shared, &self.thread);
+    }
+}
+
+fn shutdown_host(shared: &Shared, thread: &Mutex<Option<JoinHandle<()>>>) {
+    {
+        let mut queue = shared
+            .restored
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(join) = join {
-            if wait_done(&self.shared.host_done, Instant::now() + HOST_JOIN_TIMEOUT) {
-                let _ = join.join();
-            } else {
-                aterm_log::warn!("harness host did not stop within its bound; left to the exit");
-            }
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.closed = true;
+        for attempt in &queue.attempts {
+            attempt.revoked.store(true, Ordering::SeqCst);
+        }
+    }
+    shared.restored_wake.notify_all();
+    let activation = {
+        let mut state = shared.lock();
+        state.shutting_down = true;
+        std::mem::take(&mut state.activation)
+    };
+    drop(activation);
+    shared.net.stop();
+    ring();
+    if let Some(wake) = shared.wake.get() {
+        wake.pull();
+    }
+    let join = thread.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(join) = join {
+        // A callback may release the last owner on the host itself. It has
+        // been told to stop, but cannot wait for or join its own return.
+        if join.thread().id() == std::thread::current().id() {
+            return;
+        }
+        if wait_done(&shared.host_done, Instant::now() + HOST_JOIN_TIMEOUT) {
+            let _ = join.join();
+        } else {
+            aterm_log::warn!("harness host did not stop within its bound; left to the exit");
         }
     }
 }
@@ -27344,6 +27371,7 @@ fn try_activation_start(shared: &Arc<Shared>, hooks: &Hooks, now: Instant) -> Op
         return None;
     };
     let host = HostHandle {
+        _owner: None,
         shared: Arc::clone(shared),
         thread,
         hooks: hooks.clone(),

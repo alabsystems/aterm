@@ -173,8 +173,8 @@ impl LiveCases {
     }
 
     /// A bounded read of newly appended output: failed cases and long-running reports, in log
-    /// order. After a case is [`Seen::Red`], lines and case ends are still consumed for the
-    /// binary's liveness record, but no later failure is reported a second time.
+    /// order. After a case is [`Seen::Red`], lines and case ends still update liveness and
+    /// bounded failure diagnostics, but no later failure emits another decisive signal.
     pub(super) fn poll(&mut self) -> Vec<Seen> {
         let mut out = Vec::new();
         self.observations.read_end = ReadEnd::Budget;
@@ -278,7 +278,10 @@ impl LiveCases {
                 if !self.started.contains(&name) || !self.ended.insert(name.clone()) {
                     return None;
                 }
-                if ev.event != "failed" || self.red {
+                if ev.event != "failed"
+                    || (self.red
+                        && self.observations.failures.len() >= crate::report::FINDINGS_SHOWN)
+                {
                     return None;
                 }
                 let block = case_block(&ev);
@@ -292,6 +295,9 @@ impl LiveCases {
                     failure.start_line = ev.start_line;
                     failure.start_col = ev.start_col;
                     self.observations.failures.push(failure);
+                }
+                if self.red {
+                    return None;
                 }
                 self.seen.push(marks);
                 if crate::libtest::decisive(&self.seen) {

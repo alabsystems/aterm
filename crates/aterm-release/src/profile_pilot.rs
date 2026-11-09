@@ -147,6 +147,55 @@ fn order(opts: &Options) -> Vec<(usize, Arm)> {
         .collect()
 }
 
+/// Lay out a guest-only input from the measured native image and frozen resources.
+/// Assembly copies bytes and installs the frozen release identity without changing
+/// normalized product content. It neither rebuilds nor executes the product.
+pub(crate) fn runtime_app(
+    repo: &Path,
+    root: &Path,
+    binary: &Path,
+    build: u64,
+    identity: &aterm_stamp::Stamp,
+) -> Result<std::path::PathBuf, String> {
+    if !identity.release_build {
+        return Err("Q4 needs a release identity, not an unstamped pilot image".into());
+    }
+    let app = root.join("aterm.app");
+    if crate::bundle::exists_or_symlink(&app) {
+        return Err("pilot runtime app already exists".into());
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("pilot runtime input: {e}"))?;
+    let copied = root.join("runtime-image.noindex");
+    crate::durable::copy_regular_fresh(binary, &copied).map_err(|e| e.to_string())?;
+    crate::postlink::resign(&copied)?;
+    let content = crate::postlink::normalized(
+        &crate::durable::read_regular_bytes(&copied, u64::MAX).map_err(|e| e.to_string())?,
+    )?;
+    crate::postlink::stamp(&copied, &aterm_stamp::encode(identity)?)?;
+    crate::postlink::resign(&copied)?;
+    if crate::postlink::normalized(
+        &crate::durable::read_regular_bytes(&copied, u64::MAX).map_err(|e| e.to_string())?,
+    )? != content
+    {
+        return Err("pilot runtime stamping changed product content".into());
+    }
+    crate::bundle::assemble_at(
+        &crate::bundle::BundleSpec {
+            repo_root: repo.to_path_buf(),
+            out_dir: root.to_path_buf(),
+            short_version: identity.app_version.to_owned(),
+            build_number: build,
+            bundle_id: crate::bundle::BUNDLE_ID.to_owned(),
+            git_commit: identity.git_commit.to_owned(),
+            aterm_bin: copied.clone(),
+        },
+        &app,
+    )?;
+    // This staging copy was never executed; the readonly bundle is the guest input.
+    std::fs::remove_file(copied).map_err(|e| format!("retire pilot runtime staging: {e}"))?;
+    Ok(app)
+}
+
 /// Cargo's artifact path is authoritative across both traditional deps folders
 /// and Trust's per-unit output layout.
 pub(crate) fn gui_rlib(log: &str) -> Option<std::path::PathBuf> {
@@ -487,6 +536,7 @@ fn validate(rows: &[aterm_json::Value]) -> Result<(), String> {
         if peers.len() != 2
             || peers.iter().any(|r| {
                 r["sha256"] != row["sha256"]
+                    || r["runtime_app_sha256"] != row["runtime_app_sha256"]
                     || r["inspection"]["dsym_dwarf_sha256"]
                         != row["inspection"]["dsym_dwarf_sha256"]
             })
@@ -1087,6 +1137,8 @@ mod tests {
         let row = make("fat1", "a", "same");
         let mut rows = vec![row.clone(), row.clone()];
         assert!(validate(&rows).is_ok());
+        rows[1] = aterm_json::json!({"arm":"fat1","slice":"native","sha256":"a","runtime_app_sha256":"different stamped bytes","inspection":{"sections":"same","symbols":"same"}});
+        assert!(validate(&rows).is_err());
         rows[1] = make("fat1", "mutated", "same");
         assert!(validate(&rows).is_err());
         rows[1] = row;

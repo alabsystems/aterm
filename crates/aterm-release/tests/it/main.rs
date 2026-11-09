@@ -24,6 +24,10 @@ aterm_durable::plain_durable_flushes_in_tests!();
 // change what its engine fixtures see.
 mod hermetic_git;
 
+#[path = "../../src/main_lane.rs"]
+#[allow(dead_code)]
+mod main_lane;
+
 #[path = "../../src/accepted_measure.rs"]
 #[allow(dead_code)]
 mod accepted_measure;
@@ -39,6 +43,8 @@ mod build_inputs;
 #[path = "../../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
+#[path = "../../src/bump_claim.rs"]
+mod bump_claim;
 #[path = "../../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
@@ -132,6 +138,11 @@ mod provision;
 #[path = "../../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../../src/qualify_pilot.rs"]
+#[allow(dead_code)]
+mod qualify_pilot;
+#[path = "../../src/qualify_replay.rs"]
+mod qualify_replay;
 #[path = "../../src/release.rs"]
 #[allow(dead_code)]
 mod release;

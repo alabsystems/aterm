@@ -15,12 +15,24 @@ pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --li
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
+  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series
+      Cold concurrent release slices, optionally beside test compilation and lint,
+      with one Release jobserver and one-second descendant CPU/QoS/core samples.
+      chain lowers tree CPU priority; tree inverts priority as a negative control.
+      series requires --before-verify PATH and runs alone/shared/chain/chain/shared/tree
+      with one fixed grant; shared and tree use the before verifier.
+  targo --unverified ship qualify-summary RETAINED-TAKE-DIRECTORY
+  targo --unverified ship qualify-replay RETAINED-CSV-DIRECTORY PILOT-RUNS.json
+      Summarize unit chains and sampled CPU/runnable/QoS/core residency.
+      Builds only: no product execution or publication. Retains all evidence.
   targo --unverified ship profile-pilot --arm ARM [--arm ARM]... [--takes 2]
       Build cut-shaped profile arms in fresh roots, without executing the product.
       ARM: fat1, fat1-lines, fat16, fat16-lines, thin16-lines.
       Two takes run in forward/reverse order (ABBA for two arms).
       Each take retains Cargo's unit timeline in cargo-timings/ and one-second
       process-group observations in build-resources.jsonl (sampled, not accounting).
+      Native macOS takes also retain runtime_app, a guest-only app input copying
+      the measured executable and frozen resources; it is never run or installed here.
   targo --unverified ship profile-pilot --anatomy [--arm ARM]...
       Detailed front-end/codegen/link timings. One arm (fat1 by default) takes
       one diagnostic take per slice; multiple arms take two in forward/reverse
@@ -513,6 +525,9 @@ pub enum Cmd {
     /// `dev-app`: this checkout as `aterm (dev).app` ([`crate::dev_app`]).
     DevApp(crate::dev_app::Cmd),
     ProfilePilot(crate::profile_pilot::Options),
+    QualifyPilot(crate::qualify_pilot::Options),
+    QualifySummary(std::path::PathBuf),
+    QualifyReplay(std::path::PathBuf, std::path::PathBuf),
     /// `harness-bump`: the harness versions the release gate asks for ([`crate::harness_versions`]).
     HarnessBump,
     /// `inputs [--recheck]`: take, or recheck by stat, this machine's build-inputs seal and say
@@ -952,6 +967,19 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )),
         },
         "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
+        "qualify-pilot" => {
+            crate::qualify_pilot::parse(it.map(str::to_owned)).map(Cmd::QualifyPilot)
+        }
+        "qualify-summary" => match (it.next(), it.next()) {
+            (Some(path), None) => Ok(Cmd::QualifySummary(path.into())),
+            _ => Err("qualify-summary requires one retained take directory".to_owned()),
+        },
+        "qualify-replay" => match (it.next(), it.next(), it.next()) {
+            (Some(path), Some(takes), None) => Ok(Cmd::QualifyReplay(path.into(), takes.into())),
+            _ => Err(
+                "qualify-replay requires a retained CSV directory and pilot runs JSON".to_owned(),
+            ),
+        },
         "profile-pilot" => {
             crate::profile_pilot::parse(it.map(str::to_owned)).map(Cmd::ProfilePilot)
         }
@@ -1293,6 +1321,13 @@ fn normalize_version(v: &str) -> std::result::Result<String, String> {
 
 fn dispatch(cmd: Cmd) -> ledger::Result<()> {
     match cmd {
+        Cmd::QualifySummary(path) => crate::qualify_pilot::summarize(&path).map_err(Error::new),
+        Cmd::QualifyReplay(path, takes) => {
+            crate::qualify_replay::run(&path, &takes).map_err(Error::new)
+        }
+        Cmd::QualifyPilot(opts) => {
+            crate::qualify_pilot::run(&repo_root()?, &opts).map_err(Error::new)
+        }
         Cmd::ProfilePilot(opts) => {
             crate::profile_pilot::run(&repo_root()?, &opts).map_err(Error::new)
         }
@@ -1450,6 +1485,15 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qualify_replay_requires_historical_windows_and_independent_pilot_takes() {
+        let args = |parts: &[&str]| parts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(
+            matches!(parse(&args(&["qualify-replay","cuts","runs.json"])),Ok(Cmd::QualifyReplay(cuts,runs)) if cuts==std::path::Path::new("cuts") && runs==std::path::Path::new("runs.json"))
+        );
+        assert!(parse(&args(&["qualify-replay", "cuts"])).is_err());
+        assert!(parse(&args(&["qualify-replay", "cuts", "runs.json", "extra"])).is_err());
+    }
     #[test]
     fn prefreeze_is_a_standalone_nonpublishing_operation() {
         let parse = |flags: &[&str]| parse_release(&mut flags.iter().copied());

@@ -140,6 +140,7 @@ aterm-update-core = { workspace = true }
 aterm-vz = { workspace = true }
 
 [dev-dependencies]
+aterm-durable = { workspace = true }
 # Manual journal-store admission measurement; all network and identities are fixtures.
 agh-fake = { workspace = true }
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter

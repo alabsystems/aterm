@@ -573,31 +573,110 @@ pub(crate) struct Seen {
 /// # Errors
 /// As [`stamp_if_present`].
 pub(crate) fn seen_if_present(path: &Path) -> crate::Result<Option<Seen>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => Ok(Some(Seen {
+    seen_if_present_in(None, path)
+}
+
+/// [`seen_if_present`] from `glance`'s `lstat` of `path` where the caller looks through one
+/// ([`Glance::symlink_metadata`]), and from a fresh one where it does not.
+///
+/// # Errors
+/// As [`stamp_if_present`].
+pub(crate) fn seen_if_present_in(
+    glance: Option<&Glance>,
+    path: &Path,
+) -> crate::Result<Option<Seen>> {
+    match lstat_in(glance, path) {
+        Ok(Some(meta)) => Ok(Some(Seen {
             kind: kind_of(&meta),
             stamp: FileStamp::of(&meta),
             uid: meta.uid(),
             mode: meta.mode(),
             nlink: meta.nlink(),
         })),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
     }
 }
 
+/// The `lstat` of `path`, `None` where nothing is there: `glance`'s where the caller looks
+/// through one ([`Glance::symlink_metadata`]), a fresh one where it does not.
+///
+/// # Errors
+/// The `lstat`'s, other than a missing path.
+pub(crate) fn lstat_in(
+    glance: Option<&Glance>,
+    path: &Path,
+) -> io::Result<Option<std::fs::Metadata>> {
+    if let Some(glance) = glance {
+        return glance.symlink_metadata(path);
+    }
+    #[cfg(test)]
+    count_look(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The `lstat`s one check of a vault takes, each path's once. A Commons check asks several reads
+/// of the same files under one shared observation of the vault's state lock (a table session's
+/// access: this Mac's own denial, the membership log and the state behind it; a roster access's
+/// currency: the identity, the log and the state), and each stamped them again: a quiet repair
+/// round over a long log took about 8,600 `lstat`s, both peers, of a few dozen files, a check's
+/// own stamps naming many of its files two or three times (2026-11-08,
+/// `docs/measured/commons-long-log-rounds-2026-11-07.md`). A check that looks through one glance
+/// stamps each file once, at its first ask of it, and a kept answer stands for the files as that
+/// look saw them; a miss reads and stamps afresh. A file that moved meanwhile moves the next
+/// check's stamps, which read it again. Each check takes its own, never one kept across checks, and a look that
+/// confirms a file stood still across a read is never taken from one.
+pub(crate) struct Glance(std::cell::RefCell<Vec<(std::path::PathBuf, Option<std::fs::Metadata>)>>);
+
+impl Glance {
+    /// A look that has taken nothing yet.
+    pub(crate) const fn new() -> Self {
+        Self(std::cell::RefCell::new(Vec::new()))
+    }
+
+    /// The `lstat` of `path` this look took first, `None` where nothing was there; taken now
+    /// where it took none. An error is not kept: the next ask looks again.
+    ///
+    /// # Errors
+    /// The `lstat`'s, other than a missing path.
+    pub(crate) fn symlink_metadata(&self, path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        // The paths one check names share their folder: they differ at their ends.
+        let same = |at: &std::path::PathBuf| {
+            let at = at.as_os_str().as_encoded_bytes();
+            at.len() == bytes.len() && at.iter().rev().eq(bytes.iter().rev())
+        };
+        if let Some((_, meta)) = self.0.borrow().iter().find(|(at, _)| same(at)) {
+            return Ok(meta.clone());
+        }
+        let meta = lstat_in(None, path)?;
+        self.0.borrow_mut().push((path.to_path_buf(), meta.clone()));
+        Ok(meta)
+    }
+}
+
 /// The SHA-256 of the file at `path` as [`read_private`] reads it, `None` where there is none,
-/// kept while the file stands ([`digest_while_seen`]).
+/// kept while the file stands ([`digest_while_seen`]), its first `lstat` of `path` `glance`'s
+/// where the caller's check looks through one ([`seen_if_present_in`]).
 ///
 /// # Errors
 /// As [`read_private`], or the `lstat` of `path`.
-pub(crate) fn private_digest(path: &Path, max: usize) -> crate::Result<Option<[u8; 32]>> {
+pub(crate) fn private_digest(
+    path: &Path,
+    max: usize,
+    glance: Option<&Glance>,
+) -> crate::Result<Option<[u8; 32]>> {
     digest_while_seen(
         path,
         Reader {
             admit: Admit::Private,
             max,
         },
+        glance,
     )
 }
 
@@ -605,13 +684,18 @@ pub(crate) fn private_digest(path: &Path, max: usize) -> crate::Result<Option<[u
 ///
 /// # Errors
 /// As [`read_public`], or the `lstat` of `path`.
-pub(crate) fn public_digest(path: &Path, max: usize) -> crate::Result<Option<[u8; 32]>> {
+pub(crate) fn public_digest(
+    path: &Path,
+    max: usize,
+    glance: Option<&Glance>,
+) -> crate::Result<Option<[u8; 32]>> {
     digest_while_seen(
         path,
         Reader {
             admit: Admit::Any,
             max,
         },
+        glance,
     )
 }
 
@@ -656,18 +740,29 @@ impl Reader {
 /// unchanged files at each of their checks (2026-11-08). A file that changed too recently, is
 /// absent, or that the reader refused is read again at the next ask. Only digests are kept,
 /// never a file's bytes.
-fn digest_while_seen(path: &Path, reader: Reader) -> crate::Result<Option<[u8; 32]>> {
+fn digest_while_seen(
+    path: &Path,
+    reader: Reader,
+    glance: Option<&Glance>,
+) -> crate::Result<Option<[u8; 32]>> {
     let now = std::time::SystemTime::now();
     #[cfg(not(test))]
     {
         static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
-        digest_while_seen_in(&DIGESTS, now, path, reader, |path| reader.digest(path))
+        digest_while_seen_in(&DIGESTS, glance, now, path, reader, |path| {
+            reader.digest(path)
+        })
     }
     #[cfg(test)]
     THREAD_DIGESTS.with(|kept| {
-        digest_while_seen_in(kept, now + ASKED_LATER.get(), path, reader, |path| {
-            reader.digest(path)
-        })
+        digest_while_seen_in(
+            kept,
+            glance,
+            now + ASKED_LATER.get(),
+            path,
+            reader,
+            |path| reader.digest(path),
+        )
     })
 }
 
@@ -720,6 +815,7 @@ pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
 /// `reader` reads.
 fn digest_while_seen_in(
     kept: &KeptDigests,
+    glance: Option<&Glance>,
     now: std::time::SystemTime,
     path: &Path,
     reader: Reader,
@@ -727,7 +823,9 @@ fn digest_while_seen_in(
 ) -> crate::Result<Option<[u8; 32]>> {
     /// The files whose digests are kept, the oldest let go first.
     const KEPT: usize = 32;
-    let before = seen_if_present(path)?;
+    // A glance's look stands before the read: what is kept is kept only where the file the read
+    // opened is the one it saw.
+    let before = seen_if_present_in(glance, path)?;
     if let Some(seen) = before
         && let Ok(kept) = kept.lock()
         && let Some((.., digest)) = kept
@@ -1205,6 +1303,35 @@ pub(crate) fn count_read(path: &Path) {
         .or_default() += 1;
 }
 
+/// How many `lstat`s [`lstat_in`] took of each path since this test process started, a
+/// [`Glance`]'s included ([`looks_under`]).
+#[cfg(test)]
+static LOOKS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Count one `lstat` of `path` ([`looks_under`]).
+#[cfg(test)]
+fn count_look(path: &Path) {
+    *LOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Every path under `dir` [`lstat_in`] took an `lstat` of in this test process, with how many
+/// times (each tempdir path is one test's).
+#[cfg(test)]
+pub(crate) fn looks_under(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    LOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(path, _)| path.starts_with(dir))
+        .map(|(path, looks)| (path.clone(), *looks))
+        .collect()
+}
+
 /// Reads of each path this test process fails before opening it ([`fail_reads`]).
 #[cfg(test)]
 static READ_FAILS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
@@ -1297,6 +1424,72 @@ mod tests {
 
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::tempdir().expect("tempdir")
+    }
+
+    /// A glance gives each path the `lstat` it took of it first ([`Glance`]): a file rewritten,
+    /// removed or made since stands as the glance saw it, while a new glance sees each as it is;
+    /// each path has its own, and an error is not kept, so the next ask looks again.
+    /// NEGATIVE CONTROLS (2026-11-08): a glance that looks afresh at each ask sees the rewrite
+    /// (`a rewrite stands as first seen`); one that tells paths apart by their length alone gives
+    /// the second file the first one's `lstat` (`each path its own`); one that keeps a failed look
+    /// as an absence answers the file made at that path since with none (`an error is looked at
+    /// again`).
+    #[test]
+    fn a_glance_gives_each_path_the_lstat_it_took_first() {
+        let root = scratch();
+        let (a, b, made) = (
+            root.path().join("a"),
+            root.path().join("b"),
+            root.path().join("c"),
+        );
+        write_atomic(&a, b"one", 0o600).unwrap();
+        write_atomic(&b, b"second", 0o600).unwrap();
+        let len = |meta: Option<std::fs::Metadata>| meta.map(|meta| meta.len());
+        let glance = Glance::new();
+        assert_eq!(len(glance.symlink_metadata(&a).unwrap()), Some(3));
+        assert_eq!(
+            len(glance.symlink_metadata(&b).unwrap()),
+            Some(6),
+            "each path its own"
+        );
+        assert_eq!(len(glance.symlink_metadata(&made).unwrap()), None);
+
+        write_atomic(&a, b"rewritten", 0o600).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        write_atomic(&made, b"made", 0o600).unwrap();
+        assert_eq!(
+            len(glance.symlink_metadata(&a).unwrap()),
+            Some(3),
+            "a rewrite stands as first seen"
+        );
+        assert_eq!(
+            len(glance.symlink_metadata(&b).unwrap()),
+            Some(6),
+            "a removal stands as first seen"
+        );
+        assert_eq!(
+            len(glance.symlink_metadata(&made).unwrap()),
+            None,
+            "a file made since stands absent"
+        );
+        let now = Glance::new();
+        assert_eq!(len(now.symlink_metadata(&a).unwrap()), Some(9));
+        assert_eq!(len(now.symlink_metadata(&b).unwrap()), None);
+        assert_eq!(len(now.symlink_metadata(&made).unwrap()), Some(4));
+
+        let child = a.join("child");
+        assert!(
+            glance.symlink_metadata(&child).is_err(),
+            "a file has no child"
+        );
+        std::fs::remove_file(&a).unwrap();
+        std::fs::create_dir(&a).unwrap();
+        write_atomic(&child, b"child", 0o600).unwrap();
+        assert_eq!(
+            len(glance.symlink_metadata(&child).unwrap()),
+            Some(5),
+            "an error is looked at again"
+        );
     }
 
     #[test]
@@ -1395,16 +1588,16 @@ mod tests {
             let path = root.path().join("custody");
             write_atomic(&path, b"custody", 0o600).unwrap();
             let kept = store();
-            let first = digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap();
+            let first = digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap();
             assert_eq!(first, Some(sha(b"custody")), "{what}");
             let reads = reads_of(&path);
             assert_eq!(
-                digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap(),
+                digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap(),
                 first
             );
             assert_eq!(reads_of(&path), reads, "{what}: read again while it stood");
             make(&path);
-            let again = digest_while_seen_in(&kept, later, &path, PRIVATE, read).ok();
+            let again = digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).ok();
             assert_eq!(again, fresh(PRIVATE, &path), "{what}");
             assert_ne!(again, Some(first), "{what}: answered with the kept digest");
         }
@@ -1444,7 +1637,7 @@ mod tests {
         for (through, swap) in swaps {
             let kept = store();
             let seen = seen_if_present(&path).unwrap();
-            let swapped = digest_while_seen_in(&kept, later, &path, PRIVATE, swap);
+            let swapped = digest_while_seen_in(&kept, None, later, &path, PRIVATE, swap);
             assert_eq!(swapped.unwrap(), Some(sha(b"CUSTODY")), "through {through}");
             if through == "its parent directory" {
                 assert_eq!(
@@ -1454,7 +1647,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap(),
+                digest_while_seen_in(&kept, None, later, &path, PRIVATE, read).unwrap(),
                 Some(sha(b"custody")),
                 "the file put back through {through}"
             );
@@ -1487,10 +1680,11 @@ mod tests {
             write_atomic(&path, b"custody", mode).unwrap();
             let kept = store();
             let admitted =
-                digest_while_seen_in(&kept, later, &path, laxer, |path| laxer.digest(path));
+                digest_while_seen_in(&kept, None, later, &path, laxer, |path| laxer.digest(path));
             assert_eq!(admitted.unwrap(), Some(sha(b"custody")), "{what}");
-            let refused =
-                digest_while_seen_in(&kept, later, &path, stricter, |path| stricter.digest(path));
+            let refused = digest_while_seen_in(&kept, None, later, &path, stricter, |path| {
+                stricter.digest(path)
+            });
             assert!(refused.is_err(), "{what}: {refused:?}");
         }
 
@@ -1504,7 +1698,7 @@ mod tests {
             let at = after_its_change(&path, secs);
             let reads = reads_of(&path);
             for _ in 0..2 {
-                let changed = digest_while_seen_in(&kept, at, &path, PRIVATE, read).unwrap();
+                let changed = digest_while_seen_in(&kept, None, at, &path, PRIVATE, read).unwrap();
                 assert_eq!(changed, Some(sha(b"changed")));
             }
             assert_eq!(

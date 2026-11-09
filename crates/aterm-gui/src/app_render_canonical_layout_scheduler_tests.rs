@@ -113,6 +113,63 @@ fn every_frame_route_threads_one_visible_plan() {
 }
 
 #[test]
+fn compose_route_chrome_and_overlay_inputs_reuse_the_frame_plan() {
+    let wid = WindowId(0);
+    for split_mode in [0u8, 1, 2, 3] {
+        let mut app = App::headless_for_test();
+        app.config.show_build_badge = Some(true);
+        match split_mode {
+            0 => {}
+            1 => {
+                app.split_active_stub_tab(wid);
+            }
+            2 => {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            }
+            _ => {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+            }
+        }
+        app.search_enter();
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.focused = true;
+            ws.input_scratch.cells = vec![Vec::new(); usize::from(ws.rows)];
+        }
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("frame layout");
+        match route {
+            crate::VisibleContentRoute::Native { .. } => {
+                assert!(app.prepare_native_input_scratch_from_plan(wid, &plan));
+            }
+            crate::VisibleContentRoute::Heterogeneous => {
+                assert!(
+                    app.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
+                        wid, None, &plan,
+                    )
+                    .is_some()
+                );
+            }
+            crate::VisibleContentRoute::Terminal { .. } => {}
+        }
+
+        reset_visible_leaf_plan_builds();
+        assert!(
+            app.compose_route_chrome(wid, route, &plan).is_some(),
+            "route chrome must compose for mode {split_mode}"
+        );
+        let _ = app.rewind_frame_fp(wid, &plan);
+        crate::pane_chrome::with_split_chrome(crate::pane_chrome::SplitChrome::Fluent, || {
+            let _ = app.pane_overlay_inputs_from_plan(wid, plan.leaves.len() > 1, Some(&plan));
+        });
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "compose_route_chrome, rewind_frame_fp, and pane_overlay_inputs_from_plan must reuse the frame plan (mode {split_mode})"
+        );
+    }
+}
+
+#[test]
 fn terminal_capture_threads_one_fresh_visible_plan() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

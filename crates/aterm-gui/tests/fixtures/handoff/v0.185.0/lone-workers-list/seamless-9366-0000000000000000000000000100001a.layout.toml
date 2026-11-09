@@ -1,0 +1,7 @@
+schema = 2
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+workers_in_front = true

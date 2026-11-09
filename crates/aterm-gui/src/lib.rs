@@ -6330,6 +6330,12 @@ fn register_terminal_tab(
     ))
 }
 
+/// How long Quit waits for the PTY readers it stopped before it retires their masters
+/// ([`SessionPool::retire_at_quit`]), well inside the reaper's kill tick for a shell that runs a
+/// hang-up handler.
+#[cfg(unix)]
+const QUIT_READER_STOP: Duration = Duration::from_millis(250);
+
 #[derive(Default)]
 struct SessionPool {
     sessions: std::collections::HashMap<u64, PooledSession>,
@@ -6469,11 +6475,67 @@ impl SessionPool {
             p.session.temporal_tx = tx;
         }
     }
+    /// Quit's teardown of the sessions this instance owns, before [`aterm_pty::wait_for_reaps`]:
+    /// each shell is hung up and its input severed, and the keeper lets go of its duplicates of
+    /// their masters ([`keeper_link::release_at_quit`]); then each reader is stopped and each
+    /// master retired once its reader has ended, or at [`QUIT_READER_STOP`]
+    /// ([`SinkWriter::retire_master_at_exit`]). The master's last close, end of file under the
+    /// `CLOCAL` its teardown keeps set, then reaches a shell still in its hang-up handler, or a job
+    /// in front of it waiting on its terminal, while its reap waits, as closing its tab does. With
+    /// every master held open until exit, a zsh whose `trap ... HUP` runs `exit` behind a `less`
+    /// was killed at the reaper's kill tick, its history unsaved (ATERM-KI-1104-7). Where the
+    /// keeper's RELEASEs were not written in time it may still hold the masters, so the readers
+    /// go on reading them, as they did before: a master held open and unread keeps a zsh at its
+    /// prompt from exiting. A session its predecessor still owns is left as it is.
     #[cfg(unix)]
-    fn hang_up_at_exit(&self) {
-        for pooled in self.sessions.values() {
-            let session = &pooled.session;
-            session.hang_up_and_reap(session.predecessor_owns());
+    fn retire_at_quit(&mut self) {
+        let owned: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, pooled)| !pooled.session.predecessor_owns())
+            .map(|(id, _)| *id)
+            .collect();
+        for session in owned.iter().filter_map(|id| self.get(*id)) {
+            session.hang_up_and_reap(false);
+            session.ctx.sink.sever_input();
+        }
+        if !keeper_link::release_at_quit(&owned) {
+            aterm_log::info!(
+                "keeper: not every master's RELEASE was written at quit; the readers go on \
+                 reading the masters it may still hold, which close at exit"
+            );
+            return;
+        }
+        for session in owned.iter().filter_map(|id| self.get(*id)) {
+            if session.wake_wr >= 0 {
+                aterm_pty::wake(session.wake_wr);
+            }
+            session
+                .reader_stop
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let deadline = Instant::now() + QUIT_READER_STOP;
+        let mut running = 0_usize;
+        for id in &owned {
+            let Some(pooled) = self.sessions.get_mut(id) else {
+                continue;
+            };
+            let session = &mut pooled.session;
+            if let Some(reader) = session.reader_join.take() {
+                if reader.ended_by(deadline) {
+                    let _ = reader.join();
+                } else {
+                    running += 1;
+                    session.reader_join = Some(reader);
+                }
+            }
+            session.ctx.sink.retire_master_at_exit();
+        }
+        if running > 0 {
+            aterm_log::info!(
+                "{running} PTY reader(s) had not stopped {} ms into quit; their masters are retired anyway",
+                QUIT_READER_STOP.as_millis()
+            );
         }
     }
     fn predecessors_sessions(&self) -> Vec<SessionId> {
@@ -29304,7 +29366,7 @@ pub fn main_entry_with_network(
     }
     #[cfg(unix)]
     {
-        app.pool.hang_up_at_exit();
+        app.pool.retire_at_quit();
         let _ = aterm_pty::wait_for_reaps(aterm_pty::REAP_GRACE_WAIT);
     }
     #[cfg(windows)]

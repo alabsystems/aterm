@@ -936,6 +936,9 @@ pub struct Prepare {
     /// Fresh host-process epoch obtained from `native-act info`. An app crash/replacement
     /// cannot silently turn recovery of an old operation into a new admission.
     pub host_epoch: String,
+    /// The host's authenticated journal domain, obtained before preparation.
+    /// Older hosts reject this marker; unmarked recipes cannot use cross-epoch rejection.
+    pub rejection_domain: Option<String>,
     /// The actual holder; a private built-in always uses its own holder.
     pub holder: String,
     /// The exact claim revision under which the constructor begins.
@@ -1085,6 +1088,8 @@ pub enum Request {
     Info,
     /// Discover enabled actual constructor kinds before preparing or claiming anything.
     Constructors,
+    /// Read the host's durable rejection domain before creating a restart recipe.
+    RejectionDomain,
     /// Discover atomic initial-prepare cancellation before creating a scoped claim.
     /// This probe leaves the frozen native protocol's Info reply unchanged.
     CancelSupport,
@@ -1222,6 +1227,7 @@ impl Request {
         let request = match verb {
             "info" => Self::Info,
             "constructors" => Self::Constructors,
+            "rejection-domain" => Self::RejectionDomain,
             "cancel-support" => Self::CancelSupport,
             "prepare" | "cancel-prepare" => {
                 let id = take(&mut words, "id")?.to_string();
@@ -1232,6 +1238,11 @@ impl Request {
                 if !aterm_codec::hex::is_lower(&host_epoch, 32) {
                     return None;
                 }
+                let rejection_domain = match words.remove("reject") {
+                    None => None,
+                    Some(value) if aterm_codec::hex::is_lower(value, 64) => Some(value.to_owned()),
+                    Some(_) => return None,
+                };
                 let holder = text_blob(take(&mut words, "holder")?, 1024)?;
                 let revision = canonical_number(take(&mut words, "revision")?)?;
                 let expected_human_seq = match words.remove("human-seq") {
@@ -1339,6 +1350,7 @@ impl Request {
                 let prepare = Prepare {
                     id,
                     host_epoch,
+                    rejection_domain,
                     holder,
                     revision,
                     expected_human_seq,
@@ -1444,6 +1456,7 @@ impl Request {
         match self {
             Self::Info => out.push_str("info"),
             Self::Constructors => out.push_str("constructors"),
+            Self::RejectionDomain => out.push_str("rejection-domain"),
             Self::CancelSupport => out.push_str("cancel-support"),
             Self::Prepare(_) | Self::CancelPrepare(_) => {
                 let p = match self {
@@ -1467,6 +1480,12 @@ impl Request {
                     p.duty.word()
                 )
                 .ok()?;
+                if let Some(domain) = &p.rejection_domain {
+                    if !aterm_codec::hex::is_lower(domain, 64) {
+                        return None;
+                    }
+                    write!(out, " reject={domain}").ok()?;
+                }
                 if let Some(seq) = p.expected_human_seq {
                     write!(out, " human-seq={seq}").ok()?;
                 }
@@ -1645,6 +1664,8 @@ pub enum Reply {
     /// Enabled actual constructors in canonical order. An empty set is explicit disabled
     /// support; this observation grants no plan, mutation, typing duty or supervisor claim.
     Constructors(Vec<Constructor>),
+    /// Authenticated journal namespace, without any execution or signing capability.
+    RejectionDomain(String),
     /// This host can atomically seal an exact initial OwnImage preparation. Check this
     /// separate discovery reply before claiming; native-act=1 alone is insufficient.
     CancelSupport,
@@ -1710,8 +1731,9 @@ pub enum Reply {
     /// attempt settled, all without an exec grant. The same plan may retry.
     Unissued(ImagePhase),
     /// The host never admitted this restart operation id, and no later replay can: its
-    /// deadline passed on this host epoch's clock, no table holds the id and no issuer
-    /// record names it. Only a constructor that saved this exact prepare without a binding
+    /// deadline passed on this host epoch's clock with no table or issuer record,
+    /// or the issuer durably rejected this exact never-admitted recipe. Only a
+    /// constructor that saved this exact prepare without a binding
     /// may drop it; it records nothing completed.
     Unadmitted(String),
 }
@@ -1760,6 +1782,13 @@ impl Reply {
                     return None;
                 }
                 Self::CancelSupport
+            }
+            "rejection-domain" => {
+                let domain = words.next()?.strip_prefix("domain=")?;
+                if !aterm_codec::hex::is_lower(domain, 64) {
+                    return None;
+                }
+                Self::RejectionDomain(domain.to_owned())
             }
             "cancelled" => {
                 let encoded = words.next()?.strip_prefix("request=")?;
@@ -2051,6 +2080,42 @@ mod asked_upgrade_wire_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn durable_rejection_is_an_explicit_canonical_wire_requirement() {
+        let legacy = fixture();
+        let legacy_wire = legacy.encode().unwrap();
+        assert!(!legacy_wire.contains("reject="));
+        assert_eq!(Request::parse(&legacy_wire), Some(legacy.clone()));
+        let Request::Prepare(mut marked) = legacy else {
+            unreachable!()
+        };
+        let domain = "ab".repeat(32);
+        marked.rejection_domain = Some(domain.clone());
+        let marked = Request::Prepare(marked);
+        let wire = marked.encode().unwrap();
+        assert!(wire.contains(&format!(" reject={domain}")));
+        assert_eq!(Request::parse(&wire), Some(marked));
+        assert_eq!(
+            Request::parse(&wire.replace(&format!("reject={domain}"), "reject=unknown")),
+            None
+        );
+        assert_eq!(Request::parse(&(wire + &format!(" reject={domain}"))), None);
+        assert_eq!(
+            Request::parse("rejection-domain"),
+            Some(Request::RejectionDomain)
+        );
+        assert_eq!(
+            Reply::parse(&format!(
+                "OK native-act state=rejection-domain domain={domain}\n"
+            )),
+            Some(Reply::RejectionDomain(domain))
+        );
+        assert_eq!(
+            Reply::parse("OK native-act state=rejection-domain domain=bad\n"),
+            None
+        );
+    }
+
     fn fixture() -> Request {
         let image = Image {
             path: b"/private/image \xff".to_vec(),
@@ -2058,6 +2123,7 @@ mod tests {
             inode: 19,
         };
         Request::prepare(Prepare {
+            rejection_domain: None,
             asked: None,
             id: "12".repeat(16),
             host_epoch: "34".repeat(16),

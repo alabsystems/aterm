@@ -1452,6 +1452,11 @@ pub struct Log {
     /// (2026-11-08). `hold` lets it go; clones share it until one holds a record.
     #[cfg(unix)]
     generation: Arc<OnceLock<history::Generation>>,
+    /// What every epoch's historical writers read of the held records ([`eval::Historical`]):
+    /// a quiet repair round's history leases each derived it again, 8.5% of such a round over a
+    /// log of 9,605 records (2026-11-08). `hold` lets it go; clones share it until one holds a
+    /// record.
+    historical: Arc<OnceLock<eval::Historical>>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1543,6 +1548,7 @@ impl Log {
             advertised: Arc::default(),
             #[cfg(unix)]
             generation: Arc::default(),
+            historical: Arc::default(),
         })
     }
 
@@ -2118,9 +2124,9 @@ impl Log {
         self.historical_commons_writers_in(&OnceCell::new(), epoch)
     }
 
-    /// [`Log::historical_commons_writers`], reading what every epoch's writers read of this log
-    /// from `writers`, which the first epoch that needs it fills: a batch of epochs derives it
-    /// once.
+    /// [`Log::historical_commons_writers`], reading this log's graph from `writers`, which the
+    /// first epoch that needs it fills: a batch of epochs builds it once. What every epoch's
+    /// writers read of the log is the log's own ([`Log::historical_writers`]).
     fn historical_commons_writers_in<'a>(
         &'a self,
         writers: &OnceCell<eval::HistoricalWriters<'a>>,
@@ -2139,12 +2145,15 @@ impl Log {
         Some((*generation, writers))
     }
 
-    /// What every epoch's historical writers read of this log, derived into `writers` once.
+    /// This log's graph, built into `writers` once, with what every epoch's historical writers
+    /// read of it, which the log keeps for its held records ([`eval::Historical`]).
     fn historical_writers<'a, 'w>(
         &'a self,
         writers: &'w OnceCell<eval::HistoricalWriters<'a>>,
     ) -> &'w eval::HistoricalWriters<'a> {
-        writers.get_or_init(|| eval::HistoricalWriters::of(self.history(), self.weighing()))
+        writers.get_or_init(|| {
+            eval::HistoricalWriters::of(self.history(), &self.historical, self.weighing())
+        })
     }
 
     fn check_against_parents(&self, record: &Record) -> Result<()> {
@@ -2295,6 +2304,7 @@ impl Log {
         {
             self.generation = Arc::default();
         }
+        self.historical = Arc::default();
         #[cfg(test)]
         let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
         #[cfg(not(test))]

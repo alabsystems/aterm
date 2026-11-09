@@ -149,8 +149,8 @@ fn table(json: bool, chunks: &[String]) -> Vec<Vec<Seen>> {
 }
 
 /// A complete line is liveness and a partial line is not. The running names are exactly JSON
-/// cases with a start and no end, including after the first red (whose later failures are not
-/// reported twice). NEGATIVE CONTROLS: `half` leaves the line count unchanged, and ending `a`
+/// cases with a start and no end, including after the first red (whose later failures emit no
+/// second decisive signal). NEGATIVE CONTROLS: `half` leaves the line count unchanged, and ending `a`
 /// removes only `a` while `b` remains.
 #[test]
 fn complete_lines_and_unfinished_json_cases_are_live_evidence() {
@@ -180,6 +180,31 @@ fn complete_lines_and_unfinished_json_cases_are_live_evidence() {
     assert!(live.poll().is_empty(), "a later red is not emitted twice");
     assert!(live.running().is_empty());
     assert_eq!(live.lines(), Some(6));
+    assert_eq!(
+        live.observations()
+            .failures
+            .iter()
+            .map(|failure| failure.case.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "c"],
+        "both failed cases remain diagnostic evidence"
+    );
+    writer.write_all(failed("a", PLAIN).as_bytes()).unwrap();
+    writer
+        .write_all(failed("unknown", PLAIN).as_bytes())
+        .unwrap();
+    assert!(live.poll().is_empty());
+    assert_eq!(live.observations().failures.len(), 2);
+    for n in 0..crate::report::FINDINGS_SHOWN {
+        let name = format!("later-{n}");
+        writer.write_all(started(&name).as_bytes()).unwrap();
+        writer.write_all(failed(&name, PLAIN).as_bytes()).unwrap();
+    }
+    assert!(live.poll().is_empty());
+    assert_eq!(
+        live.observations().failures.len(),
+        crate::report::FINDINGS_SHOWN
+    );
 }
 
 /// An unread capture cannot prove that no line was written. A later readable file establishes a

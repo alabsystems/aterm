@@ -2609,24 +2609,19 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<&'static str>)> {
-        if self.stats_lens_at(wid, x, y)
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-            || self
-                .windows
-                .get(&wid)
-                .is_none_or(|ws| ws.claude_card.glass_hits.is_empty())
-        {
+        let ws = self.windows.get(&wid)?;
+        if ws.claude_card.glass_hits.is_empty() {
             return None;
         }
         let (row, col) = self.glass_cell_at(wid, x, y)?;
-        let ws = self.windows.get(&wid)?;
         let hit = ws
             .claude_card
             .glass_hits
             .iter()
             .find(|hit| hit.frame_row == row && hit.cols.contains(&col))?;
-        (!self.chrome_owns_terminal_cell(wid, hit.term_row, col)).then_some((hit.session, hit.url))
+        (!self.chrome_owns_terminal_cell(wid, hit.term_row, col)
+            && !self.chrome_overlay_at(wid, x, y))
+        .then_some((hit.session, hit.url))
     }
 
     /// Whether the pointer rests on a link of the glass's harness words in `wid`

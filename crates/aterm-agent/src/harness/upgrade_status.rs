@@ -4001,9 +4001,6 @@ pub enum Ask {
     Skip,
 }
 
-/// Hang detector for recording an owner's word behind an actual sweep writer.
-const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Prefix of [`ask`]'s refusal of `--now` for a stopped round the owner's word may not re-arm.
 pub const REFUSED_STOPPED: &str = "stopped:";
 
@@ -4026,7 +4023,7 @@ pub fn ask(opts: &Opts, sid: &str, what: Ask, claims: bool) -> Result<Row, Strin
 }
 
 fn ask_aside(opts: &Opts, sid: &str, what: Ask, aside: &dyn Fn() -> Aside) -> Result<Row, String> {
-    let (mut row, held) = ask_within(opts, sid, what, None, ASK_LOCK_WAIT, &|s| {
+    let (mut row, held) = ask_within(opts, sid, what, None, opts.timings.owner_word_wait, &|s| {
         holders(opts, s, None)
     })?;
     if row.held_by_a_process() {
@@ -4103,9 +4100,14 @@ fn ask_for_aside(
         session,
         scope: None,
     };
-    ask_within(opts, sid, what, Some(shown), ASK_LOCK_WAIT, &|s| {
-        holders(opts, s, None)
-    })
+    ask_within(
+        opts,
+        sid,
+        what,
+        Some(shown),
+        opts.timings.owner_word_wait,
+        &|s| holders(opts, s, None),
+    )
     .map(|(row, _)| row)
 }
 
@@ -4128,9 +4130,14 @@ pub fn ask_for_scope(
         session,
         scope: Some(scope),
     };
-    ask_within(opts, sid, what, Some(shown), ASK_LOCK_WAIT, &|s| {
-        holders(opts, s, None)
-    })
+    ask_within(
+        opts,
+        sid,
+        what,
+        Some(shown),
+        opts.timings.owner_word_wait,
+        &|s| holders(opts, s, None),
+    )
     .map(|(row, _)| row)
 }
 

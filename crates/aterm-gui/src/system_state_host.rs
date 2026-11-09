@@ -34,6 +34,9 @@ pub struct InitialSetupHandlers {
     pub check: fn(Plan) -> CheckStarted,
     pub restore: fn() -> bool,
     pub status: fn() -> SetupStatus,
+    /// Whether this login currently owns this Mac's local graphic console. Read only when
+    /// booking or landing the automatic Mac Setup tab, never to paint or project a page.
+    pub own_console: fn() -> bool,
     /// Start one ordinary read-only observation of every row for `plan`; private readers
     /// require the page in front, and managed rows decide which network reads run. Its result
     /// arrives in a later `status()`. Never holds the setup slot.
@@ -94,6 +97,7 @@ impl InitialSetupHandlers {
             check: |_| CheckStarted::default(),
             restore: || false,
             status: SetupStatus::default,
+            own_console: || true,
             observe: |_| false,
             look_for_token: |_| false,
             stop: || {},

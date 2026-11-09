@@ -39,7 +39,9 @@ fn dispatcher(m: &Model) -> Dispatcher {
         order: (1..=4)
             .map(|i| Planned {
                 index: i - 1,
-                width: u32_of(&format!("C{i}")),
+                // A waiting binary may use every libtest thread while consuming fewer cores.
+                // Charging its width instead breaks the model's reachable schedules.
+                width: u32_of("Share"),
                 charge: u32_of(&format!("C{i}")),
                 peak: u64_of(&format!("P{i}")),
                 predicted: Some(Duration::from_secs(1)),

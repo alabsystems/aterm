@@ -1399,6 +1399,7 @@ impl App {
         terminal.ended = true;
         let told = terminal.told;
         let claim_owner = terminal.claim_owner.clone();
+        let recovered = terminal.recovered;
         // EOF can precede the child's status. A person may start a retry meanwhile: retain the
         // old terminal's result, but only the current attempt changes the retry's state or shim.
         let current = self.workstation_setup.developer_tools_attempt == Some(session);
@@ -1459,6 +1460,12 @@ impl App {
                     if setup.developer_tools_reads_mac && setup.developer_tools_network.is_none() {
                         setup.developer_tools_network = NetworkWatch::start();
                     }
+                    if !recovered && claim_owner.is_some() && !setup.developer_tools_mark.opened() {
+                        // This current child found no definite independent root work before
+                        // its password ask. Retire only the cached scheduling hint, so the
+                        // retained want waits for the download instead of opening another tab.
+                        setup.developer_tools_root_owed = false;
+                    }
                 }
             }
             Some(aterm_pty::ChildExit::Code(code))
@@ -1470,6 +1477,45 @@ impl App {
                 );
                 if current {
                     self.workstation_setup.developer_tools_not_admin = true;
+                }
+            }
+            Some(aterm_pty::ChildExit::Code(code))
+                if code
+                    == i32::from(
+                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_OWN_LOGIN,
+                    )
+                    || code
+                        == i32::from(
+                            aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_INSTALLER_HELD,
+                        ) =>
+            {
+                aterm_log::info!(
+                    "System State: the Mac Setup tab deferred before its password ask ({code})"
+                );
+                if current {
+                    self.workstation_setup.developer_tools_unfinished = true;
+                    if !recovered && let Some(owner) = &claim_owner {
+                        self.workstation_setup
+                            .developer_tools_mark
+                            .forget_owner(owner);
+                        if !self.workstation_setup.developer_tools_mark.opened() {
+                            if code
+                                == i32::from(
+                                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_INSTALLER_HELD,
+                                )
+                            {
+                                // Read the real custody once; the combined exit code cannot
+                                // supply an installer observation for the ordinary gate.
+                                let _ = self.developer_tools_reading();
+                            }
+                            let setup = &mut self.workstation_setup;
+                            if setup.developer_tools == Install::Opened {
+                                setup.developer_tools = setup
+                                    .developer_tools_want
+                                    .map_or(Install::Unasked, Install::Wanted);
+                            }
+                        }
+                    }
                 }
             }
             Some(other) => {
@@ -1813,10 +1859,11 @@ impl App {
 
     /// Whether the automatic tab waits on the network: Low Data Mode holds the download back, or
     /// a watch just started has not read it yet ([`FIRST_READING`]). With the tools there is no
-    /// download, so the elevation's other steps never wait on it.
+    /// download, so the elevation's other steps never wait on it. A cached independent root
+    /// need also admits the same transaction; its child checks that need again before asking.
     fn developer_tools_wait_network(&self) -> bool {
         let setup = &self.workstation_setup;
-        if setup.developer_tools_shim.tools_present() {
+        if setup.developer_tools_shim.tools_present() || setup.developer_tools_root_owed {
             return false;
         }
         match setup.developer_tools_low_data {
@@ -1858,7 +1905,8 @@ impl App {
     /// itself ([`Self::developer_tools_install_held`]): a key typed in the last 2.5 s, another
     /// macOS dialog of this process, the network watch's first reading, or, while the launch's
     /// reading of the elevation's other steps is out
-    /// ([`crate::workstation_setup::Host::root_steps_awaited`]), no want yet or nothing yet owed.
+    /// ([`crate::workstation_setup::Host::root_steps_awaited`]), no want yet, nothing yet owed,
+    /// or Low Data Mode: independent root work may still precede its constrained download.
     /// A walk that would start by itself yields to it (`App::look_for_walk_start`), and so do
     /// System State's access steps and a control verb's page (`App::no_gesture_up`): a helper
     /// panel, alert or page nobody answers would hold setup's one password for as long as it
@@ -1873,7 +1921,9 @@ impl App {
         }
         match self.developer_tools_install_gate(false, false) {
             None | Some(FIRST_NETWORK_READING) => true,
-            Some(NO_WANT | NOTHING_OWED) => self.workstation_setup.root_steps_awaited,
+            Some(NO_WANT | NOTHING_OWED | "Low Data Mode") => {
+                self.workstation_setup.root_steps_awaited
+            }
             Some(_) => false,
         }
     }
@@ -1975,6 +2025,9 @@ impl App {
             && missing
             && crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             && self.developer_tools_install_authorized(revision)
+            && self
+                .system_state_handlers()
+                .is_some_and(|handlers| (handlers.own_console)())
             && !self.developer_tools_tab_adopted()
             && !self.access_dialog_up()
             && !self.developer_tools_install_blocked()
@@ -2130,6 +2183,14 @@ impl App {
             }
         }
         if held.is_some() {
+            return None;
+        }
+        // The app has no controlling tty. Its own local graphic console is checked here;
+        // the child's full person/tty admission is checked again under the terminal lease.
+        if !self
+            .system_state_handlers()
+            .is_some_and(|handlers| (handlers.own_console)())
+        {
             return None;
         }
         // The account's record names this build now: another asker of this build (the follow-up

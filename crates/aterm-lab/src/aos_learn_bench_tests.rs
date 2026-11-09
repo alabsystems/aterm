@@ -881,8 +881,14 @@ fn the_runner_takes_its_flags_alone() {
         assert_eq!(parse(&args(bad)).err().map(|f| f.code), Some(2), "{bad:?}");
     }
     let mut help = Vec::new();
-    assert_eq!(cmd_to(&args(&["--help"]), &mut help).ok(), Some(0));
+    assert_eq!(cmd_to(&args(&["--help"]), &mut help, || 0).ok(), Some(0));
     assert_eq!(help, HELP.as_bytes());
+    let refused = cmd_to(&args(&["--help"]), &mut Vec::new(), || 1).expect_err("a defect");
+    assert_eq!(refused.code, 1);
+    assert_eq!(
+        refused.msg.as_deref(),
+        Some("aos-learn-bench: defect: held_out_judged reads 1, not 0")
+    );
     /// A stdout that is gone: every write and flush fails as a dead pipe does.
     struct Gone;
     impl Write for Gone {
@@ -894,7 +900,7 @@ fn the_runner_takes_its_flags_alone() {
         }
     }
     assert_eq!(
-        cmd_to(&args(&["--help"]), &mut Gone).ok(),
+        cmd_to(&args(&["--help"]), &mut Gone, || 0).ok(),
         Some(0),
         "a stdout that is gone is no panic, and the exit still passes the guard"
     );

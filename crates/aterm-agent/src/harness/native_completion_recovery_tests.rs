@@ -37,6 +37,7 @@ pub(super) fn fixture(rollback: bool, wrapper: bool, future: bool) -> (St, Prepa
     }
     .clone();
     let prepare = Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),

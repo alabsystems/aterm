@@ -451,7 +451,9 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
 /// Whether `paths`' own denial check, as a table session's access asks it under `lock`
 /// (`Bootstrap::access_in_observed`), finds this Mac denied, with the files it read.
 fn denial(paths: &Paths, lock: &StateLock) -> (bool, BTreeMap<PathBuf, usize>) {
-    let (denied, read) = reads_during(paths, || local_recipient_denied_under(paths, lock));
+    let (denied, read) = reads_during(paths, || {
+        local_recipient_denied_under(paths, lock, &crate::fsx::Glance::new())
+    });
     (denied.expect("the denial check reads"), read)
 }
 

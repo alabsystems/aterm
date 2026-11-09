@@ -535,11 +535,12 @@ pub fn claim(
 ) -> Result<Claim> {
     check_version_shape(plan.version)?;
 
-    let mut tip = origin.refresh_main().map_err(|e| {
-        Error::new(format!(
-            "cannot reach origin (no offline cuts — the ledger claim IS the push): {e}"
-        ))
-    })?;
+    let mut tip = crate::cut_timing::measure("claim refresh main", || origin.refresh_main())
+        .map_err(|e| {
+            Error::new(format!(
+                "cannot reach origin (no offline cuts — the ledger claim IS the push): {e}"
+            ))
+        })?;
     let head = rev_parse(git, "HEAD")?;
     if head != plan.source {
         return Err(Error::new(format!(
@@ -548,20 +549,35 @@ pub fn claim(
             plan.source
         )));
     }
-    source_on_main(git, plan.source, &tip)?;
-    reservation_is_the_claims(git, plan, reserved)?;
-    let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
+    crate::cut_timing::measure("claim source ancestry", || {
+        source_on_main(git, plan.source, &tip)
+    })?;
+    let (source_ledger, source_changelog) =
+        crate::cut_timing::measure("claim reservation proof", || {
+            reservation_is_the_claims(git, plan, reserved)
+        })?;
     let (n, release, line) = (
         reserved.build,
         reserved.commit.as_str(),
         reserved.line.as_str(),
     );
 
-    let mut base = show_utf8(git, &tip, LEDGER_FILE)?;
+    let mut base =
+        crate::cut_timing::measure("claim read ledger", || show_utf8(git, &tip, LEDGER_FILE))?;
     let mut attempt = 0u32;
+    let source_prefix = if source_ledger.ends_with('\n') {
+        source_ledger.clone()
+    } else {
+        format!("{source_ledger}\n")
+    };
     let landed = loop {
         attempt += 1;
-        let tail_build = tail(&base)?.build;
+        if base != source_ledger && !base.starts_with(&source_prefix) {
+            return Err(Error::new(
+                "origin's ledger rewrites the published source's historical records; nothing was claimed",
+            ));
+        }
+        let tail_build = crate::cut_timing::measure("claim parse ledger", || tail(&base))?.build;
         if tail_build >= n {
             return Err(Error::new(format!(
                 "origin's ledger tail is build {tail_build}, at or past the reserved build {n} \
@@ -593,14 +609,15 @@ pub fn claim(
             )?
         };
 
-        let written = origin
-            .write("refs/heads/main", Some(&tip), &landed)
-            .map_err(|error| {
-                Error::new(format!(
-                    "native main claim failed; refusing to reinterpret it as a known \
+        let written = crate::cut_timing::measure("claim native writer", || {
+            origin.write("refs/heads/main", Some(&tip), &landed)
+        })
+        .map_err(|error| {
+            Error::new(format!(
+                "native main claim failed; refusing to reinterpret it as a known \
                  compare-and-swap conflict: {error}"
-                ))
-            })?;
+            ))
+        })?;
         if written == RefWrite::Written {
             break landed;
         }
@@ -647,14 +664,18 @@ pub fn claim(
             RELEASE_COMMAND
         ))
     };
-    let origin_tip = origin.refresh_main().map_err(unjournaled)?;
+    let origin_tip =
+        crate::cut_timing::measure("claim verify remote main", || origin.refresh_main())
+            .map_err(unjournaled)?;
     if origin_tip != landed {
         return Err(unjournaled(format!(
             "origin/main ({origin_tip}) is not the pushed claim ({landed})"
         )));
     }
-    let remote =
-        show_utf8(git, &origin_tip, LEDGER_FILE).map_err(|e| unjournaled(e.to_string()))?;
+    let remote = crate::cut_timing::measure("claim verify remote ledger", || {
+        show_utf8(git, &origin_tip, LEDGER_FILE)
+    })
+    .map_err(|e| unjournaled(e.to_string()))?;
     let remote_tail = remote.lines().last().unwrap_or("");
     if remote_tail != line {
         return Err(unjournaled(format!(
@@ -701,7 +722,7 @@ fn reservation_is_the_claims(
     git: &dyn GitRunner,
     plan: &ClaimPlan<'_>,
     reserved: &Reserved,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let refuse = |why: String| {
         Err(Error::new(format!(
             "the reserved release commit {} is not this claim's: {why} — nothing was claimed; \
@@ -724,7 +745,8 @@ fn reservation_is_the_claims(
         ));
     }
     let ledger = show_utf8(git, &reserved.commit, LEDGER_FILE)?;
-    if ledger != appended(&show_utf8(git, plan.source, LEDGER_FILE)?, &reserved.line) {
+    let source_ledger = show_utf8(git, plan.source, LEDGER_FILE)?;
+    if ledger != appended(&source_ledger, &reserved.line) {
         return refuse(format!(
             "its ledger is not the published commit's plus {:?}",
             reserved.line
@@ -757,7 +779,7 @@ fn reservation_is_the_claims(
     if !stray.is_empty() {
         return refuse(format!("it moves {stray:?} against the published commit"));
     }
-    Ok(())
+    Ok((source_ledger, source_changelog))
 }
 
 /// A commit made from git objects alone, with no worktree or index: `base`'s root tree with each top-level `files` entry's bytes replaced (each must already be a blob there), committed with `parents` and `message` under the repository's configured identity.

@@ -318,6 +318,8 @@ fn clt_recovery_an_update_preserves_the_original_episode_and_exact_release_owner
         (true, false, ChildExit::Code(low_data), true),
         (false, false, ChildExit::Code(127), false),
         (false, true, ChildExit::Code(1), true),
+        (false, false, ChildExit::Code(7), true),
+        (false, false, ChildExit::Code(8), true),
     ] {
         let directory = aterm_tempfile::tempdir().unwrap();
         let mark = directory.path().join("command-line-tools-tab");
@@ -348,7 +350,12 @@ fn clt_recovery_an_update_preserves_the_original_episode_and_exact_release_owner
                 "adopted explicit attempt survives older release"
             );
         }
+        recovered.root_steps_owed(true);
         recovered.developer_tools_install_ended(local, Some(end));
+        assert!(
+            recovered.workstation_setup.developer_tools_root_owed,
+            "an adopted child's {end:?} is not a fresh root-work reading"
+        );
         assert_eq!(Mark::at(mark.clone()).opened(), held, "{history} {end:?}");
         if history {
             assert_eq!(

@@ -2768,6 +2768,12 @@ fn prepend_path_in_profile(shell: Option<&str>, path: &str) -> Option<String> {
 }
 
 fn keg_time(dir: &std::path::Path) -> Option<u64> {
+    // Brew's tab time is the pour time recorded in the receipt;
+    // the file's mtime moves with later receipt rewrites.
+    if let Some(secs) = super::prefix::receipt_word(dir, "time").and_then(|w| w.parse::<u64>().ok())
+    {
+        return Some(secs);
+    }
     let meta = std::fs::symlink_metadata(dir.join("INSTALL_RECEIPT.json"))
         .ok()
         .filter(std::fs::Metadata::is_file)
@@ -2798,6 +2804,21 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
     let aterm_json::Value::Object(map) = value else {
         return;
     };
+    // to_hash prints caveats_with_placeholders: the real paths
+    // go back to the generation tokens.
+    if let Some(aterm_json::Value::String(caveats)) = map.get_mut("caveats") {
+        // Brew gsubs the prefix first, so a cellar path keeps
+        // its `$HOMEBREW_PREFIX/Cellar/...` shape.
+        *caveats = caveats
+            .replace(
+                &prefix.root.to_string_lossy().into_owned(),
+                "$HOMEBREW_PREFIX",
+            )
+            .replace(
+                &prefix.cellar().to_string_lossy().into_owned(),
+                "$HOMEBREW_CELLAR",
+            );
+    }
     // Brew's `to_hash` — what `info --json` prints — never carries
     // these raw-API fields (analytics is its own opt-in report), and
     // its bottle `files` holds only the bottle this machine would
@@ -2937,10 +2958,15 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
                 "used_options".to_string(),
                 aterm_json::Value::Array(Vec::new()),
             );
-            row.insert("built_as_bottle".to_string(), aterm_json::Value::Bool(true));
+            row.insert(
+                "built_as_bottle".to_string(),
+                aterm_json::Value::Bool(
+                    super::prefix::receipt_bool(&keg, "built_as_bottle").unwrap_or(true),
+                ),
+            );
             row.insert(
                 "poured_from_bottle".to_string(),
-                aterm_json::Value::Bool(true),
+                aterm_json::Value::Bool(super::prefix::receipt_poured_from_bottle(&keg)),
             );
             row.insert(
                 "time".to_string(),
@@ -2948,7 +2974,8 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
             );
             row.insert(
                 "runtime_dependencies".to_string(),
-                aterm_json::Value::Array(runtime.clone()),
+                super::prefix::receipt_runtime_deps_value(&keg)
+                    .unwrap_or_else(|| aterm_json::Value::Array(runtime.clone())),
             );
             row.insert(
                 "installed_on_request".to_string(),
@@ -2963,7 +2990,7 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
             linked = aterm_json::Value::String(v);
         }
         if let Some(f) = &parsed {
-            outdated = version_cmp(&inst.version, &f.version) == Ordering::Less;
+            outdated = formula_outdated(prefix, &inst, f);
         }
     }
     map.insert(
@@ -5321,15 +5348,169 @@ pub(super) fn cmd_cache_query(
     ExitCode::SUCCESS
 }
 
-pub(super) fn list_index(api: &Api, casks: bool) -> ExitCode {
+/// Brew's `sort -uf` over index names (BSD sort here): case
+/// folded, with letters collating between `@` and `[` rather
+/// than at their ASCII positions, so `async_simple` follows
+/// `asyncplusplus` while `async-profiler` leads. Returns the
+/// comparison of two names in that order.
+fn index_name_cmp(a: &str, b: &str) -> Ordering {
+    fn weights(s: &str) -> Vec<u32> {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphabetic() {
+                    1000 + c.to_ascii_lowercase() as u32
+                } else if ('['..='~').contains(&c) {
+                    2000 + c as u32
+                } else {
+                    c as u32
+                }
+            })
+            .collect()
+    }
+    weights(a).cmp(&weights(b))
+}
+
+pub(super) fn list_index(prefix: &Prefix, api: &Api, casks: bool) -> ExitCode {
     match api.index(casks) {
         Ok(rows) => {
-            for (name, _) in rows {
+            let mut names: Vec<String> = rows.iter().map(|(name, _)| name.clone()).collect();
+            names.extend(tap_item_names(prefix, casks));
+            names.sort_by(|a, b| index_name_cmp(a, b));
+            names.dedup_by(|next, kept| index_name_cmp(next, kept) == Ordering::Equal);
+            for name in names {
                 println!("{name}");
             }
             ExitCode::SUCCESS
         }
         Err(e) => failed(&e),
+    }
+}
+
+/// Brew's `homebrew-items` for the `formulae`/`casks` shell
+/// commands: every `<tap>/<item>` in the prefix's tap
+/// checkouts plus its short name. With tap trust required
+/// (the default) an item survives only when its tap is the
+/// official one, the tap or its remote is trusted, or the
+/// item itself is trusted; skipped taps warn unless a
+/// completion is asking. Without the requirement all items
+/// count, minus the official tap (whose names the API list
+/// already carries).
+fn tap_item_names(prefix: &Prefix, casks: bool) -> Vec<String> {
+    let trust_required =
+        std::env::var_os("HOMEBREW_NO_REQUIRE_TAP_TRUST").is_none_or(|v| v.is_empty());
+    let official = if casks {
+        "homebrew/cask"
+    } else {
+        "homebrew/core"
+    };
+    let (trusted_taps, trusted_items) = if trust_required {
+        (
+            super::trust::trusted_entries(super::trust::TrustType::Tap),
+            super::trust::trusted_entries(if casks {
+                super::trust::TrustType::Cask
+            } else {
+                super::trust::TrustType::Formula
+            }),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let subdir = if casks { "Casks" } else { "Formula" };
+    let mut out: Vec<String> = Vec::new();
+    let mut untrusted: Vec<String> = Vec::new();
+    let Ok(users) = std::fs::read_dir(prefix.taps_dir()) else {
+        return out;
+    };
+    for user_entry in users.flatten() {
+        let Some(user) = user_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(repos) = std::fs::read_dir(user_entry.path()) else {
+            continue;
+        };
+        for repo_entry in repos.flatten() {
+            let Some(repo) = repo_entry
+                .file_name()
+                .to_str()
+                .and_then(|n| {
+                    n.strip_prefix("homebrew-")
+                        .or_else(|| n.strip_prefix("linuxbrew-"))
+                })
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let tap_name = format!("{user}/{repo}");
+            if !trust_required && tap_name == official {
+                continue;
+            }
+            let tap = tap::Tap {
+                user: user.clone(),
+                repo: repo.clone(),
+                path: repo_entry.path(),
+            };
+            let reference = if trust_required {
+                tap::remote_url(&tap)
+                    .map(|r| r.to_lowercase())
+                    .unwrap_or_else(|| tap_name.clone())
+            } else {
+                String::new()
+            };
+            let mut items: Vec<String> = Vec::new();
+            collect_rb_items(&repo_entry.path().join(subdir), &mut items);
+            let had_items = !items.is_empty();
+            let mut kept_any = false;
+            for item in items {
+                let qualified = format!("{tap_name}/{item}");
+                let keep = !trust_required
+                    || tap_name == official
+                    || trusted_taps.contains(&tap_name)
+                    || trusted_taps.contains(&reference)
+                    || trusted_items.contains(&qualified)
+                    || trusted_items.contains(&format!("{reference}/{item}"));
+                if keep {
+                    kept_any = true;
+                    out.push(qualified);
+                    out.push(item);
+                }
+            }
+            // Brew warns once per tap with at least one
+            // candidate file; an empty checkout is silent.
+            if trust_required && had_items && !kept_any && tap_name != official {
+                untrusted.push(tap_name);
+            }
+        }
+    }
+    if std::env::var_os("HOMEBREW_COMPLETION").is_none_or(|v| v.is_empty()) {
+        untrusted.sort();
+        for tap in untrusted {
+            super::tty::opoo!(
+                "Warning: Skipping {tap} because it is not trusted. Run `brew trust {tap}` to trust it."
+            );
+        }
+    }
+    out
+}
+
+/// Collects `.rb` basenames (without the extension) under
+/// `dir`, pruning the directories brew's `find` prunes.
+fn collect_rb_items(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if kind.is_dir() {
+            if !matches!(name, "cmd" | ".github" | "spec" | "vendor" | ".git") {
+                collect_rb_items(&entry.path(), out);
+            }
+        } else if let Some(stem) = name.strip_suffix(".rb") {
+            out.push(stem.to_string());
+        }
     }
 }
 
@@ -5606,9 +5787,11 @@ fn brew_shellenv(root: &str, shell: &str) -> String {
 }
 
 pub(super) fn cmd_shellenv(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let shell = operands(rest)
-        .into_iter()
-        .next()
+    // Brew's shell function reads only its first raw argument
+    // as the shell name (anything unrecognized is POSIX).
+    let shell = rest
+        .first()
+        .cloned()
         .or_else(crate::caller_shell::invoking_shell)
         .unwrap_or_default();
     if super::via_reroute() {
@@ -5710,7 +5893,11 @@ fn keg_bin_linked(prefix: &Prefix, name: &str, version: &str) -> Option<bool> {
 fn linked_keg_version(prefix: &Prefix, i: &Installed) -> Option<String> {
     let mut linked: Option<String> = None;
     for version in &i.versions {
-        if keg_bin_linked(prefix, &i.name, version) == Some(true) {
+        // The full link plan, not just bin/: a header/library
+        // keg links without ever placing a binary.
+        if keg_bin_linked(prefix, &i.name, version) == Some(true)
+            || super::install::is_linked(prefix, &i.name, version)
+        {
             if linked
                 .as_deref()
                 .is_some_and(|prior| prior != version.as_str())
@@ -6157,7 +6344,7 @@ pub(super) fn outdated_linked_formula(
             .formula(name)
             .ok()
             .or_else(|| tap::lookup(prefix, name))?;
-        if version_cmp(&inst.version, &install::keg_version(&f)) != Ordering::Less {
+        if !formula_outdated(prefix, &inst, &f) {
             return None;
         }
         prefix.optlinked_version(short)?;
@@ -6168,7 +6355,7 @@ pub(super) fn outdated_linked_formula(
         .ok()
         .or_else(|| tap::lookup(prefix, name))?;
     let inst = prefix.installed_one(Kind::Formula, &f.name)?;
-    if version_cmp(&inst.version, &install::keg_version(&f)) != Ordering::Less {
+    if !formula_outdated(prefix, &inst, &f) {
         return None;
     }
     prefix.optlinked_version(&f.name)?;
@@ -8388,6 +8575,50 @@ fn cask_installed_below(installed: &str, minimum: &str) -> bool {
     installed != "latest" && version_cmp(installed, minimum) == Ordering::Less
 }
 
+/// Brew's keg version is a HEAD version (`Version#head?`).
+fn is_head_version(version: &str) -> bool {
+    version == "HEAD" || version.starts_with("HEAD-")
+}
+
+/// Brew's `Formula#outdated?` decision without `--fetch-HEAD`
+/// (that switch is not native): some non-HEAD keg at the
+/// current version and linked (or pinned) settles it, else a
+/// HEAD keg whose recorded scheme/stable have not been passed
+/// does. HEAD kegs never compare as plain versions.
+fn formula_outdated(prefix: &Prefix, inst: &super::prefix::Installed, f: &Formula) -> bool {
+    let latest = install::keg_version(f);
+    let pinned = prefix.is_pinned(&inst.name);
+    let optlinked = prefix.optlinked_version(&inst.name);
+    let mut head_keg: Option<&String> = None;
+    for version in &inst.versions {
+        if is_head_version(version) {
+            head_keg = Some(version);
+            continue;
+        }
+        let (_, scheme) = super::prefix::receipt_tab_versions(&prefix.keg(&inst.name, version));
+        let scheme = scheme.unwrap_or(0);
+        if f.version_scheme > scheme && latest != *version {
+            continue;
+        }
+        if f.version_scheme == scheme && version_cmp(&latest, version) == Ordering::Greater {
+            continue;
+        }
+        if !pinned && optlinked.as_deref() != Some(version.as_str()) {
+            continue;
+        }
+        return false;
+    }
+    if let Some(head) = head_keg {
+        let (stable, scheme) = super::prefix::receipt_tab_versions(&prefix.keg(&inst.name, head));
+        let head_outdated = scheme.unwrap_or(0) < f.version_scheme
+            || stable
+                .as_deref()
+                .is_some_and(|s| version_cmp(s, &f.version) == Ordering::Less);
+        return head_outdated;
+    }
+    true
+}
+
 fn outdated_rows(
     prefix: &Prefix,
     api: &Api,
@@ -8408,7 +8639,7 @@ fn outdated_rows(
     } else {
         for i in prefix.installed(Kind::Formula) {
             let f = api.formula(&i.name)?;
-            if version_cmp(&i.version, &install::keg_version(&f)) == Ordering::Less {
+            if formula_outdated(prefix, &i, &f) {
                 out.push((i.name, i.version, install::keg_version(&f)));
             }
         }
@@ -8972,6 +9203,18 @@ pub(super) fn cmd_upgrade(
                     }
                 }
             }
+            let scope: Vec<String> = rows
+                .iter()
+                .chain(pinned.iter())
+                .map(|(n, _, _)| n.clone())
+                .chain(
+                    dep_install_rows
+                        .iter()
+                        .chain(dep_upgrade_rows.iter())
+                        .map(|(n, _, _, _)| n.clone()),
+                )
+                .collect();
+            print_deprecated_section(prefix, api, &scope);
         };
         if opts.dry_run {
             print_would(&rows, &cask_rows, &pinned, &cask_pinned);
@@ -8982,9 +9225,11 @@ pub(super) fn cmd_upgrade(
         // plans prompt for nothing (brew prompts only when
         // something would change).
         let mut previewed_pinned = false;
+        let mut previewed_summary = false;
         if opts.ask && (!rows.is_empty() || !cask_rows.is_empty()) {
             print_would(&rows, &cask_rows, &pinned, &cask_pinned);
             previewed_pinned = !pinned.is_empty();
+            previewed_summary = true;
             if let Err(e) = install::ask_to_proceed("upgrade") {
                 return from_install(prefix, args, Err(e));
             }
@@ -8995,6 +9240,17 @@ pub(super) fn cmd_upgrade(
         }
         let mut failures = 0;
         let mut upgraded: Vec<(String, String, String, Option<String>)> = Vec::new();
+        let scope_names: Vec<String> = rows
+            .iter()
+            .map(|(n, _, _)| n.clone())
+            .chain(pinned.iter().map(|(n, _, _)| n.clone()))
+            .chain(
+                dep_install_rows
+                    .iter()
+                    .chain(dep_upgrade_rows.iter())
+                    .map(|(n, _, _, _)| n.clone()),
+            )
+            .collect();
         for (name, have, latest) in rows {
             // Brew's per-formula upgrade message: the headline,
             // then the indented version change (with the older
@@ -9071,6 +9327,9 @@ pub(super) fn cmd_upgrade(
             for line in version_change_lines(&changes) {
                 println!("{line}");
             }
+        }
+        if !previewed_summary || upgraded.len() >= 2 {
+            print_deprecated_section(prefix, api, &scope_names);
         }
         if want_casks {
             // The combined prompt above covered casks too; their
@@ -9384,6 +9643,57 @@ fn upgrade_dep_plan(
     (state.installs, state.upgrades)
 }
 
+/// Brew's final-summary deprecated/disabled section: the
+/// formulae in the upgrade scope (requested, pinned,
+/// dependents and pulled-in dependencies) whose records are
+/// deprecated or disabled, deprecated first, each once.
+fn print_deprecated_section(prefix: &Prefix, api: &Api, names: &[String]) {
+    let mut deprecated: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    for name in names {
+        let Some(f) = api.formula(name).ok().or_else(|| tap::lookup(prefix, name)) else {
+            continue;
+        };
+        let shown = prefix
+            .installed_one(Kind::Formula, &f.name)
+            .map(|i| prefix.specified_name(&i))
+            .unwrap_or_else(|| f.name.clone());
+        let list = if f.deprecate {
+            &mut deprecated
+        } else if f.disable {
+            &mut disabled
+        } else {
+            continue;
+        };
+        if !list.contains(&shown) {
+            list.push(shown);
+        }
+    }
+    let items: Vec<String> = deprecated
+        .iter()
+        .map(|n| format!("{n} (deprecated)"))
+        .chain(disabled.iter().map(|n| format!("{n} (disabled)")))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        super::tty::oh1(&format!(
+            "{} Deprecated or disabled {}",
+            items.len(),
+            if items.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            }
+        ))
+    );
+    for item in items {
+        println!("{item}");
+    }
+}
+
 /// Brew's `print_dry_run_dependency_summary`: one section per
 /// non-empty group, installs first.
 fn print_dep_sections(
@@ -9591,6 +9901,19 @@ fn upgrade_formula_names(
                 println!("{line}");
             }
         }
+        let scope: Vec<String> = planned
+            .iter()
+            .map(|f| f.name.clone())
+            .chain(dependents.upgradeable.iter().map(|(f, _)| f.name.clone()))
+            .chain(dependents.pinned.iter().map(|(n, _, _)| n.clone()))
+            .chain(
+                dep_install_rows
+                    .iter()
+                    .chain(dep_upgrade_rows.iter())
+                    .map(|(n, _, _, _)| n.clone()),
+            )
+            .collect();
+        print_deprecated_section(prefix, api, &scope);
         if let Err(e) = install::ask_to_proceed("upgrade") {
             return from_install(prefix, args, Err(e));
         }
@@ -9888,6 +10211,21 @@ fn upgrade_formula_names(
         for line in version_change_lines(&rows) {
             println!("{line}");
         }
+    }
+    {
+        let scope: Vec<String> = planned
+            .iter()
+            .map(|f| f.name.clone())
+            .chain(dependents.upgradeable.iter().map(|(f, _)| f.name.clone()))
+            .chain(dependents.pinned.iter().map(|(n, _, _)| n.clone()))
+            .chain(
+                dep_install_rows
+                    .iter()
+                    .chain(dep_upgrade_rows.iter())
+                    .map(|(n, _, _, _)| n.clone()),
+            )
+            .collect();
+        print_deprecated_section(prefix, api, &scope);
     }
     if failures == 0 {
         ExitCode::SUCCESS
@@ -11064,7 +11402,7 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
     }
 }
 
-const MAX_REQUEST_RECEIPT_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_RECEIPT_BYTES: usize = 1024 * 1024;
 
 /// Return whether any installed version of `i` was explicitly requested.
 pub(super) fn requested(
@@ -11118,73 +11456,184 @@ fn no_cleanup_formula(api: &Api, name: &str, protected: &[String]) -> bool {
         .is_ok_and(|f| f.aliases.iter().any(|a| protected.contains(a)))
 }
 
+/// Brew's autoremove set (`Utils::Autoremove`): layer by layer,
+/// formulae nothing remaining depends on (by any possible name)
+/// that were not installed on request, computed over the kegs'
+/// recorded tab closures. A receipt that predates closures
+/// falls back to the declared graph over installed formulae;
+/// a keg with neither a closure nor a readable definition
+/// makes the graph unprovable and refuses the deletion.
+/// Pinned formulae are never taken (their closures still
+/// protect), and `HOMEBREW_NO_CLEANUP_FORMULAE` names are out
+/// of the pool with their whole closures.
 fn autoremove_targets(
     prefix: &Prefix,
-    read: impl FnMut(&str) -> Result<Formula, String>,
+    mut read: impl FnMut(&str) -> Result<Formula, String>,
+    cask_formula_deps: &dyn Fn(&str) -> Option<Vec<String>>,
 ) -> Result<Vec<String>, String> {
     let installed = prefix.installed_checked(Kind::Formula)?;
-    // HOMEBREW_NO_CLEANUP_FORMULAE names formulae (and thereby
-    // their dependencies) autoremove must never take.
+    let installed_names: std::collections::BTreeSet<String> =
+        installed.iter().map(|i| i.name.clone()).collect();
     let protected = no_cleanup_names();
-    let mut roots = Vec::new();
     let mut pinned = std::collections::BTreeSet::new();
     for i in &installed {
-        let pin = prefix.is_pinned_checked(&i.name)?;
-        if pin {
+        if prefix.is_pinned_checked(&i.name)? {
             pinned.insert(i.name.clone());
         }
-        if requested(prefix, i)? || pin || protected.contains(&i.name) {
-            roots.push(i.name.clone());
-        }
     }
-    let books = install::dependency_books(&installed, read)?;
-    let mut needed = std::collections::BTreeSet::new();
-    while let Some(name) = roots.pop() {
-        if !needed.insert(name.clone()) {
-            continue;
-        }
-        let (_, formula) = books
-            .iter()
-            .find(|(i, _)| i.name == name)
-            .ok_or_else(|| format!("abrew: cannot complete installed dependency {name}"))?;
-        roots.extend(
-            formula
-                .dependencies
-                .iter()
-                .map(|d| Formula::short_name(d).to_string()),
+    // Brew keeps a source-built formula and its build deps:
+    // names that count as depended-on before any layer runs.
+    // Abrew only ever pours bottles, so this stays empty for
+    // its own receipts ("source": "bottle").
+    let mut build_keeps: std::collections::BTreeSet<String> = Default::default();
+    let mut records: std::collections::BTreeMap<String, Option<Formula>> = Default::default();
+    let mut closures: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    // Brew requires the receipt to record on_request = false;
+    // an absent word never qualifies.
+    let mut not_requested: std::collections::BTreeMap<String, bool> = Default::default();
+    for i in &installed {
+        let keg = prefix.keg(&i.name, &i.version);
+        not_requested.insert(
+            i.name.clone(),
+            super::prefix::receipt_word(&keg, "installed_on_request").as_deref() == Some("false"),
         );
+        let record = read(&i.name).ok();
+        let poured = super::prefix::receipt_poured_from_bottle(&keg);
+        if !poured {
+            build_keeps.insert(i.name.clone());
+            if let Some(record) = &record {
+                build_keeps.extend(
+                    record
+                        .build_dependencies
+                        .iter()
+                        .map(|d| Formula::short_name(d).to_string()),
+                );
+            }
+        }
+        let closure = match super::prefix::receipt_runtime_deps(&keg) {
+            Some(tab) => tab
+                .iter()
+                .map(|d| Formula::short_name(d).to_string())
+                .collect(),
+            None => {
+                let Some(root) = &record else {
+                    return Err(format!(
+                        "abrew: dependency metadata for {} is unavailable and its receipt records no runtime closure; automatic deletion refused",
+                        i.name
+                    ));
+                };
+                // Declared closure, keeping only installed names
+                // (brew's installed_runtime_formula_dependencies).
+                let mut out = std::collections::BTreeSet::new();
+                let mut queue: Vec<String> = root
+                    .dependencies
+                    .iter()
+                    .map(|d| Formula::short_name(d).to_string())
+                    .collect();
+                while let Some(cur) = queue.pop() {
+                    if cur == i.name || !out.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Ok(dep) = read(&cur) {
+                        queue.extend(
+                            dep.dependencies
+                                .iter()
+                                .map(|d| Formula::short_name(d).to_string()),
+                        );
+                    }
+                }
+                out.retain(|n| installed_names.contains(n));
+                out
+            }
+        };
+        closures.insert(i.name.clone(), closure);
+        records.insert(i.name.clone(), record);
     }
-    let mut remaining: std::collections::BTreeSet<_> = installed
-        .iter()
-        .filter(|i| !needed.contains(&i.name) && !pinned.contains(&i.name))
-        .map(|i| i.name.clone())
-        .collect();
-    let mut ordered = Vec::new();
-    while !remaining.is_empty() {
-        let next = remaining
+    let possible_names = |name: &str| -> Vec<String> {
+        let mut names = vec![name.to_string()];
+        if let Some(Some(f)) = records.get(name) {
+            names.extend(f.aliases.iter().map(|a| Formula::short_name(a).to_string()));
+            names.extend(
+                f.oldnames
+                    .iter()
+                    .map(|a| Formula::short_name(a).to_string()),
+            );
+        }
+        names
+    };
+    // The no-cleanup guard takes its formulae (by name or
+    // alias) and their recorded closures out of the pool.
+    let mut pool: std::collections::BTreeSet<String> = installed_names.clone();
+    for i in &installed {
+        let guarded = possible_names(&i.name)
             .iter()
-            .find(|candidate| {
-                !books.iter().any(|(i, f)| {
-                    remaining.contains(&i.name)
-                        && i.name != **candidate
-                        && f.dependencies
-                            .iter()
-                            .any(|d| Formula::short_name(d) == candidate.as_str())
-                })
+            .any(|n| protected.contains(n));
+        if guarded {
+            pool.remove(&i.name);
+            if let Some(closure) = closures.get(&i.name) {
+                for dep in closure {
+                    pool.remove(dep);
+                }
+            }
+        }
+    }
+    // Formulae an installed cask needs (direct deps and their
+    // recorded closures) are never removable.
+    let mut cask_keeps: std::collections::BTreeSet<String> = Default::default();
+    for cask in prefix.installed(Kind::Cask) {
+        let direct = match cask_formula_deps(&cask.name) {
+            Some(deps) => deps,
+            None => {
+                super::prefix::receipt_cask_runtime_deps(
+                    &prefix.cask_dir(&cask.name, &cask.version),
+                )
+                .0
+            }
+        };
+        for dep in &direct {
+            let short = Formula::short_name(dep).to_string();
+            if let Some(closure) = closures.get(&short) {
+                cask_keeps.insert(short);
+                cask_keeps.extend(closure.iter().cloned());
+            }
+        }
+    }
+    let mut removable: Vec<String> = Vec::new();
+    loop {
+        let mut needed: std::collections::BTreeSet<String> = build_keeps.clone();
+        for name in &pool {
+            if let Some(closure) = closures.get(name) {
+                needed.extend(closure.iter().cloned());
+            }
+        }
+        let layer: Vec<String> = pool
+            .iter()
+            .filter(|name| {
+                !pinned.contains(*name)
+                    && not_requested.get(*name).copied().unwrap_or(false)
+                    && !possible_names(name)
+                        .iter()
+                        .any(|n| needed.contains(n) || cask_keeps.contains(n))
             })
             .cloned()
-            .ok_or_else(|| {
-                "abrew: cyclic orphan dependencies; automatic deletion refused".to_string()
-            })?;
-        remaining.remove(&next);
-        ordered.push(next);
+            .collect();
+        if layer.is_empty() {
+            break;
+        }
+        for name in &layer {
+            pool.remove(name);
+        }
+        removable.extend(layer);
     }
-    Ok(ordered)
+    Ok(removable)
 }
 
 pub(super) fn cmd_autoremove(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let dry = has_flag(rest, "--dry-run", "-n");
-    let targets = match autoremove_targets(prefix, |n| api.dependency_formula(n)) {
+    let targets = match autoremove_targets(prefix, |n| api.dependency_formula(n), &|token| {
+        api.cask(token).ok().map(|c| c.depends_formula)
+    }) {
         Ok(targets) => targets,
         Err(e) => return failed(&e),
     };
@@ -12375,6 +12824,31 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         formula_row(name).or_else(|| cask_row(api, name))
     };
     let expander = DepExpander::new(&read_row, filter, missing_only, &is_installed);
+    // Brew's `Dependency#installed?` with no minimums (the
+    // condense step of --installed): the opt link exists and
+    // the latest version is in the cellar. An outdated or
+    // unresolvable dep fails it.
+    let latest_installed = |name: &str| -> bool {
+        let short = Formula::short_name(name);
+        let Some(f) = api
+            .formula_on(short, machine)
+            .ok()
+            .or_else(|| tap::lookup(prefix, short))
+        else {
+            return false;
+        };
+        prefix
+            .installed_one(Kind::Formula, &f.name)
+            .is_some_and(|inst| {
+                prefix.opt(&f.name).exists()
+                    && inst.versions.contains(&super::install::keg_version(&f))
+            })
+    };
+    // A keg's recorded tab closure, when the receipt has one.
+    let tab_names = |name: &str| -> Option<Vec<String>> {
+        let inst = prefix.installed_one(Kind::Formula, Formula::short_name(name))?;
+        super::prefix::receipt_runtime_deps(&prefix.keg(&inst.name, &inst.version))
+    };
     let only_formula = want_formula && !want_cask;
     let only_cask = want_cask && !want_formula;
     // Inputs resolve before anything prints (brew errors on an
@@ -12499,6 +12973,27 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             );
         }
     }
+    // Brew reads actual runtime dependencies (tab closures)
+    // unless a mode flag widened/narrowed the set or some
+    // input is not installed; --installed always counts.
+    let widened = direct
+        || tree
+        || graph
+        || missing_only
+        || filter.skip_recommended
+        || filter.include_build
+        || filter.include_test
+        || filter.include_optional
+        || has_flag(rest, "--include-implicit", "")
+        || has_flag(rest, "--HEAD", "")
+        || os_value.is_some()
+        || arch_value.is_some();
+    let all_inputs_installed = inputs.iter().all(|(is_cask, row)| {
+        prefix
+            .installed_one(if *is_cask { Kind::Cask } else { Kind::Formula }, &row.name)
+            .is_some()
+    });
+    let use_runtime = !widened && (installed_only || inputs.is_empty() || all_inputs_installed);
     // Root rows: the resolved inputs (deduplicated like brew's
     // `(named + from_brewfile).uniq`), the installed set, or
     // (bare, no `--brewfile`) everything in the indexes. No
@@ -12510,17 +13005,29 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         inputs.retain(|(is_cask, row)| seen.insert((*is_cask, row.name.clone())));
         roots = inputs.into_iter().map(|(_, row)| row).collect();
     } else if installed_only {
+        // In runtime mode brew lists every installed package,
+        // even one no definition answers to any more; its row
+        // is just its name and its recorded closure.
+        let minimal = |i: &super::prefix::Installed| super::api::DepRow {
+            full_name: prefix.specified_name(i),
+            name: i.name.clone(),
+            ..Default::default()
+        };
         if !want_cask {
             for i in prefix.installed(Kind::Formula) {
-                if let Some(row) = read_row(&i.name) {
-                    roots.push(row);
+                match read_row(&i.name) {
+                    Some(row) => roots.push(row),
+                    None if use_runtime => roots.push(minimal(&i)),
+                    None => {}
                 }
             }
         }
         if !want_formula {
             for i in prefix.installed(Kind::Cask) {
-                if let Some(row) = cask_row(api, &i.name) {
-                    roots.push(row);
+                match cask_row(api, &i.name) {
+                    Some(row) => roots.push(row),
+                    None if use_runtime => roots.push(minimal(&i)),
+                    None => {}
                 }
             }
         }
@@ -12548,17 +13055,60 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     for root in &roots {
         expander.seed(root.clone());
     }
+    // Actual runtime dependencies of one root: a formula's
+    // recorded tab closure, or a cask's direct formula deps
+    // each followed by their own closures (CaskDependent).
+    // `None` keeps the declared-graph answer brew falls back
+    // to for a keg with no recorded closure.
+    let runtime_names = |root: &super::api::DepRow| -> Option<Vec<String>> {
+        if let Some(names) = tab_names(&root.name) {
+            return Some(names);
+        }
+        if prefix.installed_one(Kind::Cask, &root.name).is_some()
+            && prefix.installed_one(Kind::Formula, &root.name).is_none()
+        {
+            let mut out: Vec<String> = Vec::new();
+            let mut push = |n: &str| {
+                if !out.iter().any(|x| x == n) {
+                    out.push(n.to_string());
+                }
+            };
+            for d in &root.deps {
+                push(d);
+                match tab_names(d) {
+                    Some(names) => {
+                        for n in &names {
+                            push(n);
+                        }
+                    }
+                    None => {
+                        for (n, _) in expander.expand(d).iter() {
+                            push(n);
+                        }
+                    }
+                }
+            }
+            return Some(out);
+        }
+        None
+    };
     let deps_of = |root: &super::api::DepRow| -> Vec<(String, super::api::DepTags)> {
-        let mut deps: Vec<(String, super::api::DepTags)> = if direct {
-            root.edges()
-                .into_iter()
-                .filter(|(name, tags)| {
-                    tags.passes(&filter) && !(missing_only && is_installed(name))
-                })
-                .collect()
-        } else {
-            (*expander.expand(&root.name)).clone()
-        };
+        let mut deps: Vec<(String, super::api::DepTags)> =
+            if use_runtime && let Some(names) = runtime_names(root) {
+                names
+                    .into_iter()
+                    .map(|n| (n, super::api::DepTags::default()))
+                    .collect()
+            } else if direct {
+                root.edges()
+                    .into_iter()
+                    .filter(|(name, tags)| {
+                        tags.passes(&filter) && !(missing_only && is_installed(name))
+                    })
+                    .collect()
+            } else {
+                (*expander.expand(&root.name)).clone()
+            };
         if include_requirements {
             // Requirements ride as `:display` pseudo-entries,
             // gathered recursively like Requirement.expand.
@@ -12676,7 +13226,7 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         for root in &sorted {
             let mut deps = deps_of(root);
             if installed_only {
-                deps.retain(|(name, _)| name.starts_with(':') || is_installed(name));
+                deps.retain(|(name, _)| name.starts_with(':') || latest_installed(name));
             }
             deps.sort_by(|a, b| a.0.cmp(&b.0));
             let shown: Vec<String> = deps
@@ -12704,7 +13254,7 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         }
     }
     if installed_only {
-        all.retain(|(name, _)| name.starts_with(':') || is_installed(name));
+        all.retain(|(name, _)| name.starts_with(':') || latest_installed(name));
     }
     let mut shown: Vec<String> = all
         .iter()
@@ -13146,17 +13696,22 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             unknown = true;
         }
     }
-    // Rows are the candidate dependents. With --installed brew's
-    // formula side reads install-time runtime closures from tabs,
-    // which abrew receipts don't record; the declared closure over
-    // the current graph stands in (as it does for info --json).
+    // Rows are the candidate dependents. With --installed (and
+    // no tag switches) brew's formula side reads install-time
+    // runtime closures from tabs; a receipt without one falls
+    // back to the declared closure, and a formula no definition
+    // answers to any more stays a candidate on its tab alone.
     let mut rows: Vec<super::api::DepRow> = Vec::new();
     if !want_cask {
         if installed_only {
             for name in &installed_f {
                 match api.formula(name) {
                     Ok(f) => rows.push(dep_row_of_formula(&f)),
-                    Err(error) => return failed(&error),
+                    Err(_) => rows.push(super::api::DepRow {
+                        full_name: name.clone(),
+                        name: name.clone(),
+                        ..Default::default()
+                    }),
                 }
             }
         } else {
@@ -13253,10 +13808,21 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 None
             };
             targets.iter().all(|t| {
-                if let Some(expanded) = &expanded {
+                if installed_only && !tag_flags && !unknown && installed_f.contains(&row.name) {
+                    // Brew's runtime dependents: the keg's
+                    // recorded closure decides, recursive or
+                    // not; no recorded closure falls back to
+                    // the declared graph.
+                    match prefix
+                        .installed_one(Kind::Formula, &row.name)
+                        .and_then(|i| {
+                            super::prefix::receipt_runtime_deps(&prefix.keg(&i.name, &i.version))
+                        }) {
+                        Some(tab) => tab.iter().any(|d| Formula::short_name(d) == t.as_str()),
+                        None => closure_contains(row, t),
+                    }
+                } else if let Some(expanded) = &expanded {
                     expanded.iter().any(|(name, _)| name == t)
-                } else if installed_only && !tag_flags && installed_f.contains(&row.name) {
-                    closure_contains(row, t)
                 } else {
                     row.edge_passes(t, &filter)
                 }
@@ -13280,32 +13846,37 @@ pub(super) fn cmd_leaves(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     let installed = prefix.installed(Kind::Formula);
     // Brew unions every installed keg's tab runtime_dependencies
     // (the install-time closure) with installed casks' direct
-    // formula deps; abrew receipts record no tab closure, so the
-    // declared closure over the current graph stands in.
+    // formula deps. A keg whose receipt records no closure
+    // falls back to the declared closure over the current
+    // graph, as brew falls back to the formula definition.
     let mut needed: std::collections::BTreeSet<String> = Default::default();
-    let mut formulae: Vec<(super::prefix::Installed, Formula)> = Vec::new();
+    let mut formulae: Vec<(super::prefix::Installed, Option<Formula>)> = Vec::new();
     for i in &installed {
-        let f = match api.formula(&i.name) {
-            Ok(f) => f,
-            Err(error) => return failed(&error),
-        };
-        let mut queue: Vec<String> = f
-            .dependencies
-            .iter()
-            .map(|d| Formula::short_name(d).to_string())
-            .collect();
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
-        while let Some(cur) = queue.pop() {
-            if !seen.insert(cur.clone()) {
-                continue;
-            }
-            needed.insert(cur.clone());
-            if let Ok(dep) = api.formula(&cur) {
-                queue.extend(
-                    dep.dependencies
-                        .iter()
-                        .map(|d| Formula::short_name(d).to_string()),
-                );
+        let f = api
+            .formula(&i.name)
+            .ok()
+            .or_else(|| tap::lookup(prefix, &i.name));
+        if let Some(tab) = super::prefix::receipt_runtime_deps(&prefix.keg(&i.name, &i.version)) {
+            needed.extend(tab.iter().map(|d| Formula::short_name(d).to_string()));
+        } else if let Some(f) = &f {
+            let mut queue: Vec<String> = f
+                .dependencies
+                .iter()
+                .map(|d| Formula::short_name(d).to_string())
+                .collect();
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            while let Some(cur) = queue.pop() {
+                if !seen.insert(cur.clone()) {
+                    continue;
+                }
+                needed.insert(cur.clone());
+                if let Ok(dep) = api.formula(&cur) {
+                    queue.extend(
+                        dep.dependencies
+                            .iter()
+                            .map(|d| Formula::short_name(d).to_string()),
+                    );
+                }
             }
         }
         formulae.push((i.clone(), f));
@@ -13317,16 +13888,29 @@ pub(super) fn cmd_leaves(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                     needed.insert(Formula::short_name(d).to_string());
                 }
             }
-            Err(error) => return failed(&error),
+            Err(_) => {
+                let (formulae_in_tab, _) = super::prefix::receipt_cask_runtime_deps(
+                    &prefix.cask_dir(&token.name, &token.version),
+                );
+                needed.extend(
+                    formulae_in_tab
+                        .iter()
+                        .map(|d| Formula::short_name(d).to_string()),
+                );
+            }
         }
     }
     let mut leaves: Vec<String> = Vec::new();
     for (i, f) in &formulae {
         // Brew rejects a leaf when any of its possible names (name,
         // aliases, old names) is depended upon.
-        let depended = std::iter::once(f.name.as_str())
-            .chain(f.aliases.iter().map(String::as_str))
-            .chain(f.oldnames.iter().map(String::as_str))
+        let (aliases, oldnames): (&[String], &[String]) = match f {
+            Some(f) => (&f.aliases, &f.oldnames),
+            None => (&[], &[]),
+        };
+        let depended = std::iter::once(i.name.as_str())
+            .chain(aliases.iter().map(String::as_str))
+            .chain(oldnames.iter().map(String::as_str))
             .any(|n| needed.contains(Formula::short_name(n)));
         if depended {
             continue;
@@ -13393,38 +13977,52 @@ pub(super) fn cmd_zap(prefix: &Prefix, api: &Api, args: &[String], rest: &[Strin
 }
 
 pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
-    let scope: Vec<String> = operands(rest)
+    let scope: Vec<String> = operands_without_flag_values(rest, &["--hide"])
         .iter()
         .map(|n| Formula::short_name(n).to_string())
         .collect();
-    let hidden: Vec<String> = rest
-        .iter()
-        .filter_map(|arg| arg.strip_prefix("--hide="))
-        .flat_map(|v| v.split(','))
-        .map(|part| Formula::short_name(part.trim()).to_string())
-        .collect();
+    // Brew's comma-array `--hide`: `=` and space forms, repeated.
+    let mut hidden: Vec<String> = Vec::new();
+    let mut tokens = rest.iter().take_while(|s| s.as_str() != "--");
+    while let Some(arg) = tokens.next() {
+        let value = if arg == "--hide" {
+            tokens.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--hide=")
+        };
+        if let Some(value) = value {
+            hidden.extend(
+                value
+                    .split(',')
+                    .map(|part| Formula::short_name(part.trim()).to_string()),
+            );
+        }
+    }
     let is_hidden = |name: &str| hidden.iter().any(|h| h == name);
     // Brew resolves named formulae and casks whether or not they
     // are installed; bare means every installed package. A line
     // per package lists its missing recursive dependencies,
     // space-joined, prefixed with the package name only when
-    // more than one package is in scope.
-    let mut formulae: Vec<Formula> = Vec::new();
-    let mut casks: Vec<super::formula::Cask> = Vec::new();
+    // more than one package is in scope. The dependency lists
+    // are the kegs' recorded tab closures ONLY: brew trusts no
+    // formula definition here, so a package with no installed
+    // keg (or a receipt without the closure) misses nothing.
+    // A dep counts as present when its Cellar/Caskroom or opt
+    // directory exists, unless `--hide` pretends it away.
+    let mut formulae: Vec<(String, Option<std::path::PathBuf>)> = Vec::new();
+    let mut casks: Vec<(String, Option<std::path::PathBuf>)> = Vec::new();
     if scope.is_empty() {
         for i in prefix.installed(Kind::Formula) {
-            match api.formula(&i.name).or_else(|_| {
-                tap::lookup(prefix, &i.name).ok_or_else(|| format!("abrew: no formula {}", i.name))
-            }) {
-                Ok(f) => formulae.push(f),
-                Err(error) => return failed(&error),
-            }
+            formulae.push((
+                prefix.specified_name(&i),
+                Some(prefix.keg(&i.name, &i.version)),
+            ));
         }
         for i in prefix.installed(Kind::Cask) {
-            match api.cask(&i.name) {
-                Ok(c) => casks.push(c),
-                Err(error) => return failed(&error),
-            }
+            casks.push((
+                prefix.specified_name(&i),
+                Some(prefix.cask_dir(&i.name, &i.version)),
+            ));
         }
     } else {
         for name in &scope {
@@ -13433,11 +14031,19 @@ pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
                     tap::lookup(prefix, name).ok_or_else(|| format!("abrew: no formula {name}"))
                 })
             {
-                formulae.push(f);
+                let dir = prefix
+                    .installed_one(Kind::Formula, &f.name)
+                    .map(|i| prefix.keg(&i.name, &i.version));
+                formulae.push((f.name.clone(), dir));
                 continue;
             }
             match api.cask(name) {
-                Ok(c) if !has_flag(rest, "--formula", "") => casks.push(c),
+                Ok(c) if !has_flag(rest, "--formula", "") => {
+                    let dir = prefix
+                        .installed_one(Kind::Cask, &c.token)
+                        .map(|i| prefix.cask_dir(&i.name, &i.version));
+                    casks.push((c.token.clone(), dir));
+                }
                 _ => {
                     return failed(&format!(
                         "Error: {}",
@@ -13450,6 +14056,10 @@ pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
                 }
             }
         }
+        formulae.sort_by(|a, b| a.0.cmp(&b.0));
+        formulae.dedup_by(|a, b| a.0 == b.0);
+        casks.sort_by(|a, b| a.0.cmp(&b.0));
+        casks.dedup_by(|a, b| a.0 == b.0);
     }
     let show_name = formulae.len() + casks.len() > 1;
     let mut any = false;
@@ -13464,28 +14074,40 @@ pub(super) fn cmd_missing(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
             println!("{}", missing.join(" "));
         }
     };
-    for f in &formulae {
-        let missing: Vec<String> = flat_dependencies(f, false, |n| api.formula(n).ok())
+    for (name, dir) in &formulae {
+        let tab = dir
+            .as_deref()
+            .and_then(super::prefix::receipt_runtime_deps)
+            .unwrap_or_default();
+        let missing = tab
             .into_iter()
-            .map(|d| Formula::short_name(&d).to_string())
-            .filter(|d| !is_hidden(d) && prefix.installed_one(Kind::Formula, d).is_none())
+            .filter(|full| {
+                let base = Formula::short_name(full);
+                is_hidden(base)
+                    || !(prefix.cellar().join(base).is_dir() || prefix.opt(base).is_dir())
+            })
             .collect();
-        report(&f.name, missing);
+        report(name, missing);
     }
-    for c in &casks {
+    for (name, dir) in &casks {
+        let (formula_deps, cask_deps) = dir
+            .as_deref()
+            .map_or_else(Default::default, super::prefix::receipt_cask_runtime_deps);
         let mut missing: Vec<String> = Vec::new();
-        for d in &c.depends_formula {
-            let short = Formula::short_name(d);
-            if !is_hidden(short) && prefix.installed_one(Kind::Formula, short).is_none() {
-                missing.push(short.to_string());
+        for full in &formula_deps {
+            let base = Formula::short_name(full);
+            if is_hidden(base) || !prefix.cellar().join(base).is_dir() {
+                missing.push(full.clone());
             }
         }
-        for d in &c.depends_cask {
-            if !is_hidden(d) && prefix.installed_one(Kind::Cask, d).is_none() {
-                missing.push(d.clone());
+        for full in &cask_deps {
+            let base = Formula::short_name(full);
+            if is_hidden(base) || !prefix.caskroom().join(base).is_dir() {
+                missing.push(full.clone());
             }
         }
-        report(&c.token, missing);
+        missing.sort();
+        report(name, missing);
     }
     if any {
         ExitCode::from(1)
@@ -16768,6 +17390,30 @@ mod tests {
     }
 
     #[test]
+    fn outdated_treats_head_kegs_by_their_recorded_stable() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        p.ensure().unwrap();
+        let keg = p.keg("fzf", "HEAD-abc1234");
+        std::fs::create_dir_all(&keg).unwrap();
+        let receipt = |stable: &str| {
+            format!(
+                "{{\"installed_by\":\"abrew\",\"name\":\"fzf\",\"version\":\"HEAD-abc1234\",\"installed_on_request\":\"true\",\"source\":{{\"versions\":{{\"stable\":\"{stable}\",\"version_scheme\":0}}}}}}"
+            )
+        };
+        let f = Formula {
+            name: "fzf".into(),
+            version: "0.75.0".into(),
+            ..Formula::default()
+        };
+        std::fs::write(keg.join("INSTALL_RECEIPT.json"), receipt("0.75.0")).unwrap();
+        let inst = p.installed_one(Kind::Formula, "fzf").unwrap();
+        assert!(!formula_outdated(&p, &inst, &f), "stable has not passed");
+        std::fs::write(keg.join("INSTALL_RECEIPT.json"), receipt("0.74.0")).unwrap();
+        assert!(formula_outdated(&p, &inst, &f), "stable moved past the tab");
+    }
+
+    #[test]
     fn outdated_fails_only_for_named_operands() {
         assert!(!outdated_failed(false, false));
         assert!(!outdated_failed(false, true));
@@ -17653,7 +18299,10 @@ mod tests {
                 super::super::machine::Machine::this(),
             )
         };
-        assert_eq!(autoremove_targets(&p, read).unwrap(), vec!["orphan"]);
+        assert_eq!(
+            autoremove_targets(&p, read, &|_| None).unwrap(),
+            vec!["orphan"]
+        );
         let incomplete = |name: &str| {
             if name == "app" {
                 Err("captured unknown".into())
@@ -17661,7 +18310,7 @@ mod tests {
                 read(name)
             }
         };
-        assert!(autoremove_targets(&p, incomplete).is_err());
+        assert!(autoremove_targets(&p, incomplete, &|_| None).is_err());
         for value in [
             aterm_json::json!({"name": "app", "versions": {"stable": "1"}, "revision": 0}),
             aterm_json::json!({"name": "app", "versions": {"stable": "1"}, "revision": 0, "dependencies": "dep"}),
@@ -17704,15 +18353,19 @@ mod tests {
         let receipt = p.keg("app", "1").join("INSTALL_RECEIPT.json");
         let saved = std::fs::read(&receipt).unwrap();
         std::fs::remove_file(&receipt).unwrap();
-        assert!(autoremove_targets(&p, read).is_err());
+        assert!(autoremove_targets(&p, read, &|_| None).is_err());
         std::fs::write(
             &receipt,
             br#"{"installed_by":"abrew","name":"app","version":"1","installed_on_request":null}"#,
         )
         .unwrap();
-        assert!(autoremove_targets(&p, read).is_err());
+        assert_eq!(
+            autoremove_targets(&p, read, &|_| None).unwrap(),
+            vec!["orphan"],
+            "an absent request word never qualifies"
+        );
         std::fs::write(&receipt, vec![b' '; MAX_REQUEST_RECEIPT_BYTES + 1]).unwrap();
-        assert!(autoremove_targets(&p, read).is_err());
+        assert!(autoremove_targets(&p, read, &|_| None).is_err());
         std::fs::write(&receipt, saved).unwrap();
         let old = p.keg("orphan", "0");
         std::fs::create_dir_all(&old).unwrap();
@@ -17733,9 +18386,10 @@ mod tests {
             .find(|i| i.name == "orphan")
             .unwrap();
         assert!(requested(&p, &older).unwrap(), "old request is retained");
-        assert!(
-            autoremove_targets(&p, read).is_err(),
-            "latest metadata cannot cover the older version"
+        assert_eq!(
+            autoremove_targets(&p, read, &|_| None).unwrap(),
+            vec!["orphan"],
+            "the latest keg's receipt decides, as brew's tab does"
         );
         std::fs::remove_dir_all(&old).unwrap();
         let missing = |name: &str| {
@@ -17745,20 +18399,24 @@ mod tests {
                 super::super::machine::Machine::this(),
             )
         };
-        assert!(autoremove_targets(&p, missing).is_err());
+        assert_eq!(
+            autoremove_targets(&p, missing, &|_| None).unwrap(),
+            vec!["dep", "orphan"],
+            "a dep name nothing installed answers to keeps nothing"
+        );
         #[cfg(unix)]
         {
             p.pin("orphan").unwrap();
-            assert!(autoremove_targets(&p, read).unwrap().is_empty());
+            assert!(autoremove_targets(&p, read, &|_| None).unwrap().is_empty());
             std::fs::remove_file(p.root.join("Pinned/orphan")).unwrap();
             std::fs::remove_dir(p.root.join("Pinned")).unwrap();
             std::fs::write(p.root.join("Pinned"), b"not a directory").unwrap();
-            assert!(autoremove_targets(&p, read).is_err());
+            assert!(autoremove_targets(&p, read, &|_| None).is_err());
             std::fs::remove_file(p.root.join("Pinned")).unwrap();
             let pins_outside = tmp.path().join("pins-outside");
             std::fs::create_dir(&pins_outside).unwrap();
             std::os::unix::fs::symlink(&pins_outside, p.root.join("Pinned")).unwrap();
-            assert!(autoremove_targets(&p, read).is_err());
+            assert!(autoremove_targets(&p, read, &|_| None).is_err());
             assert!(std::fs::read_dir(&pins_outside).unwrap().next().is_none());
             std::fs::remove_file(p.root.join("Pinned")).unwrap();
             let outside = tmp.path().join("outside");
@@ -17771,14 +18429,17 @@ mod tests {
                 3,
                 "legacy read-only best effort"
             );
-            assert!(autoremove_targets(&p, read).is_err());
+            assert!(autoremove_targets(&p, read, &|_| None).is_err());
             assert_eq!(
                 std::fs::read(outside.join("marker")).unwrap(),
                 b"retain outside"
             );
             std::fs::remove_file(p.cellar().join("alias")).unwrap();
         }
-        assert_eq!(autoremove_targets(&p, read).unwrap(), vec!["orphan"]);
+        assert_eq!(
+            autoremove_targets(&p, read, &|_| None).unwrap(),
+            vec!["orphan"]
+        );
         for name in ["adep", "zapp"] {
             let keg = p.keg(name, "1");
             std::fs::create_dir_all(&keg).unwrap();
@@ -17806,7 +18467,7 @@ mod tests {
             }
         };
         assert_eq!(
-            autoremove_targets(&p, chain).unwrap(),
+            autoremove_targets(&p, chain, &|_| None).unwrap(),
             ["orphan", "zapp", "adep"]
         );
         let cycle = |name: &str| {
@@ -17820,11 +18481,15 @@ mod tests {
                 chain(name)
             }
         };
-        assert!(autoremove_targets(&p, cycle).is_err());
+        assert_eq!(
+            autoremove_targets(&p, cycle, &|_| None).unwrap(),
+            vec!["orphan"],
+            "cyclic orphans keep each other"
+        );
         let unknown = p.keg("notes", "1");
         std::fs::create_dir_all(&unknown).unwrap();
         std::fs::write(unknown.join("owner"), b"keep").unwrap();
-        assert!(autoremove_targets(&p, chain).is_err());
+        assert!(autoremove_targets(&p, chain, &|_| None).is_err());
         assert_eq!(std::fs::read(unknown.join("owner")).unwrap(), b"keep");
         for name in ["app", "dep", "orphan", "adep", "zapp"] {
             assert_eq!(
@@ -17832,6 +18497,73 @@ mod tests {
                 name.as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn autoremove_reads_recorded_closures_and_keeps_cask_needs() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        p.ensure().unwrap();
+        // app's receipt records dep as its runtime closure,
+        // while the current definitions have moved on (app no
+        // longer declares dep, and gone has no definition).
+        let rows: [(&str, &str, Option<&str>); 4] = [
+            ("app", "true", Some("[{\"full_name\": \"dep\"}]")),
+            ("dep", "false", Some("[]")),
+            ("gone", "false", Some("[]")),
+            ("caskdep", "false", Some("[]")),
+        ];
+        for (name, on_request, tab) in rows {
+            let keg = p.keg(name, "1");
+            std::fs::create_dir_all(&keg).unwrap();
+            let fields: Vec<(&str, &str)> = vec![
+                ("installed_by", "abrew"),
+                ("name", name),
+                ("version", "1"),
+                ("installed_on_request", on_request),
+            ];
+            match tab {
+                Some(tab) => p
+                    .write_receipt_raw(&keg, &fields, &[("runtime_dependencies", tab)])
+                    .unwrap(),
+                None => p.write_receipt(&keg, &fields).unwrap(),
+            }
+        }
+        let read = |name: &str| {
+            if name == "gone" {
+                return Err("captured unknown".into());
+            }
+            super::super::api::dependency_formula(
+                &aterm_json::json!({"name": name, "versions": {"stable": "2"}, "revision": 0, "dependencies": []}),
+                name,
+                super::super::machine::Machine::this(),
+            )
+        };
+        assert_eq!(
+            autoremove_targets(&p, read, &|_| None).unwrap(),
+            vec!["caskdep", "gone"],
+            "the recorded closure keeps dep and needs no definition for gone"
+        );
+        // A cask depending on caskdep protects it.
+        let payload = p.cask_dir("tool", "1");
+        std::fs::create_dir_all(&payload).unwrap();
+        p.write_receipt(
+            &payload,
+            &[
+                ("installed_by", "abrew"),
+                ("token", "tool"),
+                ("version", "1"),
+                ("installed_on_request", "true"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            autoremove_targets(&p, read, &|token| {
+                (token == "tool").then(|| vec!["caskdep".to_string()])
+            })
+            .unwrap(),
+            vec!["gone"]
+        );
     }
 
     #[test]

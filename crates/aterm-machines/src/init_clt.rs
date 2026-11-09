@@ -288,10 +288,16 @@ impl Tab {
 
     /// Preserve preprompt-only exit meaning even if an engine readback changes its diagnosis.
     pub(crate) fn exit(&self, why: Unfinished) -> u8 {
-        if why == Unfinished::LowData && self.entered.load(std::sync::atomic::Ordering::Relaxed) {
-            1
-        } else {
-            why.tab_exit()
+        let entered = self.entered.load(std::sync::atomic::Ordering::Relaxed);
+        match why {
+            Unfinished::NotOwnLogin if !entered => {
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_OWN_LOGIN
+            }
+            Unfinished::Busy | Unfinished::AppleWindow if !entered => {
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_INSTALLER_HELD
+            }
+            Unfinished::LowData if entered => 1,
+            _ => why.tab_exit(),
         }
     }
 
@@ -838,6 +844,9 @@ impl Item for CommandLineTools {
             if let Ok(Some(plan)) = &fresh {
                 *command = self.command_for(*plan);
             }
+            let admission = fresh.as_ref().ok().and_then(|plan| {
+                plan.and_then(|plan| self.admission_before_ask(sys, plan))
+            });
             if sys.stopped().is_some() {
                 return Err(crate::port::RunFailed::Refused(
                     "setup was stopped before the root command started".into(),
@@ -859,6 +868,10 @@ impl Item for CommandLineTools {
                     return Err(crate::port::RunFailed::Refused(why));
                 }
             };
+            if let Some((why, _)) = admission {
+                plan_failure = Some(why.clone());
+                return Err(crate::port::RunFailed::Refused(why));
+            }
             if let Some(record) = &self.unbidden {
                 match record.claim(sys) {
                     Ok(added) => {
@@ -950,32 +963,8 @@ impl CommandLineTools {
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
             Found::Missing(from) => (from, None),
         };
-        match held(sys) {
-            crate::items::developer::Holder::Install => {
-                return (
-                    Probe::Deferred {
-                        why: format!("{from}; {INSTALLING}"),
-                    },
-                    Some(Unfinished::Busy),
-                );
-            }
-            crate::items::developer::Holder::AppleWindow => {
-                return (
-                    Probe::Deferred {
-                        why: format!("{from}; {APPLE_WINDOW_OPEN}"),
-                    },
-                    Some(Unfinished::AppleWindow),
-                );
-            }
-            crate::items::developer::Holder::Unread if unready.is_none() => {
-                return (
-                    Probe::Unusable {
-                        why: format!("{from}; the current installer owner could not be read"),
-                    },
-                    Some(Unfinished::Unread),
-                );
-            }
-            crate::items::developer::Holder::Unread | crate::items::developer::Holder::Nothing => {}
+        if let Some((probe, unfinished)) = Self::installer_hold(sys, &from, unready.is_none()) {
+            return (probe, Some(unfinished));
         }
         if let Some(unfinished) = unready {
             let independent = self.read_root_steps(sys, from.clone());
@@ -1002,6 +991,39 @@ impl CommandLineTools {
             },
             None,
         )
+    }
+
+    /// The same current installer custody used by a probe and a queued tools installation.
+    /// Unread custody holds only actual installation, not independent work beside an unread
+    /// or refusing compiler.
+    fn installer_hold(
+        sys: &dyn System,
+        from: &str,
+        installation: bool,
+    ) -> Option<(Probe, Unfinished)> {
+        match held(sys) {
+            crate::items::developer::Holder::Install => Some((
+                Probe::Deferred {
+                    why: format!("{from}; {INSTALLING}"),
+                },
+                Unfinished::Busy,
+            )),
+            crate::items::developer::Holder::AppleWindow => Some((
+                Probe::Deferred {
+                    why: format!("{from}; {APPLE_WINDOW_OPEN}"),
+                },
+                Unfinished::AppleWindow,
+            )),
+            crate::items::developer::Holder::Unread if installation => Some((
+                Probe::Unusable {
+                    why: format!("{from}; the current installer owner could not be read"),
+                },
+                Unfinished::Unread,
+            )),
+            crate::items::developer::Holder::Unread | crate::items::developer::Holder::Nothing => {
+                None
+            }
+        }
     }
 
     /// Independent root work. An `Ok` here does not establish compiler health; callers
@@ -1044,47 +1066,17 @@ impl CommandLineTools {
     /// Why this run may not ask for the password now, as the probe reads it (`from`, what it
     /// found): no person at this Mac's console (only a person there types the Mac password,
     /// never an agent's tab, a script or a remote shell), no terminal, Low Data Mode where the
-    /// run would `download` the tools, an account that is no administrator's, or a run aterm
-    /// decided whose ask is held ([`Unbidden::withheld`]). `None` where it may ask.
+    /// run would `download` the tools with no independent root work owed, an account that is
+    /// no administrator's, or a run aterm decided whose ask is held ([`Unbidden::withheld`]).
+    /// `None` where it may ask.
     fn held_back(
         &self,
         sys: &dyn System,
         from: &str,
         download: bool,
     ) -> Option<(Probe, Option<Unfinished>)> {
-        let presence = crate::console::presence(sys);
-        if let Some(person) = presence.needs_person() {
-            return Some((
-                Probe::Deferred {
-                    why: format!("{from}; finishing Mac setup {person}"),
-                },
-                Some(Unfinished::Other),
-            ));
-        }
-        if !sys.has_tty() {
-            return Some((
-                Probe::Blocked {
-                    why: format!("{from}; {NO_TTY}"),
-                },
-                Some(Unfinished::Other),
-            ));
-        }
-        // Asked before the password: the download waits for a network without Low Data Mode.
-        if download && let Some(why) = crate::items::developer::low_data(sys) {
-            return Some((
-                Probe::Blocked {
-                    why: format!("{from}; {why}"),
-                },
-                Some(Unfinished::LowData),
-            ));
-        }
-        if sys.administrator() == Some(false) {
-            return Some((
-                Probe::Blocked {
-                    why: format!("{from}; {NOT_ADMIN}"),
-                },
-                Some(Unfinished::NotAdmin),
-            ));
+        if let Some((probe, why)) = self.live_eligibility(sys, from, download) {
+            return Some((probe, Some(why)));
         }
         self.unbidden
             .as_ref()
@@ -1097,6 +1089,85 @@ impl CommandLineTools {
                     Some(Unfinished::Other),
                 )
             })
+    }
+
+    /// Current live admission, independent of whether a tab already claimed its opening.
+    fn live_eligibility(
+        &self,
+        sys: &dyn System,
+        from: &str,
+        download: bool,
+    ) -> Option<(Probe, Unfinished)> {
+        let presence = crate::console::presence(sys);
+        if let Some(person) = presence.needs_person() {
+            return Some((
+                Probe::Deferred {
+                    why: format!("{from}; finishing Mac setup {person}"),
+                },
+                if matches!(
+                    presence,
+                    crate::console::Presence::OtherLogin | crate::console::Presence::NoConsole
+                ) {
+                    Unfinished::NotOwnLogin
+                } else {
+                    Unfinished::Other
+                },
+            ));
+        }
+        if !sys.has_tty() {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {NO_TTY}"),
+                },
+                Unfinished::Other,
+            ));
+        }
+        // Independent root steps precede the retained download in the same password episode.
+        // With none definitely owed, do not ask merely to wait for Low Data Mode to end.
+        if download
+            && let Some(why) = crate::items::developer::low_data(sys)
+            && (self.owed)(sys).is_empty()
+        {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {why}"),
+                },
+                Unfinished::LowData,
+            ));
+        }
+        if sys.administrator() == Some(false) {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {NOT_ADMIN}"),
+                },
+                Unfinished::NotAdmin,
+            ));
+        }
+        None
+    }
+
+    /// Reapply the probe's live gates under the terminal lease, bounded by the original plan.
+    /// A tools installer and Low Data Mode do not hold independent root steps.
+    fn admission_before_ask(
+        &self,
+        sys: &dyn System,
+        plan: RootPlan,
+    ) -> Option<(String, Unfinished)> {
+        let download = plan == RootPlan::WithTools;
+        let from = "the queued root work";
+        let held = if download {
+            Self::installer_hold(sys, from, true)
+        } else {
+            None
+        }
+        .or_else(|| self.live_eligibility(sys, from, download));
+        held.map(|(probe, unfinished)| {
+            let why = match probe {
+                Probe::Deferred { why } | Probe::Blocked { why } | Probe::Unusable { why } => why,
+                _ => unreachable!("an admission gate only returns a refusal"),
+            };
+            (why, unfinished)
+        })
     }
 
     /// [`Item::apply`] as the tab's program: one plain line before `sudo` asks for the Mac
@@ -1120,6 +1191,10 @@ impl CommandLineTools {
             if let Ok(Some(plan)) = &fresh {
                 *command = self.command_for(*plan);
             }
+            let admission = fresh
+                .as_ref()
+                .ok()
+                .and_then(|plan| plan.and_then(|plan| self.admission_before_ask(sys, plan)));
             if sys.stopped().is_some() {
                 return Err(crate::port::RunFailed::Refused(
                     "setup was stopped before the root command started".into(),
@@ -1141,6 +1216,10 @@ impl CommandLineTools {
                     return Err(crate::port::RunFailed::Refused(why));
                 }
             };
+            if let Some((why, unfinished)) = admission {
+                plan_failure = Some(unfinished);
+                return Err(crate::port::RunFailed::Refused(why));
+            }
             tab.line(Self::intro(true, plan));
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             tab.entered
@@ -1469,6 +1548,124 @@ mod tests {
                 );
                 if suffix.is_none() {
                     assert!(said.lock().unwrap().is_empty() || failed && tabbed);
+                }
+            }
+        }
+
+        // Admission can change while another question owns the real terminal lease too.
+        // Capture the old plan before changing console ownership or installer custody.
+        for tabbed in [false, true] {
+            for (console_uid, installer, tools_arrive, code, withdraw_root) in [
+                (Some(0), None, false, 7, false),
+                (Some(502), None, false, 7, false),
+                (None, Some("/usr/sbin/softwareupdate"), false, 8, false),
+                (
+                    None,
+                    Some(
+                        "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
+                    ),
+                    false,
+                    8,
+                    false,
+                ),
+                // A narrow plan owes only independent steps, which a tools installer cannot hold.
+                (None, Some("/usr/sbin/softwareupdate"), true, 0, false),
+                // A constrained download can enter for definite independent work, but
+                // loses that exception if the work completes while the terminal is held.
+                (None, None, false, 3, true),
+            ] {
+                let state = Arc::new(Mutex::new(Found::Missing("initially missing".into())));
+                let reader = state.clone();
+                let (captured, ready) = std::sync::mpsc::sync_channel(1);
+                let reads = std::sync::atomic::AtomicUsize::new(0);
+                let said = Arc::new(Mutex::new(String::new()));
+                let sink = said.clone();
+                let owed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let owe = owed.clone();
+                let mut item = CommandLineTools::new(
+                    Box::new(move |_| {
+                        let found = reader.lock().unwrap().clone();
+                        if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                            captured.send(()).unwrap();
+                        }
+                        found
+                    }),
+                    ATERM.into(),
+                )
+                .with_owed(Box::new(move |_| {
+                    if owe.load(std::sync::atomic::Ordering::SeqCst) {
+                        vec![crate::root_steps::Owed::Debugger]
+                    } else {
+                        Vec::new()
+                    }
+                }))
+                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
+                    crate::init::Holds::NONE
+                }))
+                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
+                let tab = Tab::new({
+                    let said = said.clone();
+                    Arc::new(move |text| said.lock().unwrap().push_str(text))
+                });
+                if tabbed {
+                    item = item.in_tab(tab.clone());
+                }
+                let mut sys = console();
+                if withdraw_root {
+                    sys.low_data = Some(true);
+                }
+                sys.on(&argv(), Ran::ok(""));
+                let root = format!("{} --root-steps-only", argv());
+                sys.on(&root, Ran::ok(""));
+                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+                let result = std::thread::scope(|scope| {
+                    let worker = crate::port::owning_terminal(|| {
+                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
+                        ready
+                            .recv_timeout(std::time::Duration::from_secs(60))
+                            .expect("apply captured its plan before the terminal lease");
+                        assert!(asked(&sys).is_empty());
+                        assert!(!marked(&sys));
+                        assert!(said.lock().unwrap().is_empty());
+                        if let Some(uid) = console_uid {
+                            sys.stat_of(
+                                "/dev/console",
+                                Stat {
+                                    uid,
+                                    gid: 20,
+                                    mode: 0o600,
+                                    dir: false,
+                                    symlink: false,
+                                    len: 0,
+                                },
+                            );
+                        }
+                        if let Some(installer) = installer {
+                            sys.file(crate::items::developer::PLACEHOLDER, b"")
+                                .running(&["/sbin/launchd", installer]);
+                        }
+                        if tools_arrive {
+                            *state.lock().unwrap() = Found::Present("tools arrived".into());
+                        }
+                        if withdraw_root {
+                            owed.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        worker
+                    });
+                    worker.join().expect("the queued apply joins")
+                });
+                if code == 0 {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(asked(&sys), [root]);
+                } else {
+                    assert!(result.is_err(), "{tabbed}: admission changed: {result:?}");
+                    assert!(asked(&sys).is_empty(), "{tabbed}: {:?}", asked(&sys));
+                    assert!(!marked(&sys));
+                    assert!(!tab.entered.load(std::sync::atomic::Ordering::Relaxed));
+                    assert!(said.lock().unwrap().is_empty());
+                    if tabbed {
+                        assert_eq!(tab.exit(tab.unfinished().unwrap()), code);
+                    }
                 }
             }
         }
@@ -1808,12 +2005,15 @@ mod tests {
             let said = Arc::new(Mutex::new(Vec::new()));
             let item = missing().saying({
                 let said = Arc::clone(&said);
+                let sys = Arc::clone(&sys);
                 Arc::new(move |text: &str| {
                     assert!(
                         crate::port::terminal_free().is_none(),
                         "the prelude owns the terminal"
                     );
-                    said.lock().unwrap().push(text.to_owned());
+                    said.lock()
+                        .unwrap()
+                        .push((text.to_owned(), sys.calls().len()));
                 })
             });
             let installs = ran.success();
@@ -1830,10 +2030,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("no root half: {calls:?}"));
             assert_eq!(
                 *said.lock().unwrap(),
-                [format!("{INTRO}\n")],
-                "said once under the same terminal lease as sudo: {calls:?}"
+                [(format!("{INTRO}\n"), ran)],
+                "said once under the same terminal lease immediately before sudo: {calls:?}"
             );
-            assert_eq!(calls[ran - 1], "defer stops", "{calls:?}");
+            let deferred = calls.iter().position(|call| call == "defer stops").unwrap();
+            let restored = calls
+                .iter()
+                .position(|call| call == "stops restored")
+                .unwrap();
+            assert!(deferred < ran && ran < restored, "{calls:?}");
             assert_eq!(asked(&sys), std::slice::from_ref(&argv), "{calls:?}");
             assert!(
                 !calls.iter().any(|call| call.contains("sudo -K")),
@@ -1919,8 +2124,8 @@ mod tests {
         assert_eq!(row.why.as_deref(), Some(Unfinished::Download.reason()));
     }
 
-    /// In Low Data Mode the item asks no password and runs nothing: the download waits, and
-    /// the row says how to go on; on a network without it the same Mac plans the install.
+    /// In Low Data Mode a download alone asks no password; definite independent root work
+    /// can enter the original batch, which retains the download behind its own network gate.
     #[test]
     fn low_data_mode_asks_no_password_and_says_how_to_go_on() {
         let mut sys = console();
@@ -1938,6 +2143,50 @@ mod tests {
         assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
         sys.low_data = Some(false);
         assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+
+        // An authorized built-in batch does its independent steps before retaining that
+        // same root process while the tools' download waits for an unconstrained path.
+        for step in [
+            crate::root_steps::Owed::Debugger,
+            crate::root_steps::Owed::NameRule,
+            crate::root_steps::Owed::LanBroker,
+        ] {
+            for tabbed in [false, true] {
+                let mut sys = console();
+                sys.low_data = Some(true);
+                let mut item = missing().with_owed(Box::new(move |_| vec![step]));
+                let tab = Tab::new(Arc::new(|_| {}));
+                if tabbed {
+                    item = item.in_tab(tab.clone());
+                }
+                assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+                sys.on(&argv(), Ran::ok(""))
+                    .on_write(&argv(), std::path::Path::new(CC), b"");
+                let row = run(&sys, &item, Mode::Apply);
+                assert_eq!(row.outcome, Outcome::Changed, "{step:?}: {row:?}");
+                assert_eq!(asked(&sys), [argv()], "one full batch: {:?}", sys.calls());
+                assert_eq!(
+                    tab.entered.load(std::sync::atomic::Ordering::Relaxed),
+                    tabbed
+                );
+            }
+        }
+
+        // Unknown root state is no independent work that may admit the ask.
+        let mut unknown = console();
+        unknown.low_data = Some(true);
+        unknown
+            .on(
+                "/usr/sbin/DevToolsSecurity -status",
+                Ran::ok("Developer mode rights are in an unknown state.\n"),
+            )
+            .stat_fails(
+                crate::root_steps::ADMITTED_NAME_RULE,
+                std::io::ErrorKind::PermissionDenied,
+            );
+        let item = missing().with_owed(Box::new(crate::root_steps::owed));
+        assert_eq!(run(&unknown, &item, Mode::Apply).outcome, Outcome::Blocked);
+        assert!(asked(&unknown).is_empty());
     }
 
     /// An account that is not one of the Mac's administrators asks for no password (macOS's
@@ -2824,17 +3073,31 @@ mod tests {
     /// failure to start releases this exact claim; a lost post-start result does not.
     #[test]
     fn a_password_attempt_stays_spent_and_only_proven_no_start_releases_it() {
+        use crate::port::RunFailed;
         for (reply, keeps) in [
-            (Some(Ran::exit(82, "")), true),
-            (Some(Ran::exit(83, "")), true),
-            (Some(Ran::exit(1, "")), true),
-            (Some(Ran::exit(85, "")), true),
-            (Some(Ran::exit(88, "")), true),
+            (Some(Ok(Ran::exit(82, ""))), true),
+            (Some(Ok(Ran::exit(83, ""))), true),
+            (Some(Ok(Ran::exit(1, ""))), true),
+            (Some(Ok(Ran::exit(85, ""))), true),
+            (Some(Ok(Ran::exit(88, ""))), true),
+            (
+                Some(Err(RunFailed::AfterStart("lost wait result".into()))),
+                true,
+            ),
+            (
+                Some(Err(RunFailed::TimedOut(std::time::Duration::from_secs(60)))),
+                true,
+            ),
+            (Some(Err(RunFailed::Spawn("exec failed".into()))), false),
+            (
+                Some(Err(RunFailed::Refused("before child start".into()))),
+                false,
+            ),
             (None, false), // The port's actual unscripted Spawn failure.
         ] {
             let sys = console();
             if let Some(reply) = reply {
-                sys.on(&argv(), reply);
+                sys.on_result(&argv(), reply);
             }
             let aterm = decided(crate::init::Decider::Aterm);
             let row = run(&sys, &aterm, Mode::Apply);
@@ -2848,6 +3111,12 @@ mod tests {
                     Outcome::Planned
                 }
             );
+            if keeps {
+                let attempts = asked(&sys);
+                let next = decided(crate::init::Decider::Aterm);
+                assert_eq!(run(&sys, &next, Mode::Apply).outcome, Outcome::Deferred);
+                assert_eq!(asked(&sys), attempts);
+            }
         }
     }
 
@@ -2926,11 +3195,18 @@ mod tests {
             assert_eq!(row.outcome, Outcome::Failed, "{status:?}: {row:?}");
             assert_eq!(row.why.as_deref(), Some(why.reason()), "{status:?}");
             assert_eq!(tab.unfinished(), Some(why), "{status:?}");
-            assert_eq!(
-                tab.exit(Unfinished::LowData),
-                1,
-                "a post-sudo LowData diagnosis cannot release the episode"
-            );
+            for after in [
+                Unfinished::LowData,
+                Unfinished::NotOwnLogin,
+                Unfinished::Busy,
+                Unfinished::AppleWindow,
+            ] {
+                assert_eq!(
+                    tab.exit(after),
+                    1,
+                    "a post-sudo {after:?} diagnosis cannot release the episode"
+                );
+            }
             assert_eq!(said.lock().unwrap().len(), 1, "the intro alone: {status:?}");
         }
 

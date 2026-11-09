@@ -102,7 +102,9 @@ fn at(secs: i64) -> J {
 
 const ACCOUNT_UUID: &str = "00000000-0000-4000-8000-0000000000a1";
 const ORG_UUID: &str = "00000000-0000-4000-8000-0000000000b1";
-const EMAIL: &str = "ana@example.com";
+/// The composed account's email ([`composed_oauth_account`]), which `lab claude --own`'s roster
+/// names too.
+pub(crate) const EMAIL: &str = "ana@example.com";
 
 /// The lab's composed account: a Max 5x subscriber `ana@example.com` with usage credits on.
 #[must_use]

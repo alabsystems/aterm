@@ -89,9 +89,9 @@ pub fn cmd_account(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The scratch `.claude.json` in the tab's `CLAUDE_CONFIG_DIR` ([`Run::claude_dir`]), parsed.
+/// The scratch `.claude.json` the tab's Claude Code reads ([`Run::claude_json`]), parsed.
 fn claude_json(run: &Run) -> Result<J, Fail> {
-    let p = run.claude_dir().join(".claude.json");
+    let p = run.claude_json();
     let text = crate::verbs::read_scratch(&p)?;
     J::parse(&text).map_err(|e| Fail::die(format!("the scratch .claude.json: {e}")))
 }
@@ -106,11 +106,8 @@ pub(crate) fn set_claude_json(run: &Run, key: &str, value: J) -> Result<(), Fail
     } else {
         j.set(key, value);
     }
-    atomic_write(
-        &run.claude_dir().join(".claude.json"),
-        j.dump(PRETTY).as_bytes(),
-    )
-    .map_err(|e| Fail::die(e.to_string()))
+    atomic_write(&run.claude_json(), j.dump(PRETTY).as_bytes())
+        .map_err(|e| Fail::die(e.to_string()))
 }
 
 /// `claude-json [tag] [KEY ...]`: inspect keys in the scratch `.claude.json`.

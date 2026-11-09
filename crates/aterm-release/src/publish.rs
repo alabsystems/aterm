@@ -527,6 +527,7 @@ pub fn acquire_lease_action(
 }
 
 pub(crate) fn native_origin(repo: &Path) -> Result<crate::github_remote::Remote> {
+    let _timing = crate::cut_timing::Timer::new("native publication origin");
     let expected = workspace_repo_slug(repo)?;
     let origin = crate::github_remote::Remote::origin(repo).map_err(Error::new)?;
     if !origin.repository().eq_full_name(&expected) {
@@ -1706,8 +1707,10 @@ pub fn release_completed_publisher_session(
     guard: &PublisherFenceGuard,
 ) -> Result<LeaseRelease> {
     let expected_owner = expected_owner.to_ascii_lowercase();
-    let owner = release_lease_owner(origin)?;
-    let fence = publisher_fence_for_guard(origin, guard)?;
+    let owner = crate::cut_timing::measure("unlock read lease", || release_lease_owner(origin))?;
+    let fence = crate::cut_timing::measure("unlock read fence", || {
+        publisher_fence_for_guard(origin, guard)
+    })?;
     match (owner.as_deref(), fence.as_ref()) {
         (None, None) => return Ok(LeaseRelease::AlreadyAbsent),
         (Some(observed), Some(current))
@@ -1729,24 +1732,29 @@ pub fn release_completed_publisher_session(
             )));
         }
     }
-    let written = write_control_refs(
-        origin,
-        &expected_owner,
-        vec![
-            ControlRefChange {
-                reference: RELEASE_LEASE_REF.into(),
-                before: Some(expected_owner.clone()),
-                after: None,
-            },
-            ControlRefChange {
-                reference: PUBLISHER_FENCE_REF.into(),
-                before: Some(guard.token().into()),
-                after: None,
-            },
-        ],
-    )?;
-    let owner_now = release_lease_owner(origin)?;
-    let fence_now = publisher_fence_for_guard(origin, guard)?;
+    let written = crate::cut_timing::measure("unlock native writer", || {
+        write_control_refs(
+            origin,
+            &expected_owner,
+            vec![
+                ControlRefChange {
+                    reference: RELEASE_LEASE_REF.into(),
+                    before: Some(expected_owner.clone()),
+                    after: None,
+                },
+                ControlRefChange {
+                    reference: PUBLISHER_FENCE_REF.into(),
+                    before: Some(guard.token().into()),
+                    after: None,
+                },
+            ],
+        )
+    })?;
+    let owner_now =
+        crate::cut_timing::measure("unlock verify lease", || release_lease_owner(origin))?;
+    let fence_now = crate::cut_timing::measure("unlock verify fence", || {
+        publisher_fence_for_guard(origin, guard)
+    })?;
     match (owner_now.as_deref(), fence_now.as_ref()) {
         (None, None) => Ok(LeaseRelease::Released),
         (Some(_), None) => Ok(LeaseRelease::AlreadySuperseded),
@@ -6990,7 +6998,9 @@ impl ReleaseSession {
         let Some((lease, fence)) = &self.guards else {
             return Ok(());
         };
-        assert_publisher_session(&native_origin(&self.repo)?, lease, fence)
+        crate::cut_timing::measure("publisher authority", || {
+            assert_publisher_session(&native_origin(&self.repo)?, lease, fence)
+        })
     }
 }
 
@@ -9034,7 +9044,7 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
                     &aterm_update_core::pointer::canonical_app_tag,
                 )
             },
-            &mut anonymous_get_optional,
+            &mut head_appcast,
         )
     }
 
@@ -9402,6 +9412,18 @@ fn anonymous_get_optional(location: &str) -> Result<Option<Vec<u8>>> {
         Err(error) => Err(Error::new(format!(
             "an unauthenticated GET of {location} failed ({error})"
         ))),
+    }
+}
+
+/// The head's appcast at `location` (the tag URL the evergreen pointer named), through the cut's
+/// release reader ([`crate::github::reader`]): the web route, then the API route when the
+/// download host fails, so a passing outage does not refuse the cut; `None` on its absence.
+fn head_appcast(location: &str) -> Result<Option<Vec<u8>>> {
+    let reader = crate::github::reader(crate::machines::CUT_READ_PATIENCE)?;
+    match reader.bytes_at(location, 16 << 20) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(aterm_update_core::release_asset::AssetError::Absent(_)) => Ok(None),
+        Err(error) => Err(Error::new(format!("a read of {location} failed ({error})"))),
     }
 }
 
@@ -9892,7 +9914,9 @@ fn prove_asset_files(
     slug: &str,
     release_id: u64,
 ) -> Result<()> {
+    let timer = crate::cut_timing::Timer::parallel_parent();
     upload_pool(files, 4, &|file| {
+        let _timing = timer("asset byte proof");
         let name = file
             .file_name()
             .and_then(|name| name.to_str())

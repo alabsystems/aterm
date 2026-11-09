@@ -924,19 +924,29 @@ fn log_observation_is_current(
     remembered: Option<[u8; 32]>,
     lock: &crate::client::StateLock,
 ) -> Result<bool> {
+    // One look at the vault's files for the whole check ([`crate::fsx::Glance`]): the identity's,
+    // the log memo's stamps and the state digest name many of the same files.
+    let glance = crate::fsx::Glance::new();
     // The recipient alone answers a quiet check, kept while the identity file stands; the
     // identity itself is read only to judge the log afresh.
-    let Some(local) = crate::client::identity_recipient(paths)? else {
+    let Some(local) = crate::client::identity_recipient(paths, Some(&glance))? else {
         return Ok(false);
     };
     if recipient.is_some_and(|expected| expected != local) {
         return Ok(false);
     }
-    let Some((log, heads_digest)) = crate::client::trusted_commons_log_under(paths, trust, lock)?
+    let Some((log, heads_digest)) =
+        crate::client::trusted_commons_log_under(paths, trust, lock, &glance)?
     else {
         return Ok(false);
     };
-    if remembered == Some(commons_log_state_digest(paths, heads_digest)?) {
+    if remembered
+        == Some(commons_log_state_digest(
+            paths,
+            heads_digest,
+            Some(&glance),
+        )?)
+    {
         return Ok(true);
     }
     let Some(identity) = crate::client::read_identity(paths)? else {
@@ -946,21 +956,27 @@ fn log_observation_is_current(
         return Ok(false);
     }
     Ok(
-        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock)?
+        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock, &glance)?
             .is_some_and(|fresh| fresh.head == head && fresh.basis == basis),
     )
 }
 
+/// The digest of the state a Commons log observation stands on, each file's `lstat` `glance`'s
+/// where the caller's check looks through one ([`crate::fsx::Glance`]).
 fn commons_log_state_digest(
     paths: &crate::client::Paths,
     heads_digest: [u8; 32],
+    glance: Option<&crate::fsx::Glance>,
 ) -> Result<[u8; 32]> {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
     // Each file's digest is kept while the file stands ([`crate::fsx::private_digest`]).
-    let state = crate::fsx::private_digest(&paths.state_file(), crate::client::MAX_STATE)?;
-    let source =
-        crate::fsx::public_digest(&paths.dir.join("source.toml"), crate::client::MAX_STATE)?;
+    let state = crate::fsx::private_digest(&paths.state_file(), crate::client::MAX_STATE, glance)?;
+    let source = crate::fsx::public_digest(
+        &paths.dir.join("source.toml"),
+        crate::client::MAX_STATE,
+        glance,
+    )?;
     for digest in [state, source] {
         if let Some(digest) = digest {
             hash.update([1]);
@@ -983,12 +999,7 @@ fn commons_log_state_digest(
         node_dir.join("node.key"),
         node_dir.join("node.id"),
     ] {
-        let metadata = match std::fs::symlink_metadata(&extra) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        if let Some(meta) = metadata {
+        if let Some(meta) = crate::fsx::lstat_in(glance, &extra)? {
             hash.update([1]);
             hash.update(meta.len().to_le_bytes());
             #[cfg(unix)]
@@ -1015,7 +1026,8 @@ fn commons_log_state_digest(
     Ok(hash.finalize())
 }
 
-/// Observe current Commons membership and network key from the peer-synced membership log (`F18`).
+/// Observe current Commons membership and network key from the peer-synced membership log (`F18`),
+/// the state it stands on as the caller's check looked at it (`glance`, [`crate::fsx::Glance`]).
 pub(super) fn current_from_loaded_log(
     paths: &crate::client::Paths,
     trust: Trust,
@@ -1023,6 +1035,7 @@ pub(super) fn current_from_loaded_log(
     log: &crate::membership_log::Log,
     heads_digest: [u8; 32],
     lock: &crate::client::StateLock,
+    glance: &crate::fsx::Glance,
 ) -> Result<Option<Access>> {
     type AccessCacheKey = (Trust, [u8; 32], [u8; 32]);
     type AccessCacheVal = Option<(
@@ -1039,7 +1052,7 @@ pub(super) fn current_from_loaded_log(
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-    let state_digest = commons_log_state_digest(paths, heads_digest)?;
+    let state_digest = commons_log_state_digest(paths, heads_digest, Some(glance))?;
     let cache_key = (trust, identity.recipient().0, state_digest);
     if let Ok(cache) = ACCESS_CACHE.lock()
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)

@@ -49,6 +49,7 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
         settles: None,
     };
     let predecessor = native_act::Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),

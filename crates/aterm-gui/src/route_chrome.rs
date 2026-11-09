@@ -96,8 +96,8 @@ impl App {
             }
             match step {
                 ChromeStep::PaneOverlay => self.splice_pane_overlay(wid),
-                ChromeStep::FindBar => self.splice_find_bar(wid),
-                ChromeStep::RewindBand => self.splice_rewind_band(wid),
+                ChromeStep::FindBar => self.splice_find_bar_from_plan(wid, Some(plan)),
+                ChromeStep::RewindBand => self.splice_rewind_band(wid, plan),
                 ChromeStep::SettingsPanel => self.splice_settings_panel(wid),
                 ChromeStep::BuildBadge => self.splice_build_badge(wid),
                 ChromeStep::RouteCard => {

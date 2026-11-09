@@ -318,7 +318,7 @@ fn calls_ended(
         return;
     };
     for e in ended {
-        if let Some(row) = agent_call_row(e, at_ms, wall_now, host_name, facts) {
+        if let Some(row) = agent_call_row(e, at_ms, wall_now, host_name, facts, sid_of(e.tab)) {
             emit(row);
         }
     }
@@ -330,6 +330,7 @@ fn agent_call_row(
     wall_now: u64,
     host_name: &str,
     facts: Digest,
+    sid: Option<String>,
 ) -> Option<Row> {
     use aterm_vitals::jobs::ExitOf;
     if e.kind != aterm_vitals::jobs::JobKind::AgentCall {
@@ -370,7 +371,7 @@ fn agent_call_row(
         key: what.map(|what| Digest::key(&Kind::AgentCall, what, None)),
         dir: None,
         label: aterm_telemetry::row::label(program.unwrap_or("")),
-        sid: sid_of(e.tab),
+        sid,
         on: None,
         host: host_name.to_owned(),
         facts,

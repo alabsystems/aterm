@@ -5518,24 +5518,60 @@ fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
         reason = "the test's stand-in sweep: it lets go by unlock() before its drop"
     )]
     held.try_lock().expect("the test holds the sweep lock");
-    let (code, _, err) = go_code(
-        &Cmd::UpgradeOwner {
-            sid: tab.to_string(),
-            ask: OwnerAsk::Defer(60),
-            json: false,
-        },
+    let request = |opts: &super::super::upgrade_drive::Opts,
+                   sid: &str,
+                   word: super::super::upgrade_drive::Ask,
+                   claims: bool| {
+        let mut opts = opts.clone();
+        opts.timings.owner_word_wait = std::time::Duration::ZERO;
+        super::super::upgrade_drive::ask(&opts, sid, word, claims)
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_upgrade_owner_with(
         &env,
+        tab,
+        OwnerAsk::Defer(60),
+        false,
+        &mut out,
+        &mut err,
+        request,
     );
     held.unlock().expect("release");
     assert_eq!(
-        code,
+        format!("{code:?}"),
         format!("{:?}", ExitCode::from(atpkg::lock::CONTENDED_EXIT)),
-        "{err}"
+        "{}",
+        String::from_utf8_lossy(&err)
     );
+    assert!(out.is_empty());
     assert_eq!(
         std::fs::read_to_string(env.state.join("upgrade/03396a15.json")).expect("state"),
         before
     );
+
+    out.clear();
+    err.clear();
+    let code = run_upgrade_owner_with(
+        &env,
+        tab,
+        OwnerAsk::Defer(60),
+        false,
+        &mut out,
+        &mut err,
+        request,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let after: Value = aterm_json::from_slice(
+        &std::fs::read(env.state.join("upgrade/03396a15.json")).expect("state"),
+    )
+    .expect("recorded word");
+    let at = after["request_at"].as_u64().expect("request time");
+    assert_eq!(
+        after["request"].as_str(),
+        Some(format!("defer-until:{}", at.saturating_add(60)).as_str())
+    );
+    assert_eq!(after["request_tab"].as_str(), Some(tab));
 }
 
 #[test]

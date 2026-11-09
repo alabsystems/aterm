@@ -3,7 +3,8 @@
 
 //! The accounts outlook as the window holds it (`docs/DESIGN-accounts-outlook-2026-10-25.md`
 //! §10): one machine-wide memo on the footer's resolver thread ([`crate::claude_footer`]),
-//! which replays the rotation's policy at most once a wall minute, and the [`AccountsSnapshot`]
+//! which replays the rotation's policy at most once a wall minute (and, while a pane shows a
+//! reading the last replay had not seen, at the store's next read), and the [`AccountsSnapshot`]
 //! it posts for the Accounts card, which the main thread maps to rows without reading a file
 //! (the card's account rows are the account reader's, read off the GUI thread,
 //! `crate::account_menu_read`).
@@ -26,7 +27,9 @@ use aterm_agent::harness::quota_view::QuotaView;
 /// `claude_footer::ROSTER_RECHECK`).
 const LOOK_EVERY: Duration = Duration::from_secs(10);
 
-/// The least time between two replays: the outlook is replayed at most once a minute.
+/// The least time between two replays: the outlook is replayed at most once a minute, but for a
+/// replay behind a pane's reading ([`OutlookMemo::quota`]), which waits only for the store's next
+/// read.
 pub(crate) const REPLAY_EVERY_S: i64 = 60;
 
 /// What the Accounts card maps to its outlook rows: the outlook the resolver last replayed for
@@ -210,6 +213,8 @@ pub(crate) struct OutlookMemo {
     series: BTreeMap<String, account_series::Tail>,
     /// The wall second of the last replay, and the policy it ran under.
     replayed: Option<(i64, (Mode, bool))>,
+    /// The store was read again since the last replay (its stamps or the roster moved).
+    unreplayed: bool,
     outlook: Option<Arc<Outlook>>,
     /// Each label's plan as this process last noted it ([`Self::note_plan`]).
     planned: BTreeMap<String, account_series::PlanSaid>,
@@ -230,13 +235,18 @@ impl OutlookMemo {
     /// or after a failed read; the
     /// replay runs at most once per [`REPLAY_EVERY_S`]. Incompatible or unreadable inputs
     /// withdraw a cached forecast at once without spending or resetting that replay slot.
-    /// A move posts a new [`AccountsSnapshot`].
+    /// A move posts a new [`AccountsSnapshot`]. `behind` says a pane shows a reading the last
+    /// replay had not seen ([`Self::quota`]): then a store read again since that replay is
+    /// replayed at once, not at the minute. The read is at a stamp look, so the replay follows
+    /// the harness's fold of the reading within [`LOOK_EVERY`], and a replay that has seen it
+    /// ends the pane's `behind`.
     pub(crate) fn at(
         &mut self,
         instant: Instant,
         now: i64,
         roster: Option<&accounts::Roster>,
         force: bool,
+        behind: bool,
     ) -> Option<&Outlook> {
         let reads = self.reads.unwrap_or(LIVE);
         let (Some(roster), Some(dir)) = (roster, (reads.state_dir)()) else {
@@ -269,6 +279,7 @@ impl OutlookMemo {
                 .is_none_or(|h| h.roster != *roster || h.stamps != stamps || h.read.is_err())
             {
                 self.held = Some(read_held(&store, roster, stamps, now));
+                self.unreplayed = true;
                 moved = true;
             }
         }
@@ -279,15 +290,17 @@ impl OutlookMemo {
         if (unavailable || policy_changed) && self.outlook.take().is_some() {
             moved = true;
         }
-        let due = self
-            .replayed
-            .is_none_or(|(at, _)| now.saturating_sub(at) >= REPLAY_EVERY_S || now < at);
+        let due = (behind && self.unreplayed)
+            || self
+                .replayed
+                .is_none_or(|(at, _)| now.saturating_sub(at) >= REPLAY_EVERY_S || now < at);
         if due
             && !roster.rows.is_empty()
             && let Some(held) = self.held.as_ref()
             && let Ok((state, enrolled)) = &held.read
         {
             self.replayed = Some((now, policy));
+            self.unreplayed = false;
             let series = refresh_series(&mut self.series, &dir, roster, &state.machine, now);
             #[cfg(test)]
             {
@@ -347,7 +360,10 @@ impl OutlookMemo {
     /// read after the resolver, refuses its forecasts (`FooterFacts::quota_view`); the second
     /// `None` where it says what the first does. `own` is the footer's own figure of the week,
     /// `movable` whether the harness can move its tab. Built once per replay and input, so a
-    /// resolver pass between replays builds none.
+    /// resolver pass between replays builds none. Where `own` holds a figure of a row the last
+    /// replay read nothing of, that reading came since the replay: the next store read, which
+    /// carries the harness's fold of it, replays at once ([`Self::at`]), so the step,
+    /// the curve and the tail follow the lead within [`LOOK_EVERY`] of the fold, not the minute.
     pub(crate) fn quota(
         &mut self,
         (instant, now): (Instant, i64),
@@ -356,7 +372,13 @@ impl OutlookMemo {
         own: Option<Figure>,
         movable: bool,
     ) -> Option<QuotaViews> {
-        self.at(instant, now, roster, false)?;
+        let behind = own.is_some_and(|f| f != Figure::Unread)
+            && self.outlook.as_ref().is_some_and(|o| {
+                o.rows
+                    .iter()
+                    .any(|r| r.label == tab && r.figure(o.as_of) == Figure::Unread)
+            });
+        self.at(instant, now, roster, false, behind)?;
         let outlook = self.outlook.clone()?;
         if let Some((of, views)) = &self.views
             && Arc::ptr_eq(&of.outlook, &outlook)

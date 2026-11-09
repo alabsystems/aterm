@@ -47,10 +47,13 @@ pub fn split_test_findings(
         .map(|t| Finding {
             id: one_line(&format!("{} -- {}", t.spec, t.name)),
             rerun: Some(format!(
-                "{}targo --unverified test {} -- {} --exact",
+                "{}targo --unverified test {} -- {} --exact{}",
                 rerun.prefix(&t.spec),
                 t.spec,
-                shell_word(&t.name)
+                shell_word(&t.name),
+                rerun.seed.map_or_else(String::new, |seed| format!(
+                    " -Zunstable-options --shuffle-seed={seed}"
+                ))
             )),
             message: test_message(&t.block),
         })
@@ -68,6 +71,7 @@ pub struct Rerun {
     /// The binaries that ran at a width of their own, by cargo's rerun spec, each with it: a
     /// rerun of one sets it in place of the run's.
     widths: Vec<(String, u32)>,
+    seed: Option<u64>,
 }
 
 impl Rerun {
@@ -99,6 +103,7 @@ impl Rerun {
         Rerun {
             env,
             widths: Vec::new(),
+            seed: None,
         }
     }
 
@@ -110,6 +115,13 @@ impl Rerun {
             widths: widths.into_iter().collect(),
             ..self
         }
+    }
+
+    /// Preserve an explicitly requested libtest order in the failure's replay command.
+    #[must_use]
+    pub const fn with_seed(mut self, seed: Option<u64>) -> Self {
+        self.seed = seed;
+        self
     }
 
     /// The variables a rerun of `spec`'s failures sets, as a shell command's prefix: the run's,
@@ -524,6 +536,13 @@ mod tests {
                  -- any::width --exact"
             ]
         );
+        let seeded = test_findings("test", &log, &rerun.clone().with_seed(Some(17)));
+        assert!(seeded.iter().all(|finding| {
+            finding
+                .rerun
+                .as_deref()
+                .is_some_and(|line| line.ends_with(" -Zunstable-options --shuffle-seed=17"))
+        }));
     }
 
     #[test]

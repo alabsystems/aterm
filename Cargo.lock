@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.185.0"
+version = "0.186.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -2121,6 +2121,7 @@ dependencies = [
 name = "aterm-update"
 version = "0.0.0"
 dependencies = [
+ "agh-fake",
  "astream-sys",
  "aterm-codec",
  "aterm-digest",
@@ -2178,6 +2179,7 @@ dependencies = [
  "aterm-ctl",
  "aterm-digest",
  "aterm-dirfd",
+ "aterm-durable",
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
@@ -2377,7 +2379,6 @@ dependencies = [
 name = "atpkg"
 version = "0.0.0"
 dependencies = [
- "agh",
  "agh-fake",
  "astream-sys",
  "aterm-brotli",

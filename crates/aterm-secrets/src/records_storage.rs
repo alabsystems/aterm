@@ -58,7 +58,8 @@ impl Selected {
     /// Hold the selection after reading its data: the pin, the entry and the intent still stand
     /// as they were found, or the selection is resolved again, with what that refuses.
     pub(crate) fn confirm(&self) -> Result<()> {
-        if self.witnesses.is_some() && selection_witnesses(&self.entry).ok() == self.witnesses {
+        if self.witnesses.is_some() && selection_witnesses(&self.entry, None).ok() == self.witnesses
+        {
             return Ok(());
         }
         data_path(&self.entry).map(|_| ())
@@ -83,11 +84,11 @@ const fn is_plain(witnesses: &Witnesses) -> bool {
     )
 }
 
-fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
+fn selection_witnesses(entry: &Path, glance: Option<&fsx::Glance>) -> Result<Witnesses> {
     Ok([
-        fsx::seen_if_present(&pin_path(entry)?)?,
-        fsx::seen_if_present(entry)?,
-        fsx::seen_if_present(&intent_path(entry)?)?,
+        fsx::seen_if_present_in(glance, &pin_path(entry)?)?,
+        fsx::seen_if_present_in(glance, entry)?,
+        fsx::seen_if_present_in(glance, &intent_path(entry)?)?,
     ])
 }
 
@@ -122,8 +123,8 @@ pub(crate) struct Standing {
 /// holds) or they cannot be seen. One `lstat` of the pin, the entry and the intent decides it for
 /// a plain records file; a pinned layout standing as a reader last judged it is not judged again
 /// ([`Judgements`]).
-pub(crate) fn standing(entry: &Path) -> Option<Standing> {
-    JUDGEMENTS.standing(entry)
+pub(crate) fn standing(entry: &Path, glance: Option<&fsx::Glance>) -> Option<Standing> {
+    JUDGEMENTS.standing(entry, glance)
 }
 
 /// The files a [`Standing`] of `entry` stands for, besides the parent: the entry, its pin, its
@@ -164,20 +165,24 @@ struct Judged {
 }
 
 impl Judged {
-    fn of(entry: &Path, witnesses: Witnesses) -> Result<Self> {
-        let parent = std::fs::symlink_metadata(
+    /// What `entry`'s files show, each `lstat` `glance`'s where the caller looks through one
+    /// ([`fsx::lstat_in`]).
+    fn of(entry: &Path, witnesses: Witnesses, glance: Option<&fsx::Glance>) -> Result<Self> {
+        let parent = fsx::lstat_in(
+            glance,
             entry
                 .parent()
                 .ok_or_else(|| refused("no parent directory"))?,
-        )?;
+        )?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         Ok(Self {
             entry: entry.to_path_buf(),
             held: crate::membership_log::RecordBudgets::current().held,
             parent: (parent.dev(), parent.ino(), parent.uid(), parent.mode()),
             witnesses,
             files: [
-                fsx::seen_if_present(&entry.join(HEADER))?,
-                fsx::seen_if_present(&entry.join(DATA))?,
+                fsx::seen_if_present_in(glance, &entry.join(HEADER))?,
+                fsx::seen_if_present_in(glance, &entry.join(DATA))?,
             ],
         })
     }
@@ -200,7 +205,7 @@ impl Judgements {
     }
 
     fn selected(&self, entry: &Path) -> Result<Selected> {
-        let witnesses = selection_witnesses(entry).ok();
+        let witnesses = selection_witnesses(entry, None).ok();
         let path = match witnesses {
             Some(stood) if is_plain(&stood) => entry.to_path_buf(),
             Some(
@@ -216,7 +221,7 @@ impl Judgements {
                     _,
                 ],
             ) => {
-                self.layout(entry, stood)?;
+                self.layout(entry, stood, None)?;
                 entry.join(DATA)
             }
             _ => data_path(entry)?,
@@ -231,8 +236,8 @@ impl Judgements {
     /// [`standing`]: the shapes [`Self::selected`] tells apart, from the same `lstat`s, with the
     /// judgement of a pinned layout it would take ([`Self::layout`]), and any other shape judged by
     /// [`data_path`] afresh.
-    fn standing(&self, entry: &Path) -> Option<Standing> {
-        let witnesses = selection_witnesses(entry).ok()?;
+    fn standing(&self, entry: &Path, glance: Option<&fsx::Glance>) -> Option<Standing> {
+        let witnesses = selection_witnesses(entry, glance).ok()?;
         let judged = match witnesses {
             stood if is_plain(&stood) => None,
             [
@@ -245,10 +250,10 @@ impl Judgements {
                     ..
                 }),
                 _,
-            ] => Some(Box::new(self.layout(entry, witnesses).ok()?)),
+            ] => Some(Box::new(self.layout(entry, witnesses, glance).ok()?)),
             _ => {
                 data_path(entry).ok()?;
-                Some(Box::new(Judged::of(entry, witnesses).ok()?))
+                Some(Box::new(Judged::of(entry, witnesses, None).ok()?))
             }
         };
         Some(Standing { witnesses, judged })
@@ -258,14 +263,21 @@ impl Judgements {
     /// stood as `witnesses` say (a prepared layout keeps its intent, which `data_path` does not
     /// read once the pin stands), as its files stood before it: taken from the last judgement of
     /// it while its files all stand as they did then. A judgement answers for its files only
-    /// where they stood still across it. Its data file is the one inside the entry.
-    fn layout(&self, entry: &Path, witnesses: Witnesses) -> Result<Judged> {
-        let before = Judged::of(entry, witnesses)?;
+    /// where they stood still across it, so the look after it is fresh even where the one before
+    /// it is a check's `glance` ([`fsx::Glance`]). Its data file is the one inside the entry.
+    fn layout(
+        &self,
+        entry: &Path,
+        witnesses: Witnesses,
+        glance: Option<&fsx::Glance>,
+    ) -> Result<Judged> {
+        let before = Judged::of(entry, witnesses, glance)?;
         if self.0.lock().is_ok_and(|judged| judged.contains(&before)) {
             return Ok(before);
         }
         data_path(entry)?;
-        let after = selection_witnesses(entry).and_then(|stood| Judged::of(entry, stood));
+        let after =
+            selection_witnesses(entry, None).and_then(|stood| Judged::of(entry, stood, None));
         if after.is_ok_and(|after| after == before)
             && let Ok(mut judged) = self.0.lock()
         {

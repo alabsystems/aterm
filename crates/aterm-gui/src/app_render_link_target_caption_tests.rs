@@ -121,6 +121,34 @@ fn hovered_link_reuses_the_frame_plan() {
     );
 }
 
+/// In a split the caption's chrome check reads the focused pane's columns off the frame plan,
+/// or needs none. Negative control: a `focused_pane_rect` call in `compose_link_caption`, which
+/// builds its own plan in a split, makes the threaded splice count 2; a single pane, as in
+/// `hovered_link_reuses_the_frame_plan`, builds none there and cannot show it.
+#[test]
+fn a_split_hovered_link_reads_the_focused_pane_off_the_frame_plan() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let _ = app.split_active_stub_tab(wid);
+    feed(&app, wid, PHISH);
+    extract_only(&mut app, wid);
+    let (row, col, _, _) = app.focused_pane_rect(wid);
+    hover(&mut app, wid, row, col + LINK_COL);
+    assert!(
+        app.windows[&wid].link_hover.is_some(),
+        "the pointer rests on the focused pane's link"
+    );
+
+    reset_visible_leaf_plan_builds();
+    let (plan, _) = app.active_visible_frame_layout(wid).expect("frame layout");
+    app.splice_link_target_from_plan(wid, &plan);
+    assert_eq!(
+        visible_leaf_plan_builds(),
+        1,
+        "a split's hover caption borrows the frame plan",
+    );
+}
+
 #[test]
 fn a_hovered_hyperlink_puts_its_destination_in_the_composed_frame() {
     let mut app = App::headless_for_test();

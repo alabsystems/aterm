@@ -497,6 +497,48 @@ fn main() {
                 release_build: true,
                 ..aterm_stamp::Stamp::UNSTAMPED
             };
+            let guest_root = dir.path().join(format!("q4-{version}"));
+            let guest_app = crate::profile_pilot::runtime_app(
+                root.parent().unwrap(),
+                &guest_root,
+                &target.join("debug/stamp-fixture"),
+                build,
+                &identity,
+            )
+            .unwrap();
+            let guest_image = std::fs::read(guest_app.join("Contents/MacOS/aterm")).unwrap();
+            assert_eq!(normalized(&guest_image).unwrap(), expected);
+            assert_eq!(
+                guest_image[layout(&guest_image).unwrap().stamp],
+                aterm_stamp::encode(&identity).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(target.join("debug/stamp-fixture")).unwrap(),
+                original,
+                "Q4 stamping must leave the measured raw image unchanged"
+            );
+            // NEGATIVE CONTROLS: an old arm's input cannot be overwritten, and
+            // an unstamped identity cannot silently change release behavior.
+            assert!(
+                crate::profile_pilot::runtime_app(
+                    root.parent().unwrap(),
+                    &guest_root,
+                    &target.join("debug/stamp-fixture"),
+                    build,
+                    &identity,
+                )
+                .is_err()
+            );
+            assert!(
+                crate::profile_pilot::runtime_app(
+                    root.parent().unwrap(),
+                    &dir.path().join("unstamped-q4"),
+                    &target.join("debug/stamp-fixture"),
+                    build,
+                    &aterm_stamp::Stamp::UNSTAMPED,
+                )
+                .is_err()
+            );
             stamp(&thin, &aterm_stamp::encode(&identity).unwrap()).unwrap();
             std::fs::copy(&thin, &bin).unwrap();
             let unsigned = command(aterm_uds::os_path!("codesign"))

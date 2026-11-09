@@ -895,13 +895,17 @@ fn parse(args: &[String]) -> Result<Verb, Fail> {
 /// # Errors
 /// A usage error (exit 2), a named refusal or a defect (exit 1).
 pub fn cmd_aos_learn(args: &[String]) -> Res {
+    cmd_aos_learn_reading(args, held_out_judged)
+}
+
+fn cmd_aos_learn_reading(args: &[String], judged: impl FnOnce() -> u64) -> Res {
     let out = if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
         Ok(0)
     } else {
         parse(args).and_then(|verb| run(&verb))
     };
-    guarded("aos-learn", out, held_out_judged())
+    guarded("aos-learn", out, judged())
 }
 
 /// A command's exit `out`, unless `read`, `held_out_judged` at that exit, is not 0: then the exit

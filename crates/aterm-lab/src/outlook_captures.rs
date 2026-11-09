@@ -945,13 +945,12 @@ fn read_own_row(rl: &Path) -> bool {
 /// Take the frame as `png`: the verb's verdict line.
 fn image(inst: &Instance, png: &Path) -> Result<String, Fail> {
     let shot = inst.ctl(&["image", "outlook.png"]);
-    let path = shot.stdout.split_whitespace().nth(3).unwrap_or_default();
-    if shot.code != 0 || path.is_empty() {
+    let Some(path) = shot.image_path() else {
         return Err(Fail::die(format!(
             "outlook-captures: image: {}",
             shot.first()
         )));
-    }
+    };
     crate::util::copy_regular_file(path, png)
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", png.display())))?;
     Ok(shot.first())

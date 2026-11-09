@@ -234,6 +234,90 @@ fn the_outlook_replays_at_most_once_a_minute() {
     set_dir(None);
 }
 
+/// A FIRST READING IS DRAWN AT THE STORE'S NEXT MOVE, NOT AT THE MINUTE (2026-11-08, the glass
+/// design's §7 step 4): the memo replays a store whose `me` was never read, so `me`'s pane is case
+/// (d). Five seconds later the harness folds `me`'s first reading (58%, its reset in three days)
+/// into the store, and the pane's footer holds it (`own`). Until the next stamp look the pane
+/// leads with 58% beside no refusal (the view's own rule); from that look, ten seconds after the
+/// first, its view is a replay that read the reading: the last past cell holds 58% and phrase 1
+/// says `me`'s reset. Only that replay runs early: at second 20 the store moves again (`alt1`
+/// made active) while the pane's reading is the replay's, and that move waits for the minute,
+/// so the minute's reads replay twice in all. NEGATIVE CONTROLS (each run once, restored): a
+/// memo that replays only at the minute draws nothing of the reading within the minute; one
+/// whose pane is behind whenever it holds a figure replays the second move too (3 replays).
+#[test]
+fn a_first_reading_is_drawn_at_the_stores_next_move() {
+    let dir = scratch();
+    set_dir(Some(dir.path()));
+    let store = accounts::Store::at(dir.path());
+    let (state, _) = store.load(NOW).expect("an empty store loads");
+    store.save(&state).expect("save");
+    let roster = roster();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..OutlookMemo::default()
+    };
+    let start = Instant::now();
+    let first = memo
+        .quota((start, NOW), Some(&roster), "me", None, true)
+        .expect("a view")
+        .view;
+    assert!(first.waiting(), "case (d): me is unread");
+    assert_eq!(memo.replays, 1);
+    let mut drawn_at = None;
+    for s in 1..60i64 {
+        if s == 5 {
+            let (mut state, _) = store.load(NOW + s).expect("load");
+            let read = tap(580, NOW + 3 * D, NOW + s, true);
+            let _ = accounts::note_reading_held(&mut state, "me", &read, NOW + s);
+            store.save(&state).expect("save");
+        }
+        if s == 20 {
+            assert_eq!(memo.replays, 2, "the early replay ran by second 20");
+            let (mut state, _) = store.load(NOW + s).expect("load");
+            state.active = Some("alt1".into());
+            store.save(&state).expect("save");
+        }
+        let own = (s >= 5).then_some(Figure::Exact(580));
+        let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
+        let view = memo
+            .quota((instant, NOW + s), Some(&roster), "me", own, true)
+            .unwrap_or_else(|| panic!("second {s}: a view"))
+            .view;
+        if own.is_some() {
+            assert_eq!(view.tab().map(|t| t.figure), own, "second {s}: the lead");
+        }
+        if drawn_at.is_none() && view.tail.own.is_some() {
+            drawn_at = Some(s);
+            assert_eq!(
+                view.chart.past.last().map(|r| (r.t, r.x10)),
+                Some((NOW + s, 580)),
+                "second {s}: the last past cell holds the lead"
+            );
+        } else if drawn_at.is_none() && own.is_some() {
+            assert_eq!(
+                view.tail.verdict, None,
+                "second {s}: no refusal beside the lead"
+            );
+        }
+    }
+    assert_eq!(drawn_at, Some(10), "drawn at the stamp look after the fold");
+    assert_eq!(
+        memo.replays, 2,
+        "one replay early, and no more within the minute: the store's second move waits"
+    );
+    assert_eq!(
+        memo.held
+            .as_ref()
+            .and_then(|h| h.read.as_ref().ok().map(|(st, _)| st.active.clone()))
+            .flatten()
+            .as_deref(),
+        Some("alt1"),
+        "the second move was read (its stamps moved), and not replayed"
+    );
+    set_dir(None);
+}
+
 #[test]
 fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
     let dir = seeded();
@@ -245,7 +329,7 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
         ..Default::default()
     };
     let start = Instant::now();
-    assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+    assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
     let original = memo.replayed;
     let rejected_modified = std::fs::metadata(store.state_file())
         .unwrap()
@@ -269,7 +353,8 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
                 start + Duration::from_secs(seconds),
                 wall,
                 Some(&roster),
-                true
+                true,
+                false
             )
             .is_none()
         );
@@ -286,6 +371,7 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
             start + Duration::from_secs(71),
             NOW + 71,
             Some(&roster),
+            false,
             false
         )
         .is_none(),
@@ -296,6 +382,7 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
             start + Duration::from_secs(80),
             NOW + 80,
             Some(&roster),
+            false,
             false
         )
         .is_some(),
@@ -329,7 +416,7 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
             ..Default::default()
         };
         let start = Instant::now();
-        assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+        assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
         let original = memo.replayed;
         if !store_present {
             set_dir(None);
@@ -339,7 +426,8 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
                 start + Duration::from_secs(10),
                 NOW + 10,
                 input.as_ref(),
-                true
+                true,
+                false
             )
             .is_none(),
             "input {input:?}, store present {store_present}"
@@ -354,7 +442,8 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
                 start + Duration::from_secs(20),
                 NOW + 20,
                 Some(&roster),
-                true
+                true,
+                false
             )
             .is_none(),
             "restoring input cannot revive or recompute before the slot"
@@ -365,7 +454,8 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
                 start + Duration::from_secs(60),
                 NOW + 60,
                 Some(&roster),
-                true
+                true,
+                false
             )
             .is_some()
         );
@@ -386,7 +476,7 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
             ..Default::default()
         };
         let start = Instant::now();
-        assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+        assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
         let original = memo.replayed;
         memo.reads = Some(Reads {
             policy,
@@ -397,6 +487,7 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
                 start + Duration::from_secs(10),
                 NOW + 10,
                 Some(&roster),
+                false,
                 false
             )
             .is_none()
@@ -410,6 +501,7 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
                 start + Duration::from_secs(20),
                 NOW + 20,
                 Some(&roster),
+                false,
                 false
             )
             .is_none(),
@@ -421,6 +513,7 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
                 start + Duration::from_secs(60),
                 NOW + 60,
                 Some(&roster),
+                false,
                 false
             )
             .is_some()
@@ -449,7 +542,7 @@ fn a_gated_tier_is_one_plan_row() {
         "nothing is asked before the store is read"
     );
     let start = Instant::now();
-    assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+    assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
     let (state, _) = accounts::Store::at(dir.path()).load(NOW).expect("loads");
     let plans = || -> Vec<account_series::PlanSaid> {
         account_series::read(dir.path(), "me", &state.machine)
@@ -477,7 +570,7 @@ fn a_gated_tier_is_one_plan_row() {
     assert_eq!(plans().len(), 2);
     let later = start + Duration::from_secs(61);
     let out = memo
-        .at(later, NOW + 61, Some(&roster), true)
+        .at(later, NOW + 61, Some(&roster), true, false)
         .expect("replayed");
     let me = out.rows.iter().find(|r| r.label == "me").expect("me");
     assert_eq!(
@@ -555,7 +648,7 @@ fn a_walled_accounts_hover_says_out_once() {
         ..OutlookMemo::default()
     };
     let outlook = memo
-        .at(Instant::now(), NOW, Some(&roster), false)
+        .at(Instant::now(), NOW, Some(&roster), false, false)
         .expect("an outlook")
         .clone();
     for own in [Some(Figure::Out), Some(Figure::Exact(970))] {
@@ -624,7 +717,9 @@ fn unavailable_outlook_gallery() {
             }),
             ..Default::default()
         };
-        let outlook = memo.at(Instant::now(), NOW, Some(&roster), false).unwrap();
+        let outlook = memo
+            .at(Instant::now(), NOW, Some(&roster), false, false)
+            .unwrap();
         assert_eq!(outlook.verdict, Verdict::Refused(why));
         assert!(outlook.week.is_none() && outlook.working.is_none());
         let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
@@ -749,7 +844,7 @@ fn paused_outlook_gallery() {
         ..Default::default()
     };
     let outlook = memo
-        .at(Instant::now(), NOW, Some(&roster), false)
+        .at(Instant::now(), NOW, Some(&roster), false, false)
         .unwrap()
         .clone();
     assert!(outlook.week.is_some());
@@ -957,7 +1052,7 @@ fn watching_account_observations_gallery() {
         ..Default::default()
     };
     let outlook = memo
-        .at(Instant::now(), now, Some(&roster), false)
+        .at(Instant::now(), now, Some(&roster), false, false)
         .unwrap()
         .clone();
     let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
@@ -1031,7 +1126,10 @@ fn watching_account_observations_gallery() {
         let result = if unavailable {
             std::fs::write(store.state_file(), b"not an account state").unwrap();
             let instant = Instant::now() + Duration::from_secs(10);
-            assert!(memo.at(instant, now + 10, Some(&roster), true).is_none());
+            assert!(
+                memo.at(instant, now + 10, Some(&roster), true, false)
+                    .is_none()
+            );
             let why = memo
                 .held
                 .as_ref()
@@ -1227,7 +1325,10 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    assert!(memo.at(Instant::now(), NOW, Some(&roster), false).is_some());
+    assert!(
+        memo.at(Instant::now(), NOW, Some(&roster), false, false)
+            .is_some()
+    );
     assert_eq!(
         crate::work_counts::take_account_store_reads(),
         1,
@@ -1309,7 +1410,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
         ..OutlookMemo::default()
     };
     let outlook = Arc::new(
-        memo.at(Instant::now(), NOW, Some(&roster), false)
+        memo.at(Instant::now(), NOW, Some(&roster), false, false)
             .expect("an outlook")
             .clone(),
     );
@@ -1421,7 +1522,7 @@ fn seeded_card(
         ..OutlookMemo::default()
     };
     let outlook = Arc::new(
-        memo.at(Instant::now(), NOW, Some(roster), false)
+        memo.at(Instant::now(), NOW, Some(roster), false, false)
             .expect("an outlook")
             .clone(),
     );
@@ -1625,7 +1726,7 @@ fn a_forecast_interrupts_nobody() {
     }
     app.open_fact_menu(wid, session, Fact::Account, (0, 0), false);
     let later = Instant::now() + Duration::from_secs(61);
-    let _ = memo.at(later, NOW + 61, Some(&roster), true);
+    let _ = memo.at(later, NOW + 61, Some(&roster), true, false);
     app.on_claude_footer_changed(session);
     for _ in 0..5 {
         pass(&mut app, wid);

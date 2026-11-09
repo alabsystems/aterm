@@ -1531,6 +1531,42 @@ fn a_refused_pace_says_its_short_words_on_the_carriers_tab() {
     );
 }
 
+/// A READING THE REPLAY HAS NOT SEEN IS NOT REFUSED (§2.2, 2026-11-08): case (d)'s replay read
+/// nothing of `main`, its carrier, so its verdict is `Refusal::NoFigure` (`no reading`). A pane
+/// whose footer holds `main`'s first reading (`own`, 63%) leads with it, and nothing on its row
+/// at any rung, in its title or in its spoken words says `no reading` beside it: the past holds
+/// no step and the future is `┄` until a replay reads the reading, and the tail is empty. With no
+/// `own` the pane is case (d), the first reading's wait. A refusal of another kind is said as
+/// before (`a_refused_pace_says_its_short_words_on_the_carriers_tab`). NEGATIVE CONTROL (run
+/// once, restored): `Words::outdated` always false says `no reading` after `main 63% used`, as
+/// the first `lab claude --own` run's first minute showed (§7 step 4).
+#[test]
+fn a_reading_the_replay_has_not_seen_is_not_refused() {
+    let out = case_d().outlook();
+    let refused = Refusal::NoFigure;
+    assert_eq!(out.verdict, Verdict::Refused(refused));
+    assert!(
+        out.rows.iter().any(|r| r.label == "main" && r.carrier),
+        "main carries, so its tab says the refusal"
+    );
+    assert!(out.quota("main", None, true).waiting(), "case (d)");
+    let view = out.quota("main", Some(Figure::Exact(630)), true);
+    assert_eq!(view.tab().map(|t| t.figure), Some(Figure::Exact(630)));
+    assert_eq!(view.tail.verdict, None, "no phrase 2");
+    for room in [166, 96, 66, 24] {
+        let line = laid(&view, room).unwrap_or_else(|| panic!("a rung fits {room}"));
+        let text = line.text();
+        assert!(text.starts_with("main 63%"), "at {room}: {text}");
+        assert!(!text.contains(&refused.short()), "at {room}: {text}");
+    }
+    assert!(!view.title.contains(&refused.words()), "{}", view.title);
+    assert!(!view.spoken.contains(&refused.spoken()), "{}", view.spoken);
+    assert!(
+        future(&view.chart, 12).iter().all(|c| *c == Cell::Unknown),
+        "nothing projected"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The ladder (§2.4)
 

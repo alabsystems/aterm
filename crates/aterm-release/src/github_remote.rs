@@ -89,6 +89,25 @@ fn repository_file_with(
         .map_err(|error| client.redactor().apply(&error.why))
 }
 
+fn lane_record_with(
+    client: &Github,
+    slug: &Slug,
+    journal: &str,
+    tree: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if !agh::path::is_sha(journal) || !agh::path::is_sha(tree) {
+        return Err("a lane record read requires exact journal and tree object IDs".into());
+    }
+    match client
+        .contents(slug)
+        .raw(Some(journal), &format!("verdicts/{tree}.toml"), 16 << 20)
+    {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind == agh::error::Kind::NotFound => Ok(None),
+        Err(error) => Err(client.redactor().apply(&error.why)),
+    }
+}
+
 pub(crate) fn origin_slug(repo: &Path) -> Result<Slug, String> {
     let mut command = crate::ledger::object_git(repo);
     command.args(["remote", "get-url", "origin"]);
@@ -126,6 +145,14 @@ pub(crate) fn helper_arguments(
 }
 
 impl Remote {
+    /// Read only the selected tree's record at an observed journal OID. Never transfer the
+    /// append-only journal's history into a fresh cutter clone.
+    pub(crate) fn lane_record(&self, journal: &str, tree: &str) -> Result<Option<Vec<u8>>, String> {
+        self.ensure_origin()?;
+        let bytes = lane_record_with(&self.client, &self.slug, journal, tree)?;
+        self.ensure_origin()?;
+        Ok(bytes)
+    }
     /// The immutable repository captured when this source was admitted.
     pub(crate) fn repository(&self) -> &Slug {
         &self.slug

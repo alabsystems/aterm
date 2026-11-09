@@ -131,7 +131,7 @@ impl Remote {
 }
 
 fn is_conflict(error: &agh::Error) -> bool {
-    error.kind == agh::error::Kind::Conflict && error.side_effect == agh::error::SideEffect::None
+    error.side_effect == agh::error::SideEffect::None && error.kind == agh::error::Kind::Conflict
 }
 
 /// A scratch-only writer route for actual native local-bare claim controls.
@@ -258,6 +258,7 @@ mod tests {
             agh::Error::new(Kind::OutcomeUnknown, "non-fast-forward; [rejected]")
                 .with_side_effect(SideEffect::Unknown),
             agh::Error::new(Kind::CouldNotRun, "fetch first"),
+            agh::Error::new(Kind::Refused, "cannot lock ref 'refs/heads/main'"),
         ] {
             assert!(!is_conflict(&error));
         }

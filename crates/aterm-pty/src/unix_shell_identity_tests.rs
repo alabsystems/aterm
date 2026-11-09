@@ -337,8 +337,7 @@ fn a_real_shell_finishes_its_hang_up_handler_past_the_holdout_tick() {
         // SAFETY: writing a few bytes from a valid buffer to the fifo this test opened.
         let wrote = unsafe { libc::write(gate, b"go\n".as_ptr().cast(), 3) };
         assert_eq!(wrote, 3, "the go line reaches the fifo");
-        // Until the marker or the shell's end: zsh at its prompt runs a trap's `exit` only on
-        // its next input, which never comes.
+        // Until the marker or the shell's end, whichever comes first.
         let mut status: libc::c_int = 0;
         let mut collected = 0;
         let deadline = Instant::now() + HANG_DETECTOR;
@@ -455,8 +454,8 @@ fn a_hold_on_another_shell_keeps_no_reap_of_this_one() {
 /// on the terminal reads end of file, and the trap goes on to write its marker. Teardown that kept
 /// a duplicate of the master would leave `cat` waiting, and a close without `CLOCAL` would hang
 /// zsh up again. Kills are held throughout, so no `SIGKILL` can be what ends `cat`. This is also
-/// what ends zsh at its prompt holding a `trap ... HUP`'s `exit` until its next input (macOS
-/// 27.0.1, ATERM-KI-1104-7).
+/// what ends a job in front of zsh that waits on its terminal, which zsh waits for before it runs
+/// its `trap ... HUP` (ATERM-KI-1104-7).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_terminals_close_mid_handler_is_end_of_file_and_no_hang_up() {
@@ -868,4 +867,112 @@ fn a_close_ends_a_plain_foreground_job_and_leaves_one_that_ignores_sighup() {
             assert!(died, "a plain foreground job dies with the close");
         }
     }
+}
+
+/// Types `line` into the session behind `master` and reads its terminal until `needle` shows.
+#[cfg(target_os = "macos")]
+fn type_until(master: i32, line: &str, needle: &str) {
+    // SAFETY: writing a few bytes from a valid buffer to the master this test owns.
+    let wrote = unsafe { libc::write(master, line.as_ptr().cast(), line.len()) };
+    assert_eq!(
+        usize::try_from(wrote).ok(),
+        Some(line.len()),
+        "{line:?} reaches the terminal"
+    );
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + HANG_DETECTOR;
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        assert!(
+            Instant::now() < deadline,
+            "{needle:?} never showed after {line:?}"
+        );
+        let mut buf = [0u8; 4096];
+        let n = read(master, &mut buf);
+        if n > 0 {
+            seen.extend_from_slice(&buf[..n as usize]);
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A real interactive zsh whose `trap ... HUP` calls `exit`, at its prompt or with `less` or `vim`
+/// in front, saves its history and exits by itself once teardown has hung it up and its master is
+/// retired, as Quit retires every master it hangs up. Kills are held throughout, so no `SIGKILL`
+/// ends it. zsh runs the trap only once its foreground job has ended (no `TRAPS_ASYNC`), and the
+/// job, in a group of its own, gets no hang-up: it ends on the end of file the master's last close
+/// is. With the master kept open, as Quit kept every master before, the job waits on its terminal
+/// and the shell behind it until the reaper's kill tick, its history unsaved (ATERM-KI-1104-7).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_zsh_whose_hang_up_trap_exits_saves_its_history_once_its_master_is_retired() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let page = scratch.path().join("page.txt");
+    std::fs::write(&page, "PAGE-SHOWN\n".repeat(100)).expect("the page");
+    let page = page.display();
+    let mut unsaved = Vec::new();
+    for (name, front) in [
+        ("prompt", None),
+        ("less", Some(format!("/usr/bin/less {page}"))),
+        (
+            "vim",
+            Some(format!("/usr/bin/vim -u NONE -i NONE -N {page}")),
+        ),
+    ] {
+        let dir = scratch.path().join(name);
+        std::fs::create_dir_all(&dir).expect("the row's folder");
+        let history = dir.join("history");
+        std::fs::write(
+            dir.join(".zshrc"),
+            format!(
+                "HISTFILE='{}'\nSAVEHIST=100\nHISTSIZE=100\ntrap 'exit' HUP\nPS1='UP%# '\n",
+                history.display()
+            ),
+        )
+        .expect("the rc file");
+        let sh = parked_session(&format!(
+            "HOME='{0}' ZDOTDIR='{0}' TERM=xterm-256color LESSHISTFILE=- exec /bin/zsh -d -i",
+            dir.display()
+        ));
+        type_until(sh.master, "print -r -- $((6*7))-typed\r", "42-typed");
+        if let Some(front) = &front {
+            type_until(sh.master, &format!("{front}\r"), "PAGE-SHOWN");
+        }
+        let hold = hold_reap_kills_for_test(sh.pid);
+        let identity = record_spawned_shell(sh.pid);
+        let hung = hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
+        assert_eq!(
+            hung,
+            ShellHangup::Shell(sh.pid),
+            "{name}: the shell is hung up"
+        );
+        retire_master(sh.master).expect("the master is retired");
+        // SAFETY: read-only probes of the slot this test owns.
+        let (tty, cloexec) = unsafe {
+            (
+                libc::isatty(sh.master) == 1,
+                libc::fcntl(sh.master, libc::F_GETFD),
+            )
+        };
+        assert!(
+            !tty && cloexec == libc::FD_CLOEXEC,
+            "{name}: the retired slot is open, close-on-exec and no longer the terminal"
+        );
+        let exited = aterm_spec::wait::within(HANG_DETECTOR, Duration::from_millis(5), || {
+            (child_exit_unreaped(sh.pid) != Some(false)).then_some(())
+        })
+        .is_some();
+        let saved = std::fs::read_to_string(&history).unwrap_or_default();
+        if !exited || !saved.contains("6*7") {
+            unsaved.push(format!("{name} (exited={exited}, history={saved:?})"));
+        }
+        end_row(sh.pid, hold);
+        // SAFETY: closing the retired slot this test owns.
+        unsafe { libc::close(sh.master) };
+    }
+    assert!(
+        unsaved.is_empty(),
+        "these shells did not exit with their history saved once their master was retired: \
+         {unsaved:?}"
+    );
 }

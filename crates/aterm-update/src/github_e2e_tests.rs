@@ -18,14 +18,15 @@ const HOLD_AT: usize = 64 * 1024;
 
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-const QUICK_STALL_SECS: &str = "8";
+/// The release reader's `--speed-time` (its file reads end after this many seconds under
+/// `--speed-limit`), which the wrapper shortens for the fresh attempt.
+const STALL_SECS: &str = "30";
 
 const FRESH_STALL_SECS: u32 = 2;
 
 /// The fresh attempt's `--speed-limit` in place of the product's 4 KiB/s: curl judges speed
 /// over its last few seconds, so at 4 KiB/s the burst before the hold keeps the attempt
-/// "fast" for about 6 s more; at this limit the hold reads slow at once, and the attempt's
-/// average (the burst over about 3 s) still earns the quick bound for the resume.
+/// "fast" for about 6 s more; at this limit the hold reads slow at once.
 const FRESH_SPEED_LIMIT: u32 = 1024 * 1024;
 
 fn e2e_staging(dir: &std::path::Path) -> Staging {
@@ -51,10 +52,14 @@ fn probe_one_check_over_real_curl_if_asked() -> bool {
     let master = pub_b64(&MASTER_SEED_FIXTURE);
     let masters = [master.as_str()];
     let mut head = aterm_update_core::head_no_redirect;
+    let reader = Reader::anonymous();
+    let mut latest = || reader.latest_tag("alabsystems", "aterm", APPCAST_ASSET);
     let world = CheckWorld {
         installed_parent: Some(&installed_parent),
         staging: e2e_staging(&dir),
         head: &mut head,
+        latest: &mut latest,
+        reader: &reader,
         master_pubkeys: &masters,
         team: "",
     };
@@ -332,7 +337,7 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
 
     let world = dir.path().join("world");
     std::fs::create_dir_all(world.join("Applications")).unwrap();
-    let quick = QUICK_STALL_SECS;
+    let quick = STALL_SECS;
     let wrapper = dir.path().join("curl");
     std::fs::write(
         &wrapper,

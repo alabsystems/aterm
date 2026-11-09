@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Compiler wire evidence before general-purpose JSON maps can erase ambiguity.
+//! The checked value decoder is also shared by raw verifier attribution readers.
 
 use aterm_json::Value;
 
@@ -92,12 +93,16 @@ pub(crate) fn artifact_target_kinds(message: &Value) -> Result<Vec<&str>, &'stat
 }
 
 /// Uses the JSON decoder's existing depth bound, including objects nested in arrays.
-struct CheckedValue {
+pub(crate) struct CheckedValue {
     value: Value,
     duplicate: bool,
 }
 
 impl CheckedValue {
+    pub(crate) fn into_parts(self) -> (Value, bool) {
+        (self.value, self.duplicate)
+    }
+
     fn plain(value: Value) -> Self {
         Self {
             value,
@@ -158,12 +163,9 @@ impl<'de> serde::Deserialize<'de> for CheckedValue {
                 let mut duplicate = false;
                 while let Some((key, checked)) = input.next_entry::<String, CheckedValue>()? {
                     duplicate |= checked.duplicate;
-                    match values.entry(key) {
-                        std::collections::btree_map::Entry::Occupied(_) => duplicate = true,
-                        std::collections::btree_map::Entry::Vacant(slot) => {
-                            slot.insert(checked.value);
-                        }
-                    }
+                    // Keep Value's payload semantics while separately retaining
+                    // ambiguity. UnitMessage still refuses duplicate unit data.
+                    duplicate |= values.insert(key, checked.value).is_some();
                 }
                 Ok(CheckedValue {
                     value: Value::Object(values),

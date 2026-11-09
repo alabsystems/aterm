@@ -24,6 +24,72 @@ mod native {
         let by = started + COMMAND_HANG;
         operation_remaining(Some(end.map_or(by, |end| end.min(by))), COMMAND_HANG)
     }
+    /// Hang detector for a required page response within its original operation.
+    const PAGE_REQUEST_HANG: Duration = Duration::from_secs(60);
+
+    fn page_request_remaining(end: Option<Instant>, started: Instant) -> Result<Duration, String> {
+        let own = started + PAGE_REQUEST_HANG;
+        operation_remaining(Some(end.map_or(own, |end| end.min(own))), PAGE_REQUEST_HANG)
+    }
+
+    fn mailbox_key_script(local: &str, headers: &str, timeout_ms: u128) -> String {
+        format!(
+            r#"(async () => {{
+                const local={local};
+                if(local===undefined) throw new Error('No account route');
+                const session=JSON.parse(localStorage.getItem('ps-'+local) || 'null');
+                if(!session?.UID || !session.blob) throw new Error('No persisted session');
+                const headers={headers};
+                if(headers['x-pm-uid'] && session.UID!==headers['x-pm-uid']) throw new Error('Different session');
+                headers['x-pm-uid']=session.UID;
+                const response=await fetch('/api/auth/v4/sessions/local/key',{{headers,credentials:'include',redirect:'error',signal:AbortSignal.timeout({timeout_ms})}});
+                if(!response.ok) throw new Error('Session key unavailable');
+                const result=await response.json();
+                const bytes=value=>Uint8Array.from(atob(value),c=>c.charCodeAt(0));
+                const raw=bytes(result.ClientKey), blob=bytes(session.blob);
+                if(raw.length!==32 || blob.length>65536) throw new Error('Invalid session data');
+                const version=session.payloadVersion || 1;
+                if(![1,2,3].includes(version)) throw new Error('Unknown session version');
+                const n=version===3?12:16;
+                const key=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['decrypt']);
+                const options={{name:'AES-GCM',iv:blob.slice(0,n)}};
+                if(version>=2) options.additionalData=new TextEncoder().encode('session');
+                const decrypted=await crypto.subtle.decrypt(options,key,blob.slice(n));
+                const payload=JSON.parse(new TextDecoder().decode(decrypted));
+                if(typeof payload.keyPassword!=='string' || payload.keyPassword.length>4096) throw new Error('Invalid mailbox key');
+                return payload.keyPassword;
+            }})()"#
+        )
+    }
+
+    fn api_request_script(
+        url: &str,
+        method: &str,
+        body: &str,
+        headers: &str,
+        timeout_ms: u128,
+    ) -> String {
+        format!(
+            r#"(async () => {{
+              const signal=AbortSignal.timeout({timeout_ms});
+              const target=new URL({url});
+              if(target.origin!=='https://mail.proton.me' || !/^\/api\/(core|mail)\/v4\//.test(target.pathname)) throw new Error('Invalid mail API URL');
+              const response=await fetch(target.href, {{method:{method},body:{body},headers:{headers},credentials:'include',cache:'no-store',redirect:'error',signal}});
+              const reader=response.body?.getReader(), decoder=new TextDecoder();
+              let bytes=0,text='';
+              if(reader) while(true) {{
+                const chunk=await reader.read();
+                if(chunk.done) break;
+                bytes+=chunk.value.byteLength;
+                if(bytes>33554432) {{await reader.cancel();throw new Error('Mail response exceeds limit');}}
+                text+=decoder.decode(chunk.value,{{stream:true}});
+              }}
+              text+=decoder.decode();
+              return {{status:response.status,retryAfter:response.headers.get('Retry-After'),text}};
+            }})()"#
+        )
+    }
+
     const SNAPSHOT: &str = r#"(() => {
       const buttons=Array.from(document.querySelectorAll('button'));
       const profile=document.title.includes('@') ? document.title : buttons.map(b=>b.getAttribute('aria-label') || '').find(s=>s.includes('@')) || '';
@@ -549,6 +615,7 @@ mod native {
 
         /// Resume the derived mailbox secret belonging to this private browser session.
         pub fn mailbox_key_password(&mut self) -> Result<Secret, String> {
+            let started = Instant::now();
             self.authenticate(|_| {})?;
             let headers: BTreeMap<_, _> = self
                 .api_headers
@@ -558,32 +625,10 @@ mod native {
             let headers = aterm_json::to_string(&headers).map_err(|_| "Invalid session headers")?;
             let local =
                 aterm_json::to_string(&self.local_id).map_err(|_| "Invalid account route")?;
-            let timeout_ms = self.within(Duration::from_secs(25))?.as_millis().max(1);
-            let value=self.evaluate(&format!(r#"(async () => {{
-                const local={local};
-                if(local===undefined) throw new Error('No account route');
-                const session=JSON.parse(localStorage.getItem('ps-'+local) || 'null');
-                if(!session?.UID || !session.blob) throw new Error('No persisted session');
-                const headers={headers};
-                if(headers['x-pm-uid'] && session.UID!==headers['x-pm-uid']) throw new Error('Different session');
-                headers['x-pm-uid']=session.UID;
-                const response=await fetch('/api/auth/v4/sessions/local/key',{{headers,credentials:'include',redirect:'error',signal:AbortSignal.timeout({timeout_ms})}});
-                if(!response.ok) throw new Error('Session key unavailable');
-                const result=await response.json();
-                const bytes=value=>Uint8Array.from(atob(value),c=>c.charCodeAt(0));
-                const raw=bytes(result.ClientKey), blob=bytes(session.blob);
-                if(raw.length!==32 || blob.length>65536) throw new Error('Invalid session data');
-                const version=session.payloadVersion || 1;
-                if(![1,2,3].includes(version)) throw new Error('Unknown session version');
-                const n=version===3?12:16;
-                const key=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['decrypt']);
-                const options={{name:'AES-GCM',iv:blob.slice(0,n)}};
-                if(version>=2) options.additionalData=new TextEncoder().encode('session');
-                const decrypted=await crypto.subtle.decrypt(options,key,blob.slice(n));
-                const payload=JSON.parse(new TextDecoder().decode(decrypted));
-                if(typeof payload.keyPassword!=='string' || payload.keyPassword.length>4096) throw new Error('Invalid mailbox key');
-                return payload.keyPassword;
-            }})()"#))?;
+            let timeout_ms = page_request_remaining(self.operation_deadline, started)?
+                .as_millis()
+                .max(1);
+            let value = self.evaluate(&mailbox_key_script(&local, &headers, timeout_ms))?;
             match value {
                 Value::String(password) if !password.is_empty() => Ok(Secret::new(password)),
                 _ => Err("No derived mailbox key in authenticated session".into()),
@@ -596,6 +641,7 @@ mod native {
             path: &str,
             body: Option<Value>,
         ) -> Result<aterm_mail::proton::ApiResponse, String> {
+            let started = Instant::now();
             if (!path.starts_with("/core/v4/") && !path.starts_with("/mail/v4/"))
                 || path.contains("..")
                 || path.contains('#')
@@ -626,24 +672,12 @@ mod native {
                 .transpose()
                 .map_err(|_| "Invalid API body")?
                 .unwrap_or_else(|| "undefined".into());
-            let timeout_ms = self.within(Duration::from_secs(25))?.as_millis().max(1);
-            let response = self.evaluate(&format!(r#"(async () => {{
-              const signal=AbortSignal.timeout({timeout_ms});
-              const target=new URL({url});
-              if(target.origin!=='https://mail.proton.me' || !/^\/api\/(core|mail)\/v4\//.test(target.pathname)) throw new Error('Invalid mail API URL');
-              const response=await fetch(target.href, {{method:{method},body:{body},headers:{headers},credentials:'include',cache:'no-store',redirect:'error',signal}});
-              const reader=response.body?.getReader(), decoder=new TextDecoder();
-              let bytes=0,text='';
-              if(reader) while(true) {{
-                const chunk=await reader.read();
-                if(chunk.done) break;
-                bytes+=chunk.value.byteLength;
-                if(bytes>33554432) {{await reader.cancel();throw new Error('Mail response exceeds limit');}}
-                text+=decoder.decode(chunk.value,{{stream:true}});
-              }}
-              text+=decoder.decode();
-              return {{status:response.status,retryAfter:response.headers.get('Retry-After'),text}};
-            }})()"#))?;
+            let timeout_ms = page_request_remaining(self.operation_deadline, started)?
+                .as_millis()
+                .max(1);
+            let response = self.evaluate(&api_request_script(
+                &url, &method, &body, &headers, timeout_ms,
+            ))?;
             let status = response["status"]
                 .as_u64()
                 .and_then(|n| u16::try_from(n).ok())
@@ -819,6 +853,9 @@ mod native {
                             .any(|domain| candidate == format!("{local}@{domain}"))
             })
     }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod page_wait_tests;
 
     #[cfg(test)]
     mod tests {

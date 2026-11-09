@@ -1174,6 +1174,14 @@ trait Kernel {
     /// Authenticated read-only history; absent, damaged or unavailable is false.
     fn historical_noexec(&self, request: &Request) -> bool;
     fn recorded_operation(&self, id: &str) -> Result<bool, ()>;
+    /// Commit permanent rejection only if this exact restart ID was never admitted.
+    fn reject_unadmitted(&self, _prepare: &Prepare) -> Result<bool, ()> {
+        Err(())
+    }
+    /// `None` means unsupported; an error means supported custody is unavailable.
+    fn rejection_domain(&self) -> Result<Option<String>, ()> {
+        Ok(None)
+    }
     fn account_admission(
         &self,
         _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
@@ -1419,6 +1427,29 @@ impl Kernel for System<'_> {
         {
             let _ = id;
             Ok(false)
+        }
+    }
+    fn reject_unadmitted(&self, prepare: &Prepare) -> Result<bool, ()> {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::reject_unadmitted(prepare).map_err(|_| ())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = prepare;
+            Err(())
+        }
+    }
+    fn rejection_domain(&self) -> Result<Option<String>, ()> {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::rejection_domain()
+                .map(Some)
+                .map_err(|_| ())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
         }
     }
     fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
@@ -2202,13 +2233,29 @@ fn unadmitted_after_deadline(
     account: Option<&AccountContinuation>,
     kernel: &dyn Kernel,
 ) -> String {
+    if !unadmitted_guard(ctx, request, caller, renewal, account)
+        || kernel.recorded_operation(&request.id) != Ok(false)
+    {
+        return DEADLINE.into();
+    }
+    aterm_agent::harness::native_act::unadmitted_reply(&request.id)
+        .unwrap_or_else(|| DEADLINE.into())
+}
+
+fn unadmitted_guard(
+    ctx: &crate::SessionCtx,
+    request: &Prepare,
+    caller: &SupervisorInputCaller,
+    renewal: Option<&renewal::Seal>,
+    account: Option<&AccountContinuation>,
+) -> bool {
     if caller.principal != crate::control::Principal::Harness
         || renewal.is_some()
         || account.is_some()
         || (request.asked.is_some() && !asked_upgrade::shape(request))
         || !matches!(request.plan, NativePlan::Restart { .. })
     {
-        return DEADLINE.into();
+        return false;
     }
     let held = {
         let table = ctx
@@ -2222,11 +2269,7 @@ fn unadmitted_after_deadline(
             || table.account_fences.contains_key(&request.id)
             || table.renewal_seals.contains_key(&request.id)
     };
-    if held || kernel.recorded_operation(&request.id) != Ok(false) {
-        return DEADLINE.into();
-    }
-    aterm_agent::harness::native_act::unadmitted_reply(&request.id)
-        .unwrap_or_else(|| DEADLINE.into())
+    !held
 }
 
 fn prepare_inner(
@@ -2253,7 +2296,24 @@ fn prepare_inner(
     }
 
     if host_epoch() != Some(request.host_epoch.as_str()) {
+        // The old epoch's clock cannot prove absence. A marked recipe is rejected
+        // by pre-journal hosts. Its acknowledged durable rejection races admission
+        // under the same journal lock and only in its original domain. If
+        // preparation won, this refuses; if rejection won, no old host can
+        // publish admission later. This never reconstructs execution authority.
+        if request.rejection_domain.is_some()
+            && unadmitted_guard(ctx, &request, &caller, renewal.as_ref(), account.as_ref())
+            && kernel.reject_unadmitted(&request) == Ok(true)
+        {
+            return aterm_agent::harness::native_act::unadmitted_reply(&request.id)
+                .unwrap_or_else(|| "ERR native host epoch changed\n".into());
+        }
         return "ERR native host epoch changed\n".into();
+    }
+    if let Some(expected) = &request.rejection_domain
+        && kernel.rejection_domain().ok().flatten().as_ref() != Some(expected)
+    {
+        return DENIED.into();
     }
     {
         let table = ctx
@@ -4288,6 +4348,15 @@ fn serve_request(
         }
         Request::Info => return host_epoch().map_or_else(|| "ERR native entropy unavailable\n".into(), |epoch|
             format!("OK native-act state=info epoch={epoch} native-act=1 handoff=blocked clock=monotonic-us own-image={}\n", own_image_rows(&ctx.native_policy))),
+        Request::RejectionDomain => return if caller.principal == crate::control::Principal::Harness {
+            match kernel.rejection_domain() {
+                Ok(Some(domain)) => format!("OK native-act state=rejection-domain domain={domain}\n"),
+                Ok(None) => "ERR usage: native-act rejection-domain unsupported\n".into(),
+                Err(()) => UNKNOWN.into(),
+            }
+        } else {
+            DENIED.into()
+        },
         Request::Prepare(request) => return prepare(ctx, master, *request, caller, kernel),
         Request::CancelSupport => return "OK native-act state=cancel-support cancel-prepare=1\n".into(),
         Request::CancelPrepare(request) => return cancel_prepare(ctx, master, *request, caller, kernel),
@@ -4296,6 +4365,7 @@ fn serve_request(
     let binding = match &request {
         Request::Info
         | Request::Constructors
+        | Request::RejectionDomain
         | Request::Prepare(_)
         | Request::CancelSupport
         | Request::CancelPrepare(_) => unreachable!(),
@@ -4956,6 +5026,7 @@ fn serve_request(
         }
         Request::Info
         | Request::Constructors
+        | Request::RejectionDomain
         | Request::Prepare(_)
         | Request::CancelSupport
         | Request::CancelPrepare(_)

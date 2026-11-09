@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+// A required side effect needs an execution, not first_exec's inode-keyed warm-up
+// cache. Some fixtures deliberately fail; callers check their status or output file.
+fn run_fixture(path: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = aterm_uds::spawnfd::command(path);
+    command.args(args);
+    aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+        .expect("run the fixture")
+}
+
 #[test]
 fn occupied_legacy_temps_never_prevent_generated_file_updates_or_touch_their_targets() {
     let ordinary = crate::testdir::dir("selfsetup-temp-positive-");
@@ -1325,7 +1334,8 @@ fn an_uninstall_quits_the_acaffeine_mug_and_removes_its_files() {
         &aterm,
         &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
     );
-    aterm_spec::wait::first_exec(&aterm, &["warm"]);
+    let warm = run_fixture(&aterm, &["warm"]);
+    assert!(warm.status.success(), "{warm:?}");
     std::fs::remove_file(&log).expect("the warm-up's line");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
@@ -2200,7 +2210,7 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
         &bin.join("update-desktop-database"),
         &format!("#!/bin/sh\n: >'{}'\n", refreshed.display()),
     );
-    aterm_spec::wait::first_exec(&bin.join("update-desktop-database"), &[]);
+    let _ = run_fixture(&bin.join("update-desktop-database"), &[]);
     std::fs::remove_file(&refreshed).expect("the warm-up's mark");
     let env = ShellEnv {
         shell: None,
@@ -2217,7 +2227,7 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
     assert!(!home_is_the_accounts(me, a.home()));
     assert!(!home_is_the_accounts(0, a.home()));
 
-    aterm_spec::wait::first_exec(&planted, &["--version"]);
+    let _ = run_fixture(&planted, &["--version"]);
     std::fs::remove_file(&ran).expect("the warm-up's mark");
     assert!(!store_entry_is_ours(&planted, RunAs::Nobody));
     assert!(!ran.exists(), "not run for nobody");
@@ -2869,7 +2879,7 @@ fn an_uninstall_removes_a_bundle_whose_programs_ended_however_they_ended() {
                 log.display()
             ),
         );
-        aterm_spec::wait::first_exec(&macos.join(program), &["warm"]);
+        let _ = run_fixture(&macos.join(program), &["warm"]);
     }
     std::fs::remove_file(&log).expect("the warm-ups' lines");
     let (ok, out, err) = a.sweep(None, true);

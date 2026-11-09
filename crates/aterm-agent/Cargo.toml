@@ -62,9 +62,9 @@ aterm-digest = { workspace = true }
 # supervisor decodes). First-party; its one dependency is astream-wire
 # (dependency-free, vendor/astream), for the CRC-32.
 aterm-codec = { workspace = true }
-# The fleet document from a URL (src/ai/fleet.rs): its HTTPS-only, size-capped fetch
-# (`http::download_bytes`) and its Ed25519 check (`roster::verify_roster`), the verifier the
-# updater's own roster uses. Already in the graph through atpkg.
+# The fleet document from a URL (src/ai/fleet.rs): its size-capped release read
+# (`release_asset::Reader::bytes_at`) and its Ed25519 check (`roster::verify_roster`), the
+# verifier the updater's own roster uses. Already in the graph through atpkg.
 aterm-update-core = { workspace = true }
 # First-party HTTP/1.1 client for Codex's native OAuth token exchange/refresh and `/wham/usage`
 # read (`src/harness/codex_app_login.rs`), avoiding any external `codex app-server` subprocess.

@@ -144,52 +144,43 @@ fn first_line_at(file: &File, offset: u64) -> io::Result<String> {
     String::from_utf8(bytes[..end].to_vec()).map_err(io::Error::other)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairRecord {
+    schema: u64,
+    id: String,
+    device: String,
+    inode: String,
+}
+
 fn owned_events(human: &File, path: &Path, events: File) -> io::Result<File> {
     if !has_header(&events, PRIVATE_EVENTS_HEADER)? || !has_header(human, PRIVATE_HUMAN_HEADER)? {
         return Err(io::Error::other("existing pair has no private file roles"));
     }
     let line = first_line_at(human, PRIVATE_HUMAN_HEADER.len() as u64)?;
-    let value: aterm_json::Value = aterm_json::from_str(
+    let pair: PairRecord = aterm_json::from_str(
         line.strip_prefix("verify-pair: ")
             .ok_or_else(|| io::Error::other("existing companion has no owned pairing record"))?,
     )
     .map_err(io::Error::other)?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| io::Error::other("invalid pairing record"))?;
-    if object.len() != 4
-        || object
-            .keys()
-            .any(|key| !["schema", "id", "device", "inode"].contains(&key.as_str()))
-    {
-        return Err(io::Error::other("unknown pairing record"));
+    if !crate::event_log::valid_id(&pair.id) {
+        return Err(io::Error::other("pair identity is unknown"));
     }
-    let id = value["id"]
-        .as_str()
-        .filter(|id| crate::event_log::valid_id(id))
-        .ok_or_else(|| io::Error::other("pair identity is unknown"))?;
     let (device, inode) = file_key(&events)?;
-    if value["schema"].as_u64() != Some(1)
-        || value["device"].as_str() != Some(device.as_str())
-        || value["inode"].as_str() != Some(inode.as_str())
-        || !same_file(&events, path)
+    if pair.schema != 1 || pair.device != device || pair.inode != inode || !same_file(&events, path)
     {
         return Err(io::Error::other(
             "existing companion is not the recorded physical file",
         ));
     }
     let line = first_line_at(&events, PRIVATE_EVENTS_HEADER.len() as u64)?;
-    let first: aterm_json::Value = aterm_json::from_str(
+    let first = crate::event_log::raw_event(
         line.strip_prefix("verify-event: ")
             .ok_or_else(|| io::Error::other("existing companion has no stamped first record"))?,
     )
-    .map_err(io::Error::other)?;
-    if first["schema"].as_u64() != Some(1)
-        || first["event"].as_str() != Some("invocation-started")
-        || crate::event_log::attribution(&first)
-            .as_ref()
-            .map(|a| a.id.as_str())
-            != Some(id)
+    .ok_or_else(|| io::Error::other("existing companion has an ambiguous event header"))?;
+    if first.value["event"].as_str() != Some("invocation-started")
+        || first.attribution.as_ref().map(|a| a.id.as_str()) != Some(pair.id.as_str())
     {
         return Err(io::Error::other(
             "existing companion descriptor does not match its pairing",
@@ -511,6 +502,100 @@ mod tests {
         let newline = after_header.iter().position(|byte| *byte == b'\n').unwrap();
         assert!(after_header.starts_with(b"verify-pair: "));
         after_header[newline + 1..].to_vec()
+    }
+
+    #[test]
+    fn ambiguous_raw_pair_or_first_descriptor_never_grants_reuse_or_pruning() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut preserved = Vec::new();
+        for (at, (human, key, inserted, prior)) in [
+            (true, "schema", "schema", "0"),
+            (true, "id", "id", "\"unknown\""),
+            (true, "id", "\\u0069d", "\"unknown\""),
+            (true, "device", "device", "\"other\""),
+            (true, "inode", "inode", "\"other\""),
+            (false, "schema", "schema", "0"),
+            (false, "event", "\\u0065vent", "\"other\""),
+            (false, "invocation", "invocation", "null"),
+            (false, "id", "\\u0069d", "\"unknown\""),
+            (false, "identity_error", "identity_error", "\"unavailable\""),
+            (false, "source_observation", "source_observation", "{}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.path().join(format!("1-{}.log", at + 100));
+            let (log, events) = paired(&path);
+            log.file
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+                .unwrap();
+            drop((log, events));
+            let target = if human {
+                path.clone()
+            } else {
+                events_path(&path)
+            };
+            let original = std::fs::read_to_string(&target).unwrap();
+            let header = if human {
+                PRIVATE_HUMAN_HEADER
+            } else {
+                PRIVATE_EVENTS_HEADER
+            };
+            let body = original.strip_prefix(header).unwrap();
+            let needle = format!("\"{key}\":");
+            let malformed = format!(
+                "{header}{}",
+                body.replacen(&needle, &format!("\"{inserted}\":{prior},{needle}"), 1)
+            );
+            assert_ne!(malformed, original);
+            std::fs::write(&target, malformed).unwrap();
+            let human_before = std::fs::read(&path).unwrap();
+            let events_before = std::fs::read(events_path(&path)).unwrap();
+            let human_key = file_key(&aterm_uds::regular_file::open(&path).unwrap().0).unwrap();
+            let events_key = file_key(
+                &aterm_uds::regular_file::open(&events_path(&path))
+                    .unwrap()
+                    .0,
+            )
+            .unwrap();
+            assert!(Candidate::take(path.clone()).is_err());
+            let next = crate::event_log::EventLog::unrecorded();
+            assert!(open_paired_at(&path, false, next.id()).is_err());
+            preserved.push((path, human_before, events_before, human_key, events_key));
+        }
+        let mut managed = Vec::new();
+        for at in 0..LOGS_KEPT + 5 {
+            let path = dir.path().join(format!("{}-{}.log", 100 + at, 1000 + at));
+            let (log, events) = paired(&path);
+            log.file
+                .set_modified(UNIX_EPOCH + Duration::from_secs((100 + at) as u64))
+                .unwrap();
+            drop((log, events));
+            managed.push(path);
+        }
+        let lock = directory_lock(dir.path()).unwrap();
+        prune(dir.path(), &lock);
+        assert_eq!(
+            managed.iter().filter(|path| path.exists()).count(),
+            LOGS_KEPT
+        );
+        for (path, human, events, human_key, events_key) in preserved {
+            assert_eq!(std::fs::read(&path).unwrap(), human);
+            assert_eq!(std::fs::read(events_path(&path)).unwrap(), events);
+            assert_eq!(
+                file_key(&aterm_uds::regular_file::open(&path).unwrap().0).unwrap(),
+                human_key
+            );
+            assert_eq!(
+                file_key(
+                    &aterm_uds::regular_file::open(&events_path(&path))
+                        .unwrap()
+                        .0
+                )
+                .unwrap(),
+                events_key
+            );
+        }
     }
 
     #[test]

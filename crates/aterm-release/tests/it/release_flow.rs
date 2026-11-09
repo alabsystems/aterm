@@ -1125,6 +1125,11 @@ impl crate::release::PendingSign for FakePreparingSign {
 }
 
 impl Backend for World {
+    fn main_lane(&mut self, base: &str) -> Option<String> {
+        Some(format!(
+            "main lane: base {base}: red, age_s=23 (advisory fixture)"
+        ))
+    }
     fn start_prefreeze(&mut self) {
         std::fs::write(
             self.dir.path().join("prefreeze-started"),
@@ -2744,6 +2749,21 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
         "{:?}",
         w.calls
     );
+}
+
+#[test]
+fn selection_states_the_bases_lane_red_without_refusing_or_reselecting() {
+    let mut w = World::new();
+    let tip = w.history.last().unwrap().clone();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(w.out.iter().any(|line| line == &format!("main lane: base {tip}: red, age_s=23 (advisory fixture)")));
+    assert!(w.journal().is_none());
+    assert_eq!(w.count("build"), 0);
+    assert_eq!(w.count("bump"), 0);
 }
 
 /// A refusal before step 1 starts a child still creates the log its verdict names, with the

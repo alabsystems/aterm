@@ -85,7 +85,7 @@ pub(crate) fn client() -> Result<Client> {
 fn client_via(spawn: Option<&Arc<dyn Spawn>>) -> Result<Client> {
     let client = base_client()?;
     Ok(match spawn {
-        Some(spawn) => client.with_spawn(Arc::clone(spawn)),
+        Some(spawn) => client.with_spawn(Arc::new(TimedSpawn(Arc::clone(spawn)))),
         None => client,
     })
 }
@@ -101,15 +101,62 @@ fn base_client() -> Result<Client> {
             .map_err(Error::new)?;
         let client = Client::new(fixture.origins, token);
         return Ok(match fixture.spawn {
-            Some(spawn) => client.with_spawn(spawn),
-            None => client,
+            Some(spawn) => client.with_spawn(Arc::new(TimedSpawn(spawn))),
+            None => client.with_spawn(Arc::new(TimedSpawn(Arc::new(
+                aterm_update_core::github_rest::Direct,
+            )))),
         });
     }
     let token = match crate::publish::channel_token_path() {
         Some(path) => Token::from_file(&path).map_err(Error::new)?,
         None => None,
     };
-    Ok(Client::new(Origins::github(), token))
+    Ok(
+        Client::new(Origins::github(), token).with_spawn(Arc::new(TimedSpawn(Arc::new(
+            aterm_update_core::github_rest::Direct,
+        )))),
+    )
+}
+
+/// Attribute waited curl CPU separately from native Git authority checks.
+/// Never label a timing row with a URL, command argument or request body.
+struct TimedSpawn(Arc<dyn Spawn>);
+
+impl Spawn for TimedSpawn {
+    fn run(
+        &self,
+        command: &mut Command,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        crate::cut_timing::measure("publication curl", || self.0.run(command, stdin))
+    }
+}
+
+/// The shared release reader ([`aterm_update_core::release_asset`]) as the cut reads a
+/// release's assets: the web route and the asset CDN anonymously, as clients read them, and the
+/// API route, when the download host fails, as the release org's token when its file holds one
+/// (that token's allowance, not the address's shared anonymous 60 an hour); a test's fixture
+/// origins. It goes on for `patience` without progress before it stops.
+/// # Errors
+/// A token file that cannot be read, or holds a token [`Token::new`] refuses.
+pub(crate) fn reader(
+    patience: std::time::Duration,
+) -> Result<aterm_update_core::release_asset::Reader> {
+    use aterm_update_core::release_asset::Reader;
+    #[cfg(test)]
+    if let Some(fixture) = FIXTURE.with(|f| f.borrow().clone()) {
+        let token = fixture
+            .token
+            .map(|t| Token::new(t.as_bytes()))
+            .transpose()
+            .map_err(Error::new)?;
+        return Ok(Reader::loopback(fixture.origins, token, patience));
+    }
+    let token = match crate::publish::channel_token_path() {
+        Some(path) => Token::from_file(&path).map_err(Error::new)?,
+        None => None,
+    };
+    Ok(Reader::new(Origins::github(), token).patient(patience))
 }
 
 /// curl started as `L` starts a child (the release's `StepChildren`, or `ship site`'s `Plain`).

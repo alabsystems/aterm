@@ -3,6 +3,23 @@
 
 use super::*;
 
+#[test]
+fn raw_event_validation_keeps_ignored_payload_semantics_and_record_bounds() {
+    let events = EventLog::unrecorded();
+    let wire = events.prepare("verify-event: {\"schema\":1,\"event\":\"observation\"}");
+    let json = wire.trim().strip_prefix("verify-event: ").unwrap();
+    let with_payload = json.replacen('{', "{\"ignored\":{\"a\":1,\"a\":2},", 1);
+    let raw = raw_event(&with_payload).unwrap();
+    assert_eq!(raw.value["ignored"]["a"].as_u64(), Some(2));
+    assert_eq!(raw.attribution.unwrap().id, events.id().unwrap());
+    let oversized = format!(
+        "{{\"schema\":1,\"event\":\"other\",\"pad\":\"{}\"}}",
+        "x".repeat(MAX_RECORD_BYTES)
+    );
+    assert!(raw_event(&oversized).is_none());
+    assert!(raw_event("{\"schema\":1,\"event\":\"other\",\"invocation\":").is_none());
+}
+
 fn row(pad: &str) -> String {
     format!(
         "verify-event: {}",

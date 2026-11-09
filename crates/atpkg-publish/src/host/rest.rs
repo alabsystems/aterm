@@ -15,6 +15,7 @@ use aterm_uds::spawnfd::Command;
 #[cfg(any(test, debug_assertions))]
 use aterm_update_core::github_rest::Spawn;
 use aterm_update_core::github_rest::{Answer, Client, Method, Origins, RestError, Token};
+use aterm_update_core::release_asset::{Asset, AssetError, Reader};
 
 use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, Slug};
 
@@ -174,6 +175,8 @@ pub struct RestHost {
     /// of bare repositories.
     git_base: String,
     retry_pause: Duration,
+    /// How long a public read goes on without progress ([`aterm_update_core::release_asset`]).
+    read_patience: Duration,
     /// Tests: what starts curl (a recorder of each spawn).
     #[cfg(any(test, debug_assertions))]
     spawn: Option<Arc<dyn Spawn>>,
@@ -205,6 +208,7 @@ impl RestHost {
             git_base: origins.web.clone(),
             origins,
             retry_pause: RETRY_PAUSE,
+            read_patience: aterm_update_core::release_asset::PATIENCE,
             #[cfg(any(test, debug_assertions))]
             spawn: None,
             #[cfg(any(test, debug_assertions))]
@@ -214,7 +218,8 @@ impl RestHost {
         }
     }
 
-    /// Constructs a host for custom `origins` and `git_base` with zero retry pause.
+    /// Constructs a host for custom `origins` and `git_base` with zero retry pause, whose public
+    /// reads try each route once.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn at(token_file: Option<PathBuf>, origins: Origins, git_base: String) -> Self {
@@ -223,6 +228,7 @@ impl RestHost {
             origins,
             git_base,
             retry_pause: Duration::ZERO,
+            read_patience: Duration::ZERO,
             spawn: None,
             git_env: Vec::new(),
             git_transport: None,
@@ -969,20 +975,27 @@ impl ReleaseHost for RestHost {
         {
             return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
         }
-        match aterm_update_core::download_to_resumable(
-            &self.public_url(slug, tag, asset),
-            dest,
-            cap,
-        ) {
-            Ok(()) => Probe::Present,
-            Err(e) => {
-                if aterm_update_core::download_error_is_not_found(&e) {
-                    Probe::Absent
-                } else {
-                    Probe::Unknown(e)
-                }
-            }
-        }
+        // The shared release reader: the web route as clients take it, then the API route when
+        // the download host fails, whose requests carry this identity's token (its own
+        // allowance, not the address's shared anonymous one); the web and CDN legs stay
+        // anonymous.
+        let reader = Reader::new(self.origins.clone(), self.token().ok().flatten())
+            .patient(self.read_patience);
+        let named = Asset::tagged(&slug.owner, &slug.repo, tag, asset);
+        // Every read starts from the first byte: the reader continues a partial file it finds,
+        // and an asset replaced under its tag must not continue an earlier upload's bytes.
+        let mut part = dest.as_os_str().to_owned();
+        part.push(".part");
+        let _ = std::fs::remove_file(&part);
+        // The reader writes `dest` only by renaming a whole `.part` onto it, so a read that did
+        // not deliver leaves the caller's file as it was.
+        let answer = match reader.to_file(&named, dest, cap) {
+            Ok(()) => return Probe::Present,
+            Err(AssetError::Absent(_)) => Probe::Absent,
+            Err(e) => Probe::Unknown(e.to_string()),
+        };
+        let _ = std::fs::remove_file(&part);
+        answer
     }
 
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {

@@ -12036,17 +12036,20 @@ pub(crate) fn least_view(scale: f32) -> (f32, f32) {
 /// or Shift-Tab to any control lands on a screen showing a line of its name, no Page Down screen
 /// shows a row's words without its name, a press's status neither covers nor moves the control
 /// pressed and each Messages entry is whole on a screen. One step under each, a Tab lands on a
-/// control with no line of its name. Narrower, a name wraps off its control: Packages' Share ALab
-/// tools with the fleet at 0.85× in 203x208 and at 1× in 209x208, Harness's Question priority at
-/// 1.25× in 219x264, Packages' Install ALab tools at 1.5× in 231x236 and at 1.75× in 254x250, its
-/// Show a note when cargo or rustc is rerouted at 2× in 277x278. Shorter, no screen holds the
-/// control with its name: Cursor Styles' trail sliders under its preview at 0.85× in 302x194 and at
-/// 0.9× (held by 1×'s least) in 210x194, Question priority at 1.25× in 220x208, at 1.5× in 232x222,
-/// at 1.75× in 255x236 and at 1.95× (held by 2×'s) in 278x250. The least height also says where a
-/// page keeps its heading row ([`compact_page_omits_heading`]): with 180pt at 0.85×, a 264pt view
-/// kept it and left Question priority no screen with its name. A fixed 164x98 window squeezed 2×
-/// text into a 164x96 view, where 127 of 282 Tab landings showed no line of the control's name and
-/// 41 controls were never whole; at 1× in 164x96, 58 landings showed none.
+/// control with no line of its name (at 2×'s width, with the longer name that set it, below).
+/// Narrower, a name wraps off its control: Packages' Share ALab tools with the fleet at 0.85× in
+/// 203x208 and at 1× in 209x208, Harness's Question priority at 1.25× in 219x264, Packages' Install
+/// ALab tools at 1.5× in 231x236 and at 1.75× in 254x250, and its rerouting note switch at 2× in
+/// 277x278, under its earlier name Show a note when cargo or rustc is rerouted (its current,
+/// shorter name has not been measured on a Mac, so 2×'s least width may hold more than it needs).
+/// Shorter, no screen holds the control with its name: Cursor Styles' trail sliders under its
+/// preview at 0.85× in 302x194 and at 0.9× (held by 1×'s least) in 210x194, Question priority at
+/// 1.25× in 220x208, at 1.5× in 232x222, at 1.75× in 255x236 and at 1.95× (held by 2×'s) in
+/// 278x250. The least height also says where a page keeps its heading row
+/// ([`compact_page_omits_heading`]): with 180pt at 0.85×, a 264pt view kept it and left Question
+/// priority no screen with its name. A fixed 164x98 window squeezed 2× text into a 164x96 view,
+/// where 127 of 282 Tab landings showed no line of the control's name and 41 controls were never
+/// whole; at 1× in 164x96, 58 landings showed none.
 const LEAST_VIEWS: [(f32, (f32, f32)); 6] = [
     (0.85, (204.0, 208.0)),
     (1.0, (210.0, 208.0)),

@@ -265,6 +265,11 @@ impl StackSample {
 /// (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT), injected through
 /// [`ExecEnv::host`]: [`LIVE_HOST`] reads the OS, a test's stand-in says what it is told.
 pub trait Host: Sync + std::fmt::Debug {
+    /// The monotonic clock for work deadlines and start-watch cadence. A fixture may advance
+    /// it after its child proves execution; the live host always reads the system clock.
+    fn monotonic(&self) -> Instant {
+        Instant::now()
+    }
     /// What each member of process group `pgid` has used, read now
     /// ([`aterm_sysprobe::group_usage`]); `None` where unread, and the clock then counts every
     /// span with no marked wait as work.
@@ -1607,6 +1612,7 @@ impl Own {
 /// into the child's own ([`Own`], [`TreeUsage`]), and the clock's end takes the tree out of its
 /// stage's.
 struct Clock<'a> {
+    host: &'a dyn Host,
     marks: Option<&'a Path>,
     last: Instant,
     looked: Option<Instant>,
@@ -1642,11 +1648,12 @@ impl<'a> Clock<'a> {
         pgid: u32,
         meter: Option<Arc<crate::memory::Meter>>,
     ) -> Clock<'a> {
-        let now = Instant::now();
+        let now = host.monotonic();
         if let Some(m) = &meter {
             m.started();
         }
         Clock {
+            host,
             meter: meter.map(|m| (m, pgid)),
             begun: now,
             metered_at: None,
@@ -1725,7 +1732,7 @@ impl<'a> Clock<'a> {
     }
 
     fn tick_kind(&mut self, read_tree: bool) {
-        let now = Instant::now();
+        let now = self.host.monotonic();
         if now.saturating_duration_since(self.begun) < READ_USAGE_EVERY
             && meter_due(self.begun, self.metered_at, now)
         {
@@ -1928,7 +1935,7 @@ impl<'a> Clock<'a> {
     fn look(&mut self) {
         if let Some(dir) = self.marks {
             let waits = aterm_toolchain::waits::waiting(dir);
-            self.looked = Some(Instant::now());
+            self.looked = Some(self.host.monotonic());
             if waits.is_empty() && ending() {
                 return;
             }
@@ -5817,6 +5824,7 @@ mod tests {
         asked: [AtomicU64; 3],
         pgid: AtomicU64,
         release_on_second_look: std::sync::Mutex<Option<File>>,
+        clock: Option<(PathBuf, Instant, AtomicU64)>,
     }
 
     #[cfg(unix)]
@@ -5860,6 +5868,7 @@ mod tests {
                 asked: Default::default(),
                 pgid: AtomicU64::new(0),
                 release_on_second_look: Default::default(),
+                clock: None,
             }
         }
 
@@ -5871,6 +5880,13 @@ mod tests {
 
         fn leaked(self) -> &'static HeldAt {
             Box::leak(Box::new(self))
+        }
+
+        /// Advance only after the actual shell wrote its execution proof. Until then the
+        /// clock stays at its base; the parent's one-minute hang detector bounds that wait.
+        fn advancing_after(mut self, proof: PathBuf) -> Self {
+            self.clock = Some((proof, Instant::now(), AtomicU64::new(0)));
+            self
         }
 
         fn asked(&self, what: Asked) -> u64 {
@@ -5889,6 +5905,23 @@ mod tests {
 
     #[cfg(unix)]
     impl Host for HeldAt {
+        fn monotonic(&self) -> Instant {
+            match &self.clock {
+                Some((proof, began, ticks)) => {
+                    let ran = std::fs::read_to_string(proof)
+                        .ok()
+                        .and_then(|line| line.trim().parse::<u32>().ok())
+                        .is_some_and(|pid| pid > 0);
+                    let elapsed = if ran {
+                        ticks.fetch_add(100, Ordering::SeqCst)
+                    } else {
+                        0
+                    };
+                    *began + Duration::from_millis(elapsed)
+                }
+                None => Instant::now(),
+            }
+        }
         fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
             self.pgid.store(u64::from(pgid), Ordering::SeqCst);
             let held = self.held_pid(pgid);
@@ -6017,6 +6050,26 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// The work clock must use its injected monotonic source even after usage disappears.
+    /// Replacing it with Instant::now loses the planted hour and fails this assertion.
+    #[cfg(unix)]
+    #[test]
+    fn the_work_clock_advances_from_its_host_without_sleeping() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let proof = dir.path().join("proof");
+        std::fs::write(&proof, b"42\n").unwrap();
+        let host = HeldAt::stranded().advancing_after(proof);
+        let mut clock = Clock::new(None, &host, 1, None);
+        clock.usage = None;
+        host.clock
+            .as_ref()
+            .unwrap()
+            .2
+            .store(3_600_000, Ordering::SeqCst);
+        clock.tick();
+        assert!(clock.worked >= Duration::from_secs(3599));
+    }
+
     /// Negative controls for the stranded rule, each a leader held 31 min under a 9 s ceiling,
     /// over which its watch looks twice, 11 min apart on its host's clock: a syspolicyd older than
     /// its first look (its check went to the one running now); one that started after it but has
@@ -6027,7 +6080,9 @@ mod tests {
     /// one whose CPU moved between the looks (it ran, and may have exec'd again); a leader that
     /// reads stopped before its first instruction (`StoppedUnstarted`, never held, so the daemon
     /// is never asked of it). Each waits to its ceiling and ends there unrun, not as a finding,
-    /// with the leader still unstarted, its words saying how; the backlog is read only once the
+    /// with the leader still unstarted, its words saying how. The deadline clock advances only
+    /// after the actual child wrote its pid, so these cases do not wait nine real seconds.
+    /// The backlog is read only once the
     /// leader's check was sent before a daemon past its grace. A tree with nothing unrun ends at
     /// its ceiling as the finding it was.
     #[cfg(unix)]
@@ -6067,16 +6122,16 @@ mod tests {
             ("nothing unrun", nothing, false),
         ]
         .map(|(what, host, backlog)| {
-            let host = host.leaked();
             let pidfile = tmp.join(format!("{what}.pid"));
-            let begun = Instant::now();
+            let host = host.advancing_after(pidfile.clone()).leaked();
             let run = running(stand_in(&pidfile, "exec sleep 600"), &tmp, ceiling, host);
-            (what, host, backlog, pidfile, begun, run)
+            (what, host, backlog, pidfile, run)
         });
-        for (what, host, backlog, pidfile, begun, run) in cases {
-            let (out, at) = ended_at(run, &pidfile, what);
+        for (what, host, backlog, pidfile, run) in cases {
+            let out = ended(run, &pidfile, what);
             assert!(
-                at.saturating_duration_since(begun) >= ceiling,
+                u128::from(host.clock.as_ref().unwrap().2.load(Ordering::SeqCst))
+                    >= ceiling.as_millis(),
                 "{what}: ended before its ceiling: {out:?}"
             );
             assert!(!out.ok && out.code.is_none(), "{what}: {out:?}");

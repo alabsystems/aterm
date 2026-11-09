@@ -40,6 +40,7 @@ pub(super) fn pending() -> St {
     };
     let line = command.legacy_line().unwrap();
     let prepare = Request::prepare(Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),

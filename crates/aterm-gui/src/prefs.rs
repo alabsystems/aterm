@@ -629,7 +629,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: EDIT_REROUTE_ANNOUNCE,
-        label: "Show a note when cargo or rustc is rerouted",
+        label: "Note when cargo or rustc is rerouted",
         kind: EditKind::Bool,
     },
     NestedLeaf {

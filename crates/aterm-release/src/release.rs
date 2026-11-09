@@ -1290,6 +1290,10 @@ pub trait PendingSign: Send {
 
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
+    /// State the selected base's B8 evidence without steering selection or refusing a cut.
+    fn main_lane(&mut self, _base: &str) -> Option<String> {
+        None
+    }
     /// Best-effort preparation for the next cut, after this run's windowed checks ended.
     fn start_prefreeze(&mut self) {}
     fn prepare_sign(
@@ -3402,6 +3406,9 @@ impl Run<'_> {
             return self.refuse_hard(refusal);
         }
         self.cand = Some(cand.clone());
+        if let Some(evidence) = self.b.main_lane(&cand.commit) {
+            self.b.say(&evidence);
+        }
         let (r, v) = (cand.commit.clone(), cand.version.clone());
         if self.opts.supersede && !continued {
             if self.version_used(&v, &tip) {

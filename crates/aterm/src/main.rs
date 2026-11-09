@@ -2199,6 +2199,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
         check: check_initial_setup,
         restore: restore_initial_setup,
         status: initial_setup_status,
+        own_console: || !aterm_machines::console::remote_here(),
         observe: observe_initial_setup,
         look_for_token: look_for_github_token,
         stop: || {

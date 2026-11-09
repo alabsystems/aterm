@@ -12,6 +12,10 @@ fn cap(state: &State) -> Limits {
     }
 }
 
+fn candidate_id(which: i64) -> String {
+    format!("{:032x}", which + 1)
+}
+
 fn candidate(w: &World, which: i64, phase: i64) -> Prepare {
     w.parent
         .with_account_successor(
@@ -20,7 +24,7 @@ fn candidate(w: &World, which: i64, phase: i64) -> Prepare {
             } else {
                 ImagePhase::Rollback
             },
-            format!("{:032x}", which + 1),
+            candidate_id(which),
             2,
             8,
             w.parent.deadline_us + 1,
@@ -94,8 +98,7 @@ fn project(w: &World, mut state: State) -> State {
         (1, "a", "a_phase", "a_auth", "ca", "fa"),
         (2, "b", "b_phase", "b_auth", "cb", "fb"),
     ] {
-        let c = candidate(w, which, 0);
-        let operation = key.operation(&c.id);
+        let operation = key.operation(&candidate_id(which));
         let entry = view.entries.get(&operation);
         let kind = entry.map_or(0, |entry| {
             if entry.state == IssuerState::Fenced {
@@ -126,7 +129,9 @@ fn project(w: &World, mut state: State) -> State {
                 IssuerState::NoExec => 2,
                 IssuerState::Sealed { may_execute: false } => 3,
                 IssuerState::Sealed { may_execute: true } => 4,
-                IssuerState::Fenced => panic!("a fence consumed its parent"),
+                IssuerState::Fenced | IssuerState::Rejected => {
+                    panic!("a fence consumed its parent")
+                }
             };
         }
     }

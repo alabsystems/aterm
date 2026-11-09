@@ -2229,10 +2229,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     ] {
         keep_file(&r.w.join(f), &keep.join(to));
     }
-    keep_file(
-        &r.claude_dir().join(".claude.json"),
-        &keep.join("claude.json"),
-    );
+    keep_file(&r.claude_json(), &keep.join("claude.json"));
     for (_, log) in crate::stats::chain_debug_logs(&r) {
         if let Some(name) = log.file_name() {
             keep_file(&log, &keep.join(name));
@@ -2511,6 +2508,16 @@ pub struct Launch {
     /// person's `/login` leaves one, on [`Self::stub_route_alone`], in a login directory of its
     /// own ([`stored_login_dir`]).
     pub stored: bool,
+    /// `--own`: a person's own claude.ai login as aterm's managed launch runs it, the one line E
+    /// claims (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step 4): the lab's stored
+    /// login ([`lay_own_login`]) in the scratch HOME's own `.claude` with no `CLAUDE_CONFIG_DIR`,
+    /// on [`Self::stub_route_alone`], and aterm's usage tap on its line
+    /// ([`crate::forever::tap::tap_args`], the `--settings` the managed twin's launch carries).
+    /// The harness then reads the process as the default home's own account (`auth=stored`), and
+    /// the tap's row as its own. `--subscriber`'s token is a credential from outside, whose
+    /// figures the harness credits to no account, and `--stored`'s login directory is a home of
+    /// its own, whose records no footer reads: neither shows line E.
+    pub own: bool,
     /// The stub's base URL its only route: no black-hole proxy in the environment, so a stored
     /// login's process is the default route's where the instance's seam admits that base URL
     /// ([`UpOpts::route_seam`]); the jail still denies every connection but loopback.
@@ -2550,6 +2557,10 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
                 l.stored = true;
                 l.stub_route_alone = true;
             }
+            "--own" => {
+                l.own = true;
+                l.stub_route_alone = true;
+            }
             "--debug-log" => l.debug_log = true,
             "--by-name" => l.by_name = true,
             "--" => {
@@ -2557,13 +2568,18 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
             }
             other => {
                 return Err(format!(
-                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --prepare-only, --relay, --subscriber, --stored, --debug-log, --by-name, -- <claude args>)"
+                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --prepare-only, --relay, --subscriber, --stored, --own, --debug-log, --by-name, -- <claude args>)"
                 ));
             }
         }
     }
-    if l.stored && l.subscriber {
-        return Err("claude: --stored and --subscriber are two logins; give one".into());
+    if [l.stored, l.subscriber, l.own]
+        .into_iter()
+        .filter(|on| *on)
+        .count()
+        > 1
+    {
+        return Err("claude: --stored, --subscriber and --own are three logins; give one".into());
     }
     Ok(l)
 }
@@ -2604,6 +2620,13 @@ impl LaunchWords {
     }
 }
 
+/// The `--settings` value that puts aterm's usage tap on an `--own` launch's line, as the managed
+/// twin's launch carries it ([`aterm_agent::harness::tap::settings_value`] of the lab's aterm);
+/// `None` where that aterm's path cannot be named in the tap's command.
+fn own_tap(run: &Run) -> Option<String> {
+    aterm_agent::harness::tap::settings_value(Path::new(&run.aterm))
+}
+
 /// The parts of `l`'s launch in `run`.
 #[must_use]
 pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
@@ -2629,25 +2652,29 @@ pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
     }
     let px = q(&run.proxy);
     let pair = |k: &str, v: String| (k.to_string(), v);
+    // `--own` names no `CLAUDE_CONFIG_DIR`: its Claude Code reads the scratch HOME's own
+    // `.claude` and `.claude.json`, the default home the harness credits to its account.
+    let config = (!l.own).then(|| {
+        pair(
+            "CLAUDE_CONFIG_DIR",
+            q(&if l.stored {
+                stored_login_dir(run).to_string_lossy().into_owned()
+            } else {
+                format!("{w}/home/.claude")
+            }),
+        )
+    });
     let env = vec![
-        vec![
-            pair(
-                "PATH",
-                shell_prepend_path(&run.run.join("shim").to_string_lossy()),
-            ),
-            pair(
-                "CLAUDE_CONFIG_DIR",
-                q(&if l.stored {
-                    stored_login_dir(run).to_string_lossy().into_owned()
-                } else {
-                    format!("{w}/home/.claude")
-                }),
-            ),
-            pair(
-                "ANTHROPIC_BASE_URL",
-                q(&format!("http://127.0.0.1:{}", run.port)),
-            ),
-        ],
+        std::iter::once(pair(
+            "PATH",
+            shell_prepend_path(&run.run.join("shim").to_string_lossy()),
+        ))
+        .chain(config)
+        .chain([pair(
+            "ANTHROPIC_BASE_URL",
+            q(&format!("http://127.0.0.1:{}", run.port)),
+        )])
+        .collect(),
         [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -2673,6 +2700,13 @@ pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
         env.retain(|line| !line.iter().any(|(k, _)| PROXY_KEYS.contains(&k.as_str())));
     }
     let mut args = Vec::new();
+    if l.own {
+        // [`launch_claude`] refuses an `--own` launch whose aterm the tap cannot name first.
+        if let Some(tap) = own_tap(run) {
+            args.push("--settings".to_string());
+            args.push(q(&tap));
+        }
+    }
     if l.debug_log {
         args.push("--debug-file".to_string());
         args.push(q(&crate::stats::debug_log(run).to_string_lossy()));
@@ -2787,9 +2821,9 @@ fn prepare_claude_with(
     user: &str,
     witness: impl FnOnce(&Run) -> Result<(), String>,
 ) -> Result<PreparedChild, Fail> {
-    if l.relay || l.subscriber || l.stored || l.by_name {
+    if l.relay || l.subscriber || l.stored || l.own || l.by_name {
         return Err(Fail::usage(
-            "claude --prepare-only takes no --relay, --subscriber, --stored or --by-name",
+            "claude --prepare-only takes no --relay, --subscriber, --stored, --own or --by-name",
         ));
     }
     let vars = prepared_child_vars(
@@ -3025,6 +3059,53 @@ fn lay_stored_login(run: &Run) -> Result<(), Fail> {
     crate::forever::sysmsg::login::lay_stored(run)
 }
 
+/// The roster `claude --own` lays where the lab's config holds none ([`lay_own_login`]): one row,
+/// `main`, the default login's (no `dir`), named by the composed profile's email, as an ALab Mac
+/// lists its own account. The quota row is the outlook's, which forecasts a roster's accounts: a
+/// Mac with no roster has no outlook (`docs/DESIGN-accounts-outlook-2026-10-25.md` §15.3), so
+/// line E stays Claude's there and line D names `this login`.
+fn own_roster() -> String {
+    format!(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"{}\"\n",
+        crate::stub::account::EMAIL
+    )
+}
+
+/// Lay `claude --own`'s login in the scratch HOME itself, as a person's `/login` leaves one in
+/// the default home: the HOME's `.claude.json` (Claude Code's profile where no
+/// `CLAUDE_CONFIG_DIR` is set, [`Run::claude_json`]) as `up` laid the scratch `.claude`'s where it
+/// holds none yet (a later launch keeps what Claude Code wrote there), owner-only; the roster
+/// [`own_roster`] beside the instance's `aterm.toml` where none is there (one a lab verb or a
+/// person wrote stays); then the stored login [`crate::forever::sysmsg::login::lay_stored`] lays
+/// in the HOME's `.claude` and that profile. Every later launch in the scratch home runs on it, as
+/// one after a person's `/login` does.
+fn lay_own_login(run: &Run) -> Result<(), Fail> {
+    let (from, to) = (run.w.join("home/.claude/.claude.json"), run.claude_json());
+    debug_assert_eq!(
+        to,
+        run.w.join("home/.claude.json"),
+        "launch_claude names the own login first"
+    );
+    let held =
+        crate::sys::scratch_read(&to).map_err(|e| Fail::die(format!("the own login: {e}")))?;
+    if held.is_none() {
+        let text = crate::verbs::read_scratch(&from)?;
+        crate::sys::put(&to, 0o600, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+            .map_err(|e| Fail::die(format!("the own login: .claude.json: {e}")))?;
+    }
+    let roster = run
+        .w
+        .join("cfg/aterm")
+        .join(aterm_agent::harness::accounts::ACCOUNTS_FILE);
+    let listed =
+        crate::sys::scratch_read(&roster).map_err(|e| Fail::die(format!("the own login: {e}")))?;
+    if listed.is_none() {
+        atomic_write(&roster, own_roster().as_bytes())
+            .map_err(|e| Fail::die(format!("the own login: {}: {e}", roster.display())))?;
+    }
+    crate::forever::sysmsg::login::lay_stored(run)
+}
+
 /// Type the launch line of the managed Claude Code into the lab's first tab.
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
@@ -3037,17 +3118,26 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     if let Some(why) = by_name_refused(run, l) {
         return Err(Fail::usage(why));
     }
-    if l.stored && run.route_seam != "1" {
-        return Err(Fail::usage(
-            "claude --stored: a stored login's process is the default route's only where the \
+    if (l.stored || l.own) && run.route_seam != "1" {
+        return Err(Fail::usage(format!(
+            "claude {}: a stored login's process is the default route's only where the \
              instance admits the stub's base URL: up the lab with LAB_ROUTE_SEAM=1",
-        ));
+            if l.own { "--own" } else { "--stored" }
+        )));
+    }
+    if l.own && own_tap(run).is_none() {
+        return Err(Fail::usage(format!(
+            "claude --own: the usage tap's command cannot name the lab's aterm ({})",
+            run.aterm
+        )));
     }
     procs::need_witness(run)?;
     let mut run = run.clone();
     run.agent = "claude".into();
     run.claude_login = if l.stored {
         crate::run::STORED_LOGIN
+    } else if l.own {
+        crate::run::OWN_LOGIN
     } else {
         ""
     }
@@ -3062,6 +3152,9 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     }
     if l.stored {
         lay_stored_login(run)?;
+    }
+    if l.own {
+        lay_own_login(run)?;
     }
     let script = run.run.join("claude.sh");
     let text = launcher(run, l);
@@ -3105,8 +3198,8 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     ))
 }
 
-/// `claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored]
-/// [--debug-log] [--by-name] [-- claude args]`.
+/// `claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored |
+/// --own] [--debug-log] [--by-name] [-- claude args]`.
 pub fn cmd_claude(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let tag = take_tag(&mut args)?;
@@ -3210,6 +3303,151 @@ mod tests {
         assert_eq!(config_dir(&plain, &Launch::default()), plain.claude_dir());
         assert_eq!(crate::util::scratch_text(&plain.settings()), settings);
         assert!(!plain.w.join("home/.claude/.credentials.json").exists());
+    }
+
+    /// AN OWN LAUNCH IS THE DEFAULT HOME'S LOGIN WITH THE TAP ON ITS LINE: `claude --own`, the
+    /// launch whose row line E claims (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §7 step
+    /// 4), names no `CLAUDE_CONFIG_DIR`, no credential and no proxy, so the harness reads its
+    /// process as the default home's own login (`ProcessLogin::default_home`, which the footer's
+    /// account label asks), its route the stub's base URL alone (which the instance's route seam
+    /// admits); it carries aterm's usage tap (`tap::carried_by`); and its login is laid where
+    /// that Claude Code reads it, the profile in the scratch HOME's `.claude.json`, which the
+    /// harness's profile read takes for a subscription. Measured before (2026-11-08): `claude
+    /// --subscriber` ran with `CLAUDE_CODE_OAUTH_TOKEN` (`auth=outside`) and no tap, so Claude Code
+    /// drew no statusLine row and the footer named no account.
+    #[test]
+    fn an_own_launch_is_the_default_homes_login_with_the_tap_on_its_line() {
+        use aterm_agent::harness::{accounts, netwatch, tap};
+        let own = parse_launch(&["--own".to_string()]).unwrap();
+        assert!(own.own && own.stub_route_alone && !own.stored && !own.subscriber);
+        for other in ["--stored", "--subscriber"] {
+            assert!(
+                parse_launch(&["--own".to_string(), other.to_string()]).is_err(),
+                "--own and {other} are two logins"
+            );
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut run = Run {
+            tag: "t".into(),
+            run: root.join("runs/t"),
+            w: root.join("runs/t/scratch"),
+            port: "5".into(),
+            proxy: "http://127.0.0.1:6".into(),
+            claude_bin: "/c/claude".into(),
+            aterm: "/a/target/debug/aterm".into(),
+            route_seam: "1".into(),
+            ..Run::default()
+        };
+        let words = exec_words(&launcher(&run, &own));
+        let at = words
+            .iter()
+            .position(|w| w == "/c/claude")
+            .expect("the binary");
+        let (env, argv) = (&words[..at], &words[at..]);
+        assert!(tap::carried_by(argv), "the tap rides the line: {argv:?}");
+        assert_eq!(
+            argv.get(2).map(String::as_str),
+            tap::settings_value(Path::new(&run.aterm)).as_deref()
+        );
+        let stub = format!("http://127.0.0.1:{}", run.port);
+        let pairs: Vec<(&str, &str)> = env.iter().filter_map(|w| w.split_once('=')).collect();
+        for (k, v) in &pairs {
+            assert!(
+                !accounts::CREDENTIAL_KEYS.contains(k)
+                    && !accounts::PROFILE_KEYS.contains(k)
+                    && (!netwatch::ROUTE_KEYS.contains(k)
+                        || netwatch::lab_default_route(Some(&stub), k, v)),
+                "{k} moves the launch off its own login: {env:?}"
+            );
+        }
+        for k in PROXY_KEYS {
+            assert!(
+                env.windows(2).any(|w| w[0] == "-u" && w[1] == k),
+                "unsets {k}: {env:?}"
+            );
+        }
+        let login = accounts::ProcessLogin::of_env(pairs.iter().copied());
+        assert!(
+            login.default_home && login.login.is_none(),
+            "the default home's own login: {env:?}"
+        );
+        // As `up` laid the scratch home, then as launch_claude saves the run and lays the login.
+        std::fs::create_dir_all(run.w.join("home/.claude")).unwrap();
+        let (settings, cj) = scratch_claude_config(&run, "/helper", "/proj", &UpOpts::default());
+        std::fs::write(run.settings(), &settings).unwrap();
+        std::fs::write(run.w.join("home/.claude/.claude.json"), &cj).unwrap();
+        run.claude_login = crate::run::OWN_LOGIN.into();
+        let run = Run::parse(&run.render());
+        assert_eq!(run.claude_dir(), run.w.join("home/.claude"));
+        assert_eq!(run.claude_json(), run.w.join("home/.claude.json"));
+        lay_own_login(&run).unwrap();
+        let home = run.w.join("home");
+        let theirs = crate::util::scratch_text(&run.settings());
+        assert!(
+            !theirs.contains("apiKeyHelper") && !theirs.contains("HTTP_PROXY"),
+            "{theirs}"
+        );
+        assert!(
+            crate::util::scratch_text(&home.join(".claude/.credentials.json"))
+                .contains("claudeAiOauth")
+        );
+        assert!(
+            !crate::util::scratch_text(&home.join(".claude/.claude.json")).contains("oauthAccount"),
+            "the scratch `.claude`'s profile stays as `up` laid it"
+        );
+        // The roster names it, the default login's one row, whose email is the profile's.
+        let roster_at = run.w.join("cfg/aterm").join(accounts::ACCOUNTS_FILE);
+        let roster = accounts::Roster::load(&roster_at).unwrap();
+        assert_eq!(
+            roster
+                .row_for_login(None)
+                .map(|row| (row.label.as_str(), row.expected_identity_email())),
+            Some(("main", Some(crate::stub::account::EMAIL))),
+            "{roster:?}"
+        );
+        assert_eq!(
+            accounts::judged_label(
+                &roster,
+                &accounts::ProcessLogin {
+                    route: accounts::AuthRoute::Stored,
+                    ..login.clone()
+                }
+            ),
+            Some("main"),
+            "the seam admitting it, the default home's login is the roster's `main`"
+        );
+        // The harness's profile read of that process, its base URL the seam's: a subscription.
+        let env: Vec<String> = pairs
+            .iter()
+            .filter(|(k, _)| *k != "ANTHROPIC_BASE_URL")
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([format!("HOME={}", home.display())])
+            .collect();
+        let read = aterm_agent::harness::profile::subscription_and_plan_for(
+            &env,
+            &home,
+            &home.join(".claude"),
+            Some(&roster),
+            1_794_000_000,
+            None,
+        );
+        assert!(read.is_some(), "the profile read takes the own login");
+        // A second launch keeps what Claude Code wrote in the HOME's `.claude.json`.
+        let mut kept = J::parse(&crate::util::scratch_text(&run.claude_json())).unwrap();
+        kept.set("numStartups", J::Int(7));
+        std::fs::write(run.claude_json(), kept.dump(crate::pyjson::COMPACT)).unwrap();
+        lay_own_login(&run).unwrap();
+        let again = crate::util::scratch_text(&run.claude_json());
+        assert!(
+            again.contains("numStartups") && again.contains("oauthAccount"),
+            "{again}"
+        );
+        // And a roster it finds there stays as it was written.
+        let theirs = "[[account]]\nlabel = \"alt1\"\nclass = \"shared\"\n";
+        std::fs::write(&roster_at, theirs).unwrap();
+        lay_own_login(&run).unwrap();
+        assert_eq!(crate::util::scratch_text(&roster_at), theirs);
     }
 
     #[test]

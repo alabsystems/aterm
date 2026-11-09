@@ -1122,14 +1122,14 @@ impl App {
         self.repaint_palette_pointer(wid, changed);
     }
 
-    fn active_tab_is_single_focused_pane(&self, wid: WindowId) -> bool {
+    pub(crate) fn active_tab_is_single_focused_pane(&self, wid: WindowId) -> bool {
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active())
             .is_some_and(|tab| tab.root.len() == 1 && tab.root.contains(tab.focus))
     }
 
-    fn active_tab_has_multiple_visible_panes(&self, wid: WindowId) -> bool {
+    pub(crate) fn active_tab_has_multiple_visible_panes(&self, wid: WindowId) -> bool {
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active())
@@ -4560,9 +4560,7 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if self.stats_lens_at(wid, px, py)
-            || self.band_banner_at(wid, px, py).is_some()
-            || self.find_bar_cell_at(wid, px, py).is_some()
+        if self.chrome_overlay_at(wid, px, py)
             || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
                 != crate::claude_lights::OverChips::No
         {
@@ -4603,9 +4601,7 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if self.stats_lens_at(wid, px, py)
-            || self.band_banner_at(wid, px, py).is_some()
-            || self.find_bar_cell_at(wid, px, py).is_some()
+        if self.chrome_overlay_at(wid, px, py)
             || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
                 != crate::claude_lights::OverChips::No
             || self.claude_glass_hit_at(wid, px, py).is_some()

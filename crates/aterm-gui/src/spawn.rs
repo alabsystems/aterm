@@ -3933,7 +3933,7 @@ impl ReaderJoin {
 
     /// Sleep until the reader has ended or `deadline` passes: whether it ended.
     #[cfg(any(unix, test))]
-    fn ended_by(&self, deadline: Instant) -> bool {
+    pub(crate) fn ended_by(&self, deadline: Instant) -> bool {
         #[cfg(test)]
         self.looks.fetch_add(1, Ordering::AcqRel);
         match self

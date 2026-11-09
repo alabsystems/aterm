@@ -804,19 +804,21 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 /// What a single read of `shim` ([`super::ShimRead`]) learns.
 #[must_use]
 pub fn read_shim(shim: &Path) -> super::ShimRead {
+    if let Some(target) = symlink_target(shim) {
+        return super::ShimRead {
+            target: Some(target),
+            env: crate::shim_env::ShimEnv::NONE,
+            body: None,
+        };
+    }
     match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
         Ok(body) => super::ShimRead {
             target: super::parse_sh_shim_target(&body),
             env: super::parse_sh_shim_env(&body),
             body: Some(body),
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => super::ShimRead {
-            target: None,
-            env: crate::shim_env::ShimEnv::NONE,
-            body: None,
-        },
         Err(_) => super::ShimRead {
-            target: fs::read_link(shim).ok(),
+            target: None,
             env: crate::shim_env::ShimEnv::NONE,
             body: None,
         },
@@ -826,10 +828,20 @@ pub fn read_shim(shim: &Path) -> super::ShimRead {
 /// Resolve the store/checkout target a `bin/<tool>` shim execs, or `None` for no shim or a tombstone (no `exec` line).
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
-    match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
-        Ok(content) => super::parse_sh_shim_target(&content),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => fs::read_link(shim).ok(),
+    read_shim(shim).target
+}
+
+/// A relative POSIX link names its target from the link's directory, unlike an
+/// `exec` in a script, whose relative program is interpreted by the caller.
+/// Keep `..` and the final name: resolving either lexically or through the final
+/// file would change symlinked-parent or invocation-name semantics. This is only
+/// a locator observation; callers still establish presence and held custody.
+fn symlink_target(shim: &Path) -> Option<PathBuf> {
+    let target = fs::read_link(shim).ok()?;
+    if target.is_absolute() {
+        Some(target)
+    } else {
+        Some(std::path::absolute(shim).ok()?.parent()?.join(target))
     }
 }
 
@@ -1210,5 +1222,101 @@ mod tests {
             account.display()
         );
         assert_eq!(account_home(), Some(account));
+    }
+}
+
+#[cfg(test)]
+mod shim_link_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn relative_links_keep_their_parent_and_final_alias_even_when_dangling() {
+        let root = crate::testdir::dir("atpkg-relative-shim-");
+        let bin = root.join("bin");
+        let store_bin = root.join("store/trust/1/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&store_bin).unwrap();
+        let program = store_bin.join("targo");
+        fs::write(&program, b"program").unwrap();
+        symlink("targo", store_bin.join("cargo")).unwrap();
+        let shim = bin.join("cargo");
+        let raw = Path::new("../store/trust/1/bin/cargo");
+        symlink(raw, &shim).unwrap();
+        let expected = bin.join(raw);
+        let read = read_shim(&shim);
+        assert_eq!(read.target.as_ref(), Some(&expected));
+        assert_eq!(resolve_shim(&shim), Some(expected.clone()));
+        assert!(expected.is_absolute());
+        assert_eq!(expected.file_name().unwrap(), "cargo");
+        assert_eq!(
+            expected.canonicalize().unwrap(),
+            program.canonicalize().unwrap()
+        );
+        assert_eq!(read.env, crate::shim_env::ShimEnv::NONE);
+        assert_eq!(read.body, None);
+
+        // Relative caller paths use the same native link-parent rule, without
+        // changing this test process's working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for part in cwd.components() {
+            if matches!(part, std::path::Component::Normal(_)) {
+                relative.push("..");
+            }
+        }
+        relative.push(shim.strip_prefix("/").unwrap());
+        assert_eq!(
+            resolve_shim(&relative).unwrap().canonicalize().unwrap(),
+            program.canonicalize().unwrap()
+        );
+
+        fs::remove_file(&program).unwrap();
+        assert_eq!(resolve_shim(&shim), Some(expected.clone()));
+        assert_eq!(read_shim(&shim).target, Some(expected));
+        assert!(!shim.exists());
+        assert_eq!(resolve_shim(&bin.join("missing")), None);
+    }
+
+    #[test]
+    fn link_dot_parent_uses_native_directory_resolution() {
+        let root = crate::testdir::dir("atpkg-shim-native-parent-");
+        let bin = root.join("bin");
+        let foreign = root.join("foreign");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(foreign.join("nested")).unwrap();
+        fs::write(bin.join("tool"), b"lexical wrong target").unwrap();
+        fs::write(foreign.join("tool"), b"native target").unwrap();
+        symlink(foreign.join("nested"), bin.join("slot")).unwrap();
+        let shim = bin.join("shim");
+        symlink("slot/../tool", &shim).unwrap();
+        let target = resolve_shim(&shim).unwrap();
+        assert_eq!(target, bin.join("slot/../tool"));
+        assert_eq!(fs::read(&target).unwrap(), b"native target");
+        assert_ne!(
+            target.canonicalize().unwrap(),
+            bin.join("tool").canonicalize().unwrap()
+        );
+        assert_eq!(read_shim(&shim).target, Some(target));
+    }
+
+    #[test]
+    fn absolute_links_and_relative_script_execs_keep_their_spelling() {
+        let root = crate::testdir::dir("atpkg-shim-spelling-");
+        let target = root.join("absent-alias");
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        assert_eq!(resolve_shim(&link), Some(target.clone()));
+        assert_eq!(read_shim(&link).target, Some(target));
+        let script = root.join("script");
+        fs::write(&script, b"#!/bin/sh\nexec '../relative-tool' \"$@\"\n").unwrap();
+        assert_eq!(
+            resolve_shim(&script),
+            Some(PathBuf::from("../relative-tool"))
+        );
+        assert_eq!(
+            read_shim(&script).target,
+            Some(PathBuf::from("../relative-tool"))
+        );
     }
 }

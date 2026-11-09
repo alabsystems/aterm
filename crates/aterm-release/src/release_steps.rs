@@ -442,7 +442,7 @@ fn qualify_pool(
 
 /// The export's share of the pool's `slots` while it runs: a quarter of them, at least one, and
 /// never every slot (none of one slot), so the tree and the build always draw.
-fn export_share(slots: u32, export: bool) -> u32 {
+pub(crate) fn export_share(slots: u32, export: bool) -> u32 {
     if !export || slots < 2 {
         return 0;
     }
@@ -1065,6 +1065,21 @@ impl Real {
         self.configure_child(self.scrubbed(program), prover)
     }
 
+    /// The release's own tree fills idle cores behind its slices. Keep this relative to
+    /// the held Release pool: a global Background claim is cancellable by that same release.
+    fn verifier_child(
+        &self,
+        program: &Path,
+        prover: Option<&Prover>,
+        half: crate::check_record::Half,
+    ) -> Command {
+        let lower = self.pool.is_some() && half == crate::check_record::Half::Tree;
+        let (program, prefix) = crate::qualify_pilot::invocation(program, lower);
+        let mut command = self.child(program, prover);
+        command.args(prefix);
+        command
+    }
+
     fn configure_child(&self, mut cmd: Command, prover: Option<&Prover>) -> Command {
         cmd.current_dir(&self.repo).stdin(Stdio::null());
         if let Some(claim) = &self.prefreeze_claim {
@@ -1524,6 +1539,15 @@ impl Real {
     ) -> Result<String, Refusal> {
         let origin = aterm(&self.repo).map_err(origin_refresh_refusal)?;
         self.origin_tags = origin.tags;
+        if !self.scratch_logs && self.branch_is_main() {
+            crate::bump_claim::recover(
+                &self.git(),
+                &self.release.join("bump-claim.json"),
+                &origin.main,
+                false,
+            )
+            .map_err(|why| cut_refusal("owned bump recovery", &why))?;
+        }
         self.fetch_engine_origin()?;
         Ok(origin.main)
     }
@@ -3294,7 +3318,7 @@ impl Real {
             )
             .could_not_run()
         })?;
-        let mut cmd = self.child(&frozen.verify.path, Some(prover));
+        let mut cmd = self.verifier_child(&frozen.verify.path, Some(prover), run.half);
         self.hand_pool(&mut cmd, true)?;
         cmd.arg("release").arg(run.half.flag());
         if run.strict_subset() {
@@ -3623,6 +3647,7 @@ impl Real {
                 .collect(),
             launch: std::rc::Rc::new(self.step_children()),
             curl: std::sync::Arc::new(crate::github::Launched(self.step_children())),
+            reader: aterm_update_core::release_asset::Reader::anonymous(),
         };
         let opts = crate::site::Options {
             latest: true,
@@ -5535,6 +5560,14 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
 }
 
 impl Backend for Real {
+    fn main_lane(&mut self, base: &str) -> Option<String> {
+        Some(
+            match self.git_out(&["rev-parse", &format!("{base}^{{tree}}")]) {
+                Some(tree) => crate::main_lane::observe(&self.repo, base, &tree, now),
+                None => format!("main lane: base {base}: tree unavailable (advisory)"),
+            },
+        )
+    }
     fn prepare_sign(
         &mut self,
         args: &[String],
@@ -6409,176 +6442,174 @@ impl Backend for Real {
         let undo = |s: &mut Self| {
             let _ = s.git().git(&["checkout", "-q", "--", "."]);
         };
-        for attempt in 1..=3 {
-            let tip = self
-                .git_out(&["rev-parse", "origin/main"])
-                .unwrap_or_default();
-            self.main_to(&tip)?;
-            {
-                let _phase = crate::cut_timing::Timer::start(
-                    &self.step_log(self.step),
-                    "bump-submodule-sync",
-                );
-                self.submodule_sync(Step::Commit)?;
-            }
-            let cur = self.version_at("HEAD").unwrap_or_default();
-            if cur != from {
-                return Err(Refusal::new(
-                    format!(
-                        "origin/main's version moved to {cur} while this release bumped {from}"
-                    ),
-                    format!("{RELEASE_COMMAND} again (without --bump when {cur} is unreleased)"),
-                ));
-            }
-            let mut cmd = self.scrubbed(&edit);
-            cmd.arg(&self.repo).args([to, &cur]).current_dir(&self.repo);
-            let edit_timing =
-                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-version-edit");
-            if self.logged(Step::Commit, &mut cmd).code != 0 {
-                return Err(Refusal::new(
-                    "bin/pub-bump-edit could not find the version line",
-                    "read Cargo.toml's [workspace.package]",
-                ));
-            }
-            drop(edit_timing);
-            // A nested workspace (a recorder run read-only in the Linux lane)
-            // locks aterm's path crates at the workspace's version too: each
-            // moves with the root, or its `--locked` run fails until relocked.
-            let nested = self.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]);
-            let lock_timing =
-                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-lockfiles");
-            let followed = match bump_nested_locks(&self.repo, nested, from, to) {
-                Ok(followed) => followed,
-                Err(why) => {
-                    undo(self);
-                    return Err(Refusal::new(why, "read the commit step's log"));
+        let journal = self.release.join("bump-claim.json");
+        let tip = self
+            .git_out(&["rev-parse", "origin/main"])
+            .unwrap_or_default();
+        let git = GitCli::new(&self.repo);
+        let log = self.step_log(self.step);
+        let bumped = crate::bump_claim::push(
+            &git,
+            &journal,
+            tip,
+            |tip| {
+                self.main_to(tip)?;
+                {
+                    let _phase = crate::cut_timing::Timer::start(
+                        &self.step_log(self.step),
+                        "bump-submodule-sync",
+                    );
+                    self.submodule_sync(Step::Commit)?;
                 }
-            };
-            if let Err(why) = self.validate_bumped_locks(prover, &followed) {
-                undo(self);
-                return Err(Refusal::new(
-                    why,
-                    "read the commit step's log; the bump is undone",
-                ));
-            }
-            drop(lock_timing);
-            let inspected = [
-                &["diff", "--name-only", "-z", "HEAD"][..],
-                &["ls-files", "--others", "--exclude-standard", "-z"][..],
-            ]
-            .iter()
-            .map(|args| self.git_paths(args))
-            .collect::<Result<Vec<_>, _>>();
-            let inspected = match inspected {
-                Ok(inspected) => inspected,
-                Err(why) => {
-                    undo(self);
-                    return Err(Refusal::new(why, "read the commit step's log"));
-                }
-            };
-            let moved: Vec<String> = inspected
-                .into_iter()
-                .flatten()
-                .filter(|p| p != "Cargo.toml" && p != "Cargo.lock" && !followed.contains(p))
-                .collect();
-            let Some(diff) = self.git_out(&["diff", "-U0"]) else {
-                undo(self);
-                return Err(Refusal::new(
-                    "could not inspect the bump's diff; the bump is undone",
-                    "read the commit step's log",
-                ));
-            };
-            let stray = diff.lines().any(|l| {
-                (l.starts_with('+') || l.starts_with('-'))
-                    && !l.starts_with("+++")
-                    && !l.starts_with("---")
-                    && !l.contains("version")
-            });
-            if !moved.is_empty() || stray {
-                undo(self);
-                return Err(Refusal::new(
-                    "the bump moved more than version lines; it is undone",
-                    "bump by hand and read the diff",
-                )
-                .detail(moved));
-            }
-            // The bump opens a release window, so it also carries the harness versions the
-            // window owes (`ship harness-bump`'s writes), after the version-only check above
-            // judged the edit's own changes.
-            let harness_timing =
-                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-harness-versions");
-            let owed = match crate::harness_versions::apply(&self.repo, &origin) {
-                Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
-                Err(e) => {
-                    undo(self);
+                let cur = self.version_at("HEAD").unwrap_or_default();
+                if cur != from {
                     return Err(Refusal::new(
                         format!(
-                            "the harness versions could not be bumped ({e}); the bump is undone"
+                            "origin/main's version moved to {cur} while this release bumped {from}"
                         ),
+                        format!(
+                            "{RELEASE_COMMAND} again (without --bump when {cur} is unreleased)"
+                        ),
+                    ));
+                }
+                let mut cmd = self.scrubbed(&edit);
+                cmd.arg(&self.repo).args([to, &cur]).current_dir(&self.repo);
+                let edit_timing =
+                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-version-edit");
+                if self.logged(Step::Commit, &mut cmd).code != 0 {
+                    return Err(Refusal::new(
+                        "bin/pub-bump-edit could not find the version line",
+                        "read Cargo.toml's [workspace.package]",
+                    ));
+                }
+                drop(edit_timing);
+                // A nested workspace (a recorder run read-only in the Linux lane)
+                // locks aterm's path crates at the workspace's version too: each
+                // moves with the root, or its `--locked` run fails until relocked.
+                let nested =
+                    self.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]);
+                let lock_timing =
+                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-lockfiles");
+                let followed = match bump_nested_locks(&self.repo, nested, from, to) {
+                    Ok(followed) => followed,
+                    Err(why) => {
+                        undo(self);
+                        return Err(Refusal::new(why, "read the commit step's log"));
+                    }
+                };
+                if let Err(why) = self.validate_bumped_locks(prover, &followed) {
+                    undo(self);
+                    return Err(Refusal::new(
+                        why,
+                        "read the commit step's log; the bump is undone",
+                    ));
+                }
+                drop(lock_timing);
+                let inspected = [
+                    &["diff", "--name-only", "-z", "HEAD"][..],
+                    &["ls-files", "--others", "--exclude-standard", "-z"][..],
+                ]
+                .iter()
+                .map(|args| self.git_paths(args))
+                .collect::<Result<Vec<_>, _>>();
+                let inspected = match inspected {
+                    Ok(inspected) => inspected,
+                    Err(why) => {
+                        undo(self);
+                        return Err(Refusal::new(why, "read the commit step's log"));
+                    }
+                };
+                let moved: Vec<String> = inspected
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p != "Cargo.toml" && p != "Cargo.lock" && !followed.contains(p))
+                    .collect();
+                let Some(diff) = self.git_out(&["diff", "-U0"]) else {
+                    undo(self);
+                    return Err(Refusal::new(
+                        "could not inspect the bump's diff; the bump is undone",
+                        "read the commit step's log",
+                    ));
+                };
+                let stray = diff.lines().any(|l| {
+                    (l.starts_with('+') || l.starts_with('-'))
+                        && !l.starts_with("+++")
+                        && !l.starts_with("---")
+                        && !l.contains("version")
+                });
+                if !moved.is_empty() || stray {
+                    undo(self);
+                    return Err(Refusal::new(
+                        "the bump moved more than version lines; it is undone",
+                        "bump by hand and read the diff",
+                    )
+                    .detail(moved));
+                }
+                // The bump opens a release window, so it also carries the harness versions the
+                // window owes (`ship harness-bump`'s writes), after the version-only check above
+                // judged the edit's own changes.
+                let harness_timing = crate::cut_timing::Timer::start(
+                    &self.step_log(self.step),
+                    "bump-harness-versions",
+                );
+                let owed = match crate::harness_versions::apply(&self.repo, &origin) {
+                    Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
+                    Err(e) => {
+                        undo(self);
+                        return Err(Refusal::new(
+                            format!(
+                                "the harness versions could not be bumped ({e}); the bump is undone"
+                            ),
+                            "read the commit step's log",
+                        ));
+                    }
+                };
+                drop(harness_timing);
+                let msg = if owed.is_empty() {
+                    format!("release: {to} — the version and the lockfile move together")
+                } else {
+                    let names: Vec<String> = owed
+                        .iter()
+                        .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+                        .collect();
+                    format!(
+                        "release: {to} — the version, the lockfile and the harness versions move \
+                     together ({})",
+                        names.join(", ")
+                    )
+                };
+                let mut commit = command(aterm_uds::os_path!("git"));
+                commit
+                    .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
+                    .args(&followed)
+                    .args(crate::harness_versions::written(&owed))
+                    .current_dir(&self.repo);
+                let commit_timing =
+                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
+                if self.logged(Step::Commit, &mut commit).code != 0 {
+                    undo(self);
+                    return Err(Refusal::new(
+                        "could not commit the bump; it is undone",
                         "read the commit step's log",
                     ));
                 }
-            };
-            drop(harness_timing);
-            let msg = if owed.is_empty() {
-                format!("release: {to} — the version and the lockfile move together")
-            } else {
-                let names: Vec<String> = owed
-                    .iter()
-                    .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
-                    .collect();
-                format!(
-                    "release: {to} — the version, the lockfile and the harness versions move \
-                     together ({})",
-                    names.join(", ")
-                )
-            };
-            let mut commit = command(aterm_uds::os_path!("git"));
-            commit
-                .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
-                .args(&followed)
-                .args(crate::harness_versions::written(&owed))
-                .current_dir(&self.repo);
-            let commit_timing =
-                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
-            if self.logged(Step::Commit, &mut commit).code != 0 {
-                undo(self);
-                return Err(Refusal::new(
-                    "could not commit the bump; it is undone",
-                    "read the commit step's log",
-                ));
-            }
-            drop(commit_timing);
-            let bumped = self.head();
-            let _write_timing =
-                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-native-ref-write");
-            match origin.write_ref("refs/heads/main", Some(&tip), &bumped) {
-                Ok(crate::ledger::RefWrite::Written) => return Ok(bumped),
-                Ok(crate::ledger::RefWrite::Conflict) => {}
-                Err(why) => return Err(Refusal::new(
-                    "the native bump write did not establish a successful claim",
-                    "inspect the reported native intent or routing refusal before rerunning; the local bump commit is retained",
-                ).detail([why])),
-            }
-            if attempt == 3 {
-                return Err(Refusal::new(
-                    "main moved under the bump three times (each push lost the race)",
-                    format!("{RELEASE_COMMAND} --bump again"),
-                ));
-            }
-            origin.refresh_main().map_err(|why| {
-                Refusal::new(
-                    "cannot refresh main after the bump lost its compare-and-swap",
-                    "read the native refusal before rerunning; the local bump commit is retained",
-                )
-                .detail([why])
-            })?;
-            let _ = self.git().git(&["reset", "-q", "--keep", "origin/main"]);
-        }
-        Err(Refusal::new(
-            "the bump did not land",
-            "read the commit step's log",
-        ))
+                drop(commit_timing);
+                let bumped = self.head();
+                let mut declared = vec!["Cargo.toml".into(), "Cargo.lock".into()];
+                declared.extend(followed);
+                declared.extend(crate::harness_versions::written(&owed));
+                crate::bump_claim::record(&self.git(), &journal, &msg, declared)
+                    .map_err(|why| cut_refusal("bump custody journal", &why))?;
+                Ok(bumped)
+            },
+            |tip, bumped| {
+                let _timing = crate::cut_timing::Timer::start(&log, "bump-native-ref-write");
+                origin.write_ref("refs/heads/main", Some(tip), bumped)
+            },
+            || origin.refresh_main(),
+        )?;
+        self.submodule_sync(Step::Commit)?;
+        Ok(bumped)
     }
 
     fn validation_tools(&mut self) -> Result<String, Refusal> {
@@ -9940,6 +9971,10 @@ mod tests {
         let mut none = command("verify");
         real.hand_pool(&mut none, true).unwrap();
         assert_eq!(pool_of(&none), None, "no pool, nothing handed");
+        let verifier = Path::new("/frozen/verifier");
+        let plain = real.verifier_child(verifier, None, crate::check_record::Half::Tree);
+        assert_eq!(plain.get_program(), verifier.as_os_str());
+        assert_eq!(plain.get_args().count(), 0);
 
         // Asked for by a spelling no child is handed: a `.` component, and a doubled separator
         // too where `TMPDIR` holds one (as `$TMPDIR/.ubd/` does where `$TMPDIR` ends in a
@@ -9958,6 +9993,23 @@ mod tests {
             "the pool's FIFO is the one asked for"
         );
         real.pool = Some(pool);
+
+        let tree = real.verifier_child(verifier, None, crate::check_record::Half::Tree);
+        if cfg!(unix) {
+            assert_eq!(tree.get_program(), "/usr/bin/nice");
+            assert_eq!(
+                tree.get_args().collect::<Vec<_>>(),
+                [
+                    std::ffi::OsStr::new("-n"),
+                    std::ffi::OsStr::new("10"),
+                    verifier.as_os_str()
+                ]
+            );
+        }
+        // Negative control: bundle checks run after the pool's slices and keep foreground priority.
+        let bundle = real.verifier_child(verifier, None, crate::check_record::Half::Bundle);
+        assert_eq!(bundle.get_program(), verifier.as_os_str());
+        assert_eq!(bundle.get_args().count(), 0);
 
         let mut build = command("ship");
         real.hand_pool(&mut build, false).unwrap();

@@ -1043,7 +1043,7 @@ pub const VERBS: &[VerbSpec] = &[
          `delivery=deferred|blocked`, `installable=false` (a disk-image, translocated or dev copy \
          never updates), on Linux \
          `linux_installed_build= linux_staged_build= linux_trial=<phase|none> linux_trial_starts= \
-         linux_trial_healthy=`, `apply_refusal= apply_refusal_at= apply_failure= trial_wait=`, the \
+         linux_trial_healthy=`, `apply_refusal= apply_refusal_detail= apply_refusal_at= apply_failure= trial_wait=`, the \
          handoff timings `freeze_seed_ms= handoff_capture_ms= handoff_park_ms=`, and `changelog=` \
          (prose pct-encoded). `apply_posture`: `automatic`, `automatic-idle`, `next-launch` \
          (installs once aterm is quit and opened again), `manual-config`, `disabled-env`, \

@@ -1168,12 +1168,25 @@ impl KeeperLink {
 
     /// Queue `op` using waited room and wait for a written answer.
     pub fn send_and_wait(&self, op: LinkOp, within: Duration) -> bool {
-        let terminal = matches!(op, LinkOp::Bye);
+        let lasting = matches!(op, LinkOp::Bye);
+        self.send_waited(op, within, lasting)
+    }
+
+    /// [`Self::send_and_wait`], but a wait that runs out gives up only the wait, as a BYE's does:
+    /// `op` stays queued and is written in its turn, so it keeps its place among the ops queued
+    /// before and after it whether or not the caller saw it written.
+    pub fn send_lasting_and_wait(&self, op: LinkOp, within: Duration) -> bool {
+        self.send_waited(op, within, true)
+    }
+
+    /// Queue `op` using waited room and wait at most `within` for a written answer; a `lasting`
+    /// op outlives its wait, any other is dropped unwritten once its wait has run out.
+    fn send_waited(&self, op: LinkOp, within: Duration, lasting: bool) -> bool {
         let now = std::time::Instant::now();
         let Some(until) = now.checked_add(within) else {
             return false;
         };
-        if !terminal && within.is_zero() {
+        if !lasting && within.is_zero() {
             return false;
         }
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
@@ -1181,7 +1194,7 @@ impl KeeperLink {
         let waited = Waited {
             answer: ack_tx,
             state: std::sync::Arc::clone(&state),
-            until: (!terminal).then_some(until),
+            until: (!lasting).then_some(until),
         };
         if self.tx.try_send((op, Some(waited))).is_err() {
             return false;
@@ -1190,7 +1203,7 @@ impl KeeperLink {
         match ack_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
             Ok(written) => written,
             Err(_) => {
-                if !terminal {
+                if !lasting {
                     Waited::cancel(&state);
                 }
                 false
@@ -2971,6 +2984,31 @@ mod tests {
         );
         assert!(server.holds(rdev), "the RELEASE after the BYE never came");
         drop(server);
+    }
+
+    /// A lasting wait that runs out leaves its op queued, to be written in its turn; an ordinary
+    /// waited op whose wait ran out is never written.
+    #[test]
+    fn a_lasting_waited_op_outlives_its_wait() {
+        let (link, far) = KeeperLink::stalled();
+        assert!(
+            !link.send_lasting_and_wait(LinkOp::Release { rdev: 7 }, Duration::ZERO),
+            "no keeper wrote it"
+        );
+        assert!(!link.send_and_wait(LinkOp::Release { rdev: 8 }, Duration::from_millis(1)));
+        let queued: Vec<u64> = far
+            .drain()
+            .into_iter()
+            .filter_map(|op| match op {
+                LinkOp::Release { rdev } => Some(rdev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            [7],
+            "the lasting op stays queued; the ordinary one went with its wait"
+        );
     }
 
     #[test]

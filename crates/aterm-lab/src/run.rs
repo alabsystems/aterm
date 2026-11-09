@@ -13,6 +13,10 @@ use crate::util::{atomic_write, shell_quote, shell_unquote};
 /// ([`Run::claude_dir`]).
 pub const STORED_LOGIN: &str = "stored-login";
 
+/// The tab's last `lab claude` ran on `--own`'s login, in the scratch HOME itself with no
+/// `CLAUDE_CONFIG_DIR` ([`Run::claude_json`]).
+pub const OWN_LOGIN: &str = "own";
+
 /// Everything `env.sh` says of a lab.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Run {
@@ -107,7 +111,8 @@ pub struct Run {
     /// `1` when `up --tab-strip` gave the instance its one-row tab strip (`tab_strip_rows = 1`).
     pub tab_strip: String,
     /// [`STORED_LOGIN`] when the tab's last `lab claude` ran on `--stored`'s login directory, its
-    /// `CLAUDE_CONFIG_DIR` then ([`Run::claude_dir`]); empty otherwise.
+    /// `CLAUDE_CONFIG_DIR` then ([`Run::claude_dir`]); [`OWN_LOGIN`] when it ran on `--own`'s, in
+    /// the scratch HOME with none ([`Run::claude_json`]); empty otherwise.
     pub claude_login: String,
 }
 
@@ -336,14 +341,27 @@ impl Run {
         )
     }
 
-    /// The `CLAUDE_CONFIG_DIR` the tab's Claude Code reads: `scratch/stored-login` after `lab
-    /// claude --stored` ([`STORED_LOGIN`]), else the scratch home's `.claude`.
+    /// The Claude home the tab's Claude Code reads: `scratch/stored-login` after `lab claude
+    /// --stored` ([`STORED_LOGIN`]), else the scratch home's `.claude` (its `CLAUDE_CONFIG_DIR`,
+    /// or after `--own` its default home, [`OWN_LOGIN`]).
     #[must_use]
     pub fn claude_dir(&self) -> PathBuf {
         if self.claude_login == STORED_LOGIN {
             self.w.join(STORED_LOGIN)
         } else {
             self.w.join("home/.claude")
+        }
+    }
+
+    /// The `.claude.json` the tab's Claude Code reads its profile from: the scratch HOME's own
+    /// after `lab claude --own`, which names no `CLAUDE_CONFIG_DIR` ([`OWN_LOGIN`]), else the one
+    /// in [`Run::claude_dir`].
+    #[must_use]
+    pub fn claude_json(&self) -> PathBuf {
+        if self.claude_login == OWN_LOGIN {
+            self.w.join("home/.claude.json")
+        } else {
+            self.claude_dir().join(".claude.json")
         }
     }
 

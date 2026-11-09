@@ -228,6 +228,9 @@ thread_local! {
     pub(super) static MUTANT: Cell<Option<Mutant>> = const { Cell::new(None) };
     /// How many weighings [`weigh`] ran on this thread, for the pins of what a log carries.
     pub(super) static WEIGHINGS: Cell<usize> = const { Cell::new(0) };
+    /// How many derivations of what epochs' historical writers read ([`Historical`]) ran on this
+    /// thread, for the pins of what a log keeps.
+    pub(super) static HISTORICALS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -944,11 +947,13 @@ pub(super) fn undo(history: History<'_>, weighing: &Weighing, actor: &MemberId) 
 /// all: the effects and authorization under the weighing, the standing they give, which records
 /// count, the counting Commons epochs and the recipients of each epoch's counting `Wrap`s. Each
 /// epoch's writers are then its founders' and entrants' bindings these admit
-/// ([`HistoricalWriters::of_epoch`]). A quiet repair round asks for 16 epochs' writers under one
-/// history lease: over a log of 9,605 records that batch's writers took 4.3% of such a round, most
-/// of it each epoch deriving these again (2026-11-08).
-pub(super) struct HistoricalWriters<'a> {
-    graph: Graph<'a>,
+/// ([`Historical::of_epoch`]). A quiet repair round asks for 16 epochs' writers under one history
+/// lease: over a log of 9,605 records that batch's writers took 4.3% of such a round, most of it
+/// each epoch deriving these again (2026-11-08), and then 8.5% of it, each lease deriving these
+/// again, so the log keeps them for its held records (`Log::hold` lets them go). Each is a record
+/// index or a set of members, recipients and record ids, none a borrow of the records.
+#[derive(Debug)]
+pub(super) struct Historical {
     effects: Effects,
     authorized: Vec<bool>,
     standing: Standing,
@@ -961,12 +966,36 @@ pub(super) struct HistoricalWriters<'a> {
     wrapped: BTreeMap<RecordId, BTreeSet<Recipient>>,
 }
 
+/// One history's graph, with what its epochs' historical writers read of it ([`Historical`]).
+pub(super) struct HistoricalWriters<'a> {
+    graph: Graph<'a>,
+    historical: &'a Historical,
+}
+
 impl<'a> HistoricalWriters<'a> {
-    pub(super) fn of(history: History<'a>, weighing: &Weighing) -> Self {
-        Self::of_graph(Graph::new(history), weighing)
+    /// `history`'s graph, with what `kept` holds of it or, where it holds nothing yet, what is
+    /// derived into it under `weighing`: `kept` is the history's own, which nothing it was derived
+    /// from has changed since.
+    pub(super) fn of(
+        history: History<'a>,
+        kept: &'a std::sync::OnceLock<Historical>,
+        weighing: &Weighing,
+    ) -> Self {
+        let graph = Graph::new(history);
+        let historical = kept.get_or_init(|| Historical::of_graph(&graph, weighing));
+        Self { graph, historical }
     }
 
-    fn of_graph(graph: Graph<'a>, weighing: &Weighing) -> Self {
+    /// [`Historical::of_epoch`] over this graph.
+    pub(super) fn of_epoch(&self, epoch_index: usize) -> Option<Vec<Binding>> {
+        self.historical.of_epoch(&self.graph, epoch_index)
+    }
+}
+
+impl Historical {
+    fn of_graph(graph: &Graph<'_>, weighing: &Weighing) -> Self {
+        #[cfg(test)]
+        HISTORICALS.set(HISTORICALS.get() + 1);
         let (effects, authorized) = graph.settled(weighing, &mut graph.scratch());
         let all = |_: usize| true;
         let standing = graph.standing(&all, &effects.void, &effects.out, &authorized);
@@ -994,7 +1023,6 @@ impl<'a> HistoricalWriters<'a> {
             }
         }
         Self {
-            graph,
             effects,
             authorized,
             standing,
@@ -1005,10 +1033,9 @@ impl<'a> HistoricalWriters<'a> {
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under the
-    /// effective `Epoch` record at `epoch_index`.
-    pub(super) fn of_epoch(&self, epoch_index: usize) -> Option<Vec<Binding>> {
+    /// effective `Epoch` record at `epoch_index` of `graph`, the graph these were derived from.
+    fn of_epoch(&self, graph: &Graph<'_>, epoch_index: usize) -> Option<Vec<Binding>> {
         let Self {
-            graph,
             effects,
             authorized,
             standing,
@@ -1212,6 +1239,7 @@ impl AuthScratch {
 }
 
 /// What a set of quorums does: records void everywhere, and members out for good.
+#[derive(Debug)]
 struct Effects {
     void: Vec<bool>,
     out: BTreeSet<MemberId>,
@@ -1253,6 +1281,7 @@ impl Weighed {
 }
 
 /// Membership over one causally closed part of the log.
+#[derive(Debug)]
 struct Standing {
     /// Each member and the entry (record index) that lets it in.
     members: BTreeMap<MemberId, usize>,
@@ -3056,14 +3085,14 @@ impl<'a> Graph<'a> {
         standing.admits.contains_key(actor)
     }
 
-    /// [`HistoricalWriters::of_epoch`] over this graph alone (the dense oracle's tests).
+    /// [`Historical::of_epoch`] over this graph alone (the dense oracle's tests).
     #[cfg(test)]
     fn historical_bindings_for_epoch(
         self,
         weighing: &Weighing,
         epoch_index: usize,
     ) -> Option<Vec<Binding>> {
-        HistoricalWriters::of_graph(self, weighing).of_epoch(epoch_index)
+        Historical::of_graph(&self, weighing).of_epoch(&self, epoch_index)
     }
 
     /// The cutoff of a quorum `Remove` of `actor` that every honest Mac holding these records

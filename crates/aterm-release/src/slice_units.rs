@@ -299,6 +299,10 @@ fn wrap(
         let mut event = unit_event(units, unit, "started", queued, started, None, None);
         if let aterm_json::Value::Object(fields) = &mut event {
             fields.insert("compiler_pid".to_owned(), child.id().into());
+            fields.insert(
+                "memory_waiting_s".to_owned(),
+                aterm_json::json!(claim.as_ref().map(|claim| claim.waited().as_secs_f64())),
+            );
         }
         eprintln!("{event}");
     }

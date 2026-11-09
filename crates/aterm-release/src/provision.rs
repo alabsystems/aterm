@@ -1020,45 +1020,26 @@ fn promote_public_pair_held(
     Ok(true)
 }
 
-/// The latest channel release's pair, fetched anonymously and admitted.
+/// The latest channel release's pair ([`machines::channel_roster_pair`]), admitted.
 #[cfg(unix)]
 fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String> {
-    let bytes =
-        anonymous_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
-            // Only the body's clean 404 means no roster is published yet; any other
-            // failure (429/403, a timeout, a private repo) is "cannot tell", and the mint
-            // gate refuses on it.
-            if aterm_update_core::download_error_is_not_found(&e) {
-                format!("{NO_CHANNEL_ROSTER}: {e}")
-            } else {
-                e
-            }
+    let reader = crate::github::reader(machines::CUT_READ_PATIENCE).map_err(|e| e.to_string())?;
+    // Only the channel answering that its latest release has no roster means none is published
+    // yet; any other failure (a route that failed, a private repository) is "cannot tell", and
+    // the mint gate refuses on it.
+    let machines::RosterDocument { bytes, signature } =
+        machines::channel_roster_pair(&reader, slug)?.ok_or_else(|| {
+            format!(
+                "{NO_CHANNEL_ROSTER}: {slug}'s latest release carries no {}",
+                roster::ROSTER_ASSET
+            )
         })?;
-    let sig = anonymous_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)
-        .map_err(|e| format!("roster present but its signature could not be fetched: {e}"))?;
-    admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
+    admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, signature)
 }
 
-/// Marker prefix when the channel roster body answered a clean 404.
+/// Marker prefix when the channel's latest release answered that it carries no roster.
 #[cfg(unix)]
 const NO_CHANNEL_ROSTER: &str = "no roster on the channel";
-
-/// `https://github.com/<slug>/releases/latest/download/<asset>`.
-#[cfg(unix)]
-fn release_asset_url(slug: &str, asset: &str) -> String {
-    format!("https://github.com/{slug}/releases/latest/download/{asset}")
-}
-
-/// One bounded anonymous download.
-#[cfg(unix)]
-fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
-    let cap = u64::try_from(cap).map_err(|_| format!("{url}: byte cap is too large"))?;
-    let bytes = aterm_update_core::download_bytes(url, cap)?;
-    if bytes.is_empty() {
-        return Err(format!("{url}: zero bytes"));
-    }
-    Ok(bytes)
-}
 
 /// Take the roster pair's writer lock.
 #[cfg(unix)]

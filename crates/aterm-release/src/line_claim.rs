@@ -587,7 +587,29 @@ enum Request {
 }
 
 fn keep_local(path: &Path, state: &State) -> Result<(), String> {
-    let text = aterm_json::to_vec(state).map_err(|e| e.to_string())?;
+    // Fleet surveys need identity and the latest boundary, and refuse registry
+    // files over 4 MiB before stripping rows. Keep outcome history in State and
+    // its remote Git record; do not copy it into this local observation.
+    #[derive(Serialize)]
+    struct LocalRecord<'a> {
+        line: &'a crate::line::Line,
+        holder: &'a Holder,
+        step: &'a str,
+        boundary: &'a str,
+        at: u64,
+        p95_s: u64,
+        rows: &'a [String],
+    }
+    let record = LocalRecord {
+        line: &state.line,
+        holder: &state.holder,
+        step: &state.step,
+        boundary: &state.boundary,
+        at: state.at,
+        p95_s: state.p95_s,
+        rows: &[],
+    };
+    let text = aterm_json::to_vec(&record).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(path.parent().ok_or("no registry parent")?)
         .map_err(|e| e.to_string())?;
     crate::durable::write_atomic_durable(path, &text, 0o600).map_err(|e| e.to_string())
@@ -655,7 +677,7 @@ impl Claim {
         let (sample_stop, sample_rx) = std::sync::mpsc::channel();
         let mut reader = Rows::default();
         // Seed before either thread starts: old rows cannot prove new progress.
-        let _ = reader.read(logs);
+        reader.seed(logs);
         let logs = logs.to_path_buf();
         let sampling = Arc::clone(&local);
         let sampler = std::thread::spawn(move || {
@@ -842,14 +864,67 @@ fn p95(history: &str, step: &str) -> u64 {
 }
 
 #[derive(Default)]
-struct Rows(std::collections::BTreeMap<PathBuf, u64>);
+struct Rows(std::collections::BTreeMap<PathBuf, RowCursor>);
+
+const PROGRESS_LINE_BYTES: usize = 64 * 1024;
+
+struct RowCursor {
+    // Retain the physical file so its identity cannot be recycled between polls.
+    file: std::fs::File,
+    identity: (u64, u128),
+    offset: u64,
+    partial: Vec<u8>,
+    discarding: bool,
+}
+
+impl RowCursor {
+    fn consume(&mut self, mut bytes: &[u8], mut rows: Option<&mut Vec<String>>) {
+        while !bytes.is_empty() {
+            let newline = bytes.iter().position(|byte| *byte == b'\n');
+            let length = newline.map_or(bytes.len(), |at| at + 1);
+            let part = &bytes[..length];
+            self.offset += length as u64;
+            if !self.discarding {
+                if self.partial.len() + part.len() <= PROGRESS_LINE_BYTES {
+                    self.partial.extend_from_slice(part);
+                } else {
+                    self.partial.clear();
+                    self.discarding = true;
+                }
+            }
+            if newline.is_some() {
+                if !self.discarding
+                    && let Some(rows) = rows.as_mut()
+                    && let Ok(text) = std::str::from_utf8(&self.partial)
+                    && let Some(row) = completed_row(text)
+                {
+                    rows.push(row);
+                }
+                self.partial.clear();
+                self.discarding = false;
+            }
+            bytes = &bytes[length..];
+        }
+    }
+}
 
 impl Rows {
+    // Historical completions establish cursor position, never new progress.
+    // Do not decode or collect summaries that the initial seed would discard.
+    fn seed(&mut self, logs: &Path) {
+        self.scan(logs, None);
+    }
+
     fn read(&mut self, logs: &Path) -> Vec<String> {
-        use std::io::{BufRead as _, Seek as _};
         let mut rows = Vec::new();
+        self.scan(logs, Some(&mut rows));
+        rows
+    }
+
+    fn scan(&mut self, logs: &Path, mut rows: Option<&mut Vec<String>>) {
+        use std::io::{Read as _, Seek as _};
         let Ok(entries) = std::fs::read_dir(logs) else {
-            return rows;
+            return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -864,29 +939,65 @@ impl Rows {
                 continue;
             }
             let path = entry.path();
-            let Ok(mut file) = crate::durable::open_regular_file(&path) else {
+            let Ok(file) = crate::durable::open_regular_file(&path) else {
                 continue;
             };
-            let offset = self.0.entry(path).or_default();
-            if file.seek(std::io::SeekFrom::Start(*offset)).is_err() {
+            let (Ok(stat), Ok(metadata)) = (aterm_dirfd::fstat(&file), file.metadata()) else {
+                continue;
+            };
+            #[cfg(unix)]
+            let inode = u128::from(stat.st_ino);
+            #[cfg(not(unix))]
+            let inode = stat.st_ino;
+            let identity = (stat.st_dev, inode);
+            if self
+                .0
+                .get(&path)
+                .is_none_or(|cursor| cursor.identity != identity)
+            {
+                self.0.insert(
+                    path.clone(),
+                    RowCursor {
+                        file,
+                        identity,
+                        offset: 0,
+                        partial: Vec::new(),
+                        discarding: false,
+                    },
+                );
+            }
+            let cursor = self.0.get_mut(&path).unwrap();
+            // A different stream or an observed truncation cannot complete an
+            // earlier stream's fragment. A truncate-and-regrow entirely between
+            // samples is not observable here; these remain incomplete diagnostics.
+            if metadata.len() < cursor.offset {
+                cursor.offset = 0;
+                cursor.partial.clear();
+                cursor.discarding = false;
+            }
+            if cursor
+                .file
+                .seek(std::io::SeekFrom::Start(cursor.offset))
+                .is_err()
+            {
                 continue;
             }
-            let mut reader = std::io::BufReader::new(file);
-            let mut bytes = Vec::new();
-            while let Ok(n) = reader.read_until(b'\n', &mut bytes) {
-                if n == 0 || bytes.last() != Some(&b'\n') {
+            // Snapshot the extent: a continuously appending writer cannot keep
+            // this sample chasing its tail indefinitely.
+            let mut remaining = metadata.len().saturating_sub(cursor.offset);
+            let mut bytes = [0; 8192];
+            while remaining != 0 {
+                let limit = usize::try_from(remaining.min(bytes.len() as u64)).unwrap();
+                let Ok(n) = cursor.file.read(&mut bytes[..limit]) else {
+                    break;
+                };
+                if n == 0 {
                     break;
                 }
-                *offset += n as u64;
-                if let Ok(text) = std::str::from_utf8(&bytes)
-                    && let Some(row) = completed_row(text)
-                {
-                    rows.push(row);
-                }
-                bytes.clear();
+                cursor.consume(&bytes[..n], rows.as_deref_mut());
+                remaining -= n as u64;
             }
         }
-        rows
     }
 }
 
@@ -1101,9 +1212,158 @@ mod tests {
     }
 
     #[test]
+    fn progress_reader_discards_large_lines_without_rereading_partial_bytes() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("06-verify.events");
+        let event = r#"{"event":"check-finished","check":"lint","outcome":"PASS"}"#;
+        let mut reader = Rows::default();
+        // Complete arbitrary output is bounded too, even though it is not JSON.
+        std::fs::write(
+            &path,
+            format!("{}\n{event}\n", "x".repeat(PROGRESS_LINE_BYTES * 3)),
+        )
+        .unwrap();
+        assert_eq!(reader.read(dir.path()).len(), 1);
+        assert!(reader.read(dir.path()).is_empty());
+
+        std::fs::write(&path, "x".repeat(PROGRESS_LINE_BYTES * 2)).unwrap();
+        assert!(reader.read(dir.path()).is_empty());
+        let cursor = reader.0.get(&path).unwrap();
+        let consumed = cursor.offset;
+        assert_eq!(consumed, (PROGRESS_LINE_BYTES * 2) as u64);
+        assert!(cursor.partial.is_empty());
+        assert!(cursor.discarding);
+        assert!(reader.read(dir.path()).is_empty());
+        assert_eq!(reader.0[&path].offset, consumed);
+        // A valid-looking suffix of the oversized record must not become a row.
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(append, "{event}\n{event}\n").unwrap();
+        assert_eq!(reader.read(dir.path()).len(), 1);
+        assert!(!reader.0[&path].discarding);
+        assert!(reader.0[&path].partial.is_empty());
+        assert!(reader.read(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn progress_reader_keeps_bounded_fragments_and_seeds_old_completed_rows() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.log");
+        let event = "verify-event: {\"event\":\"check-finished\",\"check\":\"lint\",\"outcome\":\"PASS\"}\n";
+        std::fs::write(&path, event).unwrap();
+        let mut reader = Rows::default();
+        reader.seed(dir.path());
+        assert!(reader.read(dir.path()).is_empty());
+        let split = event.len() / 2;
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        append.write_all(&event.as_bytes()[..split]).unwrap();
+        assert!(reader.read(dir.path()).is_empty());
+        assert_eq!(reader.0[&path].partial, event.as_bytes()[..split]);
+        assert_eq!(reader.0[&path].offset, (event.len() + split) as u64);
+        append.write_all(&event.as_bytes()[split..]).unwrap();
+        assert_eq!(reader.read(dir.path()).len(), 1);
+        assert!(reader.read(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn progress_seed_skips_dense_history_and_keeps_its_incomplete_tail() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("06-verify.events");
+        let event = "{\"event\":\"check-finished\",\"check\":\"lint\",\"outcome\":\"PASS\"}\n";
+        let next = "{\"event\":\"check-finished\",\"check\":\"doc\",\"outcome\":\"PASS\"}\n";
+        let split = event.len() / 2;
+        let mut file = std::fs::File::create(&path).unwrap();
+        for _ in 0..10_000 {
+            file.write_all(event.as_bytes()).unwrap();
+        }
+        file.write_all(&event.as_bytes()[..split]).unwrap();
+        let mut reader = Rows::default();
+        reader.seed(dir.path());
+        assert_eq!(reader.0[&path].offset, file.metadata().unwrap().len());
+        assert_eq!(reader.0[&path].partial, event.as_bytes()[..split]);
+        assert!(reader.read(dir.path()).is_empty());
+        file.write_all(&event.as_bytes()[split..]).unwrap();
+        file.write_all(next.as_bytes()).unwrap();
+        assert_eq!(
+            reader.read(dir.path()),
+            [completed_row(event).unwrap(), completed_row(next).unwrap()]
+        );
+        assert!(reader.read(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn progress_seed_keeps_oversize_discard_through_the_next_newline() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.log");
+        std::fs::write(&path, "x".repeat(PROGRESS_LINE_BYTES * 2)).unwrap();
+        let mut reader = Rows::default();
+        reader.seed(dir.path());
+        assert_eq!(reader.0[&path].offset, (PROGRESS_LINE_BYTES * 2) as u64);
+        assert!(reader.0[&path].partial.is_empty());
+        assert!(reader.0[&path].discarding);
+        assert!(reader.read(dir.path()).is_empty());
+        let event = "{\"event\":\"check-finished\",\"check\":\"lint\",\"outcome\":\"PASS\"}\n";
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{event}{event}").unwrap();
+        assert_eq!(reader.read(dir.path()), [completed_row(event).unwrap()]);
+        assert!(!reader.0[&path].discarding);
+        assert!(reader.read(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn progress_reader_never_joins_fragments_across_replacement_or_observed_truncation() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("06-verify.events");
+        let event = r#"{"event":"check-finished","check":"lint","outcome":"PASS"}"#;
+        let split = event.len() - 3;
+        let mut reader = Rows::default();
+        std::fs::write(&path, &event[..split]).unwrap();
+        assert!(reader.read(dir.path()).is_empty());
+        let old_identity = reader.0[&path].identity;
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, format!("{}\n{event}\n", &event[split..])).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(reader.read(dir.path()).len(), 1);
+        assert_ne!(reader.0[&path].identity, old_identity);
+        assert!(reader.read(dir.path()).is_empty());
+
+        // Observe a shortened same-inode file while an old prefix is retained.
+        std::fs::write(&path, "x".repeat(PROGRESS_LINE_BYTES / 2)).unwrap();
+        assert!(reader.read(dir.path()).is_empty());
+        let same_identity = reader.0[&path].identity;
+        std::fs::write(&path, format!("{}\n{event}\n", &event[split..])).unwrap();
+        assert_eq!(reader.read(dir.path()).len(), 1);
+        assert_eq!(reader.0[&path].identity, same_identity);
+        assert!(reader.read(dir.path()).is_empty());
+    }
+
+    #[test]
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     fn blocked_publication_cannot_hide_completed_progress_from_the_fleet() {
+        const COMPLETIONS: usize = 16_384;
         let dir = aterm_tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let event = aterm_json::json!({
+            "event":"test-binary-finished", "test":"db", "outcome":"FAIL",
+            "detail":"x".repeat(256),
+        })
+        .to_string();
+        let recording = format!("{event}\n").repeat(COMPLETIONS);
+        let log = logs.join("06-verify.events");
+        std::fs::write(&log, &recording).unwrap();
         let mut old = state("m3", 1);
         old.holder.pid = std::process::id();
         (old.holder.boot, old.holder.start) =
@@ -1137,19 +1397,40 @@ mod tests {
             })
         });
         tx.send(Request::Wake).unwrap();
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap();
-        let logs = dir.path().join("logs");
-        std::fs::create_dir(&logs).unwrap();
-        std::fs::write(
-            logs.join("06-verify.events"),
-            "{\"event\":\"test-binary-finished\",\"test\":\"db\",\"outcome\":\"PASS\"}\n",
-        )
-        .unwrap();
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(60));
         // This is the production sampler path, while the publisher is held by a channel.
-        local.sample(&mut Rows::default(), &logs).unwrap();
+        let sampled = local.sample(&mut Rows::default(), &logs);
         let observed = local_observation(&old, dir.path());
+        let current = local.snapshot();
+        let local_bytes = std::fs::read(&local.path);
+        let recorded_bytes = std::fs::read(&log);
+        // Retire the held publisher before any assertion, including I/O failures.
+        let stopped = tx.send(Request::Stop);
+        let released = release_tx.send(());
+        let joined = writer.join();
+        entered.unwrap();
+        stopped.unwrap();
+        released.unwrap();
+        joined.unwrap();
+        sampled.unwrap();
+        let current = current.unwrap();
+        let local_bytes = local_bytes.unwrap();
+        let full_history = aterm_json::to_vec(&current).unwrap();
+        assert!(full_history.len() > 4 * 1024 * 1024);
+        assert!(local_bytes.len() < 4 * 1024 * 1024);
+        assert_eq!(current.rows.len(), COMPLETIONS);
+        let mut expected_local = current.clone();
+        expected_local.rows.clear();
+        let local_record: State = aterm_json::from_slice(&local_bytes).unwrap();
+        assert_eq!(local_record, expected_local);
+        assert_eq!(recorded_bytes.unwrap(), recording.as_bytes());
+        // Remote serialization still carries every outcome, including red details.
+        let remote_text = aterm_toml::to_string(&current).unwrap();
+        let remote_record =
+            parse_state(&remote_text, &reference(&current.line.version).unwrap()).unwrap();
+        assert_eq!(remote_record, current);
+        assert!(!red_items(&remote_record).is_empty());
+        assert!(matches!(&observed, Observation::Live(live) if **live == expected_local));
         assert!(!adoptable(&old, &observed, now()));
         // Negative control: without the sampler's fresh host observation this same old
         // ref and live process would be judged stalled and adopted.
@@ -1158,9 +1439,13 @@ mod tests {
             &Observation::Live(Box::new(old.clone())),
             now()
         ));
-        tx.send(Request::Stop).unwrap();
-        release_tx.send(()).unwrap();
-        writer.join().unwrap();
+        // Negative control: the previous full-history registry shape is omitted by
+        // the real survey reader before its own rows projection can run.
+        std::fs::write(&local.path, full_history).unwrap();
+        assert!(matches!(
+            local_observation(&old, dir.path()),
+            Observation::Unknown
+        ));
     }
 
     #[cfg(unix)]

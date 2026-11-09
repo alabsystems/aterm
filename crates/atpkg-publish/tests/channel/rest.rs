@@ -1234,3 +1234,65 @@ fn a_download_shorter_than_its_listing_is_refused_and_leaves_no_file() {
         [7_u8; 3000]
     );
 }
+
+/// A PUBLIC READ RIDES THE DOWNLOAD HOST'S OUTAGE: with the web route answering 504, the asset is
+/// read through the API route, whose requests alone carry the identity's token; the web and CDN
+/// legs stay anonymous.
+/// NEGATIVE CONTROL: an asset the release lacks is absent on the web route's 404, and the API is
+/// never asked; a partial left by an earlier run is not continued; a read over its cap leaves
+/// neither the file nor a partial.
+#[test]
+fn a_public_read_takes_the_api_route_when_the_web_route_fails_and_a_404_is_absent() {
+    let rig = Rig::new();
+    let host = rig.host();
+    let id = rig.fake.add_release(
+        SLUG,
+        ReleaseSpec::published("atpkg-ay-1", "2026-10-01T00:00:00Z").prerelease(true),
+    );
+    rig.fake
+        .add_asset(id, AssetSpec::uploaded("ay.toml", b"the manifest"));
+    let dest = rig.dir.path().join("public").join("ay.toml");
+
+    assert_eq!(
+        host.fetch_public(&slug(), "atpkg-ay-1", "missing.toml", &dest, 64),
+        Probe::Absent
+    );
+    assert!(
+        rig.fake.seen().iter().all(|s| s.origin != FakeOrigin::Api),
+        "a 404 asks the API nothing"
+    );
+
+    rig.fake.fault_always(
+        Match::web("/fixture-dev/packs/releases/"),
+        Fault::Status {
+            status: 504,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    rig.fake.clear_seen();
+    // A partial an earlier run left (of bytes since replaced) is not continued.
+    let part = rig.dir.path().join("public").join("ay.toml.part");
+    std::fs::write(&part, b"XX").expect("a stale partial");
+    assert_eq!(
+        host.fetch_public(&slug(), "atpkg-ay-1", "ay.toml", &dest, 64),
+        Probe::Present
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("the fetched file"),
+        b"the manifest"
+    );
+    let seen = rig.fake.seen();
+    assert!(seen.iter().any(|s| s.origin == FakeOrigin::Api), "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|s| s.had_authorization == (s.origin == FakeOrigin::Api)),
+        "only the API leg carries the token: {seen:?}"
+    );
+
+    std::fs::remove_file(&dest).expect("remove the fetched file");
+    let over = host.fetch_public(&slug(), "atpkg-ay-1", "ay.toml", &dest, 4);
+    assert!(matches!(over, Probe::Unknown(_)), "{over:?}");
+    assert!(!dest.exists());
+    assert!(!part.exists());
+}

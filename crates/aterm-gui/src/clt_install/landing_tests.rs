@@ -2014,6 +2014,8 @@ fn an_install_that_ended_unfinished_keeps_the_shim_and_ends_its_word_of_an_insta
     for end in [
         Some(ChildExit::Code(1)),
         Some(ChildExit::Code(not_admin)),
+        Some(ChildExit::Code(7)),
+        Some(ChildExit::Code(8)),
         Some(ChildExit::Code(closed)),
         Some(ChildExit::Code(127)),
         Some(ChildExit::Signal(9)),
@@ -2049,12 +2051,19 @@ fn failed_cancelled_and_unknown_attempts_keep_automatic_requests_paused() {
     use aterm_pty::ChildExit;
     let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
     let closed = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED);
-    for (end, asks_again) in [
-        (Some(ChildExit::Code(1)), false),
-        (Some(ChildExit::Code(stopped)), false),
-        (Some(ChildExit::Code(closed)), false),
-        (Some(ChildExit::Signal(1)), false),
-        (None, false),
+    for (end, owner) in [
+        (Some(ChildExit::Code(1)), Some(aterm_stamp::build_id())),
+        (
+            Some(ChildExit::Code(stopped)),
+            Some(aterm_stamp::build_id()),
+        ),
+        (Some(ChildExit::Code(closed)), Some(aterm_stamp::build_id())),
+        (Some(ChildExit::Signal(1)), Some(aterm_stamp::build_id())),
+        (None, Some(aterm_stamp::build_id())),
+        (Some(ChildExit::Code(7)), None),
+        (Some(ChildExit::Code(8)), None),
+        (Some(ChildExit::Code(7)), Some("another-owner".to_owned())),
+        (Some(ChildExit::Code(8)), Some("another-owner".to_owned())),
     ] {
         let dir = aterm_tempfile::tempdir().expect("a state directory");
         let path = dir.path().join("command-line-tools-tab");
@@ -2063,11 +2072,11 @@ fn failed_cancelled_and_unknown_attempts_keep_automatic_requests_paused() {
         app.workstation_setup.developer_tools_mark = Mark::at(path.clone());
         app.workstation_setup.developer_tools = Install::Opened;
         let mut terminal = Terminal::running(77, false, None);
-        terminal.claim_owner = Some(aterm_stamp::build_id());
+        terminal.claim_owner = owner;
         app.workstation_setup.developer_tools_session = vec![terminal];
         app.workstation_setup.developer_tools_attempt = Some(77);
         app.developer_tools_install_ended(77, end);
-        assert_eq!(Mark::at(path).opened(), !asks_again, "{end:?}");
+        assert!(Mark::at(path).opened(), "{end:?}");
         assert!(
             !app.workstation_setup.developer_tools.due(false),
             "{end:?}: never twice in a launch"
@@ -2135,6 +2144,8 @@ fn a_late_install_result_does_not_replace_the_retry_state() {
         assert!(app.developer_tools_install_active());
         assert!(installing_said(&shim));
 
+        app.root_steps_owed(true);
+
         if let Some(exit) = exit {
             app.pool
                 .get(previous)
@@ -2146,6 +2157,10 @@ fn a_late_install_result_does_not_replace_the_retry_state() {
         } else {
             app.developer_tools_install_ended(previous, None);
         }
+        assert!(
+            app.workstation_setup.developer_tools_root_owed,
+            "{exit:?}: an older result cannot replace the root-work hint"
+        );
         assert!(
             app.workstation_setup
                 .developer_tools_session
@@ -2406,6 +2421,212 @@ fn low_data_mode_spends_no_automatic_opening() {
         "the tab opens by itself once Low Data Mode is off"
     );
     assert_ne!(step(&mut app), Some(ToolsInstall::LowData));
+
+    // A faster network reading must not give another automatic dialog the slot while
+    // the launch's independent-root reading is still out. Priority is not admission.
+    {
+        for owed in [false, true] {
+            let (mut pending, _) = page();
+            pending.want_developer_tools_install(4, true);
+            pending.workstation_setup.root_steps_awaited = true;
+            assert!(!pending.workstation_setup.developer_tools_root_owed);
+            pending.workstation_setup.developer_tools_network = Some(NetworkWatch::stand_in());
+            pending.developer_tools_low_data(true);
+            assert!(
+                pending.mac_setup_tab_comes_next(),
+                "the root reading is out"
+            );
+            assert!(
+                pending.begin_developer_tools_install(aterm).is_none(),
+                "an unread root need cannot admit a constrained download"
+            );
+            pending.root_steps_owed(owed);
+            assert!(!pending.workstation_setup.root_steps_awaited);
+            assert_eq!(pending.mac_setup_tab_comes_next(), owed);
+            assert_eq!(pending.begin_developer_tools_install(aterm).is_some(), owed);
+        }
+        for held in ["marked", "scratch", "not-admin"] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let mark = dir.path().join("command-line-tools-tab");
+            if held == "marked" {
+                this_builds_mark(&mark);
+            }
+            let (mut pending, _) = page();
+            pending.workstation_setup.developer_tools_mark = Mark::at(mark);
+            pending.want_developer_tools_install(4, true);
+            pending.workstation_setup.root_steps_awaited = true;
+            pending.workstation_setup.developer_tools_network = Some(NetworkWatch::stand_in());
+            pending.developer_tools_low_data(true);
+            pending.workstation_setup.developer_tools_scratch_world = held == "scratch";
+            pending.workstation_setup.developer_tools_not_admin = held == "not-admin";
+            assert!(!pending.mac_setup_tab_comes_next(), "{held}");
+            assert!(pending.begin_developer_tools_install(aterm).is_none());
+        }
+    }
+
+    // A definite independent root need admits the original full transaction. If the
+    // child's fresh check finds no such need, its owned preprompt result retires only
+    // this scheduling hint; the download still waits and the want is retained.
+    for disposition in [
+        "current",
+        "unowned",
+        "newer-owner",
+        "entered",
+        "unknown",
+        "stopped",
+    ] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mark = dir.path().join("command-line-tools-tab");
+        let (mut app, wid) = page();
+        app.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+        app.want_developer_tools_install(4, true);
+        app.root_steps_owed(true);
+        app.workstation_setup.developer_tools_network = Some(NetworkWatch::stand_in());
+        app.developer_tools_low_data(true);
+        let (window, ask, then) = app
+            .begin_developer_tools_install(aterm)
+            .expect("independent root work can precede the constrained download");
+        let id = test_support::book_as(&mut app, window, &ask, then);
+        let (landed, read) = land(&mut app, wid, id);
+        assert!(landed);
+        assert_eq!(drain(&read), go_line());
+        if disposition == "unowned" {
+            app.workstation_setup
+                .developer_tools_session
+                .iter_mut()
+                .find(|terminal| terminal.session == id)
+                .unwrap()
+                .claim_owner = None;
+        } else if disposition == "newer-owner" {
+            aterm_types::clt_mark::explicit(&aterm_types::clt_mark::Live, &mark, "newer-owner")
+                .unwrap();
+        }
+        let end = match disposition {
+            "entered" => Some(aterm_pty::ChildExit::Code(1)),
+            "unknown" => None,
+            "stopped" => Some(aterm_pty::ChildExit::Code(i32::from(
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
+            ))),
+            _ => Some(aterm_pty::ChildExit::Code(i32::from(
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA,
+            ))),
+        };
+        app.developer_tools_install_ended(id, end);
+        assert_eq!(
+            app.workstation_setup.developer_tools_root_owed,
+            disposition != "current",
+            "{disposition}"
+        );
+        assert_eq!(app.workstation_setup.developer_tools_want, Some(4));
+        assert_eq!(app.workstation_setup.developer_tools_low_data, Some(true));
+        assert!(app.workstation_setup.developer_tools_network.is_some());
+        assert!(
+            app.begin_developer_tools_install(aterm).is_none(),
+            "{disposition}: no repeated tab"
+        );
+        if disposition == "current" {
+            assert!(!Mark::at(mark).opened());
+            assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+            app.developer_tools_low_data(false);
+            assert!(
+                app.begin_developer_tools_install(aterm).is_some(),
+                "the ordinary want resumes once the download is allowed"
+            );
+        } else {
+            assert!(
+                Mark::at(mark).opened(),
+                "{disposition}: a possible or another attempt stays spent"
+            );
+        }
+    }
+
+    // These distinct preprompt results also spend no episode. The GUI must keep its want
+    // without booking off-console, and must check again after an asynchronous booking.
+    thread_local! {
+        static OWN_CONSOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static CONSOLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    for (code, watched) in [(7, false), (8, false), (8, true)] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mark = dir.path().join("command-line-tools-tab");
+        let (mut app, wid) = page();
+        app.set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+            own_console: || {
+                CONSOLE_READS.with(|reads| reads.set(reads.get() + 1));
+                OWN_CONSOLE.with(std::cell::Cell::get)
+            },
+            ..crate::InitialSetupHandlers::inert_for_test()
+        });
+        OWN_CONSOLE.with(|own| own.set(true));
+        app.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+        app.want_developer_tools_install(4, true);
+        let (window, ask, then) = app.begin_developer_tools_install(aterm).expect("due");
+        let id = test_support::book_as(&mut app, window, &ask, then);
+        let (landed, read) = land(&mut app, wid, id);
+        assert!(landed);
+        assert_eq!(drain(&read), go_line());
+        if code == 8 {
+            app.workstation_setup.developer_tools_probe = Some(installing);
+            if watched {
+                app.developer_tools_watch(Some(idle()));
+            } else {
+                assert!(app.workstation_setup.developer_tools_seen.is_none());
+            }
+        }
+        app.developer_tools_install_ended(id, Some(aterm_pty::ChildExit::Code(code)));
+        assert!(!Mark::at(mark.clone()).opened(), "preprompt {code}");
+        assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+        if code == 8 {
+            assert!(
+                app.begin_developer_tools_install(aterm).is_none(),
+                "installer holds"
+            );
+            assert_eq!(
+                app.workstation_setup.developer_tools_seen.is_some(),
+                watched
+            );
+            app.workstation_setup.developer_tools_probe = Some(idle);
+            if watched {
+                app.developer_tools_watch(Some(idle()));
+            } else {
+                assert!(app.workstation_setup.developer_tools_seen.is_none());
+            }
+        }
+        OWN_CONSOLE.with(|own| own.set(false));
+        CONSOLE_READS.with(|reads| reads.set(0));
+        let _ = app.mac_setup_tab_comes_next();
+        assert_eq!(
+            CONSOLE_READS.with(std::cell::Cell::get),
+            0,
+            "paint is memory-only"
+        );
+        assert!(
+            app.begin_developer_tools_install(aterm).is_none(),
+            "console is away"
+        );
+        assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+        assert!(!mark.exists());
+        OWN_CONSOLE.with(|own| own.set(true));
+        let (window, ask, then) = app
+            .begin_developer_tools_install(aterm)
+            .expect("console returned");
+        let id = test_support::book_as(&mut app, window, &ask, then);
+        OWN_CONSOLE.with(|own| own.set(false));
+        let (landed, read) = land(&mut app, wid, id);
+        assert!(!landed, "console changed after booking");
+        assert!(drain(&read).is_empty());
+        assert!(!mark.exists());
+        assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+        OWN_CONSOLE.with(|own| own.set(true));
+        let (window, ask, then) = app
+            .begin_developer_tools_install(aterm)
+            .expect("still wanted");
+        let id = test_support::book_as(&mut app, window, &ask, then);
+        let (landed, read) = land(&mut app, wid, id);
+        assert!(landed);
+        assert_eq!(drain(&read), go_line());
+        assert!(mark.exists());
+    }
 }
 
 /// An account that is none of the Mac's administrators may not install the tools, as the tab's

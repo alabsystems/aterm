@@ -701,6 +701,26 @@ impl Kernel for Facts {
                 .iter()
                 .any(|(prepare, _)| prepare.id == id))
     }
+    fn reject_unadmitted(&self, prepare: &Prepare) -> Result<bool, ()> {
+        if !self.receipt_readable.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            return journal.reject_unadmitted(prepare).map_err(|_| ());
+        }
+        Err(())
+    }
+    fn rejection_domain(&self) -> Result<Option<String>, ()> {
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            if !self.receipt_readable.load(Ordering::SeqCst) {
+                return Err(());
+            }
+            return journal.rejection_domain().map(Some).map_err(|_| ());
+        }
+        Ok(None)
+    }
     fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
         if !self.receipt_allowed.load(Ordering::SeqCst)
             || (phase == ImagePhase::Rollback
@@ -961,6 +981,7 @@ fn caller() -> SupervisorInputCaller {
 
 fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
     Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: host_epoch().unwrap().to_string(),

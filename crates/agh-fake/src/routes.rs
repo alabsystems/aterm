@@ -1301,15 +1301,21 @@ fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
 /// `/releases/latest`: the `set_latest` release, else the newest published non-prerelease,
 /// without what the listing lag hides.
 fn latest(state: &State, repo: &Repo) -> Answer {
+    latest_release(state, repo).map_or_else(Answer::not_found, |r| {
+        Answer::json(200, &release_json(state, repo, r))
+    })
+}
+
+/// The release `releases/latest` (and the web route's `releases/latest/download`) names: the
+/// `set_latest` release, else the newest published non-prerelease, without what the listing lag
+/// hides.
+fn latest_release<'s>(state: &'s State, repo: &Repo) -> Option<&'s Release> {
     let set = match repo.latest {
-        Latest::None => return Answer::not_found(),
+        Latest::None => return None,
         Latest::Set(id) => published(state, repo).find(|r| r.id == id && !r.hidden),
         Latest::Auto => None,
     };
-    let found = set.or_else(|| auto_latest(state, repo, None));
-    found.map_or_else(Answer::not_found, |r| {
-        Answer::json(200, &release_json(state, repo, r))
-    })
+    set.or_else(|| auto_latest(state, repo, None))
 }
 
 /// The CDN URL of asset `id`, with its signature.
@@ -1738,9 +1744,33 @@ fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer
 }
 
 /// The web origin: a release asset by tag and name (`/{o}/{r}/releases/download/{tag}/{name}`),
-/// of a published release the listing lag does not hide.
+/// of a published release the listing lag does not hide; and GitHub's evergreen
+/// `/{o}/{r}/releases/latest/download/{name}`, a 302 to the latest release's tag route for that
+/// name (whether or not that release carries it, as GitHub answers).
 fn web(state: &State, req: &Request) -> Answer {
     let segs = segments(req.path());
+    if let ["releases", "latest", "download", name] = segs.get(2..).unwrap_or(&[])
+        && req.is_read()
+    {
+        let latest = state
+            .repo_index_parts(
+                &aterm_codec::pct::decode(segs[0]),
+                &aterm_codec::pct::decode(segs[1]),
+            )
+            .map(|i| &state.repos[i])
+            .filter(|r| !r.spec.private)
+            .and_then(|r| latest_release(state, r));
+        return match latest {
+            Some(release) => Answer::redirect(
+                302,
+                format!(
+                    "http://127.0.0.1:{}/{}/{}/releases/download/{}/{name}",
+                    state.ports.web, segs[0], segs[1], release.spec.tag
+                ),
+            ),
+            None => Answer::text(404, "Not Found"),
+        };
+    }
     let ["releases", "download", tag @ .., name] = segs.get(2..).unwrap_or(&[]) else {
         return Answer::text(404, "Not Found");
     };

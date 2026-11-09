@@ -2221,6 +2221,7 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             .collect(),
         launch: Rc::new(Plain),
         curl: std::sync::Arc::new(crate::github::Launched(Plain)),
+        reader: aterm_update_core::release_asset::Reader::anonymous(),
     };
     let mut out = std::io::stdout();
     if opts.check_key || opts.check_access {

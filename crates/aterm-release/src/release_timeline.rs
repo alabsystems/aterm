@@ -161,8 +161,20 @@ impl Timeline {
         }
     }
 
-    /// Book one record read from the log named `log`.
+    /// Book one already decoded diagnostic object. Duplicate keys erased before
+    /// construction cannot be detected here; raw log input goes through `read`.
+    #[cfg(test)]
     pub fn observe(&mut self, log: &str, event: &aterm_json::Value) {
+        let invocation = aterm_verify::event_log::diagnostic_invocation_id(event);
+        self.observe_identified(log, event, invocation.as_deref());
+    }
+
+    fn observe_identified(
+        &mut self,
+        log: &str,
+        event: &aterm_json::Value,
+        invocation: Option<&str>,
+    ) {
         if event["schema"].as_u64() != Some(1) {
             return;
         }
@@ -204,10 +216,9 @@ impl Timeline {
             }
             Some("stage-started") => {
                 if let Some(index) = event["stage_index"].as_u64()
-                    && let Some(invocation) =
-                        aterm_verify::event_log::diagnostic_invocation_id(event)
+                    && let Some(invocation) = invocation
                 {
-                    let key = (log.to_owned(), invocation, index);
+                    let key = (log.to_owned(), invocation.to_owned(), index);
                     if let Some(started) = self.stage_starts.get_mut(&key) {
                         *started = None;
                     } else if self.stage_starts.len() < MAX_ROWS {
@@ -216,7 +227,7 @@ impl Timeline {
                     }
                 }
             }
-            Some("stage-finished") => self.verify_stage(log, event),
+            Some("stage-finished") => self.verify_stage(log, event, invocation),
             Some("build-child-finished") => {
                 let fresh = event["units"]["fresh"].as_u64();
                 let compiled = event["units"]["compiled"].as_u64();
@@ -429,11 +440,11 @@ impl Timeline {
             .collect()
     }
 
-    fn verify_stage(&mut self, log: &str, event: &aterm_json::Value) {
+    fn verify_stage(&mut self, log: &str, event: &aterm_json::Value, invocation: Option<&str>) {
         let started = if let Some(index) = event["stage_index"].as_u64()
-            && let Some(invocation) = aterm_verify::event_log::diagnostic_invocation_id(event)
+            && let Some(invocation) = invocation
         {
-            let key = (log.to_owned(), invocation, index);
+            let key = (log.to_owned(), invocation.to_owned(), index);
             if let Some(started) = self.stage_starts.get_mut(&key) {
                 started.take()
             } else {
@@ -508,9 +519,8 @@ impl Timeline {
                         && let Some(json) = seg
                             .strip_prefix(b"verify-event: ")
                             .or_else(|| seg.strip_prefix(b"release-event: "))
-                        && let Ok(event) = aterm_json::from_slice::<aterm_json::Value>(json)
                     {
-                        self.observe(log, &event);
+                        self.observe_json(log, json);
                     }
                 } else {
                     if !overflow && line.len() + seg.len() <= LINE_LIMIT {
@@ -518,9 +528,8 @@ impl Timeline {
                         if let Some(json) = line
                             .strip_prefix(b"verify-event: ")
                             .or_else(|| line.strip_prefix(b"release-event: "))
-                            && let Ok(event) = aterm_json::from_slice::<aterm_json::Value>(json)
                         {
-                            self.observe(log, &event);
+                            self.observe_json(log, json);
                         }
                     }
                     line.clear();
@@ -544,6 +553,14 @@ impl Timeline {
                     overflow = true;
                 }
             }
+        }
+    }
+
+    fn observe_json(&mut self, log: &str, json: &[u8]) {
+        if let Ok(json) = std::str::from_utf8(json)
+            && let Some((event, invocation)) = aterm_verify::event_log::diagnostic_event(json)
+        {
+            self.observe_identified(log, &event, invocation.as_deref());
         }
     }
 
@@ -848,6 +865,73 @@ mod tests {
             "child_cpu":{"observed_s":7.0},"decisions":[{"outcome":"FAIL","detail":"kept"}]}),
             id,
         )
+    }
+
+    #[test]
+    fn raw_ambiguous_attribution_cannot_supply_or_consume_a_stage_start() {
+        for padding in [0, 9000] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let path = dir.path().join("events");
+            let writer = aterm_verify::event_log::EventLog::open(&path).unwrap();
+            let mut start = verify_start(&"a".repeat(32), 100);
+            let mut finish = verify_finish(&"a".repeat(32), 400);
+            finish.as_object_mut().unwrap().remove("ended_at_unix_ms");
+            for value in [&mut start, &mut finish] {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("pad".into(), "x".repeat(padding).into());
+            }
+            writer.write(&format!("verify-event: {start}"));
+            writer.write(&format!("verify-event: {finish}"));
+            let recorded = std::fs::read_to_string(&path).unwrap();
+            let mut lines = recorded.lines();
+            let start = format!("{}\n", lines.next().unwrap());
+            let finish = format!("{}\n", lines.next().unwrap());
+            assert!(lines.next().is_none());
+            let (_, id) = aterm_verify::event_log::diagnostic_event(
+                start.trim().strip_prefix("verify-event: ").unwrap(),
+            )
+            .unwrap();
+            assert!(id.is_some());
+            for (key, replacement) in [
+                ("\"id\":", "\"id\":\"unknown\",\"id\":"),
+                ("\"id\":", "\"\\u0069d\":\"unknown\",\"id\":"),
+                ("\"invocation\":", "\"invocation\":null,\"invocation\":"),
+                (
+                    "\"identity_error\":",
+                    "\"identity_error\":\"unavailable\",\"identity_error\":",
+                ),
+            ] {
+                let bad_start = start.replacen(key, replacement, 1);
+                let bad_finish = finish.replacen(key, replacement, 1);
+                assert_ne!(bad_start, start);
+                let text = format!("{start}{bad_start}{bad_finish}{finish}");
+                let mut timeline = Timeline::default();
+                timeline.read("06-verify.log", text.as_bytes()).unwrap();
+                let value = timeline.value();
+                let rows = value["branches"].as_array().unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows[0]["started_at_unix_ms"].is_null());
+                assert!(rows[0]["ended_at_unix_ms"].is_null());
+                assert_eq!(rows[1]["started_at_unix_ms"].as_u64(), Some(100));
+                assert_eq!(rows[1]["ended_at_unix_ms"].as_u64(), Some(2100));
+            }
+            for (key, replacement) in [
+                ("\"schema\":", "\"schema\":0,\"schema\":"),
+                ("\"event\":", "\"\\u0065vent\":\"other\",\"event\":"),
+            ] {
+                let malformed = finish.replacen(key, replacement, 1);
+                assert_ne!(malformed, finish);
+                let text = format!("{start}{malformed}{finish}");
+                let mut timeline = Timeline::default();
+                timeline.read("06-verify.log", text.as_bytes()).unwrap();
+                let value = timeline.value();
+                let rows = value["branches"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["started_at_unix_ms"].as_u64(), Some(100));
+            }
+        }
     }
 
     #[test]

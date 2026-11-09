@@ -392,6 +392,7 @@ fn make_prepare(
         ..rollback.clone()
     };
     Some(Prepare {
+        rejection_domain: None,
         asked: None,
         id: id.into(),
         host_epoch: host_epoch()?.into(),
@@ -1415,6 +1416,7 @@ mod tests {
             .supervisor_authority(crate::metrics::now_us())
             .revision();
         let prepare = Prepare {
+            rejection_domain: None,
             asked: None,
             id: "ab".repeat(16),
             host_epoch: host_epoch().unwrap().into(),

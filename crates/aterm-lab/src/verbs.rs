@@ -1205,6 +1205,9 @@ pub struct Launched {
     /// On the default route with a stored login: where that login lives, and whether it is
     /// dead ([`stored_login_dead`]); `None` otherwise.
     pub stored: Option<(LoginDir, bool)>,
+    /// The launcher sets `CLAUDE_CONFIG_DIR`; on the stub's route only `lab claude --own` sets
+    /// none, so its Claude Code reads the scratch HOME's own `.claude`.
+    pub config_dir: bool,
 }
 
 /// How Claude Code was launched, from the tab's `launcher`, the scratch `settings` and the
@@ -1227,6 +1230,7 @@ pub fn launched(launcher: &str, settings: &str, stored: Option<&str>) -> Launche
         route,
         login,
         stored,
+        config_dir: launcher_value(launcher, aterm_agent::harness::accounts::HOME_ENV).is_some(),
     }
 }
 
@@ -1236,8 +1240,13 @@ impl Launched {
     pub fn sentence(self) -> String {
         match self.route {
             ClaudeRoute::Stub => format!(
-                "launched by path with a scratch `CLAUDE_CONFIG_DIR`, {} and \
+                "launched by path with {}, {} and \
                  `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab)",
+                if self.config_dir {
+                    "a scratch `CLAUDE_CONFIG_DIR`"
+                } else {
+                    "no `CLAUDE_CONFIG_DIR` (the scratch HOME's own `.claude`, `claude --own`)"
+                },
                 self.login.phrase()
             ),
             ClaudeRoute::Default => {
@@ -1847,7 +1856,13 @@ mod tests {
             route,
             login,
             stored,
+            config_dir: route == ClaudeRoute::Stub,
         };
+        // `lab claude --own`'s: the stub's route with no `CLAUDE_CONFIG_DIR` and no proxy.
+        let own = STUB
+            .replace(" CLAUDE_CONFIG_DIR=/r/scratch/home/.claude", "")
+            .replace("\\\n  HTTP_PROXY=http://127.0.0.1:57045 ", "")
+            .replace("exec env ", "exec env -u HTTP_PROXY ");
         let (stub, default, stored) = (
             ClaudeRoute::Stub,
             ClaudeRoute::Default,
@@ -1855,6 +1870,15 @@ mod tests {
         );
         let cases = [
             ("the stub's route", STUB, Some(DEAD), of(stub, stored, None)),
+            (
+                "the stub's route in the scratch HOME's own `.claude` (`--own`)",
+                own.as_str(),
+                Some(DEAD),
+                Launched {
+                    config_dir: false,
+                    ..of(stub, stored, None)
+                },
+            ),
             (
                 "the default route, a dead login in a named dir",
                 DEFAULT,

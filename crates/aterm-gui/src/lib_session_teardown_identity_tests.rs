@@ -254,7 +254,7 @@ fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_s
     assert!(!overlap.released(), "PRECONDITION: no Commit in this test");
 }
 
-/// `SessionPool::hang_up_at_exit` terminates a `SIGHUP`-ignoring shell while leaving an uncommitted adopted shell alive.
+/// `SessionPool::retire_at_quit` terminates a `SIGHUP`-ignoring shell while leaving an uncommitted adopted shell alive.
 #[cfg(unix)]
 #[test]
 fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
@@ -276,7 +276,7 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
     adopted.handoff_commit = Some(Arc::new(crate::shell_rekey::Deferred::holding()));
     pool.insert(adopted);
 
-    pool.hang_up_at_exit();
+    pool.retire_at_quit();
     let settled = aterm_pty::wait_for_reaps(Duration::from_secs(60));
     let deadline = Instant::now() + Duration::from_secs(60);
     while running(&mut holdout) && Instant::now() < deadline {
@@ -367,4 +367,120 @@ fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
         "the exec ran with a closed tab's HUP-ignoring shell still in its grace"
     );
     assert!(ended, "the holdout was SIGKILLed");
+}
+/// A pooled session over a real PTY running `script` under `/bin/bash`, its master owned by its
+/// sink as a spawned tab's is, once the script has printed `READY`.
+#[cfg(target_os = "macos")]
+fn pty_session(id: u64, script: &str) -> Session {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // SAFETY: the test owns its synthetic shell and trusted spawn capabilities.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let exec = vec![
+        std::ffi::OsString::from("/bin/bash"),
+        "-c".into(),
+        script.into(),
+    ];
+    let child = aterm_pty::spawn_shell_with_pid(
+        24,
+        80,
+        &cap,
+        &sandbox,
+        &[],
+        None,
+        None,
+        None,
+        Some(&exec),
+        None,
+        None,
+        aterm_sandbox::Limits::inherit(),
+    )
+    .expect("the shell starts");
+    aterm_pty::set_nonblocking(child.master, true).expect("a nonblocking master");
+    // SAFETY: the new PTY master has no other owner.
+    let master = unsafe { OwnedFd::from_raw_fd(child.master) };
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut seen = Vec::new();
+    while !seen.windows(5).any(|word| word == b"READY") {
+        assert!(Instant::now() < deadline, "the shell never printed READY");
+        let mut bytes = [0; 256];
+        let n = aterm_pty::read(master.as_raw_fd(), &mut bytes);
+        if n > 0 {
+            seen.extend_from_slice(&bytes[..n as usize]);
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let raw = master.as_raw_fd();
+    let mut session = stub_session_with_sink(id, Arc::new(SinkWriter::new_owned(master)));
+    session.master = raw;
+    session.pid = child.pid;
+    session.shell_identity = aterm_pty::record_spawned_shell(child.pid);
+    session
+}
+
+/// Quit retires each master it hangs up, so a hang-up handler that reads its terminal meets end
+/// of file and runs to its end while its reap waits, kills held so nothing else ends it; a
+/// session its predecessor still owns keeps its terminal and its shell. With the master held open
+/// until exit, the handler's `cat` waited on it until the reaper's kill tick (ATERM-KI-1104-7).
+#[cfg(target_os = "macos")]
+#[test]
+fn quitting_retires_each_master_it_hangs_up_so_a_handler_reading_its_terminal_ends() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let done = scratch.path().join("done");
+    let tab = pty_session(
+        1,
+        &format!(
+            "trap 'cat > /dev/null; printf done > \"{}\"; exit 0' HUP; printf READY; \
+             while :; do read line; done",
+            done.display()
+        ),
+    );
+    let mut adopted = pty_session(2, "printf READY; exec /bin/sleep 600");
+    adopted.handoff_local_id = Some(7);
+    adopted.handoff_commit = Some(Arc::new(crate::shell_rekey::Deferred::holding()));
+    let (tab_pid, adopted_pid, adopted_master) = (tab.pid, adopted.pid, adopted.master);
+    let hold = aterm_pty::hold_reap_kills_for_test(tab_pid);
+    let mut pool = SessionPool::default();
+    pool.insert(tab);
+    pool.insert(adopted);
+
+    pool.retire_at_quit();
+    let ended = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(5),
+        || done.exists().then_some(()),
+    )
+    .is_some();
+    // SAFETY: a read-only probe of the descriptor the adopted session's sink owns.
+    let kept_terminal = unsafe { libc::isatty(adopted_master) } == 1;
+    let kept_shell = aterm_pty::child_exit_unreaped(adopted_pid) == Some(false);
+    // SAFETY: ending the test's own children; the adopted one, which no teardown reaps, is reaped
+    // here.
+    unsafe {
+        if aterm_pty::child_exit_unreaped(tab_pid) == Some(false) {
+            libc::kill(tab_pid, libc::SIGKILL);
+        }
+        libc::kill(adopted_pid, libc::SIGKILL);
+        libc::waitpid(adopted_pid, std::ptr::null_mut(), 0);
+    }
+    drop(hold);
+    drop(pool);
+    assert!(
+        aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN),
+        "the reaps never settled"
+    );
+    assert!(
+        ended,
+        "the hang-up handler's `cat` never read end of file: Quit kept the master open"
+    );
+    assert!(
+        kept_terminal && kept_shell,
+        "Quit retired the master or ended the shell of a session its predecessor still owns \
+         (terminal kept: {kept_terminal}, shell kept: {kept_shell})"
+    );
 }

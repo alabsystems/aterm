@@ -148,7 +148,81 @@ pub(crate) struct Attribution {
     pub(crate) source_observation: Option<String>,
 }
 
+pub(crate) const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// A raw event's header and attribution are checked before map insertion can
+/// erase repeated decoded keys. Payload interpretation remains with its owner.
+pub(crate) struct RawEvent {
+    pub(crate) value: aterm_json::Value,
+    pub(crate) attribution: Option<Attribution>,
+}
+
+impl<'de> serde::Deserialize<'de> for RawEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Event;
+        impl<'de> serde::de::Visitor<'de> for Event {
+            type Value = RawEvent;
+            fn expecting(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                out.write_str("a verifier event with an unambiguous header")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut input: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = aterm_json::Map::new();
+                let mut ambiguous_binding = false;
+                while let Some((key, checked)) =
+                    input.next_entry::<String, crate::compiler_message::CheckedValue>()?
+                {
+                    let (value, duplicate) = checked.into_parts();
+                    if matches!(key.as_str(), "schema" | "event") && fields.contains_key(&key) {
+                        return Err(serde::de::Error::custom("ambiguous verifier event header"));
+                    }
+                    if key == "invocation" {
+                        ambiguous_binding |= duplicate || fields.contains_key(&key);
+                    }
+                    // Keep the existing payload map semantics. An ambiguous
+                    // binding cannot erase an otherwise observed check row.
+                    fields.insert(key, value);
+                }
+                let value = aterm_json::Value::Object(fields);
+                if value["schema"].as_u64() != Some(1) || value["event"].as_str().is_none() {
+                    return Err(serde::de::Error::custom(
+                        "unsupported verifier event header",
+                    ));
+                }
+                let attribution = if ambiguous_binding {
+                    None
+                } else {
+                    attribution(&value)
+                };
+                Ok(RawEvent { value, attribution })
+            }
+        }
+        decoder.deserialize_map(Event)
+    }
+}
+
+/// Bound one raw JSON event, retaining attribution ambiguity as unknown. The
+/// decoder's existing recursion limit also bounds nested objects and arrays.
+pub(crate) fn raw_event(json: &str) -> Option<RawEvent> {
+    (json.len() <= MAX_RECORD_BYTES)
+        .then(|| aterm_json::from_str(json).ok())
+        .flatten()
+}
+
+/// Decode one raw diagnostic event (at most 1 MiB) with its validated invocation
+/// ID. Ambiguous schema/event keys refuse the record; ambiguous attribution
+/// returns an unknown ID while retaining the payload. No source, execution,
+/// custody or qualification authority follows from either returned value.
+#[must_use]
+pub fn diagnostic_event(json: &str) -> Option<(aterm_json::Value, Option<String>)> {
+    let record = raw_event(json)?;
+    Some((record.value, record.attribution.map(|binding| binding.id)))
+}
+
 /// Decode diagnostic attribution only, never source or execution authority.
+/// A Value has already lost duplicate keys; raw readers must use `raw_event`.
 pub(crate) fn attribution(value: &aterm_json::Value) -> Option<Attribution> {
     if value["schema"].as_u64() != Some(1) || value["event"].as_str().is_none() {
         return None;
@@ -177,6 +251,7 @@ pub(crate) fn attribution(value: &aterm_json::Value) -> Option<Attribution> {
 
 /// The validated per-event diagnostic invocation ID, without inferring attribution from
 /// neighboring records. This establishes no source, execution, custody or qualification authority.
+/// Duplicate keys erased before this Value was constructed cannot be detected here.
 #[must_use]
 pub fn diagnostic_invocation_id(value: &aterm_json::Value) -> Option<String> {
     attribution(value).map(|binding| binding.id)

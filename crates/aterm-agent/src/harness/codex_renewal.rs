@@ -2229,6 +2229,7 @@ mod tests {
             dialect: super::super::upgrade::Dialect::Zsh,
         };
         let mut prepare = Prepare {
+            rejection_domain: None,
             asked: None,
             id: "ab".repeat(16),
             host_epoch: "cd".repeat(16),

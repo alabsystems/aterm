@@ -738,10 +738,22 @@ fn begin_plan(
         else {
             return Err("native-host-epoch");
         };
+        let rejection_domain =
+            match native_act::exchange(client, &st.tab, &Request::RejectionDomain) {
+                Ok(Reply::RejectionDomain(domain)) => Some(domain),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && error.to_string().starts_with("ERR usage: native-act ") =>
+                {
+                    None
+                }
+                _ => return Err("native-rejection-domain-unavailable"),
+            };
         let deadline_us = native_act::monotonic_us()
             .and_then(|now| now.checked_add(120_000_000))
             .ok_or("native-clock")?;
         let mut prepare = Prepare {
+            rejection_domain,
             asked: asked.cloned(),
             id: native_act::operation_id().map_err(|_| "native-entropy")?,
             host_epoch,

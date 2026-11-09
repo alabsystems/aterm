@@ -29,6 +29,10 @@ const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 const MEMORY: u64 = 1024 * 1024 * 1024;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "resource_admission_owner_tests/bootstrap_object_engineering.rs"]
+mod bootstrap_object_engineering;
+
 #[cfg(target_os = "macos")]
 fn owner_fixture_sdk_lease(
     prefix: &std::path::Path,

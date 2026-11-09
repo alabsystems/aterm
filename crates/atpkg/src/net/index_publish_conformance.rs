@@ -68,7 +68,7 @@ fn real_walk(floor: u64, tags: [i64; 3]) -> u64 {
     };
     let fetch = |url: &str, _cap: u64| -> Result<Vec<u8>, String> { Ok(url.as_bytes().to_vec()) };
     let candidates = fetcher
-        .walk_candidates(&fetcher.index_slug(), &head, &fetch)
+        .walk_candidates(&fetcher.index_slug(), &head, &super::by_url(&fetch))
         .expect("a walk over answered HEADs is never an error");
     candidates.first().map_or(floor, |newest| {
         newest

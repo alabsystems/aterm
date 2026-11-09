@@ -305,15 +305,12 @@ fn authenticate(
     for name in &names {
         leaf(name)?;
     }
+    // A local directory, not a repository: the reader's owner and repository name nothing.
     let release = Release {
+        owner: String::new(),
+        repo: String::new(),
         tag_name: format!("v{}", hint.version),
-        assets: names
-            .iter()
-            .map(|name| Asset {
-                name: name.clone(),
-                url: name.clone(),
-            })
-            .collect(),
+        assets: names.clone(),
     };
     let candidate = AuthoritativeRelease {
         version: hint.version.clone(),
@@ -322,7 +319,10 @@ fn authenticate(
     };
     let mut fetched = fetch_authoritative_release(
         Some(candidate),
-        &mut |name, cap| read_asset(dir, name, cap),
+        &mut |asset, cap| {
+            read_asset(dir, asset.name, cap)
+                .map_err(aterm_update_core::release_asset::AssetError::Refused)
+        },
         policy,
     );
     let source = Source::resolve_with(false, None, None);

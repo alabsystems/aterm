@@ -24,6 +24,7 @@ fn stored_number(state: Stored) -> i64 {
         Stored::Sealed { may_execute: false } => 3,
         Stored::Sealed { may_execute: true } => 4,
         Stored::Fenced => 5,
+        Stored::Rejected => panic!("a rejected recipe is not a published admission"),
     }
 }
 

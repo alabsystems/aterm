@@ -140,8 +140,21 @@ fn program_build_ref_of_target(target: &Path) -> Option<(&str, u64)> {
 }
 
 /// Parse `(program, build)` out of a path that must lie inside `prefix`'s store.
+/// Dot-parent paths need native resolution: a symlinked directory before `..`
+/// can make lexical normalization name a different store. Keep the executable's
+/// invocation path unchanged; only this classification uses the resolved path.
 #[must_use]
 pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
+    let resolved;
+    let (prefix, target) = if [prefix, target].into_iter().any(|path| {
+        path.components()
+            .any(|part| part == std::path::Component::ParentDir)
+    }) {
+        resolved = (prefix.canonicalize().ok()?, target.canonicalize().ok()?);
+        (resolved.0.as_path(), resolved.1.as_path())
+    } else {
+        (prefix, target)
+    };
     let rel = target.strip_prefix(prefix.join("store")).ok()?;
     let mut comps = rel.components();
     let (Some(std::path::Component::Normal(program)), Some(std::path::Component::Normal(build))) =
@@ -149,6 +162,9 @@ pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
     else {
         return None;
     };
+    if comps.any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return None;
+    }
     let program = program.to_str()?.to_string();
     let build = build_in_path(build)?;
     Some((program, build))
@@ -595,6 +611,82 @@ mod tests {
             assert_eq!(store_build_of(prefix, &path), None, "{name}");
             assert_eq!(program_build_of_target(&path), None, "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_store_links_use_the_actual_build_sidecar_and_presence() {
+        use std::os::unix::fs::symlink;
+
+        let l = layout("relative-store-link");
+        let physical = l.prefix.join("store/ay/17.noindex");
+        std::fs::create_dir_all(physical.join("bin")).unwrap();
+        std::fs::create_dir_all(l.bin_dir()).unwrap();
+        let file = physical.join("bin/ay");
+        std::fs::write(&file, b"original target").unwrap();
+        symlink("17.noindex", l.prefix.join("store/ay/17")).unwrap();
+        let declared =
+            crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        crate::shim_env::write_sidecar(&l.build_dir("ay", 17), &declared).unwrap();
+        let raw = Path::new("../store/ay/17/bin/ay");
+        symlink(raw, l.shim(&tool("ay"))).unwrap();
+        let target = l.bin_dir().join(raw);
+        let selected = managed(&l, "ay").unwrap();
+        assert_eq!(selected.target, target);
+        assert_eq!(selected.env, declared);
+        assert_eq!(which(&l, "ay"), Some(target.clone()));
+        assert_eq!(
+            store_build_of(&l.prefix, &target),
+            Some(("ay".to_string(), 17))
+        );
+        assert_eq!(
+            store_build_of(&l.prefix.join("bin/.."), &file),
+            Some(("ay".to_string(), 17))
+        );
+        assert_eq!(active_build_of(&l, "ay"), Some(17));
+        assert_eq!(active_builds(&l).get("ay"), Some(&17));
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(which(&l, "ay"), Some(target.clone()));
+        assert_eq!(store_build_of(&l.prefix, &target), None);
+        assert_eq!(active_build_of(&l, "ay"), None);
+        assert!(!active_builds(&l).contains_key("ay"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dot_parent_classification_never_borrows_a_lexically_named_store_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let l = layout("relative-store-escape");
+        let local = l.build_dir("ay", 17);
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        std::fs::write(local.join("bin/ay"), b"wrong local target").unwrap();
+        let declared = crate::shim_env::ShimEnv::admit(&["AY_QUIET=1".to_string()]).unwrap();
+        crate::shim_env::write_sidecar(&local, &declared).unwrap();
+        std::fs::create_dir_all(l.bin_dir()).unwrap();
+        let foreign = crate::testdir::dir("atpkg-native-link-foreign-");
+        std::fs::create_dir_all(foreign.join("deep/nested")).unwrap();
+        let foreign_bin = foreign.join("store/ay/17/bin");
+        std::fs::create_dir_all(&foreign_bin).unwrap();
+        std::fs::write(foreign_bin.join("ay"), b"actual foreign target").unwrap();
+        symlink(foreign.join("deep/nested"), l.bin_dir().join("slot")).unwrap();
+        let raw = Path::new("slot/../../store/ay/17/bin/ay");
+        symlink(raw, l.shim(&tool("ay"))).unwrap();
+        let selected = managed(&l, "ay").unwrap();
+        assert_eq!(selected.target, l.bin_dir().join(raw));
+        assert_eq!(
+            std::fs::read(&selected.target).unwrap(),
+            b"actual foreign target"
+        );
+        assert_eq!(store_build_of(&l.prefix, &selected.target), None);
+        assert_eq!(selected.env, crate::shim_env::ShimEnv::NONE);
+        // A parent traversal after the apparent build is not a store member,
+        // either, even though the old shape-only parser had already found it.
+        assert_eq!(
+            store_build_of(&l.prefix, &local.join("../../../../missing")),
+            None
+        );
     }
 
     #[test]

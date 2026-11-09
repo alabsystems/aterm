@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aterm_update_core::linux::LinuxTarget;
+use aterm_update_core::release_asset::{Asset, AssetError, Reader};
 
 use crate::floor_sources::FloorSources;
 use crate::linux_trial::{Lane, LaneConfirm, Lanes, StartClock, Steady};
@@ -585,8 +586,10 @@ const TEMP_STEMS: [&str; 6] = [
 ];
 
 /// Whether `name` is one [`fresh_file`] makes: a [`TEMP_STEMS`] stem, a dash, and its
-/// 32 lowercase hex digits of nonce.
+/// 32 lowercase hex digits of nonce, or that name and `.part`, where [`Reader::to_file`]
+/// writes a download until it is whole.
 fn is_temp_name(name: &str) -> bool {
+    let name = name.strip_suffix(".part").unwrap_or(name);
     TEMP_STEMS.iter().any(|stem| {
         name.strip_prefix(stem)
             .and_then(|rest| rest.strip_prefix('-'))
@@ -600,7 +603,7 @@ fn is_temp_name(name: &str) -> bool {
 }
 
 /// Remove what a killed writer left in the update folder (a download cut off by a closed tab
-/// leaves `download-<nonce>`, and the next check uses a fresh nonce).
+/// leaves `download-<nonce>` and `download-<nonce>.part`, and the next check uses a fresh nonce).
 fn sweep_stale_temps(context: &Context) {
     let Ok(entries) = fs::read_dir(&context.dir) else {
         return;
@@ -2062,31 +2065,31 @@ fn confirm_lane_locked(
 }
 
 fn download_proof(
+    reader: &Reader,
     source: &Source,
     tag: &str,
     current_roster: Option<&Proof>,
 ) -> Result<Proof, String> {
-    download_named_proof(source, tag, APPCAST, current_roster)
+    download_named_proof(reader, source, tag, APPCAST, current_roster)
 }
 
 fn download_named_proof(
+    reader: &Reader,
     source: &Source,
     tag: &str,
     appcast_name: &str,
     current_roster: Option<&Proof>,
 ) -> Result<Proof, String> {
-    let fetch = |name: &str, limit| {
-        let url =
-            aterm_update_core::cdn::release_download_url(&source.owner, &source.repo, tag, name)
-                .ok_or("unsafe release asset address")?;
-        aterm_update_core::download_bytes(&url, limit)
+    let read = |name: &str, limit| {
+        reader.bytes(
+            &Asset::tagged(&source.owner, &source.repo, tag, name),
+            limit,
+        )
     };
-    let appcast = fetch(appcast_name, APPCAST_LIMIT).map_err(|error| {
-        if aterm_update_core::download_error_is_not_found(&error) {
-            format!("missing appcast: {error}")
-        } else {
-            error
-        }
+    let fetch = |name: &str, limit| read(name, limit).map_err(|error| error.to_string());
+    let appcast = read(appcast_name, APPCAST_LIMIT).map_err(|error| match error {
+        AssetError::Absent(why) => format!("missing appcast: {why}"),
+        other => other.to_string(),
     })?;
     Ok(Proof {
         policy: current_roster.map(|head| (head.appcast.clone(), head.signature.clone())),
@@ -2142,12 +2145,20 @@ fn authenticate_head(
     Ok(manifest)
 }
 
+/// The channel head's tag: the evergreen pointer's one HEAD, or, when that HEAD failed in
+/// transit (an HTTP 429 or 5xx, a timeout, a connection that died), `latest`'s read of the latest
+/// release (the web route again, then the API route).
 fn discovered_head(
     pointer: Result<aterm_update_core::pointer::Pointer, aterm_update_core::pointer::PointerError>,
+    latest: impl FnOnce() -> Result<String, AssetError>,
 ) -> Result<String, String> {
+    use aterm_update_core::pointer::PointerError;
     match pointer {
         Ok(pointer) => Ok(pointer.tag),
-        Err(aterm_update_core::pointer::PointerError::OtherTag { tag }) => Ok(tag),
+        Err(PointerError::OtherTag { tag }) => Ok(tag),
+        Err(web @ (PointerError::Transient { .. } | PointerError::Transport(_))) => {
+            latest().map_err(|api| format!("{web}; then {api}"))
+        }
         Err(error) => Err(error.to_string()),
     }
 }
@@ -2169,6 +2180,7 @@ fn check_locked(
     state: &mut State,
     source: &Source,
     provider: &crate::CheckSettingsProvider,
+    reader: &Reader,
 ) -> Result<Checked, String> {
     recover(context, state)?;
     sweep_stale_temps(context);
@@ -2188,18 +2200,16 @@ fn check_locked(
         context.save(state)?;
         return Ok(Checked::Nothing);
     }
-    let head = discovered_head(aterm_update_core::pointer::resolve(
-        &source.owner,
-        &source.repo,
-        APPCAST,
-        &|tag| {
+    let head = discovered_head(
+        aterm_update_core::pointer::resolve(&source.owner, &source.repo, APPCAST, &|tag| {
             matches!(
                 aterm_update_core::tag::parse_release_tag(tag),
                 Ok(aterm_update_core::tag::TagKind::Candidate(_))
             )
-        },
-    ))?;
-    let proof = match download_proof(source, &head, None) {
+        }),
+        || reader.latest_tag(&source.owner, &source.repo, APPCAST),
+    )?;
+    let proof = match download_proof(reader, source, &head, None) {
         Ok(proof) => proof,
         Err(error) if error.starts_with("missing appcast: ") => {
             state.outcome =
@@ -2243,20 +2253,19 @@ fn check_locked(
         };
         return context.save(state).map(|()| Checked::Channel);
     }
-    let url = aterm_update_core::cdn::release_download_url(
-        &source.owner,
-        &source.repo,
-        &tag,
-        artifact.name,
-    )
-    .ok_or("unsafe Linux artifact name")?;
+    let executable = Asset::tagged(&source.owner, &source.repo, &tag, artifact.name);
     if !reusable_stage(context, state, &manifest, target) {
         let (temp, file) = fresh_file(&context.dir, "download")?;
         drop(file);
-        let downloaded = aterm_update_core::download_to(&url, &temp, artifact.size)
+        let downloaded = reader
+            .to_file(&executable, &temp, artifact.size)
+            .map_err(|error| error.to_string())
             .and_then(|()| verify_binary(&temp, &manifest, target).map(|_| ()));
         if let Err(error) = downloaded {
             let _ = fs::remove_file(&temp);
+            let mut part = temp.into_os_string();
+            part.push(".part");
+            let _ = fs::remove_file(part);
             return Err(error);
         }
         clear_stage(context, state)?;
@@ -2477,6 +2486,14 @@ fn check_recording_in(
     check_recording_owned_in(context, current_build, provider, trigger, None)
 }
 
+/// When the check after one that began at `started` is due: half an hour on, or an hour when
+/// the check made `api_requests` reads on the metered API route (the download host failing),
+/// because the anonymous allowance is 60 an hour per public address, shared by every machine
+/// behind it. A failed check's backoff starts at that hour anyway.
+fn next_check_after(started: i64, api_requests: u32) -> i64 {
+    started.saturating_add(if api_requests > 0 { 3600 } else { 1800 })
+}
+
 fn check_recording_owned_in(
     context: Result<&Context, String>,
     current_build: u64,
@@ -2514,10 +2531,13 @@ fn check_recording_owned_in(
         state.check_repo = source.repo.clone();
         state.check_build = current_build;
         state.last_attempt_unix = started;
-        state.next_check_unix = started.saturating_add(1800);
+        state.next_check_unix = next_check_after(started, 0);
         context.save(&state)?;
         let apply_provider = request_apply_provider(provider, settings.auto_apply);
-        let result = check_locked(context, &mut state, source, &apply_provider);
+        // Anonymous, as every updater read is; one reader per check.
+        let reader = Reader::anonymous();
+        let result = check_locked(context, &mut state, source, &apply_provider, &reader);
+        state.next_check_unix = next_check_after(started, reader.api_requests());
         match &result {
             Ok(Checked::Nothing) => state.check_build = checked_build,
             Ok(Checked::Channel) => {
@@ -2530,11 +2550,7 @@ fn check_recording_owned_in(
                 state.outcome = error.clone();
                 state.failing_checks = state.failing_checks.saturating_add(1);
                 state.failing_kind = "linux-update".into();
-                let delay = if aterm_update_core::download_error_is_rate_limit(error) {
-                    3600
-                } else {
-                    1800i64.saturating_mul(1i64 << state.failing_checks.min(4))
-                };
+                let delay = 1800i64.saturating_mul(1i64 << state.failing_checks.min(4));
                 state.next_check_unix = started.saturating_add(delay);
             }
         }

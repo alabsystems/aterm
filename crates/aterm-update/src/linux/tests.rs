@@ -1684,9 +1684,12 @@ fn a_crash_loop_restarting_every_five_seconds_is_rolled_back() {
 #[test]
 fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an_appcast() {
     let mut f = Fixture::new();
-    let tag = discovered_head(Err(aterm_update_core::pointer::PointerError::OtherTag {
-        tag: "atpkg-index-7".into(),
-    }))
+    let tag = discovered_head(
+        Err(aterm_update_core::pointer::PointerError::OtherTag {
+            tag: "atpkg-index-7".into(),
+        }),
+        || panic!("a redirect the pointer judged needs no second read"),
+    )
     .unwrap();
     assert_eq!(tag, "atpkg-index-7");
     assert!(
@@ -1702,9 +1705,46 @@ fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an
         .is_err()
     );
     assert!(
-        discovered_head(Err(aterm_update_core::pointer::PointerError::Refused {
-            why: "foreign location"
-        }))
+        discovered_head(
+            Err(aterm_update_core::pointer::PointerError::Refused {
+                why: "foreign location"
+            }),
+            || panic!("a refused redirect is a verdict, not weather"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_pointer_that_failed_in_transit_reads_the_latest_release_once_and_names_both_routes() {
+    use aterm_update_core::pointer::PointerError;
+    use aterm_update_core::release_asset::AssetError;
+    let gateway = || PointerError::Transient {
+        code: 504,
+        url: "https://github.com/alabsystems/aterm/releases/latest/download/x".into(),
+    };
+    let mut reads = 0;
+    let head = discovered_head(Err(gateway()), || {
+        reads += 1;
+        Ok("v0.175.0".into())
+    });
+    assert_eq!(head.as_deref(), Ok("v0.175.0"));
+    assert_eq!(reads, 1);
+    let reset = PointerError::Transport("connection reset".into());
+    assert_eq!(
+        discovered_head(Err(reset), || Ok("v0.175.0".into())).as_deref(),
+        Ok("v0.175.0")
+    );
+    let both = discovered_head(Err(gateway()), || {
+        Err(AssetError::Refused("the API answered 403".into()))
+    })
+    .unwrap_err();
+    assert!(both.contains("504") && both.contains("403"), "{both}");
+    // Negative control: a channel with no release is an answer, and the API is not asked.
+    assert!(
+        discovered_head(Err(PointerError::NoRelease { url: "u".into() }), || panic!(
+            "a 404 is not a reason to spend the metered allowance"
+        ),)
         .is_err()
     );
 }
@@ -3479,4 +3519,23 @@ fn a_second_crash_loop_is_said_as_its_own() {
             .any(|(title, body)| install_half(title) && body.contains("0.12.0")),
         "the second crash loop is said as its own: {second:?}"
     );
+}
+
+#[test]
+fn the_sweep_takes_a_cut_off_download_and_its_partial_file_and_nothing_else() {
+    let nonce = "0123456789abcdef0123456789abcdef";
+    assert!(is_temp_name(&format!("download-{nonce}")));
+    assert!(is_temp_name(&format!("download-{nonce}.part")));
+    // Negative controls: an owner's file named like a partial, and a doubled suffix.
+    assert!(!is_temp_name("aterm.part"));
+    assert!(!is_temp_name(&format!("download-{nonce}.part.part")));
+    assert!(!is_temp_name(&format!("download-{nonce}.partial")));
+}
+
+#[test]
+fn a_check_that_read_through_the_metered_api_waits_an_hour_for_the_next() {
+    assert_eq!(next_check_after(1_000, 1), 4_600);
+    assert_eq!(next_check_after(1_000, 7), 4_600);
+    // Negative control: a check the download host served keeps the half-hour cadence.
+    assert_eq!(next_check_after(1_000, 0), 2_800);
 }

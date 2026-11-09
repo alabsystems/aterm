@@ -18,30 +18,26 @@
 //!   as busy as one computing, so the threads, not the CPU, scale the wall: a binary of a hundred
 //!   tests that each wait a second uses almost no CPU, and still takes a hundred times as long on
 //!   one thread as on a hundred;
-//! - its charge `c(w) = min(S, max(w, ⌈q · min(w, n)⌉))`, where `q` is the most CPU per thread
+//! - its charge `c(w) = min(S, max(1, ⌈q · min(w, n)⌉))`, where `q` is the most CPU per thread
 //!   any kept run showed (`cpu / wall / t_o`): a test that spawns processes uses more than its
 //!   thread, and a binary whose run went over its charge is charged that much more next time.
 //!
-//! The plan has a target `T`: each binary runs at the narrowest width whose predicted wall is
+//! A measured binary retains at least the initial four-thread width, narrowed by its test
+//! count, caller ceiling and measured CPU demand. A whole-run target cannot turn an isolated
+//! concurrent suite into a serial one merely because unrelated suites take longer.
+//! The plan has a target `T`: each binary runs at the narrowest remaining width whose predicted wall is
 //! within `T` (its widest where none is), so the long poles get the width they need and the rest
 //! leave the share to each other. A binary's widest is `min(S, n, ceiling)`, and no wider than
-//! the width at which it uses `S` before the clamp (`max(w, ⌈q · min(w, n)⌉) ≤ S`; one where even
+//! the width at which it uses `S` before the clamp (`max(1, ⌈q · min(w, n)⌉) ≤ S`; one where even
 //! one thread uses more): a binary whose tests each run a pool of their own, charged `S` at a
 //! wider width, would use more than the share with nothing beside it. No plan ends before its bound: the
-//! share's work `Σ wall · t_o / S` (a binary's threads times its wall, the same at every width it
-//! scales to, over the share, as every charge is at least its width) or the longest binary at
-//! its widest, whichever is later. The planner uses that bound as an empirical regularization
-//! floor: it tries as `T` the bound and each larger wall a binary would take at a width it can
-//! run at ([`TARGET_STEP`] apart at least), lays each plan out as the dispatcher starts it, every
-//! binary taking its predicted wall ([`schedule`]), and keeps the plan that ends first, and of
-//! those that end together the narrowest. This is deliberately not an exact search of the
-//! prediction. A target below the bound can widen a strict FIFO head and remove fragmentation;
-//! on two cores, binaries predicted at one and two seconds one thread wide have a 1.5 s bound,
-//! where the first starts narrow and the two-wide head waits (2 s), while target 0.5 s runs both
-//! two wide in series (1.5 s). But the measured every-wall variant packed about ninety binaries
-//! at the full share and replayed near one-at-a-time baseline wall; bound-up plans replayed at
-//! about 0.53 of it on ten cores, 0.74 with one loaded run's walls left out of the fit
-//! (`docs/measured/test-dispatch-qualification-2026-11-05.md`).
+//! share's CPU work `Σ wall · t_o · q / S` or the longest binary at
+//! its widest, whichever is later. The planner tries that bound and each larger wall a binary
+//! would take at an allowed width ([`TARGET_STEP`] apart at least), lays each plan out through
+//! [`schedule`], and keeps the plan that ends first, the narrowest among ties. This optimizes
+//! widths above the retained initial width; it cannot spend the whole run's slack by making
+//! an already isolated binary serial. The prediction assumes parallel cases; measured replay
+//! is still necessary to judge fixed startup costs, contention and cases of unequal lengths.
 //!
 //! Order: binaries with no history first (nothing says how long they take), at width
 //! `min(4, S, ceiling)` and planned to hold as much memory as the heaviest binary the history
@@ -52,7 +48,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Duration;
 
-/// The width a binary with no history runs at, at most.
+/// The initial libtest width, retained after history arrives unless the ceiling, number of
+/// cases or measured CPU demand requires a narrower run.
 pub const UNSEEN_WIDTH: u32 = 4;
 
 /// The least factor between two targets the planner tries ([`plan`]): plans whose targets are
@@ -70,7 +67,7 @@ pub struct Seen {
     /// The tests libtest ran in its last run (`running <n> tests`).
     pub tests: u32,
     /// The most CPU per thread any kept run showed (`cpu / wall / min(width, tests)`, at least
-    /// one: a run with no reading was busy on every thread).
+    /// zero; with no reading assume one busy core per thread).
     pub per_thread: f64,
     /// The most memory any kept run held at once, in bytes.
     pub peak: u64,
@@ -110,8 +107,8 @@ impl Seen {
         self.uses(w).clamp(1, share.max(1))
     }
 
-    /// The cores it uses at width `w` (at least one): its width, or its CPU per thread times the
-    /// threads it has there, whichever is more.
+    /// The cores it uses at width `w` (at least one): its CPU per thread times the
+    /// threads it has there, rounded up. A blocked thread does not consume a core.
     fn uses(&self, w: u32) -> u32 {
         let w = w.max(1);
         let usable = w.min(self.tests.max(1));
@@ -128,7 +125,7 @@ impl Seen {
         } else {
             u32::MAX
         };
-        w.max(own)
+        own.max(1)
     }
 }
 
@@ -224,15 +221,14 @@ pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak
 }
 
 /// The earliest any plan of the binaries `known` on a share of `share` cores, each at most
-/// `ceiling` wide, can end as predicted: their work over the share (each binary's threads times
-/// its wall, which its predicted wall keeps at every width up to its tests, over `share`, as each
-/// charge is at least its width), or the longest of them at its widest ([`Seen::widest`]),
+/// `ceiling` wide, can end as predicted: their CPU work over the share, or the longest
+/// of them at its widest ([`Seen::widest`]),
 /// whichever is later. Zero
 /// with none known.
 fn bound(known: &[(usize, Seen)], share: u32, ceiling: u32) -> Duration {
     let work: f64 = known
         .iter()
-        .map(|(_, s)| s.wall.as_secs_f64() * f64::from(s.threads()))
+        .map(|(_, s)| s.wall.as_secs_f64() * f64::from(s.threads()) * s.per_thread.max(0.0))
         .sum();
     let work = Duration::try_from_secs_f64(work / f64::from(share.max(1))).unwrap_or(Duration::MAX);
     let longest = known
@@ -244,14 +240,15 @@ fn bound(known: &[(usize, Seen)], share: u32, ceiling: u32) -> Duration {
 }
 
 /// The binaries `known` (by their indexes) at target `target`: each at the narrowest width whose
-/// predicted wall is within it, its widest where none is, in the order they start: those whose
+/// predicted wall is within it, starting at its retained initial width and using its widest
+/// where none is, in the order they start: those whose
 /// last run failed, then the rest, each longest predicted first.
 fn at_target(known: &[(usize, Seen)], target: Duration, share: u32, ceiling: u32) -> Vec<Planned> {
     let mut failed = Vec::new();
     let mut rest = Vec::new();
     for &(index, s) in known {
         let widest = s.widest(ceiling, share);
-        let width = (1..=widest)
+        let width = (UNSEEN_WIDTH.min(widest)..=widest)
             .find(|&w| s.wall_at(w) <= target)
             .unwrap_or(widest);
         let planned = Planned {

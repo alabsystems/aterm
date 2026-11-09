@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::event_log::{CheckRow, Finished, Judged};
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 1024 * 1024;
+use crate::event_log::MAX_RECORD_BYTES;
 const COMPILER_STAGE_ROWS: usize = 64;
 const LONG_CASE_ROWS: usize = 64;
 const CASE_NAME_BYTES: usize = 4096;
@@ -149,12 +149,11 @@ fn outcome(word: &str) -> bool {
 /// Fold the entire supplied event text, never a bounded output tail.
 /// A newline is required before a record is considered complete.
 #[must_use]
-fn record_value(line: &str) -> Option<aterm_json::Value> {
+fn record_value(line: &str) -> Option<crate::event_log::RawEvent> {
     let json = line
         .strip_prefix("verify-event: ")
         .filter(|json| json.len() <= MAX_RECORD_BYTES)?;
-    let value = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
-    (value["schema"].as_u64() == Some(1)).then_some(value)
+    crate::event_log::raw_event(json)
 }
 
 fn observe_one(text: &str) -> Observed {
@@ -180,10 +179,11 @@ fn observe_one(text: &str) -> Observed {
             break;
         };
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let Some(value) = record_value(line) else {
+        let Some(record) = record_value(line) else {
             malformed += 1;
             continue;
         };
+        let value = record.value;
         match value["event"].as_str() {
             Some("test-phase-ended") => {
                 let Some(end) = line
@@ -194,7 +194,7 @@ fn observe_one(text: &str) -> Observed {
                     continue;
                 };
                 phase_end_records += 1;
-                let id = crate::event_log::diagnostic_invocation_id(&value);
+                let id = record.attribution.map(|binding| binding.id);
                 let key = (id.clone(), end.run, end.sequence);
                 if let Some(row) = phase_ends.get_mut(&key) {
                     row.occurrences += 1;
@@ -388,16 +388,12 @@ pub fn observe(text: &str) -> Observed {
     let mut groups = BTreeMap::<String, (String, Option<String>, bool)>::new();
     let mut unknown = String::new();
     for line in text.split_inclusive('\n') {
-        let value = line
+        let record = line
             .strip_suffix('\n')
             .and_then(|line| record_value(line.strip_suffix('\r').unwrap_or(line)));
-        let binding = value
-            .as_ref()
-            .filter(|v| v["schema"].as_u64() == Some(1))
-            .and_then(|v| {
-                let attribution = crate::event_log::attribution(v)?;
-                Some((attribution.id, attribution.source_observation))
-            });
+        let binding = record
+            .and_then(|record| record.attribution)
+            .map(|binding| (binding.id, binding.source_observation));
         if let Some((id, source)) = binding {
             let group = groups
                 .entry(id)
@@ -1056,8 +1052,21 @@ mod tests {
             );
             let invalid = observe(&format!("{terminal}verify-event: {duplicate}\n"));
             assert!(invalid.phase_ends.is_empty(), "duplicate {key}");
-            assert_eq!(invalid.unprojected_records, 1);
-            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+            let header = matches!(key, "schema" | "event");
+            assert_eq!(invalid.unprojected_records, if header { 0 } else { 1 });
+            assert_eq!(
+                invalid.malformed_complete_records,
+                if header { 1 } else { 0 }
+            );
+            assert_eq!(invalid.checks, baseline.checks);
+            assert_eq!(
+                invalid.terminal_consistency,
+                if header {
+                    "unavailable"
+                } else {
+                    baseline.terminal_consistency
+                }
+            );
         }
         let partial = observe(PHASE_END);
         assert!(partial.phase_ends.is_empty());
@@ -1258,7 +1267,21 @@ mod tests {
             );
             let invalid = observe(&format!("{terminal}verify-event: {duplicate}\n"));
             assert!(invalid.long_cases.is_empty(), "duplicate {key}");
-            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+            let header = matches!(key, "schema" | "event");
+            assert_eq!(invalid.unprojected_records, if header { 0 } else { 1 });
+            assert_eq!(
+                invalid.malformed_complete_records,
+                if header { 1 } else { 0 }
+            );
+            assert_eq!(invalid.checks, baseline.checks);
+            assert_eq!(
+                invalid.terminal_consistency,
+                if header {
+                    "unavailable"
+                } else {
+                    baseline.terminal_consistency
+                }
+            );
         }
     }
 
@@ -1607,6 +1630,88 @@ mod tests {
         let mut writer = crate::event_log::EventLog::unrecorded();
         writer.bind(crate::event_log::Context::captured(&ctx));
         writer
+    }
+
+    #[test]
+    fn ambiguous_raw_bindings_stay_globally_observed_but_unattributed() {
+        let writer = writer(None);
+        let check = writer.prepare(&event(Check::Doc));
+        let terminal = writer.prepare(&crate::report::run_event(
+            &[result(Check::Doc, Outcome::Ok)],
+            crate::exit::PASS,
+        ));
+        let value: aterm_json::Value =
+            aterm_json::from_str(check.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+        let binding = value["invocation"].to_string();
+        let needle = format!("\"invocation\":{binding}");
+        let text = format!("{check}{terminal}");
+        let baseline = observe(&text);
+        let other = "f".repeat(32);
+        let duplicate_id = binding.replacen("\"id\":", &format!("\"id\":\"{other}\",\"id\":"), 1);
+        let escaped_id =
+            binding.replacen("\"id\":", &format!("\"\\u0069d\":\"{other}\",\"id\":"), 1);
+        let source = binding.replacen(
+            "\"selection\":",
+            "\"selection\":\"other\",\"selection\":",
+            1,
+        );
+        let escaped_source = binding.replacen(
+            "\"observed_head\":",
+            "\"\\u006fbserved_head\":null,\"observed_head\":",
+            1,
+        );
+        let bindings = [duplicate_id, escaped_id, source, escaped_source];
+        let mut replacements = bindings
+            .iter()
+            .map(|binding| format!("\"invocation\":{binding}"))
+            .collect::<Vec<_>>();
+        replacements.push(format!("\"invocation\":null,{needle}"));
+        for replacement in replacements {
+            assert_ne!(replacement, needle);
+            let ambiguous = text.replace(&needle, &replacement);
+            assert_ne!(ambiguous, text);
+            let observed = observe(&ambiguous);
+            assert_eq!(observed.checks, baseline.checks);
+            assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+            assert_eq!(observed.malformed_complete_records, 0);
+            assert!(observed.invocations.is_empty());
+            let unknown = observed.unattributed.as_ref().unwrap();
+            assert_eq!(unknown.checks, baseline.checks);
+            assert_eq!(unknown.terminal_consistency, "matching-observed-rows");
+        }
+        let second = self::writer(None);
+        let mixed = observe(&format!(
+            "{text}{}{}\n",
+            second.prepare(&event(Check::Doc)),
+            event(Check::Doc)
+        ));
+        assert_eq!(mixed.invocations.len(), 2);
+        assert_eq!(mixed.unattributed.as_ref().unwrap().checks.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_raw_event_headers_cannot_supply_last_winning_checks_or_terminals() {
+        let writer = writer(None);
+        for raw in [
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS),
+        ] {
+            let bound = writer.prepare(&raw);
+            for (key, replacement) in [
+                ("\"schema\":", "\"schema\":0,\"schema\":"),
+                ("\"schema\":", "\"\\u0073chema\":1,\"schema\":"),
+                ("\"event\":", "\"event\":\"other\",\"event\":"),
+                ("\"event\":", "\"\\u0065vent\":\"other\",\"event\":"),
+            ] {
+                let ambiguous = bound.replacen(key, replacement, 1);
+                assert_ne!(ambiguous, bound);
+                let observed = observe(&ambiguous);
+                assert!(observed.checks.is_empty());
+                assert_eq!(observed.terminal_records, 0);
+                assert_eq!(observed.malformed_complete_records, 1);
+                assert!(observed.invocations.is_empty());
+            }
+        }
     }
 
     #[test]

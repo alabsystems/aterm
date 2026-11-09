@@ -6937,6 +6937,23 @@ fn run_upgrade_owner(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    run_upgrade_owner_with(env, sid, ask, json, out, err, super::upgrade_drive::ask)
+}
+
+fn run_upgrade_owner_with(
+    env: &Env,
+    sid: &str,
+    ask: OwnerAsk,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    request: impl FnOnce(
+        &super::upgrade_drive::Opts,
+        &str,
+        super::upgrade_drive::Ask,
+        bool,
+    ) -> Result<super::upgrade_drive::Row, String>,
+) -> ExitCode {
     let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
     let opts = match upgrade_opts(env, sid, &policy, super::tap::stable_exe) {
         Ok(opts) => opts,
@@ -7017,7 +7034,7 @@ fn run_upgrade_owner(
         OwnerAsk::Defer(secs) => super::upgrade_drive::Ask::Defer(secs),
         OwnerAsk::Skip => super::upgrade_drive::Ask::Skip,
     };
-    match super::upgrade_drive::ask(&opts, sid, word, policy.enabled && policy.upgrade) {
+    match request(&opts, sid, word, policy.enabled && policy.upgrade) {
         Ok(row) => {
             print(out, &row);
             if ask == OwnerAsk::Now

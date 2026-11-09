@@ -233,7 +233,7 @@ impl<'a> Watch<'a> {
         quiet: impl FnOnce() -> Option<Vec<(u32, u64)>>,
         label: &str,
     ) -> Option<Verdict> {
-        let now = Instant::now();
+        let now = self.host.monotonic();
         if self
             .asked
             .is_some_and(|t| now.saturating_duration_since(t) < LOOK_EVERY)

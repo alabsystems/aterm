@@ -551,11 +551,13 @@ fn local_discovery_requires_current_root_head_and_exact_device() {
 /// current decision for this Mac (none at all, then only another Mac's), and each time it reads
 /// while the test holds this Mac's control journal writer, the writer converge's own writers fail
 /// fast against. CONTROL: the other Mac finds the decision that names it, a current decision for
-/// this Mac is found, and only through its permit: while the test holds the writer that permit
-/// needs (a wait the admission's one-minute hang detector ends), it finds nothing permitted;
-/// demoted to a Reader, the same Mac finds nothing, and readmitted as a Writer, finds it again.
+/// this Mac is found, and only through its permit: an actual attempt contends on the writer
+/// that permit needs before the test releases it, then finds that preparation. Demoted to a
+/// Reader, the same Mac finds nothing, and readmitted as a Writer, finds it again.
 #[test]
 fn local_discovery_of_nothing_prepared_is_empty_and_takes_no_writer() {
+    use std::{cell::Cell, os::unix::fs::MetadataExt as _, rc::Rc};
+
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     super::super::proposals::Proposals::at(lab.paths[0].clone())
         .write(
@@ -601,9 +603,31 @@ fn local_discovery_of_nothing_prepared_is_empty_and_takes_no_writer() {
         .unwrap();
     let (local, _) = db.issue(&admin, [11; 16], local).unwrap();
     assert_eq!(discover(false), Ok(vec![(ACCOUNT, local.id())]), "CONTROL");
-    assert!(
-        !matches!(discover(true), Ok(found) if !found.is_empty()),
-        "CONTROL: a busy writer permits nothing"
+    let mut owner = Some(held());
+    let (_lock, metadata) =
+        aterm_uds::private_file::open_private(owner.as_ref().unwrap().directory(), "control.lock")
+            .unwrap();
+    let identity = (metadata.dev(), metadata.ino());
+    let waited = Rc::new(Cell::new(0));
+    let observed = waited.clone();
+    let found = aterm_uds::file_lock::with_lock_wait_observer(
+        move |file| {
+            let metadata = file.metadata().unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), identity);
+            observed.set(observed.get() + 1);
+            drop(owner.take());
+        },
+        || db.local_preparations().map_err(|why| why.0),
+    );
+    assert_eq!(
+        waited.get(),
+        1,
+        "CONTROL: the permit needed the held writer"
+    );
+    assert_eq!(
+        found,
+        Ok(vec![(ACCOUNT, local.id())]),
+        "CONTROL: released writer permits the current preparation"
     );
     lab.admit(&[Role::Reader, Role::Writer]);
     assert_eq!(discover(false), Ok(vec![]), "CONTROL: no permit");

@@ -1169,7 +1169,7 @@ mod tests {
         os_unfair_lock_unlock, release_free_memory,
     };
 
-    fn partial_slab_count(idx: usize) -> usize {
+    fn retained_cohort_slabs(idx: usize, cohort: &[usize]) -> usize {
         let cell = BINS[idx].0.get();
         // SAFETY: Test acquires the bin lock before walking `partial_head`.
         unsafe {
@@ -1177,7 +1177,8 @@ mod tests {
             let mut n = 0usize;
             let mut cur = (*cell).partial_head;
             while !cur.is_null() {
-                n += 1;
+                let base = super::slab_base_from_header(cur) as usize;
+                n += usize::from(cohort.binary_search(&base).is_ok());
                 cur = (*cur).next;
             }
             os_unfair_lock_unlock(&raw mut (*cell).lock);
@@ -1267,6 +1268,24 @@ mod tests {
 
     #[test]
     fn spike_and_drain_across_threads_flushes_magazines_and_unmaps_slabs() {
+        const PROBE: &str = "ATERM_COMPACT_ZONE_SPIKE_PROBE";
+        const CASE: &str = "compact_zone::tests::spike_and_drain_across_threads_flushes_magazines_and_unmaps_slabs";
+        if std::env::var_os(PROBE).is_none() {
+            let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", CASE, "--test-threads=1", "--nocapture"])
+                .env(PROBE, "1");
+            let output = aterm_uds::deadline::output_within(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("the isolated allocator workload finishes");
+            assert!(output.status.success(), "allocator probe: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("compact-zone-spike-drained"));
+            return;
+        }
+        // Other cases use this binary's global allocator. Only a private process can prove
+        // that these slabs empty, with no unrelated allocation taking one of their slots.
         let layout = Layout::from_size_align(3_072, 16).expect("valid 3072 layout");
         let idx = class_index(layout.size(), layout.align()).expect("3072 uses slab bin");
         let (tx, rx) = std::sync::mpsc::channel::<usize>();
@@ -1283,18 +1302,26 @@ mod tests {
             }
         });
         let consumer = std::thread::spawn(move || {
+            let mut cohort = Vec::with_capacity(96);
             // SAFETY: Every pointer came from `CompactZoneAlloc.alloc(layout)`.
             unsafe {
                 while let Ok(addr) = rx.recv() {
+                    cohort.push(addr & !(super::SLAB_BYTES - 1));
                     CompactZoneAlloc.dealloc(addr as *mut u8, layout);
                 }
             }
+            assert_eq!(cohort.len(), 96, "every spike allocation crossed threads");
+            cohort.sort_unstable();
+            cohort.dedup();
+            assert!(cohort.len() > 2, "the spike spans multiple slabs");
+            cohort
         });
         producer.join().expect("producer join");
-        consumer.join().expect("consumer join");
+        let cohort = consumer.join().expect("consumer join");
         release_free_memory();
-        assert!(
-            partial_slab_count(idx) <= 2,
+        assert_eq!(
+            retained_cohort_slabs(idx, &cohort),
+            0,
             "thread-exit magazine flush + release_free_memory must unmap spike slabs"
         );
         // SAFETY: Allocate and free one zeroed slot with `layout`.
@@ -1309,6 +1336,7 @@ mod tests {
             );
             CompactZoneAlloc.dealloc(z, layout);
         }
+        println!("compact-zone-spike-drained");
     }
 
     /// One bin driven through its own state machine as the global path drives it (a slot from a

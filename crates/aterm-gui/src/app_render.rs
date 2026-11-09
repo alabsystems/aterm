@@ -12318,9 +12318,13 @@ impl App {
                 pet_glow.style,
             );
             let rewound = self.pool.is_rewound(front_terminal.session);
-            let rewind_fp = if rewound { self.rewind_frame_fp(id) } else { 0 };
+            let rewind_fp = if rewound {
+                self.rewind_frame_fp(id, plan)
+            } else {
+                0
+            };
             let rain_session_on = self.session_rain_enabled(front_terminal.session) && !rewound;
-            let overlay_inputs = self.pane_overlay_inputs(id, false);
+            let overlay_inputs = self.pane_overlay_inputs_from_plan(id, false, Some(plan));
             let question = self.question_key(id);
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
@@ -16268,7 +16272,7 @@ impl App {
                     .get(&wid)
                     .is_some_and(|w| w.fx.rain().is_some())
         });
-        let overlay_inputs = self.pane_overlay_inputs(wid, panes.len() > 1);
+        let overlay_inputs = self.pane_overlay_inputs_from_plan(wid, panes.len() > 1, Some(plan));
         if let Some(ws) = self.windows.get_mut(&wid) {
             if overlay_inputs.is_some() {
                 ws.pane_overlay.begin();
@@ -17024,7 +17028,7 @@ impl App {
             system_dark: repaint_system_dark(self.os_appearance),
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
             claude_footer_fp: self.claude_footer_fp(wid, plan),
-            rewind_fp: self.rewind_frame_fp(wid),
+            rewind_fp: self.rewind_frame_fp(wid, plan),
         };
         let recovery_redraw_outstanding = self
             .windows
@@ -17916,7 +17920,11 @@ impl App {
         };
     }
 
-    fn find_region(&self, wid: WindowId) -> FindRegion {
+    fn find_region(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> FindRegion {
         let Some(ws) = self.windows.get(&wid) else {
             return FindRegion::default();
         };
@@ -17927,16 +17935,24 @@ impl App {
             cols: usize::from(ws.cols),
             display_offset: ws.input_scratch.display_offset,
         };
-        let Some(plan) = self
-            .active_visible_leaf_plan(wid)
-            .filter(|plan| plan.leaves.len() > 1)
-        else {
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return whole;
+        }
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => Some(plan),
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid);
+                owned_plan.as_ref()
+            }
+        };
+        let Some(plan) = plan.filter(|plan| plan.leaves.len() > 1) else {
             return whole;
         };
         let Some(leaf) = plan.leaves.iter().find(|leaf| leaf.focused) else {
             return whole;
         };
-        let source = match self.visible_content_route_from_plan(&plan) {
+        let source = match self.visible_content_route_from_plan(plan) {
             Some(crate::VisibleContentRoute::Terminal { composed: true }) => {
                 Some(&ws.composed_focus_scratch)
             }
@@ -17961,8 +17977,17 @@ impl App {
         }
     }
 
-    /// Paint the Cmd-f find bar over the top terminal rows (below the tab strip; floated to the bottom when the current match sits under it) while find is active (`ws.search`).
+    #[cfg(test)]
     pub(crate) fn splice_find_bar(&mut self, wid: WindowId) {
+        self.splice_find_bar_from_plan(wid, None);
+    }
+
+    /// Paint the Cmd-f find bar over the top terminal rows (below the tab strip; floated to the bottom when the current match sits under it) while find is active (`ws.search`).
+    pub(crate) fn splice_find_bar_from_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         let Some((base_y_now, frame_absolute_row_revision, frame_history_renumber_epoch)) =
             self.windows.get(&wid).map(|ws| {
                 (
@@ -18046,7 +18071,7 @@ impl App {
             }
             return;
         };
-        let region = self.find_region(wid);
+        let region = self.find_region(wid, frame_plan);
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols as usize);
         if cols == 0 || region.rows == 0 || region.cols == 0 {
             return;
@@ -18447,35 +18472,36 @@ impl App {
     }
 
     fn card_over_native_page(&self, wid: WindowId) -> bool {
-        if !self.active_tab_contains_native(wid) {
-            return false;
-        }
-        let Some((plan, route)) = self.active_visible_frame_layout(wid) else {
+        let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) else {
             return false;
         };
-        match route {
-            crate::VisibleContentRoute::Native { .. } => true,
-            crate::VisibleContentRoute::Terminal { .. } => false,
-            crate::VisibleContentRoute::Heterogeneous => {
-                let bounds = plan.bounds;
-                let right = bounds.origin.x + bounds.size.width;
-                let bottom = bounds.origin.y + bounds.size.height;
-                let (x, y) = (right - 0.5, bounds.origin.y + 0.5);
-                let point = crate::tab_model::LogicalPoint {
-                    x: x.clamp(bounds.origin.x, (right - 0.5).max(bounds.origin.x)),
-                    y: y.clamp(bounds.origin.y, (bottom - 0.5).max(bounds.origin.y)),
-                };
-                plan.leaves
-                    .iter()
-                    .find(|leaf| leaf.outer_rect().contains(point))
-                    .is_some_and(|leaf| {
-                        matches!(
-                            self.view_store.get(leaf.view),
-                            Some(crate::tab_model::View::Native(_))
-                        )
-                    })
+        let view = if tab.zoomed || tab.root.len() == 1 {
+            if !tab.root.contains(tab.focus) {
+                return false;
             }
-        }
+            tab.focus
+        } else {
+            let mut tree = &tab.root;
+            loop {
+                match tree {
+                    crate::tab_model::SplitTree::Leaf(leaf) => break *leaf,
+                    crate::tab_model::SplitTree::Split {
+                        axis: crate::tab_model::SplitAxis::Horizontal,
+                        second,
+                        ..
+                    } => tree = second,
+                    crate::tab_model::SplitTree::Split {
+                        axis: crate::tab_model::SplitAxis::Vertical,
+                        first,
+                        ..
+                    } => tree = first,
+                }
+            }
+        };
+        matches!(
+            self.view_store.get(view),
+            Some(crate::tab_model::View::Native(_))
+        )
     }
 
     /// Overlay the modal Settings panel over the top `panel_rows` rows of the composed frame (a byte-identical no-op when no overlay is open).
@@ -18730,20 +18756,15 @@ impl App {
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<crate::app_mouse::ShownCaption> {
         let Some(hover) = self.windows.get(&wid).and_then(|ws| {
-            ws.link_hover
-                .filter(|_| ws.overlay.is_none() && ws.tab_menu.is_none())
+            ws.link_hover.filter(|hover| {
+                ws.overlay.is_none()
+                    && ws.tab_menu.is_none()
+                    && !chrome_owns_terminal_row_of(ws, usize::from(hover.window_row))
+            })
         }) else {
             // Distinct branch.
             return None; // the ordinary frame: no hover, no band, no cost
         };
-        let (_, pane_col, _, pane_cols) = self.focused_pane_rect(wid);
-        if self.chrome_owns_terminal_span(
-            wid,
-            usize::from(hover.window_row),
-            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)),
-        ) {
-            return None;
-        }
         if !self
             .front_terminal(wid)
             .is_some_and(|front| front.session == hover.session)
@@ -18769,6 +18790,20 @@ impl App {
             .then(|| self.active_visible_leaf_plan(wid))
             .flatten();
         let plan = frame_plan.or(owned_plan.as_ref())?;
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| !ws.chrome_spans.is_empty())
+        {
+            let (_, pane_col, _, pane_cols) = self.focused_pane_rect_from_plan(wid, plan);
+            if self.chrome_owns_terminal_span(
+                wid,
+                usize::from(hover.window_row),
+                usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)),
+            ) {
+                return None;
+            }
+        }
         let (frame_row, seam) = self.link_caption_row(wid, hover, plan)?;
         let cols = self.windows.get(&wid).map(|ws| usize::from(ws.cols))?;
         let palette = self.chrome_palette(ChromeSurface::OverGrid(wid));

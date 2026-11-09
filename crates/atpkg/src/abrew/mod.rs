@@ -470,6 +470,15 @@ fn named_arg_types(cmd: &str) -> String {
     }
 }
 
+/// Commands brew.sh answers itself, before Ruby's help
+/// interception and argument parser ever run.
+fn shell_fast_path(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "shellenv" | "formulae" | "casks" | "--taps" | "--repository" | "--repo"
+    )
+}
+
 fn native_args(
     cmd: &str,
     rest: &[String],
@@ -488,6 +497,12 @@ fn native_args(
     }
     if let Some(message) = internal_api_env_error(cmd, rest, |key| std::env::var(key).ok()) {
         return Err(InstallError::Failed(message));
+    }
+    // Brew's shell fast paths (brew.sh handles these before
+    // Ruby and its parser): every argument is positional data
+    // or ignored outright, `--help` included.
+    if shell_fast_path(cmd) {
+        return Ok((None, typed_rest.to_vec()));
     }
     let unsupported =
         || InstallError::Unsupported(format!("'{cmd}' with these arguments is not native"));
@@ -2746,6 +2761,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             .take_while(|arg| arg.as_str() != "--")
             .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
         if help_flag
+            && !shell_fast_path(cmd)
             && help_texts::TEXTS
                 .iter()
                 .any(|(name, _)| *name == canonical_help_command(cmd))
@@ -2760,7 +2776,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             .iter()
             .take_while(|arg| arg.as_str() != "--")
             .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
-        if help_flag && command_names(true).contains(&canonical_help_command(cmd)) {
+        if help_flag
+            && !shell_fast_path(cmd)
+            && command_names(true).contains(&canonical_help_command(cmd))
+        {
             print!("{}", help_for(cmd));
             return ExitCode::SUCCESS;
         }
@@ -2819,22 +2838,33 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         "--repository" | "--repo" => {
-            if let Some(name) = rest.first()
-                && let Some((user, repo)) = tap::parse_tap_name(name)
-            {
-                println!(
-                    "{}",
-                    prefix
-                        .taps_dir()
-                        .join(user)
-                        .join(format!("homebrew-{repo}"))
-                        .display()
+            if rest.is_empty() {
+                return unsupported(
+                    "--repository without a tap: atpkg has no Homebrew source repository",
                 );
-                return ExitCode::SUCCESS;
             }
-            return unsupported(
-                "--repository without a tap: atpkg has no Homebrew source repository",
-            );
+            for name in rest {
+                match tap::parse_tap_name(name) {
+                    Some((user, repo)) => println!(
+                        "{}",
+                        prefix
+                            .taps_dir()
+                            .join(user)
+                            .join(format!("homebrew-{repo}"))
+                            .display()
+                    ),
+                    None => {
+                        return from_install(
+                            prefix,
+                            args,
+                            Err(InstallError::Failed(format!(
+                                "Error: Invalid tap name: {name}"
+                            ))),
+                        );
+                    }
+                }
+            }
+            return ExitCode::SUCCESS;
         }
         "--env" | "env" => return print_env(prefix, rest),
         _ => {}
@@ -2927,8 +2957,8 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "docs" => cmd_docs(),
         "source" => cmd_source(&api, rest),
         "cat" => cmd_cat(prefix, &api, rest),
-        "formulae" => list_index(&api, false),
-        "casks" => list_index(&api, true),
+        "formulae" => list_index(prefix, &api, false),
+        "casks" => list_index(prefix, &api, true),
         "commands" => {
             if has_flag(rest, "--include-aliases", "") && !has_flag(rest, "--quiet", "-q") {
                 eprintln!(
@@ -3726,8 +3756,6 @@ mod admission_tests {
             ("postinstall", vec!["wget"]),
             ("--cache", vec!["-s", "wget"]),
             ("--cache", vec!["--HEAD", "wget"]),
-            ("--repository", vec!["notatap"]),
-            ("--repo", vec!["a/b/c"]),
             ("desc", vec!["-s", "/(?=http)client/"]),
             ("missing", vec!["--hide=../outside"]),
             ("list", vec!["--versions", "--json", "wget"]),
@@ -3905,6 +3933,16 @@ mod admission_tests {
             ("info", vec!["--installed", "--json"]),
             ("doctor", vec!["--quiet"]),
             ("shellenv", vec!["fish"]),
+            // Brew's shell fast paths: arguments are data or
+            // ignored, help flags included.
+            ("shellenv", vec!["--help"]),
+            ("shellenv", vec!["--bogus", "fish"]),
+            ("formulae", vec!["--help"]),
+            ("casks", vec!["--bogus"]),
+            ("--taps", vec!["anything"]),
+            ("--repository", vec!["--help"]),
+            ("--repository", vec!["notatap"]),
+            ("--repo", vec!["a/b/c"]),
             ("tap", vec!["--list-official"]),
             ("cleanup", vec!["--prune=all"]),
             ("cleanup", vec!["--prune=30", "-n"]),

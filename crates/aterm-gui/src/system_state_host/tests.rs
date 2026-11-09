@@ -230,6 +230,7 @@ fn handlers() -> InitialSetupHandlers {
             true
         },
         status: SetupStatus::default,
+        own_console: || true,
         observe: |plan| {
             note(format!("observe {}", plan.vault_url));
             true

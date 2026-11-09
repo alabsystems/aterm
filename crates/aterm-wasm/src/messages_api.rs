@@ -351,7 +351,7 @@ impl WebBand {
     }
 
     /// A fresh engine whose motion grid starts at `t0` (the tests' injected clock; the
-    /// native golden anchors its center the same way).
+    /// native golden was recorded with its center anchored the same way).
     #[cfg(test)]
     pub(crate) fn reset_at(&mut self, t0: Instant) {
         self.center = new_center(MessageLog::default(), t0);

@@ -1159,7 +1159,9 @@ fn oversized_first_success_learns_once_and_warm_work_reuses_then_retires_whole()
         world.admit(THIRD, 16 << 10).unwrap()["created"].as_bool(),
         Some(true)
     );
-    assert_ne!(super::super::identity(&world.target).unwrap(), identity);
+    // Filesystems may reuse the removed directory's inode. A fresh admission
+    // must lose the retired build's output, regardless of its new inode number.
+    assert!(!world.target.join("debug/deps/unit").exists());
     assert_eq!(world.receipt().package.unwrap().budget(), first * 2);
 }
 

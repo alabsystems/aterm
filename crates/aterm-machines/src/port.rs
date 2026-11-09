@@ -3083,7 +3083,7 @@ mod fake {
         scroll_natural: Mutex<Option<bool>>,
         scroll_set_error: Mutex<Option<String>>,
         scroll_set_readback: Mutex<Option<bool>>,
-        replies: Mutex<BTreeMap<String, Vec<Ran>>>,
+        replies: Mutex<BTreeMap<String, Vec<Result<Ran, RunFailed>>>>,
         broker_hellos: Mutex<Vec<Result<aterm_uds::lan::BrokerHello, String>>>,
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
         /// What each [`System::bonjour`] request hears, by its [`Bonjour::key`]
@@ -3747,6 +3747,11 @@ mod fake {
 
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
+            self.on_result(key, Ok(reply))
+        }
+
+        /// Script a command result, including a failure before or after it started.
+        pub fn on_result(&self, key: &str, reply: Result<Ran, RunFailed>) -> &Self {
             self.replies
                 .lock()
                 .unwrap()
@@ -4106,6 +4111,7 @@ mod fake {
             let model = self.model.lock().unwrap().clone();
             let reply = model
                 .and_then(|model| model(self, &cmd))
+                .map(Ok)
                 .or_else(|| {
                     self.replies
                         .lock()
@@ -4114,7 +4120,8 @@ mod fake {
                         .and_then(|rows| rows.first())
                         .cloned()
                 })
-                .ok_or("fake: no keyboard property data scripted")?;
+                .ok_or("fake: no keyboard property data scripted")?
+                .map_err(|error| error.to_string())?;
             if !reply.success()
                 || reply.stdout.len() > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES
             {
@@ -4323,8 +4330,8 @@ mod fake {
             }
             let mut replies = self.replies.lock().unwrap();
             let reply = match replies.get_mut(&key) {
-                Some(list) if list.len() > 1 => Ok(list.remove(0)),
-                Some(list) if list.len() == 1 => Ok(list[0].clone()),
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
                 _ => Err(RunFailed::Spawn(format!(
                     "fake: no reply scripted for `{key}`"
                 ))),
@@ -4390,8 +4397,8 @@ mod fake {
                 .push((key.clone(), input.bytes().to_vec()));
             let mut replies = self.replies.lock().unwrap();
             let reply = match replies.get_mut(&key) {
-                Some(list) if list.len() > 1 => Ok(list.remove(0)),
-                Some(list) if list.len() == 1 => Ok(list[0].clone()),
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
                 _ => Err(RunFailed::Spawn(format!(
                     "fake: no reply scripted for `{key}`"
                 ))),
@@ -4589,8 +4596,8 @@ mod fake {
                 }
                 let mut replies = self.replies.lock().unwrap();
                 let status = match replies.get_mut(&key) {
-                    Some(list) if list.len() > 1 => Ok(list.remove(0).status),
-                    Some(list) if list.len() == 1 => Ok(list[0].status),
+                    Some(list) if list.len() > 1 => list.remove(0).map(|ran| ran.status),
+                    Some(list) if list.len() == 1 => list[0].clone().map(|ran| ran.status),
                     _ => Err(RunFailed::Spawn(format!(
                         "fake: no reply scripted for `{key}`"
                     ))),

@@ -2493,26 +2493,48 @@ fn a_verification_is_not_spaced_from_the_scan_before_it() {
 #[test]
 fn a_process_launchd_started_is_no_orphan() {
     let launchd = launchd_idversion().expect("launchd's pid version is readable");
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let waits = FixtureWaits::new();
-    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
-    let (mut owned, orphan_pid, adopted) = adopted_orphan(dir.path(), &waits);
-    assert_ne!(
-        adopted.p_orig_ppidversion, launchd,
-        "an adopted orphan keeps its launcher as its original parent"
-    );
-    let orphan = scan_with_first_read(shell_pid, orphan_pid, adopted);
-    let launchd_started = scan_with_first_read(
-        shell_pid,
-        orphan_pid,
-        BsdInfoWithUniqId {
-            p_orig_ppidversion: launchd,
+    let shell_pid = i32::MAX;
+    let orphan_pid = i32::try_from(std::process::id()).expect("our pid fits");
+    assert_ne!(shell_pid, orphan_pid);
+    let mut adopted = bsdinfo_uniq(orphan_pid).expect("our process record");
+    adopted.pbsd.pbi_ppid = 1;
+    adopted.pbsd.pbi_start_tvsec = 2;
+    adopted.pbsd.pbi_start_tvusec = 0;
+    adopted.p_uniqueid = 20;
+    let mut shell = adopted;
+    shell.pbsd.pbi_pid = shell_pid as u32;
+    shell.pbsd.pbi_start_tvsec = 1;
+    shell.p_uniqueid = 10;
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(2);
+    // This test judges original-parent policy. Keep ownership and identity
+    // observations fixed instead of racing an orphan's exec/environment read.
+    let scan = |launcher| {
+        let candidate = BsdInfoWithUniqId {
+            p_orig_ppidversion: launcher,
             ..adopted
-        },
-    );
-    owned
-        .retire_owned_escape_fixture()
-        .expect("retire the orphan");
+        };
+        escape_scan_with_owner(
+            shell_pid,
+            None,
+            FIXTURE_SID,
+            at,
+            at,
+            |_| Some(vec![shell_pid, orphan_pid]),
+            |pid| {
+                if pid == shell_pid {
+                    Some(shell)
+                } else if pid == orphan_pid {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            },
+            |_, _| Some(true),
+            |_| Some(false),
+        )
+    };
+    let orphan = scan(launchd.wrapping_add(1));
+    let launchd_started = scan(launchd);
     assert_eq!(orphan, Scan::Escaped, "an orphan launchd adopted");
     assert_eq!(
         launchd_started,

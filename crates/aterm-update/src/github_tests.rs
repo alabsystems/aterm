@@ -69,7 +69,7 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     assert_eq!(chosen.container, Container::Dmg);
     assert_eq!(chosen.name, "aterm-0.54.0.dmg");
     assert_eq!(chosen.sha256, dmg_only.sha256);
-    assert_eq!(release.assets[chosen.asset_index].name, chosen.name);
+    assert_eq!(release.assets[chosen.asset_index], chosen.name);
 
     let mut zipped = candidate_manifest();
     zipped.zip = Some(zip_name.clone());
@@ -78,7 +78,7 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     assert_eq!(chosen.container, Container::Zip);
     assert_eq!(chosen.name, zip_name);
     assert_eq!(chosen.sha256, zip_digest);
-    assert_eq!(release.assets[chosen.asset_index].name, chosen.name);
+    assert_eq!(release.assets[chosen.asset_index], chosen.name);
 
     let mut no_digest = zipped.clone();
     no_digest.zip_sha256 = None;
@@ -772,6 +772,22 @@ fn chain(
     }
 }
 
+/// A test's URL-keyed answer as the release reader's: each asset by its web route; an error
+/// that starts "HTTP 404" is the asset's absence, any other a refusal.
+fn by_url<'a>(
+    mut answer: impl FnMut(&str, u64) -> Result<Vec<u8>, String> + 'a,
+) -> impl FnMut(&release_asset::Asset<'_>, u64) -> Result<Vec<u8>, AssetError> + 'a {
+    move |asset, cap| {
+        answer(&asset.web_url(), cap).map_err(|e| {
+            if e.starts_with("HTTP 404") {
+                AssetError::Absent(e)
+            } else {
+                AssetError::Refused(e)
+            }
+        })
+    }
+}
+
 fn serve_chain(c: &Chain, url: &str) -> Result<Vec<u8>, String> {
     match url.rsplit('/').next().unwrap_or_default() {
         APPCAST_ASSET => Ok(c.manifest.clone()),
@@ -785,7 +801,7 @@ fn serve_chain(c: &Chain, url: &str) -> Result<Vec<u8>, String> {
 fn run_chain(c: &Chain, masters: &[&str], floor_seq: u64, now_unix: i64) -> AuthoritativeFetch {
     fetch_authoritative_release(
         Some(web_release(&test_source(), WEB_TAG).unwrap()),
-        &mut |url, _| serve_chain(c, url),
+        &mut by_url(|url, _| serve_chain(c, url)),
         &RosterPolicy {
             master_pubkeys: masters,
             floor_seq,
@@ -869,7 +885,7 @@ fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
         let masters = [channel.master_pub.as_str()];
         let mut fetched = fetch_authoritative_release(
             Some(web_release(&test_source(), WEB_TAG).unwrap()),
-            &mut |url, _| channel.serve(url),
+            &mut by_url(|url, _| channel.serve(url)),
             &channel.policy(&masters),
         );
         assert!(fetched.selected.is_some(), "the chain selects it");
@@ -956,7 +972,7 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
         let refresh = move || refreshed_floor;
         fetch_authoritative_release(
             Some(web_release(&test_source(), WEB_TAG).unwrap()),
-            &mut |url, _| serve_chain(&c, url),
+            &mut by_url(|url, _| serve_chain(&c, url)),
             &RosterPolicy {
                 master_pubkeys: &masters,
                 floor_seq: snapshot,
@@ -1855,14 +1871,25 @@ fn acquire_web_from(
     source: &Source,
     mut answer: impl FnMut() -> Result<HeadAnswer, HttpError>,
 ) -> (Result<Acquisition, String>, Vec<String>) {
-    let mut heads = Vec::new();
+    let heads = std::cell::RefCell::new(Vec::new());
     let mut head = |url: &str| {
-        heads.push(url.to_string());
+        heads.borrow_mut().push(url.to_string());
         answer()
     };
-    let outcome = acquire(staging, WEB_BUILD, source, &mut head);
-    (outcome, heads)
+    let mut latest = || {
+        heads.borrow_mut().push(LATEST_READ.to_string());
+        Err(AssetError::Unavailable {
+            web: "HTTP 504".into(),
+            api: "HTTP 503".into(),
+        })
+    };
+    let outcome = acquire(staging, WEB_BUILD, source, (&mut head, &mut latest));
+    (outcome, heads.into_inner())
 }
+
+/// What [`acquire_web_from`] records when the check asks for the latest release's tag after
+/// the pointer's HEAD failed (the web route again, then the API route).
+const LATEST_READ: &str = "latest release read";
 
 #[test]
 fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
@@ -1884,13 +1911,12 @@ fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
     };
     assert_eq!(candidate.version, "0.10.0");
     assert_eq!(candidate.release.tag_name, WEB_TAG);
-    for asset in &candidate.release.assets {
+    for index in 0..candidate.release.assets.len() {
         assert_eq!(
-            asset.url,
-            tag_url(WEB_TAG, &asset.name),
-            "every asset URL is the derived tag-specific one"
+            candidate.release.named(index).web_url(),
+            tag_url(WEB_TAG, &candidate.release.assets[index]),
+            "every asset is read at the pointer's tag"
         );
-        assert!(!aterm_update_core::cdn::is_api_host(&asset.url));
     }
 
     let mut gets: Vec<String> = Vec::new();
@@ -1898,8 +1924,11 @@ fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
         gets.push(url.to_string());
         channel.serve(url)
     };
-    let fetched =
-        fetch_authoritative_release(Some(candidate), &mut download, &channel.policy(&masters));
+    let fetched = fetch_authoritative_release(
+        Some(candidate),
+        &mut by_url(&mut download),
+        &channel.policy(&masters),
+    );
     let (manifest, release, _) = fetched
         .selected
         .as_ref()
@@ -1981,7 +2010,7 @@ fn an_unchanged_web_head_refetches_a_release_whose_stage_is_lost() {
 }
 
 #[test]
-fn every_web_lane_failure_path_ends_without_an_api_request() {
+fn only_a_pointer_head_that_failed_in_transit_reads_the_latest_release_again() {
     let _guard = crate::STRANDED_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2012,7 +2041,11 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
                 location: None,
             })
         });
-        assert_eq!(heads.len(), 1);
+        assert_eq!(
+            heads,
+            [evergreen_url().as_str(), LATEST_READ],
+            "{code}: the HEAD, then the latest release from the web or API route"
+        );
         assert!(
             matches!(outcome, Ok(Acquisition::Ended)),
             "{code}: {outcome:?}"
@@ -2044,7 +2077,12 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
     ] {
         let before = crate::health::Health::read(&staging.health()).network_failures;
         let (outcome, heads) = acquire_web(&staging, None, || answer.clone());
-        assert_eq!(heads.len(), 1, "{label}");
+        assert_eq!(
+            heads.len(),
+            if label == "transport" { 2 } else { 1 },
+            "{label}: only a HEAD that failed in transit reads the latest release again: \
+             {heads:?}"
+        );
         let Err(error) = outcome else {
             panic!("{label}: expected a failure, got {outcome:?}");
         };
@@ -2063,6 +2101,165 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
+/// agh-fake holding `alabsystems/aterm` release [`WEB_TAG`] with `channel`'s four assets, its
+/// web route answering 504 to every read, and a loopback reader of it.
+fn web_route_down(channel: &WebChannel) -> (agh_fake::FakeGithub, Reader) {
+    let fake = agh_fake::FakeGithub::start();
+    fake.add_repo(
+        "alabsystems/aterm",
+        agh_fake::RepoSpec::public().push("alabsystems-bot"),
+    );
+    let id = fake.add_release(
+        "alabsystems/aterm",
+        agh_fake::ReleaseSpec::published(WEB_TAG, "2026-10-01T00:00:00Z"),
+    );
+    for (name, bytes) in [
+        (APPCAST_ASSET, &channel.appcast),
+        (APPCAST_SIG_ASSET, &channel.appcast_sig),
+        (aterm_update_core::roster::ROSTER_ASSET, &channel.roster),
+        (
+            aterm_update_core::roster::ROSTER_SIG_ASSET,
+            &channel.roster_sig,
+        ),
+    ] {
+        fake.add_asset(id, agh_fake::AssetSpec::uploaded(name, bytes));
+    }
+    fake.fault_always(
+        agh_fake::Match::web("/alabsystems/aterm/releases/"),
+        gateway_timeout(),
+    );
+    let p = fake.ports();
+    let reader = Reader::loopback(
+        aterm_update_core::github_rest::Origins::loopback(p.api, p.uploads, p.web, p.cdn),
+        None,
+        std::time::Duration::from_secs(60),
+    );
+    (fake, reader)
+}
+
+fn gateway_timeout() -> agh_fake::Fault {
+    agh_fake::Fault::Status {
+        status: 504,
+        body: String::new(),
+        headers: Vec::new(),
+    }
+}
+
+/// A WEB ROUTE ANSWERING 504 STILL AUTHORIZES THE RELEASE, through the API route: the same
+/// signed bytes, read anonymously, one listing of the release, and the check that leaned on the
+/// metered route holds this machine off for the deferral window. With the API route failing
+/// too, the release is unavailable: a deferral, never a broken download.
+#[test]
+fn a_web_route_answering_504_authorizes_the_release_through_the_api_route() {
+    let _guard = crate::STRANDED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+    let masters = [channel.master_pub.as_str()];
+    let (fake, reader) = web_route_down(&channel);
+    let fetched = fetch_authoritative_release(
+        Some(web_release(&test_source(), WEB_TAG).unwrap()),
+        &mut |asset, cap| reader.bytes(asset, cap),
+        &channel.policy(&masters),
+    );
+    assert!(
+        fetched.selected.is_some(),
+        "the chain verifies over the API route: {:?}",
+        fetched.rejection_reason
+    );
+    assert_eq!(
+        fetched
+            .attribution
+            .as_ref()
+            .map(|who| who.machine_id.as_str()),
+        Some("m3")
+    );
+    let seen = fake.seen();
+    assert!(
+        seen.iter().any(|s| s.origin == agh_fake::FakeOrigin::Web),
+        "the web route was asked first"
+    );
+    assert!(
+        seen.iter().all(|s| !s.had_authorization),
+        "the updater reads anonymously on every route"
+    );
+    assert_eq!(
+        reader.api_requests(),
+        5,
+        "one listing of the release and one request per asset"
+    );
+    RATE_LIMITED.store(false, Ordering::Relaxed);
+    hold_after_api_route(0);
+    assert!(
+        !rate_limited(),
+        "a check on the web route alone holds nothing"
+    );
+    hold_after_api_route(reader.api_requests());
+    assert!(
+        rate_limited(),
+        "a check that used the API route holds the machine off"
+    );
+    RATE_LIMITED.store(false, Ordering::Relaxed);
+
+    fake.fault_always(
+        agh_fake::Match::api("/repos/alabsystems/aterm/releases/"),
+        gateway_timeout(),
+    );
+    let p = fake.ports();
+    let both_down = Reader::loopback(
+        aterm_update_core::github_rest::Origins::loopback(p.api, p.uploads, p.web, p.cdn),
+        None,
+        std::time::Duration::from_millis(200),
+    );
+    let fetched = fetch_authoritative_release(
+        Some(web_release(&test_source(), WEB_TAG).unwrap()),
+        &mut |asset, cap| both_down.bytes(asset, cap),
+        &channel.policy(&masters),
+    );
+    assert!(fetched.selected.is_none() && fetched.appcast_fetch_error);
+    assert!(
+        fetched.asset_unavailable && !fetched.appcast_missing,
+        "neither route serving is unavailability, never absence"
+    );
+}
+
+/// A POINTER HEAD THAT FAILED IN TRANSIT TAKES THE LATEST RELEASE'S TAG FROM THE READER: an app
+/// tag proceeds to that release; any other tag is a head with no app release.
+#[test]
+fn a_transient_pointer_head_proceeds_on_the_latest_tag_the_reader_names() {
+    let _guard = crate::STRANDED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let staging = Staging::scratch("pointer-fallback");
+    let source = test_source();
+    crate::status::clear_check_note();
+    crate::unreadable::clear();
+    let _ = std::fs::remove_file(&staging.status);
+    for (named, proceeds) in [(WEB_TAG, true), ("atpkg-index-44", false)] {
+        let mut head = |_: &str| {
+            Ok(HeadAnswer {
+                code: 504,
+                location: None,
+            })
+        };
+        let mut asked = 0;
+        let mut latest = || {
+            asked += 1;
+            Ok(named.to_string())
+        };
+        let outcome = acquire(&staging, WEB_BUILD, &source, (&mut head, &mut latest));
+        assert_eq!(asked, 1, "{named}");
+        match outcome {
+            Ok(Acquisition::Proceed(candidate)) if proceeds => {
+                assert_eq!(candidate.release.tag_name, WEB_TAG);
+            }
+            Ok(Acquisition::Ended) if !proceeds => {}
+            other => panic!("{named}: {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging.root);
+}
+
 #[test]
 fn the_pointers_tag_and_the_manifest_version_must_agree() {
     let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
@@ -2074,8 +2271,11 @@ fn the_pointers_tag_and_the_manifest_version_must_agree() {
         let name = url.rsplit('/').next().unwrap().to_string();
         channel.serve(&tag_url(WEB_TAG, &name))
     };
-    let fetched =
-        fetch_authoritative_release(Some(candidate), &mut download, &channel.policy(&masters));
+    let fetched = fetch_authoritative_release(
+        Some(candidate),
+        &mut by_url(&mut download),
+        &channel.policy(&masters),
+    );
     assert!(fetched.selected.is_none());
     assert!(
         fetched.manifest_rejected,
@@ -2105,32 +2305,42 @@ fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {
             }
             channel.serve(url)
         };
-        let fetched =
-            fetch_authoritative_release(Some(candidate), &mut download, &channel.policy(&masters));
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
+            &mut by_url(&mut download),
+            &channel.policy(&masters),
+        );
         assert!(fetched.selected.is_none(), "{missing}: refused");
         assert!(
             fetched.appcast_fetch_error,
             "{missing}: transport, not a manifest verdict"
         );
         assert!(!fetched.manifest_rejected, "{missing}");
-        assert!(!fetched.asset_fetch_rate_limited, "{missing}");
+        assert!(!fetched.asset_unavailable, "{missing}");
         assert!(fetched.attribution.is_none(), "{missing}");
         assert!(
             gets.iter().all(|u| !aterm_update_core::cdn::is_api_host(u)),
             "{gets:?}"
         );
     }
-    let mut download = |url: &str, _max: u64| {
-        if url.ends_with(aterm_update_core::roster::ROSTER_ASSET) {
-            return Err("rate limited (HTTP 429) fetching an asset".to_string());
+    let mut served = by_url(|url: &str, _max: u64| channel.serve(url));
+    let mut download = |asset: &release_asset::Asset<'_>, max: u64| {
+        if asset.name == aterm_update_core::roster::ROSTER_ASSET {
+            return Err(AssetError::Unavailable {
+                web: "HTTP 504".into(),
+                api: "HTTP 503".into(),
+            });
         }
-        channel.serve(url)
+        served(asset, max)
     };
     let candidate = web_release(&source, WEB_TAG).unwrap();
     let fetched =
         fetch_authoritative_release(Some(candidate), &mut download, &channel.policy(&masters));
     assert!(fetched.selected.is_none() && fetched.appcast_fetch_error);
-    assert!(fetched.asset_fetch_rate_limited);
+    assert!(
+        fetched.asset_unavailable,
+        "a roster neither route served is GitHub's weather, not a broken download"
+    );
 }
 
 #[test]
@@ -2188,9 +2398,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
         panic!("a retired stage forces a re-fetch: {outcome:?}");
     };
     assert_eq!(candidate.release.tag_name, WEB_TAG);
-    for asset in &candidate.release.assets {
-        assert!(!aterm_update_core::cdn::is_api_host(&asset.url));
-    }
     crate::status::clear_check_note();
     let _ = std::fs::remove_dir_all(&staging.root);
 }
@@ -2270,7 +2477,7 @@ fn a_published_release_verifies_under_the_committed_master_alone() {
     };
     let fetched = fetch_authoritative_release(
         Some(web_release(&test_source(), tag).unwrap()),
-        &mut serve(APPCAST),
+        &mut by_url(serve(APPCAST)),
         &policy(aterm_update_core::pins::PAPER_MASTER_PUBKEYS),
     );
     let (manifest, release, _) = fetched.selected.as_ref().unwrap_or_else(|| {
@@ -2293,7 +2500,7 @@ fn a_published_release_verifies_under_the_committed_master_alone() {
     let tampered: &'static [u8] = Vec::leak(tampered);
     let refused = fetch_authoritative_release(
         Some(web_release(&test_source(), tag).unwrap()),
-        &mut serve(tampered),
+        &mut by_url(serve(tampered)),
         &policy(aterm_update_core::pins::PAPER_MASTER_PUBKEYS),
     );
     assert!(refused.selected.is_none() && refused.manifest_rejected);
@@ -2308,7 +2515,7 @@ fn a_source_only_head_is_never_the_authorized_tag() {
     crate::status::clear_check_note();
     let fetched = fetch_authoritative_release(
         Some(web_release(&test_source(), WEB_TAG).unwrap()),
-        &mut |url: &str, _max: u64| Err(format!("HTTP 404: no such asset {url}")),
+        &mut by_url(|url: &str, _max: u64| Err(format!("HTTP 404: no such asset {url}"))),
         &RosterPolicy {
             master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
             floor_seq: 0,
@@ -2349,7 +2556,10 @@ fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
             }),
         })
     };
-    let outcome = acquire(&staging, WEB_BUILD, &source, &mut head);
+    let mut latest = || -> Result<String, AssetError> {
+        panic!("the latest release is read again only after the pointer's HEAD fails")
+    };
+    let outcome = acquire(&staging, WEB_BUILD, &source, (&mut head, &mut latest));
     assert!(matches!(outcome, Ok(Acquisition::Ended)), "{outcome:?}");
     assert_eq!(
         heads,
@@ -2479,10 +2689,16 @@ fn an_up_to_date_check_reclaims_a_bundle_a_stage_left_once_its_stamp_is_spent() 
     let check = || {
         write_ledger(&staging, WEB_TAG, WEB_BUILD, "alabsystems/aterm");
         let mut head = |_: &str| redirect_to(WEB_TAG);
+        let mut latest = || -> Result<String, AssetError> {
+            panic!("the latest release is read again only after the pointer's HEAD fails")
+        };
+        let reader = Reader::anonymous();
         let world = CheckWorld {
             installed_parent: None,
             staging: (*staging).clone(),
             head: &mut head,
+            latest: &mut latest,
+            reader: &reader,
             master_pubkeys: &[],
             team: "",
         };

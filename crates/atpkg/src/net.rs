@@ -5,33 +5,44 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_update_core::release_asset::{Asset, AssetError, Reader, Release};
+
 use crate::flow::VendorFetchError;
 use crate::select::Candidate;
 
-mod manifest_api;
-
-fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
-    let (owner, repo) = slug.split_once('/')?;
-    aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
+/// One release asset as atpkg names it (`atpkg-<program>-<build>`'s `pkg-<program>-<build>.toml`
+/// and the like): what a read asks the shared release-asset reader for
+/// ([`aterm_update_core::release_asset`]), which takes the web route and, when that fails, the
+/// API route. The reader is anonymous: atpkg runs on every client and holds no credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Named {
+    owner: String,
+    repo: String,
+    tag: String,
+    name: String,
 }
 
-fn web_fetch_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
-    refuse_api_host(url)?;
-    aterm_update_core::download_bytes(url, cap)
-}
-
-fn web_fetch_to(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
-    refuse_api_host(url)?;
-    aterm_update_core::download_to_resumable(url, dest, cap)
-}
-
-fn refuse_api_host(url: &str) -> Result<(), String> {
-    if aterm_update_core::cdn::is_api_host(url) {
-        let mut msg = String::from("not the release download host: ");
-        msg.push_str(url);
-        return Err(msg);
+impl Named {
+    /// Asset `name` of release `tag` in `slug`; `None` unless `slug` is `owner/repo` and every
+    /// segment is URL-safe.
+    fn new(slug: &str, tag: &str, name: &str) -> Option<Named> {
+        let asset = Asset::in_slug(slug, Release::Tag(tag), name)?;
+        Some(Named {
+            owner: asset.owner.to_string(),
+            repo: asset.repo.to_string(),
+            tag: tag.to_string(),
+            name: name.to_string(),
+        })
     }
-    Ok(())
+
+    fn asset(&self) -> Asset<'_> {
+        Asset::tagged(&self.owner, &self.repo, &self.tag, &self.name)
+    }
+
+    /// Its web route, which index discovery HEADs.
+    fn web_url(&self) -> String {
+        self.asset().web_url()
+    }
 }
 
 fn underivable(slug: &str, what: &str) -> String {
@@ -42,7 +53,8 @@ fn underivable(slug: &str, what: &str) -> String {
     msg
 }
 
-fn manifest_assets(program: &str, build: u64) -> Option<(String, String, String)> {
+/// `pkg-<program>-<build>.toml` and its `.sig` on release `atpkg-<program>-<build>` of `slug`.
+fn manifest_assets(slug: &str, program: &str, build: u64) -> Option<(Named, Named)> {
     if program.is_empty()
         || !program
             .bytes()
@@ -60,19 +72,15 @@ fn manifest_assets(program: &str, build: u64) -> Option<(String, String, String)
     name.push('-');
     name.push_str(&b);
     name.push_str(".toml");
-    let mut sig = name.clone();
-    sig.push_str(".sig");
-    Some((tag, name, sig))
-}
-
-fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
-    let (tag, name, sig) = manifest_assets(program, build)?;
-    let toml = web_asset_url(slug, &tag, &name)?;
-    let sig = web_asset_url(slug, &tag, &sig)?;
+    let toml = Named::new(slug, &tag, &name)?;
+    name.push_str(".sig");
+    let sig = Named::new(slug, &tag, &name)?;
     Some((toml, sig))
 }
 
-fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
+/// Archive `asset` on the release of its stem up to its first all-digit segment
+/// (`ty-2973-<triple>.tar.zst` is on `atpkg-ty-2973`) of `slug`.
+fn unit_asset(slug: &str, asset: &str) -> Option<Named> {
     let stem = asset.split_once('.')?.0;
     if stem.is_empty()
         || !stem
@@ -93,7 +101,7 @@ fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
     }
     let mut tag = String::from("atpkg-");
     tag.push_str(stem.get(..end?)?);
-    web_asset_url(slug, &tag, asset)
+    Named::new(slug, &tag, asset)
 }
 
 /// Byte caps bounding what an attacker-controlled asset can write.
@@ -287,10 +295,10 @@ pub fn published_index_run() -> Result<IndexHint, String> {
 #[derive(Debug)]
 struct IndexQuad {
     label: String,
-    index: String,
-    index_sig: String,
-    roster: String,
-    roster_sig: String,
+    index: Named,
+    index_sig: Named,
+    roster: Named,
+    roster_sig: Named,
 }
 
 fn index_quad(slug: &str, tag: &str) -> Option<IndexQuad> {
@@ -299,10 +307,10 @@ fn index_quad(slug: &str, tag: &str) -> Option<IndexQuad> {
     roster_sig.push_str(".sig");
     Some(IndexQuad {
         label: tag.to_string(),
-        index: web_asset_url(slug, tag, "index.toml")?,
-        index_sig: web_asset_url(slug, tag, "index.toml.sig")?,
-        roster: web_asset_url(slug, tag, roster)?,
-        roster_sig: web_asset_url(slug, tag, &roster_sig)?,
+        index: Named::new(slug, tag, "index.toml")?,
+        index_sig: Named::new(slug, tag, "index.toml.sig")?,
+        roster: Named::new(slug, tag, roster)?,
+        roster_sig: Named::new(slug, tag, &roster_sig)?,
     })
 }
 
@@ -337,24 +345,24 @@ fn fetch_run(
             )
         })
         .collect();
-    let assets: Vec<(&str, u64)> = quads
+    let assets: Vec<(&Named, u64)> = quads
         .iter()
         .zip(&cached)
         .filter(|(_, candidate)| candidate.is_none())
         .flat_map(|(quad, _)| {
             [
-                (quad.index.as_str(), MANIFEST_CAP),
-                (quad.index_sig.as_str(), SIG_CAP),
-                (quad.roster.as_str(), ROSTER_CAP),
-                (quad.roster_sig.as_str(), SIG_CAP),
+                (&quad.index, MANIFEST_CAP),
+                (&quad.index_sig, SIG_CAP),
+                (&quad.roster, ROSTER_CAP),
+                (&quad.roster_sig, SIG_CAP),
             ]
         })
         .collect();
-    let mut answers = fan_out(&assets, &|&(url, cap)| fetch(url, cap)).into_iter();
+    let mut answers = fan_out(&assets, &|&(asset, cap)| fetch(asset, cap)).into_iter();
     let mut take = || {
         answers
             .next()
-            .unwrap_or_else(|| Err(underivable(slug, "an index asset")))
+            .unwrap_or_else(|| Err(AssetError::Refused(underivable(slug, "an index asset"))))
     };
     let mut out = Vec::new();
     for (quad, cached) in quads.iter().zip(cached) {
@@ -366,9 +374,9 @@ fn fetch_run(
             Ok(candidate) => out.push(candidate),
             Err(e) => {
                 if signed_index_asset_error_is_transport(&e) {
-                    return Err(e);
+                    return Err(e.to_string());
                 }
-                first_error.get_or_insert(e);
+                first_error.get_or_insert_with(|| e.to_string());
             }
         }
     }
@@ -377,8 +385,8 @@ fn fetch_run(
 
 fn whole_quad(
     label: &str,
-    [index, index_sig, roster, roster_sig]: [Result<Vec<u8>, String>; 4],
-) -> Result<Candidate, String> {
+    [index, index_sig, roster, roster_sig]: [Result<Vec<u8>, AssetError>; 4],
+) -> Result<Candidate, AssetError> {
     Ok(Candidate {
         label: label.to_string(),
         index_bytes: index?,
@@ -450,9 +458,7 @@ impl Heads for Wire {
 
 type HeadFn<'a> = dyn Heads + 'a;
 
-type WebFetch<'a> = dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Sync + 'a;
-
-type ManifestFetch<'a> = dyn Fn(&str, &str, u64) -> Result<(Vec<u8>, Vec<u8>), String> + Sync + 'a;
+type WebFetch<'a> = dyn Fn(&Named, u64) -> Result<Vec<u8>, AssetError> + Sync + 'a;
 
 /// `Err(message, link_down, transport_failed)` for one freshness probe.
 type HeadVerdict = Result<bool, (String, bool, bool)>;
@@ -464,7 +470,9 @@ fn head_verdict(slug: &str, build: u64, head: &HeadFn<'_>) -> HeadVerdict {
 
 fn index_head_url(slug: &str, build: u64) -> Result<String, (String, bool, bool)> {
     let tag = index_tag(build);
-    web_asset_url(slug, &tag, "index.toml").ok_or_else(|| (underivable(slug, &tag), false, false))
+    Named::new(slug, &tag, "index.toml")
+        .map(|index| index.web_url())
+        .ok_or_else(|| (underivable(slug, &tag), false, false))
 }
 
 fn read_head_answer(
@@ -688,13 +696,21 @@ pub struct GithubFetcher {
     /// Per-invocation memo of the raw `(pkg-<program>-<build>.toml, .sig)` bytes, keyed by
     /// `(slug, program, build)`.
     manifests: ManifestMemo,
-    /// One whole manifest-pair API fallback per fetcher, claimed before native requests and
-    /// never refunded. Normal web reads and successful manifest memo hits consume none.
-    manifest_api_used: std::sync::atomic::AtomicBool,
     /// The LAN peers an archive download races ([`crate::peers::unit_peers`]: `[packages]
     /// peers`, else this machine's fleet members; [`crate::peers::race`]).
     unit_peers: Vec<String>,
+    /// Every asset read of this invocation: anonymous, web route first, API route when the web
+    /// route fails, one patience for the whole pass, and at most [`API_RELEASES`] releases
+    /// listed on the API route.
+    reader: Reader,
 }
+
+/// The releases one fetcher may list on the API route. Its reads are anonymous and draw on the
+/// allowance every machine behind this address shares (60 an hour); a fallback for every
+/// failing program once emptied it. One release keeps a pass's recovery to one package (its
+/// manifest pair and archive, which share a release) or the index, never one per program.
+/// Claimed before the listing and never given back; reads the web route serves cost nothing.
+const API_RELEASES: u32 = 1;
 
 impl GithubFetcher {
     /// A fetcher for `owner`'s public releases.
@@ -711,9 +727,37 @@ impl GithubFetcher {
             transport_failed: std::sync::atomic::AtomicBool::new(false),
             walk_cost: Default::default(),
             manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            manifest_api_used: std::sync::atomic::AtomicBool::new(false),
             unit_peers: Vec::new(),
+            reader: Reader::anonymous().api_releases(API_RELEASES),
         }
+    }
+
+    /// Read every asset through `reader` (a loopback fixture's), bounded as [`Self::new`]'s.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_reader(mut self, reader: Reader) -> Self {
+        self.reader = reader.api_releases(API_RELEASES);
+        self
+    }
+
+    /// The bytes of `asset`, at most `cap`.
+    fn read(&self, asset: &Named, cap: u64) -> Result<Vec<u8>, AssetError> {
+        self.reader.bytes(&asset.asset(), cap)
+    }
+
+    /// `asset` into `dest`, at most `cap` bytes, ending early once `stop` is set.
+    fn read_to(
+        &self,
+        asset: &Named,
+        dest: &Path,
+        cap: u64,
+        stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        match stop {
+            Some(stop) => self.reader.to_file_until(&asset.asset(), dest, cap, stop),
+            None => self.reader.to_file(&asset.asset(), dest, cap),
+        }
+        .map_err(|e| e.to_string())
     }
 
     /// Race each archive download against `peers`, LAN peers that may hold its unit
@@ -773,7 +817,6 @@ impl GithubFetcher {
         program: &str,
         build: u64,
         fetch: &WebFetch<'_>,
-        api: &ManifestFetch<'_>,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let slug = self.slug_for(program, repo);
         let key = (slug.clone(), program.to_string(), build);
@@ -782,36 +825,27 @@ impl GithubFetcher {
         {
             return Ok((**hit).clone());
         }
-        let (toml_url, sig_url) = direct_manifest_urls(&slug, program, build)
-            .ok_or_else(|| underivable(&slug, program))?;
-        let (tag, toml_name, sig_name) =
-            manifest_assets(program, build).ok_or_else(|| underivable(&slug, program))?;
-        // This seam acquires bytes only. Verification/parser errors happen
-        // downstream and must never select another transport. If either web
-        // half fails, acquire BOTH exact assets through the native API owner.
-        let pair = (|| {
-            let urls = [(toml_url.as_str(), MANIFEST_CAP), (sig_url.as_str(), SIG_CAP)];
-            let mut fetched = fan_out_upto(&urls, 2, &|&(url, cap)| fetch(url, cap)).into_iter();
-            let toml = fetched.next().expect("manifest request has a result")
-                .map_err(|error| format!("{program} build {build} package manifest on {slug} tag {tag} asset {toml_name}: {error}"))?;
-            let sig = fetched.next().expect("signature request has a result")
-                .map_err(|error| format!("{program} build {build} package signature on {slug} tag {tag} asset {sig_name}: {error}"))?;
-            Ok((toml, sig))
-        })()
-            .or_else(|web: String| {
-                if self.manifest_api_used.compare_exchange(
-                    false, true, std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                ).is_err() {
-                    return Err(format!(
-                        "package metadata web fetch failed: {web}; this fetcher's one manifest-pair API fallback is already spent"
-                    ));
-                }
-                api(&slug, program, build).map_err(|api| {
-                    format!("package metadata web fetch failed: {web}; API fetch failed: {api}")
+        let (toml, sig) =
+            manifest_assets(&slug, program, build).ok_or_else(|| underivable(&slug, program))?;
+        // Bytes only: signature and parser verdicts come downstream and never select another
+        // route. Both halves start in one wave; each rides the download host's outages on the
+        // API route inside the reader.
+        let halves = [(&toml, MANIFEST_CAP), (&sig, SIG_CAP)];
+        let mut fetched = fan_out_upto(&halves, 2, &|&(asset, cap)| fetch(asset, cap)).into_iter();
+        let mut half = |what: &str, asset: &Named| {
+            fetched
+                .next()
+                .expect("each half has a result")
+                .map_err(|why| {
+                    format!(
+                        "{program} build {build} package {what} on {slug} tag {} asset {}: {why}",
+                        asset.tag, asset.name
+                    )
                 })
-            })?;
-        let pair = std::sync::Arc::new(pair);
+        };
+        let raw = half("manifest", &toml)?;
+        let signature = half("signature", &sig)?;
+        let pair = std::sync::Arc::new((raw, signature));
         if let Ok(mut memo) = self.manifests.lock() {
             memo.insert(key, std::sync::Arc::clone(&pair));
         }
@@ -819,7 +853,7 @@ impl GithubFetcher {
     }
 
     fn prefetch_with(&self, pins: &[(String, String, u64)], fetch: &WebFetch<'_>) {
-        let mut wanted: Vec<(ManifestKey, String, String)> = Vec::new();
+        let mut wanted: Vec<(ManifestKey, Named, Named)> = Vec::new();
         for (repo, program, build) in pins {
             let slug = self.slug_for(program, repo);
             let key = (slug, program.clone(), *build);
@@ -830,16 +864,16 @@ impl GithubFetcher {
             if held || wanted.iter().any(|(k, ..)| *k == key) {
                 continue;
             }
-            if let Some((toml, sig)) = direct_manifest_urls(&key.0, program, *build) {
+            if let Some((toml, sig)) = manifest_assets(&key.0, program, *build) {
                 wanted.push((key, toml, sig));
             }
         }
-        let urls: Vec<(&str, u64)> = wanted
+        let assets: Vec<(&Named, u64)> = wanted
             .iter()
-            .flat_map(|(_, toml, sig)| [(toml.as_str(), MANIFEST_CAP), (sig.as_str(), SIG_CAP)])
+            .flat_map(|(_, toml, sig)| [(toml, MANIFEST_CAP), (sig, SIG_CAP)])
             .collect();
         let mut fetched =
-            fan_out_upto(&urls, MANIFEST_WAVE, &|&(url, cap)| fetch(url, cap)).into_iter();
+            fan_out_upto(&assets, MANIFEST_WAVE, &|&(asset, cap)| fetch(asset, cap)).into_iter();
         for (key, ..) in wanted {
             if let (Some(Ok(toml)), Some(Ok(sig))) = (fetched.next(), fetched.next())
                 && let Ok(mut memo) = self.manifests.lock()
@@ -863,12 +897,12 @@ impl GithubFetcher {
         for count in &self.walk_cost {
             count.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        let counted = |url: &str, cap: u64| {
+        let counted = |asset: &Named, cap: u64| {
             gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let answer = fetch(url, cap);
+            let answer = fetch(asset, cap);
             if answer
                 .as_ref()
-                .is_err_and(|error| signed_index_asset_error_is_transport(error))
+                .is_err_and(signed_index_asset_error_is_transport)
             {
                 self.transport_failed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -969,7 +1003,9 @@ impl crate::flow::Fetcher for GithubFetcher {
         {
             return Ok((**hit).clone());
         }
-        let walked = self.walk_candidates(&self.index_slug(), &Wire, &web_fetch_bytes);
+        let walked = self.walk_candidates(&self.index_slug(), &Wire, &|asset, cap| {
+            self.read(asset, cap)
+        });
         let [heads, rounds, gets] = self
             .walk_cost
             .each_ref()
@@ -1043,11 +1079,11 @@ impl crate::flow::Fetcher for GithubFetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.manifest_pair(repo, program, build, &web_fetch_bytes, &manifest_api::fetch)
+        self.manifest_pair(repo, program, build, &|asset, cap| self.read(asset, cap))
     }
 
     fn prefetch_manifests(&self, pins: &[(String, String, u64)]) {
-        self.prefetch_with(pins, &web_fetch_bytes);
+        self.prefetch_with(pins, &|asset, cap| self.read(asset, cap));
     }
 
     fn shared(&self) -> Option<&(dyn crate::flow::Fetcher + Sync)> {
@@ -1056,8 +1092,8 @@ impl crate::flow::Fetcher for GithubFetcher {
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
         let slug = self.slug_of(repo);
-        let url = direct_asset_url(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
-        web_fetch_to(&url, dest, ARTIFACT_CAP)
+        let named = unit_asset(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
+        self.read_to(&named, dest, ARTIFACT_CAP, None)
     }
 
     fn download_for(
@@ -1069,8 +1105,8 @@ impl crate::flow::Fetcher for GithubFetcher {
         cap: u64,
     ) -> Result<(), String> {
         let slug = self.slug_for(program, repo);
-        let url = direct_asset_url(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
-        web_fetch_to(&url, dest, artifact_cap(cap))
+        let named = unit_asset(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
+        self.read_to(&named, dest, artifact_cap(cap), None)
     }
 
     fn download_unit(
@@ -1081,24 +1117,27 @@ impl crate::flow::Fetcher for GithubFetcher {
         dest: &Path,
     ) -> Result<(), String> {
         let slug = self.slug_for(program, repo);
-        let url = direct_asset_url(&slug, &artifact.asset)
+        let named = unit_asset(&slug, &artifact.asset)
             .ok_or_else(|| underivable(&slug, &artifact.asset))?;
         let cap = artifact_cap(artifact.size);
         if self.unit_peers.is_empty() {
-            return web_fetch_to(&url, dest, cap);
+            return self.read_to(&named, dest, cap, None);
         }
-        refuse_api_host(&url)?;
         crate::peers::race(
             &self.unit_peers,
             &artifact.sha256,
             artifact.size,
             dest,
-            |dest, stop| aterm_update_core::download_to_resumable_until(&url, dest, cap, stop),
+            |dest, stop| self.read_to(&named, dest, cap, Some(stop)),
         )
     }
 
     fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
-        aterm_update_core::download_to_resumable_https_only(url, dest, cap)
+        // A vendor URL that names a GitHub release asset is read as one, so it rides the
+        // download host's outages on the API route; any other URL is the vendor's own.
+        self.reader
+            .to_file_at(url, dest, cap)
+            .map_err(|e| e.to_string())
     }
 
     fn vendor_get(
@@ -1148,14 +1187,13 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 }
 
-/// An immutable index asset's read failed in transport rather than receiving the exact 404
-/// source verdict. URL-construction refusals are local/source errors; rate limits and HTTP 5xx
-/// are transport availability failures even though the host answered.
-fn signed_index_asset_error_is_transport(error: &str) -> bool {
-    !aterm_update_core::download_error_is_not_found(error)
-        && !error.starts_with("refusing asset URL with non-https scheme")
-        && !error.starts_with("not the release download host")
-        && !error.starts_with("no release download URL derives")
+/// An immutable index asset's read failed in transport: neither route delivered it
+/// ([`AssetError::Unavailable`]), which a rate limit or an HTTP 5xx is even though a host
+/// answered. The source's 404 ([`AssetError::Absent`]) and a refusal here
+/// ([`AssetError::Refused`]: an underivable or unsafe name, an asset over its cap, a host that
+/// refuses) are verdicts.
+const fn signed_index_asset_error_is_transport(error: &AssetError) -> bool {
+    matches!(error, AssetError::Unavailable { .. })
 }
 
 /// The §14 cache key of the GitHub source under `owner`.
@@ -1318,94 +1356,34 @@ impl crate::flow::Fetcher for DirFetcher {
 #[cfg(test)]
 mod index_publish_conformance;
 
+/// A test's fetch of a URL, at most a cap of bytes.
+#[cfg(test)]
+type UrlFetch<'a> = dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Sync + 'a;
+
+/// A test's URL-keyed fetch as the asset-keyed one the walk and the manifest reads take: each
+/// asset by its web route, and each failure as the reader reports it: a fixture's `HTTP 404`
+/// answer is the asset absent, any other failure the read unavailable on both routes.
+#[cfg(test)]
+fn by_url<'a>(
+    fetch: &'a UrlFetch<'a>,
+) -> impl Fn(&Named, u64) -> Result<Vec<u8>, AssetError> + Sync + 'a {
+    move |asset: &Named, cap: u64| {
+        fetch(&asset.web_url(), cap).map_err(|why| {
+            if why.starts_with("HTTP 404") {
+                AssetError::Absent(why)
+            } else {
+                AssetError::Unavailable {
+                    web: why,
+                    api: "this fixture serves no API route".into(),
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn manifest_web_success_never_calls_api() {
-        let f = GithubFetcher::new("alabsystems".into());
-        let web = |url: &str, cap| {
-            assert_eq!(
-                cap,
-                if url.ends_with(".sig") {
-                    SIG_CAP
-                } else {
-                    MANIFEST_CAP
-                }
-            );
-            Ok(url.as_bytes().to_vec())
-        };
-        let api = |_: &str, _: &str, _: u64| panic!("successful web pair must not call API");
-        let (raw, sig) = f.manifest_pair("aterm", "cpython", 1, &web, &api).unwrap();
-        assert!(raw.ends_with(b"pkg-cpython-1.toml"));
-        assert!(sig.ends_with(b"pkg-cpython-1.toml.sig"));
-        let unavailable_web = |_: &str, _: u64| Err("HTTP 504".to_string());
-        let fallback = |_: &str, _: &str, _: u64| Ok((b"toml".to_vec(), b"sig".to_vec()));
-        assert_eq!(
-            f.manifest_pair("aterm", "lean", 3, &unavailable_web, &fallback)
-                .unwrap(),
-            (b"toml".to_vec(), b"sig".to_vec()),
-            "the successful web pair left the fallback allowance available"
-        );
-    }
-
-    #[test]
-    fn concurrent_manifest_failures_share_one_api_pair_allowance() {
-        let f = GithubFetcher::new("alabsystems".into());
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = std::sync::Mutex::new(release_rx);
-        let hang = std::time::Duration::from_secs(60);
-        let web = |_: &str, _: u64| {
-            ready_tx.send(()).map_err(|error| error.to_string())?;
-            release_rx
-                .lock()
-                .map_err(|error| error.to_string())?
-                .recv_timeout(hang)
-                .map_err(|error| error.to_string())?;
-            Err("HTTP 504".to_string())
-        };
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let api = |_: &str, _: &str, _: u64| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok((b"toml".to_vec(), b"sig".to_vec()))
-        };
-        let (ready, results) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| f.manifest_pair("aterm", "cpython", 1, &web, &api));
-            let second = scope.spawn(|| f.manifest_pair("aterm", "lean", 3, &web, &api));
-            // Each of the two requests starts both web halves in the same wave.
-            let ready = std::array::from_fn::<_, 4, _>(|_| ready_rx.recv_timeout(hang));
-            for _ in 0..4 {
-                let _ = release_tx.send(());
-            }
-            (ready, [first.join().unwrap(), second.join().unwrap()])
-        });
-        assert!(ready.iter().all(Result::is_ok));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        let refused = results.into_iter().find_map(Result::err).unwrap();
-        assert!(refused.contains("HTTP 504") && refused.contains("already spent"));
-    }
-
-    #[test]
-    fn a_failed_manifest_api_pair_does_not_refund_the_allowance() {
-        let f = GithubFetcher::new("alabsystems".into());
-        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let api = |_: &str, _: &str, _: u64| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err("API denied".to_string())
-        };
-        let first = f
-            .manifest_pair("aterm", "cpython", 1, &web, &api)
-            .unwrap_err();
-        let second = f.manifest_pair("aterm", "lean", 3, &web, &api).unwrap_err();
-        assert!(first.contains("API denied"));
-        assert!(second.contains("HTTP 504") && second.contains("already spent"));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(f.manifests.lock().unwrap().is_empty());
-    }
 
     #[test]
     fn a_repository_override_has_a_distinct_durable_artifact_namespace() {
@@ -1435,7 +1413,8 @@ mod tests {
                 Ok(url.as_bytes().to_vec())
             }
         };
-        let error = fetch_run(slug, (2, 1), &fetch, None, None, &mut first_error).unwrap_err();
+        let error =
+            fetch_run(slug, (2, 1), &by_url(&fetch), None, None, &mut first_error).unwrap_err();
         assert!(error.contains("HTTP 504"), "{error}");
 
         let mut first_error = None;
@@ -1446,7 +1425,8 @@ mod tests {
                 Ok(url.as_bytes().to_vec())
             }
         };
-        let candidates = fetch_run(slug, (2, 1), &absent, None, None, &mut first_error).unwrap();
+        let candidates =
+            fetch_run(slug, (2, 1), &by_url(&absent), None, None, &mut first_error).unwrap();
         assert_eq!(
             candidates
                 .iter()
@@ -1458,85 +1438,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_partial_web_failure_reacquires_exact_whole_pair_and_memoizes_bytes() {
-        let mut overrides = std::collections::BTreeMap::new();
-        overrides.insert("cpython".into(), "alabsystems/aterm".into());
-        let f = GithubFetcher::new("fixture".into()).with_overrides(overrides);
-        let web = |url: &str, _| {
-            if url.ends_with(".sig") {
-                Err("HTTP 504".into())
-            } else {
-                Ok(b"web half".to_vec())
-            }
-        };
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let api = |slug: &str, program: &str, build| {
-            assert_eq!((slug, program, build), ("alabsystems/aterm", "cpython", 1));
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok((b"API toml".to_vec(), b"API sig".to_vec()))
-        };
-        let expected = (b"API toml".to_vec(), b"API sig".to_vec());
-        assert_eq!(
-            f.manifest_pair("ignored", "cpython", 1, &web, &api)
-                .unwrap(),
-            expected
-        );
-        let no_web = |_: &str, _: u64| panic!("memoized pair must not refetch");
-        assert_eq!(
-            f.manifest_pair("ignored", "cpython", 1, &no_web, &api)
-                .unwrap(),
-            expected
-        );
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn manifest_api_bytes_do_not_grant_signature_trust_or_trigger_crypto_fallback() {
-        use crate::sig::testkit;
-        let f = GithubFetcher::new("alabsystems".into());
-        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let api = |_: &str, _: &str, _: u64| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok((b"untrusted metadata".to_vec(), vec![0; 64]))
-        };
-        let index = testkit::trusted_index_at(
-            testkit::SEQ,
-            format!(
-                "schema = 2\nindex_build = 47\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
-             machine_id = \"{}\"\nroster_seq = {}\n[programs.cpython]\nrepo = \"aterm\"\n",
-                testkit::MACHINE_ID,
-                testkit::SEQ
-            )
-            .into_bytes(),
-        );
-        let (raw, sig) = f.manifest_pair("aterm", "cpython", 1, &web, &api).unwrap();
-        assert!(index.verify_pkg(raw, &sig).is_err());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn manifest_failed_api_keeps_both_errors_and_invalid_identity_never_fetches() {
-        let f = GithubFetcher::new("alabsystems".into());
-        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
-        let api = |_: &str, _: &str, _: u64| Err("API denied".to_string());
-        let error = f
-            .manifest_pair("aterm", "cpython", 1, &web, &api)
-            .unwrap_err();
-        assert!(error.contains("HTTP 504") && error.contains("API denied"));
-        assert!(error.contains("alabsystems/aterm tag atpkg-cpython-1 asset pkg-cpython-1.toml"));
-        assert!(f.manifests.lock().unwrap().is_empty());
-        let no_web = |_: &str, _: u64| panic!("invalid identity must not fetch");
-        let no_api = |_: &str, _: &str, _: u64| panic!("invalid identity must not fetch");
-        assert!(
-            f.manifest_pair("aterm", "../cpython", 1, &no_web, &no_api)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn direct_urls_match_the_publishing_tag_convention() {
-        let (toml, sig) = super::direct_manifest_urls("alabsystems/ty", "ty", 2973).unwrap();
+        let (toml, sig) = super::manifest_assets("alabsystems/ty", "ty", 2973).unwrap();
+        let (toml, sig) = (toml.web_url(), sig.web_url());
         assert_eq!(
             toml,
             "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/pkg-ty-2973.toml"
@@ -1546,16 +1450,21 @@ mod tests {
             "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/pkg-ty-2973.toml.sig"
         );
         assert_eq!(
-            super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst").unwrap(),
+            super::unit_asset("alabsystems/ty", "ty-2973.tar.zst")
+                .unwrap()
+                .web_url(),
             "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
         );
         assert_eq!(
-            super::direct_asset_url("alabsystems/trust-mc", "trust-mc-20011.tar.zst").unwrap(),
+            super::unit_asset("alabsystems/trust-mc", "trust-mc-20011.tar.zst")
+                .unwrap()
+                .web_url(),
             "https://github.com/alabsystems/trust-mc/releases/download/atpkg-trust-mc-20011/trust-mc-20011.tar.zst"
         );
         assert!(
-            !super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst")
+            !super::unit_asset("alabsystems/ty", "ty-2973.tar.zst")
                 .unwrap()
+                .web_url()
                 .contains(".tar/")
         );
     }
@@ -1590,12 +1499,14 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::direct_asset_url(slug, asset).as_deref(),
+                super::unit_asset(slug, asset)
+                    .map(|a| a.web_url())
+                    .as_deref(),
                 Some(format!("https://github.com/{slug}/releases/download/{tag}/{asset}").as_str()),
                 "{asset}"
             );
         }
-        assert!(super::direct_asset_url("alabsystems/ty", "ty-latest.tar.zst").is_none());
+        assert!(super::unit_asset("alabsystems/ty", "ty-latest.tar.zst").is_none());
     }
 
     #[test]
@@ -1610,26 +1521,27 @@ mod tests {
             "https://evil.com/a",
         ] {
             assert!(
-                super::direct_manifest_urls(bad, "ty", 1).is_none(),
+                super::manifest_assets(bad, "ty", 1).is_none(),
                 "manifest URL built from unsafe slug {bad:?}"
             );
             assert!(
-                super::direct_asset_url(bad, "ty-1.tar.zst").is_none(),
+                super::unit_asset(bad, "ty-1.tar.zst").is_none(),
                 "asset URL built from unsafe slug {bad:?}"
             );
         }
-        assert!(super::direct_manifest_urls("a/b", "../ty", 1).is_none());
-        assert!(super::direct_manifest_urls("a/b", "", 1).is_none());
-        assert!(super::direct_asset_url("a/b", "../x.tar.zst").is_none());
-        assert!(super::direct_asset_url("a/b", "noextension").is_none());
+        assert!(super::manifest_assets("a/b", "../ty", 1).is_none());
+        assert!(super::manifest_assets("a/b", "", 1).is_none());
+        assert!(super::unit_asset("a/b", "../x.tar.zst").is_none());
+        assert!(super::unit_asset("a/b", "noextension").is_none());
         for tag in ["v1?x", "v1#x", "v1%2f", "v 1", "", ".."] {
             assert!(
-                super::web_asset_url("a/b", tag, "index.toml").is_none(),
+                super::Named::new("a/b", tag, "index.toml").is_none(),
                 "{tag:?}"
             );
         }
         assert_eq!(
-            super::web_asset_url("alabsystems/atpkg-index", "atpkg-index-41", "index.toml")
+            super::Named::new("alabsystems/atpkg-index", "atpkg-index-41", "index.toml")
+                .map(|a| a.web_url())
                 .as_deref(),
             Some(
                 "https://github.com/alabsystems/atpkg-index/releases/download/atpkg-index-41/index.toml"
@@ -1653,15 +1565,153 @@ mod tests {
     }
 
     #[test]
-    fn direct_fetches_present_no_credential_to_the_web_host() {
-        let api = "https://api.github.com/repos/alabsystems/ty/releases/assets/1";
-        let web =
+    fn the_fetcher_reads_through_the_api_route_when_the_web_route_answers_504() {
+        use crate::flow::Fetcher as _;
+        use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+        let fake = FakeGithub::start();
+        fake.add_repo("alabsystems/ty", RepoSpec::public().push("alabsystems-bot"));
+        let id = fake.add_release(
+            "alabsystems/ty",
+            ReleaseSpec::published("atpkg-ty-2973", "2026-10-01T00:00:00Z"),
+        );
+        for (name, bytes) in [
+            ("pkg-ty-2973.toml", &b"manifest"[..]),
+            ("pkg-ty-2973.toml.sig", b"signature"),
+            ("ty-2973.tar.zst", b"archive"),
+        ] {
+            fake.add_asset(id, AssetSpec::uploaded(name, bytes));
+        }
+        let gateway_timeout = || Fault::Status {
+            status: 504,
+            body: String::new(),
+            headers: Vec::new(),
+        };
+        fake.fault_always(Match::web("/alabsystems/ty/releases/"), gateway_timeout());
+        let p = fake.ports();
+        let origins =
+            aterm_update_core::github_rest::Origins::loopback(p.api, p.uploads, p.web, p.cdn);
+        let f = GithubFetcher::new("alabsystems".into()).with_reader(Reader::loopback(
+            origins.clone(),
+            None,
+            aterm_spec::wait::MUST_HAPPEN,
+        ));
+        assert_eq!(
+            f.pkg_manifest("ty", "ty", 2973),
+            Ok((b"manifest".to_vec(), b"signature".to_vec()))
+        );
+        let dir = crate::testdir::dir("atpkg-api-route-");
+        let dest = dir.join("ty-2973.tar.zst");
+        f.download_for("ty", "ty", "ty-2973.tar.zst", &dest, 7)
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"archive");
+        // A vendor URL naming a release asset is read the same way.
+        let vendor = dir.join("vendor.tar.zst");
+        let url =
             "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst";
-        let dest = std::env::temp_dir().join("atpkg-web-fetch-gate");
-        assert!(super::web_fetch_bytes(api, 1024).is_err());
-        assert!(super::web_fetch_to(api, &dest, 1024).is_err());
-        assert!(super::refuse_api_host(web).is_ok());
-        assert!(!dest.exists(), "nothing was spawned");
+        f.download_url(url, &vendor, 7).unwrap();
+        assert_eq!(std::fs::read(&vendor).unwrap(), b"archive");
+        // Negative control: a URL that is not github.com's release route stays the vendor's
+        // own (and plain http is refused before any request).
+        let asked = fake.seen().len();
+        let plain = dir.join("plain");
+        assert!(
+            f.download_url(&url.replacen("https", "http", 1), &plain, 7)
+                .is_err()
+        );
+        assert_eq!(fake.seen().len(), asked, "the reader was not asked");
+        let seen = fake.seen();
+        assert!(
+            seen.iter().any(|s| s.origin == FakeOrigin::Web),
+            "the web route was asked first"
+        );
+        assert!(
+            seen.iter().all(|s| !s.had_authorization),
+            "atpkg reads anonymously on every route"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|s| s.path_and_query == "/repos/alabsystems/ty/releases/tags/atpkg-ty-2973")
+                .count(),
+            1,
+            "one listing of the release served the pass"
+        );
+        fake.fault_always(
+            Match::api("/repos/alabsystems/ty/releases/"),
+            gateway_timeout(),
+        );
+        let both_down = GithubFetcher::new("alabsystems".into()).with_reader(Reader::loopback(
+            origins,
+            None,
+            std::time::Duration::from_millis(200),
+        ));
+        let err = both_down.pkg_manifest("ty", "ty", 2973).unwrap_err();
+        assert!(
+            err.contains("web route") && err.contains("API route"),
+            "with both routes down the read names both: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_packages_share_one_release_of_api_recovery() {
+        use crate::flow::Fetcher as _;
+        use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+        let fake = FakeGithub::start();
+        for program in ["ty", "ay"] {
+            let slug = format!("alabsystems/{program}");
+            fake.add_repo(&slug, RepoSpec::public().push("alabsystems-bot"));
+            let id = fake.add_release(
+                &slug,
+                ReleaseSpec::published(&format!("atpkg-{program}-7"), "2026-10-01T00:00:00Z"),
+            );
+            fake.add_asset(
+                id,
+                AssetSpec::uploaded(&format!("pkg-{program}-7.toml"), b"m"),
+            );
+            fake.add_asset(
+                id,
+                AssetSpec::uploaded(&format!("pkg-{program}-7.toml.sig"), b"s"),
+            );
+            fake.fault_always(
+                Match::web(&format!("/{slug}/releases/")),
+                Fault::Status {
+                    status: 504,
+                    body: String::new(),
+                    headers: Vec::new(),
+                },
+            );
+        }
+        let p = fake.ports();
+        let origins =
+            aterm_update_core::github_rest::Origins::loopback(p.api, p.uploads, p.web, p.cdn);
+        let f = GithubFetcher::new("alabsystems".into()).with_reader(Reader::loopback(
+            origins,
+            None,
+            std::time::Duration::from_secs(2),
+        ));
+        let got: Vec<Result<_, String>> = std::thread::scope(|s| {
+            let both = ["ty", "ay"].map(|program| {
+                let f = &f;
+                s.spawn(move || f.pkg_manifest(program, program, 7))
+            });
+            both.map(|h| h.join().expect("no panic")).into()
+        });
+        assert_eq!(
+            got.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "one package recovered: {got:?}"
+        );
+        let refused = got
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one refused");
+        assert!(refused.contains("is spent"), "{refused}");
+        let listings = fake
+            .seen()
+            .into_iter()
+            .filter(|s| s.origin == FakeOrigin::Api && s.path_and_query.contains("/releases/tags/"))
+            .count();
+        assert_eq!(listings, 1, "one release listed for the pass");
     }
 
     #[test]
@@ -1869,7 +1919,9 @@ mod tests {
         );
         assert!(!dest.exists(), "nothing was fetched");
         assert_eq!(
-            direct_asset_url(&f.slug_for("ty", "ty"), "ty-2973.tar.zst").as_deref(),
+            unit_asset(&f.slug_for("ty", "ty"), "ty-2973.tar.zst")
+                .map(|a| a.web_url())
+                .as_deref(),
             Some(
                 "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
             ),
@@ -1948,7 +2000,9 @@ mod tests {
                     "index discovery on {slug} found no end within {WALK_HEAD_BUDGET} HEADs"
                 ));
             }
-            let url = web_asset_url(slug, &index_tag(build), "index.toml").expect("derivable");
+            let url = Named::new(slug, &index_tag(build), "index.toml")
+                .expect("derivable")
+                .web_url();
             let answer = head(&url).map_err(|e| {
                 *link_down |= matches!(e, aterm_update_core::HttpError::Transport(_));
                 format!("HEAD {url}: {e}")
@@ -1970,10 +2024,10 @@ mod tests {
                 let mut fetch_quad = || -> Result<Candidate, String> {
                     Ok(Candidate {
                         label: quad.label.clone(),
-                        index_bytes: fetch(&quad.index, MANIFEST_CAP)?,
-                        sig: fetch(&quad.index_sig, SIG_CAP)?,
-                        roster_bytes: fetch(&quad.roster, ROSTER_CAP)?,
-                        roster_sig: fetch(&quad.roster_sig, SIG_CAP)?,
+                        index_bytes: fetch(&quad.index.web_url(), MANIFEST_CAP)?,
+                        sig: fetch(&quad.index_sig.web_url(), SIG_CAP)?,
+                        roster_bytes: fetch(&quad.roster.web_url(), ROSTER_CAP)?,
+                        roster_sig: fetch(&quad.roster_sig.web_url(), SIG_CAP)?,
                     })
                 };
                 match fetch_quad() {
@@ -2044,10 +2098,10 @@ mod tests {
                     headed.lock().unwrap().push(url.to_string());
                     answer(walked_build(url))
                 },
-                &|url: &str, _cap: u64| {
+                &by_url(&|url: &str, _cap: u64| {
                     fetched.lock().unwrap().push(url.to_string());
                     download(url)
-                },
+                }),
             )
             .map(|candidates| candidates.into_iter().map(|c| c.label).collect::<Vec<_>>());
         let mut heads = Vec::new();
@@ -2114,7 +2168,7 @@ mod tests {
             .iter()
             .flat_map(|b| {
                 let q = index_quad("alabsystems/aterm", &index_tag(*b)).unwrap();
-                [q.index, q.index_sig, q.roster, q.roster_sig]
+                [q.index, q.index_sig, q.roster, q.roster_sig].map(|a| a.web_url())
             })
             .collect();
         urls.sort();
@@ -2359,7 +2413,7 @@ mod tests {
                 "curl: (6) Could not resolve host".into(),
             ))
         };
-        assert!(f.walk_candidates(&slug, &dead, &fetch).is_err());
+        assert!(f.walk_candidates(&slug, &dead, &by_url(&fetch)).is_err());
         assert!(f.index_link_down());
         let busy = |_: &str| {
             Ok(aterm_update_core::HeadAnswer {
@@ -2367,7 +2421,7 @@ mod tests {
                 location: None,
             })
         };
-        assert!(f.walk_candidates(&slug, &busy, &fetch).is_err());
+        assert!(f.walk_candidates(&slug, &busy, &by_url(&fetch)).is_err());
         assert!(!f.index_link_down(), "a host answered this walk");
     }
 
@@ -2449,7 +2503,7 @@ mod tests {
                         absent()
                     }
                 },
-                &|url: &str, _cap: u64| {
+                &by_url(&|url: &str, _cap: u64| {
                     asset_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if assets_fail.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err("exact release transport is blocked".into());
@@ -2490,7 +2544,7 @@ mod tests {
                         "aterm-machines.toml" => roster,
                         _ => testkit::sign(&testkit::MASTER_SEED, &roster),
                     })
-                },
+                }),
             )
         }
         fn index_link_down(&self) -> bool {
@@ -2957,7 +3011,9 @@ mod tests {
             };
             let dead = |_| Err(refused());
             let heads = ScriptedHeads::new(&unreached, &dead);
-            let err = f.walk_candidates(&slug, &heads, &fetch).unwrap_err();
+            let err = f
+                .walk_candidates(&slug, &heads, &by_url(&fetch))
+                .unwrap_err();
             assert!(err.contains("Failed to connect"), "{err}");
             assert!(f.index_link_down(), "from {floor}");
             assert_eq!(heads.downs.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -2980,7 +3036,7 @@ mod tests {
             };
             let heads = ScriptedHeads::new(&one_unreached, &up);
             let labels = f
-                .walk_candidates(&slug, &heads, &fetch)
+                .walk_candidates(&slug, &heads, &by_url(&fetch))
                 .map(|c| c.into_iter().map(|c| c.label).collect::<Vec<_>>());
             assert_eq!(labels, walk(floor, &up, &[]).labels, "from {floor}");
             assert_eq!(ScriptedHeads::sorted(&heads.agains), vec![lone]);
@@ -2994,7 +3050,7 @@ mod tests {
                 cause: aterm_types::http_retry::Cause::Timeout,
             };
             let heads = ScriptedHeads::new(&timed_out, &up);
-            assert!(f.walk_candidates(&slug, &heads, &fetch).is_ok());
+            assert!(f.walk_candidates(&slug, &heads, &by_url(&fetch)).is_ok());
             assert_eq!(
                 ScriptedHeads::sorted(&heads.agains),
                 ScriptedHeads::sorted(&heads.firsts),
@@ -3149,21 +3205,44 @@ mod tests {
                 Ok(url.as_bytes().to_vec())
             }
         };
-        let no_api = |_: &str, _: &str, _: u64| panic!("successful web pair must not use API");
-        let pair = f.manifest_pair("ay", "ay", 8256, &wire, &no_api).unwrap();
-        let (toml, sig) = direct_manifest_urls("alabsystems/ay", "ay", 8256).unwrap();
-        assert_eq!(pair, (toml.into_bytes(), sig.into_bytes()));
+        let pair = f.manifest_pair("ay", "ay", 8256, &by_url(&wire)).unwrap();
+        let (toml, sig) = manifest_assets("alabsystems/ay", "ay", 8256).unwrap();
+        assert_eq!(
+            pair,
+            (toml.web_url().into_bytes(), sig.web_url().into_bytes())
+        );
         let hit = f
-            .manifest_pair(
-                "ay",
-                "ay",
-                8256,
-                &|_, _| panic!("a complete pair must be memoized"),
-                &no_api,
-            )
+            .manifest_pair("ay", "ay", 8256, &|_: &Named, _| {
+                panic!("a complete pair must be memoized")
+            })
             .unwrap();
         assert_eq!(hit, pair);
         assert_eq!(*arrived.0.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_failed_half_names_its_release_and_asset_and_an_invalid_identity_never_fetches() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("cpython".into(), "alabsystems/aterm".into());
+        let f = GithubFetcher::new("fixture".into()).with_overrides(overrides);
+        let web = |url: &str, _: u64| {
+            if url.ends_with(".sig") {
+                Ok(b"sig".to_vec())
+            } else {
+                Err("HTTP 504".to_string())
+            }
+        };
+        let error = f
+            .manifest_pair("ignored", "cpython", 1, &by_url(&web))
+            .unwrap_err();
+        assert!(error.contains("HTTP 504"), "{error}");
+        assert!(
+            error.contains("alabsystems/aterm tag atpkg-cpython-1 asset pkg-cpython-1.toml"),
+            "{error}"
+        );
+        assert!(f.manifests.lock().unwrap().is_empty());
+        let no_web = |_: &Named, _: u64| panic!("invalid identity must not fetch");
+        assert!(f.manifest_pair("aterm", "../cpython", 1, &no_web).is_err());
     }
 
     #[test]
@@ -3189,15 +3268,15 @@ mod tests {
                 None => Ok(url.as_bytes().to_vec()),
             }
         };
-        f.prefetch_with(&pins, &wire);
+        f.prefetch_with(&pins, &by_url(&wire));
         let mut first: Vec<(String, u64)> = std::mem::take(&mut *asked.lock().unwrap());
         first.sort();
         let mut expected: Vec<(String, u64)> = pins
             .iter()
             .flat_map(|(repo, program, build)| {
                 let (toml, sig) =
-                    direct_manifest_urls(&format!("alabsystems/{repo}"), program, *build).unwrap();
-                [(toml, MANIFEST_CAP), (sig, SIG_CAP)]
+                    manifest_assets(&format!("alabsystems/{repo}"), program, *build).unwrap();
+                [(toml.web_url(), MANIFEST_CAP), (sig.web_url(), SIG_CAP)]
             })
             .collect();
         expected.sort();
@@ -3216,29 +3295,24 @@ mod tests {
             )
             .into_bytes(),
         );
-        let unavailable_api = |_: &str, _: &str, _: u64| Err("fixture API unavailable".to_string());
-        let (raw, sig) = f
-            .manifest_pair("ay", "ay", 8256, &wire, &unavailable_api)
-            .unwrap();
+        let (raw, sig) = f.manifest_pair("ay", "ay", 8256, &by_url(&wire)).unwrap();
         assert!(
             index.verify_pkg(raw, &sig).is_ok(),
             "the genuine pair verifies"
         );
-        let (raw, sig) = f
-            .manifest_pair("ty", "ty", 3007, &wire, &unavailable_api)
-            .unwrap();
+        let (raw, sig) = f.manifest_pair("ty", "ty", 3007, &by_url(&wire)).unwrap();
         assert!(
             index.verify_pkg(raw, &sig).is_err(),
             "a tampered signature the prefetch carried is refused"
         );
         assert!(asked.lock().unwrap().is_empty(), "both read from the memo");
         let err = f
-            .manifest_pair("nn", "nn", 108, &wire, &unavailable_api)
+            .manifest_pair("nn", "nn", 108, &by_url(&wire))
             .unwrap_err();
         assert!(err.contains("HTTP 503"), "{err}");
         assert_eq!(asked.lock().unwrap().len(), 2, "fetched again on the read");
         asked.lock().unwrap().clear();
-        f.prefetch_with(&pins[..2], &wire);
+        f.prefetch_with(&pins[..2], &by_url(&wire));
         assert!(asked.lock().unwrap().is_empty());
     }
 
@@ -3268,7 +3342,7 @@ mod tests {
                 Ok(url.as_bytes().to_vec())
             }
         };
-        f.prefetch_with(&pins, &wire);
+        f.prefetch_with(&pins, &by_url(&wire));
         assert_eq!(
             f.manifests.lock().unwrap().len(),
             pins.len(),
@@ -3289,10 +3363,13 @@ mod tests {
         let q = index_quad("alabsystems/aterm", "atpkg-index-41").unwrap();
         let base = "https://github.com/alabsystems/aterm/releases/download/atpkg-index-41/";
         assert_eq!(q.label, "atpkg-index-41");
-        assert_eq!(q.index, format!("{base}index.toml"));
-        assert_eq!(q.index_sig, format!("{base}index.toml.sig"));
-        assert_eq!(q.roster, format!("{base}aterm-machines.toml"));
-        assert_eq!(q.roster_sig, format!("{base}aterm-machines.toml.sig"));
+        assert_eq!(q.index.web_url(), format!("{base}index.toml"));
+        assert_eq!(q.index_sig.web_url(), format!("{base}index.toml.sig"));
+        assert_eq!(q.roster.web_url(), format!("{base}aterm-machines.toml"));
+        assert_eq!(
+            q.roster_sig.web_url(),
+            format!("{base}aterm-machines.toml.sig")
+        );
         assert!(index_quad("a/b/c", "atpkg-index-41").is_none());
         assert!(index_quad("alabsystems/aterm", "atpkg-index-4/1").is_none());
         const { assert!(INDEX_CANDIDATE_CAP < 24) };

@@ -154,8 +154,8 @@ impl Log {
         self.historical_fold_writers_in(&std::cell::OnceCell::new(), epoch)
     }
 
-    /// [`Log::historical_fold_writers`], reading what every epoch's writers read of this log from
-    /// `writers` ([`Log::historical_commons_writers_in`]).
+    /// [`Log::historical_fold_writers`], reading this log's graph from `writers`, as
+    /// [`Log::historical_commons_writers_in`] does.
     pub(super) fn historical_fold_writers_in<'a>(
         &'a self,
         writers: &std::cell::OnceCell<super::eval::HistoricalWriters<'a>>,

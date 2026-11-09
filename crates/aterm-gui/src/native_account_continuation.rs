@@ -152,10 +152,9 @@ impl AccountContinuation {
             && candidate.host_epoch == self.proof.predecessor.host_epoch
             && host_epoch() == Some(candidate.host_epoch.as_str())
             && self.proof.closed_phase() == self.relation.phase()
-            && self
-                .proof
-                .predecessor
-                .account_successor_recipe(candidate, self.relation.phase())
+            // Relation::new validated this immutable recipe. The exact candidate
+            // and predecessor comparisons above retain that fact; only the live
+            // authority and custody below need to be checked again.
             && self.proof.noexec()
             && self.proof.quiescent(kernel)
             && self.conversation.current(ctx)

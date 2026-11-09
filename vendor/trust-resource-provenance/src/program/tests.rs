@@ -129,6 +129,31 @@ fn native_program_retains_exact_transitive_runtime_and_detects_later_changes() {
     );
 }
 
+#[test]
+fn system_only_environment_keeps_actual_search_root_and_shadow_custody() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+    let pin = fixture.open().unwrap();
+    assert!(pin.runtime.is_empty());
+    assert_eq!(pin.observation().loader_paths, [fixture.root.join("lib")]);
+    assert_eq!(pin.observation().system_dependencies, ["/usr/lib/libSystem.B.dylib"]);
+    assert!(pin.runtime_environment().unwrap().is_empty());
+    pin.validate(deadline()).unwrap();
+    // A missing override does not discard the original namespace bookends.
+    let lib = fixture.root.join("lib");
+    let original = fixture.root.join("original-lib");
+    fs::rename(&lib, &original).unwrap();
+    fs::create_dir(&lib).unwrap();
+    assert!(pin.validate(deadline()).is_err());
+    fs::remove_dir(&lib).unwrap();
+    fs::rename(&original, &lib).unwrap();
+    assert!(pin.validate(deadline()).is_err());
+    drop(pin);
+    // New capture still refuses a private image shadowing the OS dependency.
+    fixture.runtime("libSystem.B.dylib", &[]);
+    assert!(fixture.open().is_err());
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn unrelated_outer_entries_do_not_change_selected_inputs_but_retargeting_does() {
@@ -317,6 +342,11 @@ fn actual_native_child_matches_original_held_image_not_equal_bytes_at_another_pa
     let digest = fixture.digest();
     let pin = fixture.open().unwrap();
     let other_pin = HeldProgram::open(&fixture.root, &other, &digest, deadline()).unwrap();
+    // This actual executable has no private dynamic dependencies. Existing SDK lib/
+    // custody is still observed without inventing a DYLD override for its execution.
+    assert!(pin.runtime.is_empty());
+    assert!(!pin.observation().loader_paths.is_empty());
+    assert!(pin.runtime_environment().unwrap().is_empty());
     let child = actor(&mut fixture);
     let identity = process::read_identity(child.0.id()).unwrap();
     pin.validate_loaded(identity, deadline()).unwrap();

@@ -963,9 +963,20 @@ struct Words<'a> {
     tab: &'a str,
     tab_reset: Option<i64>,
     single: bool,
+    /// The lead is a reading this replay has not seen: the replay read nothing of this tab's
+    /// row, and the footer holds its figure now (`own`), its first reading having come since.
+    unseen: bool,
 }
 
 impl Words<'_> {
+    /// Whether `verdict` is the replay's refusal for want of the reading this view's lead holds
+    /// ([`Self::unseen`]): the carrier's `no reading` beside its own figure. Such a refusal is
+    /// not said, on the row, in its title or aloud (§2.2: one figure at now); the next replay,
+    /// which the memo runs once the store holds the reading, draws its step and its projection.
+    fn outdated(&self, verdict: &Verdict) -> bool {
+        self.unseen && *verdict == Verdict::Refused(outlook::Refusal::NoFigure)
+    }
+
     fn when(&self, t: i64) -> String {
         when(t, self.out.as_of, &self.out.offsets)
     }
@@ -1189,7 +1200,10 @@ impl Outlook {
     /// rotation can move (`movable`; else nothing is projected and no verdict is said). A wall
     /// standing on the tab's account keeps it [`Figure::Out`] whatever `own` says: `out` means
     /// a standing wall, and a wall never prints a percentage (§2.1, §3.2), while the footer's
-    /// figure ([`Figure::of_weekly`]) is a reading, which is never `Out`.
+    /// figure ([`Figure::of_weekly`]) is a reading, which is never `Out`. Where `own` holds a
+    /// figure of a row this replay read nothing of, the reading came since the replay: the view
+    /// says no refusal for want of it (`Words::outdated`), and has no step or projection to
+    /// draw until a replay reads it.
     #[must_use]
     pub fn quota(&self, tab: &str, own: Option<Figure>, movable: bool) -> QuotaView {
         let as_of = self.as_of;
@@ -1257,7 +1271,10 @@ impl Outlook {
             .flatten()
             .map(|&i| self.lane_of(&self.rows[i], drawn.is_some()))
             .collect();
-        let words = self.words_for(tab);
+        let words = Words {
+            unseen: row_figure == Figure::Unread && tab_figure != Figure::Unread,
+            ..self.words_for(tab)
+        };
         let tail = self.tail_of(&words, tab_row, tab_figure, &chart, movable);
         let mut view = QuotaView {
             as_of,
@@ -1285,6 +1302,7 @@ impl Outlook {
             tab: "",
             tab_reset: None,
             single: self.rows.len() <= 1,
+            unseen: false,
         };
         phrase_of(&words, &self.verdict, true)
     }
@@ -1301,6 +1319,7 @@ impl Outlook {
             tab,
             tab_reset,
             single: self.rows.len() <= 1,
+            unseen: false,
         }
     }
 
@@ -1823,7 +1842,7 @@ impl Outlook {
         }
         let verdict = self.verdict_for(tab_row);
         let carrier = tab_row.is_some_and(|i| self.rows[i].carrier);
-        let said = if movable {
+        let said = if movable && !words.outdated(&verdict) {
             phrase_of(words, &verdict, carrier)
         } else {
             None
@@ -2113,7 +2132,9 @@ impl Outlook {
                     words.spoken_about(*at)
                 ));
             }
-            Verdict::Refused(why) if tab_row.is_some_and(|i| self.rows[i].carrier) => {
+            Verdict::Refused(why)
+                if tab_row.is_some_and(|i| self.rows[i].carrier) && !words.outdated(&verdict) =>
+            {
                 s.push(' ');
                 s.push_str(&why.spoken());
             }

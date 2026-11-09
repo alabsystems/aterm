@@ -39,7 +39,7 @@ impl Vault {
         let (_, heads) = client::trusted_commons_log(&self.paths, self.bootstrap.trust())
             .unwrap()
             .unwrap();
-        commons_log_state_digest(&self.paths, heads).unwrap()
+        commons_log_state_digest(&self.paths, heads, None).unwrap()
     }
 }
 
@@ -132,21 +132,21 @@ fn a_kept_recipient_is_the_recipient_of_the_identity_its_file_holds() {
     let path = paths.dir.join("identity");
     crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
         assert_eq!(
-            client::identity_recipient(&paths).unwrap(),
+            client::identity_recipient(&paths, None).unwrap(),
             Some(first.recipient())
         );
         let reads = crate::fsx::reads_of(&path);
         assert_eq!(
-            client::identity_recipient(&paths).unwrap(),
+            client::identity_recipient(&paths, None).unwrap(),
             Some(first.recipient())
         );
         assert_eq!(crate::fsx::reads_of(&path), reads, "opened while it stood");
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(client::identity_recipient(&paths).unwrap(), None);
+        assert_eq!(client::identity_recipient(&paths, None).unwrap(), None);
         let second = client::machine_identity(&paths).unwrap();
         assert_ne!(second.recipient(), first.recipient());
         assert_eq!(
-            client::identity_recipient(&paths).unwrap(),
+            client::identity_recipient(&paths, None).unwrap(),
             Some(second.recipient()),
             "the identity put in the first one's place"
         );
@@ -205,6 +205,76 @@ fn a_warm_access_check_observes_the_state_lock_once() {
             1,
             "an access's observations"
         );
+    });
+}
+
+/// The `lstat`s `f` took of each path under `dir` ([`crate::fsx::looks_under`]).
+fn looks_during(
+    dir: &std::path::Path,
+    f: impl FnOnce(),
+) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    let before = crate::fsx::looks_under(dir);
+    f();
+    crate::fsx::looks_under(dir)
+        .into_iter()
+        .filter_map(|(path, looks)| {
+            let looked = looks - before.get(&path).copied().unwrap_or(0);
+            (looked > 0).then_some((path, looked))
+        })
+        .collect()
+}
+
+/// A warm access check and a warm access each take one stamping `lstat` of each file they stamp
+/// ([`crate::fsx::lstat_in`], through one [`crate::fsx::Glance`]): this Mac's recipient, the
+/// membership log's memo, this Mac's own denial and the state the log stands on name many of the
+/// same files, and the call stamps each once; the next call looks again. The state lock's own
+/// looks at its folder and file (`StateLock::open_observed`, `StateLock::guards`) are no stamps
+/// and are not counted here.
+/// NEGATIVE CONTROLS (2026-11-08): with `log_observation_is_current`'s log memo stamping through
+/// a look of its own, a check takes two `lstat`s of the identity, the state, the source and the
+/// envelope (`a check's looks`); with `Bootstrap::access_in_observed`'s log
+/// memo stamping through its own, an access takes two of each file both memos stamp (`an
+/// access's looks`).
+#[test]
+fn a_warm_access_check_looks_at_each_file_once() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let home = vault.paths.home.clone();
+    let shared = [
+        vault.paths.dir.clone(),
+        vault.paths.dir.join("identity"),
+        vault.paths.state_file(),
+        vault.paths.dir.join("source.toml"),
+        vault.paths.cache_file(),
+    ];
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        assert!(access.is_current(&vault.journal));
+        let check = || looks_during(&home, || assert!(access.is_current(&vault.journal)));
+        let looked = check();
+        for file in &shared {
+            assert_eq!(looked.get(file), Some(&1), "a check's looks: {looked:#?}");
+        }
+        assert!(
+            looked.values().all(|looks| *looks == 1),
+            "a check's looks: {looked:#?}"
+        );
+        assert_eq!(check(), looked, "the next check looks again");
+
+        let access_in = || {
+            looks_during(&home, || {
+                assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
+            })
+        };
+        access_in();
+        let looked = access_in();
+        for file in &shared {
+            assert_eq!(looked.get(file), Some(&1), "an access's looks: {looked:#?}");
+        }
+        assert!(
+            looked.values().all(|looks| *looks == 1),
+            "an access's looks: {looked:#?}"
+        );
+        assert_eq!(access_in(), looked, "the next access looks again");
     });
 }
 

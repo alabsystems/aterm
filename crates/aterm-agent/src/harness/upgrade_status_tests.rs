@@ -514,15 +514,19 @@ fn a_required_upgrade_word_waits_for_its_native_sweep_writer() {
                         session: "aaa",
                         scope: Some(&scope),
                     }),
-                    (ASK_LOCK_WAIT, std::time::Instant::now() - age, || {
-                        assert!(held.is_some());
-                        assert!(matches!(super::super::sweep_lock(&o), Err("another-sweep")));
-                        assert_eq!(std::fs::read(&path).unwrap(), before);
-                        assert!(!super::super::ledger_path(&o).exists());
-                        assert!(!word_marker(&o.state).exists());
-                        observed += 1;
-                        drop(held.take());
-                    }),
+                    (
+                        o.timings.owner_word_wait,
+                        std::time::Instant::now() - age,
+                        || {
+                            assert!(held.is_some());
+                            assert!(matches!(super::super::sweep_lock(&o), Err("another-sweep")));
+                            assert_eq!(std::fs::read(&path).unwrap(), before);
+                            assert!(!super::super::ledger_path(&o).exists());
+                            assert!(!word_marker(&o.state).exists());
+                            observed += 1;
+                            drop(held.take());
+                        },
+                    ),
                     &|_| Some(Vec::new()),
                 );
                 assert_eq!(observed, usize::from(!expired));
@@ -700,11 +704,25 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
                 ..holder("other-agent", "2.1.281", Some("s-busy"))
             }])
         };
-        let stopped =
-            ask_within(&o, "s-busy", Ask::Now, None, ASK_LOCK_WAIT, &answered).expect_err("back");
+        let stopped = ask_within(
+            &o,
+            "s-busy",
+            Ask::Now,
+            None,
+            o.timings.owner_word_wait,
+            &answered,
+        )
+        .expect_err("back");
         assert!(stopped.starts_with(REFUSED_STOPPED), "{agent:?}: {stopped}");
-        let (skipped_row, _) =
-            ask_within(&o, "s-busy", Ask::Skip, None, ASK_LOCK_WAIT, &answered).expect("skip");
+        let (skipped_row, _) = ask_within(
+            &o,
+            "s-busy",
+            Ask::Skip,
+            None,
+            o.timings.owner_word_wait,
+            &answered,
+        )
+        .expect("skip");
         assert!(
             !skipped_row.failed_after_exit(),
             "{agent:?}: answered row clears failed_after_exit"
@@ -745,7 +763,7 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         Ask::Skip,
         None,
         (
-            ASK_LOCK_WAIT,
+            o.timings.owner_word_wait,
             std::time::Instant::now() - std::time::Duration::from_secs(61),
             || panic!("the intentionally expired wait releases no writer"),
         ),
@@ -2368,7 +2386,7 @@ fn a_press_closes_a_restart_its_tab_overtook_and_lands() {
                     ..holder(B, "2.1.281", Some(TAB))
                 }])
             };
-            let got = ask_within(&o, TAB, Ask::Press, None, ASK_LOCK_WAIT, &held);
+            let got = ask_within(&o, TAB, Ask::Press, None, o.timings.owner_word_wait, &held);
             let a = load(&o, A).expect("A kept");
             let b = load(&o, B).expect("B kept");
             if closes {
@@ -8384,7 +8402,8 @@ fn the_owners_word_lands_on_the_row_the_window_shows() {
             scope: None,
         };
         let shown = (!session.is_empty()).then_some(shown);
-        let (row, _) = ask_within(&o, TAB, Ask::Skip, shown, ASK_LOCK_WAIT, held).expect("lands");
+        let (row, _) =
+            ask_within(&o, TAB, Ask::Skip, shown, o.timings.owner_word_wait, held).expect("lands");
         let other = if row.session == FRONT { ASIDE } else { FRONT };
         assert_eq!(load(&o, other).expect("kept").request, Request::None);
         row.session
@@ -8413,8 +8432,15 @@ fn the_owners_word_lands_on_the_row_the_window_shows() {
         session: &down,
         scope: None,
     };
-    let (row, _) = ask_within(&o, TAB, Ask::Skip, Some(shown), ASK_LOCK_WAIT, &back)
-        .expect("the move's record takes it");
+    let (row, _) = ask_within(
+        &o,
+        TAB,
+        Ask::Skip,
+        Some(shown),
+        o.timings.owner_word_wait,
+        &back,
+    )
+    .expect("the move's record takes it");
     assert_eq!(row.session, down);
     assert_eq!(
         load(&o, &down).expect("written").request,

@@ -7,9 +7,11 @@
 //! build) with a URL-safety allowlist; the `[update] enabled` switch ([`settings`]); an
 //! advisory [`FileLock`] and [`same_volume`]; `curl` plumbing for GitHub's web host ([`cdn`]
 //! derives a tag's download URL, [`mod@pointer`] learns the newest tag from one redirect-refusing
-//! HEAD, [`download_bytes`]/[`download_to`] never attach a credential) and for vendor-direct
-//! hosts ([`vendor_get`]); the publishers' credentialed GitHub REST lane over the same curl
-//! ([`github_rest`], with [`github_pages`]' listing reader), which no updater path calls;
+//! HEAD) and for vendor-direct hosts ([`vendor_get`]); the one reader of a release's assets
+//! ([`release_asset`]: the web route, then the API route when the download host fails, anonymous
+//! unless a tool hands it a token); the publishers' credentialed GitHub REST lane over the same
+//! curl ([`github_rest`], with [`github_pages`]' listing reader), which an updater path reaches
+//! only anonymously, as [`release_asset`]'s API route;
 //! [`ensure_private_dir`]; [`sha256_file`]; the release-tag grammar
 //! ([`tag`]) the publisher and the updater both classify with; the trust anchors ([`pins`]);
 //! the master-signed machine [`roster`]; and the Developer ID requirement with its bounded
@@ -41,6 +43,7 @@ pub mod manifest;
 pub mod pins;
 pub mod pkg_check;
 pub mod pointer;
+pub mod release_asset;
 pub mod roster;
 pub mod seal_guard;
 pub mod service_image;
@@ -66,11 +69,10 @@ pub use http::{
     CURL_SEAM, DOWNLOAD_STOPPED, FirstHead, HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND,
     VendorResponse, curl_retry_cause, download_bytes, download_bytes_uncached,
     download_bytes_uncached_via, download_bytes_with_accept, download_error_is_local_write,
-    download_error_is_not_found, download_error_is_rate_limit, download_to, download_to_resumable,
-    download_to_resumable_https_only, download_to_resumable_https_only_via,
-    download_to_resumable_until, head_no_redirect, head_no_redirect_again, head_no_redirect_first,
-    head_no_redirect_quick, note_link_down, vendor_content_length, vendor_download_to, vendor_get,
-    vendor_get_hint,
+    download_error_is_not_found, download_to_resumable_https_only,
+    download_to_resumable_https_only_via, head_no_redirect, head_no_redirect_again,
+    head_no_redirect_first, head_no_redirect_quick, note_link_down, vendor_content_length,
+    vendor_download_to, vendor_get, vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

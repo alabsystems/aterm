@@ -12,6 +12,7 @@
 //! identity or access metadata, changes.
 
 use super::{Paths, StateLock, StateObservation};
+use crate::fsx;
 #[cfg(test)]
 use crate::swarm_roster::SwarmRoster;
 use std::{os::unix::fs::MetadataExt as _, path::PathBuf, sync::Mutex};
@@ -98,7 +99,9 @@ pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commo
 /// a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's CPU
 /// (2026-11-08) and a third of its reads of the vault. That access asks it under its own
 /// observation of the state lock, `lock`, which the memo takes for its own as
-/// [`trusted_commons_log_under`] does. The swarm's checks of this Mac
+/// [`trusted_commons_log_under`] does, and looks up what it kept through the access's `glance`, as
+/// that log's memo does next ([`fsx::Glance`]); a miss reads and stamps afresh, and keeps its
+/// answer under those stamps. The swarm's checks of this Mac
 /// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)) read afresh, so
 /// one that cannot read a file it was settled on takes this Mac as denied. This one, like every
 /// memo here, gives the answer it kept through a read fault on files that have not moved: the
@@ -108,9 +111,13 @@ pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commo
 ///
 /// # Errors
 /// As [`local_recipient_denied`](super::steward::local_recipient_denied).
-pub(crate) fn local_recipient_denied_under(paths: &Paths, lock: &StateLock) -> crate::Result<bool> {
+pub(crate) fn local_recipient_denied_under(
+    paths: &Paths,
+    lock: &StateLock,
+    glance: &fsx::Glance,
+) -> crate::Result<bool> {
     static MEMO: Memo<bool> = Memo::keyed(observation_inputs, true);
-    MEMO.read_keyed_under(paths, &(), lock, |paths| {
+    MEMO.read_keyed_under(paths, &(), lock, glance, |paths| {
         super::steward::local_recipient_denied(&super::Reads::new(paths))
     })
 }
@@ -179,7 +186,9 @@ pub fn trusted_commons_log_now(
 /// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation
 /// that still guards the lock at the vault's path ([`StateLock::observes`]), it is the observation
 /// the memo would take, so what it kept is given without another. A writer's own take, or a lock
-/// that guards another file, is [`trusted_commons_log_now`]'s call.
+/// that guards another file, is [`trusted_commons_log_now`]'s call. It looks up what it kept
+/// through the caller's check's look, `glance` ([`fsx::Glance`]); a miss reads as
+/// [`trusted_commons_log_now`] does, stamping afresh.
 ///
 /// # Errors
 /// As [`trusted_commons_log`](super::trusted_commons_log).
@@ -187,9 +196,10 @@ pub(crate) fn trusted_commons_log_under(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
     lock: &StateLock,
+    glance: &fsx::Glance,
 ) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
     ACKNOWLEDGED
-        .read_keyed_under(paths, &trust, lock, |paths| {
+        .read_keyed_under(paths, &trust, lock, glance, |paths| {
             super::acknowledged_commons_log(paths, trust)
         })
         .map(super::CommonsLog::trusted)
@@ -371,9 +381,19 @@ pub(super) fn stamp_inputs(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
 ) -> Option<InputStamps> {
+    stamp_inputs_in(paths, inputs, None)
+}
+
+/// [`stamp_inputs`], each `lstat` `glance`'s where the caller looks through one ([`fsx::Glance`]):
+/// the stamps of a check that asks several memos of the same files.
+fn stamp_inputs_in(
+    paths: &Paths,
+    inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    glance: Option<&fsx::Glance>,
+) -> Option<InputStamps> {
     Some(InputStamps {
-        stamps: stamp_files(paths, inputs)?,
-        records: crate::records_storage::standing(&paths.records_file())?,
+        stamps: stamp_files_in(paths, inputs, glance)?,
+        records: crate::records_storage::standing(&paths.records_file(), glance)?,
     })
 }
 
@@ -383,29 +403,37 @@ pub(super) fn stamp_files(
     paths: &Paths,
     files: fn(&Paths) -> Option<Vec<PathBuf>>,
 ) -> Option<FileStamps> {
-    let directory = match std::fs::symlink_metadata(&paths.dir) {
-        Ok(meta) if meta.is_dir() => Some(DirectoryStamp {
+    stamp_files_in(paths, files, None)
+}
+
+/// [`stamp_files`], each `lstat` `glance`'s where the caller looks through one ([`fsx::lstat_in`]).
+fn stamp_files_in(
+    paths: &Paths,
+    files: fn(&Paths) -> Option<Vec<PathBuf>>,
+    glance: Option<&fsx::Glance>,
+) -> Option<FileStamps> {
+    let directory = match fsx::lstat_in(glance, &paths.dir) {
+        Ok(Some(meta)) if meta.is_dir() => Some(DirectoryStamp {
             dev: meta.dev(),
             inode: meta.ino(),
             uid: meta.uid(),
             gid: meta.gid(),
             mode: meta.mode(),
         }),
-        Ok(_) => return None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
+        Ok(Some(_)) | Err(_) => return None,
+        Ok(None) => None,
     };
     let files = files(paths)?
         .iter()
-        .map(|path| match std::fs::symlink_metadata(path) {
-            Ok(meta) => Some(Some(Stamp {
+        .map(|path| match fsx::lstat_in(glance, path) {
+            Ok(Some(meta)) => Some(Some(Stamp {
                 dev: meta.dev(),
                 inode: meta.ino(),
                 len: meta.size(),
                 modified: (meta.mtime(), meta.mtime_nsec()),
                 changed: (meta.ctime(), meta.ctime_nsec()),
             })),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+            Ok(None) => Some(None),
             Err(_) => None,
         })
         .collect::<Option<Vec<_>>>()?;
@@ -478,18 +506,20 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
     /// [`Memo::read_keyed`] for a caller that holds `lock`. A quiet memo takes the caller's shared
     /// observation of the state lock for the one `read_keyed` takes before its stamps, while it
     /// still guards the lock at the vault's path ([`StateLock::observes`]): no writer holds that
-    /// lock, and none can write until the caller drops it. Anything else, a miss included, is
-    /// `read_keyed`'s.
+    /// lock, and none can write until the caller drops it. Its stamps are `glance`'s, the look of
+    /// the caller's check, which stamps each file once for every memo the check asks
+    /// ([`fsx::Glance`]). Anything else, a miss included, is `read_keyed`'s, which stamps afresh.
     fn read_keyed_under(
         &self,
         paths: &Paths,
         key: &K,
         lock: &StateLock,
+        glance: &fsx::Glance,
         read: impl FnOnce(&Paths) -> crate::Result<T>,
     ) -> crate::Result<T> {
         if self.quiet
             && lock.observes(paths)
-            && let Some(stamps) = stamp_inputs(paths, self.inputs)
+            && let Some(stamps) = stamp_inputs_in(paths, self.inputs, Some(glance))
             && let Some(answer) = self.kept(paths, key, &stamps)
         {
             return Ok(answer);
@@ -1218,7 +1248,11 @@ mod tests {
             Some(vec!["m60".to_owned()])
         );
         let lock = StateLock::observe(&paths).unwrap().expect("no writer");
-        let under = || memo.read_keyed_under(&paths, &(), &lock, |p| lines(p, &reads));
+        let under = || {
+            memo.read_keyed_under(&paths, &(), &lock, &fsx::Glance::new(), |p| {
+                lines(p, &reads)
+            })
+        };
 
         let observations = super::super::lock_observations_of(&paths);
         assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
@@ -1256,8 +1290,10 @@ mod tests {
             let writer = StateLock::take(&paths).unwrap();
             for _ in 0..2 {
                 assert_eq!(
-                    memo.read_keyed_under(&paths, &(), &writer, |p| lines(p, &reads))
-                        .unwrap(),
+                    memo.read_keyed_under(&paths, &(), &writer, &fsx::Glance::new(), |p| lines(
+                        p, &reads
+                    ))
+                    .unwrap(),
                     Some(vec!["m60".to_owned()])
                 );
             }
@@ -1275,8 +1311,10 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 4, "kept under the new lock");
         let _writer = StateLock::take(&paths).unwrap();
         assert_eq!(
-            memo.read_keyed_under(&paths, &(), &renamed_away, |p| lines(p, &reads))
-                .unwrap(),
+            memo.read_keyed_under(&paths, &(), &renamed_away, &fsx::Glance::new(), |p| lines(
+                p, &reads
+            ))
+            .unwrap(),
             Some(vec!["m60".to_owned()])
         );
         assert_eq!(

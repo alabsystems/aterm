@@ -809,8 +809,10 @@ impl SinkWriter {
                       `Arc<SinkWriter>` clone; THE FIX is that the held `OwnedFd` (this field) closes \
                       the fd EXACTLY when the LAST clone drops (sink.rs:32-39, exercised by the \
                       `owned_fd_stays_open_until_last_clone_drops` regression). The close is \
-                      `OwnedFd::drop`, not an aterm method, so there is nothing to #[refines]. Waived \
-                      so the model's DropClone action is covered (Ob.3)."
+                      `OwnedFd::drop`, not an aterm method, so there is nothing to #[refines]. At \
+                      the final exit `retire_master_at_exit` lets go of the terminal before that by \
+                      pointing the number at /dev/null; the number itself still closes only here. \
+                      Waived so the model's DropClone action is covered (Ob.3)."
         )
     )]
     #[must_use]
@@ -1079,6 +1081,26 @@ impl SinkWriter {
         self.shared.drained.notify_all();
         #[cfg(windows)]
         aterm_pty::release_input_writes(self.master);
+    }
+
+    /// Let go of this sink's PTY master for good, at the final exit ([`aterm_pty::retire_master`]):
+    /// its number then names `/dev/null`, so this process's hold on the terminal ends while every
+    /// raw copy of the number ([`Self::master`], a reader's, a probe's) still names an open file no
+    /// later open can take. Run it after [`Self::sever_input`], and once the master's reader has
+    /// stopped where it can: a reader still running reads end of file from then on. It waits for a
+    /// direct write already under way to finish on the terminal. A sink that does not own its
+    /// master ([`Self::new`]) leaves it alone. Whether the master was retired.
+    #[cfg(unix)]
+    pub fn retire_master_at_exit(&self) -> bool {
+        if self._owned.is_none() || self.master < 0 {
+            return false;
+        }
+        let _writes = self
+            .shared
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        aterm_pty::retire_master(self.master).is_ok()
     }
 
     /// Whether [`Self::sever_input`] has run.
@@ -3340,6 +3362,42 @@ mod tests {
             &buf, b"alive",
             "peer got the bytes then EOF — fd closed on last clone drop"
         );
+    }
+
+    /// At the final exit the owner lets go of its master while clones still live: the peer reads
+    /// what was written and then end of file, and a sink that does not own its descriptor leaves it
+    /// alone.
+    #[test]
+    fn retiring_the_master_at_exit_ends_it_while_clones_live() {
+        use std::io::Write as _;
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .expect("the hang detector");
+        let sink = Arc::new(SinkWriter::new_owned(OwnedFd::from(writer)));
+        let clone = Arc::clone(&sink);
+        assert_eq!(clone.write_frame(b"before").expect("a write"), 6);
+        sink.sever_input();
+        assert!(sink.retire_master_at_exit(), "the owner retires its master");
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .expect("end of file while both clones live, not the hang detector");
+        assert_eq!(&buf, b"before");
+
+        let (mut kept_reader, mut kept) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let borrowed = SinkWriter::new(kept.as_raw_fd());
+        assert!(
+            !borrowed.retire_master_at_exit(),
+            "a borrowed descriptor is not retired"
+        );
+        kept.write_all(b"x")
+            .expect("the borrowed descriptor still writes");
+        let mut one = [0u8; 1];
+        kept_reader
+            .read_exact(&mut one)
+            .expect("its peer still reads");
     }
 
     #[test]

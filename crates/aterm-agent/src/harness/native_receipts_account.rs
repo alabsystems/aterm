@@ -174,7 +174,7 @@ impl Bound {
             IssuerState::Fenced if parent.successor != Some(self.candidate) => {
                 AccountOutcome::Fenced
             }
-            IssuerState::Fenced => return None,
+            IssuerState::Fenced | IssuerState::Rejected => return None,
             state if parent.successor == Some(self.candidate) => {
                 AccountOutcome::Claimed(match state {
                     IssuerState::Prepared => ClaimedState::Prepared,
@@ -183,7 +183,7 @@ impl Bound {
                         phase: entry.closed_phase?,
                     },
                     IssuerState::Sealed { may_execute } => ClaimedState::Sealed { may_execute },
-                    IssuerState::Fenced => unreachable!(),
+                    IssuerState::Fenced | IssuerState::Rejected => unreachable!(),
                 })
             }
             _ => return None,
@@ -404,6 +404,8 @@ pub(super) fn claim_at(
     let bound = Bound::new(&key, relation)?;
     let candidate = receipt(&key, relation.candidate, binding)?;
     let (mut log, view) = open_existing(paths, &key, limits)?;
+    check_rejection_domain(paths, &key, relation.predecessor)?;
+    check_rejection_domain(paths, &key, relation.candidate)?;
     let parent = bound.parent(&view)?;
     if let Some(old) = view.entries.get(&bound.candidate) {
         return bound
@@ -493,6 +495,8 @@ pub(super) fn fence_at(
     let key = existing_key(paths)?;
     let bound = Bound::new(&key, relation)?;
     let (mut log, view) = open_existing(paths, &key, limits)?;
+    check_rejection_domain(paths, &key, relation.predecessor)?;
+    check_rejection_domain(paths, &key, relation.candidate)?;
     bound.parent(&view)?;
     if view.entries.contains_key(&bound.candidate) {
         return bound

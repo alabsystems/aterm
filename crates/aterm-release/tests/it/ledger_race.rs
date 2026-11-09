@@ -761,6 +761,17 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
             ],
             "its ledger is not the published commit's plus",
         ),
+        (
+            vec![
+                ("CHANGELOG.md", rolled.clone()),
+                // Preserve the reserved tail while rewriting an old record.
+                (
+                    "RELEASES.ledger",
+                    ledger_text.replacen("0.25.0", "0.24.0", 1),
+                ),
+            ],
+            "historical ledger bytes changed beneath the same reserved tail",
+        ),
     ] {
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let forged = ledger::commit_with(&git, &source, &files, &[&source], "forged").unwrap();
@@ -845,6 +856,46 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}1790000000 0.26.0\n1790000001 0.26.0\n")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn claim_refuses_a_rewritten_historical_record_on_newer_main() {
+    let fix = Fixture::new("rewritten-history");
+    rival_append(&fix, "1783354740 0.25.0");
+    run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
+    run(&fix.work, "git", &["reset", "-q", "--hard", "origin/main"]);
+    let source = head_of(&fix.work);
+    let git = Git::new(&fix.work);
+    let plan = ClaimPlan {
+        version: "0.26.0",
+        now: NOW,
+        allow_existing_section: false,
+        max_attempts: 5,
+        source: &source,
+    };
+    let rolls = |s: &str, m: &str| changelog::claim_changelogs(s, m, "0.26.0", DATE);
+    let reserved = ledger::reserve(&git, &git, &plan, &rolls).unwrap();
+    let original = fs::read_to_string(fix.rival.join("RELEASES.ledger")).unwrap();
+    let tampered = original.replacen("0.25.0", "0.24.0", 1);
+    assert_eq!(original.lines().last(), tampered.lines().last());
+    fs::write(fix.rival.join("RELEASES.ledger"), &tampered).unwrap();
+    run(
+        &fix.rival,
+        "git",
+        &["commit", "-q", "-am", "rewrite historical record"],
+    );
+    run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
+    let before = head_of(&fix.rival);
+    // NEGATIVE CONTROL: without the prefix proof, claim succeeds and appends
+    // its reservation to this well-formed but rewritten ledger.
+    assert!(ledger::claim(&git, &git, &fix.work, &plan, &reserved, &rolls).is_err());
+    assert_eq!(
+        run(&fix.origin, "git", &["rev-parse", "main"]).trim(),
+        before
+    );
+    assert_eq!(origin_file(&fix, "RELEASES.ledger"), tampered);
+    assert_eq!(head_of(&fix.work), source);
 }
 
 #[cfg(unix)]

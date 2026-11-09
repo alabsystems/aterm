@@ -557,7 +557,7 @@ impl Prefix {
             }
         }
         let receipt_path = dir.join("INSTALL_RECEIPT.json");
-        let bytes = crate::metadata_io::read_bounded_regular(&receipt_path, 64 * 1024)
+        let bytes = crate::metadata_io::read_bounded_regular(&receipt_path, 1024 * 1024)
             .map_err(|e| format!("abrew: cannot read {}: {e}", receipt_path.display()))?;
         let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes)
             .map_err(|e| format!("abrew: cannot parse {}: {e}", receipt_path.display()))?;
@@ -807,6 +807,19 @@ impl Prefix {
 
     /// Writes `INSTALL_RECEIPT.json` into `dir`.
     pub fn write_receipt(&self, dir: &Path, fields: &[(&str, &str)]) -> Result<(), String> {
+        self.write_receipt_raw(dir, fields, &[])
+    }
+
+    /// Writes `INSTALL_RECEIPT.json` into `dir`: the string
+    /// `fields` first, then `raw` fields whose values are
+    /// already-encoded JSON (the `runtime_dependencies` array
+    /// brew tabs carry).
+    pub fn write_receipt_raw(
+        &self,
+        dir: &Path,
+        fields: &[(&str, &str)],
+        raw: &[(&str, &str)],
+    ) -> Result<(), String> {
         self.ensure()?;
         let mut s = String::from("{\n");
         for (i, (k, v)) in fields.iter().enumerate() {
@@ -815,9 +828,15 @@ impl Prefix {
             }
             s.push_str(&format!("  \"{}\": \"{}\"", json_escape(k), json_escape(v)));
         }
+        for (k, v) in raw {
+            if s.len() > 2 {
+                s.push_str(",\n");
+            }
+            s.push_str(&format!("  \"{}\": {}", json_escape(k), v));
+        }
         s.push_str("\n}\n");
-        if s.len() > 64 * 1024 {
-            return Err("abrew: install receipt exceeds the 64KiB reader limit".to_string());
+        if s.len() > 1024 * 1024 {
+            return Err("abrew: install receipt exceeds the 1MiB reader limit".to_string());
         }
         write_metadata(&dir.join("INSTALL_RECEIPT.json"), s.as_bytes())
             .map_err(|e| format!("abrew: cannot write receipt in {}: {e}", dir.display()))
@@ -1010,7 +1029,7 @@ fn read_receipt(dir: &Path, limit: usize) -> Option<aterm_json::Value> {
 
 /// Reads string fields `keys` from `INSTALL_RECEIPT.json` in `dir` in a single read.
 pub(super) fn receipt_words<const N: usize>(dir: &Path, keys: [&str; N]) -> [Option<String>; N] {
-    let Some(receipt) = read_receipt(dir, 64 * 1024) else {
+    let Some(receipt) = read_receipt(dir, 1024 * 1024) else {
         return std::array::from_fn(|_| None);
     };
     keys.map(|key| {
@@ -1092,6 +1111,49 @@ fn parse_runtime_deps(receipt: &aterm_json::Value) -> Option<Vec<String>> {
     )
 }
 
+/// Reads a formula receipt's `runtime_dependencies` full names,
+/// in recorded order. `None` when the receipt or the key is
+/// absent (brew's nil tab deps); `Some([])` for a recorded
+/// empty closure.
+pub(super) fn receipt_runtime_deps(dir: &Path) -> Option<Vec<String>> {
+    parse_runtime_deps(&read_receipt(dir, 1024 * 1024)?)
+}
+
+/// The receipt's `runtime_dependencies` array verbatim (info
+/// replays the recorded tab rows), or `None` when the key is
+/// absent or not an array.
+pub(super) fn receipt_runtime_deps_value(dir: &Path) -> Option<aterm_json::Value> {
+    let receipt = read_receipt(dir, 1024 * 1024)?;
+    match receipt.get("runtime_dependencies") {
+        Some(value @ aterm_json::Value::Array(_)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Reads a cask receipt's `runtime_dependencies` hash as
+/// `(formula full names, cask full names)`. Absent or
+/// non-hash values read as no deps, as in brew's `Missing`.
+pub(super) fn receipt_cask_runtime_deps(dir: &Path) -> (Vec<String>, Vec<String>) {
+    let names = |receipt: &aterm_json::Value, key: &str| -> Vec<String> {
+        receipt
+            .get("runtime_dependencies")
+            .and_then(|deps| deps.get(key))
+            .and_then(aterm_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|d| d.get("full_name").and_then(aterm_json::Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match read_receipt(dir, 1024 * 1024) {
+        Some(receipt) => (names(&receipt, "formula"), names(&receipt, "cask")),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
 /// Reads `(installed_on_request != "false", runtime_dependencies, used_options)` from
 /// `INSTALL_RECEIPT.json` in `dir` in a single read (`bundle dump`).
 pub(super) fn receipt_dump_fields(dir: &Path) -> (bool, Option<Vec<String>>, Vec<String>) {
@@ -1121,12 +1183,59 @@ pub(super) fn receipt_cleanup_fields(dir: &Path) -> (Option<Vec<String>>, bool) 
     )
 }
 
+/// Whether the keg was poured from a bottle: abrew's
+/// `"source": "bottle"` word, or a brew tab's typed
+/// `poured_from_bottle`. Only explicit negative evidence
+/// reads as source-built; abrew never builds.
+pub(super) fn receipt_poured_from_bottle(dir: &Path) -> bool {
+    // A typed tab field, when present, is the authority brew
+    // itself reads; abrew receipts carry the source word.
+    if let Some(receipt) = read_receipt(dir, 1024 * 1024)
+        && let Some(poured) = parse_bool(&receipt, "poured_from_bottle")
+    {
+        return poured;
+    }
+    match receipt_word(dir, "source").as_deref() {
+        Some(other) => other == "bottle",
+        None => true,
+    }
+}
+
+/// A keg receipt's recorded `(stable version, version_scheme)`
+/// at install time: abrew's top-level words, or a brew tab's
+/// `source.versions` object. Either may be absent.
+pub(super) fn receipt_tab_versions(dir: &Path) -> (Option<String>, Option<u64>) {
+    let scheme_of = |value: Option<&aterm_json::Value>| -> Option<u64> {
+        value.and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+    };
+    let Some(receipt) = read_receipt(dir, 1024 * 1024) else {
+        return (None, None);
+    };
+    let nested = receipt.get("source").and_then(|s| s.get("versions"));
+    let stable = nested
+        .and_then(|v| v.get("stable"))
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_owned);
+    let scheme = scheme_of(receipt.get("version_scheme"))
+        .or_else(|| scheme_of(nested.and_then(|v| v.get("version_scheme"))));
+    (stable, scheme)
+}
+
+/// A typed boolean receipt field (`true`/`false` as JSON bool
+/// or word), when present.
+pub(super) fn receipt_bool(dir: &Path, key: &str) -> Option<bool> {
+    parse_bool(&read_receipt(dir, 1024 * 1024)?, key)
+}
+
 /// Replace string-valued receipt words in place, preserving
 /// every other byte (the migration receipt fix-up). Returns false
 /// when the receipt is absent or none of `pairs` matched.
 pub(super) fn replace_receipt_words(dir: &Path, pairs: &[(&str, &str)]) -> Result<bool, String> {
     let path = dir.join("INSTALL_RECEIPT.json");
-    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 64 * 1024) else {
+    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 1024 * 1024) else {
         return Ok(false);
     };
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1178,7 +1287,7 @@ pub(super) fn set_installed_on_request(
     on_request: bool,
 ) -> Result<Option<bool>, String> {
     let path = dir.join("INSTALL_RECEIPT.json");
-    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 64 * 1024) else {
+    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 1024 * 1024) else {
         return Ok(None);
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -1382,6 +1491,54 @@ mod tests {
         assert_eq!(set_installed_on_request(dir, true).unwrap(), None);
         std::fs::remove_file(&receipt).unwrap();
         assert_eq!(set_installed_on_request(dir, true).unwrap(), None);
+    }
+
+    #[test]
+    fn receipt_runtime_deps_distinguish_absent_from_recorded() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        let dir = tmp.path().join("keg");
+        std::fs::create_dir(&dir).unwrap();
+        // No receipt, then no key: brew's nil tab deps.
+        assert_eq!(receipt_runtime_deps(&dir), None);
+        p.write_receipt(&dir, &[("name", "x")]).unwrap();
+        assert_eq!(receipt_runtime_deps(&dir), None);
+        // A recorded empty closure is Some([]), and entries keep order.
+        p.write_receipt_raw(&dir, &[("name", "x")], &[("runtime_dependencies", "[]")])
+            .unwrap();
+        assert_eq!(receipt_runtime_deps(&dir), Some(Vec::new()));
+        p.write_receipt_raw(
+            &dir,
+            &[("name", "x")],
+            &[(
+                "runtime_dependencies",
+                "[{\"full_name\": \"b\"}, {\"full_name\": \"a\"}]",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            receipt_runtime_deps(&dir),
+            Some(vec!["b".to_string(), "a".to_string()])
+        );
+        // The cask hash shape splits by kind; a formula array
+        // (or nothing) reads as no cask deps.
+        assert_eq!(
+            receipt_cask_runtime_deps(&dir),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        p.write_receipt_raw(
+            &dir,
+            &[("token", "x")],
+            &[(
+                "runtime_dependencies",
+                "{\"cask\": [{\"full_name\": \"other\"}], \"formula\": [{\"full_name\": \"git\"}]}",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            receipt_cask_runtime_deps(&dir),
+            (vec!["git".to_string()], vec!["other".to_string()])
+        );
     }
 
     #[test]

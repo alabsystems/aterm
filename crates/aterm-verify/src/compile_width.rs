@@ -31,6 +31,18 @@ pub(crate) fn current() -> Option<u32> {
     JOBS.with(Cell::get)
 }
 
+/// Every compiling stage joins the release FIFO, including stages whose memory admission
+/// keeps a whole-stage envelope. Unit memory admission is independent of core accounting.
+pub(crate) fn stage_jobs(
+    stage: crate::plan::StageId,
+    pool_slots: Option<u32>,
+    ceiling: Option<u32>,
+) -> Option<u32> {
+    pool_slots
+        .filter(|_| crate::memory::compiles(stage))
+        .map(|slots| ceiling.map_or(slots, |ceiling| ceiling.min(slots)).max(1))
+}
+
 /// Pooled observations must not lower an unpooled compile's cold estimate.
 pub(crate) fn record_key(mut key: crate::memory::Key, jobs: Option<u32>) -> crate::memory::Key {
     if let Some(jobs) = jobs {
@@ -166,7 +178,6 @@ pub(crate) fn claim(
                 "the full compile (no unit history)"
             },
         ),
-        compile_jobs: Some(jobs),
     }))
 }
 

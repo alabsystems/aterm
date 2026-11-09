@@ -717,18 +717,18 @@ pub fn sidecar_text(i: &Inputs, g: &Gates, wrote: &Wrote, heads: &[Head]) -> Str
 /// # Errors
 /// A usage error (exit 2); a refusal, a stop, a void or a defect (exit 1).
 pub fn cmd_aos_learn_bench(args: &[String]) -> Res {
-    cmd_to(args, &mut std::io::stdout())
+    cmd_to(args, &mut std::io::stdout(), held_out_judged)
 }
 
 /// [`cmd_aos_learn_bench`], its help written to `o`.
-fn cmd_to(args: &[String], o: &mut dyn Write) -> Res {
+fn cmd_to(args: &[String], o: &mut dyn Write, judged: impl FnOnce() -> u64) -> Res {
     let out = if args.iter().any(|a| a == "-h" || a == "--help") {
         shown(o, HELP);
         Ok(0)
     } else {
         parse(args).and_then(|a| run(&a))
     };
-    guarded("aos-learn-bench", out, held_out_judged())
+    guarded("aos-learn-bench", out, judged())
 }
 
 /// A regular file `given` names, canonical.

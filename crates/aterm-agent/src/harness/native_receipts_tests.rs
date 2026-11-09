@@ -19,6 +19,9 @@ mod accounts;
 #[path = "native_receipts_legacy_cold_tests.rs"]
 mod legacy_cold;
 
+#[path = "native_receipts_rejection_tests.rs"]
+mod rejection;
+
 fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
@@ -36,6 +39,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
         image: image(u64::from(pid)),
     };
     let prepare = Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
@@ -394,7 +398,8 @@ fn issuer_number(state: IssuerState) -> i64 {
         IssuerState::NoExec => 3,
         IssuerState::Sealed { may_execute: false } => 4,
         IssuerState::Sealed { may_execute: true } => 5,
-        IssuerState::Fenced => 6,
+        IssuerState::Rejected => 6,
+        IssuerState::Fenced => 7,
     }
 }
 
@@ -402,7 +407,8 @@ pub(crate) fn issuer_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    let (_home, paths, a, a_binding) = fixture();
+    let (_home, paths, mut a, a_binding) = fixture();
+    a.rejection_domain = Some(rejection_domain_at(&paths).unwrap());
     let (b, b_binding) = other_epoch(&a, &a_binding);
     let actors = [(&a, &a_binding, state["a"]), (&b, &b_binding, state["b"])];
     let put = |prepare, binding, event| {
@@ -412,12 +418,16 @@ pub(crate) fn issuer_transition(
     // closure can fit before a three-record closure, but not in reverse order.
     let mut seed = actors.to_vec();
     seed.sort_by_key(|(_, _, phase)| match phase {
-        3 | 4 => 0,
+        3 | 4 | 6 => 0,
         5 => 1,
         _ => 2,
     });
     for (prepare, binding, phase) in seed {
         if phase == 0 {
+            continue;
+        }
+        if phase == 6 {
+            assert!(reject_unadmitted_at(&paths, prepare, five_records()).unwrap());
             continue;
         }
         put(prepare, binding, Event::Prepare).unwrap();
@@ -438,6 +448,12 @@ pub(crate) fn issuer_transition(
         }
         "PrepareB" => {
             let _ = put(&b, &b_binding, Event::Prepare);
+        }
+        "RejectA" => {
+            let _ = reject_unadmitted_at(&paths, &a, five_records());
+        }
+        "RejectB" => {
+            let _ = reject_unadmitted_at(&paths, &b, five_records());
         }
         "MayA" => {
             put(&a, &a_binding, Event::MayExecute).unwrap();
@@ -464,18 +480,29 @@ pub(crate) fn issuer_transition(
             );
         }
         "RetryA" | "ConflictA" => {
-            let event = match state["a"] {
-                1 => Event::Prepare,
-                2 => Event::MayExecute,
-                3 => Event::NoExec,
-                _ => Event::Seal,
-            };
-            let mut requested = a.clone();
-            if action == "ConflictA" {
-                requested.deadline_us += 1;
+            if state["a"] == 6 {
+                let mut requested = a.clone();
+                if action == "ConflictA" {
+                    requested.deadline_us += 1;
+                }
+                assert_eq!(
+                    reject_unadmitted_at(&paths, &requested, five_records()).unwrap(),
+                    action == "RetryA"
+                );
+            } else {
+                let event = match state["a"] {
+                    1 => Event::Prepare,
+                    2 => Event::MayExecute,
+                    3 => Event::NoExec,
+                    _ => Event::Seal,
+                };
+                let mut requested = a.clone();
+                if action == "ConflictA" {
+                    requested.deadline_us += 1;
+                }
+                let result = put(&requested, &a_binding, event);
+                assert_eq!(result.is_ok(), action == "RetryA");
             }
-            let result = put(&requested, &a_binding, event);
-            assert_eq!(result.is_ok(), action == "RetryA");
         }
         "ReopenA" => {
             assert!(put(&a, &a_binding, Event::Prepare).is_err());
@@ -502,6 +529,14 @@ pub(crate) fn issuer_transition(
         next.insert(
             if name == "a" { "a_closed" } else { "b_closed" },
             i64::from(phase >= 3),
+        );
+        next.insert(
+            if name == "a" {
+                "a_rejected"
+            } else {
+                "b_rejected"
+            },
+            i64::from(phase == 6),
         );
     }
     next.insert(

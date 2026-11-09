@@ -21,6 +21,84 @@ pub(super) fn keg_version(f: &Formula) -> String {
     }
 }
 
+/// One entry of a receipt's `runtime_dependencies` (brew's tab
+/// dep hash): the recursive runtime closure as the formula
+/// definitions stood at pour time.
+struct RuntimeDep {
+    full_name: String,
+    version: String,
+    revision: u64,
+    bottle_rebuild: u64,
+    pkg_version: String,
+    declared: bool,
+    compatibility_version: Option<u64>,
+}
+
+/// Brew's tab closure for `f`: every recursive runtime
+/// dependency, depth-first in declared order, first occurrence
+/// kept. `read` resolves a short name to its record (the plan
+/// first, then the catalog); an unresolvable name records
+/// nothing, as its keg can never be poured either.
+fn runtime_closure(f: &Formula, read: &dyn Fn(&str) -> Option<Formula>) -> Vec<RuntimeDep> {
+    fn walk(
+        deps: &[String],
+        direct: &[String],
+        read: &dyn Fn(&str) -> Option<Formula>,
+        seen: &mut BTreeSet<String>,
+        out: &mut Vec<RuntimeDep>,
+    ) {
+        for dep in deps {
+            let short = Formula::short_name(dep);
+            if !seen.insert(short.to_string()) {
+                continue;
+            }
+            let Some(record) = read(short) else { continue };
+            let declared = direct
+                .iter()
+                .any(|d| d == &record.full_name || Formula::short_name(d) == record.name);
+            out.push(RuntimeDep {
+                full_name: record.full_name.clone(),
+                version: record.version.clone(),
+                revision: record.revision,
+                bottle_rebuild: record.bottle_rebuild,
+                pkg_version: keg_version(&record),
+                declared,
+                compatibility_version: record.compatibility_version,
+            });
+            walk(&record.dependencies.clone(), direct, read, seen, out);
+        }
+    }
+    let mut seen: BTreeSet<String> = [f.name.clone()].into_iter().collect();
+    let mut out = Vec::new();
+    walk(&f.dependencies, &f.dependencies, read, &mut seen, &mut out);
+    out
+}
+
+/// Encodes a runtime closure as the receipt's JSON array.
+fn runtime_deps_json(deps: &[RuntimeDep]) -> String {
+    let mut s = String::from("[");
+    for (i, d) in deps.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!(
+            "{{\"full_name\": \"{}\", \"version\": \"{}\", \"revision\": {}, \"bottle_rebuild\": {}, \"pkg_version\": \"{}\", \"declared_directly\": {}",
+            super::prefix::json_escape(&d.full_name),
+            super::prefix::json_escape(&d.version),
+            d.revision,
+            d.bottle_rebuild,
+            super::prefix::json_escape(&d.pkg_version),
+            d.declared,
+        ));
+        if let Some(cv) = d.compatibility_version {
+            s.push_str(&format!(", \"compatibility_version\": {cv}"));
+        }
+        s.push('}');
+    }
+    s.push(']');
+    s
+}
+
 fn preflight(
     prefix: &Prefix,
     f: &Formula,
@@ -876,7 +954,25 @@ pub fn install(
                     super::tty::oh1(&format!("Installing {}", specified_of(&f.full_name)))
                 );
             }
-            match install_one(prefix, f, on_request, link, replacing, opts.quiet, narrate) {
+            let closure = runtime_closure(f, &|short| {
+                planned
+                    .iter()
+                    .find(|p| p.name == short)
+                    .cloned()
+                    .or_else(|| api.formula(short).ok())
+            });
+            match install_one(
+                prefix,
+                f,
+                &closure,
+                PourFlags {
+                    on_request,
+                    link,
+                    quiet: opts.quiet,
+                    prefetched: narrate,
+                },
+                replacing,
+            ) {
                 Ok(()) => {
                     completed = true;
                     if !prior.contains_key(&f.name) {
@@ -1525,15 +1621,27 @@ fn keg_was_linked(prefix: &Prefix, name: &str, version: &str) -> Result<bool, In
     state.ok_or_else(uncertain)
 }
 
+/// The per-keg switches of one pour.
+struct PourFlags {
+    on_request: bool,
+    link: bool,
+    quiet: bool,
+    prefetched: bool,
+}
+
 fn install_one(
     prefix: &Prefix,
     f: &Formula,
-    on_request: bool,
-    link: bool,
+    runtime_deps: &[RuntimeDep],
+    flags: PourFlags,
     replace: ReplaceMode,
-    quiet: bool,
-    prefetched: bool,
 ) -> Result<(), InstallError> {
+    let PourFlags {
+        on_request,
+        link,
+        quiet,
+        prefetched,
+    } = flags;
     let version = keg_version(f);
     let keg = prefix.keg(&f.name, &version);
     let work =
@@ -1570,7 +1678,8 @@ fn install_one(
         .map_or(0, |d| d.as_secs())
         .to_string();
     let version_scheme = f.version_scheme.to_string();
-    prefix.write_receipt(
+    let runtime_deps = runtime_deps_json(runtime_deps);
+    prefix.write_receipt_raw(
         &poured,
         &[
             ("name", &f.name),
@@ -1586,6 +1695,7 @@ fn install_one(
             ("keg_only", if f.keg_only { "true" } else { "false" }),
             ("full_name", &f.full_name),
         ],
+        &[("runtime_dependencies", &runtime_deps)],
     )?;
     let mut links = Vec::new();
     if !f.keg_only && link {
@@ -3148,6 +3258,34 @@ mod tests {
         assert_eq!(parents.get("leaf").map(String::as_str), Some("mid"));
         assert_eq!(specified_of("homebrew/core/zstd"), "zstd");
         assert_eq!(tap_of(&mk("x", &[])), "homebrew/core");
+    }
+
+    #[test]
+    fn runtime_closure_records_the_recursive_graph_in_declared_order() {
+        let mk = |name: &str, deps: &[&str]| Formula {
+            name: name.to_string(),
+            full_name: name.to_string(),
+            version: "1".to_string(),
+            dependencies: deps.iter().map(ToString::to_string).collect(),
+            ..Formula::default()
+        };
+        let records = [
+            mk("top", &["mid", "shared"]),
+            mk("mid", &["leaf", "shared"]),
+            mk("leaf", &[]),
+            mk("shared", &[]),
+        ];
+        let read = |short: &str| records.iter().find(|r| r.name == short).cloned();
+        let closure = runtime_closure(&records[0], &read);
+        let names: Vec<(&str, bool)> = closure
+            .iter()
+            .map(|d| (d.full_name.as_str(), d.declared))
+            .collect();
+        assert_eq!(names, [("mid", true), ("leaf", false), ("shared", true),]);
+        let json = runtime_deps_json(&closure);
+        assert!(json.contains("\"full_name\": \"mid\", \"version\": \"1\""));
+        assert!(json.starts_with('[') && json.ends_with(']'));
+        assert_eq!(runtime_deps_json(&[]), "[]");
     }
 
     #[test]

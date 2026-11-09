@@ -595,6 +595,35 @@ fn native_cut_push_measurement() {
         &source,
         &["commit-tree", &tree, "-p", &before, "-m", "claim"],
     );
+    let metadata = host_git(
+        &source,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--filter=blob:none",
+            &after,
+        ],
+    );
+    let commits = host_git(&source, &["rev-list", "--count", &after]);
+    let new = host_git(
+        &source,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            &after,
+            &format!("^{before}"),
+        ],
+    );
+    assert_eq!(commits, "6004");
+    assert_eq!(metadata.lines().count(), 12007);
+    assert_eq!(new, after);
+    println!(
+        "cut inventory: commits {commits}, trees {}, metadata {}, new objects 1; ledger records 0 (native-writer fixture)",
+        metadata.lines().count() - 6004,
+        metadata.lines().count()
+    );
     host_git(&source, &["tag", "-a", "cut-tag", "-m", "cut", &before]);
     let tag = host_git(&source, &["rev-parse", "cut-tag"]);
     host_git(&source, &["tag", "-a", "cut-fence", "-m", "fence", &before]);
@@ -618,8 +647,21 @@ fn native_cut_push_measurement() {
             "https://github.com/fixture-dev/app.git",
         ],
     );
+    let child_spans = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let previous_cpu = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let prior = Arc::clone(&previous_cpu);
+    let observed = Arc::clone(&child_spans);
+    let fx = Fx::simulated(live_start()).with_git_child_observer_for_tests(move |span| {
+        let end =
+            aterm_sysprobe::jobs::counters_of(std::process::id()).and_then(|cpu| cpu.child_cpu_ns);
+        let mut previous = prior.lock().unwrap();
+        let delta = previous.zip(end).and_then(|(a, b)| b.checked_sub(a));
+        *previous = end;
+        observed.lock().unwrap().push((span, delta));
+    });
     let gh = world
         .client(git_env())
+        .fx(Arc::new(fx))
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
     let slug = common::slug("fixture-dev/app");
@@ -664,7 +706,9 @@ fn native_cut_push_measurement() {
         ),
         ("unlock", None),
     ] {
+        let first = gh.fx().children_run().len();
         let cpu = aterm_sysprobe::jobs::counters_of(std::process::id()).unwrap();
+        *previous_cpu.lock().unwrap() = cpu.child_cpu_ns;
         let start = std::time::Instant::now();
         if let Some(run) = run {
             gh.run_git(&run).unwrap();
@@ -680,6 +724,24 @@ fn native_cut_push_measurement() {
             (end.child_cpu_ns.unwrap() - cpu.child_cpu_ns.unwrap()) as f64 / 1e9,
             (end.cpu_ns - cpu.cpu_ns) as f64 / 1e9
         );
+        let specs = gh.fx().children_run();
+        for (span, child_cpu) in child_spans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| s.ordinal >= first)
+        {
+            let spec = &specs[span.ordinal];
+            // This fixture contains no real remotes or credentials. Retain the
+            // exact arguments so repeated walks can be identified unambiguously.
+            println!(
+                "cut child {name} {}: wall {:.6}s child_cpu_ns {:?} args {:?}",
+                span.ordinal - first,
+                span.finished.duration_since(span.started).as_secs_f64(),
+                child_cpu,
+                spec.args
+            );
+        }
     }
     assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
     assert_eq!(host_git(&remote, &["rev-parse", "refs/tags/cut-tag"]), tag);
@@ -1473,6 +1535,14 @@ fn native_push_incremental_borrows_only_authenticated_old_blob_authority() {
         .expect("new-object pack");
     assert!(pack.args.iter().any(|a| a == "--threads=8"));
     assert!(!pack.args.iter().any(|a| a == "--thin"));
+    // NEGATIVE CONTROL: the old second revision walk has --revs here.
+    // The inventoried set must be the pack input, including a real new blob.
+    let new_pack = children
+        .iter()
+        .filter(|s| s.args.iter().any(|a| a == "pack-objects"))
+        .nth(1)
+        .unwrap();
+    assert!(new_pack.args.iter().any(|a| a == "--no-revs"));
     assert_eq!(
         children
             .iter()

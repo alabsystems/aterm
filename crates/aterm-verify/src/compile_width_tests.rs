@@ -2,6 +2,127 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::memory::StageKey;
+
+#[cfg(unix)]
+#[test]
+fn the_real_lint_stage_installs_pool_flags_without_a_unit_memory_claim() {
+    use crate::{Check, Ctx, EnvSnapshot, Scope};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut ctx = Ctx::new(
+        dir.path().to_owned(),
+        Scope::crate_only("aterm-verify"),
+        EnvSnapshot::default(),
+        dir.path().join("scratch"),
+    )
+    .with_checks(&[Check::Lint]);
+    ctx.pool = Some(aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap());
+    ctx.env.cargo_build_jobs = Some("3".into());
+    let memory = dir.path().join("memory.json");
+    ctx.memory = Some(crate::memory::Book::at(
+        Some(memory.clone()),
+        Some(128 << 30),
+        Some(120 << 30),
+    ));
+    ctx.unit_reader = |_| crate::memory::Named::Nothing;
+    let mut spec = crate::plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == crate::plan::StageId::Tippy)
+        .unwrap();
+    // No memory claim, yet the observation must belong to the pooled width.
+    spec.mem = 0;
+    let quiet = crate::Quiet::of(&ctx, std::slice::from_ref(&spec), crate::LIVE.admit_quiet);
+    let observed = std::cell::Cell::new(false);
+    let _ =
+        crate::staged(
+            &ctx,
+            &quiet,
+            &spec,
+            None,
+            crate::LIVE,
+            || {},
+            || {
+                assert_eq!(current(), Some(3));
+                let pool = ctx.pool.as_ref().unwrap();
+                let mut command = aterm_uds::spawnfd::command("unused");
+                configure(&mut command);
+                assert!(command.get_envs().any(
+                    |(k, v)| k == "MAKEFLAGS" && v == Some(std::ffi::OsStr::new(&pool.flags()))
+                ));
+                let tokens: Vec<_> = (0..3)
+                    .map(|_| pool.try_acquire().unwrap().unwrap())
+                    .collect();
+                assert!(pool.try_acquire().unwrap().is_none());
+                drop(tokens);
+                let meter = crate::memory::current().unwrap();
+                meter.started();
+                meter.book(
+                    123,
+                    &[aterm_sysprobe::MemberUsage {
+                        pid: 123,
+                        start: 1,
+                        cpu_ns: 1,
+                        runnable_ns: 1,
+                        io_bytes: 0,
+                        footprint: 8 << 20,
+                        peak_footprint: 8 << 20,
+                    }],
+                );
+                meter.ended(123);
+                observed.set(true);
+                let mut report = crate::Report::new("lint");
+                report.pass("ran with the shared pool");
+                report
+            },
+        );
+    assert!(observed.get(), "the lint callback must actually run");
+    assert_eq!(current(), None);
+    let ordinary = crate::memory::Key::of_stage(&spec, &ctx);
+    let pooled = record_key(ordinary.clone(), Some(3));
+    let records = crate::memory::Records::load(&memory);
+    assert!(records.rows().iter().any(|row| row.key == pooled));
+    assert!(!records.rows().iter().any(|row| row.key == ordinary));
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_without_per_unit_memory_claims_still_borrows_from_the_release_fifo() {
+    use crate::plan::StageId;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
+    for stage in [
+        StageId::Tippy,
+        StageId::Doctests,
+        StageId::SpecCheck,
+        StageId::TestCompile,
+    ] {
+        let jobs = stage_jobs(stage, Some(pool.slots()), Some(3));
+        assert_eq!(jobs, Some(3));
+        run(Some(&pool), jobs, &|| false, || {
+            let mut command = aterm_uds::spawnfd::command("unused");
+            configure(&mut command);
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "CARGO_MAKEFLAGS"
+                        && value == Some(std::ffi::OsStr::new(&pool.flags())))
+            );
+            let tokens: Vec<_> = (0..3)
+                .map(|_| pool.try_acquire().unwrap().unwrap())
+                .collect();
+            assert!(
+                pool.try_acquire().unwrap().is_none(),
+                "the stage owns its implicit token"
+            );
+            drop(tokens);
+        })
+        .unwrap();
+    }
+    // Negative controls: pure work has no compiler token; unpooled calls do not invent a pool.
+    assert_eq!(stage_jobs(StageId::Formatting, Some(4), None), None);
+    assert_eq!(stage_jobs(StageId::Tippy, None, Some(4)), None);
+    assert_eq!(stage_jobs(StageId::TestCompile, Some(4), Some(2)), Some(2));
+}
 
 #[test]
 fn unit_envelopes_match_the_package_and_compiler_kind() {
@@ -380,7 +501,12 @@ fn only_a_recorded_unit_enables_driver_only_admission_and_the_wrapper() {
             claim.claim.record().need.mem,
             if measured { 2 << 30 } else { 50 << 30 }
         );
-        run(ctx.pool.as_ref(), claim.compile_jobs, &|| false, || {
+        let jobs = stage_jobs(
+            spec.id,
+            ctx.pool.as_ref().map(aterm_capacity::Jobserver::slots),
+            ctx.build_jobs_ceiling(),
+        );
+        run(ctx.pool.as_ref(), jobs, &|| false, || {
             let mut command = aterm_uds::spawnfd::command("unused");
             configure(&mut command);
             assert_eq!(

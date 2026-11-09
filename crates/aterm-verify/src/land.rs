@@ -4,7 +4,10 @@
 //! `targo --unverified verify land` (design B10, `docs/DESIGN-fast-build-release-2026-11-05.md`
 //! §4.6): land this checkout's branch on main, judged.
 //!
-//! 1. Fetch main and merge it (M1), stopping on a conflict.
+//! 1. Fetch main and merge it (M1), stopping on a conflict. A `CHANGELOG.md` entry the branch
+//!    adds that the merge leaves under a released version (a release cut on main after it was
+//!    written) goes back under `## [Unreleased]` ([`changelog`]), in the tool's own merge, else
+//!    in a commit of its own; so does one each re-judge's merge (step 4) leaves there.
 //! 2. Run the dev set over the cone since M1 (`verify --base M1`, B7's export scan included),
 //!    on the committed checkout: one that changes during the run pushes nothing.
 //! 3. A red main's lane verdict on the merged main commit names (B8's journal,
@@ -27,7 +30,7 @@
 use crate::exit;
 use aterm_types::land_trailer::{Checked, Row, Stated};
 use aterm_uds::spawnfd::Command;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -266,11 +269,11 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         );
         return Ok(exit::PASS);
     }
-    if !git.is_ancestor(&merged, &start)?
-        && let Merge::Conflict(paths) = git.merge(&merged, &subject)?
-    {
+    let merged_here = !git.is_ancestor(&merged, &start)?;
+    if merged_here && let Merge::Conflict(paths) = git.merge(&merged, &subject)? {
         return Ok(conflicted(seams, &merged, &paths));
     }
+    rehome_changelog(git, seams, &merged, merged_here.then_some(subject.as_str()))?;
     let mut judged_at = git.head()?;
     let branch = (seams.branch)(git.root, &merged);
     say(
@@ -409,8 +412,9 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         }
         match git.merge(&tip, &subject)? {
             Merge::Conflict(paths) => return Ok(conflicted(seams, &tip, &paths)),
-            Merge::Clean(sha) => {
-                let previous = std::mem::replace(&mut judged_at, sha);
+            Merge::Clean => {
+                rehome_changelog(git, seams, &tip, Some(&subject))?;
+                let previous = std::mem::replace(&mut judged_at, git.head()?);
                 rejudges += 1;
                 composes = 0;
                 composed_tree = None;
@@ -512,6 +516,162 @@ fn judge(
     Ok(None)
 }
 
+/// Move the `CHANGELOG.md` entries the checkout adds beside main commit `main` that sit under a
+/// released version back under `## [Unreleased]`, or drop one that copies an entry the file
+/// holds elsewhere ([`changelog::rehome`]), and commit the change:
+/// into HEAD, restated as `merge` (the tool's own merge's subject), else as a commit of its own.
+fn rehome_changelog(
+    git: &Git<'_>,
+    seams: &mut Seams<'_>,
+    main: &str,
+    merge: Option<&str>,
+) -> Result<(), String> {
+    let file = git.root.join(changelog::PATH);
+    let theirs = format!("{main}:{}", changelog::PATH);
+    if !file.is_file()
+        || git
+            .status(&["cat-file", "-e", &theirs], LOCAL)?
+            .status
+            .code()
+            != Some(0)
+    {
+        return Ok(());
+    }
+    let diff = git.local(&[
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--unified=0",
+        "--inter-hunk-context=0",
+        main,
+        "HEAD",
+        "--",
+        changelog::PATH,
+    ])?;
+    let show = |commit: &str| git.local(&["show", &format!("{commit}:{}", changelog::PATH)]);
+    let text =
+        std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    if text.contains('\r') {
+        (seams.say)(&format!(
+            "verify land: {} holds a carriage return, so its entries were not checked across \
+             the merge of {main}",
+            changelog::PATH
+        ));
+        return Ok(());
+    }
+    let added = changelog::added_lines(&diff);
+    let theirs = show(main)?;
+    let wanted = changelog::in_question(&text, &added, &theirs);
+    let written = if wanted.is_empty() {
+        changelog::Written::new()
+    } else {
+        written_since(git, main, &wanted)?
+    };
+    let Some(rehomed) = changelog::rehome(&text, &added, &theirs, &written) else {
+        return Ok(());
+    };
+    let said = changelog::said(&rehomed);
+    let message = match merge {
+        Some(subject) => format!("{subject}\n\nverify land {said}"),
+        None => format!(
+            "verify land: the CHANGELOG entries this branch adds sit under [Unreleased]\n\n\
+             verify land {said}"
+        ),
+    };
+    let mut commit = vec!["commit", "--quiet", "--no-verify", "-m", message.as_str()];
+    if merge.is_some() {
+        commit.push("--amend");
+    }
+    std::fs::write(&file, &rehomed.text).map_err(|e| format!("write {}: {e}", file.display()))?;
+    // Put the file back as the merge left it (and the index, once it took the change), so a
+    // refused step leaves the checkout committed and clean.
+    let put_back = |why: String, staged: bool| {
+        let restored = std::fs::write(&file, &text)
+            .map_err(|e| format!("write {}: {e}", file.display()))
+            .and_then(|()| {
+                if staged {
+                    git.local(&["add", "--", changelog::PATH]).map(drop)
+                } else {
+                    Ok(())
+                }
+            });
+        match restored {
+            Ok(()) => format!("{why}; {} is as the merge left it", changelog::PATH),
+            Err(again) => format!(
+                "{why}; putting {} back failed too: {again}",
+                changelog::PATH
+            ),
+        }
+    };
+    git.local(&["add", "--", changelog::PATH])
+        .map_err(|why| put_back(why, false))?;
+    git.local(&commit).map_err(|why| put_back(why, true))?;
+    (seams.say)(&format!("verify land: {said} (merging {main})"));
+    Ok(())
+}
+
+/// The `CHANGELOG.md` entries the branch's own commits wrote ([`changelog::Written`]): each
+/// commit in `main..HEAD`, oldest first, whose changelog differs from every parent's, against its
+/// parents' ([`changelog::wrote`]), each placing only the entries `wanted`
+/// ([`changelog::in_question`]). Each changelog is read and scanned once, by its blob, however
+/// many commits hold it.
+fn written_since(
+    git: &Git<'_>,
+    main: &str,
+    wanted: &BTreeSet<String>,
+) -> Result<changelog::Written, String> {
+    let mut blobs: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut blob = |commit: &str| -> Option<String> {
+        blobs
+            .entry(commit.to_owned())
+            .or_insert_with(|| {
+                git.local(&[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{commit}:{}", changelog::PATH),
+                ])
+                .ok()
+            })
+            .clone()
+    };
+    let mut placed: BTreeMap<String, changelog::Placed> = BTreeMap::new();
+    let mut written = changelog::Written::new();
+    for line in git
+        .local(&[
+            "rev-list",
+            "--topo-order",
+            "--reverse",
+            "--parents",
+            &format!("{main}..HEAD"),
+        ])?
+        .lines()
+    {
+        let mut ids = line.split_whitespace();
+        let Some(commit) = ids.next() else {
+            continue;
+        };
+        let Some(own) = blob(commit) else {
+            continue;
+        };
+        let theirs: Vec<String> = ids.filter_map(&mut blob).collect();
+        if theirs.contains(&own) {
+            continue;
+        }
+        for id in theirs.iter().chain([&own]) {
+            if !placed.contains_key(id) {
+                let text = git.local(&["cat-file", "blob", id])?;
+                placed.insert(id.clone(), changelog::placed(&text, wanted));
+            }
+        }
+        let before: Vec<&changelog::Placed> = theirs.iter().map(|id| &placed[id]).collect();
+        changelog::wrote(&mut written, &placed[&own], &before);
+    }
+    Ok(written)
+}
+
 fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[Vec<u8>]) -> i32 {
     (seams.say)(&format!(
         "verify land: FAIL — merging {main} conflicts in {}; nothing was pushed. Fix: resolve \
@@ -543,8 +703,8 @@ fn landed_line(landing: &str, stated: &Stated) -> String {
 
 /// How a merge of main into the checkout went.
 enum Merge {
-    /// Merged and committed: the merge commit.
-    Clean(String),
+    /// Merged and committed.
+    Clean,
     /// Stopped on conflicts, left for the person: the conflicted paths.
     Conflict(Vec<Vec<u8>>),
 }
@@ -755,7 +915,7 @@ impl Git<'_> {
             return Ok(Merge::Conflict(conflicted.into_iter().collect()));
         }
         self.update_submodules()?;
-        Ok(Merge::Clean(self.head()?))
+        Ok(Merge::Clean)
     }
 
     /// Checkout only already imported submodule objects. `--init` could clone through raw git,
@@ -1057,6 +1217,9 @@ fn live_lane(root: &Path, commit: &str) -> Lane {
         Err(e) => Lane::Unjudged(format!("its verdict was not read: {e}")),
     }
 }
+
+#[path = "land_changelog.rs"]
+mod changelog;
 
 #[cfg(test)]
 #[path = "land_tests.rs"]

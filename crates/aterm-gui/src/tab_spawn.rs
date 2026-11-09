@@ -2668,7 +2668,7 @@ pub(crate) mod tests {
             },
         );
         let queued = queued.expect("the worker queued its successful completion");
-        app.pool.hang_up_at_exit();
+        app.pool.retire_at_quit();
         assert!(
             holdout.identity.verify(),
             "the test's queued child must be alive outside the pool"

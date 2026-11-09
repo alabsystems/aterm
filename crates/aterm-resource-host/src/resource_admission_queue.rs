@@ -153,14 +153,21 @@ impl Owner {
                 self.faulted = true;
             }
             Err(error) => {
-                let reason = if workload::purpose(&pending.submission.request) {
+                let reason = if workload::purpose(&pending.submission.request)
+                    || bootstrap_graph::purpose(&pending.submission.request)
+                {
                     let detail: String = error
                         .to_string()
                         .chars()
                         .filter(|ch| !ch.is_control())
                         .take(512)
                         .collect();
-                    format!("native workload admission refused before launch: {detail}")
+                    let kind = if bootstrap_graph::purpose(&pending.submission.request) {
+                        "Bootstrap graph"
+                    } else {
+                        "workload"
+                    };
+                    format!("native {kind} admission refused before launch: {detail}")
                 } else {
                     "resource admission refused before launch".into()
                 };

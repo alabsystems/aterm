@@ -2974,8 +2974,8 @@ fn reap_shell_scheduled(
 ///
 /// On macOS teardown first sets `CLOCAL` on the terminal and keeps it set ([`Held::Carrier`]):
 /// the master's close is then end of file and no hang-up, so no master is retained, and the
-/// caller's close both spares a `zshexit` or EXIT trap and ends a shell that waits on input, as
-/// zsh at its prompt does before running a `trap ... HUP`'s `exit` (ATERM-KI-1104-7). Elsewhere,
+/// caller's close both spares a `zshexit` or EXIT trap and ends a job in front that waits on its
+/// terminal, which zsh waits for before it runs its `trap ... HUP` (ATERM-KI-1104-7). Elsewhere,
 /// or if the flag cannot be set, the terminal is retained as a close-on-exec duplicate drained
 /// until the shell settles or the kill tick ([`Held::Master`]). The existing reap deadlines bound
 /// both.
@@ -4696,6 +4696,38 @@ pub fn close_fd(fd: i32) {
             libc::close(fd);
         }
     }
+}
+
+/// Let go of this process's hold on a PTY master for good, at the final exit: `master`'s slot is
+/// pointed at `/dev/null` (one `dup2`), which lets go of the terminal as a `close` would, while
+/// the number stays open, so no later open takes it and no raw copy of it (a resize, a probe, a
+/// write already past its check) reaches another file. Whichever holder of the master lets go
+/// last ends the terminal, which on macOS is end of file and no hang-up for a shell whose
+/// teardown keeps `CLOCAL` set ([`hangup_and_reap_shell`]). The slot stays close-on-exec.
+///
+/// # Errors
+/// The error of opening `/dev/null` or of the `dup2`; `master` is then unchanged.
+pub fn retire_master(master: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")?;
+    loop {
+        // SAFETY: `null` is open for this call and `master` is the caller's open descriptor;
+        // `dup2` takes both by value, closes the slot's old file and keeps the slot reserved
+        // throughout.
+        if unsafe { libc::dup2(null.as_raw_fd(), master) } >= 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    // SAFETY: a descriptor flag set on the slot `dup2` just filled, which cleared it.
+    unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok(())
 }
 
 /// Focus-linked shell QoS boost: a no-op on Unix.

@@ -294,7 +294,11 @@ pub struct LiveFetcher;
 
 impl Fetcher for LiveFetcher {
     fn get(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
-        aterm_update_core::download_bytes(url, max)
+        // A fleet document published as a release asset rides the download host's outages on
+        // the API route; anonymous either way.
+        aterm_update_core::release_asset::Reader::anonymous()
+            .bytes_at(url, max)
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -64,6 +64,11 @@ const PENDING_WAIT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const BYE_WAIT: Duration = Duration::from_millis(500);
 
+/// How long the final exit waits for its RELEASEs to be written ([`release_at_quit`]), well
+/// inside the reaper's kill tick for a shell that runs a hang-up handler.
+#[cfg(unix)]
+const QUIT_RELEASE_WAIT: Duration = Duration::from_millis(250);
+
 /// Whether the keeper link is on in this process.
 pub(crate) fn on() -> bool {
     ON.load(Ordering::Relaxed)
@@ -1798,9 +1803,19 @@ pub(crate) fn release(session_id: u64) {
 /// [`release`] over `st`.
 #[cfg(unix)]
 fn release_in(st: &mut State, session_id: u64) {
-    let Some(tracked) = st.tracked.remove(&session_id) else {
-        return;
-    };
+    if let Some(op) = release_op(st, session_id)
+        && matches!(st.phase, Phase::Live(_))
+    {
+        send_in(st, Some(session_id), op);
+    }
+}
+
+/// What releasing `session_id` owes the keeper, its tracking dropped from `st`: `None` when the
+/// keeper holds nothing of it (untracked, or its REGISTER still owed with no prior claim, which
+/// is dropped here instead).
+#[cfg(unix)]
+fn release_op(st: &mut State, session_id: u64) -> Option<LinkOp> {
+    let tracked = st.tracked.remove(&session_id)?;
     st.buffered.retain(|(id, _)| *id != session_id);
     let unadmitted = st.owed.iter().any(|(id, op)| {
         *id == Some(session_id)
@@ -1808,11 +1823,54 @@ fn release_in(st: &mut State, session_id: u64) {
     });
     if unadmitted && !tracked.prior_claim {
         st.owed.retain(|(id, _)| *id != Some(session_id));
-        return;
+        return None;
     }
-    if matches!(st.phase, Phase::Live(_)) {
-        send_in(st, Some(session_id), LinkOp::Release { rdev: tracked.rdev });
-    }
+    Some(LinkOp::Release { rdev: tracked.rdev })
+}
+
+/// Release each of `sessions` at the final exit, as closing its tab does, and wait at most
+/// [`QUIT_RELEASE_WAIT`] until the link has written the last of those RELEASEs. The link drops
+/// its duplicate of a master as it takes the op and the keeper its own as it reads it, so each
+/// master's last close can come while its shell's reap runs rather than at the BYE's disconnect,
+/// after this process has exited. `true` too when the keeper holds none of them (off, or not yet
+/// live). `false` when they were not all written in time (a full queue, a slow keeper): a RELEASE
+/// already queued is still written in its turn, one still owed goes with the BYE, and the caller
+/// keeps reading its masters, which the keeper may still hold.
+#[cfg(unix)]
+pub(crate) fn release_at_quit(sessions: &[u64]) -> bool {
+    !on() || release_at_quit_over(&KEEPER_STATE, sessions, QUIT_RELEASE_WAIT)
+}
+
+/// [`release_at_quit`] over `state`, waiting at most `wait`.
+#[cfg(unix)]
+fn release_at_quit_over(state: &Mutex<State>, sessions: &[u64], wait: Duration) -> bool {
+    let (link, last) = {
+        let mut st = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = matches!(st.phase, Phase::Live(_));
+        let mut last = None;
+        for &id in sessions {
+            if let Some(op) = release_op(&mut st, id)
+                && live
+                && let Some((before, op)) = last.replace((id, op))
+            {
+                send_in(&mut st, Some(before), op);
+            }
+        }
+        let Some((id, op)) = last else {
+            return true;
+        };
+        match live_link_in(&mut st) {
+            Ok(Some(link)) => (link, op),
+            Ok(None) => return true,
+            Err(()) => {
+                st.owed.push_back((Some(id), op));
+                return false;
+            }
+        }
+    };
+    link.send_lasting_and_wait(last, wait)
 }
 
 /// Pending (both seamless-update lanes, before the grant).
@@ -3962,6 +4020,80 @@ mod tests {
         link.shutdown();
         older.shutdown();
         end(&sh);
+    }
+
+    /// Quit's RELEASEs reach the keeper before its BYE: once [`release_at_quit`] has returned the
+    /// link has written every one, the last waited on, and the keeper closes its copies of the
+    /// masters as it reads them, with no BYE sent, so no master's last close waits for this process
+    /// to exit. A session the keeper never held is passed over.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn quits_releases_are_written_before_its_bye_and_the_keeper_closes_on_them() {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut keeper = Keeper::new("quit release");
+        let shells = [live_pty(), live_pty()];
+        let state = Mutex::new(State {
+            phase: Phase::Live(Arc::new(keeper.link(None))),
+            buffered: Vec::new(),
+            owed: VecDeque::new(),
+            tracked: BTreeMap::new(),
+            pump: false,
+        });
+        let mut rdevs = Vec::new();
+        for (id, (sh, birth)) in (10..).zip(&shells) {
+            let master = owned_dup(sh.master);
+            let rdev = std::fs::File::from(master.try_clone().expect("dup"))
+                .metadata()
+                .expect("stat the master")
+                .rdev();
+            register_in(
+                &mut state.lock().expect("state"),
+                id,
+                Tracked {
+                    rdev,
+                    prior_claim: false,
+                    term: Weak::new(),
+                    fabric: Weak::new(),
+                    last: None,
+                },
+                LinkOp::Register {
+                    master,
+                    header: MasterHeader {
+                        rdev,
+                        local_id: id,
+                        ..header_for(sh.pid, *birth)
+                    },
+                    tag: tag(),
+                },
+                LinkOp::CompanionRelease {
+                    rdev,
+                    receipt: None,
+                },
+            );
+            rdevs.push(rdev);
+        }
+        keeper.step_until("the keeper holds both masters", |s| {
+            rdevs.iter().all(|rdev| s.holds(*rdev))
+        });
+        let written = std::thread::scope(|scope| {
+            let quit = scope.spawn(|| {
+                release_at_quit_over(&state, &[10, 99, 11], aterm_spec::wait::MUST_HAPPEN)
+            });
+            keeper.step_until("the quit's RELEASEs are written", |_| quit.is_finished());
+            quit.join().expect("the quit's release")
+        });
+        assert!(written, "the last RELEASE was written");
+        keeper.step_until("the keeper closes both masters with no BYE", |s| {
+            rdevs.iter().all(|rdev| !s.holds(*rdev))
+        });
+        let mut st = state.lock().expect("state");
+        assert!(st.tracked.is_empty() && st.owed.is_empty());
+        if let Some(link) = quit_link_in(&mut st).and_then(Arc::into_inner) {
+            link.shutdown();
+        }
+        for (sh, _) in &shells {
+            end(sh);
+        }
     }
 
     /// F01, an adoption never placed: the window admits the offer, but its session never comes

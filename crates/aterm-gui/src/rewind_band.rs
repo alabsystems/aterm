@@ -121,24 +121,64 @@ pub(crate) fn border_rects(
 impl App {
     /// The rewound panes window `wid` shows, with their cells in the terminal grid.
     pub(crate) fn rewound_panes(&self, wid: WindowId) -> Vec<(u64, CellBox)> {
+        self.rewound_panes_from_plan(wid, None)
+    }
+
+    pub(crate) fn rewound_panes_from_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Vec<(u64, CellBox)> {
         if !self.pool.any_rewound() {
+            return Vec::new();
+        }
+        let map_leaves = |plan: &crate::tab_model::VisibleLeafPlan| {
+            plan.leaves
+                .iter()
+                .filter_map(|leaf| {
+                    let session = self
+                        .view_store
+                        .get(leaf.view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)?;
+                    let shown = self.pool.rewind(session)?.shown.is_some();
+                    shown.then(|| (session, CellBox::of(leaf.rect)))
+                })
+                .collect()
+        };
+        if let Some(plan) = frame_plan {
+            return map_leaves(plan);
+        }
+        if let Some(ws) = self.windows.get(&wid)
+            && let Some(tab) = ws.tab_set.active()
+            && (tab.zoomed || tab.root.len() == 1)
+            && tab.root.contains(tab.focus)
+        {
+            let Some(session) = self
+                .view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            else {
+                return Vec::new();
+            };
+            if self.pool.rewind(session).is_some_and(|v| v.shown.is_some()) {
+                return vec![(
+                    session,
+                    CellBox {
+                        row: 0,
+                        col: 0,
+                        rows: usize::from(ws.rows.max(1)),
+                        cols: usize::from(ws.cols.max(1)),
+                    },
+                )];
+            }
             return Vec::new();
         }
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return Vec::new();
         };
-        plan.leaves
-            .iter()
-            .filter_map(|leaf| {
-                let session = self
-                    .view_store
-                    .get(leaf.view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)?;
-                let shown = self.pool.rewind(session)?.shown.is_some();
-                shown.then(|| (session, CellBox::of(leaf.rect)))
-            })
-            .collect()
+        map_leaves(&plan)
     }
 
     /// Whether window row `row` (in terminal grid rows) of window `wid` lies under the band or the track of the rewound `session`'s pane: rows the last frame claimed as chrome, or, before any frame, that pane's bottom band rows.
@@ -158,20 +198,32 @@ impl App {
     }
 
     /// The Rewind fingerprint of window `wid`'s frame: 0 while no pane it shows is rewound.
-    pub(crate) fn rewind_frame_fp(&self, wid: WindowId) -> u64 {
+    pub(crate) fn rewind_frame_fp(
+        &self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> u64 {
+        let panes = self.rewound_panes_from_plan(wid, Some(plan));
+        if panes.is_empty() {
+            return 0;
+        }
         let effects = match self.rewind_effects_status(wid) {
             None => 0,
             Some(words) => aterm_hash::fnv1a_64(words.as_bytes()),
         };
-        self.rewound_panes(wid).iter().fold(0, |fp, (session, _)| {
+        panes.iter().fold(0, |fp, (session, _)| {
             let faith = self.rewind_faith(*session).map_or(0, Faith::code);
             fp.rotate_left(7) ^ self.pool.rewind_fp(*session) ^ faith.rotate_left(32) ^ effects
         })
     }
 
     /// Paint each rewound pane's band and border into window `wid`'s frame, taking back the last frame's border.
-    pub(crate) fn splice_rewind_band(&mut self, wid: WindowId) {
-        let panes = self.rewound_panes(wid);
+    pub(crate) fn splice_rewind_band(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        let panes = self.rewound_panes_from_plan(wid, Some(plan));
         let painted = self
             .windows
             .get(&wid)

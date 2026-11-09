@@ -7,6 +7,31 @@
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
 )]
 
+// These fixtures judge write ordering and recovery. The durable crate judges the hardware
+// flush itself; keep every requested flush here without draining the SSD for each fixture.
+#[cfg(all(test, unix))]
+aterm_durable::plain_durable_flushes_in_tests!();
+
+/// Removing the fixture policy must fail, and keeping it must preserve every requested flush
+/// and every injected I/O error. Hardware durability itself belongs to aterm-durable's tests.
+#[cfg(all(test, target_vendor = "apple"))]
+#[test]
+fn fixture_flushes_keep_their_order_and_errors_without_hardware_drains() {
+    use aterm_durable::{Flush, seam};
+    assert!(aterm_durable::durable_flushes_are_plain());
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("record")).unwrap();
+    let recorded = seam::Recording::start();
+    Flush::Durable.file(&file).unwrap();
+    Flush::Ordered.file(&file).unwrap();
+    let _failure = seam::FailingDirs::with_kind(std::io::ErrorKind::Other);
+    assert!(Flush::Durable.dir(dir.path()).is_err());
+    assert_eq!(
+        recorded.take(),
+        [Flush::Durable, Flush::Ordered, Flush::Durable]
+    );
+}
+
 /// The exact first-exec line B1's frozen release-tool proof expects.
 pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
 
@@ -621,6 +646,10 @@ pub struct Ctx {
     /// Requested `--test-threads`, else the caller's own `RUST_TEST_THREADS`: the widest a test
     /// binary runs ([`test_plan`]).
     pub test_threads: Option<u32>,
+    /// Requested maximum test CPU share, still subject to admission and pool limits.
+    pub test_cores: Option<u32>,
+    /// Explicit libtest shuffle seed; none preserves its ordinary case order.
+    pub test_seed: Option<u64>,
     /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
     pub test_recorder: Option<PathBuf>,
     /// How the timing stages ([`plan::TIMED`]), and the browser lane where Safari's window takes
@@ -794,6 +823,8 @@ impl Ctx {
             checkers_in_tests: false,
             measure_artifact: None,
             test_threads: pinned_threads,
+            test_cores: None,
+            test_seed: None,
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
             background: false,
@@ -931,15 +962,17 @@ impl Ctx {
     /// pool's slots where a pool was adopted, the admitted share where a slot is held
     /// ([`test_workers::admitted_share`]), else the host's cores. A context inspected before
     /// [`run_with`] refuses malformed admission data (or a pool named and not adopted) still
-    /// names no unbounded share: one core.
+    /// names no unbounded share: one core. `--test-cores` caps this request without granting
+    /// capacity; the execution stage can receive less from admission.
     #[must_use]
     pub fn test_share(&self) -> u32 {
-        match test_workers::share(&self.env, self.pool.as_ref()) {
+        let available = match test_workers::share(&self.env, self.pool.as_ref()) {
             Ok(test_workers::Share::Pool(slots)) => slots,
             Ok(test_workers::Share::Claim(share)) => share.unwrap_or_else(|| self.cores()),
             Err(_) => 1,
         }
-        .max(1)
+        .max(1);
+        self.test_cores.map_or(available, |n| n.clamp(1, available))
     }
 
     /// The most libtest threads one test binary runs on, within `share` cores: `--test-threads`,
@@ -961,8 +994,11 @@ impl Ctx {
     /// was adopted or the caller pinned it: what the recording pass, the doctests and a rerun
     /// give each binary.
     pub(crate) fn test_thread_override(&self) -> Option<u32> {
-        (self.env.build_slot_held.is_some() || self.pool.is_some() || self.test_threads.is_some())
-            .then(|| self.test_threads())
+        (self.env.build_slot_held.is_some()
+            || self.pool.is_some()
+            || self.test_threads.is_some()
+            || self.test_cores.is_some())
+        .then(|| self.test_threads())
     }
 
     fn refresh_test_threads(&mut self) {
@@ -997,6 +1033,14 @@ impl Ctx {
         if let Some(n) = threads {
             self.test_threads = Some(n.get());
         }
+        self.refresh_test_threads();
+        self
+    }
+
+    /// Request at most this test CPU share; this grants no capacity itself.
+    #[must_use]
+    pub fn with_test_cores(mut self, cores: Option<std::num::NonZeroU32>) -> Self {
+        self.test_cores = cores.map(std::num::NonZeroU32::get);
         self.refresh_test_threads();
         self
     }
@@ -1816,7 +1860,6 @@ pub(crate) struct ResourceClaim {
     pub(crate) claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
     pub(crate) said: String,
-    compile_jobs: Option<u32>,
 }
 
 impl ResourceClaim {
@@ -2014,7 +2057,6 @@ fn claim_bytes(
             let how = admitted_how(&claim, mode);
             Ok(ResourceClaim {
                 claim: Arc::new(claim),
-                compile_jobs: None,
                 said: format!(
                     "{}: {what}{how}",
                     if cores > 0 { "resources" } else { "memory" }
@@ -2103,7 +2145,11 @@ fn staged(
         }
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
-        let jobs = claim.as_ref().and_then(|c| c.compile_jobs);
+        let jobs = compile_width::stage_jobs(
+            spec.id,
+            ctx.pool.as_ref().map(aterm_capacity::Jobserver::slots),
+            ctx.build_jobs_ceiling(),
+        );
         let (report, begun, machine) =
             compile_width::run(ctx.pool.as_ref(), jobs, &stopping, || {
                 let begun = Instant::now();
@@ -2114,14 +2160,14 @@ fn staged(
                 (report, begun, aterm_capacity::between(&from, &to))
             })
             .map_err(|e| format!("compiler tokens could not be acquired: {e}"))?;
-        Ok((report, begun, machine, claim))
+        Ok((report, begun, machine, claim, jobs))
     };
     let ran = if takes_quiet(ctx, spec.id) {
         quietly(ctx, quiet, &spec.title, run).and_then(|(ran, admitted)| Ok((ran?, admitted)))
     } else {
         run().map(|ran| (ran, None))
     };
-    let ((report, begun, mut machine, claim), admitted) = match ran {
+    let ((report, begun, mut machine, claim, jobs), admitted) = match ran {
         Ok(ran) => ran,
         Err(why) => return could_not_run(why, held),
     };
@@ -2130,13 +2176,7 @@ fn staged(
         machine.push_str("; ");
         machine.push_str(&said);
     }
-    if let Some(said) = measured(
-        ctx,
-        spec,
-        &report,
-        meter.as_deref(),
-        claim.as_ref().and_then(|c| c.compile_jobs),
-    ) {
+    if let Some(said) = measured(ctx, spec, &report, meter.as_deref(), jobs) {
         machine.push_str("; ");
         machine.push_str(&said);
     }
@@ -2989,6 +3029,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_pool(pool)
         .with_test_threads(parsed.test_threads)
+        .with_test_cores(parsed.test_cores)
         .with_passed_binaries(passed_binaries)
         .with_events(events)
         .with_quiet(Some(if parsed.background {
@@ -3006,6 +3047,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
     ctx.background = parsed.background;
+    ctx.test_seed = parsed.test_seed;
     let mut ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
@@ -3989,6 +4031,47 @@ mod tests {
         let c = ctx(&root, theirs);
         assert_eq!((pinned(&c).is_some(), c.main_build_dir), (true, None));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn requested_test_cores_narrow_but_never_grant_a_share() {
+        let make = |env| {
+            Ctx::new(
+                PathBuf::from("/repo"),
+                Scope::workspace(),
+                env,
+                PathBuf::from("/tmp"),
+            )
+        };
+        let held = || {
+            make(EnvSnapshot {
+                build_slot_held: Some("1".into()),
+                cargo_build_jobs: Some("6".into()),
+                ..EnvSnapshot::default()
+            })
+        };
+        let capped = held().with_test_cores(std::num::NonZeroU32::new(3));
+        assert_eq!(capped.test_share(), 3);
+        assert_eq!(capped.test_thread_override(), Some(3));
+        assert_eq!(
+            held()
+                .with_test_cores(std::num::NonZeroU32::new(20))
+                .test_share(),
+            6
+        );
+        let unheld = make(EnvSnapshot::default()).with_test_cores(std::num::NonZeroU32::new(1));
+        assert_eq!(unheld.test_share(), 1);
+        assert_eq!(
+            test_workers::share(&unheld.env, None),
+            Ok(test_workers::Share::Claim(None))
+        );
+        let malformed = make(EnvSnapshot {
+            build_slot_held: Some("1".into()),
+            ..EnvSnapshot::default()
+        })
+        .with_test_cores(std::num::NonZeroU32::new(20));
+        assert_eq!(malformed.test_share(), 1);
+        assert!(test_workers::share(&malformed.env, None).is_err());
     }
 
     #[test]

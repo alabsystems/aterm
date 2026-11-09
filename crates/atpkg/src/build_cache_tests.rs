@@ -1225,18 +1225,35 @@ fn a_placed_member_build_resolves_the_unit_graph_plain_targo_does() {
         f.file(&format!("home/ws/{name}/src/lib.rs"), "");
     }
     let cargo_home = f.dir("cargo-home");
-    // The unit graph `args` resolve, run by the `targo` that built this test, at the workspace,
+    let mut version = aterm_uds::spawnfd::command(env!("CARGO"));
+    version.arg("--version");
+    let version = aterm_uds::deadline::output_within(&mut version, Duration::from_secs(60))
+        .expect("query the compiler driver");
+    assert!(version.status.success());
+    let version = String::from_utf8_lossy(&version.stdout);
+    let trust = version.starts_with("targo ");
+    assert!(trust || version.starts_with("cargo "), "{version}");
+    // The unit graph `args` resolve, run by the driver that built this test, at the workspace,
     // in a CARGO_HOME of its own, without what `targo test` said about this crate or a target
     // directory it chose.
     let graph = |args: &[String]| -> String {
         let mut cmd = aterm_uds::spawnfd::command(env!("CARGO"));
-        cmd.args(args)
-            .args(["--offline", "--unit-graph", "-Z", "unstable-options"])
-            .current_dir(&ws)
-            .env("CARGO_HOME", &cargo_home)
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("CARGO_BUILD_TARGET_DIR")
-            .env_remove(BUILD_DIR_ENV);
+        // STOCK EXCEPTION: the Linux runtime lane uses stock Cargo. Keep the Trust
+        // lane word in the placement assertions, but omit it from that driver's query.
+        cmd.args(
+            args.iter()
+                .filter(|arg| trust || arg.as_str() != "--unverified"),
+        )
+        .args(["--offline", "--unit-graph", "-Z", "unstable-options"])
+        .current_dir(&ws)
+        .env("CARGO_HOME", &cargo_home)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove(BUILD_DIR_ENV);
+        if !trust {
+            // Enable the unit-graph instrument only; this command builds no artifacts.
+            cmd.env("RUSTC_BOOTSTRAP", "1");
+        }
         for (name, _) in std::env::vars_os() {
             if name.to_str().is_some_and(|name| {
                 said_by_cargo_run(name)
@@ -1246,7 +1263,8 @@ fn a_placed_member_build_resolves_the_unit_graph_plain_targo_does() {
                 cmd.env_remove(name);
             }
         }
-        let out = cmd.output().unwrap();
+        let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(60))
+            .expect("query the unit graph");
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             out.status.success(),

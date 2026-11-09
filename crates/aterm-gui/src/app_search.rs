@@ -620,7 +620,7 @@ impl SearchState {
         }
     }
 
-    /// Structural repaint key of the find bar over the fields [`splice_find_bar`](crate::App::splice_find_bar) paints, folded into [`RepaintKey`](crate::RepaintKey) so an edit that does not move the highlight still presents (`None` with no find open).
+    /// Structural repaint key of the find bar over the fields [`splice_find_bar_from_plan`](crate::App::splice_find_bar_from_plan) paints, folded into [`RepaintKey`](crate::RepaintKey) so an edit that does not move the highlight still presents (`None` with no find open).
     pub(crate) fn fingerprint(&self) -> SearchRepaintKey {
         let mut flags = 0u8;
         for (bit, flag) in [

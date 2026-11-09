@@ -1618,8 +1618,12 @@ pub(crate) fn read_identity_marked(
 /// The recipient of this machine's age identity ([`read_identity`]), `None` where there is none,
 /// kept for the digest of the bytes it was parsed from. The identity file's digest is kept while
 /// the file stands ([`fsx::private_digest`]), so a check that compares this Mac's recipient opens
-/// the secret only when the file changed. Only digests and recipients are kept, never the key.
-pub(crate) fn identity_recipient(paths: &Paths) -> crate::Result<Option<Recipient>> {
+/// the secret only when the file changed; the file's first `lstat` is `glance`'s where the
+/// caller's check looks through one. Only digests and recipients are kept, never the key.
+pub(crate) fn identity_recipient(
+    paths: &Paths,
+    glance: Option<&fsx::Glance>,
+) -> crate::Result<Option<Recipient>> {
     type Kept = std::sync::Mutex<std::collections::VecDeque<([u8; 32], Recipient)>>;
     #[cfg(not(test))]
     static RECIPIENTS: Kept = std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -1633,7 +1637,7 @@ pub(crate) fn identity_recipient(paths: &Paths) -> crate::Result<Option<Recipien
     const KEPT: usize = 8;
     let recipient_in = |kept: &Kept| -> crate::Result<Option<Recipient>> {
         let path = paths.identity_file();
-        let Some(digest) = fsx::private_digest(&path, IDENTITY_MAX)? else {
+        let Some(digest) = fsx::private_digest(&path, IDENTITY_MAX, glance)? else {
             return Ok(None);
         };
         if let Ok(kept) = kept.lock()

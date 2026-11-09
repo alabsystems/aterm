@@ -841,7 +841,16 @@ fn every_exit_is_checked_against_held_out_judged() {
 
 #[test]
 fn a_verb_exits_by_its_named_codes() {
-    assert_eq!(cmd_aos_learn(&args(&["--help"])).ok(), Some(0));
+    assert_eq!(
+        cmd_aos_learn_reading(&args(&["--help"]), || 0).ok(),
+        Some(0)
+    );
+    let guarded_help = cmd_aos_learn_reading(&args(&["--help"]), || 1).expect_err("a defect");
+    assert_eq!(guarded_help.code, 1);
+    assert_eq!(
+        guarded_help.msg.as_deref(),
+        Some("aos-learn: defect: held_out_judged reads 1, not 0")
+    );
     let exit = |a: &[&str]| parse(&args(a)).and_then(|v| run(&v)).err();
     assert_eq!(exit(&["chain", "--store", "s"]).map(|f| f.code), Some(2));
     let homes = || HOMES.with(std::cell::Cell::get);

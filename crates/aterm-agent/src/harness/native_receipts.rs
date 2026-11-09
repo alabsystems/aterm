@@ -9,7 +9,8 @@
 //! NoExec receipt; its caller must retain and revalidate live native evidence.
 //! Absence alone is unknown, never proof of nonexecution: the host's `unadmitted` answer
 //! composes it with its own operation table and an expired same-epoch deadline
-//! ([`contains_operation`]).
+//! ([`contains_operation`]). Across epochs, [`reject_unadmitted`] instead commits
+//! permanent denial before absence can release an unbound recipe.
 //! The separate enrollment file detects a missing established journal; neither
 //! it nor a signed log protects against rollback of the whole custody tree.
 
@@ -119,6 +120,7 @@ enum IssuerState {
     NoExec,
     Sealed { may_execute: bool },
     Fenced,
+    Rejected,
 }
 
 impl IssuerState {
@@ -126,7 +128,7 @@ impl IssuerState {
         match self {
             Self::Prepared => 2,
             Self::MayExecute => 1,
-            Self::NoExec | Self::Sealed { .. } | Self::Fenced => 0,
+            Self::NoExec | Self::Sealed { .. } | Self::Fenced | Self::Rejected => 0,
         }
     }
 }
@@ -137,6 +139,7 @@ enum Event {
     MayExecute = 2,
     NoExec = 3,
     Seal = 4,
+    Reject = 5,
 }
 
 impl Event {
@@ -146,6 +149,7 @@ impl Event {
             2 => Ok(Self::MayExecute),
             3 => Ok(Self::NoExec),
             4 => Ok(Self::Seal),
+            5 => Ok(Self::Reject),
             _ => Err(invalid()),
         }
     }
@@ -153,6 +157,7 @@ impl Event {
     fn advance(self, previous: Option<IssuerState>) -> io::Result<IssuerState> {
         match (previous, self) {
             (None, Self::Prepare) => Ok(IssuerState::Prepared),
+            (None, Self::Reject) => Ok(IssuerState::Rejected),
             (Some(IssuerState::Prepared), Self::MayExecute) => Ok(IssuerState::MayExecute),
             (Some(IssuerState::Prepared), Self::NoExec) => Ok(IssuerState::NoExec),
             (Some(IssuerState::Prepared), Self::Seal) => {
@@ -172,6 +177,7 @@ impl Event {
                 | (Self::MayExecute, IssuerState::MayExecute)
                 | (Self::NoExec, IssuerState::NoExec)
                 | (Self::Seal, IssuerState::Sealed { .. } | IssuerState::NoExec)
+                | (Self::Reject, IssuerState::Rejected)
         )
     }
 }
@@ -428,6 +434,7 @@ impl View {
             limits,
             match event {
                 Some(Event::Prepare) => 3,
+                Some(Event::Reject) => 1,
                 Some(_) => 0, // The existing reservation already covers this append.
                 None => 1,    // A legacy NoExec has no earlier reservation.
             },
@@ -770,6 +777,8 @@ fn record_successor_at(
     let candidate = receipt(&key, prepare, binding)?;
     let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
     let (mut log, view) = open_existing(paths, &key, limits)?;
+    check_rejection_domain(paths, &key, predecessor)?;
+    check_rejection_domain(paths, &key, prepare)?;
     let parent = view
         .entries
         .get(&parent_receipt.operation)
@@ -1050,6 +1059,7 @@ fn record_with_phase_at_limits(
     } else {
         open_existing(paths, &key, limits)?
     };
+    check_rejection_domain(paths, &key, prepare)?;
     let previous = view.entries.get(&receipt.operation);
     if let Some(old) = previous {
         if event == Some(Event::Prepare) && old.predecessor.is_some() {
@@ -1422,6 +1432,102 @@ pub fn contains_operation(id: &str) -> io::Result<bool> {
     contains_operation_at(&Paths::locate().map_err(|_| invalid())?, id)
 }
 
+/// Permanently reject an explicitly marked restart recipe only if its ID was never admitted.
+/// The append shares admission's journal lock: either preparation wins and this
+/// refuses, or this wins and every later preparation of the ID refuses. No
+/// execution, rollback or successor capability is recovered from this record.
+///
+/// # Errors
+/// Refuses unmarked, foreign-domain or malformed recipes, damaged custody,
+/// unavailable space or an unacknowledged append.
+pub fn reject_unadmitted(prepare: &Prepare) -> io::Result<bool> {
+    reject_unadmitted_at(&Paths::locate().map_err(|_| invalid())?, prepare, LIMITS)
+}
+
+/// Identify this authenticated journal namespace before preparing a restart.
+/// The value grants no authority and survives process/host-epoch changes.
+/// # Errors
+/// Refuses unavailable identity, untrusted custody or failed journal enrollment.
+pub fn rejection_domain() -> io::Result<String> {
+    rejection_domain_at(&Paths::locate().map_err(|_| invalid())?)
+}
+
+fn rejection_domain_at(paths: &Paths) -> io::Result<String> {
+    let key = write_key(paths)?;
+    let (_log, _view) = open(paths, &key, LIMITS)?;
+    rejection_domain_for(paths, &key)
+}
+
+fn rejection_domain_for(paths: &Paths, key: &Key) -> io::Result<String> {
+    let canonical = std::fs::canonicalize(directory(paths))?;
+    Ok(aterm_codec::hex::encode_lower(&key.digest(
+        b"rejection-domain\0",
+        canonical.as_os_str().as_encoded_bytes(),
+    )))
+}
+
+fn check_rejection_domain(paths: &Paths, key: &Key, prepare: &Prepare) -> io::Result<()> {
+    if let Some(expected) = &prepare.rejection_domain
+        && *expected != rejection_domain_for(paths, key)?
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerJournal",
+        action = "RejectA",
+        project = "aterm_agent::harness::native_receipts::tests::issuer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerJournal",
+        action = "RejectB",
+        project = "aterm_agent::harness::native_receipts::tests::issuer_transition"
+    )
+)]
+fn reject_unadmitted_at(paths: &Paths, prepare: &Prepare, limits: Limits) -> io::Result<bool> {
+    if prepare.rejection_domain.is_none()
+        || !matches!(prepare.plan, NativePlan::Restart { .. })
+        || Request::prepare(prepare.clone()).encode().is_none()
+    {
+        return Err(invalid());
+    }
+    let key = existing_key(paths)?;
+    if prepare.rejection_domain.as_deref() != Some(rejection_domain_for(paths, &key)?.as_str()) {
+        return Err(invalid());
+    }
+    let receipt = Receipt {
+        operation: key.operation(&prepare.id),
+        prepare: key.prepare(prepare)?,
+        capability: [0; 32],
+    };
+    let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
+    let (mut log, view) = open_existing(paths, &key, limits)?;
+    if let Some(old) = view.entries.get(&receipt.operation) {
+        return Ok(old.state == IssuerState::Rejected
+            && old.receipt == receipt
+            && old.epoch == Some(epoch));
+    }
+    if !view.can_append(Some(Event::Reject), limits) {
+        return Err(io::Error::other("native rejection capacity is unavailable"));
+    }
+    let body = view.encode_event(
+        &key,
+        &receipt,
+        epoch,
+        Event::Reject,
+        aterm_time::unix_millis().ok_or_else(invalid)?,
+    );
+    log.append(ISSUER_SUBJECT, body)?;
+    Ok(true)
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1460,6 +1566,7 @@ pub mod testing {
         NoExec,
         Sealed { may_execute: bool },
         Fenced,
+        Rejected,
     }
 
     /// The same admission and transition code used by the native issuer.
@@ -1531,6 +1638,7 @@ pub mod testing {
                     IssuerState::NoExec => State::NoExec,
                     IssuerState::Sealed { may_execute } => State::Sealed { may_execute },
                     IssuerState::Fenced => State::Fenced,
+                    IssuerState::Rejected => State::Rejected,
                 }))
         }
 
@@ -1560,6 +1668,20 @@ pub mod testing {
         /// Refuses damaged or untrusted established custody.
         pub fn contains_operation(&self, id: &str) -> io::Result<bool> {
             contains_operation_at(&self.paths, id)
+        }
+
+        /// Exercise durable rejection with the production journal lock.
+        /// # Errors
+        /// Refuses malformed requests, damaged custody or unavailable space.
+        pub fn reject_unadmitted(&self, prepare: &Prepare) -> io::Result<bool> {
+            reject_unadmitted_at(&self.paths, prepare, LIMITS)
+        }
+
+        /// Obtain this test journal's same production domain binding.
+        /// # Errors
+        /// Refuses invalid identity or failed enrollment.
+        pub fn rejection_domain(&self) -> io::Result<String> {
+            rejection_domain_at(&self.paths)
         }
 
         /// Recover an existing exact claim with the production durability path.

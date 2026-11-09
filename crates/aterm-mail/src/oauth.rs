@@ -5,6 +5,9 @@
 
 use crate::Secret;
 
+/// Hang detector for a required token response, bounded by its original parent.
+const TOKEN_REQUEST_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     Transport,
@@ -168,7 +171,7 @@ pub fn exchange(
         pending,
         state,
         code,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        std::time::Instant::now() + TOKEN_REQUEST_HANG,
     )
 }
 
@@ -210,7 +213,7 @@ pub fn refresh(
         client_id,
         client_secret,
         refresh_token,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        std::time::Instant::now() + TOKEN_REQUEST_HANG,
     )
 }
 
@@ -240,9 +243,24 @@ pub fn refresh_until(
 }
 
 fn request_until(fields: &[(&str, &str)], end: std::time::Instant) -> Result<Tokens, Error> {
-    let within = end
-        .saturating_duration_since(std::time::Instant::now())
-        .min(std::time::Duration::from_secs(30));
+    request_started(
+        fields,
+        end,
+        std::time::Instant::now(),
+        "https://oauth2.googleapis.com/token",
+        aterm_http::ProxyMode::Environment,
+    )
+}
+
+fn request_started(
+    fields: &[(&str, &str)],
+    end: std::time::Instant,
+    started: std::time::Instant,
+    endpoint: &str,
+    proxy: aterm_http::ProxyMode,
+) -> Result<Tokens, Error> {
+    let by = end.min(started + TOKEN_REQUEST_HANG);
+    let within = by.saturating_duration_since(std::time::Instant::now());
     if within.is_zero() {
         return Err(Error {
             kind: ErrorKind::Transport,
@@ -262,21 +280,22 @@ fn request_until(fields: &[(&str, &str)], end: std::time::Instant) -> Result<Tok
         body.push('=');
         encode_into(&mut body, v);
     }
-    let client = aterm_http::Client::new(
-        aterm_http::Trust::PlatformVerifier,
-        aterm_http::ProxyMode::Environment,
-        within,
-    );
+    let client = aterm_http::Client::new(aterm_http::Trust::PlatformVerifier, proxy, within);
     let response = client
-        .post("https://oauth2.googleapis.com/token")
+        .post(endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .limit(64 * 1024)
+        .backstop(by.saturating_duration_since(std::time::Instant::now()))
         .send(body.as_bytes())
         .map_err(|_| Error {
             kind: ErrorKind::Transport,
         })?;
     decode_response(response.status(), response.body())
 }
+
+#[cfg(test)]
+#[path = "oauth/native_wait_tests.rs"]
+mod native_wait_tests;
 
 fn decode_response(status: u16, body: &[u8]) -> Result<Tokens, Error> {
     if matches!(status, 407 | 408 | 425 | 429) || status >= 500 {

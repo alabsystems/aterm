@@ -46,7 +46,7 @@ fn wrapper_timeline_probe() {
     let units = Units {
         record: dir.path().join("record"),
         triple: NATIVE.to_owned(),
-        spare: None,
+        spare: (mode == "claim").then_some(2 * DRIVER),
     };
     let mut args = vec![OsString::from("/usr/bin/false")];
     args.extend(["--crate-name", "fixture", "--crate-type", "lib"].map(OsString::from));
@@ -86,6 +86,12 @@ fn wrapper_retains_a_failed_units_timeline_but_does_not_invent_query_units() {
     assert_eq!(rows[0]["phase"].as_str(), Some("started"));
     assert_eq!(rows[1]["phase"].as_str(), Some("ended"));
     assert_eq!(rows[1]["success"].as_bool(), Some(false));
+    assert!(
+        rows[0]["memory_waiting_s"].is_null(),
+        "record-only mode admits no unit memory"
+    );
+    let claimed = run("claim");
+    assert!(claimed[0]["memory_waiting_s"].as_f64().is_some());
     assert!(rows[1]["cpu_s"].as_f64().unwrap() >= 0.0);
     assert!(rows[1]["at_unix_s"].as_f64() >= rows[0]["at_unix_s"].as_f64());
     // Negative control: Cargo's compiler queries are not compiles, even with unit flags.

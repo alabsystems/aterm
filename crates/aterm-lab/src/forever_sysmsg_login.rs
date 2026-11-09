@@ -154,9 +154,10 @@ fn pinned(run: &Run) -> bool {
 }
 
 /// LAYS THE STORED LOGIN in the lab's scratch, nowhere else, as a person's `/login` leaves one: a
-/// live fake login of [`STORED_LABEL`]'s in `$CLAUDE_CONFIG_DIR/.credentials.json`, where Claude
-/// Code keeps it when no keychain answers (the jail denies the keychain, and its `security`
-/// stand-in answers none), its profile naming a Max plan's account (`oauthAccount`), no
+/// live fake login of [`STORED_LABEL`]'s in `.credentials.json` in the Claude home the tab's
+/// Claude Code reads ([`Run::claude_dir`]), where Claude Code keeps it when no keychain answers
+/// (the jail denies the keychain, and its `security` stand-in answers none), its profile
+/// ([`Run::claude_json`]) naming a Max plan's account (`oauthAccount`), no
 /// `apiKeyHelper`, and no proxy in the settings' `env`: the stub's base URL is its only route,
 /// which the instance's route seam admits as the default route. Claude Code draws in its inline
 /// renderer (`tui: "default"`), where the rule before slice 12a pressed the picker's subscription
@@ -190,14 +191,20 @@ pub fn lay_stored(run: &Run) -> Result<(), Fail> {
         ".credentials.json",
         &crate::claude_rotation_proof::live_login(STORED_LABEL, now_ms()),
     )?;
-    let text = crate::verbs::read_scratch(&dir.join(".claude.json"))?;
+    let at = run.claude_json();
+    let text = crate::verbs::read_scratch(&at)?;
     let mut profile = J::parse(&text)
         .map_err(|e| Fail::die(format!("the stored login: the scratch .claude.json: {e}")))?;
     profile.set(
         "oauthAccount",
         crate::stub::account::composed_oauth_account(now_ms()),
     );
-    put(".claude.json", &profile.dump(crate::pyjson::COMPACT))
+    crate::sys::put(
+        &at,
+        0o600,
+        &crate::sys::PutSrc::Bytes(profile.dump(crate::pyjson::COMPACT).as_bytes()),
+    )
+    .map_err(|e| Fail::die(format!("the stored login: {}: {e}", at.display())))
 }
 
 /// What the person types once signed in again.

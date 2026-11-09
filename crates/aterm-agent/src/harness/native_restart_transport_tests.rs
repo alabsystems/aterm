@@ -873,6 +873,9 @@ fn endpoint(
 }
 
 fn common(line: &str) -> Option<String> {
+    if line == format!("@{SID} native-act rejection-domain") {
+        return Some("ERR usage: native-act <prepare|precommit|commit|query|signal|resume> <bounded fields>\n".into());
+    }
     if line == format!("@{SID} native-act constructors") {
         return Some("OK native-act state=constructors plans=private-restart\n".into());
     }
@@ -899,6 +902,78 @@ fn request(line: &str) -> Request {
             .expect("typed native request"),
     )
     .unwrap()
+}
+
+#[test]
+fn an_unavailable_rejection_domain_never_silently_downgrades_a_new_prepare() {
+    for answer in [None, Some("OK native-act state=unknown\n")] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let options = opts(home.path());
+        let command = planned();
+        let (mut st, _) = state(&command);
+        let (mut client, worker) = endpoint(move |line| {
+            if line == format!("@{SID} native-act rejection-domain") {
+                answer.map(str::to_owned)
+            } else {
+                common(line)
+            }
+        });
+        assert_eq!(
+            begin(
+                &options,
+                &mut client,
+                &mut st,
+                "conversation",
+                Scope::Relaunch,
+                &command.target,
+                Some(&command),
+                Some(&command)
+            ),
+            Err("native-rejection-domain-unavailable")
+        );
+        assert!(st.native_prepare.is_empty());
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|line| line.contains(" native-act prepare "))
+        );
+        let (mut retry, worker) = endpoint(|line| {
+            if line == format!("@{SID} native-act rejection-domain") {
+                return Some(format!(
+                    "OK native-act state=rejection-domain domain={}\n",
+                    "ab".repeat(32)
+                ));
+            }
+            common(line).or_else(|| match request(line) {
+                Request::Prepare(plan) => {
+                    assert_eq!(plan.rejection_domain, Some("ab".repeat(32)));
+                    Some(format!(
+                        "OK native-act state=admitted id={} cap={}\n",
+                        plan.id,
+                        binding().capability
+                    ))
+                }
+                other => panic!("unexpected retry: {other:?}"),
+            })
+        });
+        assert_eq!(
+            begin(
+                &options,
+                &mut retry,
+                &mut st,
+                "conversation",
+                Scope::Relaunch,
+                &command.target,
+                Some(&command),
+                Some(&command)
+            ),
+            Ok(Recovery::Admitted)
+        );
+        drop(retry);
+        worker.join().unwrap();
+    }
 }
 
 fn actual_request(line: &str) -> Option<Request> {
@@ -953,6 +1028,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
     shell.pid = if vendor.pid == 2 { 3 } else { 2 };
     shell.group = shell.pid;
     let original = Prepare {
+        rejection_domain: None,
         asked: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
@@ -1420,10 +1496,17 @@ fn an_unadmitted_answer_drops_only_its_own_prepare_and_the_next_begin_plans_afre
     let (mut st, _) = state(&command);
     let mut prepares = 0;
     let (mut client, worker) = endpoint(move |line| {
+        if line == format!("@{SID} native-act rejection-domain") {
+            return Some(format!(
+                "OK native-act state=rejection-domain domain={}\n",
+                "ab".repeat(32)
+            ));
+        }
         common(line).or_else(|| {
             let Request::Prepare(plan) = request(line) else {
                 panic!("only prepares are dispatched");
             };
+            assert_eq!(plan.rejection_domain.as_ref(), Some(&"ab".repeat(32)));
             prepares += 1;
             Some(if prepares == 1 {
                 native_act::unadmitted_reply(&plan.id).unwrap()

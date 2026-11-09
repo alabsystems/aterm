@@ -61,6 +61,9 @@ pub struct Timings {
     /// top (`RelayClient::bounded`): a hang guard, never a wait a test sits through, so the tests'
     /// clock keeps the product's and a test of a server that never answers names its own.
     pub drive_reply: Duration,
+    /// Recording an owner's upgrade word behind a sweep writer. Zero still attempts the
+    /// native lock once, but does not wait after contention.
+    pub owner_word_wait: Duration,
 }
 
 impl Timings {
@@ -88,6 +91,7 @@ impl Timings {
         redecide_after_skip: Duration::from_secs(2),
         claim_ttl: Duration::from_secs(90),
         drive_reply: crate::DEFAULT_REPLY_WAIT,
+        owner_word_wait: Duration::from_secs(60),
     };
 
     /// The tests' waits.
@@ -114,6 +118,7 @@ impl Timings {
         redecide_after_skip: Duration::from_millis(100),
         claim_ttl: Duration::from_secs(600),
         drive_reply: crate::DEFAULT_REPLY_WAIT,
+        owner_word_wait: Duration::from_secs(60),
     };
 
     /// This build's clock.
@@ -176,6 +181,7 @@ mod tests {
             (p.agy_adopt, f.agy_adopt),
             (p.redecide_after_skip, f.redecide_after_skip),
             (p.drive_reply, f.drive_reply),
+            (p.owner_word_wait, f.owner_word_wait),
         ] {
             assert!(fast <= prod, "{fast:?} > {prod:?}");
         }

@@ -6,7 +6,8 @@ use aterm_spec::derive::Model;
 /// Two live host epochs share five physical records. Preparation reserves two
 /// future records; terminal closure releases only its unused append capacity.
 /// Once a read finds an operation's record, every later read finds it: the host's
-/// unadmitted answer reads absence as never recorded.
+/// same-epoch unadmitted answer reads absence as never recorded. A permanent
+/// rejection races admission under that same lock and never becomes a grant.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn issuer_journal_model() -> Model {
@@ -14,18 +15,31 @@ pub fn issuer_journal_model() -> Model {
         IssuerJournal {
             const Buggy = 0;
             // 0 absent, 1 prepared, 2 may execute, 3 NoExec,
-            // 4 sealed without MayExecute, 5 sealed with MayExecute.
+            // 4 sealed without MayExecute, 5 sealed with MayExecute, 6 rejected before admission.
             var a = 0; var b = 0; var records = 0;
             var a_may = 0; var b_may = 0;
             var a_closed = 0; var b_closed = 0;
+            var a_rejected = 0; var b_rejected = 0;
             var observed = 0; var changed = 0; var seen_a = 0;
-            action PrepareA when (a == 0) {
+            action PrepareA when (a == 0 || (a == 6 && Buggy == 9)) {
                 a = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 3 <= 5 {1} else {0};
                 records = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 3 <= 5 {records + 1} else {records};
             }
             action PrepareB when (b == 0) {
                 b = if records + (if Buggy == 1 {0} else {if a == 1 {2} else {if a == 2 {1} else {0}}}) + 3 <= 5 {1} else {0};
                 records = if records + (if Buggy == 1 {0} else {if a == 1 {2} else {if a == 2 {1} else {0}}}) + 3 <= 5 {records + 1} else {records};
+            }
+            action RejectA when (a == 0) {
+                a = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 1 <= 5 {6} else {0};
+                a_closed = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 1 <= 5 {1} else {0};
+                a_rejected = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 1 <= 5 {1} else {0};
+                records = if records + (if b == 1 {2} else {if b == 2 {1} else {0}}) + 1 <= 5 {records + 1} else {records};
+            }
+            action RejectB when (b == 0) {
+                b = if records + (if a == 1 {2} else {if a == 2 {1} else {0}}) + 1 <= 5 {6} else {0};
+                b_closed = if records + (if a == 1 {2} else {if a == 2 {1} else {0}}) + 1 <= 5 {1} else {0};
+                b_rejected = if records + (if a == 1 {2} else {if a == 2 {1} else {0}}) + 1 <= 5 {1} else {0};
+                records = if records + (if a == 1 {2} else {if a == 2 {1} else {0}}) + 1 <= 5 {records + 1} else {records};
             }
             action MayA when (a == 1) { a = 2; a_may = 1; records = records + 1; }
             action MayB when (b == 1) { b = 2; b_may = 1; records = records + 1; }
@@ -56,15 +70,17 @@ pub fn issuer_journal_model() -> Model {
             invariant MayNeverNoExec: (a_may == 0 || a == 2 || a == 5) && (b_may == 0 || b == 2 || b == 5);
             invariant ObserveOnlyNoExec: observed == 0 || a == 3;
             invariant Counted:
-                records == (if a == 0 {0} else {if a == 1 {1} else {if a == 5 {3} else {2}}})
-                    + (if b == 0 {0} else {if b == 1 {1} else {if b == 5 {3} else {2}}});
+                records == (if a == 0 {0} else {if a == 1 || a == 6 {1} else {if a == 5 {3} else {2}}})
+                    + (if b == 0 {0} else {if b == 1 || b == 6 {1} else {if b == 5 {3} else {2}}});
             invariant Immutable: changed == 0;
             invariant Terminal: (a_closed == 0 || a > 2) && (b_closed == 0 || b > 2);
             invariant PresencePermanent: seen_a == 0 || a > 0;
-            invariant Finite: 0 <= a && a <= 5 && 0 <= b && b <= 5 && 0 <= records && records <= 6
+            invariant RejectionPermanent: (a_rejected == 0 || a == 6) && (b_rejected == 0 || b == 6);
+            invariant Finite: 0 <= a && a <= 6 && 0 <= b && b <= 6 && 0 <= records && records <= 6
                 && 0 <= a_may && a_may <= 1 && 0 <= b_may && b_may <= 1
                 && 0 <= a_closed && a_closed <= 1 && 0 <= b_closed && b_closed <= 1
                 && 0 <= observed && observed <= 1 && 0 <= changed && changed <= 1
+                && 0 <= a_rejected && a_rejected <= 1 && 0 <= b_rejected && b_rejected <= 1
                 && 0 <= seen_a && seen_a <= 1;
         }
     }

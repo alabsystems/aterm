@@ -12,6 +12,10 @@
 //! the rolled copy stays in its release. Every line of the result is one someone wrote, so no
 //! conflict marker and no gate of `ship release` reads it as wrong, and the next release ships
 //! the entry a second time. The same holds for one entry landed twice under `[Unreleased]`.
+//! A merge across a cut can also strand a branch's copy of an entry the cut did not ship under
+//! the release, beside the copy main keeps under `[Unreleased]` (`verify land` drops such a copy
+//! from the merges it makes): the tree cannot say which copy shipped, so the finding names both
+//! and the release's tag decides.
 //!
 //! An entry is a top-level `- ` line and every indented line after it, the blank lines between
 //! them included; it ends at the first line that is neither blank nor indented. Only a whole
@@ -28,7 +32,8 @@ pub(super) const CHANGELOG_REPEAT: Rule = Rule {
     why: "`ship release` ships `CHANGELOG.md`'s `[Unreleased]` verbatim as the release's notes \
           (the Software Update window, the GitHub release, the update manifest): an entry \
           there that a released `## [X.Y.Z]` section already holds, which a merge across a \
-          release cut brings back, or one `[Unreleased]` holds twice, would ship again",
+          release cut brings back, or one `[Unreleased]` holds twice, would ship again (where the \
+          release never shipped it, the copy under the release is the one a merge stranded)",
     scope: &[],
     check: changelog_repeat,
 };
@@ -143,8 +148,11 @@ fn repeats(changelog: &str, out: &mut Vec<Finding>) {
     for entry in entries.iter().filter(|e| e.section == Section::Unreleased) {
         let detail = if let Some(&(version, line)) = shipped.get(entry.text.as_str()) {
             format!(
-                "this entry is word for word the one [{version}] shipped at {CHANGELOG}:{line}, so \
-                 the next release would ship it again: delete this copy from [Unreleased]"
+                "this entry is word for word the one [{version}] holds at {CHANGELOG}:{line}: if \
+                 v{version} shipped it (`git show v{version}:{CHANGELOG}`), the next release would \
+                 ship it again, so delete this copy from [Unreleased]; else delete that one, a \
+                 branch's copy a merge across the cut stranded under a release that never shipped \
+                 it"
             )
         } else if let Some(&line) = unreleased.get(entry.text.as_str()) {
             format!(
@@ -187,8 +195,9 @@ mod tests {
         assert_eq!(spots(&found), ["CHANGELOG.md:7"], "{found:?}");
         let detail = &found[0].detail;
         assert!(
-            detail.contains("the one [0.2.0] shipped at CHANGELOG.md:18")
-                && detail.contains("delete this copy from [Unreleased]"),
+            detail.contains("the one [0.2.0] holds at CHANGELOG.md:18")
+                && detail.contains("if v0.2.0 shipped it")
+                && detail.contains("so delete this copy from [Unreleased]; else delete that one"),
             "{detail}"
         );
     }
@@ -243,7 +252,7 @@ mod tests {
         assert!(
             found[0]
                 .detail
-                .contains("the one [0.2.0] shipped at CHANGELOG.md:24"),
+                .contains("the one [0.2.0] holds at CHANGELOG.md:24"),
             "{found:?}"
         );
     }

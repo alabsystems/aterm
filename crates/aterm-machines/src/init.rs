@@ -13086,7 +13086,15 @@ mod tests {
             }
             said.push(format!("{}\n", why.line()));
             assert_eq!(run.said, said, "{why:?}");
-            assert_eq!(run.code, why.tab_exit(), "{why:?}");
+            assert_eq!(
+                run.code,
+                if !intro && why == Unfinished::NotOwnLogin {
+                    7 // The tab refused its own login before entering the root command.
+                } else {
+                    why.tab_exit()
+                },
+                "{why:?}"
+            );
         };
         let sudo = tab_sudo();
         for (ran, why) in [

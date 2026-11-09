@@ -160,7 +160,7 @@ impl History {
     }
 
     /// What the width planner reads of the binary `test` ([`crate::test_plan`]): its last timed
-    /// sample's wall, width and tests, the most CPU per thread (at least one) and the most memory
+    /// sample's wall, width and tests, the most CPU per thread and the most memory
     /// any kept sample showed, and whether its last sample was a FAIL. `None` with no timed
     /// sample.
     #[must_use]
@@ -172,7 +172,8 @@ impl History {
             .iter()
             .filter(|s| s.timed())
             .filter_map(Sample::per_thread)
-            .fold(1.0_f64, f64::max);
+            .reduce(f64::max)
+            .unwrap_or(1.0);
         Some(crate::test_plan::Seen {
             wall: std::time::Duration::from_millis(last.wall_ms),
             width: last.width.max(1),

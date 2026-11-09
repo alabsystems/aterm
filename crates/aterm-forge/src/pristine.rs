@@ -8,7 +8,10 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Hang detector for the required registry connection within its original request.
+const CONNECT_HANG: Duration = Duration::from_secs(60);
 
 use aterm_codec::inflate::stream::GzipReader;
 
@@ -66,12 +69,20 @@ impl CratesIo {
     }
 
     fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+        self.get_started(url, limit, Instant::now())
+    }
+
+    fn get_started(&self, url: &str, limit: usize, started: Instant) -> Result<Vec<u8>, String> {
+        let connect = (started + CONNECT_HANG).saturating_duration_since(Instant::now());
+        if connect.is_zero() {
+            return Err(format!("GET {url} connect deadline expired"));
+        }
         let response = self
             .client
             .get(url)
             .header("User-Agent", "aterm-forge")
             .limit(limit)
-            .connect_within(Duration::from_secs(30))
+            .connect_within(connect)
             .idle(Duration::from_secs(60))
             .send(b"")
             .map_err(|e| format!("GET {url} failed: {e}"))?;
@@ -81,6 +92,10 @@ impl CratesIo {
         Ok(response.body().to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "pristine/native_connect_tests.rs"]
+mod native_connect_tests;
 
 impl Registry for CratesIo {
     fn index(&self, name: &str) -> Result<Vec<u8>, String> {

@@ -994,6 +994,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
         .app
         .set_system_state_handlers_for_test(crate::InitialSetupHandlers {
             apply: |_, _, _, _| false,
+            own_console: || true,
             check: |_| crate::CheckStarted::default(),
             restore: || false,
             status: crate::SetupStatus::default,

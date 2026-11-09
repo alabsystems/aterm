@@ -520,6 +520,144 @@ fn on() -> SupervisorConfig {
     SupervisorConfig::default()
 }
 
+mod lifetime {
+    use super::*;
+
+    #[test]
+    fn the_last_host_handle_stops_and_joins_its_worker() {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(on(), false, false, hooks(&world, parking_body(&world)));
+        assert!(host.is_running());
+        let shared = Arc::clone(&host.shared);
+        let thread = Arc::clone(&host.thread);
+        let other = host.clone();
+        drop(host);
+        assert!(
+            !shared.lock().shutting_down,
+            "a remaining handle owns the host"
+        );
+        drop(other);
+        check_dropped_host(&shared, &thread);
+    }
+
+    fn check_dropped_host(shared: &Shared, thread: &Mutex<Option<JoinHandle<()>>>) {
+        let stopped = shared.lock().shutting_down;
+        let joined = thread.lock().unwrap().is_none();
+        let done = shared.host_done.load(Ordering::SeqCst);
+
+        // Clean up the negative control too: the old handle leaves its worker parked.
+        shared.lock().shutting_down = true;
+        ring();
+        until("host stopped", || shared.host_done.load(Ordering::SeqCst));
+        if let Some(worker) = thread.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
+        assert!(
+            stopped && joined && done,
+            "last handle left its worker alive"
+        );
+    }
+
+    #[test]
+    fn concurrent_final_host_handles_stop_and_join_once() {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(on(), false, false, hooks(&world, parking_body(&world)));
+        let shared = Arc::clone(&host.shared);
+        let thread = Arc::clone(&host.thread);
+        let other = host.clone();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for owner in [host, other] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(owner);
+                });
+            }
+        });
+        check_dropped_host(&shared, &thread);
+    }
+
+    #[test]
+    fn activation_access_does_not_keep_the_hosts_owner_alive() {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(on(), false, false, hooks(&world, parking_body(&world)));
+        let shared = Arc::clone(&host.shared);
+        let thread = Arc::clone(&host.thread);
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (ended, end) = std::sync::mpsc::channel();
+        let ended = Arc::new(Mutex::new(Some(ended)));
+        spawn_activation_wake_on(
+            host.clone(),
+            move |_| {
+                (
+                    None,
+                    Box::new(move || {
+                        entered.send(()).unwrap();
+                        wait.recv().unwrap_or(false)
+                    }),
+                )
+            },
+            Arc::new(move |task| {
+                let ended = ended.lock().unwrap().take().unwrap();
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        task();
+                        ended.send(()).unwrap();
+                    })
+                    .map(|_| ())
+            }),
+        );
+        entry.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        drop(host);
+        let stopped = shared.lock().shutting_down;
+        shared.lock().shutting_down = true;
+        ring();
+        // Release the injected wait too; production shutdown pulls its native wake.
+        release.send(false).unwrap();
+        end.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        check_dropped_host(&shared, &thread);
+        assert!(stopped, "activation access retained the external owner");
+    }
+
+    #[test]
+    fn shutdown_on_its_own_thread_does_not_wait_for_its_own_return() {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(off(), false, false, hooks(&world, parking_body(&world)));
+        let shared = Arc::clone(&host.shared);
+        let (give, take) = std::sync::mpsc::channel();
+        let (ended, end) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let own_join = take.recv().unwrap();
+                shutdown_host(&shared, &Mutex::new(Some(own_join)));
+                assert!(shared.lock().shutting_down);
+                assert!(!shared.host_done.load(Ordering::SeqCst));
+                ended.send(()).unwrap();
+            })
+            .unwrap();
+        give.send(worker).unwrap();
+        end.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    }
+
+    #[test]
+    fn internal_access_cannot_restart_a_dropped_host() {
+        let world = Arc::new(World::default());
+        let host = HostHandle::start(on(), false, false, hooks(&world, parking_body(&world)));
+        let internal = HostHandle {
+            _owner: None,
+            shared: Arc::clone(&host.shared),
+            thread: Arc::clone(&host.thread),
+            hooks: host.hooks.clone(),
+        };
+        drop(host);
+        internal.ensure_thread();
+        assert!(!internal.is_running());
+        check_dropped_host(&internal.shared, &internal.thread);
+    }
+}
+
 fn asking() -> SupervisorConfig {
     let mut c = SupervisorConfig::default();
     c.set("upgrade_ask", "true").unwrap();

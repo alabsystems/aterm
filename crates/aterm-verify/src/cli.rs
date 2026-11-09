@@ -55,6 +55,10 @@ pub struct Args {
     pub admit: aterm_capacity::Admit,
     /// `--test-threads`: the most libtest threads any test binary runs on.
     pub test_threads: Option<NonZeroU32>,
+    /// Requested ceiling on the test run's CPU share; admission may grant less.
+    pub test_cores: Option<NonZeroU32>,
+    /// Replay every libtest binary's cases in a deterministic shuffled order.
+    pub test_seed: Option<u64>,
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
@@ -181,6 +185,15 @@ where
                 }
             }
             "--test-threads" => a.test_threads = Some(count("--test-threads", &value(&flag)?)?),
+            "--test-cores" => a.test_cores = Some(count("--test-cores", &value(&flag)?)?),
+            "--test-seed" => {
+                let raw = value(&flag)?;
+                a.test_seed = Some(raw.parse().map_err(|_| {
+                    Usage::new(format!(
+                        "--test-seed takes an unsigned integer, not `{raw}`"
+                    ))
+                })?);
+            }
             "--timeout" => {
                 let v = value("--timeout")?;
                 match crate::exec::parse_ceiling(&v) {
@@ -506,6 +519,9 @@ Options:
                           the cores it used, and the binaries running at
                           once stay within held CARGO_BUILD_JOBS, or host
                           cores when no build-slot share is held
+      --test-cores <n>    request at most n CPU cores for test execution;
+                          admission and the release pool may grant less
+      --test-seed <n>     deterministic libtest shuffle at each planned width
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
@@ -726,6 +742,9 @@ mod tests {
             &["-p=--all"],
             &["-p", "--all"],
             &["--test-threads", "0"],
+            &["--test-cores", "0"],
+            &["--test-seed", "-1"],
+            &["--test-seed", "not-a-seed"],
             &["--test-jobs", "2"],
             &["--timeout", "45m"],
             &["--admit", "later"],
@@ -764,6 +783,8 @@ mod tests {
         let a = ok(&[
             "test",
             "--test-threads=3",
+            "--test-cores=10",
+            "--test-seed=17",
             "--timeout",
             "off",
             "--log",
@@ -773,6 +794,8 @@ mod tests {
             "main",
         ]);
         assert_eq!(a.test_threads.map(NonZeroU32::get), Some(3));
+        assert_eq!(a.test_cores.map(NonZeroU32::get), Some(10));
+        assert_eq!(a.test_seed, Some(17));
         assert_eq!(a.timeout, Some(None));
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
         assert!(a.no_windows);

@@ -9,6 +9,7 @@ mod apple;
 mod artifact;
 mod build_inputs;
 mod buildplan;
+mod bump_claim;
 mod bundle;
 mod changelog;
 mod check_record;
@@ -48,12 +49,15 @@ mod line;
 mod line_claim;
 
 mod machines;
+mod main_lane;
 mod manifest_out;
 mod service_qualification;
 
 mod profile_pilot;
 mod provision;
 mod publish;
+mod qualify_pilot;
+mod qualify_replay;
 
 mod cutter_inputs;
 mod release;

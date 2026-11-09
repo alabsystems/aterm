@@ -112,6 +112,7 @@ pub(in crate::harness_host) fn host_for(
         passes_panic: AtomicBool::new(false),
     };
     HostHandle {
+        _owner: None,
         shared: Arc::new(shared),
         thread: Arc::default(),
         hooks,
