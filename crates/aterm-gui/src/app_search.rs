@@ -1210,6 +1210,10 @@ impl App {
                 if clear_selection_if_content_is_mutable(&mut term) {
                     note_selection_custody(&mut term, false);
                 }
+                // The find state the caller changed is still the bar's to show (a torn rerun
+                // marks the count stale, and one after a rewrap stops saying the history is
+                // away), so the window draws it.
+                ws.request_redraw();
                 return;
             }
             let base_y = i64::try_from(term.grid().base_y()).unwrap_or(0);

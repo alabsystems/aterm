@@ -68,10 +68,6 @@ pub const VISUDO: &str = "/usr/sbin/visudo";
 /// `sudo`.
 pub const SUDO: &str = "/usr/bin/sudo";
 
-/// Where the rule is written before `visudo -c` passes it: sudo's include directory skips every
-/// name with a dot, so a staged rule never authorizes anything.
-const STAGED_RULE: &str = "/private/etc/sudoers.d/.aterm-admitted-name";
-
 /// Where a rule this Mac's `visudo` refused is kept
 /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`]): the next elevation that runs for
 /// another step tries the rule once more and removes it once the rule goes live.
@@ -421,7 +417,8 @@ impl Item for DeveloperMode {
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         let (mode, user) = Self::read(sys, ctx);
-        if mode != Some(true) {
+        let mode = mode.ok_or_else(|| format!("{} did not say", status_cmd().display()))?;
+        if !mode {
             run_ok(sys, &Cmd::new(DEVTOOLS_SECURITY).arg("-enable"))?;
         }
         if let Some((name, member)) = user
@@ -503,23 +500,24 @@ impl Item for NameRule {
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         let wanted = Self::wanted(ctx)?;
-        let staged = Path::new(STAGED_RULE);
+        let dir = Path::new(ADMITTED_NAME_RULE)
+            .parent()
+            .ok_or("the naming rule has no parent directory")?;
         // macOS's sudoers includes the directory; a Mac that has none gets it, as root's.
-        if let Some(dir) = staged.parent() {
-            sys.create_dir_all(dir, 0o755)
-                .map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        sys.write_file(staged, wanted.as_bytes(), 0o440)
-            .map_err(|e| format!("{STAGED_RULE}: {e}"))?;
-        let checked = run_ok(sys, &Cmd::new(VISUDO).args(["-c", "-q", "-f", STAGED_RULE]));
+        sys.create_dir_all(dir, 0o755)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        let allocation = crate::port::Scratch::new_in(sys, dir, "admitted-name")
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        let staged = allocation.path().join("rule");
+        sys.write_file(&staged, wanted.as_bytes(), 0o440)
+            .map_err(|e| format!("{}: {e}", staged.display()))?;
+        let checked = run_ok(sys, &Cmd::new(VISUDO).args(["-c", "-q", "-f"]).arg(&staged));
         if let Err(why) = checked {
             // Kept where sudo never reads it, so the rule stops being owed ([`REFUSED_RULE`]).
-            if sys.rename(staged, Path::new(REFUSED_RULE)).is_err() {
-                let _ = sys.remove(staged);
-            }
+            let _ = sys.rename(&staged, Path::new(REFUSED_RULE));
             return Err(why);
         }
-        sys.rename(staged, Path::new(ADMITTED_NAME_RULE))
+        sys.rename(&staged, Path::new(ADMITTED_NAME_RULE))
             .map_err(|e| format!("{ADMITTED_NAME_RULE}: {e}"))?;
         let _ = sys.remove(Path::new(REFUSED_RULE));
         Ok(())
@@ -647,12 +645,30 @@ mod tests {
         ] {
             assert_eq!(developer_mode(&ran), None, "{ran:?}");
             let sys = Fake::root();
-            sys.on(STATUS, ran);
+            sys.on(STATUS, ran.clone());
             assert!(matches!(
                 DeveloperMode.probe(&sys, &ctx(&[])),
                 Probe::Unusable { .. }
             ));
             assert!(!owed(&sys).contains(&Owed::Debugger));
+            // A known-off probe can become unread before apply; the old plan grants no
+            // authority to enable the switch from that new unknown reading.
+            let stale = Fake::root();
+            stale
+                .on(STATUS, Ran::ok("Developer mode is currently disabled.\n"))
+                .on(STATUS, ran)
+                .on("/usr/sbin/DevToolsSecurity -enable", Ran::ok(""));
+            assert!(matches!(
+                DeveloperMode.probe(&stale, &ctx(&[])),
+                Probe::Change { .. }
+            ));
+            assert!(DeveloperMode.apply(&stale, &ctx(&[])).is_err());
+            assert!(
+                !stale
+                    .calls()
+                    .iter()
+                    .any(|call| call.contains("-enable") || call.contains("-o edit"))
+            );
         }
     }
 
@@ -1067,21 +1083,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn overlapping_rule_checks_publish_their_own_checked_files() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let entered = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(Mutex::new(Vec::new()));
+        let observed = checks.clone();
+        let sys = Fake::root();
+        sys.simulate(move |sys, command| {
+            if command.program != Path::new(VISUDO) {
+                return None;
+            }
+            let staged = std::path::PathBuf::from(command.args.last().unwrap());
+            let bytes = sys.read_file(&staged).unwrap();
+            observed.lock().unwrap().push((staged, bytes));
+            if !entered.swap(true, Ordering::SeqCst) {
+                let mut other = console();
+                other.console.as_mut().unwrap().name = "bob".into();
+                NameRule.apply(sys, &other).unwrap();
+            }
+            Some(Ran::ok(""))
+        });
+        NameRule.apply(&sys, &console()).unwrap();
+        let checked = checks.lock().unwrap();
+        assert_eq!(checked.len(), 2);
+        assert_eq!(checked[0].1, name_rule("alice").unwrap().as_bytes());
+        assert_eq!(checked[1].1, name_rule("bob").unwrap().as_bytes());
+        assert_eq!(
+            sys.read_file(Path::new(ADMITTED_NAME_RULE)).unwrap(),
+            checked[0].1
+        );
+        assert_ne!(checked[0].0, checked[1].0);
+        for (staged, _) in checked.iter() {
+            assert!(sys.stat(staged).is_err());
+            assert!(sys.stat(staged.parent().unwrap()).is_err());
+        }
+    }
+
     /// As root, the rule is staged where sudo reads nothing, checked by `visudo -c`, and only
     /// then renamed into place. NEGATIVE CONTROL: a rule `visudo` refuses never goes live: it is
     /// kept where sudo reads nothing, and the rule is no longer owed, so no later launch asks for
     /// the password again for it.
     #[test]
     fn the_rule_goes_live_only_once_visudo_passes_it() {
-        let check = "/usr/sbin/visudo -c -q -f /private/etc/sudoers.d/.aterm-admitted-name";
+        let watch = |sys: &Fake, reply: Ran| {
+            let path = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let observed = path.clone();
+            sys.simulate(move |sys, command| {
+                if command.program != Path::new(VISUDO) {
+                    return None;
+                }
+                let staged = std::path::PathBuf::from(command.args.last().unwrap());
+                let parent = sys.stat(staged.parent().unwrap()).unwrap();
+                assert!(parent.dir && !parent.symlink);
+                assert_eq!(parent.uid, 0);
+                assert_eq!(parent.mode & 0o777, 0o700);
+                *observed.lock().unwrap() = Some(staged);
+                Some(reply.clone())
+            });
+            path
+        };
         let sys = Fake::root();
-        sys.on(check, Ran::ok(""));
+        let checked_path = watch(&sys, Ran::ok(""));
         let ctx = console();
         assert!(matches!(NameRule.probe(&sys, &ctx), Probe::Change { .. }));
         NameRule.apply(&sys, &ctx).unwrap();
         let calls = sys.calls();
         let staged = calls.iter().position(|c| c.starts_with("write ")).unwrap();
-        let checked = calls.iter().position(|c| c == check).unwrap();
+        let checked = calls.iter().position(|c| c.starts_with(VISUDO)).unwrap();
         let live = calls.iter().position(|c| c.starts_with("rename ")).unwrap();
         assert!(staged < checked && checked < live, "{calls:?}");
         assert_eq!(
@@ -1089,17 +1161,49 @@ mod tests {
             name_rule("alice").as_deref().map(str::as_bytes)
         );
         assert_eq!(sys.mode_of(ADMITTED_NAME_RULE), Some(0o440));
+        let path = checked_path.lock().unwrap().clone().unwrap();
+        assert!(sys.stat(&path).is_err());
+        assert!(sys.stat(path.parent().unwrap()).is_err());
         assert!(matches!(NameRule.probe(&sys, &ctx), Probe::Ok { .. }));
 
         let refused = Fake::root();
-        refused.on(check, Ran::exit(1, "syntax error"));
+        let refused_path = watch(&refused, Ran::exit(1, "syntax error"));
         refused.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"));
         assert_eq!(owed(&refused), vec![Owed::NameRule]);
         assert!(NameRule.apply(&refused, &ctx).is_err());
         assert_eq!(refused.written(ADMITTED_NAME_RULE), None);
-        assert_eq!(refused.written(STAGED_RULE), None);
+        let path = refused_path.lock().unwrap().clone().unwrap();
+        assert!(refused.stat(&path).is_err());
+        assert!(refused.stat(path.parent().unwrap()).is_err());
         assert!(refused.written(REFUSED_RULE).is_some());
         assert_eq!(owed(&refused), Vec::<Owed>::new());
+
+        // Neither a failed publication nor a failed refusal-marker move may replace the
+        // live rule or discard an older refusal record. Only this attempt's stage is removed.
+        for (destination, reply) in [
+            (ADMITTED_NAME_RULE, Ran::ok("")),
+            (REFUSED_RULE, Ran::exit(1, "syntax error")),
+        ] {
+            let failed = Fake::root();
+            let previous = name_rule("bob").unwrap();
+            failed
+                .file(ADMITTED_NAME_RULE, previous.as_bytes())
+                .file(REFUSED_RULE, b"previous refusal")
+                .rename_fails(destination, std::io::ErrorKind::PermissionDenied);
+            let checked_path = watch(&failed, reply);
+            assert!(NameRule.apply(&failed, &ctx).is_err());
+            assert_eq!(
+                failed.read_file(Path::new(ADMITTED_NAME_RULE)).unwrap(),
+                previous.as_bytes()
+            );
+            assert_eq!(
+                failed.read_file(Path::new(REFUSED_RULE)).unwrap(),
+                b"previous refusal"
+            );
+            let path = checked_path.lock().unwrap().clone().unwrap();
+            assert!(failed.stat(&path).is_err());
+            assert!(failed.stat(path.parent().unwrap()).is_err());
+        }
     }
 
     /// Developer mode turns on with a non-admin console account added to `_developer`, each only where

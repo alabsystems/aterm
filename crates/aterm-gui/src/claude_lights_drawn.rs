@@ -265,10 +265,14 @@ impl App {
                     let face = ChipFace::of(view_now, &glass);
                     let drawn = plan
                         .as_ref()
-                        .and_then(|plan| plan.leaves.iter().position(|l| l.view == view))
-                        .map_or(Drawn::NoRule, |pane| {
+                        .and_then(|plan| {
+                            plan.leaves.iter().enumerate().find(|(_, l)| l.view == view)
+                        })
+                        .map_or(Drawn::NoRule, |(pane, leaf)| {
+                            let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
+                            let cols = leaf.rect.size.width.round().max(1.0) as usize;
                             ws.claude_lights.drawn_chip(session, pane, |row| {
-                                self.chrome_owns_terminal_row(wid, row)
+                                self.chrome_owns_terminal_span(wid, row, col_off..col_off + cols)
                             })
                         });
                     let spoken = matches!(drawn, Drawn::Cells(_)).then(|| {

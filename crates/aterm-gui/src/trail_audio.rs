@@ -346,80 +346,10 @@ mod mac {
         }
     }
 
-    type AudioQueueRef = *mut c_void;
-
-    /// `AudioStreamBasicDescription` as CoreAudioTypes lays it out.
-    #[repr(C)]
-    struct AudioStreamBasicDescription {
-        m_sample_rate: f64,
-        m_format_id: u32,
-        m_format_flags: u32,
-        m_bytes_per_packet: u32,
-        m_frames_per_packet: u32,
-        m_bytes_per_frame: u32,
-        m_channels_per_frame: u32,
-        m_bits_per_channel: u32,
-        m_reserved: u32,
-    }
-
-    /// `AudioQueueBuffer` header; `mAudioData` points at the sample storage
-    /// the queue allocated alongside it.
-    #[repr(C)]
-    struct AudioQueueBuffer {
-        m_audio_data_bytes_capacity: u32,
-        m_audio_data: *mut c_void,
-        m_audio_data_byte_size: u32,
-        m_user_data: *mut c_void,
-        m_packet_description_capacity: u32,
-        m_packet_descriptions: *mut c_void,
-        m_packet_description_count: u32,
-    }
-
-    type AudioQueueOutputCallback =
-        extern "C" fn(*mut c_void, AudioQueueRef, *mut AudioQueueBuffer);
-
-    type AudioQueuePropertyID = u32;
-
-    type AudioQueuePropertyListenerProc =
-        extern "C" fn(*mut c_void, AudioQueueRef, AudioQueuePropertyID);
-
-    #[link(name = "AudioToolbox", kind = "framework")]
-    unsafe extern "C" {
-        fn AudioQueueNewOutput(
-            in_format: *const AudioStreamBasicDescription,
-            in_callback_proc: AudioQueueOutputCallback,
-            in_user_data: *mut c_void,
-            in_callback_run_loop: *const c_void,
-            in_run_loop_mode: *const c_void,
-            in_flags: u32,
-            out_aq: *mut AudioQueueRef,
-        ) -> i32;
-        fn AudioQueueAllocateBuffer(
-            in_aq: AudioQueueRef,
-            in_buffer_byte_size: u32,
-            out_buffer: *mut *mut AudioQueueBuffer,
-        ) -> i32;
-        fn AudioQueueEnqueueBuffer(
-            in_aq: AudioQueueRef,
-            in_buffer: *mut AudioQueueBuffer,
-            in_num_packet_descs: u32,
-            in_packet_descs: *const c_void,
-        ) -> i32;
-        fn AudioQueueStart(in_aq: AudioQueueRef, in_start_time: *const c_void) -> i32;
-        fn AudioQueueStop(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
-        fn AudioQueueAddPropertyListener(
-            in_aq: AudioQueueRef,
-            in_id: AudioQueuePropertyID,
-            in_proc: AudioQueuePropertyListenerProc,
-            in_user_data: *mut c_void,
-        ) -> i32;
-        fn AudioQueueGetProperty(
-            in_aq: AudioQueueRef,
-            in_id: AudioQueuePropertyID,
-            out_data: *mut c_void,
-            io_data_size: *mut u32,
-        ) -> i32;
-    }
+    use aterm_macos_ui::audio::{
+        AudioApi, AudioQueueBuffer, AudioQueuePropertyID, AudioQueueRef,
+        AudioStreamBasicDescription, api,
+    };
 
     /// `kAudioQueueProperty_IsRunning` ('aqrn').
     pub(super) const PROP_IS_RUNNING: AudioQueuePropertyID = 0x6171_726E;
@@ -428,6 +358,8 @@ mod mac {
     const FLAGS_FLOAT_PACKED: u32 = 1 | 8;
 
     struct Shared {
+        /// Acquired before the queue exists; callbacks only read resolved pointers.
+        api: &'static AudioApi,
         synth: Mutex<TrailSynth>,
         /// Consecutive buffers of exact silence (reset by any audible one).
         silent: AtomicU32,
@@ -448,8 +380,9 @@ mod mac {
     }
 
     impl Shared {
-        fn new(seed: u32) -> Self {
+        fn new(seed: u32, api: &'static AudioApi) -> Self {
             Self {
+                api,
                 synth: Mutex::new(TrailSynth::new(SAMPLE_RATE as f32, seed)),
                 silent: AtomicU32::new(0),
                 running: AtomicBool::new(false),
@@ -483,22 +416,7 @@ mod mac {
         use std::ffi::c_void;
         use std::sync::Arc;
 
-        use super::{
-            AudioQueueAddPropertyListener, AudioQueueGetProperty, AudioQueuePropertyID,
-            AudioQueuePropertyListenerProc, AudioQueueRef, PROP_IS_RUNNING, Shared,
-            running_listener,
-        };
-
-        #[link(name = "AudioToolbox", kind = "framework")]
-        unsafe extern "C" {
-            fn AudioQueueDispose(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
-            fn AudioQueueRemovePropertyListener(
-                in_aq: AudioQueueRef,
-                in_id: AudioQueuePropertyID,
-                in_proc: AudioQueuePropertyListenerProc,
-                in_user_data: *mut c_void,
-            ) -> i32;
-        }
+        use super::{AudioQueueRef, PROP_IS_RUNNING, Shared, api, running_listener};
 
         /// Own the queue `AudioQueueNewOutput` just made.
         pub(super) fn own(
@@ -577,7 +495,7 @@ mod mac {
                 // SAFETY: the queue is live (owned, not yet disposed); `value`
                 // and `size` outlive the call and `size` states the buffer.
                 let status = unsafe {
-                    AudioQueueGetProperty(
+                    (api().get_property)(
                         self.queue,
                         PROP_IS_RUNNING,
                         (&mut value as *mut u32).cast(),
@@ -593,7 +511,7 @@ mod mac {
                 // SAFETY: The queue is live; the userdata's lifetime is argued at
                 // `running_listener`.
                 unsafe {
-                    AudioQueueAddPropertyListener(
+                    (api().add_listener)(
                         self.queue,
                         PROP_IS_RUNNING,
                         running_listener,
@@ -606,7 +524,7 @@ mod mac {
                 // SAFETY: the queue is live (dispose has not run); proc and
                 // userdata are the exact pair that was added.
                 unsafe {
-                    AudioQueueRemovePropertyListener(
+                    (api().remove_listener)(
                         self.queue,
                         PROP_IS_RUNNING,
                         running_listener,
@@ -619,7 +537,7 @@ mod mac {
                 // SAFETY: synchronous dispose (immediate = 1) stops the callback
                 // thread before `release_user` drops the refcount it was using.
                 unsafe {
-                    AudioQueueDispose(self.queue, 1);
+                    (api().dispose)(self.queue, 1);
                 }
             }
 
@@ -754,7 +672,7 @@ mod mac {
             if shared.recycle_epoch.load(Ordering::Acquire) != recycle_epoch {
                 return;
             }
-            if AudioQueueEnqueueBuffer(q, buf, 0, std::ptr::null()) != 0 {
+            if (shared.api.enqueue_buffer)(q, buf, 0, std::ptr::null()) != 0 {
                 shared.faulted.store(true, Ordering::Release);
             }
         }
@@ -779,6 +697,10 @@ mod mac {
 
     impl MacOut {
         /// Open the output queue and allocate, but do not enqueue, its buffers.
+        ///
+        /// # Panics
+        /// Panics before acquiring queue state if the system AudioToolbox framework
+        /// or one of its required entry points is unavailable.
         #[cfg_attr(
             any(test, debug_assertions),
             aterm_spec_anchor::refines(
@@ -788,7 +710,8 @@ mod mac {
             )
         )]
         pub(crate) fn new(seed: u32) -> Option<Self> {
-            let shared = Arc::new(Shared::new(seed));
+            let api = api();
+            let shared = Arc::new(Shared::new(seed, api));
             let fmt = AudioStreamBasicDescription {
                 m_sample_rate: SAMPLE_RATE,
                 m_format_id: FORMAT_LPCM,
@@ -805,7 +728,7 @@ mod mac {
             // SAFETY: fmt/queue outlive the call; null run loop selects
             // AudioToolbox's internal callback thread.
             let st = unsafe {
-                AudioQueueNewOutput(
+                (api.new_output)(
                     &fmt,
                     render_cb,
                     user,
@@ -829,7 +752,7 @@ mod mac {
                 let mut buf: *mut AudioQueueBuffer = std::ptr::null_mut();
                 // SAFETY: Queue is live; on success the pointer stays allocated until queue
                 // disposal. It remains unscheduled/available here.
-                let st = unsafe { AudioQueueAllocateBuffer(queue, bytes, &mut buf) };
+                let st = unsafe { (api.allocate_buffer)(queue, bytes, &mut buf) };
                 if st != 0 || buf.is_null() {
                     return None;
                 }
@@ -1040,7 +963,7 @@ mod mac {
             // SAFETY: the indexed pointer is still AVAILABLE and becomes
             // scheduled/queue-owned exactly once on success.
             unsafe {
-                AudioQueueEnqueueBuffer(self.queue, self.buffers[index], 0, std::ptr::null()) == 0
+                (api().enqueue_buffer)(self.queue, self.buffers[index], 0, std::ptr::null()) == 0
             }
         }
 
@@ -1050,14 +973,14 @@ mod mac {
 
         fn start_queue(&mut self) -> bool {
             // SAFETY: Queue is live and all three buffers are scheduled.
-            unsafe { AudioQueueStart(self.queue, std::ptr::null()) == 0 }
+            unsafe { (api().start)(self.queue, std::ptr::null()) == 0 }
         }
 
         fn stop_immediate(&mut self) -> bool {
             // SAFETY: immediate=true is synchronous. On success AudioToolbox
             // reset/removal has completed and all retained pointers are again
             // available for the worker to fill.
-            unsafe { AudioQueueStop(self.queue, 1) == 0 }
+            unsafe { (api().stop)(self.queue, 1) == 0 }
         }
     }
 }

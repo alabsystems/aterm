@@ -816,7 +816,11 @@ impl App {
                 let term_row = leaf.pane.row_off + usize::from(row.row);
                 let frame_row = leaf.pane.strip + term_row;
                 if (scratch.cursor_visible && scratch.cursor_row == frame_row)
-                    || self.chrome_owns_terminal_row(wid, term_row)
+                    || self.chrome_owns_terminal_span(
+                        wid,
+                        term_row,
+                        leaf.pane.col_off..leaf.pane.col_off + leaf.pane.cols,
+                    )
                 {
                     leaf.skip |= 1 << k;
                 }

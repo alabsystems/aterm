@@ -4684,12 +4684,17 @@ fn the_discard_question_leaves_messages_room() {
 }
 
 /// A SPLIT ROW'S CAPTION SAYS ITS ROW'S NAME WHOLE (N100, N52): on every screen of every page at
-/// each scale's least view (and at 1.5x in a 234x236 window), a caption over a row's control says
-/// the name in a whole form, the row parted smaller so its lines fit, never cut with an ellipsis.
-/// Negative controls: at 1.5x in 234x236 Harness's Default autopilot read "Default…" over Cruise,
-/// Land and Off; at 2x in the least window Security's Secure Keyboard Entry caption ended on
-/// "keystroke…"; and at 1x in the least window Modified read "Check for updates…" and "Keep ALab
-/// tools up to…", its rows parted for the 72pt list under a pinned summary the page then listed.
+/// each scale's least view (and at 1.5x in a 234x236 window), in the host's UI faces and in the
+/// Linux ladder's ([`LinuxLayoutFace`]; `ATERM_TEST_LINUX_UI_FONTS` names another pair), a caption
+/// over a row's control says the name in a whole form, the row parted smaller so its lines fit,
+/// never cut with an ellipsis. Negative controls: at 1.5x in 234x236 Harness's Default autopilot
+/// read "Default…" over Cruise, Land and Off; at 2x in the least window Security's Secure Keyboard
+/// Entry caption ended on "keystroke…"; at 1x in the least window Modified read "Check for
+/// updates…" and "Keep ALab tools up to…", its rows parted for the 72pt list under a pinned summary
+/// the page then listed; and on Linux at 2x in the least window, in Cantarell, Noto Sans and
+/// DejaVu Sans, Security's "Allow programs to resize the window and read its title and size" took
+/// four lines where three fit over its switch, its caption ending on "and read its title…"
+/// ("window and…" in DejaVu Sans).
 #[test]
 fn a_split_row_s_caption_says_its_name_whole() {
     const SOURCE: &str = "agents_auto_prime = false\n[update]\nenabled = false\n\
@@ -4702,36 +4707,35 @@ fn a_split_row_s_caption_says_its_name_whole() {
         }
         let captions = std::sync::atomic::AtomicUsize::new(0);
         on_workers(&SettingsRoute::ALL, "row captions", |&route| {
-            for &(width, height) in &sizes {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height} {route:?}");
+            for (&(width, height), face) in sizes.iter().flat_map(|size| {
+                [LinuxLayoutFace::Host, LinuxLayoutFace::LinuxLadder].map(|face| (size, face))
+            }) {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height} {route:?} {face:?}");
                 let (mut runtime, instance, view) = every_page_runtime_over(SOURCE);
                 go_to_route(&mut runtime, instance, view, route);
-                each_screen(
-                    &mut runtime,
-                    instance,
-                    view,
-                    &view_cx_at(width, height),
-                    |screen, top| {
-                        for node in &screen.paint {
-                            let key = node.key.as_str();
-                            if !key.starts_with("settings/row-caption/") {
-                                continue;
-                            }
-                            let UiContent::Text(text) = &node.content else {
-                                continue;
-                            };
-                            if text.text.is_empty() {
-                                continue;
-                            }
-                            captions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            assert!(
-                                !text.text.contains('\u{2026}'),
-                                "{context} stop {top}: {key} reads {:?}",
-                                text.text
-                            );
+                let Some(cx) = linux_layout_cx(face, width, height) else {
+                    continue;
+                };
+                each_screen(&mut runtime, instance, view, &cx, |screen, top| {
+                    for node in &screen.paint {
+                        let key = node.key.as_str();
+                        if !key.starts_with("settings/row-caption/") {
+                            continue;
                         }
-                    },
-                );
+                        let UiContent::Text(text) = &node.content else {
+                            continue;
+                        };
+                        if text.text.is_empty() {
+                            continue;
+                        }
+                        captions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        assert!(
+                            !text.text.contains('\u{2026}'),
+                            "{context} stop {top}: {key} reads {:?}",
+                            text.text
+                        );
+                    }
+                });
             }
         });
         assert!(

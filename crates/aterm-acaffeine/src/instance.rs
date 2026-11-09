@@ -16,6 +16,10 @@ pub const HANDOVER_FD: i32 = 0;
 /// The longest lock file read: a pid, a label and their newlines.
 const HOLDER_CAP: u64 = 128;
 
+/// Allowance for the lock release required by an explicitly requested quit.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) const QUIT_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A running mug's hold on the lock file; dropping it lets go (`LOCK_UN`).
 #[derive(Debug)]
 pub struct Instance {
@@ -325,7 +329,16 @@ pub fn running_pid(path: &Path) -> Option<u32> {
 /// The holder's pid, when one of `pids` still holds the lock after `within`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn await_released(path: &Path, pids: &[u32], within: std::time::Duration) -> Result<(), u32> {
-    let start = std::time::Instant::now();
+    await_released_started(path, pids, within, std::time::Instant::now(), || {})
+}
+
+fn await_released_started(
+    path: &Path,
+    pids: &[u32],
+    within: std::time::Duration,
+    start: std::time::Instant,
+    mut held: impl FnMut(),
+) -> Result<(), u32> {
     loop {
         let Some(holder) = running_holder(path).filter(|holder| pids.contains(&holder.pid)) else {
             return Ok(());
@@ -333,6 +346,7 @@ pub fn await_released(path: &Path, pids: &[u32], within: std::time::Duration) ->
         if start.elapsed() >= within {
             return Err(holder.pid);
         }
+        held();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -476,6 +490,55 @@ mod tests {
         let letting_go = std::thread::spawn(move || drop(held));
         assert_eq!(await_released(&path, &[me], hang), Ok(()));
         letting_go.join().expect("join");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_requested_quit_waits_for_its_native_holder_to_release() {
+        use std::cell::RefCell;
+        use std::time::{Duration, Instant};
+        let dir = crate::test_scratch_dir("quit-release");
+        let path = dir.path().join("acaffeine.lock");
+        let me = std::process::id();
+        for age in [11, 61, 0] {
+            let writer = RefCell::new(Some(Instance::try_hold(&path).unwrap().unwrap()));
+            assert_eq!(running_pid(&path), Some(me));
+            let mut released = false;
+            let got = await_released_started(
+                &path,
+                &[me],
+                QUIT_HANG,
+                Instant::now() - Duration::from_secs(age),
+                || {
+                    assert_eq!(running_pid(&path), Some(me));
+                    assert!(Instance::try_hold(&path).unwrap().is_none());
+                    drop(writer.borrow_mut().take());
+                    released = true;
+                },
+            );
+            if age == 61 {
+                assert_eq!(got, Err(me));
+                assert!(!released);
+                assert_eq!(running_pid(&path), Some(me));
+                assert!(writer.borrow().is_some());
+                let unrelated = await_released_started(
+                    &path,
+                    &[me.wrapping_add(1)],
+                    QUIT_HANG,
+                    Instant::now() - Duration::from_secs(61),
+                    || panic!("another holder is not ours to await"),
+                );
+                assert_eq!(unrelated, Ok(()));
+                assert_eq!(running_pid(&path), Some(me));
+            } else {
+                assert_eq!(got, Ok(()), "the requested quit's native holder released");
+                assert!(released);
+                assert_eq!(running_pid(&path), None);
+            }
+            drop(writer.into_inner());
+            assert_eq!(await_released(&path, &[me], QUIT_HANG), Ok(()));
+            assert!(Instance::try_hold(&path).unwrap().is_some());
+        }
     }
 
     #[test]

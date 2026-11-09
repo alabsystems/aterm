@@ -706,17 +706,91 @@ fi
 # saved (bash 3.2.57), and on 4.4 the real number again, at the prompt and in a
 # trap, once a function's `local -` returns (`__aterm_untraced` under functrace),
 # so there `$HISTCMD` tells nothing: snapshot the last history entry at the prompt
-# and require it to differ on the first trap.
+# and require it to differ on the first trap (and its number to have moved at the
+# next prompt, for a line no trap heard: `__aterm_line_unheard`).
+#
+# Below 5.3 the mark also holds bash's command number (`__aterm_cmd_mark`), the
+# count of commands bash read and ran that a prompt's `\#` shows. A line that ran
+# moves it by one. A line bash read and saved to history but never ran leaves it
+# where it was: a comment, a blank line, a syntax error, and a line a Ctrl-C
+# cancelled at the continuation prompt (history keeps its first line). So
+# `__aterm_line_unheard` starts no line while the count stands still. Only a prompt
+# string decodes the count. 4.4 and later read it in process with `${p@P}` (inside
+# eval, so that 3.2 parses this file). Before 4.4 xtrace's PS4 decodes it, in the
+# fork that reads the history entry (`__aterm_history_numbered`). A bash compares
+# reads of one kind only: 5.3's PS4 read gives one less than its `${p@P}`.
 __aterm_hist_seen="${__aterm_hist_seen:-}"
+__aterm_cmd_mark="${__aterm_cmd_mark:-}"
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    # The command number in `__aterm_no`.
+    eval '__aterm_cmd_number() { local __aterm_p="\#"; __aterm_no=${__aterm_p@P}; }'
+fi
 if (( BASH_VERSINFO[0] < 5 )); then
+    if [[ -n "$__aterm_win_posix" ]]; then
+        __aterm_history_numbered() {
+            __aterm_no=
+            return 1
+        }
+    elif (( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4 )); then
+        __aterm_history_numbered() {
+            __aterm_cmd_number
+            __aterm_history_line
+        }
+    else
+        # The last history entry in `REPLY`, as `__aterm_history_line` reads it, and the
+        # command number in `__aterm_no` (empty when unread), from one fork. xtrace
+        # writes PS4 for the `:` after the entry, with PS4's first character repeated
+        # once per level, so the number is the last line. A `BASH_XTRACEFD` (4.1 and
+        # later) other than 1 or 2 would send that line elsewhere, so the fork unsets it.
+        __aterm_history_numbered() {
+            local __aterm_nl=$'\n'
+            REPLY=$(HISTTIMEFORMAT= builtin history 1
+                {
+                    [[ ${BASH_XTRACEFD-1} == [12] ]] || unset BASH_XTRACEFD
+                    PS4='+\#;'
+                    set -x
+                    :
+                } 2>&1)
+            __aterm_no=${REPLY##*"$__aterm_nl"}
+            __aterm_no=${__aterm_no#"${__aterm_no%%[!+]*}"}
+            __aterm_no=${__aterm_no%%;*}
+            if [[ "$__aterm_no" != [0-9]* || "$__aterm_no" == *[!0-9]* ]]; then
+                # A readonly PS4 or BASH_XTRACEFD: no number, and the entry as ever.
+                __aterm_no=
+                __aterm_history_line
+                return
+            fi
+            if [[ "$REPLY" == *"$__aterm_nl"* ]]; then
+                REPLY=${REPLY%"$__aterm_nl"*}
+            else
+                REPLY=
+            fi
+            while [[ "$REPLY" == *"$__aterm_nl" ]]; do
+                REPLY=${REPLY%"$__aterm_nl"}
+            done
+        }
+    fi
+fi
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    __aterm_hist_mark_take() { __aterm_hist_mark=${HISTCMD-}; }
+elif (( BASH_VERSINFO[0] == 5 )); then
     __aterm_hist_mark_take() {
-        local REPLY
+        local __aterm_no
         __aterm_hist_mark=${HISTCMD-}
-        __aterm_hist_seen=
-        __aterm_history_line && __aterm_hist_seen=$REPLY
+        __aterm_cmd_number
+        __aterm_cmd_mark=$__aterm_no
     }
 else
-    __aterm_hist_mark_take() { __aterm_hist_mark=${HISTCMD-}; }
+    __aterm_hist_mark_take() {
+        local REPLY __aterm_no
+        __aterm_hist_mark=${HISTCMD-}
+        __aterm_hist_seen=
+        __aterm_cmd_mark=
+        if __aterm_history_numbered; then
+            __aterm_hist_seen=$REPLY
+            __aterm_cmd_mark=$__aterm_no
+        fi
+    }
 fi
 
 # Return the typed command line in `REPLY`: the history entry (with its index
@@ -899,15 +973,16 @@ __aterm_mark_exec_finish() {
     __aterm_last_command=""
 }
 
-# End the running command once: take a pending re-key (builtins alone), then
-# write its D. A command's D must come before anything of aterm's or the user's
-# can run a program (the re-key file's and body pointer's `rm`, the tty repair's
-# `stty`, the user's PROMPT_COMMAND), for a program heard after D is never the
-# command's. The permanent trampoline calls this before its body check; the
-# body's PROMPT_COMMAND handler calls it for a trampoline that predates it. Only
-# the first call writes.
+# End the running command once: start a line no hook heard (`__aterm_line_unheard`,
+# bash before 5.3), take a pending re-key (builtins alone), then write its D. A
+# command's D must come before anything of aterm's or the user's can run a program
+# (the re-key file's and body pointer's `rm`, the tty repair's `stty`, the user's
+# PROMPT_COMMAND), for a program heard after D is never the command's. The permanent
+# trampoline calls this before its body check; the body's PROMPT_COMMAND handler
+# calls it for a trampoline that predates it. Only the first call writes.
 __aterm_end_command() {
     local __aterm_hook_live=1
+    [[ -n "$__aterm_last_command" ]] || __aterm_untraced __aterm_line_unheard
     [[ -n "$__aterm_last_command" ]] || return 0
     __aterm_rekey_take
     __aterm_untraced __aterm_mark_exec_finish "$1"
@@ -1003,7 +1078,8 @@ __aterm_preexec_run() {
     [[ -n "$2" ]] && return
     # Functrace hands this trap to each `$(…)` and subshell, the prompt's own among
     # them, where what it records never reaches the shell: a line that opens with a
-    # subshell reports as it does with no flag (by PS0 on bash 5.3, not at all below).
+    # subshell reports as it does with no flag (by PS0 on bash 5.3, at the next
+    # prompt below, `__aterm_line_unheard`).
     (( BASH_SUBSHELL )) && return
 
     # Capture only the first simple command of the line.
@@ -1109,6 +1185,63 @@ __aterm_body_ps0() {
     __aterm_in_prompt_cmd=0
     return 0
 }
+
+# ─── A line no hook heard (bash before 5.3) ───
+#
+# The DEBUG trap fires before simple commands only, and before 5.3 bash has no hook
+# that runs before every line (PS0, above, is 5.3's), so a line that runs no simple
+# command at its top (a function's definition, a line that starts with a subshell:
+# `(cd x && make)`) ran with no C. The next prompt starts it, before anything else
+# (`__aterm_end_command`), when no trap took the last prompt's mark, history holds an
+# entry newer than that mark, and bash's command number moved since it: from that
+# entry, as the trap starts any line, so its caller then ends it with the `$?` it
+# left. Its C comes once it has ended, after anything it printed. An entry is new by
+# its number, never its text, which readline rewrites in place when a recalled line
+# is edited and left unsent (`5* …`): bash 5 reads the next entry's number in
+# `$HISTCMD` at a prompt, while before 5 it tells nothing there (3.2 reads 1), so the
+# mark is the last entry `__aterm_hist_mark_take` read. A line bash keeps no new
+# entry for stays unheard: a space-led one under `HISTCONTROL`'s `ignorespace` or
+# `ignoreboth`, a repeat under `ignoredups` or `erasedups`, one `HISTIGNORE` matches,
+# any with history off. An empty line, a Ctrl-C at the prompt and a failed history
+# expansion add no entry. A comment, a blank line, a syntax error and a line a
+# Ctrl-C cancelled at the continuation prompt add one, but none of them ran, so the
+# command number stays where it was (`__aterm_cmd_mark`) and none starts. A shell
+# joined to bash-preexec is left to it, and before 5.3 its own DEBUG trap misses these
+# lines too (it hooks PS0 on 5.3 alone), so there they make no run. Takes the marks
+# either way.
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    __aterm_line_unheard() { :; }
+else
+    __aterm_line_unheard() {
+        local __aterm_mark=$__aterm_hist_mark __aterm_seen=${__aterm_hist_seen-} \
+            __aterm_cmd=$__aterm_cmd_mark __aterm_n __aterm_no REPLY
+        __aterm_hist_mark=
+        __aterm_hist_seen=
+        __aterm_cmd_mark=
+        (( ! ${__aterm_bp_joined:-0} )) || return 0
+        [[ "$__aterm_mark" == [1-9]* && "$__aterm_mark" != *[!0-9]* &&
+            "$__aterm_cmd" == [0-9]* ]] || return 0
+        if (( BASH_VERSINFO[0] >= 5 )); then
+            [[ "${HISTCMD-}" != "$__aterm_mark" ]] || return 0
+            __aterm_cmd_number
+        else
+            __aterm_history_numbered || return 0
+            __aterm_n=${REPLY#"${REPLY%%[! ]*}"}
+            __aterm_seen=${__aterm_seen#"${__aterm_seen%%[! ]*}"}
+            [[ "${__aterm_n%%[!0-9]*}" != "${__aterm_seen%%[!0-9]*}" ]] || return 0
+        fi
+        # History saved the line, but nothing ran unless bash's count moved.
+        [[ "$__aterm_no" == [0-9]* && "$__aterm_no" != "$__aterm_cmd" ]] || return 0
+        # Bash 5 forks for the line found alone, so also where `__aterm_history_line`
+        # forks for none (Git Bash before 5.3).
+        (( BASH_VERSINFO[0] < 5 )) || REPLY=$(HISTTIMEFORMAT= builtin history 1)
+        REPLY="${REPLY#*[0-9][* ] }"
+        [[ -n "$REPLY" ]] || return 0
+        # Its marks are written now, so they carry a key the host handed meanwhile.
+        __aterm_rekey_take
+        __aterm_line_start "$REPLY"
+    }
+fi
 
 # ─── TTY mode repair ───
 #
@@ -1234,11 +1367,14 @@ __aterm_body_prompt_command() {
 __aterm_body_pc_open() {
     __aterm_last_exit=$last_status
     __aterm_in_prompt_cmd=1
-    __aterm_hist_mark=
-    __aterm_hist_seen=
     __aterm_prompt_end_armed=0
 
+    # Under a trampoline that predates its call, this is the first: the mark is
+    # still there for a line no hook heard.
     __aterm_end_command "$last_status"
+    __aterm_hist_mark=
+    __aterm_hist_seen=
+    __aterm_cmd_mark=
 
     if [[ -n "${__aterm_start_pending:-}" ]]; then
         unset __aterm_start_pending

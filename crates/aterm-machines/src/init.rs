@@ -8145,11 +8145,9 @@ mod tests {
             line(Layer::Workstation.name()),
             Remedy::Develop.command().unwrap(),
         ];
-        for text in [crate::init_clt::NO_TTY, crate::init_github::NEEDS_GIT] {
-            let named = init_lines(text);
-            assert!(!named.is_empty(), "{text}");
-            lines.extend(named);
-        }
+        let named = init_lines(crate::init_github::NEEDS_GIT);
+        assert!(!named.is_empty());
+        lines.extend(named);
         for line in &lines {
             assert_eq!(refusal(line, &base, &station), None, "{line}");
         }

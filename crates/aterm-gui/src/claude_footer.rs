@@ -4968,7 +4968,11 @@ impl App {
         let Some(top) = texts.top_line(leaf_index, program) else {
             return;
         };
-        if self.chrome_owns_terminal_row(wid, region.row_off + top) {
+        if self.chrome_owns_terminal_span(
+            wid,
+            region.row_off + top,
+            region.col_off..region.col_off + region.cols,
+        ) {
             return;
         }
         let (Some(run), tag) = texts.top_run(
@@ -5151,7 +5155,7 @@ impl App {
         };
         let grid = self.glass_grid(wid);
         self.splice_claude_footer_with(wid, plan, route, &mut lists, clock, grid);
-        self.settle_glass_hover(wid, grid);
+        self.settle_glass_hover(wid, grid, plan);
         for (session, pgid) in lists.top_seen.drain(..) {
             self.claude_facts.entry(session).or_default().top_seen = Some(pgid);
         }
@@ -5294,6 +5298,13 @@ impl App {
                                 markdown_accent,
                                 &mut lists.agy_edits,
                             );
+                            lists.agy_edits.retain(|e| {
+                                !self.chrome_owns_terminal_span(
+                                    wid,
+                                    e.frame_row.saturating_sub(region.strip),
+                                    region.col_off..region.col_off + region.cols,
+                                )
+                            });
                         }
                     }
                     continue;
@@ -5737,7 +5748,13 @@ impl App {
                 let on_glass = read
                     .filter(|_| !agy_switch_off)
                     .map(|r| r.rule)
-                    .filter(|&r| !self.chrome_owns_terminal_row(wid, row_off + r));
+                    .filter(|&r| {
+                        !self.chrome_owns_terminal_span(
+                            wid,
+                            row_off + r,
+                            col_off..col_off + pane_cols,
+                        )
+                    });
                 let rule = on_glass.and_then(|r| {
                     let frame_row = strip + row_off + r;
                     let (run, rule) = texts.rule_run(
@@ -5843,6 +5860,13 @@ impl App {
                             markdown_accent,
                             &mut lists.agy_edits,
                         );
+                        lists.agy_edits.retain(|e| {
+                            !self.chrome_owns_terminal_span(
+                                wid,
+                                e.frame_row.saturating_sub(region.strip),
+                                region.col_off..region.col_off + region.cols,
+                            )
+                        });
                     }
                     if matches!(
                         prog,
@@ -5904,7 +5928,13 @@ impl App {
                             &cached.rows,
                             region,
                             mode,
-                            |term_row| self.chrome_owns_terminal_row(wid, term_row),
+                            |term_row| {
+                                self.chrome_owns_terminal_span(
+                                    wid,
+                                    term_row,
+                                    region.col_off..region.col_off + region.cols,
+                                )
+                            },
                             blank,
                             &mut lists.mode_rows,
                             &mut lists.mode_cells,
@@ -5931,7 +5961,11 @@ impl App {
                             rows,
                             region,
                             rule: r.rule,
-                            chrome_owned: self.chrome_owns_terminal_row(wid, row_off + r.rule + 1),
+                            chrome_owned: self.chrome_owns_terminal_span(
+                                wid,
+                                row_off + r.rule + 1,
+                                region.col_off..region.col_off + region.cols,
+                            ),
                         })
                     }
                     _ => quota::Claim::Not,

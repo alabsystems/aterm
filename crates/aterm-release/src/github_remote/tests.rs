@@ -784,6 +784,69 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
 }
 
 #[test]
+fn a_baseline_imports_only_the_first_advertised_preference_and_proves_its_commit() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "remote.git", true);
+    let source = repo(root.path(), "source", false);
+    let first = commit(&source, "first release\n");
+    git(&source, &["tag", "-a", "v1", "-m", "release", &first]);
+    let later = commit(&source, "unselected release\n");
+    git(&source, &["tag", "v2", &later]);
+    let tree = git(&source, &["rev-parse", &format!("{later}^{{tree}}")]);
+    git(&source, &["tag", "tree-only", &tree]);
+    git(&source, &["push", "-q", bare.to_str().unwrap(), "--tags"]);
+    let target = repo(root.path(), "target", false);
+    git(
+        &target,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let remote = local(&target, &bare);
+    let preferences = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        remote
+            .first_tag_commit(&preferences(&["absent", "v1", "v2"]))
+            .unwrap(),
+        Some(("v1".into(), first.clone()))
+    );
+    // NEGATIVE CONTROL: importing the whole catalog also transfers this object.
+    let mut absent = object_git(&target);
+    absent.args(["cat-file", "-e", &later]);
+    assert!(
+        !absent.status().unwrap().success(),
+        "an unselected tag was imported"
+    );
+    assert_eq!(
+        remote
+            .first_tag_commit(&preferences(&["v2", "v1"]))
+            .unwrap(),
+        Some(("v2".into(), later))
+    );
+    assert!(
+        remote
+            .first_tag_commit(&preferences(&["tree-only", "v1"]))
+            .is_err()
+    );
+    assert_eq!(
+        remote.first_tag_commit(&preferences(&["absent"])).unwrap(),
+        None
+    );
+    std::fs::rename(&bare, root.path().join("offline.git")).unwrap();
+    assert!(
+        remote.first_tag_commit(&preferences(&["v1"])).is_err(),
+        "an imported object is no current tag observation"
+    );
+}
+
+#[test]
 fn child_branch_and_remote_head_import_exact_commits_without_fetch_head() {
     let root = aterm_tempfile::tempdir().unwrap();
     let parent = repo(root.path(), "parent", false);

@@ -58,13 +58,28 @@ pub(crate) fn support_with(
         return Err(refused());
     }
     channel.send(&reply.encode()?, deadline)?;
-    wire::transport::finish_reply(&mut channel)?;
-    if matches!(reply, wire::SupportReply::Supported { .. })
-        && channel.receive(deadline)?.as_slice() != [1]
-    {
+    finish_support_reply(
+        &mut channel,
+        matches!(reply, wire::SupportReply::Supported { .. }),
+        deadline,
+    )
+}
+
+/// Keep this SAME accepted peer alive through the client's final native audit.
+/// ACK permits no release or execution: the client still checks its original
+/// peer after sending it. Full peer close can invalidate Darwin's audit token,
+/// so retain the socket until the client ends its send half after those checks.
+/// Refusals also wait for that EOF so native checks do not mask their reason.
+pub(crate) fn finish_support_reply(
+    channel: &mut Channel,
+    requires_ack: bool,
+    deadline: Instant,
+) -> io::Result<()> {
+    wire::transport::finish_reply(channel)?;
+    if requires_ack && channel.receive(deadline)?.as_slice() != [1] {
         return Err(refused());
     }
-    Ok(())
+    wire::transport::require_reply_eof(channel, deadline)
 }
 
 pub(crate) fn serve(
@@ -161,4 +176,115 @@ pub(crate) fn serve_with(
     // Both write halves terminate their closed exchange. The original Job
     // retains this same accepted endpoint, independent of the wire outcome.
     stream.shutdown(std::net::Shutdown::Write)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+    use trust_resource_provenance::process;
+
+    fn connected() -> (aterm_tempfile::TempDir, UnixStream, UnixStream) {
+        let directory = aterm_tempfile::Builder::new()
+            .prefix("support-peer-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap();
+        let path = directory.path().join("socket");
+        let listener = UnixListener::bind(path).unwrap();
+        let caller =
+            UnixStream::connect(listener.local_addr().unwrap().as_pathname().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        (directory, caller, accepted)
+    }
+
+    #[test]
+    fn support_peer_stays_native_authenticated_after_reply_eof_and_ack() {
+        // These are transport-only frames, not a fabricated context or SDK.
+        for requires_ack in [true, false] {
+            let (_directory, caller, accepted) = connected();
+            let own = process::read_identity(std::process::id()).unwrap();
+            let peer = caller.try_clone().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (done, returned) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let result = {
+                    let mut channel = Channel::new(accepted).unwrap();
+                    channel.send(b"transport-only reply", deadline).unwrap();
+                    finish_support_reply(&mut channel, requires_ack, deadline)
+                };
+                // The result is sent only after every server socket owner drops.
+                done.send(result).unwrap();
+            });
+            let mut client = Channel::new(caller).unwrap();
+            assert_eq!(client.receive(deadline).unwrap(), b"transport-only reply");
+            wire::transport::require_reply_eof(&mut client, deadline).unwrap();
+            process::check_peer(&peer, own).unwrap();
+            if requires_ack {
+                client.send(&[1], deadline).unwrap();
+            }
+            assert!(matches!(
+                returned.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            process::check_peer(&peer, own).unwrap();
+            let mut changed = own;
+            changed.birth ^= 1;
+            assert!(process::check_peer(&peer, changed).is_err());
+
+            wire::transport::finish_reply(&mut client).unwrap();
+            returned
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            server.join().unwrap();
+            #[cfg(target_os = "macos")]
+            assert!(process::check_peer(&peer, own).is_err());
+        }
+    }
+
+    #[test]
+    fn support_close_refuses_wrong_ack_and_trailing_frames() {
+        for wrong_ack in [true, false] {
+            let (_directory, caller, accepted) = connected();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let server = std::thread::spawn(move || {
+                let mut channel = Channel::new(accepted).unwrap();
+                channel.send(b"transport-only reply", deadline).unwrap();
+                finish_support_reply(&mut channel, true, deadline)
+            });
+            let mut client = Channel::new(caller).unwrap();
+            client.receive(deadline).unwrap();
+            wire::transport::require_reply_eof(&mut client, deadline).unwrap();
+            client
+                .send(if wrong_ack { &[2] } else { &[1] }, deadline)
+                .unwrap();
+            if !wrong_ack {
+                client.send(b"trailing frame", deadline).unwrap();
+            }
+            wire::transport::finish_reply(&mut client).unwrap();
+            assert!(server.join().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn support_close_keeps_the_original_deadline_when_client_remains_open() {
+        let (_directory, caller, accepted) = connected();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expired = Instant::now();
+        let server = std::thread::spawn(move || {
+            let mut channel = Channel::new(accepted).unwrap();
+            channel.send(b"transport-only reply", deadline).unwrap();
+            finish_support_reply(&mut channel, false, expired)
+        });
+        let mut client = Channel::new(caller).unwrap();
+        client.receive(deadline).unwrap();
+        wire::transport::require_reply_eof(&mut client, deadline).unwrap();
+        assert_eq!(
+            server.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 }

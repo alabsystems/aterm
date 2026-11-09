@@ -212,8 +212,8 @@ pub const TAB_LOW_DATA: &str = "Low Data Mode is on, so the download waits. Turn
                                 System Settings \u{203a} Network; setup resumes automatically.";
 
 /// The tab's last line in an account that is no administrator's ([`Unfinished::NotAdmin`]).
-pub const TAB_NOT_ADMIN: &str = "Only an administrator of this Mac can install Apple's Command \
-                                 Line Tools. Ask one to install them from their own login.";
+pub const TAB_NOT_ADMIN: &str = "The remaining Mac setup needs an administrator of this Mac; \
+                                 this account is not one.";
 
 /// The one line the tab says before macOS asks for the password, with the tools missing.
 pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools for building software, \
@@ -753,19 +753,17 @@ pub fn selected(word: &str) -> bool {
     aterm_converge::selects(word, ID, "developer", Some(aterm_converge::Layer::Base))
 }
 
-/// Why the item cannot install from here.
-pub const NO_TTY: &str = "installing the Command Line Tools asks for your password, and this \
-                          run has no terminal to ask it in: run `aterm init --only base.clt` \
-                          in a terminal";
+/// Why pending root work cannot ask for a password from here.
+pub const NO_TTY: &str = "the remaining Mac setup needs an administrator password, and this \
+                          run has no terminal to ask it in";
 
 /// Why the item leaves the tools to an install under way ([`held`]).
 pub const INSTALLING: &str = "Apple's Command Line Tools are being installed now, by an install \
                               already under way";
 
 /// Why the item asks nobody for a password in an account that is no administrator's.
-pub const NOT_ADMIN: &str = "only an administrator of this Mac can install them, and this \
-                             account is not one: an administrator runs `aterm init --only \
-                             base.clt` in their own login";
+pub const NOT_ADMIN: &str = "the remaining Mac setup needs an administrator of this Mac, and \
+                             this account is not one";
 
 /// Why the item leaves the tools to Apple's installer window open for them
 /// ([`crate::items::developer::Holder::AppleWindow`]), naming the person's step there.
@@ -817,12 +815,12 @@ impl Item for CommandLineTools {
         if let Some(tab) = &self.tab {
             return self.apply_in_tab(sys, tab);
         }
-        if !sys.has_tty() {
-            return Err(NO_TTY.to_owned());
-        }
         let Some(plan) = self.apply_plan(sys).map_err(|(why, _)| why)? else {
             return Ok(());
         };
+        if !sys.has_tty() {
+            return Err(NO_TTY.to_owned());
+        }
         // Persist the episode before sudo can ask. Explicit retries bypass its withholding
         // decision, but consume the same record so a later update never retries unsolicited.
         let mut claimed = false;
@@ -910,7 +908,7 @@ impl Item for CommandLineTools {
         drop(stops);
         match (ended, ran) {
             (Ok(()), _) => Ok(()),
-            (Err(_), Err(e)) => Err(format!("`sudo` did not start: {e}")),
+            (Err(_), Err(e)) => Err(format!("administrator setup command failed: {e}")),
             (Err(why), Ok(_)) => Err(why.reason().to_owned()),
         }
     }
@@ -1058,7 +1056,7 @@ impl CommandLineTools {
         if let Some(person) = presence.needs_person() {
             return Some((
                 Probe::Deferred {
-                    why: format!("{from}; installing them {person}"),
+                    why: format!("{from}; finishing Mac setup {person}"),
                 },
                 Some(Unfinished::Other),
             ));
@@ -1108,12 +1106,12 @@ impl CommandLineTools {
     /// tools are there, whatever the root half's exit, else its plain reason ([`Unfinished`]),
     /// never an argv or a path.
     fn apply_in_tab(&self, sys: &dyn System, tab: &Tab) -> Result<(), String> {
-        if !sys.has_tty() {
-            return Err(tab.note(Unfinished::Other));
-        }
         let Some(plan) = self.apply_plan(sys).map_err(|(_, why)| tab.note(why))? else {
             return Ok(());
         };
+        if !sys.has_tty() {
+            return Err(tab.note(Unfinished::Other));
+        }
         let mut skipped = false;
         let mut plan_failure = None;
         let stops = sys.catch_stops();
@@ -1585,6 +1583,36 @@ mod tests {
                 assert_eq!(tab.entered.load(Ordering::Relaxed), tabbed && still_owed);
                 assert_eq!(said.lock().unwrap().is_empty(), !still_owed);
             }
+        }
+    }
+
+    #[test]
+    fn completed_root_work_needs_no_terminal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for tabbed in [false, true] {
+            let pending = Arc::new(AtomicBool::new(true));
+            let reader = pending.clone();
+            let mut item = item(Found::Present("healthy".into())).with_owed(Box::new(move |_| {
+                if reader.load(Ordering::Relaxed) {
+                    vec![crate::root_steps::Owed::Debugger]
+                } else {
+                    Vec::new()
+                }
+            }));
+            let tab = Tab::new(Arc::new(|_| {}));
+            if tabbed {
+                item = item.in_tab(tab.clone());
+            }
+            let mut sys = console();
+            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+            pending.store(false, Ordering::Relaxed);
+            sys.tty = false;
+            assert!(item.apply(&sys, &ctx(&[])).is_ok());
+            assert!(asked(&sys).is_empty());
+            assert_eq!(tab.unfinished(), None);
+            pending.store(true, Ordering::Relaxed);
+            assert!(item.apply(&sys, &ctx(&[])).is_err());
+            assert!(asked(&sys).is_empty());
         }
     }
 
@@ -2162,22 +2190,16 @@ mod tests {
         }
     }
 
-    /// At the console with no terminal to ask in (no `/dev/tty`), the item is blocked on
-    /// `aterm init --only base.clt` in a terminal, running nothing.
+    /// At the console with no terminal to ask in (no `/dev/tty`), pending work stays blocked,
+    /// running nothing.
     #[test]
-    fn without_a_terminal_the_item_is_blocked_on_init_only_base_clt() {
+    fn without_a_terminal_pending_work_is_blocked() {
         let mut sys = console();
         sys.tty = false;
         let item = missing();
         for mode in [Mode::Plan, Mode::Apply] {
             let row = run(&sys, &item, mode);
             assert_eq!(row.outcome, Outcome::Blocked, "{mode:?}: {row:?}");
-            assert!(
-                row.why
-                    .as_deref()
-                    .is_some_and(|why| why.contains("`aterm init --only base.clt`")),
-                "{row:?}"
-            );
         }
         assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
     }

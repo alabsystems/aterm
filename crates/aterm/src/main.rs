@@ -16338,6 +16338,9 @@ fn print_update_detail(
                 format!(" at {}", report.last_refusal_at)
             };
             println!("  install held back{when}: {}", report.last_refusal);
+            if report.last_failure.is_empty() && !report.last_refusal_detail.is_empty() {
+                println!("  handoff detail: {}", report.last_refusal_detail);
+            }
         }
         if !report.trial_wait.is_empty() {
             println!("  update trial: {}", report.trial_wait);

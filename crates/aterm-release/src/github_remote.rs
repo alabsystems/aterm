@@ -185,6 +185,14 @@ impl Remote {
         Ok(tags)
     }
 
+    /// Bind commit-only gate reuse to the same advertised immutable release
+    /// history without importing that history again.
+    pub(crate) fn tag_fingerprint(&self) -> Result<String, String> {
+        Ok(crate::publish::sha256_bytes(
+            render_tags(self.tag_inventory()?).as_bytes(),
+        ))
+    }
+
     fn import_snapshot(&self, objects: impl IntoIterator<Item = String>) -> Result<(), String> {
         self.ensure_origin()?;
         let objects = objects.into_iter().collect::<BTreeSet<_>>();
@@ -212,6 +220,36 @@ impl Remote {
         let tags = self.peel_tags(tags)?;
         self.ensure_origin()?;
         Ok(render_tags(tags))
+    }
+
+    /// Select before importing: a harness window needs one release's immutable
+    /// baseline, not every historical release's object graph and peel.
+    pub(crate) fn first_tag_commit(
+        &self,
+        names: &[String],
+    ) -> Result<Option<(String, String)>, String> {
+        let tags = self.tag_inventory()?;
+        for name in names {
+            let reference = format!("refs/tags/{name}");
+            let Some(oid) = tags.get(&reference) else {
+                continue;
+            };
+            self.import_snapshot([oid.clone()])?;
+            let peeled = self.peel_tag(oid)?;
+            if let Some(advertised) = tags.get(&format!("{reference}^{{}}"))
+                && peeled.as_ref() != Some(advertised)
+            {
+                return Err("tag peel differs from its imported object".into());
+            }
+            let commit = peeled.unwrap_or_else(|| oid.clone());
+            self.require_commit(&commit).map_err(|why| {
+                format!("{name}'s observed object is not an imported commit: {why}")
+            })?;
+            self.ensure_origin()?;
+            return Ok(Some((name.clone(), commit)));
+        }
+        self.ensure_origin()?;
+        Ok(None)
     }
 
     /// Refresh main alone for a ledger or source-line operation. Exact imports

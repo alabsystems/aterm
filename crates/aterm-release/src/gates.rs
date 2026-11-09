@@ -16,6 +16,98 @@ use crate::release::Refusal;
 /// Free-disk floor for the release's build and its cut.
 pub const MIN_FREE_DISK_GIB: u64 = 10;
 
+/// Inputs of qualify's immutable fixture and policy judgments. The advertised
+/// tag set is external input too: a new predecessor must never inherit an old
+/// judgment merely because the source and compiler stayed fixed.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommitGateRecord {
+    source: String,
+    version: String,
+    inputs: String,
+    tags: String,
+}
+
+impl CommitGateRecord {
+    pub(crate) fn new(source: &str, version: &str, inputs: String, tags: String) -> Self {
+        Self {
+            source: source.into(),
+            version: version.into(),
+            inputs,
+            tags,
+        }
+    }
+
+    fn path(git: &dyn GitRunner) -> Result<PathBuf> {
+        Ok(crate::release::release_dir(git)
+            .map_err(Error::new)?
+            .join("commit-gates.toml"))
+    }
+
+    pub(crate) fn save(&self, git: &dyn GitRunner) -> Result<()> {
+        let text = aterm_toml::to_string(self).map_err(|e| Error::new(e.to_string()))?;
+        crate::durable::write_atomic_durable(&Self::path(git)?, text.as_bytes(), 0o600)
+            .map_err(|e| Error::new(e.to_string()))
+    }
+
+    pub(crate) fn adopt(&self, git: &dyn GitRunner) -> Result<()> {
+        let record = read_bounded_string(&Self::path(git)?, 1 << 20)
+            .map_err(|e| Error::new(format!("read qualify's commit gates: {e}")))?;
+        let recorded: Self = aterm_toml::from_str(&record)
+            .map_err(|e| Error::new(format!("parse qualify's commit gates: {e}")))?;
+        self.agrees(&recorded)
+    }
+
+    fn agrees(&self, recorded: &Self) -> Result<()> {
+        if self != recorded {
+            return Err(Error::new(
+                "qualify's fixture/policy record has another source, version, inputs seal or advertised tag set; nothing was claimed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod commit_gate_record_tests {
+    use super::*;
+
+    /// NEGATIVE CONTROLS: no component of the record may cross a judgment.
+    #[test]
+    fn fixture_and_policy_records_bind_every_input() {
+        struct At(PathBuf);
+        impl GitRunner for At {
+            fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+                assert_eq!(
+                    args,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+                );
+                Ok(crate::ledger::RunOut {
+                    status: 0,
+                    stdout: format!("{}\n", self.0.display()).into_bytes(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let git = At(dir.path().to_path_buf());
+        let expected = CommitGateRecord::new("source", "0.183.0", "seal".into(), "tags".into());
+        assert!(expected.adopt(&git).is_err(), "missing is not passed");
+        expected.save(&git).unwrap();
+        expected.adopt(&git).unwrap();
+        for changed in [
+            CommitGateRecord::new("other", "0.183.0", "seal".into(), "tags".into()),
+            CommitGateRecord::new("source", "0.184.0", "seal".into(), "tags".into()),
+            CommitGateRecord::new("source", "0.183.0", "other".into(), "tags".into()),
+            CommitGateRecord::new("source", "0.183.0", "seal".into(), "other".into()),
+        ] {
+            assert!(changed.adopt(&git).is_err(), "{changed:?}");
+        }
+        std::fs::write(CommitGateRecord::path(&git).unwrap(), "garbled").unwrap();
+        assert!(expected.adopt(&git).is_err(), "garbled is not passed");
+    }
+}
+
 /// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …), found by atpkg's one resolution order.
 pub fn trust_stage2_bin() -> Result<PathBuf> {
     let pinned = pin_first_success(&PINNED, resolve_trust_stage2_bin)?;
@@ -2347,6 +2439,15 @@ fn own_cutter_stamp_of(
             "cutter identity: content-proved from {} itself",
             short(commit)
         )),
+        // The cut claims R in a child commit that adds only CLAIM_FILES, which no cutter
+        // compiles in, so R's content proof covers it as it covers R. Without this a resume
+        // past the claim could run no cutter at all: the release flow freezes R's.
+        Ok(crate::cutter::Stamp::Proved(stamp)) if claims_only(git, stamp, commit) => Ok(format!(
+            "cutter identity: content-proved from {}, whose claim commit {} adds only its \
+                 ledger line and changelog roll",
+            short(stamp),
+            short(commit)
+        )),
         Ok(crate::cutter::Stamp::Proved(stamp)) => Err(crate::cutter::NotOwn {
             why: format!("this content-proved aterm-release binary is for {stamp}, not {commit}"),
             fix: format!(
@@ -2411,33 +2512,43 @@ pub fn own_cutter_with(
             short(commit)
         ));
     }
+    if claims_only(git, stamp, commit) {
+        return Ok(format!(
+            "cutter identity: built from {}, whose claim commit {} adds only its ledger \
+             line and changelog roll",
+            short(stamp),
+            short(commit)
+        ));
+    }
+    Err(format!(
+        "this aterm-release binary was built from {stamp}, not {commit}"
+    ))
+}
+
+/// Whether `commit` is `stamp`'s claim commit: its first parent is `stamp` and it changes
+/// at least one of [`CLAIM_FILES`] and nothing else.
+fn claims_only(git: &dyn GitRunner, stamp: &str, commit: &str) -> bool {
     let parent = git
         .git(&["rev-parse", "--verify", "-q", &format!("{commit}^1")])
         .ok()
         .filter(crate::ledger::RunOut::success)
         .map(|out| out.stdout_utf8().trim().to_string());
-    if parent.as_deref() == Some(stamp)
-        && let Ok(out) = git.git(&["diff", "--name-only", "--no-renames", stamp, commit])
-        && out.success()
-    {
-        let text = out.stdout_utf8();
-        let changed: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        if !changed.is_empty() && changed.iter().all(|p| CLAIM_FILES.contains(p)) {
-            return Ok(format!(
-                "cutter identity: built from {}, whose claim commit {} adds only its ledger \
-                 line and changelog roll",
-                short(stamp),
-                short(commit)
-            ));
-        }
+    if parent.as_deref() != Some(stamp) {
+        return false;
     }
-    Err(format!(
-        "this aterm-release binary was built from {stamp}, not {commit}"
-    ))
+    let Ok(out) = git.git(&["diff", "--name-only", "--no-renames", stamp, commit]) else {
+        return false;
+    };
+    if !out.success() {
+        return false;
+    }
+    let text = out.stdout_utf8();
+    let changed: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    !changed.is_empty() && changed.iter().all(|p| CLAIM_FILES.contains(p))
 }
 
 /// [`own_cutter`] as a gate, with its remedy.
@@ -3821,10 +3932,12 @@ mod cutter_identity_tests {
         own_cutter_with(&claim, "unknown", HEAD).expect_err("not an id");
     }
 
-    /// A frozen cutter's content proof names exactly one commit. Unlike a dep-info build, it
-    /// cannot use the claim-only child exception. That mismatch is the negative control.
+    /// A frozen cutter's content proof covers its commit and that commit's claim commit,
+    /// which adds only CLAIM_FILES (no cutter compiles them in): a resume past the claim runs
+    /// R's frozen cutter against the claim commit (aterm 0.184.0's step 8 resume refused
+    /// here). Any other child, or another parent, is still refused.
     #[test]
-    fn a_content_proved_cutter_judges_only_its_exact_commit() {
+    fn a_content_proved_cutter_finishes_only_its_own_claim_commit() {
         let claim = Claimed {
             parent: OLDER,
             changed: "CHANGELOG.md\nRELEASES.ledger\n",
@@ -3833,8 +3946,25 @@ mod cutter_identity_tests {
         assert!(own_cutter_stamp_of(&claim, Ok(&proved), HEAD).is_ok());
 
         let proved_old = crate::cutter::Stamp::Proved(OLDER.into());
-        let not = own_cutter_stamp_of(&claim, Ok(&proved_old), HEAD).unwrap_err();
+        let own_claim = own_cutter_stamp_of(&claim, Ok(&proved_old), HEAD)
+            .expect("R's frozen cutter finishes R's claim commit");
+        assert!(own_claim.contains("content-proved"), "{own_claim}");
+
+        let more = Claimed {
+            parent: OLDER,
+            changed: "CHANGELOG.md\nRELEASES.ledger\ncrates/aterm-release/src/gates.rs\n",
+        };
+        let not = own_cutter_stamp_of(&more, Ok(&proved_old), HEAD).unwrap_err();
         assert!(not.why.contains("content-proved"), "{not:?}");
+        let other_parent = Claimed {
+            parent: "3333333333333333333333333333333333333333",
+            changed: "RELEASES.ledger\n",
+        };
+        assert!(own_cutter_stamp_of(&other_parent, Ok(&proved_old), HEAD).is_err());
+        assert!(
+            own_cutter_stamp_of(&unrelated(), Ok(&proved_old), HEAD).is_err(),
+            "a source change is never a claim"
+        );
 
         let built_old = crate::cutter::Stamp::Built(OLDER.into());
         assert!(

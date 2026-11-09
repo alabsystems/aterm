@@ -498,6 +498,21 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
     assert_eq!(bundle.reserved.commit, "e".repeat(40));
     assert_eq!(bundle.complete, c.complete);
 
+    // The fixture/policy fact is adopted only through the bundle reader's seal
+    // proof, even when the journal still names the same source and reservation.
+    let changed_seal = crate::publish::verified_release_bundle_with_inputs(
+        &Git::new(&c.repo),
+        &c.repo,
+        &c.source,
+        VERSION,
+        &format!("/stage2/bin trustc {}", compilers().trustc),
+        || Ok("another seal".into()),
+    );
+    assert!(
+        changed_seal.is_err(),
+        "another seal must not adopt commit gates"
+    );
+
     crate::publish::verified_release_bundle(
         &Git::new(&c.repo),
         &c.repo,
@@ -534,6 +549,24 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
     )
     .unwrap();
     c.bundle().err().expect("changed bytes");
+}
+
+/// NEGATIVE CONTROL: a COMMIT_GATES fact cannot authorize a claim when a
+/// required check of the source tree is red. Omitting verified_with_inputs in
+/// the cut's bundle reader would accept this bundle.
+#[test]
+fn adopting_commit_gates_does_not_adopt_a_red_tree() {
+    let c = Clone::new();
+    crate::check_record::record_run(
+        &Git::new(&c.repo),
+        &c.source,
+        &c.complete.macho_sha256,
+        &compilers().inputs,
+        1,
+        |name| Some(if name == "lint" { "fail" } else { "ok" }),
+    );
+    let error = c.bundle().err().expect("red tree must refuse before claim");
+    assert!(error.contains("UNVERIFIED"), "{error}");
 }
 
 /// Private preparation keeps every build proof while allowing missing verification records.

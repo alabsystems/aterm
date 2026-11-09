@@ -90,6 +90,48 @@ impl LiveShell {
         })
     }
 
+    /// Waits until the shell sleeps, each of its threads waiting interruptibly
+    /// (`aterm_sysprobe`'s reading of it): once its line editor has drawn what a test waited for,
+    /// that sleep is its read of the terminal, which a Ctrl-C the terminal sends interrupts. A
+    /// Ctrl-C that comes while the line editor is still at work meets bash's own race, with no
+    /// integration at all: bash 5.3's readline echoes it and resets the terminal, then reads on
+    /// and acts on it only at the next key; bash 3.2 leaves its redisplay (an extra `\r> ` or
+    /// `\b)` in the echo) by a jump out of its signal handler that keeps a stdio lock held, and
+    /// the next subshell its prompt forks waits on that lock forever (`flockfile`, sampled, under
+    /// a plain `PROMPT_COMMAND` that forks `$(builtin history 1)` as well as under `main`'s
+    /// integration). With this crate's tests run four at once, 13 of 32 runs stalled so, 3 of
+    /// them on bash 3.2.
+    fn wait_for_read(&mut self) {
+        use aterm_sysprobe::jobs::{JobsReader, ReadReq, RunState};
+        let started = std::time::Instant::now();
+        let req = ReadReq {
+            pid: self.child.id(),
+            fds: false,
+        };
+        let mut reader = JobsReader::new();
+        loop {
+            let state = reader.read(req).map(|facts| facts.state);
+            if state == Some(RunState::Sleeping) {
+                return;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "{}: shell exited ({status}) before it read\n{}",
+                    self.label,
+                    self.transcript()
+                );
+            }
+            if started.elapsed() >= Self::TIMEOUT {
+                panic!(
+                    "{}: timed out waiting for it to read (last {state:?})\n{}",
+                    self.label,
+                    self.transcript()
+                );
+            }
+            aterm_uds::deadline::poll_yield();
+        }
+    }
+
     fn last_prompt(&self) -> usize {
         const PROMPT: &[u8] = b"\x1b]133;A";
         let out = self
@@ -2258,22 +2300,7 @@ fn an_integrated_bash_under_functrace_marks_each_line_as_without_it() {
         "(exit 3)",
         "false",
     ];
-    let marks = |out: &str| -> Vec<String> {
-        let field = |rest: &str| rest.split(';').next().unwrap_or("").to_owned();
-        out.split("\x1b]")
-            .skip(1)
-            .filter_map(|osc| {
-                let osc = osc.split('\x07').next().unwrap_or("");
-                if let Some(line) = osc.strip_prefix("633;E;") {
-                    Some(format!("E {}", field(line)))
-                } else if let Some(status) = osc.strip_prefix("133;D;") {
-                    Some(format!("D {}", field(status)))
-                } else {
-                    osc.starts_with("133;C").then(|| "C".to_owned())
-                }
-            })
-            .collect()
-    };
+    let marks = command_marks;
     let mut shells = ShellLanes::default();
     for bash in shells.bashes() {
         let seen = ["", "set -T\n"].map(|flag| {
@@ -2302,6 +2329,383 @@ fn an_integrated_bash_under_functrace_marks_each_line_as_without_it() {
             seen[0]
         );
         assert_eq!(seen[1], seen[0], "{bash}: under functrace");
+    }
+}
+
+/// The command marks in `out`, in order: `E <the line as sent>`, `C`, `D <status>`.
+#[cfg(unix)]
+fn command_marks(out: &str) -> Vec<String> {
+    let field = |rest: &str| rest.split(';').next().unwrap_or("").to_owned();
+    out.split("\x1b]")
+        .skip(1)
+        .filter_map(|osc| {
+            let osc = osc.split('\x07').next().unwrap_or("");
+            if let Some(line) = osc.strip_prefix("633;E;") {
+                Some(format!("E {}", field(line)))
+            } else if let Some(status) = osc.strip_prefix("133;D;") {
+                Some(format!("D {}", field(status)))
+            } else {
+                osc.starts_with("133;C").then(|| "C".to_owned())
+            }
+        })
+        .collect()
+}
+
+/// How a step of [`UNHEARD_STEPS`] ends its line.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnheardEnd {
+    /// Enter.
+    Enter,
+    /// Ctrl-C once the line editor echoed the line and sleeps in its read (sent with it, the
+    /// tty flushes the line along with the signal before readline reads it).
+    Cancel,
+    /// Enter, then Ctrl-C once bash drew its continuation prompt (`PS2`, `> `) for the rest
+    /// of a command the line left open and sleeps in its read. History keeps the line, and
+    /// nothing ran.
+    CancelContinued,
+}
+
+/// One prompt of [`an_integrated_bash_marks_a_line_that_runs_no_simple_command_at_its_top`].
+#[cfg(unix)]
+struct UnheardStep {
+    /// The line typed at the prompt.
+    line: &'static str,
+    /// How it ends.
+    end: UnheardEnd,
+    /// What the shell writes once it is done with the line, in order.
+    done: &'static [&'static str],
+    /// The run it makes, as the line history holds and the status its D carries, or `None`.
+    run: Option<(&'static str, &'static str)>,
+    /// Whether bash's DEBUG trap hears it: a simple command runs at its top.
+    heard: bool,
+}
+
+/// The next prompt, drawn by the prompt command.
+#[cfg(unix)]
+const NEXT_PROMPT: &[&str] = &["\x1b]133;A"];
+
+/// What that test types, prompt by prompt.
+#[cfg(unix)]
+const UNHEARD_STEPS: [UnheardStep; 21] = [
+    // No simple command at the top: before 5.3 only the next prompt hears these.
+    UnheardStep {
+        line: "f() { :; }",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("f() { :; }", "0")),
+        heard: false,
+    },
+    UnheardStep {
+        line: "function g { :; }",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("function g { :; }", "0")),
+        heard: false,
+    },
+    UnheardStep {
+        line: "(exit 3)",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("(exit 3)", "3")),
+        heard: false,
+    },
+    UnheardStep {
+        line: "( cd / && false )",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("( cd / && false )", "1")),
+        heard: false,
+    },
+    // The trap hears these: one run each, and none more at the prompt.
+    UnheardStep {
+        line: "{ false; }",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("{ false; }", "1")),
+        heard: true,
+    },
+    UnheardStep {
+        line: "true",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("true", "0")),
+        heard: true,
+    },
+    UnheardStep {
+        line: "sleep 0",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("sleep 0", "0")),
+        heard: true,
+    },
+    // Nothing ran, or history keeps no entry of it (`ignorespace`): no run.
+    UnheardStep {
+        line: "",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    UnheardStep {
+        line: "(exit 9)",
+        end: UnheardEnd::Cancel,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    UnheardStep {
+        line: " (exit 4)",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    // bash draws the prompt again with no prompt command: its own line editor's B.
+    UnheardStep {
+        line: "echo !qzpnone",
+        end: UnheardEnd::Enter,
+        done: &["event not found", "\x1b]133;B"],
+        run: None,
+        heard: false,
+    },
+    // The mark outlives the prompts that made no run, and nothing more comes for them.
+    UnheardStep {
+        line: "(exit 5)",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("(exit 5)", "5")),
+        heard: false,
+    },
+    // History saves each of these as a new entry, but none ran: bash's command number stands
+    // still. A run made up for one would end with the status before it, here `false`'s.
+    UnheardStep {
+        line: "false",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("false", "1")),
+        heard: true,
+    },
+    UnheardStep {
+        line: "# qzp note",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    UnheardStep {
+        line: "fi",
+        end: UnheardEnd::Enter,
+        done: &["syntax error", "\x1b]133;A"],
+        run: None,
+        heard: false,
+    },
+    UnheardStep {
+        line: "for i in 1 2",
+        end: UnheardEnd::CancelContinued,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    UnheardStep {
+        line: "h() {",
+        end: UnheardEnd::CancelContinued,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    // A blank line, saved once `ignorespace` is off.
+    UnheardStep {
+        line: "HISTCONTROL=",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("HISTCONTROL=", "0")),
+        heard: true,
+    },
+    UnheardStep {
+        line: "false",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("false", "1")),
+        heard: true,
+    },
+    UnheardStep {
+        line: "   ",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: None,
+        heard: false,
+    },
+    // The mark outlives these too.
+    UnheardStep {
+        line: "(exit 6)",
+        end: UnheardEnd::Enter,
+        done: NEXT_PROMPT,
+        run: Some(("(exit 6)", "6")),
+        heard: false,
+    },
+];
+
+/// The prompt's call that starts a line no hook heard, which the control cuts.
+#[cfg(unix)]
+const UNHEARD_CALL: &str =
+    "    [[ -n \"$__aterm_last_command\" ]] || __aterm_untraced __aterm_line_unheard\n";
+
+/// The trampoline's own call of `__aterm_end_command`, which one that predates it lacks
+/// (`fixtures/loader-57daa3707e.bash`), so the body's handler ends the line.
+#[cfg(unix)]
+const TRAMPOLINE_ENDS: &str = "    __aterm_in_prompt_cmd=1\n    \
+     ! declare -F __aterm_end_command >/dev/null || __aterm_end_command \"$__aterm_status\"\n";
+
+/// `BASH_VERSINFO`'s major and minor as one number: 302 for 3.2, 503 for 5.3.
+#[cfg(unix)]
+fn bash_level(bash: &str) -> u32 {
+    let out = shell_command(bash)
+        .args(["-c", "echo $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"])
+        .output()
+        .unwrap_or_else(|error| panic!("{bash} -c: {error}"));
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{bash}: no BASH_VERSINFO: {out:?}"))
+}
+
+/// Types each of [`UNHEARD_STEPS`] at its own prompt of `bash` under the script set in `dir`,
+/// and returns the command marks each wrote before the next prompt, with every byte the
+/// shell wrote from its first line editor to its last prompt.
+#[cfg(unix)]
+fn unheard_session(bash: &str, fx: &LiveFixture, dir: &Path) -> (Vec<Vec<String>>, String) {
+    let mut sh = spawn_pty_shell(ShellType::Bash, bash, fx, dir, &[("ATERM_CHILD", "1")]);
+    sh.wait_for_line_editor();
+    // From the first prompt's end, which every session has printed alike by then: the line
+    // editor's own word can come before the prompt's text (bash 5.3's `\e[?2004h`).
+    let start = sh.wait_for_after("\x1b]133;B", sh.last_prompt());
+    let mut end = start;
+    let mut marks = Vec::new();
+    for step in &UNHEARD_STEPS {
+        let typed = sh.type_at_prompt(step.line.as_bytes());
+        match step.end {
+            UnheardEnd::Enter => sh.send_bytes(b"\r"),
+            UnheardEnd::Cancel => {
+                sh.wait_for_after(step.line, typed);
+                sh.wait_for_read();
+                sh.send_bytes(b"\x03");
+            }
+            UnheardEnd::CancelContinued => {
+                let echoed = sh.wait_for_after(step.line, typed);
+                sh.send_bytes(b"\r");
+                sh.wait_for_after("> ", echoed);
+                sh.wait_for_read();
+                sh.send_bytes(b"\x03");
+            }
+        }
+        end = typed;
+        for word in step.done {
+            end = sh.wait_for_after(word, end);
+        }
+        marks.push(command_marks(&stdout_between(&sh, typed, end)));
+    }
+    let out = stdout_between(&sh, start, end);
+    sh.finish();
+    (marks, out)
+}
+
+/// `out` without the line bash's job control prints when a child's own `setpgid` loses its race
+/// with the parent's on macOS (`bash: child setpgid (<pid> to <pid>): Operation not
+/// permitted`), which either session can print for any line that forks, whichever set it runs,
+/// and which holds no byte of the integration's (seen in 3 of 60 runs of bash 5.3.20).
+#[cfg(unix)]
+fn without_setpgid_races(out: &str) -> String {
+    const RACE: &str = "bash: child setpgid (";
+    let mut kept = String::with_capacity(out.len());
+    let mut rest = out;
+    while let Some(at) = rest.find(RACE) {
+        kept.push_str(&rest[..at]);
+        rest = match rest[at..].find("\r\n") {
+            Some(end) => &rest[at + end + 2..],
+            None => "",
+        };
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// A LINE THAT RUNS NO SIMPLE COMMAND AT ITS TOP MAKES ONE RUN ON EVERY BASH (unit BASH32): a
+/// function's definition, a `function` one and a line that starts with a subshell write E (the
+/// line history holds), C and D (the status it left), which bash before 5.3, whose DEBUG trap
+/// fires before simple commands only and which has no PS0 hook, writes at the next prompt
+/// before anything else. A line the trap heard writes exactly one of each, and an empty line,
+/// one Ctrl-C cancelled, a space-led one under `ignorespace` and one whose history expansion
+/// failed write none. Nor does a line history saves although nothing ran, after a `false` whose
+/// status a made-up run would carry: a comment, a syntax error, a line a Ctrl-C cancelled at the
+/// continuation prompt and a blank line. A shell whose trampoline predates its own call of
+/// `__aterm_end_command`, which the body's handler makes, writes the same. NEGATIVE CONTROL,
+/// in the test: with the prompt's call cut, a bash before 5.3 writes no mark for the lines its
+/// trap never hears and the same as ever for the rest, and bash 5.3, whose PS0 hears them,
+/// writes the very bytes it writes with the call, its integration's address aside.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_marks_a_line_that_runs_no_simple_command_at_its_top() {
+    const CUT_REV: &str = "00000000000000ce";
+    const OLDER_REV: &str = "00000000000000cf";
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTFILE=/dev/null\nHISTCONTROL=ignorespace\ncd /\n",
+        )
+        .expect(".bashrc");
+        let dir = install_script_set(&fx.base).expect("install");
+        let cut = folder_with_edits(
+            &fx.base,
+            CUT_REV,
+            &[("bash", scripts::BASH, &[(UNHEARD_CALL, "")])],
+        );
+        let older = folder_with_edits(
+            &fx.base,
+            OLDER_REV,
+            &[(
+                "bash",
+                scripts::BASH,
+                &[(TRAMPOLINE_ENDS, "    __aterm_in_prompt_cmd=1\n")],
+            )],
+        );
+        let (marks, out) = unheard_session(bash, &fx, &dir);
+        let (older_marks, _) = unheard_session(bash, &fx, &older);
+        let (cut_marks, cut_out) = unheard_session(bash, &fx, &cut);
+        for (i, step) in UNHEARD_STEPS.iter().enumerate() {
+            let typed = step.line;
+            // `__aterm_encode_cmd`'s escapes of the bytes these lines hold.
+            let want: Vec<String> = step.run.map_or_else(Vec::new, |(line, status)| {
+                let sent = line.replace(';', "\\x3b").replace(' ', "\\x20");
+                vec![format!("E {sent}"), "C".to_owned(), format!("D {status}")]
+            });
+            assert_eq!(marks[i], want, "{bash}: {typed:?}\n{out:?}");
+            assert_eq!(
+                older_marks[i], want,
+                "{bash}: {typed:?}, the older trampoline"
+            );
+            if step.heard {
+                assert_eq!(cut_marks[i], want, "{bash}: {typed:?}, the control");
+            }
+        }
+        if bash_level(bash) >= 503 {
+            let rev = dir.file_name().and_then(|name| name.to_str()).expect("rev");
+            assert_eq!(
+                without_setpgid_races(&cut_out.replace(CUT_REV, rev)),
+                without_setpgid_races(&out),
+                "{bash}: the control's bytes"
+            );
+        } else {
+            for (step, seen) in UNHEARD_STEPS.iter().zip(&cut_marks) {
+                assert!(
+                    step.heard || seen.is_empty(),
+                    "{bash}: the control marked {:?}: {seen:?}\n{cut_out:?}",
+                    step.line
+                );
+            }
+        }
     }
 }
 

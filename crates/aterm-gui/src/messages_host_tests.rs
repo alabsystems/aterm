@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::frame_asks_for_test as frame_asks;
 use crate::update_words::LiveHealth as _;
 use aterm_messages::{LogRecord, LogState, Retired, Severity, tags};
 
@@ -3844,16 +3845,6 @@ fn replied_id(reply: &str, field: &str) -> MessageId {
     MessageId::from_raw(raw.parse().expect("a number")).expect("a nonzero id")
 }
 
-/// Every window's frame asks so far: each one's own and the asks of all of them at once.
-fn frame_asks(app: &App) -> u64 {
-    let own: u64 = app
-        .windows
-        .values()
-        .map(|ws| u64::from(ws.redraw_requests_for_test.get()))
-        .sum();
-    own + crate::redraw_all_requests_on_this_thread()
-}
-
 #[test]
 fn a_wire_progress_flood_keeps_one_row_per_key_and_repaints_nothing() {
     let mut app = App::headless_for_test();
@@ -3914,6 +3905,122 @@ fn a_wire_progress_flood_keeps_one_row_per_key_and_repaints_nothing() {
         frame_asks(&app),
         asks_before,
         "the whole flood asks no window for a frame"
+    );
+}
+
+/// With no Settings view open, a post, a restatement, a resolve and a withdrawal settle the center
+/// and ask no window for a frame: no window draws a center row ([`App::sync_messages`]). A due
+/// Settings ▸ Messages publish repaints only the windows that show a Settings view
+/// ([`App::dispatch_to_settings_views`]), and this fixture opens none.
+#[test]
+fn a_post_a_resolve_and_a_withdrawal_ask_no_window_for_a_frame() {
+    let mut app = App::headless_for_test();
+    let asks = frame_asks(&app);
+    let resolved = app.post_message(warn("a row a resolve ends"));
+    let withdrawn = app.post_message(warn("a row a withdrawal ends"));
+    assert_eq!(
+        app.messages.live_rows().count(),
+        2,
+        "PRECONDITION: both rows are live"
+    );
+    let revision = app.messages.revision();
+    assert!(app.restate_message(withdrawn, restatement_of(&warn("a row restated"))));
+    assert_ne!(
+        app.messages.revision(),
+        revision,
+        "PRECONDITION: the restatement moved the row, so it synced"
+    );
+    assert!(
+        app.resolve_message(resolved, Outcome::Ok),
+        "PRECONDITION: the resolve ended a live row"
+    );
+    assert!(
+        app.withdraw_message(withdrawn),
+        "PRECONDITION: the withdrawal ended a live row"
+    );
+    assert_eq!(
+        frame_asks(&app),
+        asks,
+        "no post, restatement, resolve or withdrawal asks a window for a frame"
+    );
+}
+
+/// The frame a sync still asks for: the tab strip's waiting fall its settle commits re-grids
+/// every window, and the sync asks every window for a frame.
+#[test]
+fn a_sync_that_lets_the_strip_fall_asks_every_window_for_a_frame() {
+    use aterm_messages::chrome::CHROME_REGROW_SETTLE;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let sid = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(sid));
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .chrome_regrids_for_test = true;
+    let t0 = Instant::now()
+        .checked_sub(CHROME_REGROW_SETTLE * 2)
+        .expect("the clock reads past two floors");
+    let _ = app.settle_messages(t0);
+    app.set_tab_strip_rows(1, t0);
+    app.set_tab_strip_rows(0, t0 + std::time::Duration::from_millis(20));
+    assert_eq!(
+        app.tab_strip_rows, 1,
+        "PRECONDITION: the floor held the fall"
+    );
+    let asks = crate::redraw_all_requests_on_this_thread();
+    let _ = app.post_message(warn("a row whose sync passes the floor"));
+    assert_eq!(
+        app.tab_strip_rows, 0,
+        "the sync's settle let the strip fall"
+    );
+    assert_eq!(
+        crate::redraw_all_requests_on_this_thread(),
+        asks + 1,
+        "the fall's re-grid asks every window for one frame"
+    );
+}
+
+/// A post after every sweep of the loop's turn folded its deadline (the status sweep's
+/// shell-integration row, a paste wait's end) can land inside the publish gap. The publish it
+/// defers is in what the loop arms ([`App::arm_loop_deadline`]), so Settings ▸ Messages shows
+/// the row on time, and no frame is asked to wake the loop for it.
+#[test]
+fn a_publish_a_late_post_defers_is_in_what_the_loop_arms() {
+    use crate::app_native::MESSAGES_PUBLISH_MIN_GAP as GAP;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
+    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
+    let _ = app
+        .messages_last_publish
+        .expect("opening Settings publishes");
+    // The gap runs on the real clock from the last publish. Stamp that publish an hour ahead, so
+    // the post's sync falls inside the gap with no race against the time the open took.
+    let stamp = Instant::now() + std::time::Duration::from_secs(3600);
+    app.messages_last_publish = Some(stamp);
+    let asks = crate::redraw_all_requests_on_this_thread();
+    let _ = app.post_message(warn("posted by the turn's last sweep"));
+    assert_eq!(
+        app.messages_last_publish,
+        Some(stamp),
+        "PRECONDITION: the gap deferred the publish"
+    );
+    assert_eq!(
+        app.messages_publish_due_at(),
+        Some(stamp + GAP),
+        "PRECONDITION: the deferred publish falls due one gap after the stamp"
+    );
+    assert_eq!(
+        crate::redraw_all_requests_on_this_thread(),
+        asks,
+        "the post asks no frame that would wake the loop"
+    );
+    let armed = app.arm_loop_deadline(None, crate::deadline_heal::DeadlineFold::default());
+    assert!(
+        armed.is_some_and(|d| d <= stamp + GAP),
+        "the loop is armed by the deferred publish's due ({:?} after the stamp), armed {armed:?}",
+        GAP
     );
 }
 

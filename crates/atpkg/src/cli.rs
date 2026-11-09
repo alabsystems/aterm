@@ -47,6 +47,25 @@ struct Verb {
 }
 
 const TABLE: &[Verb] = &[
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Verb {
+        name: "engineering-sdk",
+        tier: Tier::Plumbing,
+        usage: crate::engineering_sdk::USAGE,
+        arity: Arity::Own,
+        program_flags: None,
+        // The early entry owns only its explicit fresh prefix and native writer lock.
+        mutates_store: false,
+        applies_machine: false,
+        run: |rest| {
+            crate::engineering_sdk::command(
+                &rest
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        },
+    },
     Verb {
         name: "install",
         tier: Tier::Daily,
@@ -584,6 +603,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// The whole package-manager CLI as a callable.
 pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // This explicit private-prefix producer must not enter the configured machine/store pass.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if argv.first().and_then(|arg| arg.to_str()) == Some("engineering-sdk") {
+        return crate::engineering_sdk::command(&argv[1..]);
+    }
     if argv.first().and_then(|arg| arg.to_str()) == Some(crate::native_defaults::VERB) {
         return crate::native_defaults::run_hidden(&argv[1..]);
     }

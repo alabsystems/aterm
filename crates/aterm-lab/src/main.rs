@@ -937,8 +937,9 @@ Outside any lab (no jail, no stub):
                                  actual GUI retains its original lane/memory after keeper and owner crash; debug lab
   window-handoff-app --aterm ABS --out ABS [--cut-keeper]
                                  authenticated launchd handoff and normal Quit or keeper-lifeline closure; debug lab
-  installer-handoff --aterm ABS --out ABS [--handoffs N]
+  installer-handoff --aterm ABS --out ABS [--handoffs N] [--stream]
                                  live same-image handoff with an inert receipt-bound installer terminal; debug lab
+                                 --stream checks every numbered output record across the handoffs while output stays active
   cold-handoff --aterm ABS --out ABS [--handoffs N]
                                  verify repeated in-place updates of a private native window with no terminal sessions
                                  both default to 2 handoffs; N is 1..32, with one-minute progress hang detectors
@@ -1455,6 +1456,8 @@ fn main() -> std::process::ExitCode {
             let cmd = args.first().cloned().unwrap_or_default();
             let rest = args.get(1..).unwrap_or_default();
             match cmd.as_str() {
+                #[cfg(debug_assertions)]
+                "__handoff-stream" => installer_handoff::stream_fixture_main(rest),
                 "stub" => stub::main(rest),
                 "sampler" => sampler::main(rest),
                 "ctty" => relay::ctty(rest),

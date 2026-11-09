@@ -886,6 +886,20 @@ impl Runner {
         };
         let ended = following.pass.ended();
         let followed = self.clock.mono().saturating_sub(following.since);
+        if ended.is_none() && followed >= PASS_FOLLOW_LIMIT {
+            let subject = match (following.program, following.index_build) {
+                (Some(program), _) => format!("vendor head watch: {program}"),
+                (None, Some(build)) => format!("atpkg index {build}"),
+                (None, None) => "vendor head watch: held Trust toolchain move".to_owned(),
+            };
+            self.following = None;
+            (self.log)(&format!(
+                "{subject} update pass has no observed exit after {} min \
+                 \u{2014} left running, watching the heads again",
+                followed.as_secs() / 60
+            ));
+            return true;
+        }
         let Some(program) = following.program else {
             return match ended {
                 Some(_) => {
@@ -898,10 +912,6 @@ impl Runner {
                             "vendor head watch: held Trust toolchain move: update pass ended",
                         );
                     }
-                    true
-                }
-                None if followed >= PASS_FOLLOW_LIMIT => {
-                    self.following = None;
                     true
                 }
                 None => false,
@@ -920,15 +930,6 @@ impl Runner {
                     )
                 };
                 (self.log)(&line);
-                true
-            }
-            None if followed >= PASS_FOLLOW_LIMIT => {
-                self.following = None;
-                (self.log)(&format!(
-                    "vendor head watch: {program} update pass still running after {} min \
-                     \u{2014} left running, watching the heads again",
-                    followed.as_secs() / 60
-                ));
                 true
             }
             None => false,
@@ -1532,10 +1533,17 @@ mod tests {
         let vendors = Vendors::new("2.1.281");
         let passes = Passes::default();
         let mut runner = session(&l, &time, &vendors, "session", &passes, &on());
-        for program in [Some("claude"), None] {
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let captured = notes.clone();
+        runner.log = Box::new(move |line| captured.lock().unwrap().push(line.to_owned()));
+        for (program, index_build, subject) in [
+            (Some("claude"), None, "claude"),
+            (None, None, "Trust"),
+            (None, Some(43), "index 43"),
+        ] {
             runner.following = Some(Following {
                 program,
-                index_build: None,
+                index_build,
                 pass: Box::new(ObservedPass(VecDeque::from([
                     Err(io::Error::other("status unavailable")),
                     Ok(None),
@@ -1558,18 +1566,27 @@ mod tests {
 
             runner.following = Some(Following {
                 program,
-                index_build: None,
-                pass: Box::new(ObservedPass(VecDeque::from([Err(io::Error::other(
-                    "still unread at the follow limit",
-                ))]))),
+                index_build,
+                pass: Box::new(ObservedPass(VecDeque::from([
+                    Err(io::Error::other("still unread before the follow limit")),
+                    Err(io::Error::other("still unread at the follow limit")),
+                ]))),
                 since: Duration::from_millis(time.mono_ms.load(Ordering::SeqCst)),
             });
-            time.advance(PASS_FOLLOW_LIMIT);
+            notes.lock().unwrap().clear();
+            time.advance(PASS_FOLLOW_LIMIT - Duration::from_millis(1));
+            assert!(!runner.follow(time.wall()));
+            assert!(notes.lock().unwrap().is_empty());
+            time.advance(Duration::from_millis(1));
             assert!(
                 runner.follow(time.wall()),
                 "unknown does not extend the follow limit"
             );
             assert!(runner.following.is_none());
+            assert!(runner.follow(time.wall()));
+            let notes = notes.lock().unwrap();
+            assert_eq!(notes.len(), 1, "journal every expired pass exactly once");
+            assert!(notes[0].contains(subject), "identify the expired pass");
         }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

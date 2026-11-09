@@ -1753,7 +1753,7 @@ impl App {
             .filter(move |hit| {
                 hit.session == session
                     && hit.fact == fact
-                    && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                    && !self.chrome_owns_terminal_span(wid, hit.term_row, hit.cols.0..hit.cols.1)
             })
     }
 

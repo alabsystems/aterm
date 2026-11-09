@@ -2786,6 +2786,12 @@ fn assert_activation_stage(app: &App, build: u64, commit: &str) {
 
 #[test]
 fn a_returned_apply_whose_child_swapped_the_bundle_arms_the_activation() {
+    #[cfg(target_os = "macos")]
+    if !crate::test_alone::alone() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let (_, _settings) = park_a_settings_draft_in_a_background_tab(&mut app);
     let build = app.native_updater_service.snapshot().current_build + 1;
@@ -2856,6 +2862,36 @@ fn a_returned_apply_whose_child_swapped_the_bundle_arms_the_activation() {
         app.auto_apply_intent.is_none(),
         "the activation does not arm inside the failure's own latch"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let (standing, _) = app
+            .apply_schedule_standing
+            .clone()
+            .expect("the physical failure queues its retry schedule");
+        app.surface_update_apply_outcome_for_target(
+            "automatic handoff",
+            outcome.expect("the returned apply has a disposition"),
+            false,
+            build,
+        );
+        let current = app.native_updater_service.snapshot().current_build;
+        let report = aterm_update::apply_lane_report(current).unwrap();
+        assert!(
+            report.last_failure.is_empty(),
+            "activation is not a failed install"
+        );
+        assert_eq!(report.failures_for_target, 0);
+        assert_eq!(report.last_refusal, standing);
+        assert!(
+            report.last_refusal_detail.contains("TimedOut"),
+            "the silent activation retains the physical handoff cause: {report:?}"
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(1)
+        );
+        assert_eq!(app.auto_apply_manual_only.unwrap().retry_at, latch.retry_at);
+    }
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
         retry_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         ..latch
@@ -7448,7 +7484,7 @@ fn the_async_physical_lane_records_its_schedule_after_the_failure() {
         "the failure was booked: {report:?}"
     );
     assert_eq!(
-        report.last_refusal, queued,
+        report.last_refusal, queued.0,
         "…and the schedule stands beside it, not erased by it"
     );
 }

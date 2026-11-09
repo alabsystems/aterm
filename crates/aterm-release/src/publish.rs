@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_digest::Sha256;
 use aterm_uds::spawnfd::command;
@@ -3703,6 +3703,24 @@ fn verify_release_asset_id_matches_local(
     local: &Path,
 ) -> Result<VerifiedReleaseAsset> {
     let before = release_asset_identity_for_release_id(slug, release_id, name)?;
+    let verified = verify_release_asset_bytes(slug, release_id, name, local, before)?;
+    if release_asset_identity_for_release_id(slug, release_id, name)? != before {
+        return Err(Error::new(format!(
+            "release ID {release_id} asset {name} identity changed during exact-ID verification"
+        )));
+    }
+    Ok(verified)
+}
+
+/// The caller brackets this transfer with either the asset identity or the
+/// complete immutable-ID inventory. Both detect replacement during the proof.
+fn verify_release_asset_bytes(
+    slug: &str,
+    release_id: u64,
+    name: &str,
+    local: &Path,
+    before: (u64, u64),
+) -> Result<VerifiedReleaseAsset> {
     validate_release_asset_download_size(before.1)?;
     let local_size = fs::metadata(local)
         .map_err(|error| {
@@ -3732,12 +3750,6 @@ fn verify_release_asset_id_matches_local(
                 return Err(Error::new(format!(
                     "release ID {release_id} asset {name} bytes differ from the local \
                      self-checked artifact"
-                )));
-            }
-            if release_asset_identity_for_release_id(slug, release_id, name)? != before {
-                return Err(Error::new(format!(
-                    "release ID {release_id} asset {name} identity changed during exact-ID \
-                     verification"
                 )));
             }
             Ok(VerifiedReleaseAsset {
@@ -6117,34 +6129,23 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     };
     // COMMIT-BEFORE-CLAIM: these read the fixed source and journal, not one
     // another's outputs. Join every verdict before claiming the reserved build.
+    // The bundle reader requires this source's COMMIT_GATES fact and proves
+    // its bytes, compiler and inputs seal. Re-running its immutable fixture and
+    // policy judgments here would repeat qualify's work with fresh tag imports.
     let commit_proofs = || {
-        crate::cut_timing::independent(
-            ("verified release bundle", || {
-                verified_release_bundle(&operator, repo, &source, &version, &toolchain)
-            }),
-            ("commit handoff gates", || {
-                crate::cut_timing::independent(
-                    ("handoff fixtures", || {
-                        let git = GitCli::new(&tree);
-                        gates::handoff_fixture_gate_at(
-                            &git,
-                            &native_origin(&tree)?,
-                            &source,
-                            &version,
-                        )
-                    }),
-                    ("handoff policy", || {
-                        let git = GitCli::new(&tree);
-                        gates::handoff_policy_gate_at(
-                            &git,
-                            &native_origin(&tree)?,
-                            &source,
-                            &version,
-                        )
-                    }),
-                )
-            }),
-        )
+        crate::cut_timing::measure("verified release bundle", || {
+            let verified = verified_release_bundle(&operator, repo, &source, &version, &toolchain)?;
+            gates::CommitGateRecord::new(
+                &source,
+                &version,
+                verified.complete.inputs.clone(),
+                native_origin(&tree)?
+                    .tag_fingerprint()
+                    .map_err(Error::new)?,
+            )
+            .adopt(&operator)?;
+            Ok::<_, Error>(verified)
+        })
     };
     let availability = || {
         crate::cut_timing::independent(
@@ -6193,7 +6194,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             }),
         )
     };
-    // All nine leaves read existing state. Only the reconciliation below can
+    // All leaves read existing state. Only the reconciliation below can
     // authorize a claim; no preflight writer or claim races these readers.
     let (commit, (availability, floors)) = crate::cut_timing::independent(
         ("commit proofs", commit_proofs),
@@ -6209,12 +6210,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             )
         }),
     );
-    let (verified, (fixtures, policy)) = commit;
+    let verified = commit;
     let (lock, channel) = availability;
     let ((head_scan, signature_verdict), (observed_roster, ledger_text)) = floors;
     let verified = verified?;
-    let fixtures = fixtures?;
-    let policy = policy?;
     step(
         "gate",
         &format!(
@@ -6224,11 +6223,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
              and the L0 censuses passed in `verify release` over its tree",
             crate::release::COMMIT_GATES,
         ),
-    );
-    step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
-    step(
-        "gate",
-        &format!("handoff policy sealed into the bundle: {policy}"),
     );
     step("gate", &verified.line);
     if kind != CutKind::Real && !opts.linux_workers.is_empty() {
@@ -6980,19 +6974,54 @@ pub fn real_cut_done_line(
 }
 
 fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
-    if ctx.kind != CutKind::Real {
-        return Ok(());
+    release_session(ctx)?.check()
+}
+
+/// An owned snapshot lets upload workers check remote authority without holding
+/// the journal mutex across network reads. Tokens remain freshly observed for
+/// every mutation; only durable journal writes need serialization.
+struct ReleaseSession {
+    repo: PathBuf,
+    guards: Option<(ReleaseLeaseGuard, PublisherFenceGuard)>,
+}
+
+impl ReleaseSession {
+    fn check(&self) -> Result<()> {
+        let Some((lease, fence)) = &self.guards else {
+            return Ok(());
+        };
+        assert_publisher_session(&native_origin(&self.repo)?, lease, fence)
     }
-    let origin = native_origin(&ctx.repo)?;
+}
+
+fn release_session(ctx: &CutCtx) -> Result<ReleaseSession> {
+    if ctx.kind != CutKind::Real {
+        return Ok(ReleaseSession {
+            repo: ctx.repo.clone(),
+            guards: None,
+        });
+    }
     let lease = ctx
         .lease
-        .as_ref()
+        .clone()
         .ok_or_else(|| Error::new("real release step has no acquired persistent claim lease"))?;
     let fence = ctx
         .fence
-        .as_ref()
+        .clone()
         .ok_or_else(|| Error::new("real release step has no unique publisher fence"))?;
-    assert_publisher_session(&origin, lease, fence)
+    Ok(ReleaseSession {
+        repo: ctx.repo.clone(),
+        guards: Some((lease, fence)),
+    })
+}
+
+fn ensure_upload_release_lease(ctx: &std::sync::Mutex<&mut CutCtx>) -> Result<()> {
+    let session = upload_release_session(ctx)?;
+    session.check()
+}
+
+fn upload_release_session(ctx: &std::sync::Mutex<&mut CutCtx>) -> Result<ReleaseSession> {
+    release_session(&ctx.lock().unwrap())
 }
 
 fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
@@ -8975,7 +9004,7 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         let (release_id, adopted) = self.bound()?;
         let ctx = std::sync::Mutex::new(&mut *self.ctx);
         let timer = crate::cut_timing::Timer::parallel_parent();
-        upload_pool(files, 4, &|file| {
+        payload_pool(files, &|file| {
             let label = format!(
                 "upload {}",
                 file.file_name().unwrap_or_default().to_string_lossy()
@@ -9180,6 +9209,12 @@ pub fn prove_assets_download_anonymously(
     Ok(issued)
 }
 
+/// Attempts for the evergreen pointer to name this cut once its head PATCH is sent ([`prove_pointer_serves`]).
+pub const POINTER_PROBE_ATTEMPTS: u32 = 30;
+
+/// Gap between evergreen-pointer attempts.
+pub const POINTER_PROBE_DELAY: Duration = Duration::from_secs(10);
+
 /// What the evergreen pointer (`https://github.com/<slug>/releases/latest/download/<asset>`) answers a credential-less client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerProbe {
@@ -9249,16 +9284,33 @@ pub fn prove_pointer_serves(
     local_manifest: &[u8],
     probe: &mut dyn FnMut() -> Result<PointerProbe>,
     fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
+    sleep: &mut dyn FnMut(Duration),
 ) -> Result<Manifest> {
     let asset = manifest_out::MANIFEST_ASSET;
-    let last = probe()?;
-    let location = match &last {
-        PointerProbe::Tag {
+    // GitHub recomputes `latest` after the head PATCH: for a while the pointer
+    // still answers, correctly and finally for that request, with the previous
+    // release. That is propagation, not a transport failure, so the shared
+    // transport retry never sees it and this gate waits within its own bound.
+    let mut last = PointerProbe::NoRelease;
+    let mut location = None;
+    for attempt in 1..=POINTER_PROBE_ATTEMPTS {
+        last = probe()?;
+        if let PointerProbe::Tag {
             tag: named,
-            location,
-        } if named == tag => Some(location.clone()),
-        _ => None,
-    };
+            location: loc,
+        } = &last
+            && named == tag
+        {
+            location = Some(loc.clone());
+            break;
+        }
+        if matches!(last, PointerProbe::Refused { .. }) {
+            break;
+        }
+        if attempt < POINTER_PROBE_ATTEMPTS {
+            sleep(POINTER_PROBE_DELAY);
+        }
+    }
     let Some(location) = location else {
         if let PointerProbe::Refused { code, reason } = &last {
             return Err(Error::new(format!(
@@ -9330,6 +9382,7 @@ fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<(
             probe_evergreen_pointer(slug, asset, &aterm_update_core::pointer::canonical_app_tag)
         },
         &mut anonymous_get,
+        &mut std::thread::sleep,
     )?;
     step(
         "",
@@ -9543,11 +9596,43 @@ pub(crate) fn upload_pool<T: Sync>(
         .map_or(Ok(()), |(_, error)| Err(error))
 }
 
+/// The channel's finite, validated payload set starts together. Each one-shot
+/// POST retains its own durable intent; the manifest barrier stays in channel.
+fn payload_pool<T: Sync>(files: &[T], upload: &(impl Fn(&T) -> Result<()> + Sync)) -> Result<()> {
+    upload_pool(files, files.len(), upload)
+}
+
 #[cfg(test)]
 mod upload_pool_tests {
     use super::*;
     use std::sync::{Condvar, Mutex, atomic::AtomicUsize, mpsc};
     use std::time::Duration;
+
+    /// NEGATIVE CONTROL: the former four-worker cap cannot enter all payloads
+    /// while the completion gate is closed.
+    #[test]
+    fn every_payload_starts_before_any_payload_must_finish() {
+        let gate = (Mutex::new(false), Condvar::new());
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                payload_pool(&[0; 10], &|_| {
+                    tx.send(()).unwrap();
+                    drop(
+                        gate.1
+                            .wait_while(gate.0.lock().unwrap(), |open| !*open)
+                            .unwrap(),
+                    );
+                    Ok(())
+                })
+            });
+            let entered = (0..10).all(|_| rx.recv_timeout(Duration::from_secs(60)).is_ok());
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            worker.join().unwrap().unwrap();
+            assert!(entered, "all payloads must enter before any finishes");
+        });
+    }
 
     /// NEGATIVE CONTROL: losing the caller's thread-local route would let a
     /// request worker use production GitHub instead of the injected fixture.
@@ -9688,7 +9773,7 @@ pub(crate) fn upload_channel_asset(
                              this cut's bytes: {error}"
                         ),
                     );
-                    ensure_ctx_release_lease(&ctx.lock().unwrap())?;
+                    ensure_upload_release_lease(ctx)?;
                     let endpoint = format!("repos/{slug}/releases/assets/{stale_id}");
                     if let Err(error) = crate::github::send_once(
                         aterm_update_core::github_rest::Method::Delete,
@@ -9715,10 +9800,10 @@ pub(crate) fn upload_channel_asset(
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
     let post = OneShotPost::prepare_binary(&endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
+    ensure_upload_release_lease(ctx)?;
     let permit = {
         let mut ctx = ctx.lock().unwrap();
         validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
-        ensure_ctx_release_lease(&ctx)?;
         ctx.persist_upload_intent(name)?
     };
     let out = post.issue(permit)?;
@@ -9784,13 +9869,12 @@ fn prove_channel_assets(
         .map(|asset| asset.name.clone())
         .collect();
     ctx.validate_channel_assets(&names)?;
-    for file in ctx.channel_asset_paths() {
-        let name = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::new("release artifact filename is not UTF-8"))?;
-        verify_release_asset_id_matches_local(slug, release_id, name, &file)?;
-    }
+    prove_asset_files(
+        &ctx.channel_asset_paths(),
+        &inventory_before,
+        slug,
+        release_id,
+    )?;
     let inventory_after = release_asset_inventory_for_release_id(slug, release_id)?;
     if inventory_after != inventory_before {
         return Err(Error::new(
@@ -9800,6 +9884,114 @@ fn prove_channel_assets(
     let after = release_object_by_id(slug, release_id)?;
     validate_channel_release_capability(after.as_ref(), release_id, &ctx.tag, expect_draft)?;
     Ok(())
+}
+
+fn prove_asset_files(
+    files: &[PathBuf],
+    inventory: &[ReleaseAssetInventoryEntry],
+    slug: &str,
+    release_id: u64,
+) -> Result<()> {
+    upload_pool(files, 4, &|file| {
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::new("release artifact filename is not UTF-8"))?;
+        let asset = inventory
+            .iter()
+            .find(|asset| asset.name == name)
+            .ok_or_else(|| Error::new(format!("release ID {release_id} has no asset {name}")))?;
+        verify_release_asset_bytes(slug, release_id, name, file, (asset.id, asset.size)).map(|_| ())
+    })
+}
+
+#[cfg(test)]
+mod asset_batch_tests {
+    use super::*;
+
+    fn fixture(run: impl FnOnce(&[PathBuf], &str, u64)) {
+        let fake = agh_fake::FakeGithub::start();
+        let slug = "cut-fixture/aterm";
+        let token = agh_fake::token("cut-assets");
+        fake.add_token(&token, "cut-reader");
+        fake.add_repo(slug, agh_fake::RepoSpec::public());
+        let release = fake.add_release(
+            slug,
+            agh_fake::ReleaseSpec::published("v0.183.0", "2026-11-08T00:00:00Z"),
+        );
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..10)
+            .map(|n| {
+                let name = format!("asset-{n}");
+                fake.add_asset(
+                    release,
+                    agh_fake::AssetSpec::uploaded(&name, b"correct bytes"),
+                );
+                let file = dir.path().join(name);
+                fs::write(&file, b"correct bytes").unwrap();
+                file
+            })
+            .collect();
+        let ports = fake.ports();
+        let _route = crate::github::Fixture {
+            origins: aterm_update_core::github_rest::Origins::loopback(
+                ports.api,
+                ports.uploads,
+                ports.web,
+                ports.cdn,
+            ),
+            token: Some(token),
+            spawn: None,
+        }
+        .enter();
+        run(&files, slug, release);
+    }
+
+    /// NEGATIVE CONTROL: a same-sized wrong byte must fail even though the
+    /// complete immutable-ID inventory remains identical.
+    #[test]
+    fn batched_asset_proof_still_checks_every_byte() {
+        fixture(|files, slug, release| {
+            let before = release_asset_inventory_for_release_id(slug, release).unwrap();
+            prove_asset_files(files, &before, slug, release).unwrap();
+            fs::write(&files[7], b"corrupt bytes").unwrap();
+            let error = prove_asset_files(files, &before, slug, release).unwrap_err();
+            assert!(error.to_string().contains("bytes differ"), "{error}");
+            assert_eq!(
+                before,
+                release_asset_inventory_for_release_id(slug, release).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "explicit loopback before/after asset-proof measurement"]
+    fn cut_asset_proof_abba() {
+        fixture(|files, slug, release| {
+            for (take, batch) in [false, true, true, false].into_iter().enumerate() {
+                let label = format!("asset proof take {take} batch={batch}");
+                let _timer = crate::cut_timing::Timer::new(&label);
+                let before = release_asset_inventory_for_release_id(slug, release).unwrap();
+                if batch {
+                    prove_asset_files(files, &before, slug, release).unwrap();
+                } else {
+                    for file in files {
+                        verify_release_asset_id_matches_local(
+                            slug,
+                            release,
+                            file.file_name().unwrap().to_str().unwrap(),
+                            file,
+                        )
+                        .unwrap();
+                    }
+                }
+                assert_eq!(
+                    before,
+                    release_asset_inventory_for_release_id(slug, release).unwrap()
+                );
+            }
+        });
+    }
 }
 
 fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
@@ -10116,6 +10308,31 @@ mod transport_body_tests {
 mod roster_wiring_tests {
 
     use super::*;
+
+    /// NEGATIVE CONTROL: a real upload cannot lose either guard, and the owned
+    /// snapshot must release the journal lock before a remote check can start.
+    #[test]
+    fn upload_authority_is_owned_without_holding_the_journal_lock() {
+        let mut cut = ctx(None);
+        assert!(release_session(&cut).is_err());
+        cut.lease = Some(ReleaseLeaseGuard {
+            owner: "a".repeat(40),
+        });
+        assert!(release_session(&cut).is_err());
+        cut.fence = Some(PublisherFenceGuard {
+            owner: "a".repeat(40),
+            token: "b".repeat(40),
+        });
+        let mutex = std::sync::Mutex::new(&mut cut);
+        let snapshot = upload_release_session(&mutex).unwrap();
+        assert!(
+            mutex.try_lock().is_ok(),
+            "remote checks must not retain the journal lock"
+        );
+        let (lease, fence) = snapshot.guards.unwrap();
+        assert_eq!(lease.owner(), "a".repeat(40));
+        assert_eq!(fence.token(), "b".repeat(40));
+    }
 
     #[test]
     fn a_recovery_verifies_under_the_release_key_and_signs_under_its_own() {

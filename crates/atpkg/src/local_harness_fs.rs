@@ -94,6 +94,25 @@ impl Parent {
         program: &str,
         create: bool,
     ) -> io::Result<Option<Self>> {
+        Self::open_optional_original(lock, program, create, None)
+    }
+    /// General descriptor custody, independent of the harness admission policy. A fresh
+    /// engineering producer binds the already-created prefix before any child mutation.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn open_original(
+        lock: &crate::lock::StoreLock,
+        program: &str,
+        prefix: &File,
+    ) -> io::Result<Self> {
+        Self::open_optional_original(lock, program, true, Some(prefix))?
+            .ok_or_else(|| io::ErrorKind::NotFound.into())
+    }
+    fn open_optional_original(
+        lock: &crate::lock::StoreLock,
+        program: &str,
+        create: bool,
+        expected_prefix: Option<&File>,
+    ) -> io::Result<Option<Self>> {
         let layout = lock.checked_layout()?;
         if crate::store::ToolName::new(program).is_none()
             || !layout.prefix.is_absolute()
@@ -127,6 +146,13 @@ impl Parent {
             }
         }
         let prefix = chain.len() - 1;
+        if let Some(original) = expected_prefix
+            && identity(original)? != identity(&chain[prefix].1)?
+        {
+            return Err(invalid(
+                "fresh prefix name no longer identifies the original created directory",
+            ));
+        }
         private(&chain[prefix].1)?;
         lock.checked_layout_at(&chain[prefix].1)?;
         let lock_identity = identity(&regular(&chain[prefix].1, OsStr::new("store.lock"))?)?;

@@ -140,6 +140,38 @@ pub fn holder_path(layout: &Layout) -> PathBuf {
 }
 
 impl StoreLock {
+    /// First writer of an already-created private prefix. All mutation addresses the
+    /// actual original directory; no configured store or pathname-open retry is involved.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn create_in_original(layout: &Layout, prefix: &File) -> io::Result<Self> {
+        match astream_sys::owner_private_dir(prefix)? {
+            Ok(_) => {}
+            Err(why) => return Err(io::Error::other(format!("fresh private prefix: {why}"))),
+        }
+        let file = aterm_uds::kept_out(|| {
+            aterm_dirfd::openat(
+                prefix,
+                "store.lock",
+                aterm_dirfd::OFlags::RDWR
+                    | aterm_dirfd::OFlags::CREATE
+                    | aterm_dirfd::OFlags::EXCL
+                    | aterm_dirfd::OFlags::NOFOLLOW
+                    | aterm_dirfd::OFlags::CLOEXEC,
+                aterm_dirfd::Mode::from_bits(0o600),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
+        })?;
+        let file = Flock::try_lock(file).map_err(|why| io::Error::other(why.to_string()))?;
+        HELD.lock()
+            .map_err(|_| io::Error::other("store lock registry poisoned"))?
+            .push(layout.prefix.clone());
+        Ok(Self {
+            _file: file,
+            holder: None,
+            prefix: layout.prefix.clone(),
+        })
+    }
     /// The layout this guard actually locked, even if configuration changes meanwhile.
     pub(crate) fn layout(&self) -> Layout {
         Layout {

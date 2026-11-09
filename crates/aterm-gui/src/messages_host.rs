@@ -679,13 +679,16 @@ impl App {
         answered
     }
 
-    /// Settles the center ([`Self::settle_messages`]), publishes Settings ▸ Messages when due,
-    /// and requests a redraw of every window.
+    /// Settles the center ([`Self::settle_messages`]) and publishes Settings ▸ Messages when due.
+    /// It asks every window for a frame only when the settle re-gridded them (the tab strip's
+    /// waiting fall): no window draws a center row, and a publish the gap defers is in the loop's
+    /// deadline ([`Self::arm_loop_deadline`]).
     pub(crate) fn sync_messages(&mut self) {
         let now = Instant::now();
-        self.settle_messages(now);
+        if self.settle_messages(now) {
+            self.request_redraw_all_windows();
+        }
         self.publish_native_messages_state_if_due(now);
-        self.request_redraw_all_windows();
     }
 
     /// Settles messages at `now` without requesting a repaint, returning whether the windows need

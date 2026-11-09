@@ -1144,11 +1144,15 @@ mod tests {
             .mode(0o711)
             .create(src.join("sub"))
             .unwrap();
+        // Creation modes pass through the runner's umask; seed the exact modes to preserve.
+        fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o711)).unwrap();
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o640)
             .open(src.join("sub/file"))
+            .unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o640))
             .unwrap();
         io::Write::write_all(&mut file, b"first").unwrap();
         drop(file);

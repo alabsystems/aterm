@@ -755,13 +755,27 @@ pub struct RecordedApplyFailure {
     pub persistent: bool,
 }
 
+/// Maximum Unicode characters retained for a refusal's separate diagnostic context.
+pub const MAX_APPLY_REFUSAL_DETAIL_CHARS: usize = 400;
+
 /// Records that an apply was refused (blocked, deferred or held) rather than attempted and failed.
 #[cfg(target_os = "macos")]
 pub fn record_apply_refusal(current_build: u64, reason: &str) {
+    record_apply_refusal_with_detail(current_build, reason, "");
+}
+
+/// Records a refusal with separate diagnostic context, without classifying that context.
+#[cfg(target_os = "macos")]
+pub fn record_apply_refusal_with_detail(current_build: u64, reason: &str, detail: &str) {
     let Some(staging) = paths::Staging::resolve() else {
         return;
     };
-    health::Health::record_apply_refusal(&staging.health(), current_build, reason);
+    health::Health::record_apply_refusal_with_detail(
+        &staging.health(),
+        current_build,
+        reason,
+        detail,
+    );
     let outcome = match manifest::Ready::read_publishable(&staging) {
         Some(ready) => format!(
             "staged {} (build {}) — NOT applied: {reason}",
@@ -785,6 +799,10 @@ pub fn record_apply_failure(
 /// Non-macOS counterpart to [`record_apply_refusal`].
 #[cfg(not(target_os = "macos"))]
 pub fn record_apply_refusal(_current_build: u64, _reason: &str) {}
+
+/// Non-macOS counterpart to [`record_apply_refusal_with_detail`].
+#[cfg(not(target_os = "macos"))]
+pub fn record_apply_refusal_with_detail(_current_build: u64, _reason: &str, _detail: &str) {}
 
 /// What the ledger knows about the seamless handoff's freeze.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -883,6 +901,8 @@ pub struct ApplyLaneReport {
     pub failures_for_target: u32,
     /// Reason of the most recent apply refusal.
     pub last_refusal: String,
+    /// Bounded, terminal-escaped diagnostic context; never a policy input.
+    pub last_refusal_detail: String,
     /// RFC3339 UTC of [`Self::last_refusal`].
     pub last_refusal_at: String,
     /// The running build's boot trial waiting for a window, in words, with when the wait ends.
@@ -908,6 +928,11 @@ pub fn apply_lane_report(current_build: u64) -> Option<ApplyLaneReport> {
         last_failure: ledger.last_apply_error,
         last_failure_target_build: ledger.last_apply_failure_target_build,
         failures_for_target: ledger.apply_failures_for_target,
+        last_refusal_detail: if standing {
+            health::diagnostic_detail(&ledger.last_apply_refusal_detail)
+        } else {
+            String::new()
+        },
         last_refusal: if standing {
             ledger.last_apply_refusal
         } else {

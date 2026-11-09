@@ -17,7 +17,13 @@ mod native {
         time::{Duration, Instant},
     };
 
-    const WAIT: Duration = Duration::from_secs(30);
+    /// Hang detector for a required browser command within its original parent.
+    const COMMAND_HANG: Duration = Duration::from_secs(60);
+
+    fn command_remaining(end: Option<Instant>, started: Instant) -> Result<Duration, String> {
+        let by = started + COMMAND_HANG;
+        operation_remaining(Some(end.map_or(by, |end| end.min(by))), COMMAND_HANG)
+    }
     const SNAPSHOT: &str = r#"(() => {
       const buttons=Array.from(document.querySelectorAll('button'));
       const profile=document.title.includes('@') ? document.title : buttons.map(b=>b.getAttribute('aria-label') || '').find(s=>s.includes('@')) || '';
@@ -232,6 +238,10 @@ mod native {
             operation_remaining(self.operation_deadline, cap)
         }
 
+        fn command_wait(&self, started: Instant) -> Result<Duration, String> {
+            command_remaining(self.operation_deadline, started)
+        }
+
         pub(super) fn connect_until(
             home: &Path,
             credentials: Credentials<'_>,
@@ -413,14 +423,14 @@ mod native {
                 None,
                 "Target.createTarget",
                 json!({"url":"about:blank"}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             let target = target["targetId"].as_str().ok_or("No browser page")?;
             let attached = result.cdp.call(
                 None,
                 "Target.attachToTarget",
                 json!({"targetId":target,"flatten":true}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             result.session = attached["sessionId"]
                 .as_str()
@@ -430,19 +440,19 @@ mod native {
                 Some(&result.session),
                 "Page.enable",
                 json!({}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             result.cdp.call(
                 Some(&result.session),
                 "Runtime.enable",
                 json!({}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             result.cdp.call(
                 Some(&result.session),
                 "Network.enable",
                 json!({}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             result.cdp.call(
                 Some(&result.session),
@@ -451,7 +461,7 @@ mod native {
                     {"urlPattern":"*","resourceType":"Image","requestStage":"Request"},
                     {"urlPattern":"*","resourceType":"Media","requestStage":"Request"}
                 ]}),
-                result.within(WAIT)?,
+                result.command_wait(Instant::now())?,
             )?;
             Ok(result)
         }
@@ -462,7 +472,7 @@ mod native {
                     Some(&self.session),
                     "Page.navigate",
                     json!({"url":url}),
-                    self.within(WAIT)?,
+                    self.command_wait(Instant::now())?,
                 )
                 .map(|_| ())
                 .map_err(|error| format!("Opening mail page: {error}"))
@@ -472,7 +482,7 @@ mod native {
                 Some(&self.session),
                 "Runtime.evaluate",
                 json!({"expression":script,"awaitPromise":true,"returnByValue":true}),
-                self.within(WAIT)?,
+                self.command_wait(Instant::now())?,
             ) {
                 Ok(answer) => answer,
                 // The outer operation polls the new document within its existing
@@ -483,7 +493,7 @@ mod native {
             if answer.get("exceptionDetails").is_some() {
                 return Err("Headless mail page operation failed".into());
             }
-            let deadline = Instant::now() + self.within(WAIT)?;
+            let deadline = Instant::now() + self.command_wait(Instant::now())?;
             loop {
                 let requests = self
                     .cdp
@@ -813,6 +823,91 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_required_mailbox_command_waits_for_its_native_pipe_reply() {
+            use std::io::{Read as _, Write as _};
+            use std::os::fd::AsFd as _;
+            for (age, parent_expired) in [(31, false), (61, false), (0, true), (0, false)] {
+                let (mut commands, command_write) = std::io::pipe().unwrap();
+                let (event_read, mut replies) = std::io::pipe().unwrap();
+                let peer = std::thread::spawn(move || {
+                    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                    let mut seen = Vec::new();
+                    loop {
+                        let mut bytes = Vec::new();
+                        loop {
+                            assert!(
+                                aterm_uds::ready::any_until(&[commands.as_fd()], until)
+                                    .is_ok_and(|ready| !ready.is_empty()),
+                                "owned native mail command did not arrive"
+                            );
+                            let mut byte = [0];
+                            if commands.read(&mut byte).unwrap() == 0 {
+                                return seen;
+                            }
+                            if byte == [0] {
+                                break;
+                            }
+                            bytes.push(byte[0]);
+                        }
+                        let request: Value = aterm_json::from_slice(&bytes).unwrap();
+                        assert_eq!(request["method"].as_str(), Some("Runtime.evaluate"));
+                        assert_eq!(request["sessionId"].as_str(), Some("owned-mail-session"));
+                        assert_eq!(
+                            request["params"]["expression"].as_str(),
+                            Some("owned-mail-expression")
+                        );
+                        let id = request["id"].as_u64().unwrap();
+                        seen.push(id);
+                        for (id, receipt) in [(id + 100, "wrong-id"), (id, "owned-mail-reply")] {
+                            let mut response =
+                                aterm_json::to_vec(&json!({"id":id,"result":{"receipt":receipt}}))
+                                    .unwrap();
+                            response.push(0);
+                            replies.write_all(&response).unwrap();
+                        }
+                    }
+                });
+                let mut client = browser::CdpClient::new(command_write, event_read);
+                let call = |client: &mut browser::CdpClient, end, started| {
+                    command_remaining(end, started).and_then(|wait| {
+                        client
+                            .call(
+                                Some("owned-mail-session"),
+                                "Runtime.evaluate",
+                                json!({"expression":"owned-mail-expression"}),
+                                wait,
+                            )
+                            .map_err(String::from)
+                    })
+                };
+                let parent = parent_expired.then(|| Instant::now() - Duration::from_secs(1));
+                let got = call(
+                    &mut client,
+                    parent,
+                    Instant::now() - Duration::from_secs(age),
+                );
+                let expired = age == 61 || parent_expired;
+                let fresh = expired.then(|| call(&mut client, None, Instant::now()));
+                drop(client);
+                let seen = peer.join().unwrap();
+                assert_eq!(
+                    seen,
+                    [1],
+                    "expiry publishes no command and poisons no fresh call"
+                );
+                if expired {
+                    assert!(got.is_err());
+                    assert_eq!(
+                        fresh.unwrap().unwrap(),
+                        json!({"receipt":"owned-mail-reply"})
+                    );
+                } else {
+                    assert_eq!(got.unwrap(), json!({"receipt":"owned-mail-reply"}));
+                }
+            }
+        }
 
         /// The webmail reader's credentials come from the lab registry's mailbox rows with no
         /// mailbox file or sheet present: its login, password, second password and TOTP seed.

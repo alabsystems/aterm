@@ -140,8 +140,14 @@ pub(crate) const PAGE: Page = Page {
                  is no program file that ran (an alias, a function), the first program the \
                  command's own job ran stands in for it until an `amend` names the word itself; a \
                  line that runs no simple command at its top (a function's definition, a line \
-                 that starts with a subshell) makes no run under a bash before 5.3, which has no \
-                 hook that hears it (5.3's `PS0` does).",
+                 that starts with a subshell) makes its run under a bash before 5.3, which has \
+                 no hook that hears it before it runs (5.3's `PS0` does), only at the next \
+                 prompt, from the history entry bash saved, so that run opens once the line has \
+                 ended, but none in a shell that loads bash-preexec or for a line bash saves no \
+                 new history entry for (a space-led one under `ignorespace`, a repeat under \
+                 `ignoredups`, one `HISTIGNORE` matches); no bash makes a run for a line that \
+                 ran nothing (a comment, a syntax error, one cancelled at the `>` continuation \
+                 prompt).",
             )],
         },
         Section {

@@ -1303,6 +1303,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     if let Some(apply) = aterm_update::apply_lane_report(st.current_build) {
         for (name, value) in [
             ("apply_refusal", apply.last_refusal.as_str()),
+            ("apply_refusal_detail", apply.last_refusal_detail.as_str()),
             ("apply_refusal_at", apply.last_refusal_at.as_str()),
             ("apply_failure", apply.last_failure.as_str()),
             ("trial_wait", apply.trial_wait.as_str()),

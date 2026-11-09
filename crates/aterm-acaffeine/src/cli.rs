@@ -747,9 +747,7 @@ mod mac {
         }
     }
 
-    /// How long a change waits for another's [`change`] before it goes on without it: past a
-    /// [`quit`]'s wait for the mug it ended ([`QUIT_WAIT`]) and its start of one again
-    /// ([`SETTLE`]).
+    /// How long a change waits for another's [`change`] before it goes on without it.
     const CHANGE_WAIT: Duration = Duration::from_secs(30);
 
     /// How often a change waiting for another's looks again.
@@ -1163,11 +1161,6 @@ mod mac {
         answer(&super::startup_line(startup))
     }
 
-    /// How long [`quit`] waits for the mug it ended to let go of the lock: launchd's SIGTERM
-    /// ends a job's mug at once (its default action), and the one a hand-run mug gets from
-    /// `quit` itself quits it through its run loop within moments, so this only bounds a hang.
-    const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
     pub(super) fn quit(own: bool) -> ExitCode {
         let here = match here() {
             Ok(here) => here,
@@ -1231,11 +1224,11 @@ mod mac {
             }
             ended.push(pid);
         }
-        if let Err(pid) = instance::await_released(&lock, &ended, QUIT_WAIT) {
+        if let Err(pid) = instance::await_released(&lock, &ended, instance::QUIT_HANG) {
             return fail(format!(
                 "the mug (pid {pid}) still holds {} {} s after it was ended",
                 lock.display(),
-                QUIT_WAIT.as_secs()
+                instance::QUIT_HANG.as_secs()
             ));
         }
         if !other && here.paths.code_dir().exists() {

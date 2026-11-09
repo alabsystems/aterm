@@ -1230,6 +1230,8 @@ pub fn recorded_version(build_dir: &Path) -> Option<String> {
 /// [`crate::install::StageHooks::sidecars`], or a kept unit ([`crate::peers::keep`]) — which gc
 /// sweeps once their build is gone.
 pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::engineering_sdk::SUFFIX,
     crate::trust_lock::TREE_ROOT_SUFFIX,
     crate::trust_lock::LOCKED_SUFFIX,
     VENDOR_SIDECAR_SUFFIX,

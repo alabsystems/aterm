@@ -45,8 +45,7 @@ pub fn isolated_lifecycle(case: &str) -> bool {
     command
         .args(["--exact", case, "--test-threads=1", "--nocapture"])
         .env(CHILD, case);
-    let output = crate::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
-        .expect("the owned lifecycle process finishes");
+    let output = crate::deadline::ends_within(&mut command, crate::deadline::ECHO_HANG);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.lines().any(|line| line.ends_with(&marker)),

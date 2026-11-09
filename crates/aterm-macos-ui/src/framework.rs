@@ -37,7 +37,7 @@ impl Framework {
         lookup(name)
     }
 
-    fn library(&self) -> &aterm_dl::Library {
+    pub(crate) fn library(&self) -> &aterm_dl::Library {
         self.library.get_or_init(|| {
             aterm_dl::Library::open(self.names).unwrap_or_else(|why| panic!("{why}"))
         })

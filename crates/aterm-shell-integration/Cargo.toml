@@ -49,6 +49,9 @@ aterm-spec = { workspace = true }
 # §6.1 row 7).
 [target.'cfg(unix)'.dev-dependencies]
 aterm-pty = { workspace = true }
+# `JobsReader`'s state of a live shell: a test's Ctrl-C waits until the line editor sleeps in
+# its read (`LiveShell::wait_for_read`), which bash's own handling needs.
+aterm-sysprobe = { workspace = true }
 
 # The Windows key-press test (src/tests_pwsh_keys.rs) types at a live PowerShell
 # prompt through the ConPTY a tab gets: aterm-pty's spawn, with the caps the test

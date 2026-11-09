@@ -2610,6 +2610,8 @@ impl App {
         y: f64,
     ) -> Option<(u64, Option<&'static str>)> {
         if self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
             || self
                 .windows
                 .get(&wid)
@@ -2624,7 +2626,7 @@ impl App {
             .glass_hits
             .iter()
             .find(|hit| hit.frame_row == row && hit.cols.contains(&col))?;
-        (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.url))
+        (!self.chrome_owns_terminal_cell(wid, hit.term_row, col)).then_some((hit.session, hit.url))
     }
 
     /// Whether the pointer rests on a link of the glass's harness words in `wid`
@@ -2653,7 +2655,7 @@ impl App {
                     hit.session == session
                         && hit.link == link
                         && hit.url.is_some()
-                        && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                        && !self.chrome_owns_terminal_span(wid, hit.term_row, hit.cols.clone())
                 })
                 .and_then(|hit| hit.url)
         });
@@ -2687,7 +2689,7 @@ impl App {
             let Some(row) = hit.frame_row.checked_sub(strip) else {
                 continue;
             };
-            if self.chrome_owns_terminal_row(wid, hit.term_row) {
+            if self.chrome_owns_terminal_span(wid, hit.term_row, hit.cols.clone()) {
                 continue;
             }
             let words: String = ws
@@ -2758,11 +2760,12 @@ impl App {
             lapsed = !focus && away.is_some();
             self.card_look(wid, focus)
         });
+        let focused_session = self.focused_session_id(wid);
         let pool = &self.pool;
         let Some(ws) = self.windows.get_mut(&wid).map(Box::as_mut) else {
             return;
         };
-        let find_up = ws.search.is_some();
+        let search_open = ws.search.is_some();
         let crate::WindowState {
             claude_card: cards,
             input_scratch: scratch,
@@ -2783,6 +2786,8 @@ impl App {
             ..
         } = cards;
         for mut leaf in leaves.drain(..) {
+            let find_up =
+                search_open && (focused_session.is_none() || Some(leaf.session) == focused_session);
             // The reader placed the slot by its text; while the card is read, whole or cut, the
             // slot's inks say whether it is the vendor's news and from which row down. Once the
             // card has scrolled off, the slot keeps what its card's last frames gave: a refused

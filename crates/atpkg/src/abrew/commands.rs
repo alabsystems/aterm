@@ -5333,7 +5333,174 @@ pub(super) fn list_index(api: &Api, casks: bool) -> ExitCode {
     }
 }
 
+/// First line of a tool's `--version`-style output.
+fn tool_first_line(tool: &str, args: &[&str]) -> Option<String> {
+    let out = fetch::run_capture(tool, args).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+/// Where `tool` resolves on PATH, for config's `=>` suffixes.
+fn tool_path(tool: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+/// brew's `SystemConfig` lines with abrew's facts, for the
+/// `brew` reroute (direct abrew keeps its ABREW_ dialect).
+/// Repository/HEAD lines have no honest abrew value and are
+/// omitted; core taps report from our own tap clones.
+fn brew_config(prefix: &Prefix) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "HOMEBREW_VERSION: abrew {} (aterm)\n",
+        aterm_stamp::app_version()
+    ));
+    let taps = tap::list(prefix);
+    for (label, name, user, repo) in [
+        ("Core tap", "homebrew/core", "homebrew", "core"),
+        ("Core cask tap", "homebrew/cask", "homebrew", "cask"),
+    ] {
+        match taps.iter().find(|tap| tap.name() == name) {
+            Some(tap) => {
+                let remote = tap_git(tap, &["config", "remote.origin.url"]);
+                let default = format!("https://github.com/{user}/homebrew-{repo}");
+                if let Some(url) = &remote
+                    && *url != default
+                {
+                    out.push_str(&format!("{label} origin: {url}\n"));
+                }
+                let head = tap_git(tap, &["rev-parse", "--verify", "--quiet", "HEAD"]);
+                out.push_str(&format!(
+                    "{label} HEAD: {}\n",
+                    head.as_deref().unwrap_or("(none)")
+                ));
+                let last = tap_git(tap, &["show", "-s", "--format=%cr", "HEAD"]);
+                out.push_str(&format!(
+                    "{label} last commit: {}\n",
+                    last.as_deref().unwrap_or("never")
+                ));
+                if let Some(branch) = tap_git(tap, &["rev-parse", "--abbrev-ref", "HEAD"])
+                    && branch != "main"
+                    && branch != "master"
+                {
+                    out.push_str(&format!("{label} branch: {branch}\n"));
+                }
+            }
+            None => out.push_str(&format!("{label}: N/A\n")),
+        }
+    }
+    out.push_str(&format!("HOMEBREW_PREFIX: {}\n", prefix.root.display()));
+    // Set HOMEBREW_* variables, values only for the
+    // non-boolean ones (brew redacts secrets the same way).
+    const VALUE_ENVS: &[&str] = &[
+        "HOMEBREW_API_DOMAIN",
+        "HOMEBREW_ARTIFACT_DOMAIN",
+        "HOMEBREW_BOTTLE_DOMAIN",
+        "HOMEBREW_BREW_FILE",
+        "HOMEBREW_BROWSER",
+        "HOMEBREW_BUNDLE_FILE",
+        "HOMEBREW_CACHE",
+        "HOMEBREW_CASK_OPTS",
+        "HOMEBREW_EDITOR",
+        "HOMEBREW_LOGS",
+        "HOMEBREW_MAKE_JOBS",
+        "HOMEBREW_PIP_INDEX_URL",
+        "SUDO_ASKPASS",
+        "HOMEBREW_TEMP",
+    ];
+    let mut envs: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            (key.starts_with("HOMEBREW_") || key == "SUDO_ASKPASS")
+                .then(|| (key, value.to_string_lossy().into_owned()))
+        })
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    envs.sort();
+    for (key, value) in envs {
+        let sensitive = key.contains("TOKEN") || key.contains("PASSWORD") || key.contains("SECRET");
+        if !sensitive && VALUE_ENVS.contains(&key.as_str()) {
+            out.push_str(&format!("{key}: {value}\n"));
+        } else {
+            out.push_str(&format!("{key}: set\n"));
+        }
+    }
+    let machine = super::machine::Machine::this();
+    let cores = std::thread::available_parallelism().map_or(0, |n| n.get());
+    out.push_str(&format!("CPU: {cores}-core 64-bit {}\n", machine.arch()));
+    let describe = |label: &str, parsed: Option<String>, path: Option<String>| match (parsed, path)
+    {
+        (Some(version), Some(path)) => format!("{label}: {version} => {path}\n"),
+        (Some(version), None) => format!("{label}: {version}\n"),
+        _ => format!("{label}: N/A\n"),
+    };
+    let clang = tool_first_line("clang", &["--version"]).and_then(|line| {
+        // "Apple clang version 21.0.0 (clang-2100.0.123.4)".
+        let mut words = line.split_whitespace();
+        let version = words.by_ref().skip_while(|w| *w != "version").nth(1)?;
+        let build = line
+            .split("(clang-")
+            .nth(1)
+            .and_then(|rest| rest.split('.').next())
+            .unwrap_or("");
+        Some(if build.is_empty() {
+            version.to_string()
+        } else {
+            format!("{version} build {build}")
+        })
+    });
+    out.push_str(&describe("Clang", clang, None));
+    let git = tool_first_line("git", &["--version"])
+        .and_then(|line| line.split_whitespace().nth(2).map(str::to_string));
+    out.push_str(&describe("Git", git, tool_path("git")));
+    let curl = tool_first_line("curl", &["--version"])
+        .and_then(|line| line.split_whitespace().nth(1).map(str::to_string));
+    out.push_str(&describe("Curl", curl, tool_path("curl")));
+    if cfg!(target_os = "macos") {
+        if let Some(version) = machine.macos_version() {
+            out.push_str(&format!("macOS: {version}-{}\n", machine.arch()));
+        }
+        let clt = fetch::run_capture(
+            "/usr/sbin/pkgutil",
+            &["--pkg-info=com.apple.pkg.CLTools_Executables"],
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("version:").map(|v| v.trim().to_string()))
+        });
+        out.push_str(&format!("CLT: {}\n", clt.as_deref().unwrap_or("N/A")));
+        out.push_str(&format!(
+            "Xcode: {}\n",
+            machine.xcode_version().unwrap_or("N/A")
+        ));
+        let rosetta = machine.arch() != "arm64"
+            && fetch::run_capture("/usr/sbin/sysctl", &["-n", "sysctl.proc_translated"])
+                .ok()
+                .filter(|o| o.status.success())
+                .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+        out.push_str(&format!("Rosetta 2: {rosetta}\n"));
+    }
+    out
+}
+
 pub(super) fn cmd_config(prefix: &Prefix) -> ExitCode {
+    if super::via_reroute() {
+        print!("{}", brew_config(prefix));
+        return ExitCode::SUCCESS;
+    }
     println!("ABREW_VERSION: {} (aterm)", aterm_stamp::app_version());
     println!("ABREW_PREFIX: {}", prefix.root.display());
     println!("ABREW_CELLAR: {}", prefix.cellar().display());
@@ -5375,12 +5542,79 @@ fn shell_kind(name: &str) -> ShellKind {
     }
 }
 
+/// brew's `shellenv` bytes for `root`, used under the
+/// `brew` reroute where scripts eval HOMEBREW_* names.
+fn brew_shellenv(root: &str, shell: &str) -> String {
+    let dq = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    };
+    let root = dq(root);
+    let base = shell.rsplit('/').next().unwrap_or(shell);
+    let base = base.strip_prefix('-').unwrap_or(base);
+    match base {
+        "fish" => format!(
+            "set --global --export HOMEBREW_PREFIX \"{root}\";\n\
+             set --global --export HOMEBREW_CELLAR \"{root}/Cellar\";\n\
+             set --global --export HOMEBREW_REPOSITORY \"{root}\";\n\
+             fish_add_path --global --move --path \"{root}/bin\" \"{root}/sbin\";\n\
+             if test -n \"$MANPATH\"; set --global --export MANPATH \
+             (string replace --regex '^:*(.*?):*$' ':$1' -- \"$MANPATH\"); end;\n\
+             if not set --query INFOPATH; set INFOPATH ''; end; \
+             set --global --export INFOPATH \"{root}/share/info\" $INFOPATH;\n"
+        ),
+        "csh" | "tcsh" => format!(
+            "setenv HOMEBREW_PREFIX {root};\n\
+             setenv HOMEBREW_CELLAR {root}/Cellar;\n\
+             setenv HOMEBREW_REPOSITORY {root};\n\
+             setenv PATH \"{root}/bin:{root}/sbin:$PATH\";\n\
+             test ${{?MANPATH}} -eq 1 && test -n \"${{MANPATH}}\" && \
+             setenv MANPATH :`printf '%s' \"${{MANPATH}}\" | /usr/bin/sed -e 's/^:*//' -e 's/:*$//'`;\n\
+             test ${{?INFOPATH}} -eq 1 || setenv INFOPATH '';\n\
+             setenv INFOPATH \"{root}/share/info:${{INFOPATH}}\";\n"
+        ),
+        "pwsh" => {
+            let root = root.replace('\'', "''");
+            format!(
+                "[System.Environment]::SetEnvironmentVariable('HOMEBREW_PREFIX','{root}',[System.EnvironmentVariableTarget]::Process)\n\
+                 [System.Environment]::SetEnvironmentVariable('HOMEBREW_CELLAR','{root}/Cellar',[System.EnvironmentVariableTarget]::Process)\n\
+                 [System.Environment]::SetEnvironmentVariable('HOMEBREW_REPOSITORY','{root}',[System.EnvironmentVariableTarget]::Process)\n\
+                 [System.Environment]::SetEnvironmentVariable('PATH',$('{root}/bin:{root}/sbin:'+$ENV:PATH),[System.EnvironmentVariableTarget]::Process)\n\
+                 if (${{ENV:MANPATH}}) {{ [System.Environment]::SetEnvironmentVariable('MANPATH',(':'+${{ENV:MANPATH}}.Trim(':')),[System.EnvironmentVariableTarget]::Process) }}\n\
+                 [System.Environment]::SetEnvironmentVariable('INFOPATH',('{root}/share/info:'+${{ENV:INFOPATH}}),[System.EnvironmentVariableTarget]::Process)\n"
+            )
+        }
+        _ => {
+            let mut out = format!(
+                "export HOMEBREW_PREFIX=\"{root}\";\n\
+                 export HOMEBREW_CELLAR=\"{root}/Cellar\";\n\
+                 export HOMEBREW_REPOSITORY=\"{root}\";\n\
+                 export PATH=\"{root}/bin:{root}/sbin${{PATH+:$PATH}}\";\n"
+            );
+            out.push_str(
+                "[ -z \"${MANPATH-}\" ] || { export MANPATH=\"${MANPATH%\"${MANPATH##*[!:]}\"}\"; \
+                 export MANPATH=\":${MANPATH#\"${MANPATH%%[!:]*}\"}\"; };\n",
+            );
+            out.push_str(&format!(
+                "export INFOPATH=\"{root}/share/info:${{INFOPATH:-}}\";\n"
+            ));
+            out
+        }
+    }
+}
+
 pub(super) fn cmd_shellenv(prefix: &Prefix, rest: &[String]) -> ExitCode {
     let shell = operands(rest)
         .into_iter()
         .next()
         .or_else(crate::caller_shell::invoking_shell)
         .unwrap_or_default();
+    if super::via_reroute() {
+        print!("{}", brew_shellenv(&prefix.root.to_string_lossy(), &shell));
+        return ExitCode::SUCCESS;
+    }
     let root = prefix.root.to_string_lossy();
     let text = match shell_kind(&shell) {
         ShellKind::Posix => shellenv(prefix),

@@ -141,6 +141,106 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     dispatch(&prefix, args)
 }
 
+/// `brew --env` with abrew's own variables: brew's mode
+/// selection (plain on a TTY, bash exports when piped,
+/// `--shell=` to choose, `--plain` to force plain) over
+/// the ABREW_/HOMEBREW_ prefix facts.
+fn print_env(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    use std::io::IsTerminal as _;
+    // A bare trailing `--shell` is brew's missing-argument error.
+    {
+        let mut args = rest.iter().take_while(|a| a.as_str() != "--").peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--shell" && args.peek().is_none() {
+                return failed("Error: missing argument: --shell");
+            }
+        }
+    }
+    let names = operands_without_flag_values(rest, &["--shell"]);
+    if !names.is_empty() {
+        let api = api::Api::new(prefix.clone());
+        for name in &names {
+            if api.formula(name).is_err() {
+                return failed(&format!(
+                    "Error: {}",
+                    commands::formula_unavailable(&api, name)
+                ));
+            }
+        }
+    }
+    let shell = valued_flag_last(rest, "--shell");
+    #[derive(PartialEq)]
+    enum Mode {
+        Plain,
+        Bash,
+        Fish,
+        Csh,
+    }
+    let kind_of = |shell: &str| -> Mode {
+        let base = shell.rsplit('/').next().unwrap_or(shell);
+        let base = base.strip_prefix('-').unwrap_or(base);
+        match base {
+            "fish" => Mode::Fish,
+            "csh" | "tcsh" => Mode::Csh,
+            _ => Mode::Bash,
+        }
+    };
+    let mode = if has_flag(rest, "--plain", "") {
+        Mode::Plain
+    } else {
+        match shell.as_deref() {
+            None if std::io::stdout().is_terminal() => Mode::Plain,
+            None => Mode::Bash,
+            Some("") => Mode::Plain,
+            Some("auto") => {
+                crate::caller_shell::invoking_shell().map_or(Mode::Bash, |shell| kind_of(&shell))
+            }
+            Some(shell) => kind_of(shell),
+        }
+    };
+    let brand = if via_reroute() { "HOMEBREW" } else { "ABREW" };
+    let vars = [
+        (format!("{brand}_PREFIX"), prefix.root.display().to_string()),
+        (
+            format!("{brand}_CELLAR"),
+            prefix.cellar().display().to_string(),
+        ),
+    ];
+    let raw_ok = |value: &str| {
+        !value.is_empty()
+            && value.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=')
+            })
+    };
+    for (key, value) in &vars {
+        match mode {
+            Mode::Plain => println!("{key}: {value}"),
+            Mode::Bash => {
+                if raw_ok(value) {
+                    println!("export {key}={value}");
+                } else {
+                    println!("export {key}={}", crate::platform::sh_quote_str(value));
+                }
+            }
+            Mode::Fish => {
+                let value = value
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$");
+                println!("set -gx {key} \"{value}\"");
+            }
+            Mode::Csh => {
+                if raw_ok(value) {
+                    println!("setenv {key} {value};");
+                } else {
+                    println!("setenv {key} {};", crate::platform::sh_quote_str(value));
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn unsupported(reason: &str) -> ExitCode {
     failed(&format!("abrew: unsupported native operation: {reason}"))
 }
@@ -1487,8 +1587,9 @@ fn native_args(
         "analytics" => (&[], 0, 1, false),
         "doctor" | "dr" => (&["--quiet", "-q", "--list-checks"], 0, usize::MAX, false),
         "shellenv" => (&[], 0, usize::MAX, false),
-        "on" | "off" | "status" | "--version" | "-v" | "--env" | "env" | "formulae" | "casks"
-        | "config" | "update" => (&[], 0, 0, false),
+        "on" | "off" | "status" | "--version" | "-v" | "formulae" | "casks" | "config"
+        | "update" => (&[], 0, 0, false),
+        "--env" | "env" => (&["--plain", "--shell"], 0, usize::MAX, true),
         "developer" => (&[], 0, 1, false),
         "commands" => (&["--quiet", "-q", "--include-aliases"], 0, 0, false),
         "leaves" => (
@@ -1512,6 +1613,7 @@ fn native_args(
             "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
         ) || flags.contains(&arg)
             || (cmd == "info" && (arg.starts_with("--days=") || arg.starts_with("--category=")))
+            || (matches!(cmd, "--env" | "env") && arg.starts_with("--shell="))
             || (cmd == "cleanup" && arg.starts_with("--prune="))
             || (cmd == "deps"
                 && (arg.starts_with("--brewfile=")
@@ -2734,11 +2836,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 "--repository without a tap: atpkg has no Homebrew source repository",
             );
         }
-        "--env" | "env" => {
-            println!("ABREW_PREFIX={}", prefix.root.display());
-            println!("ABREW_CELLAR={}", prefix.cellar().display());
-            return ExitCode::SUCCESS;
-        }
+        "--env" | "env" => return print_env(prefix, rest),
         _ => {}
     }
     let dry_run = rest

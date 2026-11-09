@@ -144,7 +144,11 @@ impl App {
     /// Whether window row `row` (in terminal grid rows) of window `wid` lies under the band or the track of the rewound `session`'s pane: rows the last frame claimed as chrome, or, before any frame, that pane's bottom band rows.
     pub(crate) fn rewind_band_covers(&self, wid: WindowId, session: u64, row: u16) -> bool {
         let row = usize::from(row);
-        self.chrome_owns_terminal_row(wid, row)
+        let col = self
+            .windows
+            .get(&wid)
+            .map_or(0, |ws| usize::from(ws.last_mouse_window_cell.1));
+        self.chrome_owns_terminal_cell(wid, row, col)
             || self.rewound_panes(wid).iter().any(|(s, pane)| {
                 *s == session
                     && row >= pane.row
@@ -258,7 +262,11 @@ impl App {
                     );
                 }
             }
-            crate::app_render::claim_chrome_rows(ws, top..bottom + 1);
+            crate::app_render::claim_chrome_span(
+                ws,
+                top..bottom + 1,
+                pane.col..pane.col + pane.cols,
+            );
             for rect in border_rects(pane, (cw32, ch32), t, lift) {
                 crate::scrollbar::push_rect(&mut ws.rewind_quads, rect, inks.accent, 255, ch32);
             }

@@ -11407,6 +11407,15 @@ fn join_live(
     options: &JoinOptions<'_>,
     expected: ExpectedConfig<'_>,
 ) -> crate::Result<JoinOutcome> {
+    join_live_started(paths, options, expected, Instant::now())
+}
+
+fn join_live_started(
+    paths: &Paths,
+    options: &JoinOptions<'_>,
+    expected: ExpectedConfig<'_>,
+    started: Instant,
+) -> crate::Result<JoinOutcome> {
     expected.check_sharing(paths)?;
     let typed = options.source.trim();
     // No URL, or the default one (System State's first run passes it), asks the live ALab: a lab
@@ -11440,11 +11449,11 @@ fn join_live(
             say: options.say,
         };
         return join_with(paths, &resolved, expected, |source| {
-            transport::fetch(source, None, Duration::from_secs(30))
+            fetch_required_primary(source, None, started)
         });
     }
     join_with(paths, options, expected, |source| {
-        transport::fetch(source, None, Duration::from_secs(30))
+        fetch_required_primary(source, None, started)
     })
 }
 
@@ -12364,18 +12373,18 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     admin_open_with_candidates(paths, &[])
 }
 
-/// Allowance for the required primary response when opening an admin session.
-const ADMIN_OPEN_HANG: Duration = Duration::from_secs(60);
+/// Hang detector shared by a required vault primary response and its original caller.
+const REQUIRED_PRIMARY_HANG: Duration = Duration::from_secs(60);
 
-fn fetch_admin_primary(
+fn fetch_required_primary(
     source: &Source,
     reader: Option<&str>,
     started: Instant,
 ) -> crate::Result<Fetched> {
-    let left = (started + ADMIN_OPEN_HANG).saturating_duration_since(Instant::now());
+    let left = (started + REQUIRED_PRIMARY_HANG).saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(Error::new(
-            "admin primary response did not finish before its hang detector",
+            "required vault primary response did not finish before its hang detector",
         ));
     }
     match source {
@@ -12385,8 +12394,8 @@ fn fetch_admin_primary(
 }
 
 #[cfg(test)]
-#[path = "client/admin_open_wait_tests.rs"]
-mod admin_open_wait_tests;
+#[path = "client/primary_wait_tests.rs"]
+mod primary_wait_tests;
 
 /// [`admin_open`], also probing candidate servers (`aterm-swarm-policy`'s `servers`, live ALab
 /// peers, and `extra_urls`) when `config.source` is unreachable, empty, or lagging behind a
@@ -12441,7 +12450,7 @@ fn admin_open_with_candidates_started(
         .into_iter()
         .flatten()
     };
-    let served = match fetch_admin_primary(&config.source, reader, started) {
+    let served = match fetch_required_primary(&config.source, reader, started) {
         Ok(Fetched::Body(bytes)) => {
             let mut chosen = bytes;
             if matches!(config.source, Source::Url(_))

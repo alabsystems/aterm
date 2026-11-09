@@ -1804,6 +1804,20 @@ pub(crate) fn redraw_all_requests_on_this_thread() -> u64 {
     REDRAW_ALL_REQUESTS.with(std::cell::Cell::get)
 }
 
+/// The frames `app`'s windows were asked for so far: each window's own asks
+/// ([`WindowState::request_redraw`]) plus this thread's asks of every window at once
+/// ([`redraw_all_requests_on_this_thread`]). A Settings view's repaint
+/// ([`App::dispatch_to_settings_views`]) asks its OS window directly and passes through neither.
+#[cfg(test)]
+pub(crate) fn frame_asks_for_test(app: &App) -> u64 {
+    let own: u64 = app
+        .windows
+        .values()
+        .map(|ws| u64::from(ws.redraw_requests_for_test.get()))
+        .sum();
+    own + redraw_all_requests_on_this_thread()
+}
+
 /// Test fixture: feed `bytes` to `session`'s engine, as its PTY reader would.
 #[cfg(test)]
 pub(crate) fn feed_session_for_test(app: &App, session: u64, bytes: &[u8]) {
@@ -7662,6 +7676,7 @@ struct WindowState {
     hover_memo: Option<app_mouse::HoverMemo>,
     shown_caption: Option<app_mouse::ShownCaption>,
     chrome_rows: Vec<std::ops::Range<usize>>,
+    chrome_spans: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     selecting: bool,
     /// Whether a control client started the text-selection gesture in flight or dragged it
     /// ([`App::person_gesture_refused`] at its press or at a move): the selection is the
@@ -8831,6 +8846,7 @@ impl WindowState {
             hover_memo: None,
             shown_caption: None,
             chrome_rows: Vec::new(),
+            chrome_spans: Vec::new(),
             selecting: false,
             sel_by_controller: false,
             drag_pane: (0, 0, 0, 0),
@@ -10879,7 +10895,8 @@ struct App {
     native_verified_download_on_disk: u64,
     native_activation_supersede: Option<app_native::ActivationSupersedeJob>,
     auto_apply_capture_refusal: Option<AutoApplyCaptureRefusal>,
-    apply_schedule_standing: Option<String>,
+    /// The classified schedule and its separate diagnostic context, published together.
+    apply_schedule_standing: Option<(String, String)>,
     auto_apply_stranded_announced: Option<(u64, bool)>,
     auto_apply_stranded_said: Option<u64>,
     #[cfg(unix)]
@@ -14155,7 +14172,8 @@ impl App {
         reclaim
     }
 
-    /// Request a redraw of every open window, for global banner state (a messages settle, the update-ready nudge).
+    /// Request a redraw of every open window, for state every window draws (the tab strip's
+    /// waiting fall a messages settle commits, the update-ready nudge).
     pub(crate) fn request_redraw_all_windows(&self) {
         #[cfg(test)]
         REDRAW_ALL_REQUESTS.with(|c| c.set(c.get() + 1));
@@ -14164,6 +14182,31 @@ impl App {
                 w.request_redraw();
             }
         }
+    }
+
+    /// What `about_to_wait` arms for this turn: `deadline`, the soonest its sweeps folded under
+    /// `owner`, with [`Self::messages_deadline`] folded last, then healed
+    /// ([`deadline_heal::DeadlineHealer::heal`]). The messages' deadline folds last because any
+    /// sweep can post, restate or end a row (the status sweep's shell-integration row, a paste
+    /// wait's end) whose Settings ▸ Messages publish the publish gap defers, and the row asks for
+    /// no frame that would wake the loop for that publish.
+    pub(crate) fn arm_loop_deadline(
+        &mut self,
+        mut deadline: Option<Instant>,
+        mut owner: deadline_heal::DeadlineFold,
+    ) -> Option<Instant> {
+        if let Some(d) = self.messages_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut owner,
+                d,
+                metrics::DeadlineOwner::Messages,
+            );
+        }
+        let now = Instant::now();
+        let heal = self.deadline_healer.heal(owner.owner(), deadline, now);
+        metrics::note_deadline(owner.owner(), deadline, now, heal);
+        owner.armed(heal, now)
     }
 
     fn service_video_wake(&mut self) {
@@ -18822,14 +18865,6 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::KittyAnimation,
             );
         }
-        if let Some(d) = self.messages_deadline() {
-            fold_owned_deadline(
-                &mut deadline,
-                &mut deadline_owner,
-                d,
-                metrics::DeadlineOwner::Messages,
-            );
-        }
         let waits_now = native_preview_now;
         self.session_waits_tick(waits_now);
         if let Some(d) = self.session_waits_deadline() {
@@ -19304,13 +19339,7 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AccountDrain,
             );
         }
-        let now = Instant::now();
-        let heal = self
-            .deadline_healer
-            .heal(deadline_owner.owner(), deadline, now);
-        metrics::note_deadline(deadline_owner.owner(), deadline, now, heal);
-        let deadline = deadline_owner.armed(heal, now);
-        match deadline {
+        match self.arm_loop_deadline(deadline, deadline_owner) {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
         }

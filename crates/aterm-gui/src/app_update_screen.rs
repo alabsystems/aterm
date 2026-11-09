@@ -664,16 +664,24 @@ impl App {
                 {
                     self.publish_native_update_state();
                 }
-                if let Some(standing) = standing {
-                    aterm_update::record_apply_refusal(current_build, &standing);
+                if let Some((standing, detail)) = standing {
+                    aterm_update::record_apply_refusal_with_detail(
+                        current_build,
+                        &standing,
+                        &detail,
+                    );
                 }
             }
             ApplyLedgerVerdict::Refused(reason) => {
                 aterm_update::record_apply_refusal(current_build, &reason);
             }
             ApplyLedgerVerdict::Silent => {
-                if let Some(standing) = standing {
-                    aterm_update::record_apply_refusal(current_build, &standing);
+                if let Some((standing, detail)) = standing {
+                    aterm_update::record_apply_refusal_with_detail(
+                        current_build,
+                        &standing,
+                        &detail,
+                    );
                 }
             }
         }

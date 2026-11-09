@@ -84,6 +84,8 @@ aterm-regex = { workspace = true }
 # THE toolchain's discovery, rustup's home, the build-cache rule, the gone-checkout rule
 # and the lease core, std only; `toolchain`, `build_cache` and `lease` re-export them.
 aterm-toolchain = { workspace = true }
+# The exact original executable/runtime input observer, also used by the Host Keeper.
+trust-resource-provenance = { workspace = true }
 # Same-handle identity when releasing only this starter's first-exec mark.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # `aterm pkg capacity` (`src/capacity.rs`): the machine's capacity now and the claims

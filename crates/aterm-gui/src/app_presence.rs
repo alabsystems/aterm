@@ -1587,17 +1587,21 @@ impl App {
         out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
-    /// Lift an update handoff's park (`Wake::UpdateHandoffFinished`).
+    /// Lift an update handoff's park (`Wake::UpdateHandoffFinished`), and ask every window for a
+    /// frame: the lift re-projects every window's presence ([`Self::refresh_presence_all_windows`]),
+    /// which asks for no frame itself.
     #[cfg(unix)]
     pub(crate) fn release_update_handoff_park(&mut self, finish: impl FnOnce(&mut Self)) {
         self.with_chrome_regrid_batch(|app| {
             finish(app);
             app.refresh_presence_all_windows();
             app.sync_messages();
+            app.request_redraw_all_windows();
         });
     }
 
-    /// Lift a successor's freeze (the Commit wake, once `incoming_handoff_pending` is false).
+    /// Lift a successor's freeze (the Commit wake, once `incoming_handoff_pending` is false), and
+    /// ask every window for a frame as [`Self::release_update_handoff_park`] does.
     #[cfg(unix)]
     pub(crate) fn release_successor_commit_freeze(&mut self) {
         self.with_chrome_regrid_batch(|app| {
@@ -1614,6 +1618,7 @@ impl App {
             app.say_carried_history_loss();
             app.say_carried_settings_drafts_loss();
             app.sync_messages();
+            app.request_redraw_all_windows();
         });
     }
 

@@ -9,6 +9,8 @@ use aterm_json::{Value, json};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://mail.proton.me/api";
+/// Hang detector for a required native response, within the original caller's deadline.
+const REQUEST_HANG: Duration = Duration::from_secs(60);
 
 /// An authenticated HTTP channel whose session is managed by its owner.
 /// Implementations must never replay a submitted write after an uncertain result.
@@ -316,7 +318,7 @@ impl Proton {
             client: Client::new(
                 Trust::PlatformVerifier,
                 ProxyMode::Environment,
-                Duration::from_secs(30),
+                REQUEST_HANG,
             ),
             transport: None,
             cache: MessageCache::default(),
@@ -791,6 +793,17 @@ impl Proton {
     }
 
     fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.call_started(method, path, body, Instant::now(), API)
+    }
+
+    fn call_started(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        started: Instant,
+        api: &str,
+    ) -> Result<Value, String> {
         if self
             .request_deadline
             .is_some_and(|end| Instant::now() >= end)
@@ -817,7 +830,7 @@ impl Proton {
                 &response.body,
             );
         }
-        let endpoint = format!("{API}{path}");
+        let endpoint = format!("{api}{path}");
         // The API validates a fixed product vocabulary. This selects its mail
         // compatibility protocol; User-Agent identifies our actual client.
         let app_version = if cfg!(target_os = "macos") {
@@ -835,12 +848,6 @@ impl Proton {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .limit(32 * 1024 * 1024);
-        if let Some(end) = self.request_deadline {
-            request = request.backstop(
-                end.saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(30)),
-            );
-        }
         if let Some(token) = &self.verification {
             request = request
                 .secret_header(
@@ -869,8 +876,15 @@ impl Proton {
                 .map_err(|_| "Could not encode Proton request")?
                 .unwrap_or_default(),
         );
+        let own = started + REQUEST_HANG;
+        let end = self.request_deadline.map_or(own, |end| end.min(own));
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("Mail operation deadline expired".into());
+        }
         self.last_failure.take();
         let response = request
+            .backstop(left)
             .send_phased(&bytes)
             .map_err(|error| self.fail(crate::proton_error::Failure::transport(path, &error)))?;
         self.process_response(
@@ -1121,6 +1135,10 @@ fn message(value: &Value) -> Result<Message, String> {
         text: String::new(),
     })
 }
+
+#[cfg(test)]
+#[path = "proton/native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 mod session_tests {

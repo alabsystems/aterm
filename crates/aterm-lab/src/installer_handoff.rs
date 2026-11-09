@@ -156,7 +156,7 @@ impl Drop for OwnedWindow {
     }
 }
 
-fn echo(instance: &Instance, sid: &str, lower: &str) -> Result<(), String> {
+fn echo(instance: &Instance, sid: &str, lower: &str, settle: bool) -> Result<(), String> {
     let selector = format!("@{sid}");
     let sent = instance.ctl_stdin(
         &[&selector, "send", "--stdin"],
@@ -173,9 +173,11 @@ fn echo(instance: &Instance, sid: &str, lower: &str) -> Result<(), String> {
             read.first()
         ));
     }
-    let idle = instance.ctl(&[&selector, "await", "idle", "1000", "timeout=60000"]);
-    if idle.code != 0 {
-        return Err(format!("fixture output did not settle: {}", idle.first()));
+    if settle {
+        let idle = instance.ctl(&[&selector, "await", "idle", "1000", "timeout=60000"]);
+        if idle.code != 0 {
+            return Err(format!("fixture output did not settle: {}", idle.first()));
+        }
     }
     Ok(())
 }
@@ -184,16 +186,219 @@ pub fn cmd(args: &[String]) -> Res {
     crate::stop::install();
     let mut args = args.to_vec();
     let handoffs = handoff_count(&mut args)?;
+    let streaming = instance::take_flag(&mut args, "--stream");
     let aterm = instance::resolve_aterm(instance::take_value(&mut args, "--aterm")?)?;
     let out = instance::take_value(&mut args, "--out")?
         .map(PathBuf::from)
         .ok_or_else(|| Fail::usage("installer-handoff needs --out ABS"))?;
     if !args.is_empty() || !out.is_absolute() {
         return Err(Fail::usage(
-            "installer-handoff takes --aterm PATH --out ABS",
+            "installer-handoff takes --aterm PATH --out ABS [--stream]",
         ));
     }
-    execute(&aterm, &out, |aterm, out| run(aterm, out, handoffs))
+    execute(&aterm, &out, |aterm, out| {
+        run(aterm, out, handoffs, streaming)
+    })
+}
+
+const STREAM_LIMIT: usize = 10_000;
+const STREAM_PAYLOAD: &str = "café λ 界 🙂";
+
+/// Private PTY fixture: numbered output continues until the controller sends `stream_stop`.
+pub(crate) fn stream_fixture_main(args: &[String]) -> i32 {
+    if !args.is_empty() {
+        return 2;
+    }
+    stream_fixture().map_or(1, |()| 0)
+}
+
+fn stream_fixture() -> std::io::Result<()> {
+    use std::io::BufRead as _;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
+    quiet_stream_input()?;
+    let (send, receive) = channel();
+    std::thread::Builder::new()
+        .name("handoff-stream-input".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        })?;
+    let mut output = std::io::stdout().lock();
+    let mut streaming = false;
+    let mut next = 0;
+    loop {
+        let input = if streaming {
+            match receive.recv_timeout(Duration::from_millis(10)) {
+                Ok(line) => Some(line),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            let Ok(line) = receive.recv() else {
+                return Ok(());
+            };
+            Some(line)
+        };
+        if let Some(line) = input {
+            match line.as_str() {
+                "stream_start" => streaming = true,
+                "stream_stop" => {
+                    streaming = false;
+                    writeln!(output, "HANDOFF_END {next}")?;
+                }
+                _ => {}
+            }
+            writeln!(output, "{}", line.to_ascii_uppercase())?;
+        } else if next == STREAM_LIMIT {
+            writeln!(output, "HANDOFF_LIMIT")?;
+            streaming = false;
+        } else {
+            write!(output, "HANDOFF_SEQ {next:06} \x1b[36m")?;
+            // Flush individual bytes so multibyte characters can span PTY reads.
+            for byte in STREAM_PAYLOAD.as_bytes() {
+                output.write_all(std::slice::from_ref(byte))?;
+                output.flush()?;
+            }
+            writeln!(output, "\x1b[0m")?;
+            next += 1;
+        }
+        output.flush()?;
+    }
+}
+
+fn quiet_stream_input() -> std::io::Result<()> {
+    use aterm_uds::{deadline, spawnfd};
+
+    // Keep stty in the fixture's foreground group so terminal job control permits the change.
+    let mut child = spawnfd::command("/bin/stty")
+        .args(["-echo", "-echonl"])
+        .stdin(spawnfd::Stdio::inherit())
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::null())
+        .spawn()?;
+    let until = Instant::now() + HANG;
+    let mut exit = deadline::ExitWait::new(&child);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(std::io::Error::other(format!("stty: {status}"))),
+            Err(error) => {
+                deadline::settle_child(&mut child);
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            deadline::kill_within(&mut child, HANG);
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stty"));
+        }
+        exit.wait(left);
+    }
+}
+
+fn search_rows(instance: &Instance, sid: &str, pattern: &str) -> Result<Vec<u64>, String> {
+    let selector = format!("@{sid}");
+    let found = instance.ctl(&[&selector, "search", pattern, "regex", "case"]);
+    parse_search_rows(&found)
+}
+
+fn parse_search_rows(found: &instance::Reply) -> Result<Vec<u64>, String> {
+    let header = found
+        .stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("aterm-ctl: "))
+        .find(|line| line.starts_with("OK "))
+        .unwrap_or_default();
+    if found.code != 0 || !header.starts_with("OK ") || header.contains("incomplete") {
+        return Err(format!("stream search was incomplete: {}", found.first()));
+    }
+    let count = header
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse::<usize>().ok())
+        .ok_or_else(|| format!("stream search had no count: {header}"))?;
+    let mut rows = found
+        .stdout
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .ok_or_else(|| format!("stream search had no row: {line}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() != count {
+        return Err("stream search did not return every reported match".into());
+    }
+    rows.sort_unstable();
+    Ok(rows)
+}
+
+fn stream_line(instance: &Instance, sid: &str, row: u64) -> Result<String, String> {
+    let selector = format!("@{sid}");
+    let read = instance.ctl(&[&selector, "line", &row.to_string()]);
+    if read.code != 0 {
+        return Err(format!("stream row was not retained: {}", read.first()));
+    }
+    parse_stream_line(&read.stdout)
+}
+
+fn parse_stream_line(reply: &str) -> Result<String, String> {
+    reply
+        .trim_end()
+        .strip_prefix("OK ")
+        .map(str::to_owned)
+        .ok_or_else(|| format!("unexpected stream row reply: {reply}"))
+}
+
+fn verify_stream_lines(lines: &[String], count: usize) -> Result<(), String> {
+    if count == 0 || count >= STREAM_LIMIT || lines.len() != count {
+        return Err(format!(
+            "stream expected {count} records, retained {}",
+            lines.len()
+        ));
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if line != &format!("HANDOFF_SEQ {index:06} {STREAM_PAYLOAD}") {
+            return Err(format!(
+                "stream record {index} was missing, duplicated or reordered: {line}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finish_stream(instance: &Instance, sid: &str, out: &Path) -> Result<usize, String> {
+    echo(instance, sid, "stream_stop", true)?;
+    let ends = search_rows(instance, sid, "^HANDOFF_END [0-9]+$")?;
+    let [end] = ends.as_slice() else {
+        return Err("the stream did not retain exactly one end record".into());
+    };
+    let count = stream_line(instance, sid, *end)?
+        .strip_prefix("HANDOFF_END ")
+        .and_then(|n| n.parse::<usize>().ok())
+        .ok_or("the stream end record had no count")?;
+    let rows = search_rows(instance, sid, "^HANDOFF_SEQ [0-9]+ ")?;
+    let lines = rows
+        .into_iter()
+        .map(|row| stream_line(instance, sid, row))
+        .collect::<Result<Vec<_>, _>>()?;
+    verify_stream_lines(&lines, count)?;
+    write_new_report(
+        &out.join("stream.json"),
+        &aterm_json::json!({
+            "count": count, "records": lines, "payload": STREAM_PAYLOAD,
+            "byte_fragmented": true, "ansi_styled": true,
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(count)
 }
 
 /// Exercise in-place replacement after replacing an exited terminal with a native Settings tab.
@@ -423,7 +628,7 @@ fn run_cold(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
+fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(), String> {
     let image = ProbeImage::read(aterm)?;
     image.record(out)?;
     let mut world = World::new(instance::CONFIG_OFF)?;
@@ -432,23 +637,26 @@ fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
     let mut env = world.env();
     env.push(("ATERM_DEBUG_SEAMLESS_REEXEC".into(), "1".into()));
     env.push(("ATERM_DEBUG_INSTALLER_CUSTODY".into(), "1".into()));
+    let mut args: Vec<String> = ["--columns", "100", "--lines", "30", "-e"]
+        .map(str::to_owned)
+        .to_vec();
+    if streaming {
+        args.push(
+            std::env::current_exe()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.push("__handoff-stream".into());
+    } else {
+        args.extend(["/usr/bin/tr", "a-z", "A-Z"].map(str::to_owned));
+    }
     let mut instance = Instance::start(
         &world,
         Launch {
             aterm: image.path.clone(),
             headless: false,
-            args: [
-                "--columns",
-                "100",
-                "--lines",
-                "30",
-                "-e",
-                "/usr/bin/tr",
-                "a-z",
-                "A-Z",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            args,
             env,
             cwd: world.home.clone(),
             sandbox: None,
@@ -463,7 +671,10 @@ fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
     let before = wait("the installer fixture's custody record", || {
         record(&instance.log_tail(200), "seeded", parent)
     })?;
-    echo(&instance, &before.sid, "installer_before")?;
+    echo(&instance, &before.sid, "installer_before", true)?;
+    if streaming {
+        echo(&instance, &before.sid, "stream_start", false)?;
+    }
     let mut successors = Vec::new();
     let mut identities = Vec::new();
     for index in 0..handoffs {
@@ -487,12 +698,17 @@ fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
                 "installer identity changed: {before:?} -> {after:?}"
             ));
         }
-        echo(&instance, &after.sid, &marker)?;
+        echo(&instance, &after.sid, &marker, !streaming)?;
         wait("the outgoing GUI to exit", || {
             (!crate::sys::alive(outgoing)).then_some(())
         })?;
         successors.push(successor);
     }
+    let stream_records = if streaming {
+        Some(finish_stream(&instance, &before.sid, out)?)
+    } else {
+        None
+    };
     window.stop()?;
     instance.stop()?;
     evidence.capture()?;
@@ -506,6 +722,7 @@ fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
         "installer_commands_submitted": false, "active_custody_adopted": true,
         "image_path": image.path.to_string_lossy().into_owned(), "image_sha256": image.sha256,
         "initial_identity": parent_identity, "successor_identities": identities,
+        "stream_records": stream_records,
     });
     write_new_report(&out.join("passed.json"), &report).map_err(|e| e.to_string())?;
     world.release();
@@ -519,6 +736,54 @@ fn run(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_line_reads_the_single_line_cli_reply() {
+        assert_eq!(
+            parse_stream_line("OK HANDOFF_END 123\n").unwrap(),
+            "HANDOFF_END 123"
+        );
+        assert!(parse_stream_line("ERR evicted\n").is_err());
+        assert!(parse_stream_line("HANDOFF_END 123\n").is_err());
+    }
+
+    #[test]
+    fn stream_search_requires_the_complete_cli_count_and_reads_stdout_rows() {
+        let mut reply = instance::Reply {
+            code: 0,
+            stdout: "92 0 14\n93 0 14\n".into(),
+            stderr: "aterm-ctl: OK 2 screen_first=90\n".into(),
+        };
+        assert_eq!(parse_search_rows(&reply).unwrap(), [92, 93]);
+        reply.stderr = "aterm-ctl: OK 2 incomplete moving screen_first=90\n".into();
+        assert!(parse_search_rows(&reply).is_err());
+        reply.stderr = "aterm-ctl: OK 3 screen_first=90\n".into();
+        assert!(parse_search_rows(&reply).is_err());
+        reply.stderr.clear();
+        assert!(parse_search_rows(&reply).is_err());
+    }
+
+    #[test]
+    fn streamed_history_must_keep_every_record_once_in_order() {
+        let good: Vec<String> = (0..4)
+            .map(|i| format!("HANDOFF_SEQ {i:06} café λ 界 🙂"))
+            .collect();
+        assert!(verify_stream_lines(&good, 4).is_ok());
+        let mut missing = good.clone();
+        missing.remove(1);
+        assert!(verify_stream_lines(&missing, 4).is_err());
+        let mut duplicated = good.clone();
+        duplicated[2].clone_from(&good[1]);
+        assert!(verify_stream_lines(&duplicated, 4).is_err());
+        let mut reordered = good.clone();
+        reordered.swap(1, 2);
+        assert!(verify_stream_lines(&reordered, 4).is_err());
+        let mut corrupted = good.clone();
+        corrupted[1] = corrupted[1].replace('🙂', "�");
+        assert!(verify_stream_lines(&corrupted, 4).is_err());
+        assert!(verify_stream_lines(&[], 0).is_err());
+        assert!(verify_stream_lines(&good, STREAM_LIMIT).is_err());
+    }
 
     #[test]
     fn handoff_chain_is_explicitly_bounded() {

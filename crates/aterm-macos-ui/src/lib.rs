@@ -3,8 +3,8 @@
 
 //! Native UI framework bindings, kept outside the foundational Objective-C runtime.
 //!
-//! AppKit, Carbon and ServiceManagement load only when a caller first needs their
-//! classes or exports.
+//! AppKit, Carbon, ServiceManagement and AudioQueue bindings acquire their
+//! frameworks only when a caller first needs their classes or exports.
 //! Handles and exported addresses remain valid for the process lifetime. Missing required
 //! frameworks or symbols panic with the loader's diagnostic rather than return fake values.
 
@@ -13,5 +13,6 @@
 #[macro_use]
 mod framework;
 pub mod appkit;
+pub mod audio;
 pub mod carbon;
 pub mod service_management;

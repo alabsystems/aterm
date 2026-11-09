@@ -3715,14 +3715,20 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
     })
 }
 
-/// Human label for a security opt-in row (keyed by its `SECURITY_BOOL_KEYS` entry).
+/// Human label for a security opt-in row (keyed by its `SECURITY_BOOL_KEYS` entry). A name too
+/// long for the lines a split row's caption has over its control at the least view ends in the
+/// words in parentheses that explain it, so the caption says the name before them whole
+/// (`settings_scroll::named_row_parts`): Linux's window-operations name, said as one sentence,
+/// took four lines at 2x in the least window (278x264) in Cantarell, Noto Sans and DejaVu Sans,
+/// where three fit over its switch, and its caption read "Allow programs to / resize the window /
+/// and read its title…".
 pub(crate) fn security_label(key: &str) -> &'static str {
     match key {
         EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard",
         EDIT_SECURE_KEYBOARD_ENTRY => "Secure Keyboard Entry (block keystroke snooping)",
         EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
-                "Allow programs to resize the window and read its title and size"
+                "Allow programs to resize the window (and read its title and size)"
             } else {
                 "Allow programs to read the window title and size"
             }

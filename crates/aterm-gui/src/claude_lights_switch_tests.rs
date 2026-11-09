@@ -2220,3 +2220,157 @@ fn harness_switch_gallery() {
     }
     crate::chrome_band::install_forced_chrome(before);
 }
+
+#[test]
+fn split_pane_find_bar_and_pre_frame_banner_shield_only_covered_pane_glass() {
+    let (mut app, wid, left, _reader, _host) = claude_pane(160);
+    let right = app.split_active_stub_tab(wid);
+    publish_facts(&app, right);
+    set_program(&app, right, Some("claude"));
+
+    let top_composer = |cols: usize| {
+        let rule = "\u{2500}".repeat(cols);
+        format!(
+            "\x1b[2J\x1b[1;1H{rule}\x1b[2;1H\u{276F} draft\
+             \x1b[3;1H{rule}\x1b[4;1H{BYPASS}\x1b[10;1Hmatch target\x1b[10;3H"
+        )
+    };
+    let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+    let left_leaf = plan
+        .leaves
+        .iter()
+        .find(|l| !l.focused)
+        .expect("unfocused left leaf");
+    let right_leaf = plan
+        .leaves
+        .iter()
+        .find(|l| l.focused)
+        .expect("focused right leaf");
+    let row0 = right_leaf.rect.origin.y.round() as usize;
+    let left_cols = left_leaf.rect.size.width.round() as usize;
+    let right_col0 = right_leaf.rect.origin.x.round() as usize;
+    let right_cols = right_leaf.rect.size.width.round() as usize;
+
+    feed(&app, left, top_composer(left_cols).as_bytes());
+    feed(&app, right, top_composer(right_cols).as_bytes());
+
+    let compose_split = |app: &mut App| {
+        let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(Instant::now()),
+        );
+        let crate::app_render::CapturePreparation::Ready((grid, plan)) = prepared else {
+            panic!("the headless capture must produce a frame");
+        };
+        app.splice_tab_strip(wid);
+        app.splice_find_bar(wid);
+        app.splice_claude_footer(
+            wid,
+            &plan,
+            crate::VisibleContentRoute::Terminal {
+                composed: grid.composed,
+            },
+        );
+    };
+
+    compose_split(&mut app);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .border_toggles
+            .iter()
+            .map(|b| b.session)
+            .collect::<Vec<_>>(),
+        vec![left, right],
+        "before find bar opens, both side-by-side panes draw their top-rule switches"
+    );
+
+    let left_switch = app.windows[&wid]
+        .claude_lights
+        .border_toggles
+        .iter()
+        .find(|b| b.session == left)
+        .cloned()
+        .expect("left switch");
+    let (lx, ly) = px_of(
+        &app,
+        wid,
+        (
+            left_switch.frame_row,
+            left_switch.cols.start + left_switch.cols.len() / 2,
+        ),
+    );
+    assert_eq!(
+        app.claude_glass_at(wid, lx, ly),
+        Some((left, super::GlassAt::Switch(HarnessSwitch::On))),
+        "left switch is hit-testable before banner or find bar"
+    );
+
+    // Pre-frame paste banner shields row 0 glass before `splice_paste_banner` runs.
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(right),
+        "line one\nline two\n".to_owned(),
+        crate::input::Source::Controller,
+        crate::input::PasteFraming::Gesture { bracketed: true },
+    ));
+    assert_eq!(
+        app.claude_glass_at(wid, lx, ly),
+        None,
+        "pre-frame paste banner shields row 0 switch even before chrome_rows is spliced"
+    );
+    app.paste_banner = None;
+
+    // Opening find bar in focused right pane claims only right pane columns, leaving left pane glass intact.
+    app.search_enter();
+    compose_split(&mut app);
+
+    assert!(
+        !app.chrome_owns_terminal_row(wid, row0),
+        "split-pane find bar does not claim the whole window row"
+    );
+    assert!(
+        !app.chrome_owns_terminal_span(wid, row0, 0..left_cols),
+        "unfocused left pane columns on find-bar row are not chrome-owned"
+    );
+    assert!(
+        app.chrome_owns_terminal_span(wid, row0, right_col0..right_col0 + right_cols),
+        "focused right pane columns under the find bar are chrome-owned"
+    );
+    assert_eq!(
+        app.windows[&wid].input_scratch.grid_top_row,
+        usize::from(app.chrome_rows(wid)),
+        "partial-width find bar does not narrow whole-window smooth-scroll grid_top_row"
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .border_toggles
+            .iter()
+            .map(|b| b.session)
+            .collect::<Vec<_>>(),
+        vec![left],
+        "sibling left pane keeps its top-rule switch while focused right pane's covered switch is suppressed"
+    );
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .hits
+            .iter()
+            .any(|h| h.session == left && h.chip == Some(Chip::Autopilot)),
+        "sibling left pane keeps its bottom-rule Autopilot chip on row 2"
+    );
+    assert!(
+        !app.windows[&wid]
+            .claude_lights
+            .hits
+            .iter()
+            .any(|h| h.session == right),
+        "focused right pane's covered bottom-rule chips on row 2 are suppressed under the find bar"
+    );
+    assert_eq!(
+        app.claude_glass_at(wid, lx, ly),
+        Some((left, super::GlassAt::Switch(HarnessSwitch::On))),
+        "sibling left pane's switch remains hit-testable on row 0 while right pane has find bar"
+    );
+}

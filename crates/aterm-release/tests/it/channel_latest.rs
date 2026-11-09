@@ -494,6 +494,7 @@ impl ChannelRelease for FakeChannel<'_> {
             &self.local_appcast,
             &mut || Ok(github.pointer()),
             &mut |url| github.fetch(url),
+            &mut |_| {},
         )
         .map(|_| ())
     }
@@ -780,7 +781,7 @@ fn a_refused_upload_whose_object_is_there_is_converged_and_still_named_by_the_jo
 }
 
 #[test]
-fn a_stale_pointer_answer_is_not_polled_again() {
+fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
@@ -791,7 +792,27 @@ fn a_stale_pointer_answer_is_not_polled_again() {
         location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
     };
 
-    let mut asked = 0;
+    let lag = 12;
+    let (mut asked, mut slept) = (0, Vec::new());
+    publish::prove_pointer_serves(
+        SLUG,
+        TAG,
+        &local_appcast,
+        &mut || {
+            asked += 1;
+            Ok(if asked <= lag {
+                stale()
+            } else {
+                github.pointer()
+            })
+        },
+        &mut |url| github.fetch(url),
+        &mut |d| slept.push(d),
+    )
+    .expect("a pointer that moves within the bound is proved");
+    assert_eq!(slept, vec![publish::POINTER_PROBE_DELAY; lag]);
+
+    let (mut asked, mut slept) = (0, Vec::new());
     let err = publish::prove_pointer_serves(
         SLUG,
         TAG,
@@ -801,14 +822,16 @@ fn a_stale_pointer_answer_is_not_polled_again() {
             Ok(stale())
         },
         &mut |url| github.fetch(url),
+        &mut |d| slept.push(d),
     )
-    .expect_err("a stale pointer answer is final for this proof");
+    .expect_err("a pointer that never moves is refused");
     assert!(
         err.to_string()
             .contains(&format!("names {PREVIOUS}, not {TAG}")),
         "{err}"
     );
-    assert_eq!(asked, 1);
+    assert_eq!(asked, publish::POINTER_PROBE_ATTEMPTS as usize);
+    assert_eq!(slept.len(), publish::POINTER_PROBE_ATTEMPTS as usize - 1);
 }
 
 #[test]
@@ -1037,6 +1060,7 @@ fn a_non_app_release_holding_latest_is_taken_over() {
             &local_appcast,
             &mut || Ok(github.pointer()),
             &mut |url| github.fetch(url),
+            &mut |_| {},
         )
         .expect_err("the gate never calls a non-app head this cut");
         assert!(err.to_string().contains("not an app release"), "{err}");

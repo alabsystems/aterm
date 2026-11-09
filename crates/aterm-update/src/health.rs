@@ -81,6 +81,9 @@ pub struct Health {
     /// Reason from the most recent apply-lane refusal.
     #[serde(default)]
     pub last_apply_refusal: String,
+    /// Diagnostic context for the refusal, never part of its policy classification.
+    #[serde(default)]
+    pub last_apply_refusal_detail: String,
     /// RFC3339 UTC timestamp of [`Self::last_apply_refusal`].
     #[serde(default)]
     pub last_apply_refusal_at: String,
@@ -142,6 +145,15 @@ fn capped_error(error: &str) -> String {
     let mut kept: String = error.chars().take(head).collect();
     kept.push_str(&tail);
     kept
+}
+
+/// Quote bounded diagnostic context without classifying any words it contains.
+#[must_use]
+pub(crate) fn diagnostic_detail(detail: &str) -> String {
+    aterm_codec::tty::one_line(detail, crate::MAX_APPLY_REFUSAL_DETAIL_CHARS)
+        .chars()
+        .take(crate::MAX_APPLY_REFUSAL_DETAIL_CHARS)
+        .collect()
 }
 
 impl Health {
@@ -427,9 +439,27 @@ impl Health {
 
     /// Record an apply-lane refusal observed by `current_build`.
     pub fn record_apply_refusal(path: &Path, current_build: u64, reason: &str) -> Self {
+        Self::record_apply_refusal_with_detail(path, current_build, reason, "")
+    }
+
+    /// Record the standing reason and separate bounded diagnostic context in one write.
+    pub fn record_apply_refusal_with_detail(
+        path: &Path,
+        current_build: u64,
+        reason: &str,
+        detail: &str,
+    ) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
         h.last_apply_refusal = capped_error(reason);
+        h.last_apply_refusal_detail = if reason.is_empty() {
+            String::new()
+        } else {
+            detail
+                .chars()
+                .take(crate::MAX_APPLY_REFUSAL_DETAIL_CHARS)
+                .collect()
+        };
         h.last_apply_refusal_at = crate::install::now_rfc3339();
         h.last_apply_refusal_build = current_build;
         h.write(path);
@@ -459,6 +489,7 @@ impl Health {
 
     fn clear_apply_refusal(&mut self) {
         self.last_apply_refusal = String::new();
+        self.last_apply_refusal_detail = String::new();
         self.last_apply_refusal_at = String::new();
         self.last_apply_refusal_build = 0;
     }
@@ -482,6 +513,7 @@ impl Health {
         if h.apply_failures == 0
             && h.apply_failures_for_target == 0
             && h.last_apply_refusal.is_empty()
+            && h.last_apply_refusal_detail.is_empty()
             && h.trial_proof_failure.is_empty()
         {
             return h;
@@ -892,9 +924,32 @@ mod tests {
     fn a_refusal_is_recorded_without_inventing_a_failure_streak() {
         let p = tmp("apply-refusal");
         let quiet = "terminal input/output is still inside the quiet epoch";
-        Health::record_apply_refusal(&p, 812, quiet);
+        let detail = format!(
+            "Transient: handoff proof ended TimedOut\n\u{1b}[31m\u{202e} {} {} {}",
+            crate::PASSING_REFUSAL_KEY,
+            crate::ROSTER_UNCONFIRMED_KEY,
+            "界".repeat(crate::MAX_APPLY_REFUSAL_DETAIL_CHARS)
+        );
+        Health::record_apply_refusal_with_detail(&p, 812, quiet, &detail);
         let h = Health::read(&p);
         assert_eq!(h.last_apply_refusal, quiet);
+        assert_eq!(
+            h.last_apply_refusal_detail.chars().count(),
+            crate::MAX_APPLY_REFUSAL_DETAIL_CHARS
+        );
+        let shown = diagnostic_detail(&h.last_apply_refusal_detail);
+        assert!(shown.contains("TimedOut"));
+        assert!(shown.chars().count() <= crate::MAX_APPLY_REFUSAL_DETAIL_CHARS);
+        assert!(!shown.chars().any(char::is_control));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(!crate::is_passing_refusal(&h.last_apply_refusal));
+        for key in [crate::PASSING_REFUSAL_KEY, crate::ROSTER_UNCONFIRMED_KEY] {
+            assert_eq!(
+                Health::withdraw_apply_refusal_containing(&p, key).last_apply_refusal,
+                quiet,
+                "diagnostic words never withdraw or classify the standing reason"
+            );
+        }
         assert!(!h.last_apply_refusal_at.is_empty(), "a refusal is timed");
         assert!(h.apply_refusal_applies_to(812));
         assert_eq!(h.total_failures(), 0, "a refusal is not a failure");
@@ -913,17 +968,23 @@ mod tests {
         Health::record_success(&p);
         assert_eq!(Health::read(&p).last_apply_refusal, quiet);
 
+        Health::record_apply_refusal(&p, 812, quiet);
+        assert!(Health::read(&p).last_apply_refusal_detail.is_empty());
+        Health::record_apply_refusal_with_detail(&p, 812, quiet, &detail);
+
         Health::record_apply_failure(&p, 77, 900 + 77, "ChildDied");
         let h = Health::read(&p);
         assert!(!h.apply_refusal_applies_to(812));
         assert!(h.last_apply_refusal.is_empty());
+        assert!(h.last_apply_refusal_detail.is_empty());
         assert!(h.last_apply_refusal_at.is_empty());
         assert_eq!(h.last_apply_error, "ChildDied");
 
-        Health::record_apply_refusal(&p, 812, "updater work is in flight");
+        Health::record_apply_refusal_with_detail(&p, 812, "updater work is in flight", &detail);
         Health::record_apply_success(&p);
         let h = Health::read(&p);
         assert!(h.last_apply_refusal.is_empty());
+        assert!(h.last_apply_refusal_detail.is_empty());
         assert!(h.last_apply_refusal_at.is_empty());
         assert_eq!(h.last_apply_refusal_build, 0);
         assert_eq!(h.apply_failures, 0);

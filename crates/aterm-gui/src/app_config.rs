@@ -11801,11 +11801,15 @@ mod least_window_size_tests {
     }
 
     /// BOTH FORMS OF `resize` HOLD A WINDOW HOLDING SETTINGS TO ITS LEAST, AND SAY SO, AT 1x AND
-    /// 2x TEXT: the grid form asked for a grid under Settings' least view gives the window the
-    /// least on each held axis and answers with the grid given, `held=least` and the grid asked;
+    /// 2x TEXT: the grid form asked for a grid under Settings' least view (on both axes, on its
+    /// rows alone, on its columns alone) gives the window the least on each held axis and what
+    /// was asked on the other, and answers with the grid given, `held=least` and the grid asked;
     /// a grid over the least is given as asked; the pixel form holds and answers the same in
     /// pixels. The grid form resized the grid and the window as asked (a 164x96 Settings view at
-    /// 1x, 1564x180 at 2x) and answered a bare `OK`, until a page opening grew it back.
+    /// 1x, 1564x180 at 2x) and answered a bare `OK`, until a page opening grew it back. The grids
+    /// asked are counted in the window's own cells from the least view, since a face's cell size
+    /// moves the least grid: the 9x20 headless cells of a Linux host's face hold the 1x least
+    /// view's 208pt in 11 rows, so a fixed 12-row grid asked as under it was given as asked.
     #[test]
     fn both_forms_of_resize_hold_a_window_holding_settings_to_its_least_and_say_so() {
         use crate::input::{InputEvent, InputOutcome, Source, WindowResize};
@@ -11825,7 +11829,22 @@ mod least_window_size_tests {
                 );
             };
             let grid = |app: &crate::App| (app.windows[&wid].rows, app.windows[&wid].cols);
-            for asked in [(6, 20), (12, 220), (60, 22)] {
+            // The fewest rows and columns whose view holds Settings' least view, in this window's
+            // cells: a grid's view is its cells and pads ([`crate::App::native_ui_full_viewport`]).
+            let (cw, ch) = app.win_cell_size(wid);
+            let (pad, device) = (app.win_pad(wid), app.windows[&wid].scale as f32);
+            let fewest = |least: f32, cell: usize, pads: usize| -> u16 {
+                (1..=u16::MAX)
+                    .find(|&n| (usize::from(n) * cell + pads) as f32 / device + 0.01 >= least)
+                    .expect("some grid holds the least view")
+            };
+            let least = (fewest(least_h, ch, pad), fewest(least_w, cw, 2 * pad));
+            assert!(
+                least.0 > 1 && least.1 > 1,
+                "precondition: a {cw}x{ch} cell is under the {least_w}x{least_h} least view"
+            );
+            let (under, roomy) = ((least.0 - 1, least.1 - 1), (2 * least.0, 2 * least.1));
+            for asked in [under, (under.0, roomy.1), (roomy.0, under.1)] {
                 let reply = app.input(
                     wid,
                     InputEvent::Resize {
@@ -11842,9 +11861,11 @@ mod least_window_size_tests {
                     InputOutcome::Resized(WindowResize::Grid { asked, given }),
                     "{scale}x: the reply names the grid given"
                 );
-                assert!(
-                    given != asked && given.0 >= asked.0 && given.1 >= asked.1,
-                    "{scale}x: {asked:?} is under the least on an axis, held to {given:?}"
+                assert_eq!(
+                    given,
+                    (asked.0.max(least.0), asked.1.max(least.1)),
+                    "{scale}x: {asked:?}, under the least {least:?} on an axis, is held to it there \
+                     and given as asked on the other"
                 );
             }
             let roomy = (grid(&app).0 + 3, grid(&app).1 + 5);

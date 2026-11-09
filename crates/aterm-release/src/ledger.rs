@@ -126,6 +126,14 @@ pub trait Origin {
     fn tag_commit(&self, _tag: &str) -> std::result::Result<Option<String>, String> {
         Err("this origin does not resolve release tag commits".into())
     }
+    /// First advertised tag in preference order, imported and proved a commit
+    /// from one complete inventory. Unselected tags need no object transfer.
+    fn first_tag_commit(
+        &self,
+        _tags: &[String],
+    ) -> std::result::Result<Option<(String, String)>, String> {
+        Err("this origin does not select a tag baseline".into())
+    }
     /// A child's exact imported declared branch tip, or its advertised HEAD.
     fn submodule_tip(&self, _path: &Path, _reference: &str) -> std::result::Result<String, String> {
         Err("this origin does not resolve submodule tips".into())
@@ -165,6 +173,13 @@ impl Origin for crate::github_remote::Remote {
 
     fn tag_commit(&self, tag: &str) -> std::result::Result<Option<String>, String> {
         Self::tag_commit(self, tag)
+    }
+
+    fn first_tag_commit(
+        &self,
+        tags: &[String],
+    ) -> std::result::Result<Option<(String, String)>, String> {
+        Self::first_tag_commit(self, tags)
     }
 
     fn submodule_tip(&self, path: &Path, reference: &str) -> std::result::Result<String, String> {

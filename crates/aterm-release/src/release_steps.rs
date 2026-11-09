@@ -637,15 +637,14 @@ impl Drop for Forwarded {
 impl Drop for Real {
     fn drop(&mut self) {
         if let Some(mut child) = self.automatic_prefreeze.take() {
-            // The supervisor handles TERM and settles its worker before exiting. Reap
-            // it here, after the step timers, only once that cleanup has completed.
-            if child.terminate().is_err() || child.wait().is_err() {
-                aterm_uds::deadline::settle_child(&mut child);
-            }
+            // The clone's singleton supervisor owns preparation between cuts too.
+            // Reap a finished supervisor; a live one is reparented on this image's
+            // exit and stops at the next release-line claim.
+            let _ = child.try_wait();
             self.say(&format!(
                 "release-event: {}",
                 aterm_json::json!({
-                    "schema":1,"event":"prefreeze-ended","timing_scope":"next-cut",
+                    "schema":1,"event":"prefreeze-handed-on","timing_scope":"next-cut",
                 })
             ));
         }
@@ -2133,6 +2132,9 @@ impl Real {
         let args = Self::frozen_tool_args(&self.repo, bin, profile, layout.as_deref());
         let mut command = self.child(prover.bin.join("targo"), Some(prover));
         command.args(&args).current_dir(&self.repo);
+        // Keep Cargo's actual dirty-unit reasons beside the artifact counts. A
+        // later cut must distinguish a source delta from cache invalidation.
+        command.env("CARGO_LOG", "targo::compiler::fingerprint=info");
         let (output, accounting) = self
             .output_accounted(self.step, &mut command)
             .map_err(|e| format!("{} build: {e}", bin.what))?;
@@ -2242,6 +2244,27 @@ impl Real {
         }
         let cache = self.release.join("cutter-cache");
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if self.line_priority.is_some() {
+            // The new line makes the clone's old supervisor settle its compiler.
+            // Join that handoff before competing for its workspace; a live
+            // background owner is cancellation in progress, not a cut refusal.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while crate::release::live_holder(&cache.join("prefreeze-running"), &mut started_of)
+                .is_some()
+            {
+                if interrupt::caught().is_some() {
+                    return Err("interrupted while settling cutter preparation".into());
+                }
+                if std::time::Instant::now() >= until {
+                    return Err(
+                        "cutter preparation did not settle after the next cut claimed its line"
+                            .into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let pid = std::process::id();
         let started = started_of(pid).ok_or("cannot identify cutter workspace holder")?;
         let _lease = crate::release::RunClaim::take(
@@ -5617,8 +5640,7 @@ impl Backend for Real {
                     .stderr(log)
                     .setsid(true)
                     .default_signals()
-                    .enter_background_band()
-                    .tether();
+                    .enter_background_band();
                 cmd.spawn().map_err(|e| e.to_string())
             };
             match start() {
@@ -6392,7 +6414,13 @@ impl Backend for Real {
                 .git_out(&["rev-parse", "origin/main"])
                 .unwrap_or_default();
             self.main_to(&tip)?;
-            self.submodule_sync(Step::Commit)?;
+            {
+                let _phase = crate::cut_timing::Timer::start(
+                    &self.step_log(self.step),
+                    "bump-submodule-sync",
+                );
+                self.submodule_sync(Step::Commit)?;
+            }
             let cur = self.version_at("HEAD").unwrap_or_default();
             if cur != from {
                 return Err(Refusal::new(
@@ -6477,6 +6505,8 @@ impl Backend for Real {
             // The bump opens a release window, so it also carries the harness versions the
             // window owes (`ship harness-bump`'s writes), after the version-only check above
             // judged the edit's own changes.
+            let harness_timing =
+                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-harness-versions");
             let owed = match crate::harness_versions::apply(&self.repo, &origin) {
                 Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
                 Err(e) => {
@@ -6489,6 +6519,7 @@ impl Backend for Real {
                     ));
                 }
             };
+            drop(harness_timing);
             let msg = if owed.is_empty() {
                 format!("release: {to} — the version and the lockfile move together")
             } else {
@@ -6508,6 +6539,8 @@ impl Backend for Real {
                 .args(&followed)
                 .args(crate::harness_versions::written(&owed))
                 .current_dir(&self.repo);
+            let commit_timing =
+                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
             if self.logged(Step::Commit, &mut commit).code != 0 {
                 undo(self);
                 return Err(Refusal::new(
@@ -6515,7 +6548,10 @@ impl Backend for Real {
                     "read the commit step's log",
                 ));
             }
+            drop(commit_timing);
             let bumped = self.head();
+            let _write_timing =
+                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-native-ref-write");
             match origin.write_ref("refs/heads/main", Some(&tip), &bumped) {
                 Ok(crate::ledger::RefWrite::Written) => return Ok(bumped),
                 Ok(crate::ledger::RefWrite::Conflict) => {}
@@ -6878,6 +6914,23 @@ impl Backend for Real {
         let mut blocks: Vec<Refusal> = Vec::new();
         let git = self.git();
         let origin = crate::publish::native_origin(&self.repo);
+        let sealed = if dry {
+            None
+        } else {
+            let snapshot = (|| {
+                Ok::<_, String>((
+                    crate::build_inputs::current()?,
+                    origin
+                        .as_ref()
+                        .map_err(ToString::to_string)?
+                        .tag_fingerprint()?,
+                ))
+            })();
+            match snapshot {
+                Ok(record) => Some(record),
+                Err(why) => return vec![cut_refusal("commit gate inputs", &why).could_not_run()],
+            }
+        };
         let with_origin =
             |check: &dyn Fn(&dyn crate::ledger::Origin) -> crate::ledger::Result<()>| match &origin
             {
@@ -6952,6 +7005,28 @@ impl Backend for Real {
                  engine's main since 2026-09-29) with --engine; the release syncs its own copy \
                  of it",
             ));
+        }
+        if blocks.is_empty()
+            && let Some((inputs, tags)) = sealed
+        {
+            let record = (|| {
+                let after = origin
+                    .as_ref()
+                    .map_err(ToString::to_string)?
+                    .tag_fingerprint()?;
+                if tags != after {
+                    return Err(
+                        "advertised release tags changed while qualify judged fixtures/policy"
+                            .into(),
+                    );
+                }
+                crate::gates::CommitGateRecord::new(&c.commit, &c.version, inputs, tags)
+                    .save(&git)
+                    .map_err(|e| e.to_string())
+            })();
+            if let Err(why) = record {
+                blocks.push(cut_refusal("commit gate record", &why).could_not_run());
+            }
         }
         blocks
     }
@@ -7753,8 +7828,8 @@ fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
     Ok(Some(claim))
 }
 
-/// Preparation without publication work. Standalone callers refresh origin/main;
-/// the automatic supervisor refreshes it and owns the worker under the cut's rank.
+/// Preparation without publication work. Standalone callers use local origin/main;
+/// the automatic worker refreshes it under admission before preparing its graph.
 fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), String> {
     #[cfg(not(unix))]
     {
@@ -7823,18 +7898,10 @@ fn prepare_cached_cutter(
 ) -> Result<crate::release_tools::Cutter, String> {
     real.prefreeze_claim = Some(prefreeze_admission()?);
     let tip = if std::env::var_os(PREFREEZE_WORKER).is_some() {
-        let mut fetch = real.child(aterm_uds::os_path!("git"), None);
-        fetch.args(["fetch", "origin"]).env_remove("GITHUB_TOKEN");
-        if !fetch
-            .spawn()
-            .and_then(|mut child| child.wait())
-            .map_err(|e| e.to_string())?
-            .success()
-        {
-            return Err("cannot refresh origin/main for preparation".into());
-        }
-        real.git_out(&["rev-parse", "origin/main"])
-            .ok_or("cannot resolve refreshed origin/main")?
+        // The typed native boundary imports only the selected main object and
+        // updates its tracking ref by CAS. Repeated preparation needs no tag
+        // inventory and must use the source's recorded agh identity.
+        (real.source_origin)(&real.repo)?.refresh_main()?
     } else {
         tip.to_owned()
     };
@@ -7864,13 +7931,36 @@ fn prepare_cached_cutter(
 #[cfg(unix)]
 fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
     interrupt::install();
+    let cache = aterm_verify::engine::release_dir(repo).join("cutter-cache");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let pid = std::process::id();
+    let started = started_of(pid).ok_or("cannot identify pre-freeze supervisor")?;
+    let _owner = crate::release::RunClaim::take(
+        &cache.join("prefreeze-running"),
+        (pid, &started),
+        &cache,
+        &mut started_of,
+    )
+    .map_err(|why| format!("pre-freeze supervisor unavailable: {why:?}"))?;
     let ledger = aterm_capacity::Ledger::user().ok_or("capacity ledger unavailable")?;
     let mut worker = PrefreezeWorker(None);
+    let mut worker_covered = false;
+    let mut next = std::time::Instant::now();
     loop {
         if interrupt::caught().is_some() {
             return Ok(());
         }
         let rows = ledger.list().map_err(|e| e.to_string())?;
+        let covered = rows.iter().any(|row| row.cover_marker() == line);
+        if worker_covered && !covered {
+            // A worker admitted beside the old line must not retain Release rank
+            // between cuts. Settle it and let Background admission own the rest.
+            if let Some(mut child) = worker.0.take() {
+                aterm_uds::deadline::settle_child(&mut child);
+            }
+            worker_covered = false;
+            next = std::time::Instant::now();
+        }
         let own = worker.0.as_ref().map(aterm_uds::spawnfd::Child::id);
         let state = prefreeze_traffic(&rows, line, own);
         if state != PrefreezeTraffic::Free {
@@ -7894,23 +7984,43 @@ fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
                         "schema":1,"event":"prefreeze-finished","success":status.success(),
                     })
                 );
-                return Ok(());
+                worker.0 = None;
+                // Main can acquire cutter changes after READY. Keep following it
+                // until the next cut; the worker fetches and Cargo judges the
+                // delta in the same persistent checkout. Failures use the same
+                // paced retry, without a request or a foreground build.
+                next = std::time::Instant::now() + PREFREEZE_REFRESH;
             }
-        } else {
+        } else if prefreeze_due(std::time::Instant::now(), next) {
             let mut cmd = command(std::env::current_exe().map_err(|e| e.to_string())?);
             cmd.args(["release", "--prefreeze"])
                 .current_dir(repo)
                 .env_remove(AUTO_PREFREEZE)
                 .env(PREFREEZE_WORKER, "1")
-                .env(aterm_capacity::RELEASE_RUN_ENV, "1")
                 .setsid(true)
                 .default_signals()
                 .enter_background_band()
                 .tether();
+            if covered {
+                // The original line permits preparation beside its untimed tail.
+                cmd.env(aterm_capacity::RELEASE_RUN_ENV, "1");
+            } else {
+                // Between cuts this is ordinary cancellable Background work.
+                cmd.env_remove(aterm_capacity::RELEASE_RUN_ENV);
+            }
             worker.0 = Some(cmd.spawn().map_err(|e| e.to_string())?);
+            worker_covered = covered;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+const PREFREEZE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(unix)]
+fn prefreeze_due(now: std::time::Instant, next: std::time::Instant) -> bool {
+    now >= next
 }
 
 #[cfg(unix)]
@@ -7927,16 +8037,14 @@ fn prefreeze_traffic(
     line: &str,
     worker: Option<u32>,
 ) -> PrefreezeTraffic {
-    let Some(owner) = rows.iter().find(|row| row.cover_marker() == line) else {
-        return PrefreezeTraffic::End;
-    };
+    let owner = rows.iter().find(|row| row.cover_marker() == line);
     let mut result = PrefreezeTraffic::Free;
     for row in rows {
         if row.cover_marker() == line || Some(row.pid) == worker {
             continue;
         }
         if row.need.rank == aterm_capacity::Rank::Release {
-            if row.need.what == owner.need.what
+            if row.need.what == owner.map_or("release line", |row| row.need.what.as_str())
                 && row.need.mem == 0
                 && row.need.cores == 0
                 && row.need.disk == 0
@@ -8534,7 +8642,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn automatic_prefreeze_yields_to_stages_and_windows_and_ends_with_its_line() {
+    fn automatic_prefreeze_follows_between_cuts_and_yields_to_stages_and_windows() {
         use super::*;
         let row = |pid, need| aterm_capacity::Record {
             accounting: aterm_capacity::Accounting::default(),
@@ -8551,7 +8659,7 @@ mod tests {
         };
         let line = row(
             1,
-            aterm_capacity::Need::new("line").rank(aterm_capacity::Rank::Release),
+            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
         );
         let marker = line.cover_marker();
         let worker = row(2, prefreeze_need().rank(aterm_capacity::Rank::Release));
@@ -8577,16 +8685,30 @@ mod tests {
         );
         let next = row(
             3,
-            aterm_capacity::Need::new("line").rank(aterm_capacity::Rank::Release),
+            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
         );
         assert_eq!(
-            prefreeze_traffic(&[line, worker.clone(), next], &marker, Some(2)),
+            prefreeze_traffic(&[line, worker.clone(), next.clone()], &marker, Some(2)),
             PrefreezeTraffic::End
+        );
+        assert_eq!(
+            prefreeze_traffic(&[next], &marker, None),
+            PrefreezeTraffic::End,
+            "a new cut must cancel preparation after the old cut exited"
         );
         assert_eq!(
             prefreeze_traffic(&[worker], &marker, Some(2)),
-            PrefreezeTraffic::End
+            PrefreezeTraffic::Free,
+            "the old cut ending must not stop following main"
         );
+        assert_eq!(
+            prefreeze_traffic(&[], &marker, None),
+            PrefreezeTraffic::Free
+        );
+        let now = std::time::Instant::now();
+        let next = now + PREFREEZE_REFRESH;
+        assert!(!prefreeze_due(now, next));
+        assert!(prefreeze_due(next, next));
     }
 
     /// Small real Cargo graph, no release, credential, service or product execution.
@@ -8607,7 +8729,14 @@ mod tests {
             "[unstable]\nchecksum-freshness=true\n",
         )
         .unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers=['dep','crates/aterm-release']\nresolver='2'\n[profile.gate]\ninherits='dev'\n").unwrap();
+        std::fs::create_dir_all(repo.join("app/src")).unwrap();
+        std::fs::write(repo.join("app/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            repo.join("app/Cargo.toml"),
+            "[package]\nname='app'\nversion.workspace=true\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers=['dep','app','crates/aterm-release']\nresolver='2'\n[workspace.package]\nversion='1.0.0'\n[profile.gate]\ninherits='dev'\n").unwrap();
         std::fs::write(repo.join("crates/aterm-release/Cargo.toml"), "[package]\nname='aterm-release'\nversion='0.0.0'\nedition='2021'\n[dependencies]\ncutter-dep={path='../../dep'}\n").unwrap();
         std::fs::write(
             repo.join("dep/Cargo.toml"),
@@ -8622,7 +8751,7 @@ mod tests {
         let program =
             "fn main() { let _ = cutter_dep::marker(); println!(\"aterm-release tool 1\"); }\n";
         std::fs::write(repo.join("crates/aterm-release/src/main.rs"), program).unwrap();
-        std::fs::write(repo.join("Cargo.lock"), "version=4\n[[package]]\nname='aterm-release'\nversion='0.0.0'\ndependencies=['cutter-dep']\n[[package]]\nname='cutter-dep'\nversion='0.0.0'\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "version=4\n[[package]]\nname='app'\nversion='1.0.0'\n[[package]]\nname='aterm-release'\nversion='0.0.0'\ndependencies=['cutter-dep']\n[[package]]\nname='cutter-dep'\nversion='0.0.0'\n").unwrap();
         let git = GitCli::new(&repo);
         let git_run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
         git_run(&["init", "-q"]);
@@ -8649,9 +8778,9 @@ mod tests {
             commit: "0".repeat(40),
             source: "fixture pinned Trust".into(),
         };
-        for prepared in [false, true] {
+        for (take, prepared) in [false, true, true, false].into_iter().enumerate() {
             git_run(&["checkout", "--quiet", "--detach", &base]);
-            let state = temp.path().join(if prepared { "after" } else { "before" });
+            let state = temp.path().join(format!("take-{take}-{prepared}"));
             let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
             real.scratch_logs = false;
             real.release = state.join("release");
@@ -8695,6 +8824,29 @@ mod tests {
             };
             let first = compiled(&log);
             assert_eq!(first, if prepared { 0 } else { 1 });
+            let hop = |label: &str, expected: u64| {
+                let text = std::fs::read_to_string(&log).unwrap();
+                assert_eq!(compiled(&log), expected, "{label}");
+                println!(
+                    "prefreeze-timeline take={take} prepared={prepared} hop={label} compiled={expected}"
+                );
+                for line in text.lines().filter(|line| {
+                    line.contains("fingerprint") || line.starts_with("release-event: ")
+                }) {
+                    println!("{line}");
+                }
+            };
+            hop("unchanged", first);
+            let manifest = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap();
+            let lock = std::fs::read_to_string(repo.join("Cargo.lock")).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), manifest.replace("1.0.0", "2.0.0")).unwrap();
+            std::fs::write(repo.join("Cargo.lock"), lock.replace("1.0.0", "2.0.0")).unwrap();
+            let bump = commit();
+            std::fs::write(&log, "").unwrap();
+            let bumped = real.frozen_cutter(&bump, &prover).unwrap();
+            assert_eq!(bumped.built_from, next_cutter.built_from);
+            assert_eq!(bumped.inputs, next_cutter.inputs);
+            hop("bump-only", 0);
             if prepared {
                 assert_eq!(next_cutter.built_from, moved);
                 std::fs::write(
@@ -8708,8 +8860,166 @@ mod tests {
                 assert_eq!(compiled(&log), 1, "unchanged dependency stays fresh");
                 assert_eq!(delta_cutter.built_from, delta);
                 assert_ne!(delta_cutter.inputs, next_cutter.inputs);
+                hop("real-cutter-change", 1);
+                std::fs::write(
+                    repo.join("dep/src/lib.rs"),
+                    "pub fn marker() -> u32 { 2 }\n",
+                )
+                .unwrap();
+                let manifest = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap();
+                let lock = std::fs::read_to_string(repo.join("Cargo.lock")).unwrap();
+                std::fs::write(repo.join("Cargo.toml"), manifest.replace("2.0.0", "3.0.0"))
+                    .unwrap();
+                std::fs::write(repo.join("Cargo.lock"), lock.replace("2.0.0", "3.0.0")).unwrap();
+                let delta = commit();
+                std::fs::write(&log, "").unwrap();
+                let cutter = real.frozen_cutter(&delta, &prover).unwrap();
+                assert_eq!(
+                    cutter.built_from, delta,
+                    "a bump carrying a real input cannot adopt another input's pre-freeze"
+                );
+                assert_ne!(cutter.inputs, bumped.inputs);
+                hop("real-dependency-change", 2);
             }
             println!("prefreeze-timeline prepared={prepared} next_freeze_compiled_units={first}");
+        }
+    }
+
+    /// Read-only native origin observations and local bump writes in a disposable
+    /// clone. Deliberately stops before the native ref write or any publication.
+    #[test]
+    #[ignore = "explicit local bump attribution; reads configured source origin"]
+    fn measure_local_bump_parts() {
+        let source = std::env::current_dir().unwrap();
+        let original = GitCli::new(&source);
+        let url = crate::ledger::git_ok(&original, &["remote", "get-url", "origin"])
+            .unwrap()
+            .stdout_utf8();
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        crate::ledger::git_ok(
+            &original,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                source.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let git = GitCli::new(&repo);
+        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url.trim()]).unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "submodule.vendor/astream.url",
+                source.join("vendor/astream").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "vendor/astream",
+            ],
+        )
+        .unwrap();
+        let mut real = Real::new(&repo, Some(&source), true, false).unwrap();
+        let prover = real.prover(None).unwrap();
+        let from = real.version_at("HEAD").unwrap();
+        let to = crate::publish::bump_minor_release(&from).unwrap();
+        crate::cut_timing::measure("fixture-bump-origin", || {
+            crate::publish::native_origin(&repo).unwrap()
+        });
+        let editor = PathBuf::from(std::env::var_os("ATERM_RELEASE_BUMP_EDITOR").unwrap());
+        crate::cut_timing::measure("fixture-bump-editor", || {
+            let mut cmd = real.child(editor, None);
+            cmd.arg(&repo).args([&to, &from]);
+            assert_eq!(real.logged(Step::Commit, &mut cmd).code, 0);
+        });
+        crate::cut_timing::measure("fixture-bump-lockfiles", || {
+            let changed = bump_nested_locks(
+                &repo,
+                real.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]),
+                &from,
+                &to,
+            )
+            .unwrap();
+            real.validate_bumped_locks(&prover, &changed).unwrap();
+        });
+        crate::cut_timing::measure("fixture-bump-harness", || {
+            // A libtest image has no credential-helper dispatch. Use the real
+            // diagnostic CLI, so its native origin uses its own typed helper.
+            let cli = PathBuf::from(std::env::var_os("ATERM_RELEASE_DIAGNOSTIC").unwrap());
+            let mut cmd = real.child(cli, None);
+            cmd.arg("harness-bump");
+            assert_eq!(real.logged(Step::Commit, &mut cmd).code, 0);
+        });
+        crate::cut_timing::measure("fixture-bump-commit", || {
+            crate::ledger::git_ok(
+                &git,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qam",
+                    "Fixture bump (never pushed)",
+                ],
+            )
+            .unwrap();
+        });
+        // Keep this mutable so Real's destructor owns all its ordinary cleanup.
+        real.scratch_logs = true;
+    }
+
+    /// Replay exact historical compiler graphs in one persistent private checkout.
+    /// The seal is fixed fixture evidence; this measures compiler reuse, not an SDK walk.
+    #[test]
+    #[ignore = "explicit full cutter rebuild attribution"]
+    fn measure_real_cutter_rebuilds() {
+        let repo = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let state = PathBuf::from(std::env::var_os("ATERM_RELEASE_REBUILD_STATE").unwrap());
+        assert!(state.is_absolute());
+        let commits = std::env::var("ATERM_RELEASE_REBUILD_COMMITS").unwrap();
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.state = state.join("state");
+        real.release = state.join("release");
+        real.logs = state.join("logs");
+        real.build_inputs = || Ok("f".repeat(64));
+        real.arm_inputs = |_, _| {};
+        std::fs::create_dir_all(&real.logs).unwrap();
+        let prover = real.prover(None).unwrap();
+        for rev in commits.split(',') {
+            let commit = crate::ledger::git_ok(&real.git(), &["rev-parse", rev])
+                .unwrap()
+                .stdout_utf8();
+            let compiler = real
+                .cutter_workspace_at(&real.release.join("cutter-cache"), commit.trim())
+                .unwrap();
+            let log = compiler.step_log(compiler.step);
+            std::fs::write(&log, "").unwrap();
+            let cutter = compiler.frozen_cutter_here(commit.trim(), &prover).unwrap();
+            std::fs::copy(&log, state.join(format!("{rev}.log"))).unwrap();
+            println!("cutter-rebuild rev={rev} built_from={}", cutter.built_from);
+            for line in std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("fingerprint") || line.starts_with("release-event: "))
+            {
+                println!("{line}");
+            }
         }
     }
 

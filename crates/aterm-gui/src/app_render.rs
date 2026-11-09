@@ -2392,6 +2392,72 @@ mod fallback_convergence_tests {
     }
 }
 
+#[cfg(test)]
+mod gpu_lost_remedy_tests {
+    use super::*;
+
+    /// The present that lands the GPU-lost remedy (`gpu_lost_remedy_floor`, set on Windows)
+    /// resolves its row on the center alone: no window draws the row, so the present asks every
+    /// window for no frame, and it settles nothing, so a strip fall the floor let go waits for
+    /// the loop's own settle rather than re-gridding every window from inside a present.
+    #[test]
+    fn the_present_that_lands_the_gpu_lost_remedy_resolves_its_row_and_asks_no_frame() {
+        use aterm_messages::chrome::CHROME_REGROW_SETTLE;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows
+            .get_mut(&wid)
+            .expect("window 0")
+            .chrome_regrids_for_test = true;
+        let t0 = Instant::now()
+            .checked_sub(CHROME_REGROW_SETTLE * 2)
+            .expect("the clock reads past two floors");
+        app.set_tab_strip_rows(1, t0);
+        app.set_tab_strip_rows(0, t0 + Duration::from_millis(20));
+        assert_eq!(
+            app.tab_strip_rows, 1,
+            "PRECONDITION: the floor held the fall"
+        );
+        let row = app
+            .messages
+            .post(
+                crate::message_reporters::gpu_lost(),
+                app.messages_wall.now(),
+                Instant::now(),
+            )
+            .id;
+        assert!(
+            app.messages.live(row).is_some(),
+            "PRECONDITION: the row is live"
+        );
+        app.gpu_lost_remedy_floor = Some(wid);
+        let asks = crate::redraw_all_requests_on_this_thread();
+        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+        app.finalize_successful_present(
+            wid,
+            metrics::StartupPresentTiming::collapsed(Instant::now()),
+            0,
+            None,
+            SuccessfulPresentRoute::Terminal,
+            crate::VisibleContentRoute::Terminal { composed: false },
+            HostVisualState::default(),
+            None,
+            &plan,
+        );
+        assert_eq!(app.gpu_lost_remedy_floor, None, "the remedy landed");
+        assert!(app.messages.live(row).is_none(), "its row is resolved");
+        assert_eq!(
+            crate::redraw_all_requests_on_this_thread(),
+            asks,
+            "the present asks every window for no frame"
+        );
+        assert_eq!(
+            app.tab_strip_rows, 1,
+            "the present settles nothing: the fall is the loop's settle's"
+        );
+    }
+}
+
 #[cfg(all(test, any(windows, target_os = "linux")))]
 mod strip_band_landing_tests {
     use super::*;
@@ -3290,8 +3356,56 @@ pub(crate) fn claim_chrome_rows(ws: &mut crate::WindowState, band: std::ops::Ran
     }
 }
 
-fn chrome_owns_terminal_row_of(ws: &crate::WindowState, row: usize) -> bool {
+pub(crate) fn claim_chrome_span(
+    ws: &mut crate::WindowState,
+    band: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) {
+    if cols.start == 0 && cols.end >= usize::from(ws.cols) {
+        claim_chrome_rows(ws, band);
+        return;
+    }
+    let strip = ws
+        .input_scratch
+        .cells
+        .len()
+        .saturating_sub(usize::from(ws.rows));
+    let band = band.start.saturating_sub(strip)..band.end.saturating_sub(strip);
+    if !band.is_empty() && !cols.is_empty() {
+        ws.chrome_spans.push((band, cols));
+    }
+}
+
+pub(crate) fn chrome_owns_terminal_row_of(ws: &crate::WindowState, row: usize) -> bool {
     ws.chrome_rows.iter().any(|band| band.contains(&row))
+}
+
+pub(crate) fn chrome_owns_terminal_cell_of(
+    ws: &crate::WindowState,
+    row: usize,
+    col: usize,
+) -> bool {
+    chrome_owns_terminal_row_of(ws, row)
+        || ws
+            .chrome_spans
+            .iter()
+            .any(|(rows, cols)| rows.contains(&row) && cols.contains(&col))
+}
+
+pub(crate) fn chrome_owns_terminal_span_of(
+    ws: &crate::WindowState,
+    row: usize,
+    span: std::ops::Range<usize>,
+) -> bool {
+    chrome_owns_terminal_row_of(ws, row)
+        || ws.chrome_spans.iter().any(|(rows, cols)| {
+            rows.contains(&row) && cols.start < span.end && span.start < cols.end
+        })
+}
+
+fn chrome_owns_any_on_terminal_row_of(ws: &crate::WindowState, row: usize) -> bool {
+    chrome_owns_terminal_row_of(ws, row)
+        || ws.chrome_spans.iter().any(|(rows, _)| rows.contains(&row))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -11589,8 +11703,13 @@ impl App {
                 .messages
                 .live_by_key(crate::message_reporters::KEY_GPU_LOST)
             {
+                // Only the center changes: no window draws the row, and a present settles
+                // nothing (a settle can re-grid the strip). The loop's next turn settles and
+                // publishes it, and its deadline holds a publish the gap defers.
                 let row = live.id;
-                self.resolve_message(row, aterm_messages::Outcome::Ok);
+                let _ = self
+                    .messages
+                    .resolve(row, aterm_messages::Outcome::Ok, Instant::now());
             }
         }
         #[cfg(any(windows, target_os = "linux"))]
@@ -17424,6 +17543,7 @@ impl App {
         self.backend.set_chrome_bleed(bleed);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.chrome_rows.clear();
+            ws.chrome_spans.clear();
         }
         if !self.windows.contains_key(&wid) {
             return;
@@ -18206,15 +18326,21 @@ impl App {
                 }
             }
         }
-        claim_chrome_rows(ws, frame_band.clone());
-        if frame_band.end == nrows {
-            if ws.input_scratch.grid_bot_row > frame_band.start {
-                let top = ws.input_scratch.grid_top_row;
-                ws.input_scratch.grid_bot_row = frame_band.start.max(top);
+        claim_chrome_span(
+            ws,
+            frame_band.clone(),
+            region.col0..region.col0 + region.cols,
+        );
+        if whole_rows {
+            if frame_band.end == nrows {
+                if ws.input_scratch.grid_bot_row > frame_band.start {
+                    let top = ws.input_scratch.grid_top_row;
+                    ws.input_scratch.grid_bot_row = frame_band.start.max(top);
+                }
+            } else if ws.input_scratch.grid_top_row < frame_band.end {
+                let bot = ws.input_scratch.grid_bot_row;
+                ws.input_scratch.grid_top_row = frame_band.end.min(bot);
             }
-        } else if ws.input_scratch.grid_top_row < frame_band.end {
-            let bot = ws.input_scratch.grid_bot_row;
-            ws.input_scratch.grid_top_row = frame_band.end.min(bot);
         }
         let at = |cols: Range<usize>| cols.start + region.col0..cols.end + region.col0;
         let field_cols = at(painted.field_cols.clone());
@@ -18610,7 +18736,12 @@ impl App {
             // Distinct branch.
             return None; // the ordinary frame: no hover, no band, no cost
         };
-        if self.chrome_owns_terminal_row(wid, usize::from(hover.window_row)) {
+        let (_, pane_col, _, pane_cols) = self.focused_pane_rect(wid);
+        if self.chrome_owns_terminal_span(
+            wid,
+            usize::from(hover.window_row),
+            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)),
+        ) {
             return None;
         }
         if !self
@@ -18691,7 +18822,7 @@ impl App {
             usize::from(hover.window_row) != *row
                 && caret != Some(strip + row)
                 && !carets.contains(row)
-                && !chrome_owns_terminal_row_of(ws, *row)
+                && !chrome_owns_any_on_terminal_row_of(ws, *row)
         };
         let term_row = [bottom, 0].into_iter().find(free)?;
         Some((strip + term_row, term_row == bottom))
@@ -18734,10 +18865,30 @@ impl App {
     }
 
     /// Whether window chrome took terminal row `row` in the frame being composed (i.e. the pointer on that row is over a band, not the grid).
+    #[cfg(test)]
     pub(crate) fn chrome_owns_terminal_row(&self, wid: WindowId, row: usize) -> bool {
         self.windows
             .get(&wid)
             .is_some_and(|ws| chrome_owns_terminal_row_of(ws, row))
+    }
+
+    /// Whether window chrome took terminal cell `(row, col)` in the frame being composed.
+    pub(crate) fn chrome_owns_terminal_cell(&self, wid: WindowId, row: usize, col: usize) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| chrome_owns_terminal_cell_of(ws, row, col))
+    }
+
+    /// Whether window chrome overlaps terminal `span` on `row` in the frame being composed.
+    pub(crate) fn chrome_owns_terminal_span(
+        &self,
+        wid: WindowId,
+        row: usize,
+        span: std::ops::Range<usize>,
+    ) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| chrome_owns_terminal_span_of(ws, row, span))
     }
 
     /// Frame rows (`0..n`) that `wid`'s top confirmation banner (`paste_banner` or `close_band`)

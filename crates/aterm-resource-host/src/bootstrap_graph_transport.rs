@@ -62,13 +62,11 @@ pub(crate) fn support(
         return Err(refused());
     }
     channel.send(&reply.encode()?, deadline)?;
-    trust_resource_controller::runtime_input_retention::transport::finish_reply(&mut channel)?;
-    if matches!(reply, wire::SupportReply::Supported { .. })
-        && channel.receive(deadline)?.as_slice() != [1]
-    {
-        return Err(refused());
-    }
-    Ok(())
+    crate::runtime_input_transport::finish_support_reply(
+        &mut channel,
+        matches!(reply, wire::SupportReply::Supported { .. }),
+        deadline,
+    )
 }
 
 pub(crate) fn serve(

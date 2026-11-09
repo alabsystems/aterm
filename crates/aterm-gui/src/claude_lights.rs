@@ -1303,16 +1303,23 @@ impl WindowLights {
         )
     }
 
-    /// A digest of the pre-footer chrome bands (`ws.chrome_rows`), `0` when none are open.
-    fn chrome_rows_digest(chrome_rows: &[std::ops::Range<usize>]) -> u64 {
+    /// A digest of the pre-footer chrome bands (`ws.chrome_rows` and `ws.chrome_spans`), `0` when none are open.
+    fn chrome_rows_digest(
+        chrome_rows: &[std::ops::Range<usize>],
+        chrome_spans: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
-        if chrome_rows.is_empty() {
+        if chrome_rows.is_empty() && chrome_spans.is_empty() {
             return 0;
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         chrome_rows.len().hash(&mut h);
         for band in chrome_rows {
             band.hash(&mut h);
+        }
+        chrome_spans.len().hash(&mut h);
+        for (rows, cols) in chrome_spans {
+            (rows, cols).hash(&mut h);
         }
         h.finish() | 1
     }
@@ -1528,29 +1535,29 @@ impl WindowLights {
     /// Whether `target` of `session` is on this frame's glass.
     #[cfg(all(test, target_os = "macos"))]
     fn shows(&self, session: u64, target: Target) -> bool {
-        self.shows_uncovered(session, target, |_| false)
+        self.shows_uncovered(session, target, |_, _| false)
     }
 
-    /// Whether `target` of `session` is on this frame's glass and not on a row `covered` owns.
+    /// Whether `target` of `session` is on this frame's glass and not on a span `covered` owns.
     fn shows_uncovered(
         &self,
         session: u64,
         target: Target,
-        covered: impl Fn(usize) -> bool,
+        covered: impl Fn(usize, std::ops::Range<usize>) -> bool,
     ) -> bool {
         match target {
-            Target::Chip(chip) => self
-                .hits
-                .iter()
-                .any(|h| h.session == session && h.chip == Some(chip) && !covered(h.term_row)),
-            Target::Fact(fact) => self
-                .fact_hits
-                .iter()
-                .any(|h| h.session == session && h.fact == fact && !covered(h.term_row)),
+            Target::Chip(chip) => self.hits.iter().any(|h| {
+                h.session == session
+                    && h.chip == Some(chip)
+                    && !covered(h.term_row, h.col..h.col + 1)
+            }),
+            Target::Fact(fact) => self.fact_hits.iter().any(|h| {
+                h.session == session && h.fact == fact && !covered(h.term_row, h.cols.0..h.cols.1)
+            }),
             Target::Switch => self
                 .border_toggles
                 .iter()
-                .any(|b| b.session == session && !covered(b.term_row)),
+                .any(|b| b.session == session && !covered(b.term_row, b.cols.clone())),
         }
     }
 
@@ -1560,8 +1567,12 @@ impl WindowLights {
         self.selection_painted = false;
     }
 
-    /// Whether the keyboard selection's target is off the glass or on a row `covered` owns.
-    fn selection_stale(&self, covered: impl Fn(usize) -> bool) -> bool {
+    /// Whether the keyboard selection's target is off the glass or on a span `covered_span` / `covered_row` owns.
+    fn selection_stale(
+        &self,
+        covered_row: impl Fn(usize) -> bool,
+        covered_span: impl Fn(usize, std::ops::Range<usize>) -> bool,
+    ) -> bool {
         let Some((session, target)) = self.selected else {
             return false;
         };
@@ -1569,8 +1580,8 @@ impl WindowLights {
             Target::Chip(_) if !self.selection_painted => !self
                 .footers
                 .iter()
-                .any(|(s, term_row, room)| *s == session && *room > 0 && !covered(*term_row)),
-            _ => !self.shows_uncovered(session, target, covered),
+                .any(|(s, term_row, room)| *s == session && *room > 0 && !covered_row(*term_row)),
+            _ => !self.shows_uncovered(session, target, covered_span),
         }
     }
 
@@ -3950,7 +3961,11 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<Chip>)> {
-        if self.stats_lens_at(wid, x, y) || self.windows.get(&wid)?.claude_lights.hits.is_empty() {
+        if self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+            || self.windows.get(&wid)?.claude_lights.hits.is_empty()
+        {
             return None;
         }
         self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)
@@ -3970,7 +3985,8 @@ impl App {
             .hits
             .iter()
             .find(|h| h.frame_row == row && h.col == col)?;
-        (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.chip))
+        (!self.chrome_owns_terminal_cell(wid, hit.term_row, hit.col))
+            .then_some((hit.session, hit.chip))
     }
 
     /// The frame cell under window pixel `(x, y)` on the grid the glass's
@@ -4007,19 +4023,26 @@ impl App {
         &mut self,
         wid: WindowId,
         grid: Option<crate::app_mouse::GlassGrid>,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
             || self.close_band(wid).is_some()
             || self.windows.get(&wid).is_some_and(|ws| {
                 ws.pointer_position_known
-                    && self.stats_lens_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+                    && (self.stats_lens_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+                        || self
+                            .band_banner_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+                            .is_some()
+                        || self
+                            .find_bar_cell_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+                            .is_some())
             });
         let focused = self.focused_session_id(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         let regridded = std::mem::replace(&mut ws.claude_lights.drawn_at, grid) != grid;
-        let chrome = WindowLights::chrome_rows_digest(&ws.chrome_rows);
+        let chrome = WindowLights::chrome_rows_digest(&ws.chrome_rows, &ws.chrome_spans);
         let chrome_changed =
             std::mem::replace(&mut ws.claude_lights.chrome_rows_laid, chrome) != chrome;
         let uncovered =
@@ -4045,9 +4068,9 @@ impl App {
                 let lights = &mut ws.claude_lights;
                 lights.cursor_owed |= lights.glass_hover() != was;
             }
-            self.evict_stale_glass_selection(wid);
+            self.evict_stale_glass_selection(wid, Some(plan));
         } else if regridded || places_changed || chrome_changed {
-            self.evict_stale_glass_hover(wid);
+            self.evict_stale_glass_hover_in_plan(wid, Some(plan));
         }
     }
 
@@ -4059,14 +4082,40 @@ impl App {
     }
 
     /// Clear any keyboard selection in `wid` whose target moved away or was covered by a chrome band.
-    fn evict_stale_glass_selection(&mut self, wid: WindowId) {
+    fn evict_stale_glass_selection(
+        &mut self,
+        wid: WindowId,
+        plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.claude_lights.selected.is_none())
+        {
+            return;
+        }
+        let (_, pane_col, _, pane_cols) = plan.map_or_else(
+            || self.focused_pane_rect(wid),
+            |plan| self.focused_pane_rect_from_plan(wid, plan),
+        );
+        let pane_span =
+            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1);
         let mut had_fact = false;
         if let Some(ws) = self.windows.get_mut(&wid) {
-            let chrome_rows = &ws.chrome_rows;
-            if ws
-                .claude_lights
-                .selection_stale(|row| chrome_rows.iter().any(|band| band.contains(&row)))
-            {
+            let stale = {
+                let ws_ref = &*ws;
+                ws_ref.claude_lights.selection_stale(
+                    |row| {
+                        crate::app_render::chrome_owns_terminal_span_of(
+                            ws_ref,
+                            row,
+                            pane_span.clone(),
+                        )
+                    },
+                    |row, cols| crate::app_render::chrome_owns_terminal_span_of(ws_ref, row, cols),
+                )
+            };
+            if stale {
                 had_fact = ws
                     .claude_lights
                     .selected
@@ -4082,17 +4131,30 @@ impl App {
 
     /// Clear any glass hover in `wid` whose target moved away or was covered by a chrome band.
     pub(crate) fn evict_stale_glass_hover(&mut self, wid: WindowId) {
-        self.evict_stale_glass_selection(wid);
+        self.evict_stale_glass_hover_in_plan(wid, None);
+    }
+
+    fn evict_stale_glass_hover_in_plan(
+        &mut self,
+        wid: WindowId,
+        plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
+        self.evict_stale_glass_selection(wid, plan);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if WindowLights::chrome_rows_digest(&ws.chrome_rows) != ws.claude_lights.chrome_rows_laid {
+        if WindowLights::chrome_rows_digest(&ws.chrome_rows, &ws.chrome_spans)
+            != ws.claude_lights.chrome_rows_laid
+        {
             ws.claude_lights.band_covered = true;
         }
         let Some((x, y)) = ws.claude_lights.glass_hover_px else {
             return;
         };
-        if self.stats_lens_at(wid, x, y) {
+        if self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+        {
             self.note_band_covered(wid);
         }
         let at = self.claude_glass_at(wid, x, y);
@@ -4273,7 +4335,10 @@ impl App {
 
     /// What of the harness's glass is under window pixel `(x, y)`.
     pub(crate) fn claude_glass_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, GlassAt)> {
-        if self.stats_lens_at(wid, x, y) {
+        if self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+        {
             return None;
         }
         let ws = self.windows.get(&wid)?;
@@ -4292,28 +4357,28 @@ impl App {
         if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.arrow.as_ref().is_some_and(|cols| cols.contains(&col))
-                && !self.chrome_owns_terminal_row(wid, b.term_row)
+                && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
             return Some((b.session, GlassAt::Upgrade));
         }
         if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.cols.contains(&col)
-                && !self.chrome_owns_terminal_row(wid, b.term_row)
+                && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
             return Some((b.session, GlassAt::Switch(b.face)));
         }
         if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.label.as_ref().is_some_and(|cols| cols.contains(&col))
-                && !self.chrome_owns_terminal_row(wid, b.term_row)
+                && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
             return Some((b.session, GlassAt::Label));
         }
         if let Some(h) = lights.fact_hits.iter().find(|h| {
             h.frame_row == row
                 && (h.cols.0..h.cols.1).contains(&col)
-                && !self.chrome_owns_terminal_row(wid, h.term_row)
+                && !self.chrome_owns_terminal_cell(wid, h.term_row, col)
         }) {
             return Some((h.session, GlassAt::Fact(h.fact, h.restores)));
         }
@@ -4323,7 +4388,7 @@ impl App {
             .find(|m| {
                 m.frame_row == row
                     && m.cols.contains(&col)
-                    && !self.chrome_owns_terminal_row(wid, m.term_row)
+                    && !self.chrome_owns_terminal_cell(wid, m.term_row, col)
             })
             .map(|m| (m.session, GlassAt::Mark))
     }
@@ -4331,7 +4396,10 @@ impl App {
     /// The quota row's chart column under window pixel `(x, y)` ([`RowPart::Chart`]): its
     /// session, the chart's cells a day and the cell.
     fn quota_column_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, u8, usize)> {
-        if self.stats_lens_at(wid, x, y) {
+        if self.stats_lens_at(wid, x, y)
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+        {
             return None;
         }
         let (row, col) = self.glass_cell_at(wid, x, y)?;
@@ -4343,7 +4411,7 @@ impl App {
             .find(|h| {
                 h.frame_row == row
                     && (h.cols.0..h.cols.1).contains(&col)
-                    && !self.chrome_owns_terminal_row(wid, h.term_row)
+                    && !self.chrome_owns_terminal_cell(wid, h.term_row, col)
             })
             .and_then(|h| match h.part {
                 Some(RowPart::Chart(per_day)) => Some((h.session, per_day, col - h.cols.0)),
@@ -4694,8 +4762,9 @@ impl App {
                 .iter()
                 .find(|b| {
                     b.session == session
-                        && b.arrow.is_some()
-                        && !self.chrome_owns_terminal_row(wid, b.term_row)
+                        && b.arrow.as_ref().is_some_and(|cols| {
+                            !self.chrome_owns_terminal_span(wid, b.term_row, cols.clone())
+                        })
                 })
                 .map(|b| (b.paint.up, b.paint.face))
         }) else {
@@ -4756,7 +4825,7 @@ impl App {
                 hit.session == session
                     && hit.fact == fact
                     && hit.restores == restores
-                    && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                    && !self.chrome_owns_terminal_span(wid, hit.term_row, hit.cols.0..hit.cols.1)
             })
         });
         if !shown {
@@ -4835,7 +4904,7 @@ impl App {
             ws.claude_lights.hits.iter().any(|hit| {
                 hit.session == session
                     && hit.chip == chip
-                    && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                    && !self.chrome_owns_terminal_cell(wid, hit.term_row, hit.col)
             })
         });
         if !shown {
@@ -5236,6 +5305,9 @@ impl App {
         let Some(session) = self.focused_session_id(wid) else {
             return false;
         };
+        let (_, pane_col, _, pane_cols) = self.focused_pane_rect(wid);
+        let pane_span =
+            usize::from(pane_col)..usize::from(pane_col.saturating_add(pane_cols)).max(1);
         let now = Instant::now();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
@@ -5245,17 +5317,28 @@ impl App {
             .footers
             .iter()
             .find(|(id, term_row, _)| {
-                *id == session && !ws.chrome_rows.iter().any(|band| band.contains(term_row))
+                *id == session
+                    && !crate::app_render::chrome_owns_terminal_span_of(
+                        ws,
+                        *term_row,
+                        pane_span.clone(),
+                    )
             })
             .map(|(_, _, room)| *room);
-        let stale = ws.claude_lights.selected.is_some_and(|(id, target)| {
-            id != session
-                || (matches!(target, Target::Chip(_)) && room.is_none())
-                || ((ws.claude_lights.selection_painted || !matches!(target, Target::Chip(_)))
-                    && !ws.claude_lights.shows_uncovered(id, target, |row| {
-                        ws.chrome_rows.iter().any(|band| band.contains(&row))
-                    }))
-        });
+        let stale = {
+            let ws_ref = &*ws;
+            ws_ref.claude_lights.selected.is_some_and(|(id, target)| {
+                id != session
+                    || (matches!(target, Target::Chip(_)) && room.is_none())
+                    || ((ws_ref.claude_lights.selection_painted
+                        || !matches!(target, Target::Chip(_)))
+                        && !ws_ref
+                            .claude_lights
+                            .shows_uncovered(id, target, |row, cols| {
+                                crate::app_render::chrome_owns_terminal_span_of(ws_ref, row, cols)
+                            }))
+            })
+        };
         let stale_had_fact = stale
             && ws
                 .claude_lights
@@ -5266,9 +5349,11 @@ impl App {
             redraw(ws);
         }
         let order = ws.claude_lights.revealable(session);
-        let lights_ = &ws.claude_lights;
-        let chrome_rows = &ws.chrome_rows;
-        let covered = |row: usize| chrome_rows.iter().any(|band| band.contains(&row));
+        let ws_ref = &*ws;
+        let lights_ = &ws_ref.claude_lights;
+        let covered = |row: usize, cols: std::ops::Range<usize>| {
+            crate::app_render::chrome_owns_terminal_span_of(ws_ref, row, cols)
+        };
         let fits = |target: Target| match target {
             Target::Chip(chip) => room.is_some_and(|room| {
                 lights_
@@ -5327,13 +5412,18 @@ impl App {
         let chip = match target {
             Target::Chip(chip) => chip,
             Target::Switch => {
-                let face = ws
+                let ws_ref = &*ws;
+                let face = ws_ref
                     .claude_lights
                     .border_toggles
                     .iter()
                     .find(|b| {
                         b.session == session
-                            && !ws.chrome_rows.iter().any(|band| band.contains(&b.term_row))
+                            && !crate::app_render::chrome_owns_terminal_span_of(
+                                ws_ref,
+                                b.term_row,
+                                b.cols.clone(),
+                            )
                     })
                     .map(|b| b.face);
                 let clicks = matches!(
@@ -5352,14 +5442,19 @@ impl App {
                 };
             }
             Target::Fact(fact) => {
-                let hit = ws
+                let ws_ref = &*ws;
+                let hit = ws_ref
                     .claude_lights
                     .fact_hits
                     .iter()
                     .filter(|h| {
                         h.session == session
                             && h.fact == fact
-                            && !ws.chrome_rows.iter().any(|band| band.contains(&h.term_row))
+                            && !crate::app_render::chrome_owns_terminal_span_of(
+                                ws_ref,
+                                h.term_row,
+                                h.cols.0..h.cols.1,
+                            )
                     })
                     .min_by_key(|h| (h.frame_row, h.cols.0))
                     .copied();
@@ -5388,14 +5483,17 @@ impl App {
         };
         let opens_menu = chip == Chip::Autopilot && menu_key;
         if opens_menu {
-            let anchor = ws
+            let ws_ref = &*ws;
+            let anchor = ws_ref
                 .claude_lights
                 .hits
                 .iter()
                 .filter(|h| {
                     h.session == session
                         && h.chip == Some(Chip::Autopilot)
-                        && !ws.chrome_rows.iter().any(|band| band.contains(&h.term_row))
+                        && !crate::app_render::chrome_owns_terminal_cell_of(
+                            ws_ref, h.term_row, h.col,
+                        )
                 })
                 .map(|h| (h.frame_row, h.col))
                 .min_by_key(|&(_, col)| col);
@@ -5547,7 +5645,7 @@ impl App {
             let Some(row) = hit.frame_row.checked_sub(strip) else {
                 continue;
             };
-            if self.chrome_owns_terminal_row(wid, hit.term_row) {
+            if self.chrome_owns_terminal_cell(wid, hit.term_row, hit.col) {
                 continue;
             }
             match chips.last_mut() {
@@ -5574,7 +5672,7 @@ impl App {
             let Some(row) = b.frame_row.checked_sub(strip) else {
                 continue;
             };
-            if self.chrome_owns_terminal_row(wid, b.term_row) {
+            if self.chrome_owns_terminal_span(wid, b.term_row, b.cols.clone()) {
                 continue;
             }
             switches.extend(harness_switch_nodes(b, row));
@@ -5626,7 +5724,7 @@ impl App {
             let Some(row) = hit.frame_row.checked_sub(strip) else {
                 continue;
             };
-            if self.chrome_owns_terminal_row(wid, hit.term_row) {
+            if self.chrome_owns_terminal_span(wid, hit.term_row, hit.cols.0..hit.cols.1) {
                 continue;
             }
             // Line E is one chip over its parts, the row's words its name (glass design §2.6).
@@ -5687,7 +5785,7 @@ impl App {
             let Some(row) = title.frame_row.checked_sub(strip) else {
                 continue;
             };
-            if self.chrome_owns_terminal_row(wid, title.term_row) {
+            if self.chrome_owns_terminal_span(wid, title.term_row, title.cols.clone()) {
                 continue;
             }
             let words: String = ws
@@ -5732,7 +5830,8 @@ impl App {
                         .border_toggles
                         .iter()
                         .find(|b| {
-                            b.session == session && !self.chrome_owns_terminal_row(wid, b.term_row)
+                            b.session == session
+                                && !self.chrome_owns_terminal_span(wid, b.term_row, b.cols.clone())
                         })
                         .map(|b| b.face)
                 });
@@ -5761,7 +5860,11 @@ impl App {
                         .find(|h| {
                             h.session == session
                                 && h.fact == fact
-                                && !self.chrome_owns_terminal_row(wid, h.term_row)
+                                && !self.chrome_owns_terminal_span(
+                                    wid,
+                                    h.term_row,
+                                    h.cols.0..h.cols.1,
+                                )
                         })
                         .map(|h| h.restores)
                 }) else {
@@ -5783,7 +5886,7 @@ impl App {
                 .filter(|hit| {
                     hit.session == session
                         && hit.chip == Some(Chip::Autopilot)
-                        && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                        && !self.chrome_owns_terminal_cell(wid, hit.term_row, hit.col)
                 })
                 .map(|hit| (hit.frame_row, hit.col))
                 .min_by_key(|&(_, col)| col)
@@ -7521,6 +7624,25 @@ mod gesture_tests {
              \x1b[23;1H{rule}\x1b[24;1H{mode}\x1b[22;3H"
         );
         feed(app, session, screen.as_bytes());
+    }
+
+    #[test]
+    fn frame_selection_eviction_reuses_the_visible_plan() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let session = app.focused_session_id(wid).unwrap();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .claude_lights
+            .select(Some((session, Target::Chip(Chip::Autopilot))));
+        crate::reset_visible_leaf_plan_builds();
+        app.evict_stale_glass_selection(wid, Some(&plan));
+        assert_eq!(crate::visible_leaf_plan_builds(), 0);
+        assert_eq!(app.windows[&wid].claude_lights.selected, None);
     }
 
     /// NO SELECTION NOBODY CAN SEE: the keyboard selects only a chip the pane has ROOM for. The

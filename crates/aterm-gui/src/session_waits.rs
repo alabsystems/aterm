@@ -815,6 +815,121 @@ mod tests {
         assert!(search.truncated, "the kept result is still a floor");
     }
 
+    /// A torn rerun keeps no match to highlight, but the find bar's words moved (stale, and no
+    /// longer the history's absence): the rerun asks its own window for a frame, and the end of
+    /// the rewrap's row asks no other window for one.
+    #[test]
+    fn a_torn_rerun_after_the_rewrap_asks_its_window_for_a_frame() {
+        let (mut app, _sink, _reader) = app_with_reader();
+        let wid = WindowId(0);
+        app.frontmost_window = Some(wid);
+        let gauge = app.pool.get(0).expect("session 0").ctx.rewrap_gauge.clone();
+        gauge.begin(500_000);
+        app.find_cmd(FindAction::Open);
+        app.find_cmd(FindAction::Type("needle".into()))
+            .expect("status");
+        assert_eq!(
+            app.messages.live_rows().count(),
+            1,
+            "fixture: the person searching waits on the rewrap"
+        );
+        let own = app.windows[&wid].redraw_requests_for_test.get();
+        let every = crate::redraw_all_requests_on_this_thread();
+        crate::app_search::FORCE_TORN_SEARCH.with(|torn| torn.set(true));
+        gauge.pass_done(500_000, None);
+        gauge.end(aterm_messages::WaitEnd::Done);
+        app.sample_session_waits(Instant::now() + WAIT_SAMPLE);
+        crate::app_search::FORCE_TORN_SEARCH.with(|torn| torn.set(false));
+        assert!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("search")
+                .results_dirty,
+            "fixture: the rerun came back torn"
+        );
+        assert_eq!(
+            app.messages.live_rows().count(),
+            0,
+            "fixture: the rewrap's row ended"
+        );
+        assert!(
+            app.windows[&wid].redraw_requests_for_test.get() > own,
+            "the torn rerun asks its window for a frame"
+        );
+        assert_eq!(
+            crate::redraw_all_requests_on_this_thread(),
+            every,
+            "the row's end asks every window for no frame"
+        );
+    }
+
+    /// A paste wait restates its row every [`WAIT_SAMPLE`] while the paste moves, and ends it when
+    /// the paste is delivered. No window draws the row, so neither asks a window for a frame: not
+    /// the paste's own window, and not every window at once. No Settings view is open, so no
+    /// publish repaints one.
+    #[test]
+    fn a_paste_waits_restates_and_end_ask_no_window_for_a_frame() {
+        let (mut app, sink, mut reader) = app_with_reader();
+        let body = 1 << 20;
+        paste(&mut app, body);
+        let started = app.session_waits.pastes[&0].started;
+        let mut at = started + PROGRESS_GRACE / 4;
+        app.sample_session_waits(at);
+        let id = app.messages.live_rows().next().expect("the paste's row").id;
+        let asks = crate::frame_asks_for_test(&app);
+        let (mut samples, mut restates, mut read) = (0_u32, 0_u32, 0_usize);
+        let mut chunk = vec![0u8; 16 * 1024];
+        let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while restates < 16 {
+            assert!(
+                Instant::now() < hang,
+                "the paste restated its row 16 times in a minute ({restates} so far)"
+            );
+            reader
+                .read_exact(&mut chunk)
+                .expect("the paste's next bytes");
+            read += chunk.len();
+            let revision = app.messages.revision();
+            at += WAIT_SAMPLE;
+            app.sample_session_waits(at);
+            samples += 1;
+            restates += u32::from(app.messages.revision() != revision);
+        }
+        assert!(
+            app.messages.live(id).is_some(),
+            "PRECONDITION: the paste is still under way"
+        );
+        let asked = crate::frame_asks_for_test(&app) - asks;
+        let waited = WAIT_SAMPLE * samples;
+        assert_eq!(
+            asked, 0,
+            "{restates} restatements over {samples} samples ({waited:?} of the wait at one \
+             sample per {WAIT_SAMPLE:?}) asked the windows for {asked} frames"
+        );
+        let rest = body + OPEN.len() + CLOSE.len() - read;
+        let drain = std::thread::spawn(move || {
+            let mut left = vec![0u8; rest];
+            reader.read_exact(&mut left).expect("the paste's rest");
+            left.ends_with(CLOSE)
+        });
+        assert!(drain.join().expect("drain"), "the paste is closed");
+        drained(&sink);
+        let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !app.session_waits.pastes.is_empty() {
+            assert!(Instant::now() < hang, "the delivered paste ends its wait");
+            std::thread::sleep(Duration::from_millis(1));
+            at += WAIT_SAMPLE;
+            app.sample_session_waits(at);
+        }
+        assert!(app.messages.live(id).is_none(), "the row ended");
+        assert_eq!(
+            crate::frame_asks_for_test(&app),
+            asks,
+            "the end asks no window for a frame"
+        );
+    }
+
     #[test]
     fn a_glide_across_a_rewrap_lands_on_its_target_not_the_sum_of_its_ticks() {
         let (mut app, _sink, _reader) = app_with_reader();

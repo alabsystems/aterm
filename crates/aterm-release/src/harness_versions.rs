@@ -440,30 +440,23 @@ fn apply_with(
     let version = crate::publish::release_version_from_workspace(
         &crate::publish::workspace_version(&manifest)?,
     )?;
-    let tags = origin.tag_catalog().map_err(Error::new)?;
-    let Some((release, commit)) = bump_base_release(&ledger_text, &version, &tags)? else {
-        return Ok(None);
-    };
-    let present = || {
-        git.git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
-            .map(|out| out.success())
-    };
-    if !present()? {
-        let kind = git.git(&["cat-file", "-t", &commit])?;
-        if kind.success() && matches!(kind.stdout.as_slice(), b"tree\n" | b"blob\n") {
-            return Err(Error::new(format!(
-                "harness-bump: v{release}'s observed object {commit} is not an imported commit"
-            )));
-        }
-        // Keep the immutable object selected from this catalog; a fresh tag
-        // name could refer to a different baseline by the time it is fetched.
-        origin.import(&commit).map_err(Error::new)?;
-        if !present()? {
-            return Err(Error::new(format!(
-                "harness-bump: v{release}'s observed object {commit} is not an imported commit"
-            )));
+    let next = crate::publish::bump_minor_release(&version)?;
+    let mut names = Vec::new();
+    for record in crate::ledger::parse(&ledger_text)?.iter().rev() {
+        let name = format!("v{}", record.version);
+        if record.version != next && !names.contains(&name) {
+            names.push(name);
         }
     }
+    let Some((tag, commit)) = origin.first_tag_commit(&names).map_err(Error::new)? else {
+        // Retain the ledger's distinction between no earlier window and an
+        // earlier window none of whose versions has actually shipped.
+        return bump_base_release(&ledger_text, &version, "").map(|_| None);
+    };
+    let release = tag
+        .strip_prefix('v')
+        .ok_or_else(|| Error::new("harness baseline is not a release tag"))?
+        .to_owned();
     let owed = bump(root, git, (&release, &commit))?;
     Ok(Some((release, owed)))
 }

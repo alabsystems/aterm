@@ -1149,6 +1149,22 @@ impl App {
             .map_or((0, 0, ws.rows, ws.cols), leaf_cell_rect)
     }
 
+    /// The focused pane's rect in a plan already owned by this frame.
+    pub(crate) fn focused_pane_rect_from_plan(
+        &self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> (u16, u16, u16, u16) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return (0, 0, 0, 0);
+        };
+        if self.active_tab_is_single_focused_pane(wid) {
+            return (0, 0, ws.rows.max(1), ws.cols.max(1));
+        }
+        plan.leaf(plan.focused)
+            .map_or((0, 0, ws.rows, ws.cols), |leaf| leaf_cell_rect(leaf.rect))
+    }
+
     /// Whether terminal `session` is window `wid`'s front (focused) terminal.
     pub(crate) fn session_is_front(&self, wid: WindowId, session: u64) -> bool {
         self.front_terminal(wid)
@@ -1379,7 +1395,10 @@ impl App {
             y: ((fy - (geom.pad_top + geom.head) as f64) / ch as f64
                 - f64::from(self.chrome_rows(wid))) as f32,
         };
-        if point.y >= 0.0 && self.chrome_owns_terminal_row(wid, point.y as usize) {
+        if point.y >= 0.0
+            && point.x >= 0.0
+            && self.chrome_owns_terminal_cell(wid, point.y as usize, point.x as usize)
+        {
             return None;
         }
         self.active_visible_leaf_plan(wid)?
@@ -1876,11 +1895,14 @@ impl App {
     }
 
     /// The terminal cell `(row, col)` on the laid glass grid under window pixel `(x, y)`, when
-    /// the grid stands as [`Self::splice_claude_footer`] laid it and no chrome owns that row.
+    /// the grid stands as [`Self::splice_claude_footer`] laid it and no chrome owns that cell.
     fn laid_terminal_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u16, u16)> {
+        if self.band_banner_at(wid, x, y).is_some() || self.find_bar_cell_at(wid, x, y).is_some() {
+            return None;
+        }
         let (frame_row, col) = self.glass_cell_at(wid, x, y)?;
         let term_row = frame_row.checked_sub(usize::from(self.chrome_rows(wid)))?;
-        if self.chrome_owns_terminal_row(wid, term_row) {
+        if self.chrome_owns_terminal_cell(wid, term_row, col) {
             return None;
         }
         let row = u16::try_from(term_row).ok()?;
@@ -3338,9 +3360,15 @@ impl App {
             .windows
             .get(&wid)
             .map_or((0, 0), |ws| ws.last_mouse_window_cell);
-        let window_row = window_cell.0;
+        let (window_row, window_col) = window_cell;
         let cell_is_under_pointer = self.pointer_is_inside_focused_pane(wid)
-            && !self.chrome_owns_terminal_row(wid, usize::from(window_row))
+            && !self.chrome_owns_terminal_cell(
+                wid,
+                usize::from(window_row),
+                usize::from(window_col),
+            )
+            && self.band_banner_at(wid, px, py).is_none()
+            && self.find_bar_cell_at(wid, px, py).is_none()
             && !self.glass_swallows_at(wid, px, py);
         if self.rewound_front(wid).is_some() {
             self.set_hover_cursor(wid, CursorIcon::Text, false, true);
@@ -4524,12 +4552,17 @@ impl App {
         }
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
-        let window_row = usize::from(ws.last_mouse_window_cell.0);
-        if self.chrome_owns_terminal_row(wid, window_row) {
+        let (window_row, window_col) = (
+            usize::from(ws.last_mouse_window_cell.0),
+            usize::from(ws.last_mouse_window_cell.1),
+        );
+        if self.chrome_owns_terminal_cell(wid, window_row, window_col) {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
         if self.stats_lens_at(wid, px, py)
+            || self.band_banner_at(wid, px, py).is_some()
+            || self.find_bar_cell_at(wid, px, py).is_some()
             || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
                 != crate::claude_lights::OverChips::No
         {
@@ -4562,12 +4595,17 @@ impl App {
         }
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
-        let window_row = usize::from(ws.last_mouse_window_cell.0);
-        if self.chrome_owns_terminal_row(wid, window_row) {
+        let (window_row, window_col) = (
+            usize::from(ws.last_mouse_window_cell.0),
+            usize::from(ws.last_mouse_window_cell.1),
+        );
+        if self.chrome_owns_terminal_cell(wid, window_row, window_col) {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
         if self.stats_lens_at(wid, px, py)
+            || self.band_banner_at(wid, px, py).is_some()
+            || self.find_bar_cell_at(wid, px, py).is_some()
             || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
                 != crate::claude_lights::OverChips::No
             || self.claude_glass_hit_at(wid, px, py).is_some()

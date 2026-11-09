@@ -9672,7 +9672,7 @@ impl App {
                     .saturating_add(wait_secs(at)),
             )
         };
-        self.apply_schedule_standing = Some(match schedule {
+        let standing = match schedule {
             PhysicalFailureSchedule::Retry(at) => format!(
                 "automatic apply of build {build} retries at {} (failure {lifetime} of {ceiling})",
                 horizon(at)
@@ -9698,7 +9698,13 @@ impl App {
                 },
                 horizon(at)
             ),
-        });
+        };
+        let diagnostic = format!("{shape:?}: ")
+            .chars()
+            .chain(detail.chars())
+            .take(aterm_update::MAX_APPLY_REFUSAL_DETAIL_CHARS)
+            .collect();
+        self.apply_schedule_standing = Some((standing, diagnostic));
         if let PhysicalFailureSchedule::Converged { resample_at } = schedule {
             self.announce_automatic_apply_stranded(build, shape, lifetime, resample_at, detail);
         }

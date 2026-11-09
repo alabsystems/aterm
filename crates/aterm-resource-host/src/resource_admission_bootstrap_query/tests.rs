@@ -80,19 +80,18 @@ fn all_128_completed_transport_snapshots_keep_ack_data_without_socket_descriptor
         assert!(fd < 256);
         let mut delivery =
             delivery::Delivery::frames_for_test(server, vec![vec![index, 0, 255, b'\n']]).unwrap();
-        let reader = std::thread::spawn(move || {
-            let mut actual = Vec::new();
-            client.read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, [0, 0, 0, 4, index, 0, 255, b'\n']);
-            client.write_all(&[0, 0, 0, 1, 1]).unwrap();
-            // This exact peer drops only after real write EOF, raw bytes and
-            // framed ACK. No status/Exit/Ready supplies transport completion.
-        });
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !delivery.poll(deadline).unwrap() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        reader.join().unwrap();
+        assert!(!delivery.poll(deadline).unwrap());
+        let mut actual = Vec::new();
+        client.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, [0, 0, 0, 4, index, 0, 255, b'\n']);
+        client.write_all(&[0, 0, 0, 1, 1]).unwrap();
+        // Publish this exact peer's write EOF before polling for it. Thread exit
+        // timing is not evidence of transport completion; the real frame, ACK
+        // and peer EOF still are, without a scheduling race on every sample.
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(client);
+        assert!(delivery.poll(deadline).unwrap());
         assert!(delivery.control_closed(deadline).unwrap());
         let observation = delivery.observation();
         drop(delivery);

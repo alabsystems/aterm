@@ -73,6 +73,9 @@ pub mod dirwatch;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;
+/// Explicit, fresh private engineering SDK construction; never release or current selection.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod engineering_sdk;
 pub mod extract;
 pub mod flow;
 pub mod freespace;

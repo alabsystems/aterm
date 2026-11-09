@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.184.0"
+version = "0.185.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1929,6 +1929,7 @@ dependencies = [
  "aterm-pty",
  "aterm-sandbox",
  "aterm-spec",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-uds",
  "libc",
@@ -2410,6 +2411,7 @@ dependencies = [
  "aterm-zstd",
  "libc",
  "ring",
+ "trust-resource-provenance",
 ]
 
 [[package]]
