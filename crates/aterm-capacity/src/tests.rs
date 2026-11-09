@@ -679,7 +679,8 @@ fn a_claim_that_fits_is_admitted_and_one_that_does_not_waits() {
             need: 20 * GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 30 * GIB
+            reserved: 30 * GIB,
+            passes: None,
         }]
     );
     assert_eq!(short.holders.len(), 1, "{short}");
@@ -940,14 +941,16 @@ fn a_waiter_marks_its_wait_for_a_ceiling_until_admitted() {
     );
 }
 
-/// A stream of 1 GiB claims from other processes does not overtake a 20 GiB claim waiting for
-/// memory (10 GiB is free, but all of it is the waiter's), and each is admitted once B is; a
-/// claim of B's own process is not held behind B (its process orders its own claims). Then,
-/// with B waiting for a quiet machine instead, the stream backfills: each 1 GiB claim that fits
-/// beside B's 20 GiB reservation goes first, and the first that would not, waits. Each claim is
-/// another process's record, as the ledger reads them.
+/// A stream of 1 GiB claims from other processes goes first past a 20 GiB claim waiting for
+/// memory only within what that claim spares (CAP3): B lacks 10 GiB, which only A's 30 GiB end
+/// brings, so it spares 20 GiB, and the stream takes the 10 GiB free and no more: the eleventh
+/// waits, behind A, B and the ten. B's turn at A's end is what it was: A's 30 GiB less the ten's
+/// 10 GiB is its 20. A claim of B's own process is not held behind B (its process orders its own
+/// claims). Then, with B waiting for a quiet machine instead, the stream backfills: each 1 GiB
+/// claim that fits beside B's 20 GiB reservation goes first, and the first that would not,
+/// waits. Each claim is another process's record, as the ledger reads them.
 #[test]
-fn a_stream_of_small_claims_does_not_overtake_a_waiting_large_one() {
+fn a_stream_of_small_claims_goes_first_past_a_waiting_large_one_only_within_its_spare() {
     let m = Reading::of_gib(48, 40, 14);
     let a = record(1, 0, Need::new("A").mem_gib(30), Some(1));
     let b = record(2, 1, Need::new("B").mem_gib(20), None);
@@ -959,20 +962,26 @@ fn a_stream_of_small_claims_does_not_overtake_a_waiting_large_one() {
             held.then_some(1),
         )
     };
-    let stream: Vec<Record> = (0..5).map(|i| c(i, false)).collect();
+    let stream: Vec<Record> = (0..11).map(|i| c(i, false)).collect();
     for (i, ci) in stream.iter().enumerate() {
         let mut ahead = vec![plain(&a), plain(&b)];
         ahead.extend(stream[..i].iter().map(plain));
-        let short = decide(&ci.need, ci.order(), &m, &ahead, 20).expect_err("waits");
+        let looked = decide(&ci.need, ci.order(), &m, &ahead, 20);
+        if i < 10 {
+            assert!(looked.is_ok(), "C{i} goes first past B: {looked:?}");
+            continue;
+        }
+        let short = looked.expect_err("waits");
         assert_eq!(
             short.shorts,
             vec![Short::Memory {
                 need: GIB,
                 margin: 0,
                 available: 40 * GIB,
-                reserved: (50 + i as u64) * GIB
+                reserved: 60 * GIB,
+                passes: Some(0),
             }],
-            "C{i} waits behind A and B"
+            "C{i} waits behind A, B and the ten"
         );
         assert!(
             short.holders.iter().any(|h| !h.held && h.mem == 20 * GIB),
@@ -1038,7 +1047,8 @@ fn a_stream_of_small_claims_does_not_overtake_a_waiting_large_one() {
             need: GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 40 * GIB
+            reserved: 40 * GIB,
+            passes: None,
         }]
     );
     assert!(
@@ -2000,7 +2010,8 @@ fn a_holders_own_use_is_not_reserved_twice() {
             need: 20 * GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 25 * GIB
+            reserved: 25 * GIB,
+            passes: None,
         }]
     );
     assert!(decide(&b, (1, 1, 0), &m, &using(10 * GIB), 1).is_ok());
@@ -2033,7 +2044,8 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
             need: 20 * GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 40 * GIB
+            reserved: 40 * GIB,
+            passes: None,
         }],
         "60 GiB of peaks less the tree's 20 GiB, credited once"
     );
@@ -2093,7 +2105,8 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
             need: 20 * GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 38 * GIB
+            reserved: 38 * GIB,
+            passes: None,
         }],
         "P's 28 GiB and Q's 10 GiB"
     );
@@ -2160,11 +2173,12 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
 }
 
 /// QUIET-FIRST: verify (pid 10) holds its run's disk and the quiet machine, and asks for its
-/// measuring stage's 3 GiB. It is held to the held claims alone, its own and the lab's 16 GiB
+/// measuring stage's 9 GiB. It is held to the held claims alone, its own and the lab's 16 GiB
 /// (11), never to the two 16 GiB builds that asked before it and wait (12, 13): admitted where 40
-/// GiB is available, though first in, first out would hold it behind 48 GiB reserved. Negative
-/// controls: a verify whose quiet claim only waits, or that holds its disk alone, keeps its place
-/// behind the builds.
+/// GiB is available, though it would wait behind them otherwise. Negative controls: a verify
+/// whose quiet claim only waits, or that holds its disk alone, keeps its place behind the builds:
+/// the first of them fits the 24 GiB the lab leaves, and the second, then 8 GiB short, spares 8
+/// (CAP3's passing rule), less than the stage asks.
 #[test]
 fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
     let m = Reading::of_gib(48, 40, 14);
@@ -2173,7 +2187,7 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
     let lab = record(11, 2, Need::new("lab boot").mem_gib(16), Some(0));
     let build = |pid: u32| record(pid, u64::from(pid), Need::new("build").mem_gib(16), None);
     let (b12, b13) = (build(12), build(13));
-    let stage = record(10, 20, Need::new("verify measuring tests").mem_gib(3), None);
+    let stage = record(10, 20, Need::new("verify measuring tests").mem_gib(9), None);
     let pids = |rs: &[&Record]| rs.iter().map(|r| r.pid).collect::<Vec<_>>();
     let look = |rs: &[&Record]| {
         let ahead: Vec<Other<'_>> = rs.iter().map(|r| plain(r)).collect();
@@ -2191,10 +2205,11 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
     assert_eq!(
         short.shorts,
         vec![Short::Memory {
-            need: 3 * GIB,
+            need: 9 * GIB,
             margin: 0,
             available: 40 * GIB,
-            reserved: 48 * GIB
+            reserved: 48 * GIB,
+            passes: Some(8 * GIB),
         }]
     );
     let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None, None);
@@ -2540,6 +2555,7 @@ fn an_unservable_waiters_memory_is_still_reserved() {
             margin: 0,
             available: 40 * GIB,
             reserved: 20 * GIB,
+            passes: None,
         }]
     );
     assert_eq!(
@@ -4348,7 +4364,8 @@ fn a_margin_is_asked_of_the_room_and_never_reserved() {
             need: 8 * GIB,
             margin: 8 * GIB,
             available: 30 * GIB,
-            reserved: 16 * GIB
+            reserved: 16 * GIB,
+            passes: None,
         }]
     );
     assert_eq!(
@@ -4421,7 +4438,8 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
             need: 8 * GIB,
             margin: 8 * GIB,
             available: 30 * GIB,
-            reserved: 16 * GIB
+            reserved: 16 * GIB,
+            passes: None,
         }],
         "uncredited, the VM's 14 GiB is reserved again"
     );
@@ -4440,7 +4458,8 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
             need: 21 * GIB,
             margin: 0,
             available: 30 * GIB,
-            reserved: 10 * GIB
+            reserved: 10 * GIB,
+            passes: None,
         }],
         "lima's 2 GiB not yet resident and Windows' 8"
     );
@@ -6546,6 +6565,7 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
                 margin: 0,
                 available: 40 * GIB,
                 reserved: u64::MAX,
+                passes: None,
             },
             Short::Disk {
                 need: GIB,
@@ -7417,6 +7437,14 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
         [20],
         "the first is short beside 40 GiB; the second, which would fit, waits behind it"
     );
+    let mut stepped_parent = held(10, 1, 40);
+    stepped_parent.need.run_mem = Some(4 * GIB);
+    stepped_parent.need.stepped = Some(4 * GIB);
+    assert_eq!(
+        counts(&[stepped_parent], 64 * GIB, sweep),
+        [20, 21, 22],
+        "a phased parent owes only its current claim beside the compiler lead"
+    );
     let credit = crediting(held(60, 5, 36));
     assert_eq!(counts(&[held(10, 1, 4), credit], 64 * GIB, sweep), [20]);
     assert_eq!(
@@ -7433,6 +7461,14 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
     assert_eq!(
         counts(&[held(10, 1, 4), held(70, 6, 32)], 20 * GIB, sweep),
         [20, 21, 22, 70]
+    );
+    let mut stepped_other = held(70, 6, 32);
+    stepped_other.need.run_mem = Some(2 * GIB);
+    stepped_other.need.stepped = Some(2 * GIB);
+    assert_eq!(
+        counts(&[held(10, 1, 4), stepped_other], 20 * GIB, sweep),
+        [20, 70],
+        "an unrelated phased holder returns at most its current claim, not its old peak"
     );
     assert_eq!(
         counts(
@@ -7459,10 +7495,14 @@ fn a_claim_that_leads_says_so_in_its_record() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let ledger = Ledger::at(dir.path());
     let machine = Fixed::new(Reading::of_gib(48, 40, 14));
-    let lead =
-        crate::admit::try_admit_with(&ledger, &machine, Need::new("lead").mem_gib(1).leads())
-            .unwrap()
-            .expect("admitted");
+    let mut lead = crate::admit::try_admit_with(
+        &ledger,
+        &machine,
+        Need::new("lead").mem_gib(1).run_mem(GIB / 2).leads(),
+    )
+    .unwrap()
+    .expect("admitted");
+    lead.step_down().unwrap();
     let plain = crate::admit::try_admit_with(&ledger, &machine, Need::new("plain").mem_gib(1))
         .unwrap()
         .expect("admitted");
@@ -7474,5 +7514,8 @@ fn a_claim_that_leads_says_so_in_its_record() {
             .map(|r| r.need.leads)
     };
     assert_eq!((leads("lead"), leads("plain")), (Some(true), Some(false)));
+    let phased = listed.iter().find(|r| r.need.what == "lead").unwrap();
+    assert_eq!(phased.need.run_mem, Some(GIB / 2));
+    assert_eq!(phased.need.mem_now(), GIB / 2);
     drop((lead, plain));
 }

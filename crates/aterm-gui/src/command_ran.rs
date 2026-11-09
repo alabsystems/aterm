@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// How many execs one session keeps, oldest dropped first; as many wait at most to be stamped.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) const RAN_MAX: usize = 128;
 
 /// How long before its block's C stamp an exec placed by its stamp alone ([`During::Window`],
@@ -44,8 +44,13 @@ pub(crate) const LAG_MS: u64 = 100;
 /// most 15 bytes (`MAXCOMLEN` with its NUL) and `p_name` 31, so a shorter one was not cut.
 const EXEC_NAME_WHOLE: usize = 15;
 
+/// The extensions a Windows image's name is read without ([`ExecNames::of_windows_image`]): the
+/// two a console program's image carries, which cmd and pwsh add to a bare word themselves.
+#[cfg(any(windows, test))]
+const WINDOWS_IMAGE_EXTENSIONS: [&str; 2] = [".exe", ".com"];
+
 /// The longest file name a ring entry keeps (`NAME_MAX`): no file is named longer.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) const NAME_MAX: usize = 255;
 
 /// The longest path a ring entry keeps or a lookup resolves (`PATH_MAX`): `execve` refuses a
@@ -54,7 +59,7 @@ pub(crate) const PATH_MAX: usize = 1_024;
 
 /// How many paths an exec was handed one ring entry keeps ([`ExecNames::handed`]), and how many
 /// script paths ([`ExecNames::scripts`]).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) const HANDED_MAX: usize = 2;
 
 /// How many argument words after `argv[0]` are looked at for the `#!` script the kernel's `#!`
@@ -68,7 +73,7 @@ pub(crate) const SCRIPT_WORDS: usize = 4;
 pub(crate) const ENV_PATH_MAX: usize = 4_096;
 
 /// How many distinct `PATH`s one session's ring keeps ([`ExecNames::env_path`] shares them).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) const PATHS_KEPT: usize = 4;
 
 /// The most of an exec's `KERN_PROCARGS2` record read for its steers, into one buffer per
@@ -177,6 +182,10 @@ pub(crate) struct ExecNames {
     /// program's name (macOS's developer-tool shim is one file under dozens of names, `python3`
     /// and `git` among them), and a stand-in shows the name it was exec'd by ([`Self::shown`]).
     pub(crate) linked: bool,
+    /// Whether a bare word equals these names in any ASCII case ([`Self::same`]): a Windows
+    /// image's ([`Self::of_windows_image`]), whose file name cmd and pwsh find in any case (`ping`
+    /// runs `PING.EXE`). Never set for a unix image, whose names a word equals byte for byte.
+    pub(crate) any_case: bool,
 }
 
 impl ExecNames {
@@ -200,8 +209,18 @@ impl ExecNames {
             .filter(|exec| exec.len() < EXEC_NAME_WHOLE)
     }
 
+    /// Whether `name`, one of these names (or a part of one), equals `word`: byte for byte, or
+    /// in any ASCII case for a Windows image's ([`Self::any_case`]).
+    pub(crate) fn same(&self, name: &str, word: &str) -> bool {
+        if self.any_case {
+            name.eq_ignore_ascii_case(word)
+        } else {
+            name == word
+        }
+    }
+
     /// Whether nothing that confirms was read.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn is_empty(&self) -> bool {
         self.image.is_none() && self.exec.is_none() && self.file.is_none()
     }
@@ -215,13 +234,39 @@ impl ExecNames {
         }
     }
 
+    /// Names from a Windows image's path (`aterm_pty::job_images`, `QueryFullProcessImageNameW`):
+    /// its file name, after its last `\` or `/` whatever the host's separator, with a `.exe` or
+    /// `.com` extension (in any case) cut, which a bare word equals in any ASCII case
+    /// ([`Self::any_case`]): cmd and pwsh run `C:\Windows\System32\PING.EXE` for `ping`. No file
+    /// identity is read: a word typed as a path confirms nothing on Windows (fail closed).
+    #[cfg(any(windows, test))]
+    pub(crate) fn of_windows_image(path: &Path) -> Self {
+        let text = path.to_string_lossy();
+        let name = text.rsplit(['\\', '/']).next().unwrap_or_default();
+        let stem = WINDOWS_IMAGE_EXTENSIONS
+            .iter()
+            .find_map(|ext| {
+                let cut = name.len().checked_sub(ext.len())?;
+                name.get(cut..)
+                    .filter(|tail| tail.eq_ignore_ascii_case(ext))
+                    .and_then(|_| name.get(..cut))
+            })
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(name);
+        Self {
+            image: (!stem.is_empty()).then(|| stem.into()),
+            any_case: true,
+            ..Self::default()
+        }
+    }
+
     /// These names as a ring entry keeps them, whatever they were read from: a name longer
     /// than [`NAME_MAX`], a handed path longer than [`PATH_MAX`] (or whose file name a confirming
     /// name already is: it steers nothing new), a script path longer than [`PATH_MAX`] and a
     /// `PATH` longer than [`ENV_PATH_MAX`] are dropped, and at most [`HANDED_MAX`] handed paths
     /// and as many script paths are kept. So an entry's size is bounded whatever an exec was
     /// given.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn bounded(mut self) -> Self {
         let name = |n: Option<Box<str>>| n.filter(|n| n.len() <= NAME_MAX);
         self.image = name(self.image.take());
@@ -232,7 +277,7 @@ impl ExecNames {
             let named = Path::new(&*path)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| self.iter().any(|kept| kept == n));
+                .is_some_and(|n| self.iter().any(|kept| self.same(kept, n)));
             if path.len() <= PATH_MAX
                 && path.starts_with('/')
                 && !named
@@ -302,16 +347,16 @@ pub(crate) enum During {
     /// a block's C before it starts the block's job and its D only once the job is done, and the
     /// job still held the foreground once the output's place was read.
     #[cfg_attr(
-        not(any(unix, test)),
-        expect(dead_code, reason = "off unix no exec is heard, so none is placed")
+        not(any(unix, windows, test)),
+        expect(dead_code, reason = "here no exec is heard, so none is placed")
     )]
     Job(Option<u64>),
     /// Heard in the shell's own group (pwsh runs its children there; a command substitution's):
     /// the block that ran where the shell's output stood at most when it was heard, so the exec
     /// came before that block's D, but not surely after its C.
     #[cfg_attr(
-        not(any(unix, test)),
-        expect(dead_code, reason = "off unix no exec is heard, so none is placed")
+        not(any(unix, windows, test)),
+        expect(dead_code, reason = "here no exec is heard, so none is placed")
     )]
     Shell(Option<u64>),
 }
@@ -345,8 +390,8 @@ impl Exec {
 /// where the shell's output stood then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(unix, test)),
-    expect(dead_code, reason = "off unix no exec is heard, so none is placed")
+    not(any(unix, windows, test)),
+    expect(dead_code, reason = "here no exec is heard, so none is placed")
 )]
 pub(crate) struct Spot {
     /// The bytes it had read and not yet handed on.
@@ -426,6 +471,7 @@ pub(crate) fn read_names(pid: i32, steer: Steering<'_>) -> ExecNames {
         handed: steers.handed,
         scripts: steers.scripts,
         linked,
+        any_case: false,
     }
 }
 
@@ -774,7 +820,9 @@ const fn head_is_local(_meta: &std::fs::Metadata) -> bool {
     true
 }
 
-/// Nothing is found here: no exec is heard either.
+/// Nothing is found here: a Windows image's file identity is not read
+/// ([`ExecNames::of_windows_image`]), so a word typed as a path confirms nothing there (fail
+/// closed), and a bare word only by an image's name.
 #[cfg(not(unix))]
 impl Files for RealFiles {
     fn program(&self, _path: &Path) -> Option<FileId> {
@@ -993,16 +1041,17 @@ struct Log {
     /// Shared with every reader ([`Ran::heard`]): a read copies no names.
     execs: VecDeque<Arc<Exec>>,
     /// Execs heard but not yet placed.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     held: VecDeque<Held>,
-    /// The bytes of the session's output the gather has handed on.
-    #[cfg(any(unix, test))]
+    /// The bytes of the session's output the gather has handed on (a Windows gather, which
+    /// parses what it reads at once, hands on none: its execs are stamped as they are heard).
+    #[cfg(any(unix, windows, test))]
     handed: u64,
     /// The bytes the parse stage has parsed.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     parsed: u64,
     /// The block running where the parse stage stopped (`None` before any parse: not known).
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     at_parsed: Option<Option<u64>>,
     /// Whether the session's shell runs every command in its own group (pwsh), as aterm launched
     /// it ([`Ran::runs_jobs`]): then an exec of the shell's group may be the command's own.
@@ -1019,7 +1068,7 @@ struct Log {
 }
 
 /// One exec heard and not yet placed ([`Log::held`]).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 #[derive(Debug)]
 struct Held {
     /// Where the shell's output stood when it was heard: the offset the parse stage parses
@@ -1044,12 +1093,12 @@ struct Steered {
 }
 
 /// A byte count as an offset in the session's output.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn offset(bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl Log {
     fn stamp(&mut self, exec: Exec, at_ms: u64) {
         let mut exec = Exec {
@@ -1145,15 +1194,24 @@ const LOOKS_MAX: usize = 32;
 /// How long a reader waits for the lookup worker's answer to a lookup it has none for
 /// ([`Lookups::resolution`]). A lookup is a few `stat`s and one short read, answered well inside
 /// it; a reader is the status sweep, on the UI thread, under the session's term lock, so a file
-/// system that stalls (an unanswering network mount) costs it this once per lookup, never more,
-/// and the word confirms nothing until the worker answers.
+/// system that stalls (an unanswering network mount) costs the UI thread this once, for the one
+/// lookup the worker is stuck on: once the worker has held a lookup longer than this, no reader
+/// waits for it or asks it anything more ([`Worker::stalled`]) until it answers, and every word
+/// confirms nothing meanwhile.
 #[cfg(not(test))]
 const LOOKUP_WAIT: Duration = Duration::from_millis(10);
+
+/// How many lookups wait for the worker at most ([`Worker::post`]). A reader asks one lookup and
+/// waits for its answer, which a working file system gives in microseconds, so the queue of a
+/// worker that answers holds about one; a full queue is a worker that stopped answering, and a
+/// lookup past it would only wait behind the ones queued: it is refused, its word confirms
+/// nothing, and a later read asks it again.
+const JOBS_MAX: usize = 16;
 
 /// What hears a session's execs (`status exec_watch=`, [`Watching::words`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ExecWatch {
-    /// Nothing: ConPTY, or a test's gather with no source.
+    /// Nothing: a test's gather with no source, or a platform with none.
     #[default]
     None,
     /// macOS's process watch on the shell (`aterm_uds::procwatch`).
@@ -1175,12 +1233,24 @@ pub(crate) enum ExecWatch {
         expect(dead_code, reason = "off unix no gather is wired with a watch")
     )]
     Connector,
+    /// Windows: the session's job listed by its gather ([`RanJob`]).
+    #[cfg_attr(
+        not(any(windows, test)),
+        expect(dead_code, reason = "only a Windows gather lists its session's job")
+    )]
+    Job,
 }
 
 impl ExecWatch {
     /// Every watch, as `help status` names them (its test is unix's, as the wiring is).
     #[cfg(all(test, unix))]
-    pub(crate) const ALL: [Self; 4] = [Self::None, Self::Kqueue, Self::Sampler, Self::Connector];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::None,
+        Self::Kqueue,
+        Self::Sampler,
+        Self::Connector,
+        Self::Job,
+    ];
 
     /// Its word.
     pub(crate) const fn word(self) -> &'static str {
@@ -1189,6 +1259,7 @@ impl ExecWatch {
             Self::Kqueue => "kqueue",
             Self::Sampler => "sampler",
             Self::Connector => "connector",
+            Self::Job => "job",
         }
     }
 }
@@ -1263,12 +1334,13 @@ impl Watching {
 }
 
 /// One session's execs, oldest first, at most [`RAN_MAX`]: the PTY gather hears what its
-/// [`RanFeed`] reads, a restore notes the holder images it reads, and every reader of a
-/// command's detail reads them back by its block's [`Window`] ([`Ran::heard`]). A session with no
-/// source (no process watch and no image read, as under ConPTY) holds none, so its details name
-/// only shell builtins. It also holds how the session finds a program word's file: the file
-/// system ([`Files`]), the home directory a `~/` names, the `PATH` the shell was spawned with,
-/// and the lookups it remembers, which a worker thread makes ([`Lookups`]).
+/// [`RanFeed`] reads (on Windows, what its [`RanJob`] lists of the session's job), a restore
+/// notes the holder images it reads, and every reader of a command's detail reads them back by
+/// its block's [`Window`] ([`Ran::heard`]). A session with no source (no process watch, no image
+/// read and no job listed) holds none, so its details name only shell builtins. It also holds
+/// how the session finds a program word's file: the file system ([`Files`]), the home directory
+/// a `~/` names, the `PATH` the shell was spawned with, and the lookups it remembers, which a
+/// worker thread makes ([`Lookups`]).
 pub(crate) struct Ran {
     log: Mutex<Log>,
     files: Arc<dyn Files>,
@@ -1330,7 +1402,7 @@ impl Ran {
     }
 
     /// The session's gather was wired with `watching` ([`Ran::watch_words`]).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn watched_by(&self, watching: Watching) {
         *self.watching.lock().unwrap_or_else(|p| p.into_inner()) = watching;
     }
@@ -1385,8 +1457,9 @@ impl Ran {
         self.hear_at(exec, spot, wall_ms());
     }
 
-    /// [`Ran::hear`] at wall ms `now`.
-    #[cfg(any(unix, test))]
+    /// [`Ran::hear`] at wall ms `now` (a Windows gather's job listing hears each image so,
+    /// [`RanJob`]).
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn hear_at(&self, exec: Exec, spot: Spot, now: u64) {
         if exec.names.is_empty() {
             return;
@@ -1824,32 +1897,93 @@ struct Job {
     home: Option<Arc<Path>>,
     key: Key,
     seen: Box<[FileId]>,
+    /// When a reader asked for it.
+    asked: Instant,
 }
 
 /// The thread that makes every session's lookups ([`resolve`]): the file system is never touched
 /// on the thread that reads a detail. A lookup the file system stalls holds up the ones behind
-/// it, which then confirm nothing until it returns (they fail closed).
+/// it, which then confirm nothing until it returns (they fail closed); at most [`JOBS_MAX`] wait
+/// behind it, and once it has been held longer than a reader's wait, no reader waits again
+/// ([`Worker::stalled`]).
 #[derive(Debug)]
 pub(crate) struct Worker {
-    jobs: Mutex<std::sync::mpsc::Sender<Job>>,
+    jobs: Mutex<std::sync::mpsc::SyncSender<Job>>,
+    /// When the lookup the thread is making was asked for (`None`: it makes none).
+    running: Arc<Mutex<Option<Instant>>>,
+    /// What the thread was asked and did, for a test.
+    #[cfg(test)]
+    counts: Arc<WorkerCounts>,
+}
+
+/// What a test's lookup worker was asked and did ([`Worker`]).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct WorkerCounts {
+    /// Readers that began waiting for an answer.
+    pub(crate) waits: std::sync::atomic::AtomicUsize,
+    /// Lookups queued.
+    pub(crate) posted: std::sync::atomic::AtomicUsize,
+    /// Lookups answered.
+    pub(crate) answered: std::sync::atomic::AtomicUsize,
+    /// Lookups queued and not yet taken by the thread.
+    queued: std::sync::atomic::AtomicUsize,
+    /// The most that ever were.
+    pub(crate) most_queued: std::sync::atomic::AtomicUsize,
 }
 
 impl Worker {
     /// A worker on a thread of its own; `None` when no thread starts.
     pub(crate) fn start() -> Option<Arc<Self>> {
-        let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
+        Self::start_after(|| {})
+    }
+
+    /// A worker whose thread runs `before` first, then makes lookups (a test's worker held back
+    /// from its queue).
+    fn start_after(before: impl FnOnce() + Send + 'static) -> Option<Arc<Self>> {
+        let (jobs, inbox) = std::sync::mpsc::sync_channel::<Job>(JOBS_MAX);
+        let running: Arc<Mutex<Option<Instant>>> = Arc::default();
+        #[cfg(test)]
+        let counts: Arc<WorkerCounts> = Arc::default();
+        let busy = Arc::clone(&running);
+        #[cfg(test)]
+        let tally = Arc::clone(&counts);
         std::thread::Builder::new()
             .name("aterm-ran-lookup".into())
             .spawn(move || {
+                before();
                 while let Ok(job) = inbox.recv() {
+                    #[cfg(test)]
+                    tally
+                        .queued
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    *busy.lock().unwrap_or_else(|p| p.into_inner()) = Some(job.asked);
                     let res = resolve(&*job.files, job.home.as_deref(), &job.key);
+                    *busy.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     job.memo.answer(&job.key, res, job.seen);
+                    #[cfg(test)]
+                    tally
+                        .answered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .ok()?;
         Some(Arc::new(Self {
             jobs: Mutex::new(jobs),
+            running,
+            #[cfg(test)]
+            counts,
         }))
+    }
+
+    /// Whether the thread is stuck: the lookup it is making was asked for at least `wait` ago,
+    /// so the wait of the reader that asked it ended unanswered, and a reader that waited now
+    /// would wait its whole wait again.
+    fn stalled(&self, wait: Duration) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|asked| asked.elapsed() >= wait)
     }
 
     /// The process's one worker, started on first use.
@@ -1859,20 +1993,43 @@ impl Worker {
         SHARED.get_or_init(Self::start).clone()
     }
 
-    /// Hand `job` to the thread; `false` when it is gone.
+    /// Hand `job` to the thread without waiting; `false` when [`JOBS_MAX`] already wait or the
+    /// thread is gone.
     fn post(&self, job: Job) -> bool {
-        self.jobs
+        #[cfg(test)]
+        let queued = 1 + self
+            .counts
+            .queued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let posted = self
+            .jobs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .send(job)
-            .is_ok()
+            .try_send(job)
+            .is_ok();
+        #[cfg(test)]
+        if posted {
+            self.counts
+                .posted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts
+                .most_queued
+                .fetch_max(queued, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            self.counts
+                .queued
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        posted
     }
 }
 
 impl Lookups {
     /// What `key` names, fresh for a window holding the exec files `seen` (or already found to
     /// name a program the window ran, `ran`): remembered, else looked up (on the worker, waited
-    /// on until the first reader's wait for it ends; `None` once it has).
+    /// on until the first reader's wait for it ends; `None` once it has). `None` at once, with
+    /// nothing asked, while the worker is stuck on a lookup ([`Worker::stalled`]) or its queue is
+    /// full: a later read asks again.
     fn resolution(
         &self,
         ran: &Ran,
@@ -1916,25 +2073,36 @@ impl Lookups {
             }
             Resolving::Worker { worker, wait } => (worker, *wait),
         };
+        if worker.stalled(wait) {
+            return None;
+        }
         let entry = entries.get_mut(at)?;
         let deadline = match &entry.asked {
             Some((asked, when)) if covers(asked, &seen) => *when + wait,
             _ => {
                 let now = Instant::now();
-                entry.asked = Some((seen.clone(), now));
                 let job = Job {
                     memo: Arc::clone(&self.memo),
                     files: Arc::clone(&ran.files),
                     home: ran.home.clone(),
                     key: key.clone(),
                     seen: seen.clone(),
+                    asked: now,
                 };
                 if !worker.post(job) {
                     return None;
                 }
+                entry.asked = Some((seen.clone(), now));
                 now + wait
             }
         };
+        #[cfg(test)]
+        if deadline > Instant::now() {
+            worker
+                .counts
+                .waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         loop {
             let left = deadline.checked_duration_since(Instant::now())?;
             if left.is_zero() {
@@ -2574,8 +2742,176 @@ impl RanFeed {
     }
 }
 
+/// How often a Windows gather lists its session's job at most ([`RanJob::batch`]): a pace, so a
+/// stream of output does not list it at every read, never a deadline (a block's start and its
+/// end each list it twice more). The job is listed only as output is read, so a program that
+/// starts after the batch its block's start came in and ends before the gather reads more is
+/// missed: its detail names only builtins (fail closed).
+#[cfg(any(windows, test))]
+pub(crate) const JOB_PACE: Duration = Duration::from_millis(100);
+
+/// Lists the job of a Windows session whose shell is the given pid: each process with its
+/// image's path ([`JobSeam::images`], or a test's script).
+#[cfg(any(windows, test))]
+pub(crate) type ListJob = Box<dyn FnMut(i32) -> Vec<(u32, PathBuf)> + Send>;
+
+/// How a Windows gather lists its session's job (`SessionFactory::job_seam`; the test App's
+/// inert arm lists none, and its gather has no [`RanJob`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JobSeam {
+    /// The job's processes with their image paths (`aterm_pty::job_images`).
+    pub(crate) images: fn(i32) -> Vec<(u32, PathBuf)>,
+    /// The console host aterm started for the session (`aterm_pty::console_host_pid`).
+    pub(crate) host: fn(i32) -> Option<u32>,
+}
+
+/// The shipping job seam.
+#[cfg(windows)]
+pub(crate) const JOB_SHIPPING: JobSeam = JobSeam {
+    images: aterm_pty::job_images,
+    host: aterm_pty::console_host_pid,
+};
+
+/// What one Windows PTY gather hears for its session's [`Ran`]: the processes the session's job
+/// holds (the ConPTY shell runs in a job of its own, which every program it starts joins), each
+/// heard once by its image's names ([`ExecNames::of_windows_image`]) through [`Ran::hear_at`],
+/// and heard again when its pid maps another image. ConPTY shows no foreground group and no
+/// unread count, so each is placed by its stamp ([`During::Window`]): it confirms a bare word
+/// that names it and never stands in, and only in a block with a C, whose stamp opens the
+/// block's window ([`Window::of`]): cmd.exe's prompt writes no C, so a cmd session's details
+/// still name only builtins (fail closed), and pwsh's (or another shell's that writes one) name
+/// their programs. The shell's own process and the console host are no command's, so neither is
+/// heard. The job is listed on the gather thread alone, between its
+/// reads, never on the UI thread and never under the term lock ([`RanJob::batch`]); a listing
+/// reads each process's image path and nothing else.
+#[cfg(any(windows, test))]
+pub(crate) struct RanJob {
+    ran: Arc<Ran>,
+    shell: i32,
+    /// The console host aterm started for the session.
+    host: Option<u32>,
+    list: ListJob,
+    /// Each process the last listing held, by pid and its image path's hash, at most
+    /// [`RAN_MAX`]: one still there with the same image is not heard again.
+    seen: Vec<(u32, u64)>,
+    /// When the job was last listed (`None`: the next batch lists it, as none has been or the
+    /// last listing's batch carried a block's start or end).
+    listed: Option<Instant>,
+    /// Where a block's start or end (an OSC 133/633 C or D) ends in the gather's batches.
+    marks: crate::holder_image::MarkScan<
+        { crate::holder_image::MARK_C | crate::holder_image::MARK_D },
+    >,
+    /// One scan's ends (kept for its allocation).
+    ends: Vec<usize>,
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Debug for RanJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RanJob")
+            .field("shell", &self.shell)
+            .field("host", &self.host)
+            .field("seen", &self.seen.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(windows, test))]
+impl RanJob {
+    /// The feed of `ran` from the gather of the session whose shell is `shell`, listing its job
+    /// with `seam`.
+    #[cfg(windows)]
+    pub(crate) fn new(ran: Arc<Ran>, shell: i32, seam: JobSeam) -> Self {
+        Self::listing(ran, shell, (seam.host)(shell), Box::new(seam.images))
+    }
+
+    /// The feed of `ran` from the gather of `shell`'s session, whose console host is `host`,
+    /// listing its job with `list`.
+    pub(crate) fn listing(ran: Arc<Ran>, shell: i32, host: Option<u32>, list: ListJob) -> Self {
+        Self {
+            ran,
+            shell,
+            host,
+            list,
+            seen: Vec::new(),
+            listed: None,
+            marks: crate::holder_image::MarkScan::default(),
+            ends: Vec::new(),
+        }
+    }
+
+    /// The gather read `batch` at `now` (`wall_ms` on the wall clock) and the parse stage has
+    /// parsed it: list the job when [`JOB_PACE`] has passed since it was last listed, at once
+    /// when the batch carries a block's start or end (an OSC 133/633 C or D), and again at the
+    /// batch after it. The shell writes its C just before it starts the command, so the
+    /// command's program may not run yet when its C is read, and its first output is read while
+    /// it surely has. A process is stamped when a listing first holds it, never earlier, so a
+    /// program the command left running (one started in the background) is listed at the
+    /// block's D, inside its window: left to the pace, the next listing could come only with
+    /// the next command's output and stamp it inside that block's window, where it would
+    /// confirm that block's word.
+    pub(crate) fn batch(&mut self, batch: &[u8], now: Instant, wall_ms: u64) {
+        self.marks.ends(batch, &mut self.ends);
+        let mark = !self.ends.is_empty();
+        let due = self
+            .listed
+            .is_none_or(|at| now.saturating_duration_since(at) >= JOB_PACE);
+        if due || mark {
+            self.listed = (!mark).then_some(now);
+            self.list_at(wall_ms);
+        }
+    }
+
+    /// List the job now, at wall ms `now`: hear each process the last listing did not hold
+    /// with the image it maps now, but the shell's and the console host's; at most
+    /// [`RAN_MAX`] are read.
+    pub(crate) fn list_at(&mut self, now: u64) {
+        let shell = u32::try_from(self.shell).ok();
+        let mut seen = Vec::new();
+        for (pid, image) in (self.list)(self.shell) {
+            if seen.len() >= RAN_MAX {
+                break;
+            }
+            if pid <= 1 || Some(pid) == shell || Some(pid) == self.host {
+                continue;
+            }
+            let Ok(id) = i32::try_from(pid) else {
+                continue;
+            };
+            let key = (
+                pid,
+                aterm_hash::fnv1a_64(image.as_os_str().as_encoded_bytes()),
+            );
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if self.seen.contains(&key) {
+                continue;
+            }
+            self.ran.hear_at(
+                Exec {
+                    at_ms: 0,
+                    pid: id,
+                    pgid: 0,
+                    names: ExecNames::of_windows_image(&image),
+                    during: During::Window,
+                },
+                Spot {
+                    filled: 0,
+                    queued: None,
+                    job: true,
+                },
+                now,
+            );
+        }
+        self.seen = seen;
+    }
+}
+
 /// The wall clock an exec is stamped with: the one the blocks' stamps read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn wall_ms() -> u64 {
     aterm_types::current_time_ms().unwrap_or(0)
 }

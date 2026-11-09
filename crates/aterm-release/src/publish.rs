@@ -9352,7 +9352,27 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         );
         let _timing = crate::cut_timing::Timer::new(&label);
         let (release_id, adopted) = self.bound()?;
-        upload_channel_asset(self.ctx, self.slug, release_id, file, !adopted)
+        upload_channel_asset(
+            &std::sync::Mutex::new(&mut *self.ctx),
+            self.slug,
+            release_id,
+            file,
+            !adopted,
+        )
+    }
+
+    fn upload_payloads(&mut self, files: &[PathBuf]) -> Result<()> {
+        let (release_id, adopted) = self.bound()?;
+        let ctx = std::sync::Mutex::new(&mut *self.ctx);
+        let timer = crate::cut_timing::Timer::parallel_parent();
+        upload_pool(files, 4, &|file| {
+            let label = format!(
+                "upload {}",
+                file.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let _timing = timer(&label);
+            upload_channel_asset(&ctx, self.slug, release_id, file, !adopted)
+        })
     }
 
     fn prove_assets(&mut self) -> Result<()> {
@@ -9428,14 +9448,21 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         let ctx = &*self.ctx;
         let after = release_object_by_id(slug, release_id)?;
         validate_channel_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
-        crate::cut_timing::measure("public client election", || {
-            prove_client_elects_this_cut(ctx, slug, release_id)
-        })?;
-        crate::cut_timing::measure("evergreen pointer propagation", || {
-            prove_evergreen_pointer_serves_this_cut(ctx, slug)
-        })?;
-        crate::cut_timing::measure("anonymous asset HEADs", || {
-            prove_channel_assets_download_anonymously(ctx, slug)
+        // All three read the published release after its head PATCH. None
+        // establishes a fact another consumes; all must pass before returning.
+        let timer = crate::cut_timing::Timer::parallel_parent();
+        upload_pool(&[0, 1, 2], 3, &|probe| {
+            let label = match probe {
+                0 => "public client election",
+                1 => "evergreen pointer propagation",
+                _ => "anonymous asset HEADs",
+            };
+            let _timing = timer(label);
+            match probe {
+                0 => prove_client_elects_this_cut(ctx, slug, release_id),
+                1 => prove_evergreen_pointer_serves_this_cut(ctx, slug),
+                _ => prove_channel_assets_download_anonymously(ctx, slug),
+            }
         })
     }
 }
@@ -10034,8 +10061,151 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
     )))
 }
 
-fn upload_channel_asset(
-    ctx: &mut CutCtx,
+/// Stop dispatch on failure, but let in-flight one-shot POSTs settle their
+/// durable intents. Cancelling those requests would create ambiguous outcomes.
+pub(crate) fn upload_pool<T: Sync>(
+    files: &[T],
+    bound: usize,
+    upload: &(impl Fn(&T) -> Result<()> + Sync),
+) -> Result<()> {
+    let queue = std::sync::Mutex::new((0, Vec::new()));
+    #[cfg(test)]
+    let fixture = crate::github::Fixture::current();
+    std::thread::scope(|scope| {
+        for _ in 0..bound.max(1).min(files.len()) {
+            let queue = &queue;
+            #[cfg(test)]
+            let fixture = fixture.clone();
+            scope.spawn(move || {
+                #[cfg(test)]
+                let _route = fixture.map(crate::github::Fixture::enter);
+                loop {
+                    let index = {
+                        let mut queue = queue.lock().unwrap();
+                        if !queue.1.is_empty() || queue.0 == files.len() {
+                            break;
+                        }
+                        let index = queue.0;
+                        queue.0 += 1;
+                        index
+                    };
+                    if let Err(error) = upload(&files[index]) {
+                        queue.lock().unwrap().1.push((index, error));
+                    }
+                }
+            });
+        }
+    });
+    let (_, mut errors) = queue.into_inner().unwrap();
+    errors.sort_by_key(|(index, _)| *index);
+    errors
+        .into_iter()
+        .next()
+        .map_or(Ok(()), |(_, error)| Err(error))
+}
+
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex, atomic::AtomicUsize, mpsc};
+
+    /// NEGATIVE CONTROL: losing the caller's thread-local route would let a
+    /// request worker use production GitHub instead of the injected fixture.
+    #[test]
+    fn upload_pool_inherits_the_test_github_route() {
+        let _route = crate::github::Fixture {
+            origins: aterm_update_core::github_rest::Origins::github(),
+            token: Some("fixture-token".into()),
+            spawn: None,
+        }
+        .enter();
+        upload_pool(&[0, 1], 2, &|_| {
+            assert_eq!(
+                crate::github::Fixture::current().unwrap().token.as_deref(),
+                Some("fixture-token")
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// NEGATIVE CONTROL: a serial dispatcher cannot enter all four callbacks
+    /// while their completion gate is closed; an unbounded one exceeds four.
+    #[test]
+    fn upload_pool_overlaps_and_bounds_requests() {
+        let gate = (Mutex::new(false), Condvar::new());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                upload_pool(&[0; 12], 4, &|_| {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    tx.send(()).unwrap();
+                    let (lock, ready) = &gate;
+                    drop(
+                        ready
+                            .wait_while(lock.lock().unwrap(), |open| !*open)
+                            .unwrap(),
+                    );
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            let entered = (0..4).all(|_| rx.recv_timeout(Duration::from_secs(60)).is_ok());
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            worker.join().unwrap().unwrap();
+            assert!(entered, "four requests must enter before any finishes");
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+    }
+
+    /// NEGATIVE CONTROL: continuing dispatch after a refusal reaches item 1.
+    #[test]
+    fn upload_pool_refuses_without_dispatching_more() {
+        let seen = Mutex::new(Vec::new());
+        let error = upload_pool(&[0, 1, 2], 1, &|index| {
+            seen.lock().unwrap().push(*index);
+            Err(Error::new("upload refused"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("upload refused"));
+        assert_eq!(*seen.lock().unwrap(), [0]);
+    }
+
+    /// NEGATIVE CONTROL: returning on the first error without joining loses
+    /// the other request's completion, including its intent settlement.
+    #[test]
+    fn upload_pool_joins_in_flight_requests_before_refusing() {
+        let entered = (Mutex::new(0), Condvar::new());
+        let finished = AtomicUsize::new(0);
+        let error = upload_pool(&[0, 1], 2, &|index| {
+            let mut count = entered.0.lock().unwrap();
+            *count += 1;
+            entered.1.notify_all();
+            let (count, _) = entered
+                .1
+                .wait_timeout_while(count, Duration::from_secs(60), |count| *count < 2)
+                .unwrap();
+            assert_eq!(*count, 2, "both requests must start");
+            drop(count);
+            if *index == 0 {
+                Err(Error::new("refused"))
+            } else {
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "refused");
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+}
+
+pub(crate) fn upload_channel_asset(
+    ctx: &std::sync::Mutex<&mut CutCtx>,
     slug: &str,
     release_id: u64,
     file: &Path,
@@ -10053,7 +10223,7 @@ fn upload_channel_asset(
             "release asset name {name:?} is outside the exact upload URL alphabet"
         )));
     }
-    let prior_intent = ctx.upload_intent_issued(name);
+    let prior_intent = ctx.lock().unwrap().upload_intent_issued(name);
     let observed = release_asset_identity_for_release_id_optional(slug, release_id, name)?;
     match durable_post_decision(prior_intent, observed.is_some()) {
         DurablePostDecision::AwaitVisibility => {
@@ -10078,7 +10248,7 @@ fn upload_channel_asset(
                              this cut's bytes: {error}"
                         ),
                     );
-                    ensure_ctx_release_lease(ctx)?;
+                    ensure_ctx_release_lease(&ctx.lock().unwrap())?;
                     let endpoint = format!("repos/{slug}/releases/assets/{stale_id}");
                     if let Err(error) = crate::github::send_once(
                         aterm_update_core::github_rest::Method::Delete,
@@ -10105,15 +10275,21 @@ fn upload_channel_asset(
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
     let post = OneShotPost::prepare_binary(&endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
-    validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
-    ensure_ctx_release_lease(ctx)?;
-    let permit = ctx.persist_upload_intent(name)?;
+    let permit = {
+        let mut ctx = ctx.lock().unwrap();
+        validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
+        ensure_ctx_release_lease(&ctx)?;
+        ctx.persist_upload_intent(name)?
+    };
     let out = post.issue(permit)?;
     let visible = || {
         release_asset_identity_for_release_id_optional(slug, release_id, name)
             .map(|found| found.is_some())
     };
-    match after_upload_post(|| ctx.settle_upload_intent(name, &out), visible)? {
+    match after_upload_post(
+        || ctx.lock().unwrap().settle_upload_intent(name, &out),
+        visible,
+    )? {
         AfterUploadPost::Converge { journal } => {
             verify_release_asset_id_matches_local(slug, release_id, name, file)?;
             if journal {
@@ -10125,7 +10301,7 @@ fn upload_channel_asset(
                         out.stderr_utf8().trim()
                     ),
                 );
-                ctx.record_upload_intent(name)?;
+                ctx.lock().unwrap().record_upload_intent(name)?;
             }
             Ok(())
         }

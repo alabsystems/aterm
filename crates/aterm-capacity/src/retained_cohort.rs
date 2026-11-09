@@ -19,6 +19,13 @@ use std::num::NonZeroU32;
 use std::{fmt, io};
 
 pub use crate::retained_gnu::Handoff as GnuHandoff;
+pub use crate::retained_gnu::{
+    Loan as GnuLoan, LoanClosure as GnuLoanClosure, NoLaunch as GnuLoanNoLaunch, RetiredSubgroup,
+    ReturnError as GnuLoanReturnError,
+};
+
+#[path = "retained_cohort_loan.rs"]
+mod loan;
 
 fn refused(why: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)

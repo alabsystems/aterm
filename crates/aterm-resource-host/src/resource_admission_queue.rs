@@ -23,6 +23,14 @@ impl Owner {
                 refused("owning-wait accounting unavailable"),
             )));
         }
+        if bootstrap_graph::purpose(&submission.request)
+            && (!accounted || !bootstrap_graph::closed_request(&submission.request))
+        {
+            return Err(Box::new((
+                submission,
+                refused("Bootstrap Root requires its closed accounted fixed request"),
+            )));
+        }
         if workload::purpose(&submission.request)
             && (!accounted
                 || !workload::closed_request(&submission.request)
@@ -65,6 +73,7 @@ impl Owner {
         self.pending.push_back(Pending {
             queued_at,
             resolver: None,
+            bootstrap_graph: None,
             submission,
             events,
             recipe: None,
@@ -86,7 +95,7 @@ impl Owner {
         };
         pending.cancelled |= pending.events.cancelled();
         let expired = pending
-            .workload_deadline()
+            .original_deadline()
             .is_ok_and(|deadline| deadline.is_some_and(|deadline| Instant::now() >= deadline));
         if pending.cancelled || expired {
             // Preparation may still hold and inspect original images. Its
@@ -186,14 +195,15 @@ impl Owner {
     ) -> io::Result<Advance> {
         let metadata = recipe::metadata_request(&pending.submission.request);
         let workload = workload::closed_request(&pending.submission.request);
-        let root_deadline = pending.workload_deadline()?;
+        let graph = bootstrap_graph::closed_request(&pending.submission.request);
+        let root_deadline = pending.original_deadline()?;
         if root_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "original workload admission deadline expired",
             ));
         }
-        if metadata || workload {
+        if metadata || workload || graph {
             if let Some(claim) = &pending.claim {
                 pending.scope_reference = Some(claim.cohort_closure_ref()?);
             }
@@ -209,7 +219,7 @@ impl Owner {
             };
             match inspection {
                 Err(error)
-                    if workload
+                    if (workload || graph)
                         && error.kind() == io::ErrorKind::TimedOut
                         && root_deadline.is_some_and(|deadline| Instant::now() < deadline) =>
                 {
@@ -221,7 +231,12 @@ impl Owner {
                 result => result?,
             }
         }
-        if !metadata && !workload && pending.recipe.is_none() && !self.poll_recipe(pending)? {
+        if !metadata
+            && !workload
+            && !graph
+            && pending.recipe.is_none()
+            && !self.poll_recipe(pending)?
+        {
             return Ok(Advance::Wait);
         }
         if pending.admitted.is_some() {
@@ -287,7 +302,9 @@ impl Owner {
             }
         }
         let prepared = self.prepare(pending)?;
-        if metadata && let Advance::Launch(custody) = prepared {
+        if (metadata || graph)
+            && let Advance::Launch(custody) = prepared
+        {
             pending.admitted = Some(*custody);
             return self.advance(pending);
         }
@@ -500,8 +517,11 @@ pub(super) enum Advance {
 impl Owner {
     pub(super) fn prepare(&mut self, pending: &mut Pending) -> io::Result<Advance> {
         let metadata = recipe::metadata_request(&pending.submission.request);
+        let graph = bootstrap_graph::closed_request(&pending.submission.request);
         let width = if metadata {
             1
+        } else if graph {
+            pending.submission.request.cpu_units
         } else {
             pending
                 .recipe
@@ -514,6 +534,9 @@ impl Owner {
             .as_mut()
             .ok_or_else(|| refused("missing original memory claim"))?;
         let reference = claim.cohort_closure_ref()?;
+        if graph {
+            pending.scope_reference = Some(reference.clone());
+        }
         let request = &pending.submission.request;
         let cooperative = !metadata
             && pending.recipe.as_ref().is_some_and(|recipe| {

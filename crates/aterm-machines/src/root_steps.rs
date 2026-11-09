@@ -136,28 +136,36 @@ pub fn developer_mode(ran: &Ran) -> Option<bool> {
 }
 
 fn developer_mode_now(sys: &dyn System) -> Option<bool> {
-    sys.run(&status_cmd())
+    sys.run_complete_stdout(&status_cmd())
         .ok()
         .as_ref()
         .and_then(developer_mode)
 }
 
-/// `dseditgroup -o checkmember`'s answer for a named account in a group: `yes …` or `no …`.
+/// A definite `dseditgroup -o checkmember` answer: one UTF-8 stdout line, no diagnostic,
+/// and a matching exit. A negative reading may exit 67 (`EX_NOUSER`); an arbitrary failure
+/// or signal is not an answer, even when stdout starts with `yes` or `no`.
 #[must_use]
 pub fn member(ran: &Ran) -> Option<bool> {
-    let out = ran.out();
-    if out.starts_with("yes ") {
-        Some(true)
-    } else if out.starts_with("no ") {
-        Some(false)
-    } else {
-        None
+    if !ran.stderr.is_empty() {
+        return None;
+    }
+    let out = std::str::from_utf8(&ran.stdout)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    if out.contains(['\r', '\n']) {
+        return None;
+    }
+    match ran.status {
+        Some(0) if out.starts_with("yes ") => Some(true),
+        Some(0 | 67) if out.starts_with("no ") => Some(false),
+        _ => None,
     }
 }
 
 fn member_now(sys: &dyn System, user: &str, group: &str) -> Option<bool> {
     let cmd = Cmd::new(DSEDITGROUP).args(["-o", "checkmember", "-m", user, group]);
-    sys.run(&cmd).ok().as_ref().and_then(member)
+    sys.run_complete_stdout(&cmd).ok().as_ref().and_then(member)
 }
 
 /// The root item's definite missing state: an unreadable mode admits no elevation, and an
@@ -205,11 +213,13 @@ fn console_member_now(sys: &dyn System) -> DebuggerMember {
 
 /// Whether the rule is in place as a stat reads it, which needs no root (the include directory
 /// is world-searchable, the rule itself readable by root alone): a root-owned regular file of
-/// mode 0440. `None` when the stat answered with anything but not-found.
+/// mode 0440 with nonzero length. `None` when the stat answered with anything but not-found.
 #[must_use]
 pub fn rule_in_place(sys: &dyn System) -> Option<bool> {
     match sys.stat(Path::new(ADMITTED_NAME_RULE)) {
-        Ok(stat) => Some(!stat.dir && !stat.symlink && stat.uid == 0 && stat.mode == 0o440),
+        Ok(stat) => {
+            Some(!stat.dir && !stat.symlink && stat.uid == 0 && stat.mode == 0o440 && stat.len > 0)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
         Err(_) => None,
     }
@@ -228,7 +238,9 @@ pub fn owed(sys: &dyn System) -> Vec<Owed> {
     if debugger_owed(mode, member) {
         owed.push(Owed::Debugger);
     }
-    if rule_in_place(sys) == Some(false) && sys.stat(Path::new(REFUSED_RULE)).is_err() {
+    if rule_in_place(sys) == Some(false)
+        && matches!(sys.stat(Path::new(REFUSED_RULE)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         owed.push(Owed::NameRule);
     }
     if crate::items::lan::reading(sys).is_some_and(|reading| reading.is_ok_and(|r| r.owed())) {
@@ -545,11 +557,10 @@ mod tests {
         }
     }
 
-    /// The account's reading owes developer mode while `-status` says it is off and the rule
-    /// while no root-owned 0440 file stands. NEGATIVE CONTROLS: an answer `-status` gives that is
-    /// neither, and a stat that fails other than not-found, owe nothing, so no password is asked
-    /// for want of a reading; a rule the account could have written (its own uid, or a wider
-    /// mode) is no rule in place.
+    /// The account owes developer mode while its status says off, and naming while no
+    /// nonempty root-owned 0440 file stands. Unknown status or metadata admits no elevation.
+    /// NEGATIVE CONTROLS: empty, directory, symlink and account-writable rules are not in
+    /// place; an unread refusal record is not evidence that no earlier refusal exists.
     #[test]
     fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
         let sys = Fake::root();
@@ -570,12 +581,41 @@ mod tests {
             .stat_fails(ADMITTED_NAME_RULE, std::io::ErrorKind::PermissionDenied);
         assert_eq!(owed(&unread), Vec::<Owed>::new());
 
-        for (uid, mode) in [(501, 0o440), (0, 0o666)] {
+        for stat in [
+            rule_stat(501, 0o440),
+            rule_stat(0, 0o666),
+            Stat {
+                len: 0,
+                ..rule_stat(0, 0o440)
+            },
+            Stat {
+                dir: true,
+                ..rule_stat(0, 0o440)
+            },
+            Stat {
+                symlink: true,
+                ..rule_stat(0, 0o440)
+            },
+        ] {
             let planted = Fake::root();
             planted
                 .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
-                .stat_of(ADMITTED_NAME_RULE, rule_stat(uid, mode));
-            assert_eq!(owed(&planted), vec![Owed::NameRule], "{uid} {mode:o}");
+                .stat_of(ADMITTED_NAME_RULE, stat);
+            assert_eq!(rule_in_place(&planted), Some(false));
+            assert_eq!(owed(&planted), vec![Owed::NameRule]);
+            assert!(name_by_rule(&planted, "m42", &|| Ok(())).is_err());
+            assert!(!planted.calls().iter().any(|call| call.contains("scutil")));
+        }
+        // An unread refusal record is not evidence that no earlier refusal exists.
+        for (kind, missing) in [
+            (std::io::ErrorKind::NotFound, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+            (std::io::ErrorKind::Other, false),
+        ] {
+            let sys = Fake::root();
+            sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+                .stat_fails(REFUSED_RULE, kind);
+            assert_eq!(owed(&sys).contains(&Owed::NameRule), missing, "{kind:?}");
         }
     }
 
@@ -613,6 +653,108 @@ mod tests {
                 Probe::Unusable { .. }
             ));
             assert!(!owed(&sys).contains(&Owed::Debugger));
+        }
+    }
+
+    #[test]
+    fn membership_admission_requires_a_complete_answer_and_expected_exit() {
+        let yes = b"yes alice is a member of _developer\n";
+        let no = b"no alice is NOT a member of _developer\n";
+        let reading = |status, stdout: &[u8], stderr: &[u8]| Ran {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        for (ran, expected) in [
+            (reading(Some(0), yes, b""), Some(true)),
+            (reading(Some(0), no, b""), Some(false)),
+            (reading(Some(67), no, b""), Some(false)),
+        ] {
+            assert_eq!(member(&ran), expected);
+        }
+        let admin = "/usr/sbin/dseditgroup -o checkmember -m alice admin";
+        let developer = "/usr/sbin/dseditgroup -o checkmember -m alice _developer";
+        for ran in [
+            reading(Some(1), yes, b""),
+            reading(Some(1), no, b""),
+            reading(Some(67), yes, b""),
+            reading(None, yes, b""),
+            reading(None, no, b""),
+            reading(Some(0), b"yes alice is a member\xff", b""),
+            reading(Some(0), b"no alice is NOT a member\xff", b""),
+            reading(Some(0), yes, b"\xff"),
+            reading(Some(0), yes, b"directory service warning\n"),
+            reading(
+                Some(0),
+                b"yes alice is a member\nno alice is NOT a member\n",
+                b"",
+            ),
+        ] {
+            assert_eq!(member(&ran), None, "{ran:?}");
+            for boundary in [admin, developer] {
+                let ctx = console();
+                let user = ctx.console.as_ref().unwrap();
+                let mut sys = Fake::root();
+                sys.euid = user.uid;
+                sys.logged_in(user)
+                    .stat_of("/dev/console", rule_stat(user.uid, 0o600))
+                    .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+                    .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+                    .on(
+                        admin,
+                        if boundary == admin {
+                            ran.clone()
+                        } else {
+                            reading(Some(67), no, b"")
+                        },
+                    )
+                    .on(
+                        developer,
+                        if boundary == developer {
+                            ran.clone()
+                        } else {
+                            reading(Some(67), no, b"")
+                        },
+                    );
+                assert!(!owed(&sys).contains(&Owed::Debugger), "{boundary}: {ran:?}");
+                assert!(matches!(
+                    DeveloperMode.probe(&sys, &ctx),
+                    Probe::Unusable { .. }
+                ));
+                DeveloperMode.apply(&sys, &ctx).unwrap();
+                assert!(
+                    !sys.calls()
+                        .iter()
+                        .any(|call| call.contains("-o edit") || call.contains("-enable"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_root_query_capture_admits_no_debugger_elevation() {
+        let admin = "/usr/sbin/dseditgroup -o checkmember -m alice admin";
+        let developer = "/usr/sbin/dseditgroup -o checkmember -m alice _developer";
+        for query in [STATUS, admin, developer] {
+            let ctx = console();
+            let user = ctx.console.as_ref().unwrap();
+            let mut sys = Fake::root();
+            sys.euid = user.uid;
+            sys.logged_in(user)
+                .stat_of("/dev/console", rule_stat(user.uid, 0o600))
+                .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+                .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+                .on(admin, Ran::ok("no alice is NOT a member of admin\n"))
+                .on(
+                    developer,
+                    Ran::ok("no alice is NOT a member of _developer\n"),
+                )
+                .refuse_complete_stdout(query, "stdout did not reach EOF");
+            assert!(
+                matches!(DeveloperMode.probe(&sys, &ctx), Probe::Unusable { .. }),
+                "{query}"
+            );
+            assert!(!owed(&sys).contains(&Owed::Debugger), "{query}");
         }
     }
 

@@ -32,7 +32,7 @@ impl System for Faults {
     fn run_tty(
         &self,
         c: &Cmd,
-        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
     ) -> Result<Option<i32>, RunFailed> {
         self.inner.run_tty(c, before)
     }

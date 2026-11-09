@@ -527,7 +527,7 @@ mod tests {
         fn run_tty(
             &self,
             c: &crate::port::Cmd,
-            before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+            before: &mut dyn FnMut(&mut crate::port::Cmd) -> Result<(), crate::port::RunFailed>,
         ) -> Result<Option<i32>, crate::port::RunFailed> {
             self.live.run_tty(c, before)
         }

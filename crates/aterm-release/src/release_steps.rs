@@ -3418,6 +3418,7 @@ impl Real {
                 )
             })?;
         self.hand_pool(&mut cmd, false)?;
+        cmd.env(crate::buildplan::SLICE_LOGS_ENV, &self.logs);
         let ran = self.logged_in(
             Logged {
                 step: Step::Qualify,
@@ -7009,6 +7010,7 @@ impl Backend for Real {
                     self.captured(self.step, prover, &log, cmd)
                 }),
                 Err(why) => crate::fixtures::Reading {
+                    checked: None,
                     answers: Err(why.to_string()),
                     checks: format!("COULD NOT RUN: {why}"),
                 },
@@ -7189,9 +7191,10 @@ impl Backend for Real {
                     move |stop| {
                         let started = std::time::Instant::now();
                         let log = real.logs.join("main-reader-prebuild.log");
-                        // This is only a cache warm-up of the proposed fixture tree.
-                        // Fixture landing still compiles its exact preview, including
-                        // any movement of main, and never consumes a prebuild verdict.
+                        // Retain the proposed fixture tree's executable index, never
+                        // a verdict. After-cut judges here if main's intervening
+                        // commits leave the fixture edit untouched; otherwise it
+                        // compiles and judges the new tip.
                         let result = reserved
                             .ok_or_else(|| "no reservation for fixture prebuild".to_string())
                             .and_then(|reserved| {

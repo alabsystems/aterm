@@ -5001,6 +5001,9 @@ impl<C: Ctl> Session<'_, C> {
                     Restart::Route {
                         to: RouteTo::Stored,
                     } => "relaunch on the row's stored login".to_string(),
+                    Restart::Permission { to, .. } => {
+                        format!("relaunch at a click on the chip ({})", to.word())
+                    }
                 };
                 if matches!(why, Restart::Account { .. }) {
                     self.forget_wall(seq);

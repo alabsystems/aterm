@@ -477,6 +477,95 @@ fn an_afresh_moves_row_takes_a_word_and_names_its_marks_command() {
 }
 
 #[test]
+fn a_required_upgrade_word_waits_for_its_native_sweep_writer() {
+    for what in [Ask::Now, Ask::Press, Ask::Defer(3600), Ask::Skip] {
+        for changed in [false, true] {
+            for age in [
+                std::time::Duration::from_secs(11),
+                std::time::Duration::from_secs(61),
+            ] {
+                let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+                let dir = ScratchDir::new("upgrade-status", "required-word-writer");
+                let o = opts(&dir);
+                let mut st = St {
+                    phase: Phase::Pending,
+                    from: "2.1.281".to_string(),
+                    to: "2.1.283".to_string(),
+                    source: "managed".to_string(),
+                    tab: TAB.to_string(),
+                    salt: 5,
+                    ..St::default()
+                };
+                let scope = AskScope::from(&Row::of("aaa", &st, NOW));
+                if changed {
+                    st.source = "native".to_string();
+                }
+                save(&o, "aaa", &st);
+                let path = state_dir(&o).join("aaa.json");
+                let before = std::fs::read(&path).unwrap();
+                let mut held = Some(super::super::sweep_lock(&o).unwrap().unwrap());
+                let mut observed = 0;
+                let result = ask_with_wait(
+                    &o,
+                    TAB,
+                    what,
+                    Some(Shown {
+                        to: "2.1.283",
+                        session: "aaa",
+                        scope: Some(&scope),
+                    }),
+                    (ASK_LOCK_WAIT, std::time::Instant::now() - age, || {
+                        assert!(held.is_some());
+                        assert!(matches!(super::super::sweep_lock(&o), Err("another-sweep")));
+                        assert_eq!(std::fs::read(&path).unwrap(), before);
+                        assert!(!super::super::ledger_path(&o).exists());
+                        assert!(!word_marker(&o.state).exists());
+                        observed += 1;
+                        drop(held.take());
+                    }),
+                    &|_| Some(Vec::new()),
+                );
+                assert_eq!(observed, usize::from(!expired));
+                assert_eq!(held.is_some(), expired);
+                if expired || changed {
+                    let error = result.unwrap_err();
+                    if expired {
+                        assert_eq!(error, "busy:another-sweep");
+                    }
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert!(!super::super::ledger_path(&o).exists());
+                    assert!(!word_marker(&o.state).exists());
+                } else {
+                    let (row, _) = result.unwrap_or_else(|error| panic!("{what:?}: {error}"));
+                    let written = load(&o, "aaa").unwrap();
+                    assert_eq!(written.request, row.request);
+                    assert_eq!(written.request_tab, TAB);
+                    assert!(
+                        written.salt > st.salt,
+                        "the accepted word arms its own round"
+                    );
+                    if what == Ask::Press {
+                        assert_eq!(written.pressed_at, written.request_at);
+                        assert_eq!(written.pressed_to, st.to);
+                    }
+                    match what {
+                        Ask::Now | Ask::Press => assert_eq!(row.request, Request::Now),
+                        Ask::Skip => assert_eq!(row.request, Request::Skip(st.to.clone())),
+                        Ask::Defer(_) => assert!(
+                            matches!(row.request, Request::DeferUntil(at) if at >= written.request_at + 3600)
+                        ),
+                    }
+                    assert!(super::super::ledger_path(&o).exists());
+                    assert!(word_marker(&o.state).exists());
+                }
+                drop(held);
+                drop(super::super::sweep_lock(&o).unwrap().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
 fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold() {
     let dir = ScratchDir::new("upgrade-status", "ask");
     let o = opts(&dir);
@@ -650,9 +739,19 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
 
     let held = super::super::sweep_lock(&o).expect("lock").expect("held");
     let before = load(&o, "aaa");
-    let wait = std::time::Duration::from_millis(300);
-    let e =
-        ask_within(&o, TAB, Ask::Skip, None, wait, &|s| holders(&o, s, None)).expect_err("busy");
+    let e = ask_with_wait(
+        &o,
+        TAB,
+        Ask::Skip,
+        None,
+        (
+            ASK_LOCK_WAIT,
+            std::time::Instant::now() - std::time::Duration::from_secs(61),
+            || panic!("the intentionally expired wait releases no writer"),
+        ),
+        &|s| holders(&o, s, None),
+    )
+    .expect_err("busy");
     assert_eq!(e, "busy:another-sweep");
     assert_eq!(load(&o, "aaa"), before, "nothing written while busy");
     drop(held);

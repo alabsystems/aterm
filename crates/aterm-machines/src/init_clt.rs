@@ -486,7 +486,17 @@ impl CommandLineTools {
     /// authority from a later reading and no longer owed work needs no password episode;
     /// a new compiler failure is not missing tools.
     fn apply_plan(&self, sys: &dyn System) -> Result<Option<RootPlan>, (String, Unfinished)> {
-        if self.root_plan() == RootPlan::StepsOnly {
+        self.plan_after(sys, self.root_plan())
+    }
+
+    /// Re-read work within the plan this apply already admitted, even if another probe
+    /// changes the item's shared plan while this run waits for the terminal.
+    fn plan_after(
+        &self,
+        sys: &dyn System,
+        ceiling: RootPlan,
+    ) -> Result<Option<RootPlan>, (String, Unfinished)> {
+        if ceiling == RootPlan::StepsOnly {
             return Ok((!(self.owed)(sys).is_empty()).then_some(RootPlan::StepsOnly));
         }
         let (why, unfinished) = match (self.found)(sys) {
@@ -816,24 +826,42 @@ impl Item for CommandLineTools {
         // Persist the episode before sudo can ask. Explicit retries bypass its withholding
         // decision, but consume the same record so a later update never retries unsolicited.
         let mut claimed = false;
+        let mut skipped = false;
+        let mut plan_failure = None;
         // The root half runs in this terminal's foreground, so a Ctrl-C (which the
         // through-installer wait invites) or a closed terminal reaches this run too: held until
         // the root half has finished its step and aterm's own ask is kept or taken back, then
         // sent again, so the run still stops as it would have.
         let stops = sys.defer_stops();
-        let ran = sys.run_tty(&self.command_for(plan), &mut || {
-            // A vault question can own the terminal first. Re-read Stop and the automatic
-            // ask's current holds only after acquiring that terminal, immediately before
-            // claiming and starting this root episode.
+        let ran = sys.run_tty(&self.command_for(plan), &mut |command| {
+            // A vault question can own the terminal first. Re-read work under that lease,
+            // then Stop and the current holds after those reads, before claiming the ask.
+            let fresh = self.plan_after(sys, plan);
+            if let Ok(Some(plan)) = &fresh {
+                *command = self.command_for(*plan);
+            }
             if sys.stopped().is_some() {
                 return Err(crate::port::RunFailed::Refused(
                     "setup was stopped before the root command started".into(),
                 ));
             }
-            if let Some(record) = &self.unbidden {
-                if let Some(why) = record.held() {
+            if let Some(why) = self.unbidden.as_ref().and_then(Unbidden::held) {
+                return Err(crate::port::RunFailed::Refused(why));
+            }
+            let plan = match fresh {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    skipped = true;
+                    return Err(crate::port::RunFailed::Refused(
+                        "the queued root work is no longer owed".into(),
+                    ));
+                }
+                Err((why, _)) => {
+                    plan_failure = Some(why.clone());
                     return Err(crate::port::RunFailed::Refused(why));
                 }
+            };
+            if let Some(record) = &self.unbidden {
                 match record.claim(sys) {
                     Ok(added) => {
                         claimed = added;
@@ -859,6 +887,14 @@ impl Item for CommandLineTools {
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         });
+        if skipped {
+            drop(stops);
+            return Ok(());
+        }
+        if let Some(why) = plan_failure {
+            drop(stops);
+            return Err(why);
+        }
         let ended = self.ended(sys, &ran, sys.stopped());
         // Only these port results prove sudo never existed. A password refusal, installer
         // failure, timeout or lost result may follow human interaction and keeps the episode.
@@ -1078,19 +1114,49 @@ impl CommandLineTools {
         let Some(plan) = self.apply_plan(sys).map_err(|(_, why)| tab.note(why))? else {
             return Ok(());
         };
+        let mut skipped = false;
+        let mut plan_failure = None;
         let stops = sys.catch_stops();
-        let ran = sys.run_tty(&self.command_for(plan), &mut || {
+        let ran = sys.run_tty(&self.command_for(plan), &mut |command| {
+            let fresh = self.plan_after(sys, plan);
+            if let Ok(Some(plan)) = &fresh {
+                *command = self.command_for(*plan);
+            }
             if sys.stopped().is_some() {
                 return Err(crate::port::RunFailed::Refused(
                     "setup was stopped before the root command started".into(),
                 ));
             }
+            if let Some(why) = self.unbidden.as_ref().and_then(Unbidden::held) {
+                return Err(crate::port::RunFailed::Refused(why));
+            }
+            let plan = match fresh {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    skipped = true;
+                    return Err(crate::port::RunFailed::Refused(
+                        "the queued root work is no longer owed".into(),
+                    ));
+                }
+                Err((why, unfinished)) => {
+                    plan_failure = Some(unfinished);
+                    return Err(crate::port::RunFailed::Refused(why));
+                }
+            };
             tab.line(Self::intro(true, plan));
             self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
             tab.entered
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         });
+        if skipped {
+            drop(stops);
+            return Ok(());
+        }
+        if let Some(why) = plan_failure {
+            drop(stops);
+            return Err(tab.note(why));
+        }
         let stopped = sys.stopped();
         drop(stops);
         self.ended(sys, &ran, stopped).map_err(|why| tab.note(why))
@@ -1291,6 +1357,123 @@ mod tests {
         sys.on(&root, Ran::ok(""));
         assert!(item.apply(&sys, &ctx(&[])).is_ok());
         assert_eq!(asked(&sys), [root]);
+
+        // Another setup question can own stdin after apply has captured its plan. Change
+        // the world only after that capture, while holding the real shared terminal lease.
+        for tabbed in [false, true] {
+            for (later, owed, suffix, failed) in [
+                (
+                    Found::Present("Xcode arrived while queued".into()),
+                    true,
+                    Some(" --root-steps-only"),
+                    false,
+                ),
+                (Found::Present("already done".into()), false, None, false),
+                (
+                    Found::Missing("still missing".into()),
+                    false,
+                    Some(""),
+                    false,
+                ),
+                (
+                    Found::Refuses("compiler now refuses".into()),
+                    true,
+                    Some(" --root-steps-only"),
+                    false,
+                ),
+                (
+                    Found::Refuses("compiler now refuses".into()),
+                    false,
+                    None,
+                    true,
+                ),
+                (
+                    Found::Unknown("compiler now unread".into()),
+                    true,
+                    Some(" --root-steps-only"),
+                    false,
+                ),
+                (
+                    Found::Unknown("compiler now unread".into()),
+                    false,
+                    None,
+                    true,
+                ),
+                (
+                    Found::NotHere("no longer applicable".into()),
+                    false,
+                    None,
+                    false,
+                ),
+            ] {
+                let state = Arc::new(Mutex::new(Found::Missing("initially missing".into())));
+                let reader = state.clone();
+                let (captured, ready) = std::sync::mpsc::sync_channel(1);
+                let reads = std::sync::atomic::AtomicUsize::new(0);
+                let said = Arc::new(Mutex::new(String::new()));
+                let sink = said.clone();
+                let mut item = CommandLineTools::new(
+                    Box::new(move |_| {
+                        let found = reader.lock().unwrap().clone();
+                        if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                            captured.send(()).unwrap();
+                        }
+                        found
+                    }),
+                    ATERM.into(),
+                )
+                .with_owed(Box::new(move |_| {
+                    if owed {
+                        vec![crate::root_steps::Owed::Debugger]
+                    } else {
+                        Vec::new()
+                    }
+                }))
+                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
+                    crate::init::Holds::NONE
+                }))
+                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
+                let tab = Tab::new({
+                    let said = said.clone();
+                    Arc::new(move |text| said.lock().unwrap().push_str(text))
+                });
+                if tabbed {
+                    item = item.in_tab(tab.clone());
+                }
+                let sys = console();
+                sys.on(&argv(), Ran::ok(""));
+                sys.on(&format!("{} --root-steps-only", argv()), Ran::ok(""));
+                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+                let result = std::thread::scope(|scope| {
+                    let worker = crate::port::owning_terminal(|| {
+                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
+                        ready
+                            .recv_timeout(std::time::Duration::from_secs(60))
+                            .expect("apply captured its pre-terminal plan");
+                        assert!(asked(&sys).is_empty());
+                        assert!(said.lock().unwrap().is_empty());
+                        assert!(!marked(&sys));
+                        *state.lock().unwrap() = later;
+                        worker
+                    });
+                    worker.join().expect("the queued apply joins")
+                });
+                let expected: Vec<_> = suffix
+                    .map(|suffix| format!("{}{suffix}", argv()))
+                    .into_iter()
+                    .collect();
+                assert_eq!(asked(&sys), expected, "tabbed={tabbed}, {result:?}");
+                assert_eq!(result.is_err(), failed, "tabbed={tabbed}, {result:?}");
+                assert_eq!(marked(&sys), !tabbed && suffix.is_some());
+                assert_eq!(
+                    tab.entered.load(std::sync::atomic::Ordering::Relaxed),
+                    tabbed && suffix.is_some()
+                );
+                if suffix.is_none() {
+                    assert!(said.lock().unwrap().is_empty() || failed && tabbed);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1332,6 +1515,76 @@ mod tests {
             assert!(item.apply(&sys, &ctx(&[])).is_ok());
             assert_eq!(asked(&sys), [root]);
             assert!(marked(&sys));
+        }
+
+        for tabbed in [false, true] {
+            for still_owed in [false, true] {
+                let owed = Arc::new(AtomicBool::new(true));
+                let owing = owed.clone();
+                let found = Arc::new(Mutex::new(Found::Present("healthy at plan".into())));
+                let reader = found.clone();
+                let (captured, ready) = std::sync::mpsc::sync_channel(1);
+                let reads = std::sync::atomic::AtomicUsize::new(0);
+                let said = Arc::new(Mutex::new(String::new()));
+                let sink = said.clone();
+                let mut item = CommandLineTools::new(
+                    Box::new(move |_| reader.lock().unwrap().clone()),
+                    ATERM.into(),
+                )
+                .with_owed(Box::new(move |_| {
+                    let pending = owing.load(Ordering::SeqCst);
+                    if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                        captured.send(()).unwrap();
+                    }
+                    if pending {
+                        vec![crate::root_steps::Owed::Debugger]
+                    } else {
+                        Vec::new()
+                    }
+                }))
+                .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
+                    crate::init::Holds::NONE
+                }))
+                .saying(Arc::new(move |text| sink.lock().unwrap().push_str(text)));
+                let tab = Tab::new({
+                    let said = said.clone();
+                    Arc::new(move |text| said.lock().unwrap().push_str(text))
+                });
+                if tabbed {
+                    item = item.in_tab(tab.clone());
+                }
+                let sys = console();
+                let root = format!("{} --root-steps-only", argv());
+                sys.on(&root, Ran::ok(""));
+                assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+                let result = std::thread::scope(|scope| {
+                    let worker = crate::port::owning_terminal(|| {
+                        let worker = scope.spawn(|| item.apply(&sys, &ctx(&[])));
+                        ready
+                            .recv_timeout(std::time::Duration::from_secs(60))
+                            .expect("apply captured its independent work");
+                        assert!(asked(&sys).is_empty());
+                        assert!(said.lock().unwrap().is_empty());
+                        assert!(!marked(&sys));
+                        owed.store(still_owed, Ordering::SeqCst);
+                        if still_owed {
+                            *found.lock().unwrap() = Found::Missing("lost while queued".into());
+                            // A concurrent probe can plan a new full installation. It cannot
+                            // expand the independent command already waiting on this lease.
+                            assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+                            assert_eq!(item.root_plan(), RootPlan::WithTools);
+                        }
+                        worker
+                    });
+                    worker.join().expect("the queued independent apply joins")
+                });
+                assert!(result.is_ok(), "tabbed={tabbed}, {result:?}");
+                let expected: Vec<_> = still_owed.then_some(root).into_iter().collect();
+                assert_eq!(asked(&sys), expected);
+                assert_eq!(marked(&sys), !tabbed && still_owed);
+                assert_eq!(tab.entered.load(Ordering::Relaxed), tabbed && still_owed);
+                assert_eq!(said.lock().unwrap().is_empty(), !still_owed);
+            }
         }
     }
 
@@ -1414,13 +1667,24 @@ mod tests {
         assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
         let root = format!("{} --root-steps-only", argv());
         sys.on(&root, Ran::ok(""));
-        let before = owed_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let reads_at_start = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        sys.tty_model({
+            let owed_reads = Arc::clone(&owed_reads);
+            let reads_at_start = Arc::clone(&reads_at_start);
+            move |_, _| {
+                reads_at_start.store(
+                    owed_reads.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                None
+            }
+        });
         let row = run(&sys, &item, Mode::Apply);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
         assert_eq!(
-            owed_reads.load(std::sync::atomic::Ordering::Relaxed) - before,
-            2,
-            "the probe and launch admission read root work; the read-back reports the tools"
+            owed_reads.load(std::sync::atomic::Ordering::Relaxed),
+            reads_at_start.load(std::sync::atomic::Ordering::Relaxed),
+            "read-back does not re-probe root work after its command starts"
         );
         assert_eq!(
             asked(&sys),

@@ -66,12 +66,24 @@ pub struct Hello {
     /// The newest finished run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<String>,
-    /// Live `aterm` sessions running on this host.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sessions: Vec<HostedSession>,
+    /// The observed sessions and whether their inventory was read completely.
+    #[serde(flatten)]
+    pub sessions: SessionSnapshot,
     /// Live system telemetry snapshot (`CPU`, `GPU`, `RAM`, `Disk`, `Uptime`, `RTT`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vitals: Option<HostVitals>,
+}
+
+/// Session rows together with whether every instance answered completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionSnapshot {
+    /// Every live session actually observed.
+    #[serde(rename = "sessions", default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<HostedSession>,
+    /// True only when every enumerated instance supplied its entire response.
+    /// Missing observation metadata means unknown, never a complete empty inventory.
+    #[serde(rename = "sessions_complete", default)]
+    pub complete: bool,
 }
 
 /// Live system telemetry snapshot reported in [`Hello::vitals`] or sampled by `aterm machines

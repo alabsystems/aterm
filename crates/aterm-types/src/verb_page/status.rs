@@ -487,11 +487,12 @@ pub(crate) const PAGE: Page = Page {
                     "the cause beside `log_journal=` (`help log closed`)",
                 ),
                 row(
-                    "exec_watch=<none|kqueue|sampler|connector>",
+                    "exec_watch=<none|kqueue|sampler|connector|job>",
                     "what hears the session's `exec`s for `detail=`: `kqueue` (macOS's process \
                      watch), `sampler` (the group in front read while a block runs), `connector` \
                      (Linux's proc connector once its listener proved itself, the sampler beside \
-                     it) or `none`",
+                     it), `job` (Windows: the session's job listed as its output is read) or \
+                     `none`",
                 ),
                 row(
                     "exec_watch_why=<-|off|no-route|proving|live|live-unmasked|socket|bind|send|\

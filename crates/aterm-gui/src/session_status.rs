@@ -1011,7 +1011,9 @@ fn before<'a>(
 
 /// The text reader's unconfirmed reading of `term`'s executing command ([`ProgramCandidate::text`]),
 /// for a decision made here and now that is never shown, stored or sent: a path link's
-/// remote-shell check, which must still hold where nothing reports execs (a ConPTY).
+/// remote-shell check, which must still hold where nothing reports execs (a session whose watch
+/// could not open, a cmd.exe block, which writes no C, or a program a Windows job's listings
+/// missed).
 pub(crate) fn executing_candidate(term: &aterm_core::terminal::Terminal) -> Option<String> {
     candidate(&executing_command_line(term)?).map(|c| c.text())
 }
@@ -2039,13 +2041,19 @@ fn detail_text(program: &str, sub: Option<&str>) -> String {
 
 /// Whether `name` is a name the kernel keeps for an image one of `ran` mapped (its canonical
 /// file's, or macOS's `p_name`: [`ExecNames::iter`]), whole: a name the kernel cut short confirms
-/// nothing longer. No process sets either, so a bare word equal to one names that program.
+/// nothing longer. No process sets either, so a bare word equal to one names that program. A
+/// Windows image's name is equal in any ASCII case ([`ExecNames::same`]), as cmd and pwsh find
+/// it; a unix image's byte for byte.
 ///
 /// [`ExecNames::iter`]: crate::command_ran::ExecNames::iter
+/// [`ExecNames::same`]: crate::command_ran::ExecNames::same
 fn ran_named(ran: &[std::sync::Arc<crate::command_ran::Exec>], name: &str) -> bool {
-    ran.iter()
-        .flat_map(|exec| exec.names.iter())
-        .any(|image| image == name || basename(image) == Some(name))
+    ran.iter().any(|exec| {
+        let names = &exec.names;
+        names.iter().any(|image| {
+            names.same(image, name) || basename(image).is_some_and(|base| names.same(base, name))
+        })
+    })
 }
 
 /// Whether an image's canonical file name is a wrapper's ([`WRAPPERS`]): a wrapper runs the

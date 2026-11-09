@@ -475,6 +475,7 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
         let shown = super::claim_line(
             &claims[0],
             reserved(&claims, Some(&trees), r.volume.as_slice())[0],
+            None,
             Some(&trees),
             None,
             1_000,
@@ -508,4 +509,117 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
             );
         }
     }
+}
+
+/// A claim of memory by `pid`, made at `start_ms`, held when `held`.
+fn mem_claim(pid: u32, start_ms: u64, need: Need, held: bool) -> Record {
+    Record {
+        need,
+        ..claim(pid, start_ms, 0, DATA, held)
+    }
+}
+
+/// THE LISTING NAMES A BUILD'S PHASES (CAP3): a held claim its holder stepped down as its run
+/// began says so beside its memory and reserves its step, and a held claim that plans a step
+/// names what it will claim once it runs what it built, reserving its whole peak till then.
+#[test]
+fn a_stepped_claim_and_a_planned_step_are_named_so() {
+    let (r, _) = data();
+    let mut stepped = mem_claim(
+        1,
+        100,
+        Need::new("test a").mem(20 * GIB).run_mem(4 * GIB),
+        true,
+    );
+    stepped.need.stepped = Some(4 * GIB);
+    let planned = mem_claim(
+        2,
+        200,
+        Need::new("test b").mem(10 * GIB).run_mem(3 * GIB),
+        true,
+    );
+    let claims = [stepped, planned];
+    let shown = claim_lines(&r, &[], &claims);
+    assert!(
+        shown[0].contains(&format!(
+            "mem {}, stepped to {} as its run began, reserves {}",
+            gib(20 * GIB),
+            gib(4 * GIB),
+            gib(4 * GIB)
+        )),
+        "{}",
+        shown[0]
+    );
+    assert!(
+        shown[1].contains(&format!(
+            "mem {}, {} once it runs what it built, reserves {}",
+            gib(10 * GIB),
+            gib(3 * GIB),
+            gib(10 * GIB)
+        )),
+        "{}",
+        shown[1]
+    );
+    let report = json_report(&r, &[], &claims, None);
+    assert_eq!(
+        json_claims(&report, "run_mem"),
+        [Value::from(4 * GIB), Value::from(3 * GIB)]
+    );
+    assert_eq!(
+        json_claims(&report, "stepped"),
+        [Value::from(4 * GIB), Value::Null]
+    );
+}
+
+/// THE LISTING NAMES WHAT A WAITER THAT CANNOT START SPARES (CAP3). On 40 GiB available, a
+/// stepped claim reserves 4 GiB and a held one 10 GiB that plans a step to 3, so a 31 GiB waiter
+/// lacks 5 GiB: the planned step brings 7, so it spares 2 GiB. A 41 GiB waiter behind it lacks
+/// 46 GiB with the first waiter's need, more than the 45 every claim ahead of it gives back at its
+/// end, so it spares nothing. A held claim has nothing to name.
+#[test]
+fn a_waiter_that_cannot_start_names_what_it_spares() {
+    let (r, _) = data();
+    let mut stepped = mem_claim(
+        1,
+        100,
+        Need::new("test a").mem(20 * GIB).run_mem(4 * GIB),
+        true,
+    );
+    stepped.need.stepped = Some(4 * GIB);
+    let claims = [
+        stepped,
+        mem_claim(
+            2,
+            200,
+            Need::new("test b").mem(10 * GIB).run_mem(3 * GIB),
+            true,
+        ),
+        mem_claim(3, 300, Need::new("check c").mem(31 * GIB), false),
+        mem_claim(4, 400, Need::new("check d").mem(41 * GIB), false),
+    ];
+    let shown = claim_lines(&r, &[], &claims);
+    assert!(
+        shown[2].contains(&format!(
+            "reserves {}: it cannot start yet, and a claim behind it of {} or less may go first",
+            gib(31 * GIB),
+            gib(2 * GIB)
+        )),
+        "{}",
+        shown[2]
+    );
+    assert!(
+        shown[3].contains("it cannot start yet, and no claim behind it goes first"),
+        "{}",
+        shown[3]
+    );
+    assert!(!shown[0].contains("cannot start") && !shown[1].contains("cannot start"));
+    assert_eq!(
+        json_claims(&json_report(&r, &[], &claims, None), "spares"),
+        [
+            Value::Null,
+            Value::Null,
+            Value::from(2 * GIB),
+            Value::from(0u64)
+        ]
+    );
 }

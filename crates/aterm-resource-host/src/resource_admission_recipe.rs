@@ -20,6 +20,7 @@ pub(super) enum Kind {
     Metadata,
     Resolver,
     Workload,
+    BootstrapGraph,
 }
 pub(super) struct Probe {
     worker: Option<preparation::Worker<()>>,
@@ -155,6 +156,11 @@ impl Recipe {
                 "workload service requires its closed cooperative request",
             ));
         }
+        if bootstrap_graph::purpose(request) && !bootstrap_graph::closed_request(request) {
+            return Err(refused(
+                "Bootstrap graph requires its closed fixed Root request",
+            ));
+        }
         if request.cpu_units > physical {
             return Err(refused("requested CPU width exceeds this host"));
         }
@@ -197,6 +203,7 @@ impl Recipe {
         if metadata_request(request)
             || resolver_root::closed_request(request)
             || workload::closed_request(request)
+            || bootstrap_graph::closed_request(request)
         {
             let selected =
                 managed.ok_or_else(|| refused("managed metadata service unavailable"))?;
@@ -207,7 +214,48 @@ impl Recipe {
             }
             let resolver = resolver_root::closed_request(request);
             let workload = workload::closed_request(request);
-            let mut environment = service_environment(request, &selected, resolver || workload)?;
+            let graph = bootstrap_graph::closed_request(request);
+            let mut environment =
+                service_environment(request, &selected, resolver || workload || graph)?;
+            if graph {
+                // The graph query profile binds the COMPLETE original six
+                // semantic entries. No PATH/config/loader/session input is
+                // silently stripped to manufacture equality with a query.
+                if request.env.len() != 6
+                    || request
+                        .env
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != 6
+                    || request.env.iter().any(|(name, _)| {
+                        !matches!(
+                            name.as_slice(),
+                            b"LANG"
+                                | b"LC_ALL"
+                                | b"CARGO"
+                                | b"RUSTC"
+                                | b"CARGO_HOME"
+                                | b"CARGO_CACHE_RUSTC_INFO"
+                        )
+                    })
+                {
+                    return Err(refused(
+                        "Bootstrap Root requires its complete closed six-entry environment",
+                    ));
+                }
+                environment = request
+                    .env
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            OsString::from_vec(key.clone()),
+                            OsString::from_vec(value.clone()),
+                        )
+                    })
+                    .collect();
+            }
             // No preparatory subprocess: actual ARM/BIND/root ownership must
             // exist before ANY selected service code runs. Live readiness is
             // negotiated by that same original root before member admission.
@@ -225,12 +273,37 @@ impl Recipe {
                 // Ready and each graph member reuse its original held inputs.
                 sdk.capture_workload_compiler(native_inputs::deadline(Instant::now()))?;
             }
+            if graph {
+                let deadline = native_inputs::deadline(Instant::now());
+                sdk.original_inputs()
+                    .require_bootstrap_graph_protocol_marker(
+                    &trust_resource_controller::bootstrap_graph::BOOTSTRAP_GRAPH_PROTOCOL_MARKER,
+                    deadline,
+                )?;
+                // SAME paid preparation and original Keeper; no path-selected
+                // SDK/compiler or late-capture fallback is permitted at query.
+                sdk.capture_bootstrap_query_inputs(deadline)?;
+                arguments.splice(
+                    0..0,
+                    [
+                        "--resource-worker-v3".into(),
+                        "--resource-subgroups-v3".into(),
+                    ],
+                );
+            }
             for (key, value) in sdk.runtime_environment()? {
+                if graph {
+                    return Err(refused(
+                        "Bootstrap graph query profile does not support a loader override",
+                    ));
+                }
                 environment.retain(|(old, _)| old != &key);
                 environment.push((key, value));
             }
             return Ok(Some(Self {
-                kind: if workload {
+                kind: if graph {
+                    Kind::BootstrapGraph
+                } else if workload {
                     Kind::Workload
                 } else if resolver {
                     Kind::Resolver
@@ -241,7 +314,11 @@ impl Recipe {
                 arguments,
                 environment,
                 cwd,
-                width: if workload { request.cpu_units } else { 1 },
+                width: if workload || graph {
+                    request.cpu_units
+                } else {
+                    1
+                },
                 compiler: workload.then(|| compiler::Selection::HeldSdk(sdk.clone())),
                 metadata_sdk: Some(sdk),
             }));

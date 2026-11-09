@@ -28,6 +28,8 @@ pub(super) struct Keeper {
     execution: PathBuf,
     build: u64,
     held: Arc<trust_resource_provenance::program::HeldProgram>,
+    bootstrap_query_compiler:
+        std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
     workload_compiler: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
     workload_linker: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
 }
@@ -133,6 +135,44 @@ impl Keeper {
             deadline,
         )?;
         self.validate()
+    }
+    /// Capture the compiler from this SAME selected manager artifact before
+    /// the Bootstrap Root can execute. No request-selected directory or marker
+    /// creates SDK custody, and this does not enable a producing profile.
+    pub(super) fn capture_bootstrap_query_inputs(&self, deadline: Instant) -> io::Result<()> {
+        if self.bootstrap_query_compiler.get().is_some() {
+            return Err(refused("Bootstrap query inputs already captured"));
+        }
+        let held = self.capture_workload_program("trustc", deadline)?;
+        self.bootstrap_query_compiler
+            .set(held)
+            .map_err(|_| refused("Bootstrap query compiler capture raced"))?;
+        self.validate()?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
+    /// Borrow only an original selected input. In particular a missing early
+    /// compiler capture never falls back to opening a request pathname.
+    pub(super) fn bootstrap_query_program(
+        &self,
+        tool: trust_resource_controller::bootstrap_graph::query::Tool,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        let held = match tool {
+            trust_resource_controller::bootstrap_graph::query::Tool::Targo => &self.held,
+            trust_resource_controller::bootstrap_graph::query::Tool::Compiler => self
+                .bootstrap_query_compiler
+                .get()
+                .ok_or_else(|| refused("Bootstrap query compiler not retained before Root GO"))?,
+        };
+        held.validate(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(Arc::clone(held))
     }
     fn capture_workload_program(
         &self,
@@ -297,6 +337,7 @@ impl Keeper {
             execution,
             build,
             held: Arc::new(held),
+            bootstrap_query_compiler: std::sync::OnceLock::new(),
             workload_compiler: std::sync::OnceLock::new(),
             workload_linker: std::sync::OnceLock::new(),
         };
@@ -317,6 +358,9 @@ impl Keeper {
         current(&self.program_path, &self.program, &self.program_before)?;
         current(&self.ready_path, &self.ready, &self.ready_before)?;
         native_inputs::validate(&self.held, started)?;
+        if let Some(compiler) = self.bootstrap_query_compiler.get() {
+            native_inputs::validate(compiler, started)?;
+        }
         if let Some(compiler) = self.workload_compiler.get() {
             native_inputs::validate(compiler, started)?;
         }

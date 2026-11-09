@@ -150,7 +150,7 @@ impl Owner {
         context.sdk = sdk;
         if peer.pid == context.original_root.pid
             && peer.birth == context.original_root.birth
-            && (job.metadata_root || job.resolver.is_some())
+            && (job.metadata_root || job.resolver.is_some() || job.bootstrap_graph.is_some())
         {
             context.sdk = job
                 .metadata_sdk

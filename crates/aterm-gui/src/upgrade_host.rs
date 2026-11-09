@@ -301,7 +301,7 @@ const PRESS_LANE_MAX: std::time::Duration =
 
 /// The pause before a press's lane's next step, `elapsed` since it began: close at first, where
 /// the owner who pressed is watching (a draft sent, a box answered, a turn ended), then calmer.
-fn press_pace(elapsed: std::time::Duration) -> std::time::Duration {
+pub(crate) fn press_pace(elapsed: std::time::Duration) -> std::time::Duration {
     if elapsed < std::time::Duration::from_secs(60) {
         std::time::Duration::from_secs(2)
     } else {

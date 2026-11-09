@@ -48,10 +48,8 @@ const _: () = assert!(MAX_RECOVERY_BYTES == 2_468);
 const RECOVERY_BYTES: usize = RECOVERY_NODES * MAX_RECOVERY_BYTES;
 const SUBJECT: &str = "commons/control/1";
 const NAME: &str = "control";
-/// How long a writer open waits for another local writer to let go. Writers do
-/// no network I/O and hold the lock for local work only, so one that outlasts
-/// this is stuck or one of many back to back: the open is refused as busy.
-const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Hang detector for a required local journal writer and its authenticated replay.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LIMITS: Limits = Limits {
     records: MAX_NODES,
     bytes: MAX_BYTES,
@@ -307,10 +305,10 @@ impl Journal {
     /// Replay all authenticated ciphertext under the exact immutable anchor.
     /// A missing anchor file can be restored only to the caller's independently
     /// trusted value; replay still verifies every event against it. Another
-    /// local writer is waited for at most a second; one that holds the
-    /// journal longer refuses this as [`crate::ErrorKind::JournalBusy`].
+    /// local writer is waited for with a minute hang detector; expiry
+    /// refuses this as [`crate::ErrorKind::JournalBusy`].
     pub fn open(dir: &Path, trust: Trust) -> Result<Self> {
-        Self::open_mode(dir, trust, false, None)
+        Self::open_started(dir, trust, false, std::time::Instant::now())
     }
 
     /// Reopen an established journal. Missing anchor/log/checkpoint state is
@@ -318,7 +316,23 @@ impl Journal {
     /// bootstrap pin uses this after the journal has first been initialized.
     /// Another writer is waited for as [`Journal::open`] does.
     pub fn open_existing(dir: &Path, trust: Trust) -> Result<Self> {
-        Self::open_mode(dir, trust, true, None)
+        Self::open_started(dir, trust, true, std::time::Instant::now())
+    }
+
+    fn open_started(
+        dir: &Path,
+        trust: Trust,
+        established: bool,
+        started: std::time::Instant,
+    ) -> Result<Self> {
+        let deadline = started + WRITER_WAIT;
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::of_kind(
+                crate::ErrorKind::JournalBusy,
+                "Commons journal writer did not finish before its hang detector",
+            ));
+        }
+        Self::open_mode(dir, trust, established, deadline)
     }
 
     /// [`Self::open`], waiting for an actual local writer until `deadline`.
@@ -326,7 +340,7 @@ impl Journal {
     /// prefix under the acquired lock; otherwise replay validates that history.
     /// A timeout obtains no current authorization observation.
     pub fn open_until(dir: &Path, trust: Trust, deadline: std::time::Instant) -> Result<Self> {
-        Self::open_mode(dir, trust, false, Some(deadline))
+        Self::open_mode(dir, trust, false, deadline)
     }
 
     /// [`Self::open_existing`] with a bounded wait for the local writer lock.
@@ -336,7 +350,7 @@ impl Journal {
         trust: Trust,
         deadline: std::time::Instant,
     ) -> Result<Self> {
-        Self::open_mode(dir, trust, true, Some(deadline))
+        Self::open_mode(dir, trust, true, deadline)
     }
 
     /// A read-only verified view of an established journal that takes no lock,
@@ -364,7 +378,7 @@ impl Journal {
         dir: &Path,
         trust: Trust,
         established: bool,
-        deadline: Option<std::time::Instant>,
+        deadline: std::time::Instant,
     ) -> Result<Self> {
         // Verify before taking the writer, so that when no other writer
         // appends meanwhile, neither verification nor the view cache's mutex
@@ -373,7 +387,6 @@ impl Journal {
         let before = VIEWS.read(dir, trust).ok();
         #[cfg(test)]
         tests::before_lock();
-        let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + WRITER_WAIT);
         let mut log = Log::open_until(dir, NAME, &trust.bytes(), established, LIMITS, deadline)
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {

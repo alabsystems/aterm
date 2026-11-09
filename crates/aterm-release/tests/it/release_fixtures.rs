@@ -38,7 +38,8 @@ fn pins(build: u64) -> Pins {
 }
 
 fn reader(staged: &fixtures::Staged) -> impl FnMut(&str) -> fixtures::Reading + '_ {
-    |_| fixtures::Reading {
+    |preview| fixtures::Reading {
+        checked: Some(preview.to_owned()),
         answers: Ok(fs::read_to_string(&staged.answers).unwrap()),
         checks: "PASS (test reader)".into(),
     }
@@ -529,6 +530,13 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     );
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Movement {
+    Edit,
+    Revert,
+    Rewrite,
+}
+
 struct Raced<'a> {
     inner: Git,
     remote: crate::github_remote::Remote,
@@ -538,6 +546,7 @@ struct Raced<'a> {
     refreshes: Cell<u32>,
     lose_reply: bool,
     path: &'static str,
+    movement: Movement,
 }
 
 #[test]
@@ -591,6 +600,7 @@ fn main_reader_answers_replace_line_answers_and_a_named_red_still_lands() {
                 corpus()
             );
             fixtures::Reading {
+                checked: Some(preview.to_owned()),
                 answers: Ok(main.clone()),
                 checks: "FAIL: restore_claude_auth_tests::new_route".into(),
             }
@@ -629,6 +639,7 @@ fn an_unavailable_main_reader_never_falls_back_to_the_line_reader() {
         &staged,
         &pins(7),
         &mut |_| fixtures::Reading {
+            checked: None,
             answers: Err("main compile failed".into()),
             checks: "COULD NOT RUN: main compile failed".into(),
         },
@@ -820,6 +831,7 @@ fn measure_main_fixture_reader() {
         .unwrap()
         .to_path_buf();
     let git = Git::new(&repo);
+    let capture = aterm_tempfile::tempdir().unwrap();
     let mut run = |cmd: &mut Command| {
         if cmd.get_args().any(|arg| arg == "--no-run")
             && let Some(dir) = std::env::var_os("ATERM_MEASURE_READER_BUILD_DIR")
@@ -827,9 +839,62 @@ fn measure_main_fixture_reader() {
             cmd.arg("--config")
                 .arg(format!("build.build-dir={:?}", PathBuf::from(dir)));
         }
-        cmd.output()
+        let stdout = capture.path().join("stdout");
+        let stderr = capture.path().join("stderr");
+        cmd.stdout(fs::File::create(&stdout)?)
+            .stderr(fs::File::create(&stderr)?);
+        let started = std::time::Instant::now();
+        let mut child = cmd.spawn()?;
+        let usage = child.wait_with_rusage()?;
+        println!(
+            "reader-child {:?}: wall {:.3}s, CPU {:.3}s",
+            cmd.get_args().collect::<Vec<_>>(),
+            started.elapsed().as_secs_f64(),
+            usage.cpu.as_secs_f64()
+        );
+        Ok(Output {
+            status: usage.status,
+            stdout: fs::read(stdout)?,
+            stderr: fs::read(stderr)?,
+        })
     };
-    let before = std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "HEAD".into());
+    let mut before = std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "HEAD".into());
+    let regression = std::env::var_os("ATERM_MEASURE_READER_REGRESSION").is_some();
+    let hold_source = "crates/aterm-gui/src/seamless_fixture_generator_tests.rs";
+    let mut repaired_hold = None;
+    if regression {
+        let source = crate::ledger::git_ok(&git, &["show", &format!("{before}:{hold_source}")])
+            .unwrap()
+            .stdout_utf8();
+        let mutant = source.replacen("fn check_landed_handoff_fields() {", "fn check_landed_handoff_fields() {\n    assert!(false, \"planted prebuilt reader regression\");", 1);
+        assert_ne!(source, mutant);
+        repaired_hold = Some(source);
+        let blob = git
+            .git_input(&["hash-object", "-w", "--stdin"], mutant.as_bytes())
+            .unwrap();
+        assert!(blob.success());
+        let tree = fixtures::tree_with(
+            &git,
+            Some(&crate::ledger::rev_parse(&git, &format!("{before}^{{tree}}")).unwrap()),
+            &[(hold_source, blob.stdout_utf8().trim())],
+        )
+        .unwrap();
+        before = crate::ledger::git_ok(
+            &git,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &before,
+                "-m",
+                "measurement planted reader regression",
+            ],
+        )
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_owned();
+    }
     let corpus = crate::ledger::git_ok(
         &git,
         &[
@@ -879,6 +944,86 @@ fn measure_main_fixture_reader() {
             "prebuild: {:.3}s {result:?}",
             started.elapsed().as_secs_f64()
         );
+        assert!(
+            result.is_ok(),
+            "measurement needs a completed prebuild: {result:?}"
+        );
+    }
+    let mut preview = preview;
+    if std::env::var_os("ATERM_MEASURE_READER_CHURN").is_some() {
+        // A source-only reader-cone edit: the fixture edit remains disjoint.
+        let path = "crates/aterm-gui/src/lib.rs";
+        let source = crate::ledger::git_ok(&git, &["show", &format!("{before}:{path}")])
+            .unwrap()
+            .stdout_utf8();
+        let blob = git
+            .git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("{source}\n// Reader churn measurement.\n").as_bytes(),
+            )
+            .unwrap();
+        assert!(blob.success());
+        let mut edits = vec![(path, blob.stdout_utf8().trim().to_owned())];
+        if let Some(source) = &repaired_hold {
+            let blob = git
+                .git_input(&["hash-object", "-w", "--stdin"], source.as_bytes())
+                .unwrap();
+            assert!(blob.success());
+            edits.push((hold_source, blob.stdout_utf8().trim().to_owned()));
+        }
+        let refs: Vec<_> = edits
+            .iter()
+            .map(|(path, blob)| (*path, blob.as_str()))
+            .collect();
+        let moved = fixtures::tree_with(&git, Some(&base), &refs).unwrap();
+        let tip = crate::ledger::git_ok(
+            &git,
+            &[
+                "commit-tree",
+                &moved,
+                "-p",
+                &before,
+                "-m",
+                "measurement reader-cone movement",
+            ],
+        )
+        .unwrap()
+        .stdout_utf8();
+        let moved_preview = fixtures::tree_with(
+            &git,
+            Some(&moved),
+            &[(
+                fixtures::SHIPPED_STATE_CORPUS,
+                {
+                    let blob = git
+                        .git_input(&["hash-object", "-w", "--stdin"], without.as_bytes())
+                        .unwrap();
+                    assert!(blob.success());
+                    blob.stdout_utf8().trim().to_owned()
+                }
+                .as_str(),
+            )],
+        )
+        .unwrap();
+        preview = crate::ledger::git_ok(
+            &git,
+            &[
+                "commit-tree",
+                &moved_preview,
+                "-p",
+                tip.trim(),
+                "-m",
+                "measurement moved fixture preview",
+            ],
+        )
+        .unwrap()
+        .stdout_utf8();
+    }
+    if std::env::var_os("ATERM_MEASURE_READER_RECOMPILE").is_some() {
+        let dir = crate::ledger::git_ok(&git, &["rev-parse", "--absolute-git-dir"])
+            .unwrap()
+            .stdout_utf8();
+        fs::remove_file(Path::new(dir.trim()).join(".ubd/main-reader.noindex/prebuilt")).unwrap();
     }
     let reading = reader.read(
         &targo(),
@@ -891,7 +1036,19 @@ fn measure_main_fixture_reader() {
     );
     println!("cold: {}", reading.checks);
     assert!(reading.answers.is_ok(), "{}", reading.checks);
-    assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+    assert!(
+        if regression {
+            reading.checks.contains("field hold: FAIL")
+                && reading
+                    .checks
+                    .contains("planted prebuilt reader regression")
+                && reading.checks.contains("no compile")
+        } else {
+            reading.checks.starts_with("PASS")
+        },
+        "{}",
+        reading.checks
+    );
     if std::env::var_os("ATERM_MEASURE_MAIN_ONCE").is_some() {
         return;
     }
@@ -997,7 +1154,230 @@ fn prebuild_fixture_tree_is_the_tree_landing_then_judges() {
 }
 
 #[test]
-fn prebuild_never_supplies_another_trees_binary_or_hides_the_preview_compile_red() {
+fn compiled_reader_timelines_execute_the_judged_tree_and_keep_its_field_red() {
+    for timeline in [
+        "still",
+        "moved",
+        "merged",
+        "touched",
+        "diverged",
+        "regression",
+        "failed",
+        "binary-changed",
+        "compiler-changed",
+        "producer-changed",
+    ] {
+        let o = Origin::new();
+        let old_branch = git(&o.rival, &["rev-parse", "HEAD"]);
+        if matches!(timeline, "merged" | "diverged") {
+            if timeline == "merged" {
+                fs::write(
+                    o.rival.join(HANDOFF_FIXTURE_GUARD),
+                    format!("{GUARD}\n// baseline fixture update\n"),
+                )
+                .unwrap();
+            } else {
+                fs::write(
+                    o.rival.join("crates/aterm-gui/src/lib.rs"),
+                    "// X's reader change\n",
+                )
+                .unwrap();
+            }
+            git(&o.rival, &["add", "-A"]);
+            git(
+                &o.rival,
+                &["commit", "-am", "fixture update before prebuild"],
+            );
+            git(&o.rival, &["push", "origin", "main"]);
+            git(&o.work, &["fetch", "origin"]);
+        }
+        let staged = fixtures::stage(
+            &targo(),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut generator(&["history"], &Cell::new(0)),
+        )
+        .unwrap();
+        let binary = o.work.join("target/debug/deps/aterm_gui-0123456789abcdef");
+        let mut warmed = String::new();
+        if timeline == "failed" {
+            // A failed attempt must invalidate an earlier successful index too.
+            fixtures::MainReader::new(&o.work)
+                .unwrap()
+                .prebuild_fixtures(&targo(), "origin/main", &staged, &pins(7), &mut |cmd| {
+                    Ok(Output {
+                        status: exit(0),
+                        stdout: artifact(cmd.get_current_dir().unwrap(), &binary).into_bytes(),
+                        stderr: Vec::new(),
+                    })
+                })
+                .unwrap();
+        }
+        let result = fixtures::MainReader::new(&o.work)
+            .unwrap()
+            .prebuild_fixtures(&targo(), "origin/main", &staged, &pins(7), &mut |cmd| {
+                let tree = cmd.get_current_dir().unwrap();
+                warmed = git(tree, &["rev-parse", "HEAD"]);
+                Ok(Output {
+                    status: exit(i32::from(timeline == "failed")),
+                    stdout: artifact(tree, &binary).into_bytes(),
+                    stderr: Vec::new(),
+                })
+            });
+        assert_eq!(result.is_err(), timeline == "failed");
+        if timeline == "binary-changed" {
+            fs::write(&binary, b"another compile").unwrap();
+        }
+        if timeline == "producer-changed" {
+            fs::write(
+                staged.dir.join("history/parent.toml"),
+                "changed producer bytes\n",
+            )
+            .unwrap();
+        }
+        if timeline != "still" && timeline != "failed" && timeline != "binary-changed" {
+            if timeline == "touched" {
+                let path = o
+                    .rival
+                    .join(HANDOFF_FIXTURE_ROOT)
+                    .join("v0.6.0/history/other");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, "intervening writer").unwrap();
+                git(&o.rival, &["add", "-A"]);
+                git(&o.rival, &["commit", "-m", "touch release fixtures"]);
+                fs::remove_file(path).unwrap();
+            }
+            fs::write(o.rival.join("README.md"), "main moved\n").unwrap();
+            if matches!(timeline, "moved" | "regression") {
+                fs::write(
+                    o.rival.join("crates/aterm-gui/src/lib.rs"),
+                    "// reader cone moved\n",
+                )
+                .unwrap();
+            }
+            git(&o.rival, &["add", "-A"]);
+            git(&o.rival, &["commit", "-m", "advance main"]);
+            if timeline == "merged" {
+                git(&o.rival, &["checkout", "-b", "peer", old_branch.trim()]);
+                fs::write(
+                    o.rival.join("crates/aterm-gui/src/lib.rs"),
+                    "// peer reader change\n",
+                )
+                .unwrap();
+                git(&o.rival, &["add", "-A"]);
+                git(
+                    &o.rival,
+                    &["commit", "-m", "peer code change on older base"],
+                );
+                git(
+                    &o.rival,
+                    &[
+                        "merge",
+                        "--no-ff",
+                        "main",
+                        "-m",
+                        "merge disjoint older peer",
+                    ],
+                );
+                // Workers merge moving main into their branch, then land that
+                // merge: X can be reachable through its second parent.
+                git(&o.rival, &["checkout", "main"]);
+                git(&o.rival, &["merge", "--ff-only", "peer"]);
+            }
+            if timeline == "diverged" {
+                // A sibling from before X has identical fixture inputs. Unlike
+                // an orphan root, its history does not add the fixture files,
+                // so only the ancestry guard can disqualify it.
+                git(
+                    &o.rival,
+                    &["checkout", "-b", "rewritten", old_branch.trim()],
+                );
+                fs::write(o.rival.join("README.md"), "rewritten main\n").unwrap();
+                git(&o.rival, &["commit", "-am", "a divergent sibling"]);
+                let unrelated = git(&o.rival, &["rev-parse", "HEAD"]);
+                git(
+                    &o.dir.path().join("origin.git"),
+                    &["fetch", "../rival", unrelated.trim()],
+                );
+                git(
+                    &o.dir.path().join("origin.git"),
+                    &["update-ref", "refs/heads/main", unrelated.trim()],
+                );
+            } else {
+                git(&o.rival, &["push", "origin", "main"]);
+            }
+        }
+        let mut compiles = 0;
+        let mut holds = 0;
+        let reuse = matches!(timeline, "still" | "moved" | "merged" | "regression");
+        let mut judged = String::new();
+        let compiler = if timeline == "compiler-changed" {
+            o.work.join("other-targo")
+        } else {
+            targo()
+        };
+        let landed = fixtures::land(&Git::new(&o.work), &native(&o), &staged, &pins(7), &mut |preview| {
+            // Reopen: the cut and after-cut do not share a MainReader object.
+            let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+            let mut run = |cmd: &mut Command| {
+                let tree = cmd.get_current_dir().unwrap();
+                judged = git(tree, &["rev-parse", "HEAD"]);
+                if cmd.get_args().any(|a| a == "--no-run") {
+                    compiles += 1;
+                    return Ok(Output { status: exit(0), stdout: artifact(tree, &binary).into_bytes(), stderr: Vec::new() });
+                }
+                if let Some(out) = field_hold_pass(cmd) {
+                    holds += 1;
+                    if timeline == "regression" && holds == 1 {
+                        assert_eq!(judged, warmed, "composition must execute X's reader");
+                        return Ok(Output { status: exit(1), stdout: b"test planted_reader_regression ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n".to_vec(), stderr: Vec::new() });
+                    }
+                    return Ok(out);
+                }
+                if let Some(path) = env_of(cmd, fixtures::ANSWERS_OUT) {
+                    fs::write(path, staged_answers(&["history"])).unwrap();
+                }
+                Ok(Output { status: exit(0), stdout: b"test result: ok. 1 passed; 0 failed; 0 ignored\n".to_vec(), stderr: Vec::new() })
+            };
+            let first = reader.read(&compiler, preview, &pins(7), &mut run);
+            if timeline == "regression" {
+                let second = reader.read(&compiler, preview, &pins(7), &mut run);
+                assert!(second.checks.contains("earlier main reader"), "{}", second.checks);
+                second
+            } else { first }
+        }).unwrap();
+        assert_eq!(holds, if timeline == "regression" { 2 } else { 1 });
+        assert_eq!(
+            compiles,
+            usize::from(!reuse),
+            "{timeline}: {}",
+            landed.words(&pins(7))
+        );
+        if reuse {
+            assert_eq!(judged, warmed, "{timeline}");
+            let message = git(&o.work, &["show", "-s", "--format=%B", "origin/main"]);
+            assert!(message.contains(&format!("Fixture-Reader-Checked: {}", warmed.trim())));
+        }
+        assert!(
+            landed
+                .words(&pins(7))
+                .contains(if timeline == "regression" {
+                    "field hold: FAIL"
+                } else {
+                    "field hold: PASS"
+                })
+        );
+        assert!(
+            landed
+                .words(&pins(7))
+                .contains(if reuse { "composed onto" } else { "compiled " })
+        );
+    }
+}
+
+#[test]
+fn incomplete_or_failed_prebuild_never_hides_the_preview_compile_red() {
     for prebuild_success in [true, false] {
         let o = Origin::new();
         let mut reader = fixtures::MainReader::new(&o.work).unwrap();
@@ -1030,7 +1410,10 @@ fn prebuild_never_supplies_another_trees_binary_or_hides_the_preview_compile_red
                 stderr: b"error: preview compile negative control".to_vec(),
             })
         });
-        assert!(compiled, "prebuild must never replace the preview compile");
+        assert!(
+            compiled,
+            "an incomplete prebuild cannot replace the preview compile"
+        );
         assert!(reading.answers.is_err());
         assert!(
             reading.checks.contains("preview compile negative control"),
@@ -1234,7 +1617,22 @@ impl OriginTransport for Raced<'_> {
             let old = fs::read_to_string(&path).unwrap();
             fs::write(path, format!("// peer move {left}\n{old}")).unwrap();
             git(rival, &["commit", "-q", "-am", "a peer's change"]);
-            git(rival, &["push", "-q", "origin", "main"]);
+            if self.movement == Movement::Revert {
+                fs::write(rival.join(self.path), old).unwrap();
+                git(rival, &["commit", "-q", "-am", "revert peer's edit"]);
+            }
+            if self.movement == Movement::Rewrite {
+                let tree = git(rival, &["rev-parse", "HEAD^{tree}"]);
+                let root = git(
+                    rival,
+                    &["commit-tree", tree.trim(), "-m", "unrelated peer root"],
+                );
+                let bare = rival.parent().unwrap().join("origin.git");
+                git(&bare, &["fetch", "../rival", root.trim()]);
+                git(&bare, &["update-ref", "refs/heads/main", root.trim()]);
+            } else {
+                git(rival, &["push", "-q", "origin", "main"]);
+            }
         }
         let outcome = OriginTransport::write(&self.remote, reference, before, after)?;
         if self.lose_reply {
@@ -1272,7 +1670,12 @@ impl OriginTransport for Raced<'_> {
 
 #[test]
 fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
-    for (path, moves, expected_reads) in [("README.md", 8, 1), (HANDOFF_FIXTURE_GUARD, 1, 2)] {
+    for (path, moves, expected_reads, movement) in [
+        ("README.md", 8, 1, Movement::Edit),
+        (HANDOFF_FIXTURE_GUARD, 1, 2, Movement::Edit),
+        (HANDOFF_FIXTURE_GUARD, 1, 2, Movement::Revert),
+        ("README.md", 1, 2, Movement::Rewrite),
+    ] {
         let o = Origin::new();
         let staged = fixtures::stage(
             &targo(),
@@ -1291,11 +1694,16 @@ fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
             refreshes: Cell::new(0),
             lose_reply: false,
             path,
+            movement,
         };
         let mut reads = 0;
         let start = std::time::Instant::now();
+        let mut checked = String::new();
         let result = fixtures::land(&raced, &raced, &staged, &pins(7), &mut |preview| {
             reads += 1;
+            if reads == 1 {
+                checked = preview.to_owned();
+            }
             assert!(
                 git(
                     &o.work,
@@ -1303,7 +1711,7 @@ fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
                 )
                 .contains("v0.6.0")
             );
-            if reads > 1 {
+            if reads > 1 && movement != Movement::Revert {
                 assert!(
                     git(&o.work, &["show", &format!("{preview}:{path}")]).contains("peer move")
                 );
@@ -1327,10 +1735,11 @@ fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
                 .contains("FAIL: retained reader verdict")
         );
         assert!(matches!(landed, Landed::Pushed { attempt, .. } if attempt == expected_reads));
-        assert!(
+        assert_eq!(
             String::from_utf8(o.on_main(path))
                 .unwrap()
-                .contains("peer move")
+                .contains("peer move"),
+            movement != Movement::Revert
         );
         assert_eq!(
             o.on_main(&format!(
@@ -1340,7 +1749,7 @@ fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
         );
         if expected_reads == 1 {
             let message = git(&o.work, &["show", "-s", "--format=%B", "origin/main"]);
-            assert!(message.contains("Fixture-Reader-Checked:"));
+            assert!(message.contains(&format!("Fixture-Reader-Checked: {checked}")));
             assert!(message.contains("Fixture-Composed-Onto:"));
         }
     }
@@ -1411,6 +1820,7 @@ fn an_unknown_fixture_write_never_retries_or_rereads_as_a_conflict() {
         refreshes: Cell::new(0),
         lose_reply: true,
         path: "README.md",
+        movement: Movement::Edit,
     };
     // The fixture performs the real native write and withholds only the caller's
     // reply. Adapter journal persistence is qualified separately; this control

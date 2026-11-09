@@ -3085,7 +3085,7 @@ fn let_disk_go(
 ) {
     let mode = held.mode();
     let held = match held {
-        disk::Disk::Held(held) => held,
+        disk::Disk::Held(held) => *held,
         disk::Disk::Covered(by) => {
             let _ = log.map(|f| writeln!(f, "{}", disk::covered_line(&by)));
             event_log::emit(events, &disk::event(mode, aterm_capacity::walks()));

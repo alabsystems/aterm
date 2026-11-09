@@ -35,7 +35,8 @@ pub struct Overrun {
     pub holds: u64,
     /// What of [`Self::holds`] its claims' reservations count ([`TreeUse::footprint`]).
     pub counted: u64,
-    /// The memory its held claims claim, summed.
+    /// The memory its held claims claim now ([`crate::Need::mem_now`]: a stepped claim's step),
+    /// summed.
     pub claimed: u64,
     /// How many held claims of memory that is.
     pub claims: usize,
@@ -115,7 +116,7 @@ pub(crate) fn overruns_of(others: &[Other<'_>]) -> HashMap<u32, Overrun> {
             .holds
             .saturating_add(o.credited.whole.max(o.credited.footprint));
         sum.counted = sum.counted.saturating_add(o.credited.footprint);
-        sum.claimed = sum.claimed.saturating_add(o.record.need.mem);
+        sum.claimed = sum.claimed.saturating_add(o.record.need.mem_now());
         sum.claims += 1;
     }
     out.retain(|_, o| o.past() >= TENTH);

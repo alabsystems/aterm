@@ -3812,6 +3812,10 @@ pub(crate) struct Acts {
     /// Chrome and its Claude extension ([`credit_claim::left_here`]), a wait in `Acts::inert`,
     /// which reads no machine.
     pub(crate) claim_left: Arc<ClaimLeftFn>,
+    /// The window's standing permission clicks, the App's own table: a tab's click holds its
+    /// loop's act at a rest for a bound of its own ([`WorkerIdle::click_holds`]); a fresh table
+    /// in `Acts::inert`.
+    pub(crate) clicks: crate::permission_click::Clicks,
 }
 
 /// What a worker hands the accounts recorder of its Claude Code at a usage wall ([`Acts::account_wall`]).
@@ -5560,10 +5564,10 @@ impl IdleHost for WorkerIdle {
         }
     }
 
-    /// The live upgrade's wind-down owns the turn ends, or a relaunch's carry-on is owed
-    /// ([`Self::carry_holds`]).
+    /// The live upgrade's wind-down owns the turn ends, a relaunch's carry-on is owed
+    /// ([`Self::carry_holds`]), or a person's permission click stands ([`Self::click_holds`]).
     fn owns_turn_end(&self) -> bool {
-        self.winding_down() || self.carry_holds()
+        self.winding_down() || self.carry_holds() || self.click_holds()
     }
 
     /// The disk is full for this session.
@@ -7865,6 +7869,15 @@ impl WorkerIdle {
             }
             *k.carry_hold.get_or_insert(now + CARRY_HOLD) > now
         })
+    }
+
+    /// Whether the loop's own act waits on the session's standing permission click
+    /// (`docs/DESIGN-yolo-binary-2026-11-04.md` Appendix, "Hold"): its lane restarts the
+    /// conversation at a rest, which a prompt the loop typed there would take. The wait is bounded
+    /// by the click's own hold ([`crate::permission_click::CLICK_HOLD`]), not a carry-on's, so a
+    /// lane stuck on a wait never parks Cruise or Land.
+    fn click_holds(&self) -> bool {
+        self.on() && self.hooks.acts.clicks.holds(&self.sid, Instant::now())
     }
 
     /// Why this worker refuses every fact line of its session (slice 1's refusals, a wake's
@@ -13298,6 +13311,19 @@ impl HostHandle {
     /// The agent's live policy gate, independently of a claim that its old worker may still be returning after a stop.
     pub(crate) fn admits(&self, agent: Program) -> bool {
         self.shared.switches.on_for(agent)
+    }
+
+    /// Whether a relaunch of tab `sid`'s agent is due ([`Relaunches::pending`]): a permission
+    /// click on a tab with no agent waits for it.
+    pub(crate) fn relaunch_due(&self, sid: &str) -> bool {
+        let kept = self
+            .shared
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(sid)
+            .map(Arc::clone);
+        kept.is_some_and(|kept| with_kept_of(&kept, |k| k.relaunches.pending()))
     }
 
     /// Whether the host relaunches the agents it supervises on its own (an exit, its memory restart).
@@ -19272,12 +19298,20 @@ pub(crate) fn window_drive_opts_with_tap(
     }
 }
 
+/// What the window hands its host's acts ([`live_acts`]): the accounts recorder's lifetime, and
+/// the window's standing permission clicks ([`Acts::clicks`]).
+#[derive(Default)]
+pub(crate) struct WindowShares {
+    pub(crate) account_work: aterm_agent::harness::account_work::Lifetime,
+    pub(crate) clicks: crate::permission_click::Clicks,
+}
+
 /// The worker's acts over this instance's own socket.
-fn live_acts(
-    store: Store,
-    sock: String,
-    account_work: aterm_agent::harness::account_work::Lifetime,
-) -> Acts {
+fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
+    let WindowShares {
+        account_work,
+        clicks,
+    } = window;
     let own_store = store.clone();
     let workers_store = store.clone();
     let task_sock = sock.clone();
@@ -19865,6 +19899,7 @@ fn live_acts(
         claim_workers: Arc::new(move || credit_claim::claim_workers(&workers_store)),
         claim_walled: Arc::new(credit_claim::walled_here),
         claim_left: Arc::new(credit_claim::left_here),
+        clicks,
     }
 }
 
@@ -27485,7 +27520,7 @@ pub(crate) fn start_default(
     headless: bool,
     suspended: bool,
     proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
-    account_work: aterm_agent::harness::account_work::Lifetime,
+    window: WindowShares,
 ) -> HostHandle {
     let words = store.clone();
     let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store.clone());
@@ -27534,7 +27569,7 @@ pub(crate) fn start_default(
             said,
             receipt,
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
-            acts: live_acts(s3, k3, account_work),
+            acts: live_acts(s3, k3, window),
             backoff: Arc::new(|n| aterm_gui_timing::current().of(restart_backoff(n))),
             pause: Arc::new(|pause| aterm_gui_timing::current().of(pause)),
             carry_clock: Arc::new(MonotonicClock),
@@ -27954,6 +27989,7 @@ impl Acts {
             claim_workers: Arc::new(Vec::new),
             claim_walled: Arc::new(|| None),
             claim_left: Arc::new(|| Some("an inert host reads no machine".to_string())),
+            clicks: crate::permission_click::Clicks::default(),
         }
     }
 }

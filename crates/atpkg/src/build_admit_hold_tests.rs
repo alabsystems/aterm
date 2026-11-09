@@ -511,3 +511,73 @@ fn a_survivor_set_keeps_its_claim_while_it_works() {
     }
     assert_eq!(growing.look(at, true, footprint), Some(Gone::Spent));
 }
+
+/// A claim in `dir`'s scratch ledger whose run phase claims 1 GiB of its 4 GiB, held for this test.
+fn phased_claim(dir: &std::path::Path) -> (Ledger, aterm_capacity::Claim) {
+    let ledger = Ledger::at(dir.join("ledger"));
+    let claim = aterm_capacity::admit_with(
+        &ledger,
+        &Fixed::new(Reading::of_gib(24, 20, 14)),
+        Need::new("targo test [a]")
+            .mem(4 << 30)
+            .run_mem(1 << 30)
+            .covers(),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("admitted");
+    (ledger, claim)
+}
+
+/// THE HOLDER STEPS ITS CLAIM DOWN ONCE ITS TREE RUNS A PROGRAM ITS BUILD MADE (CAP3), read from
+/// the live tree as the holder's watch reads it: a root running a shell holds its claim's 4 GiB;
+/// a root running this test binary (a Cargo test binary, `atpkg-<16 hex>`) as its child steps the
+/// claim to its run phase's 1 GiB in its record, as another process reads it. NEGATIVE CONTROL
+/// (by hand: `step_phase` handed an image probe that reads nothing): the claim never steps, and
+/// the second wait's hang detector fires.
+#[test]
+fn the_holder_steps_its_claim_down_once_its_tree_runs_what_its_build_made() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let (ledger, mut claim) = phased_claim(dir.path());
+    let stepped = |ledger: &Ledger| ledger.list().ok().and_then(|l| l.first()?.need.stepped);
+
+    let (mut shell, _) = root_with_a_child();
+    let meter = aterm_capacity::tree_meter::TreeMeter::start(shell.id());
+    let mut phases = aterm_capacity::phase::Phases::new();
+    until_within(MUST_HAPPEN, "the shell's child read in its tree", || {
+        meter.read();
+        (meter.survivors_using().0.len() >= 2).then_some(())
+    });
+    assert_eq!(step_phase(&mut phases, &mut claim, &meter), None);
+    assert_eq!(stepped(&ledger), None, "a tree running no program it built");
+    assert_eq!(phases.run_peak(), None);
+    shell.kill().expect("killed");
+    shell.wait().expect("reaped");
+    drop(shell.stdin.take());
+    drop(meter);
+
+    let (mut root, child) = root_with_a_working_child(16, &dir.path().join("touched"));
+    let meter = aterm_capacity::tree_meter::TreeMeter::start(root.id());
+    let mut phases = aterm_capacity::phase::Phases::new();
+    until_within(
+        MUST_HAPPEN,
+        "the claim stepped as its tree runs the test binary",
+        || {
+            meter.read();
+            if meter.survivors_using().0.contains(&child) {
+                step_phase(&mut phases, &mut claim, &meter);
+            }
+            stepped(&ledger)
+        },
+    );
+    assert_eq!(stepped(&ledger), Some(1 << 30));
+    assert!(
+        phases.run_peak().is_some_and(|p| p > 0),
+        "its run's peak read"
+    );
+    let mut tell = root.stdin.take().expect("the child's stdin");
+    tell.write_all(b"done\n").expect("told");
+    drop(tell);
+    root.wait().expect("reaped");
+}

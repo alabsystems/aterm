@@ -276,8 +276,11 @@ const TABLE: &[Verb] = &[
                 claims every session's heavy or timing-sensitive work holds or waits for; \
                 read-only. Each claim, held or waiting, says what it reserves against the claims \
                 behind it (`mem <need>, reserves <size>`, `disk <need> on <volume>, reserves \
-                <size>`; --json: `reserved_mem`, `reserved_disk`), and a waiter whose disk is more \
-                than its volume has free above the floor is `unservable`",
+                <size>`; --json: `reserved_mem`, `reserved_disk`), a held build's memory what \
+                its holder stepped it to as its run began (`stepped`), a waiter of memory that \
+                cannot start yet the most a claim behind it may take and go first without \
+                delaying it (`spares`), and a waiter whose disk is more than its volume has free \
+                above the floor is `unservable`",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,

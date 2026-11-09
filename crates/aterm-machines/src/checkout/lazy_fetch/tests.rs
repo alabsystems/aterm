@@ -47,7 +47,7 @@ fn a_git_that_takes_the_option_is_asked_nothing_more() {
 /// question's own scratch folder, which is gone after it, with no system or personal git config
 /// and in English: a complete trace and a working fetch control establish the quiet refusal.
 /// NEGATIVE CONTROLS: the same git whose read fetched or attempted to fetch the object is
-/// refused, as is a read a signal ended: a git is admitted neither for
+/// refused: a git is admitted neither for
 /// refusing the option nor for a failed read alone.
 #[test]
 fn a_git_that_refuses_the_option_is_judged_by_what_its_read_did() {
@@ -199,6 +199,47 @@ fn a_privileged_probe_gives_its_private_scratch_to_the_git_actor_before_running_
         before_the_option(sys, command, true)
     });
     assert_eq!(NoLazyFetch::of(&sys, &who), Ok(Some(NoLazyFetch::Variable)));
+}
+
+#[test]
+fn an_aborted_git_probe_defers_instead_of_classifying_the_program() {
+    for stage in ["version", "subject", "control"] {
+        let (sys, who) = fake();
+        sys.simulate(move |sys, command| {
+            let mut answer = before_the_option(sys, command, true)?;
+            let has = |word: &str| command.args.iter().any(|arg| arg == word);
+            let variable = command
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "GIT_NO_LAZY_FETCH")
+                .map(|(_, value)| value.as_str());
+            let abort = match stage {
+                "version" => has("--no-lazy-fetch"),
+                "subject" => has("cat-file") && variable == Some("1"),
+                "control" => has("cat-file") && variable == Some("0"),
+                _ => unreachable!(),
+            };
+            if abort {
+                answer.status = None;
+            }
+            Some(answer)
+        });
+        assert!(NoLazyFetch::of(&sys, &who).is_err(), "{stage}");
+        let reads = sys
+            .calls()
+            .iter()
+            .filter(|call| call.contains(" cat-file "))
+            .count();
+        assert_eq!(
+            reads,
+            match stage {
+                "version" => 0,
+                "subject" => 1,
+                _ => 2,
+            }
+        );
+    }
 }
 
 #[test]

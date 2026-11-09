@@ -741,8 +741,8 @@ footer-shell-cwds	contract	footer::shell_cwds	The newest cwds (≠ launch) of th
 claude-dir-of	contract	footer::claude_dir_of, upgrade_drive::claude_home_dir	absolute config ↦ itself; relative (incl. "") ↦ cwd()/c (cwd called only then); none ↦ home/.claude for an absolute home, else None.	1,3,13	1/1
 footer-fold-is-one-session	invariant	footer::{read_pid,FooterCache::{usage,shown,forget},session_of_pid,transcript_path}, session_usage::wall_of	Every footer read shows usage and wall folded from the session the same read's registry names (and its subagents) only; one parse and one lookup per read; a torn read shows nothing and keeps the fold only for the same process and session; a fold behind shows no tokens or unreached wall; a later served response takes the wall down.	1,2,5,7,8,13	10/10
 lights-read-screen	contract	lights::read_screen, Mode::of_indicator	None iff no composer; else, with runs = ClaudeReader.runs(title) (None for no title or an empty one), Screen{mode of the pill row under the composer, pill present, busy = a hard phase::busy_seen(rows, runs), title_live = phase::title_live(rows, runs)}; a cut hint still names its mode.	1,3,12	6/6
-lights-state-and-fold	contract	lights::{Reading::{state,fold},deviates,read,Goal::{of_mode,reached,words}}, Mode::is_expected	state = Unknown for no mode, On for Bypass/Auto, else Off; deviates ⇔ Off; fold updates the mode iff the newer read has a mode or a pill; a click's goal is the state not shown: Goal::of_mode(m) = Off where state is On (Bypass/Auto), On where it is Off; Goal::On reached ⇔ is_expected, Goal::Off reached ⇔ Manual, so no known mode is its own click's goal; words(r) = `<Bypass.word_on_glass(r)> or auto` for On, Manual.word_on_glass(r) for Off.	2,3	3/3
-lights-mode-pill-table	table-property	lights::Mode::{of_indicator,glyph,glyph_on_glass,word,word_on_glass,named_on_glass,gist,claude_name,ink,is_expected}, footer::{PILLS,YOLO_ON,YOLO_OFF}	Each Mode has exactly one PILLS entry, glyph non-empty, of_indicator injective; is_expected ⇔ Bypass/Auto; ink = Value for every expected mode (Bypass, Auto), Row for every other mode; word_on_glass(true) is YOLO_ON = `yolo` for Bypass and YOLO_OFF = `lame` for Manual, word() otherwise; glyph_on_glass(true) is empty exactly for Bypass, Auto and Manual, glyph() otherwise; named_on_glass(r) = word_on_glass(r) + ` mode`; gist non-empty with no ` — ` or ` · `; claude_name + ` on` = the pill's anchor text.	3,7	1/1; fragment: `harness::lights::Mode::is_expected` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+lights-state-and-fold	contract	lights::Reading::{yolo,fold}	yolo = None for no mode, Some(true) for Bypass, Some(false) for every other mode; fold updates the mode iff the newer read has a mode or a pill.	2,3	2/2
+lights-mode-pill-table	table-property	lights::Mode::of_indicator, footer::{PILLS,YOLO_ON,YOLO_OFF}	Each Mode has exactly one PILLS entry, of_indicator injective; YOLO_ON = `yolo`, YOLO_OFF = `lame` (the bit's two words, `docs/DESIGN-yolo-binary-2026-11-04.md` §1).	3,7	1/1
 truncate-bytes	contract	harness::truncate_bytes	Returns s[..e] with e the largest char boundary ≤ max (s itself when short); never panics or grows.	1,3,7	1/1
 one-line-shortcut-equivalence	equivalence	harness::{one_line,is_one_line_already}, supervise::limit::one_line	one_line(t,max) = limit::one_line(truncate_bytes(t,max)).trim(): the shortcut returns t only where the fold would; every break/control incl. U+2028/9 becomes a space.	1,3,7	1/1
 lanes-table	table-property	harness::lanes::lanes, Program::supervisable	relaunch = upgrade = supervisable(p); restart_in_place ⇔ p = Claude.	3,12	2/2
@@ -769,7 +769,7 @@ relaunch-line-env-quoting	round-trip	relaunch::{line_for,line_tapped,with_tap,lo
 relaunch-line-drop-order	contract	relaunch::{line_tapped,line_tap_selected,line_for}	The line typed is the first of [R+switch+tap, R+tap, R+switch, R] within the kernel's bound, else NoPlan::Refused naming `line`; a served token wrapper rides each of them until it is dropped, after the tap and only where its login is stored on this Mac (else the line is refused); the login is never dropped.	1,3,7	2/2
 relaunch-account-login	contract	relaunch::{account_login,runs_under}	account_login = the row's dir verbatim ("" for the dirless row) for a listed label; runs_under ⇔ the process's LOGIN_ENV equals it byte for byte (unset = empty).	1,3	1/1
 relaunch-cause-classes	table-property	relaunch::{relaunch_cause,ends_its_agent,carried_quietly,starts_afresh,ends_at_once,model_restart}	`account:<label>` is a relaunch cause that ended its agent, carried quietly, ends at once, not afresh; look-alikes and "" are the upgrade's; CAUSE_ASKED is a relaunch cause that did not end its agent; model_restart carries what rides.	1,3	2/2
-relaunch-carried-word	contract	relaunch::carried_word	wait:restart-in-flight when an account move meets another restart in flight and the step is no failure; else the step.	1,3	1/1
+relaunch-carried-word	contract	relaunch::carried_word	wait:restart-in-flight when an account move meets another restart in flight and the step is no failure, and when a click (Restart::Permission) meets a record not its own (own false: relaunch::its_own), whatever the step, failed: included; else the step.	1,3	2/2
 relaunch-cold-login	contract	accounts_pool::cold_launch_env; harness_host::account_cold_at	Every managed cold relaunch checks current custody, binding and identity; an error retains the conversation without executing a saved fallback. Unknown legacy attribution stays distinct from captured stored-login or credential-override state.	1,3,5	model + native conformance
 restart-stamp-file	round-trip	restart_stamp::{stamp,read,path}, Stamp::{to_json,from_json}	For a plain-word tab key, stamp then read = identity, one file per tab, no temp left, no `phase` key; a non-word key writes nothing and Errs.	1,8	1/1
 restart-stamp-take-if	contract	restart_stamp::take_if	Takes and removes the stamp iff the one present when judged satisfies ours; a refused stamp is never moved; a stamp written in between is put back.	8,13	1/1
@@ -1797,16 +1797,14 @@ src/harness/profile_tests.rs	claudes_cached_week_is_never_said_full_before_it_is
 src/harness/cli_outlook_tests.rs	the_report_says_the_cards_numbers_and_writes_nothing	cli-accounts-report	outlook-writes-nothing
 src/harness/lights.rs	a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown	lights-state-and-fold	
 src/harness/lights.rs	a_narrow_panes_cut_hint_still_names_the_mode	lights-read-screen	
-src/harness/lights.rs	each_mode_says_what_it_does_and_where_a_click_takes_it	lights-state-and-fold	lights-mode-pill-table
-src/harness/lights.rs	only_a_mode_the_owner_does_not_expect_deviates	lights-state-and-fold	
+src/harness/lights.rs	the_bit_is_yolo_in_bypass_alone	lights-state-and-fold	
+src/harness/lights.rs	every_mode_has_one_pill_and_every_pill_a_mode	lights-mode-pill-table	
 src/harness/lights.rs	every_captured_footer_screen_of_every_build_is_read	§4	
 src/harness/lights.rs	every_recorded_screen_reads_definitely_or_not_at_all	§4	
 src/harness/lights.rs	no_composer_no_lights_and_no_drive	lights-read-screen	
 src/harness/lights.rs	the_2_1_283_screens_read_as_measured	lights-read-screen	
 src/harness/lights.rs	the_2_1_301_screens_read_as_measured	lights-read-screen	
 src/harness/lights.rs	a_reply_drawn_under_a_status_line_is_busy_while_its_title_runs	lights-read-screen	
-src/harness/lights.rs	the_lights_word_follows_the_rewritten_row_and_only_under_its_gate	lights-mode-pill-table	
-src/harness/lights.rs	expected_modes_wear_the_value_ink_and_the_rest_the_rows	lights-mode-pill-table	
 src/harness/login_latch_tests.rs	a_closed_tabs_sign_in_is_the_next_tabs	login-wall-acts	
 src/harness/login_latch_tests.rs	each_login_has_its_own_sign_in	login-wall-acts	
 src/harness/login_latch_tests.rs	the_first_tab_carries_the_sign_in_and_the_others_read_it_back	login-wall-acts	
@@ -1847,6 +1845,7 @@ src/harness/relaunch_tests.rs	a_store_binarys_line_exports_its_shims_env_and_a_b
 src/harness/relaunch_tests.rs	a_store_binarys_long_line_drops_the_survey_switch_and_keeps_the_updater_switch	relaunch-line-shim-env	
 src/harness/relaunch_tests.rs	a_step_is_relaunched_left_not_yet_or_never	relaunch-on-exit-refines-model	
 src/harness/relaunch_tests.rs	an_account_move_over_another_restart_in_flight_is_not_tried	relaunch-carried-word	
+src/harness/relaunch_tests.rs	a_click_over_a_record_not_its_own_reads_another_restart_in_flight	relaunch-carried-word	
 src/harness/relaunch_tests.rs	an_account_moves_record_is_a_relaunch_that_ended_its_own_agent	relaunch-cause-classes	
 src/harness/relaunch_tests.rs	an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login	relaunch-promise-iff-plan	
 src/harness/relaunch_tests.rs	an_exit_is_relaunched_only_where_the_relaunch_would_plan_it	relaunch-promise-iff-plan	

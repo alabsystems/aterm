@@ -9,6 +9,89 @@ const GIB: u64 = 1 << 30;
 const NATIVE: &str = "aarch64-apple-darwin";
 const COMPAT: &str = "x86_64-apple-darwin";
 
+#[test]
+fn unit_timeline_keeps_identity_timestamps_failure_and_unknown_cpu() {
+    let units = Units {
+        record: PathBuf::from("unused"),
+        triple: NATIVE.to_owned(),
+        spare: None,
+    };
+    let unit = unit("aterm-gui", "aterm_gui lib");
+    let started = unit_event(&units, &unit, "started", 10.0, 12.0, None, None);
+    let ended = unit_event(&units, &unit, "ended", 10.0, 20.0, Some(6.25), Some(false));
+    assert_eq!(started["event"].as_str(), Some("release-slice-unit"));
+    assert_eq!(started["triple"].as_str(), Some(NATIVE));
+    assert_eq!(started["package"].as_str(), Some("aterm-gui"));
+    assert_eq!(started["unit"].as_str(), Some("aterm_gui lib"));
+    assert_eq!(started["phase"].as_str(), Some("started"));
+    assert_eq!(started["queued_unix_s"].as_f64(), Some(10.0));
+    assert_eq!(started["at_unix_s"].as_f64(), Some(12.0));
+    assert_eq!(started["pid"], ended["pid"]);
+    // Negative controls: absence of a reaped CPU counter or exit is not zero or success.
+    assert!(started["cpu_s"].is_null());
+    assert!(started["success"].is_null());
+    assert_eq!(ended["phase"].as_str(), Some("ended"));
+    assert_eq!(ended["at_unix_s"].as_f64(), Some(20.0));
+    assert_eq!(ended["cpu_s"].as_f64(), Some(6.25));
+    assert_eq!(ended["success"].as_bool(), Some(false));
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_timeline_probe() {
+    let Some(mode) = std::env::var_os("ATERM_SLICE_TIMELINE_PROBE") else {
+        return;
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let units = Units {
+        record: dir.path().join("record"),
+        triple: NATIVE.to_owned(),
+        spare: None,
+    };
+    let mut args = vec![OsString::from("/usr/bin/false")];
+    args.extend(["--crate-name", "fixture", "--crate-type", "lib"].map(OsString::from));
+    if mode == "query" {
+        args.push("--print=file-names".into());
+    }
+    let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 18));
+    assert_eq!(
+        wrap(&args, Some("fixture"), &units, &ledger, &machine),
+        Ok(1)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_retains_a_failed_units_timeline_but_does_not_invent_query_units() {
+    let run = |mode| {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "slice_units::tests::wrapper_timeline_probe",
+            "--nocapture",
+        ]);
+        command.env("ATERM_SLICE_TIMELINE_PROBE", mode);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .lines()
+            .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+            .filter(|row| row["event"].as_str() == Some("release-slice-unit"))
+            .collect::<Vec<_>>()
+    };
+    let rows = run("compile");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["phase"].as_str(), Some("started"));
+    assert_eq!(rows[1]["phase"].as_str(), Some("ended"));
+    assert_eq!(rows[1]["success"].as_bool(), Some(false));
+    assert!(rows[1]["cpu_s"].as_f64().unwrap() >= 0.0);
+    assert!(rows[1]["at_unix_s"].as_f64() >= rows[0]["at_unix_s"].as_f64());
+    // Negative control: Cargo's compiler queries are not compiles, even with unit flags.
+    assert!(run("query").is_empty());
+}
+
 fn unit(package: &str, kind: &str) -> UnitName {
     UnitName {
         package: package.to_owned(),

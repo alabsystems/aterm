@@ -42,6 +42,12 @@ pub struct CohortChild {
 }
 
 impl CohortChild {
+    // Observation only, used to bind a separately owned original epoch loan to
+    // this actual launch before GO. It is never a constructor or release proof.
+    pub(crate) fn birth_key(&self) -> &aterm_uds::spawnfd::BirthKey {
+        self.spawned.key()
+    }
+
     /// The owned child, retained even when it has exited but has not been reaped.
     pub fn child_mut(&mut self) -> &mut Child {
         self.spawned.child_mut()

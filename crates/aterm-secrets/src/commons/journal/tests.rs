@@ -106,12 +106,51 @@ fn tmp() -> aterm_tempfile::TempDir {
 }
 
 #[test]
+fn a_scheduled_writer_preserves_the_required_control_journal_open() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut initial = Journal::open(dir.path(), fixture.trust).unwrap();
+    initial.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(initial);
+    for established in [false, true] {
+        let opened = Journal::open_started(
+            dir.path(),
+            fixture.trust,
+            established,
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(opened.is_writer());
+        assert!(opened.node(&fixture.nodes[0].id()).is_some());
+        assert_eq!(opened.trust(), fixture.trust);
+    }
+    let owner = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    let before = owner.inventory().copied().collect::<Vec<_>>();
+    assert_eq!(
+        Journal::open_started(
+            dir.path(),
+            fixture.trust,
+            true,
+            std::time::Instant::now() - std::time::Duration::from_secs(61)
+        )
+        .err()
+        .unwrap()
+        .kind(),
+        crate::ErrorKind::JournalBusy
+    );
+    assert_eq!(owner.inventory().copied().collect::<Vec<_>>(), before);
+    drop(owner);
+    let fresh = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(fresh.inventory().copied().collect::<Vec<_>>(), before);
+}
+
+#[test]
 fn control_writer_contention_is_busy_and_release_preserves_the_journal() {
     let fixture = Fixture::new();
     let dir = tmp();
     let mut owner = Journal::open(dir.path(), fixture.trust).unwrap();
     owner.ingest(fixture.nodes[0].bytes()).unwrap();
-    let error = Journal::open_existing(dir.path(), fixture.trust)
+    let error = Journal::open_existing_until(dir.path(), fixture.trust, std::time::Instant::now())
         .err()
         .unwrap();
     assert_eq!(error.kind(), crate::ErrorKind::JournalBusy);
@@ -300,7 +339,7 @@ fn authentication_and_exact_anchor_precede_any_append() {
     assert_eq!(journal.state(), State::Empty);
     assert_eq!(journal.inventory().count(), 0);
     assert!(
-        Journal::open(root.path(), fixture.trust).is_err(),
+        Journal::open_until(root.path(), fixture.trust, std::time::Instant::now()).is_err(),
         "exclusive local writer"
     );
     journal.ingest(node.bytes()).unwrap();
@@ -998,7 +1037,7 @@ fn a_reader_succeeds_while_another_handle_holds_the_writer() {
     let mut owner = Journal::open(dir.path(), fixture.trust).unwrap();
     owner.ingest(fixture.nodes[0].bytes()).unwrap();
     owner.ingest(fixture.nodes[1].bytes()).unwrap();
-    let busy = Journal::open_existing(dir.path(), fixture.trust)
+    let busy = Journal::open_existing_until(dir.path(), fixture.trust, std::time::Instant::now())
         .err()
         .unwrap();
     assert_eq!(busy.kind(), crate::ErrorKind::JournalBusy);

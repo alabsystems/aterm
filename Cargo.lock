@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.182.0"
+version = "0.183.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -178,6 +178,8 @@ dependencies = [
  "aterm-machines",
  "aterm-mesh",
  "aterm-mesh-core-islands",
+ "aterm-mesh-core-islands-no-lost-edit",
+ "aterm-mesh-core-islands-p1",
  "aterm-metrics",
  "aterm-models-session",
  "aterm-net",
@@ -1313,10 +1315,20 @@ name = "aterm-mesh-core"
 version = "0.0.0"
 dependencies = [
  "aterm-mesh-core-islands",
+ "aterm-mesh-core-islands-no-lost-edit",
+ "aterm-mesh-core-islands-p1",
 ]
 
 [[package]]
 name = "aterm-mesh-core-islands"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-mesh-core-islands-no-lost-edit"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-mesh-core-islands-p1"
 version = "0.0.0"
 
 [[package]]

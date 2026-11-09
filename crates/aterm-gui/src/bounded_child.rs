@@ -124,12 +124,31 @@ pub(crate) fn run_bounded(
     args: &[String],
     cap: Option<Duration>,
 ) -> Result<Ran, String> {
-    run_with_readers(program, args, cap, |which, work| {
-        std::thread::Builder::new()
-            .name(format!("aterm-child-{which}"))
-            .spawn(work)
-            .map(drop)
-    })
+    run_bounded_observing(program, args, cap, Instant::now, || {})
+}
+
+/// The same owned command, with its start clock and observation of a live,
+/// unexpired child supplied by the caller.
+pub(crate) fn run_bounded_observing(
+    program: &Path,
+    args: &[String],
+    cap: Option<Duration>,
+    started: impl FnOnce() -> Instant,
+    pending: impl FnMut(),
+) -> Result<Ran, String> {
+    run_with_readers(
+        program,
+        args,
+        cap,
+        |which, work| {
+            std::thread::Builder::new()
+                .name(format!("aterm-child-{which}"))
+                .spawn(work)
+                .map(drop)
+        },
+        started,
+        pending,
+    )
 }
 
 fn run_with_readers(
@@ -137,6 +156,8 @@ fn run_with_readers(
     args: &[String],
     cap: Option<Duration>,
     mut start: impl FnMut(&str, ReaderWork) -> io::Result<()>,
+    started: impl FnOnce() -> Instant,
+    mut pending: impl FnMut(),
 ) -> Result<Ran, String> {
     let stdout = reader("stdout", &mut start)?;
     let stderr = reader("stderr", &mut start)?;
@@ -161,7 +182,7 @@ fn run_with_readers(
     let stderr = stderr.hand_off(owned.child.stderr.take(), "stderr");
     let (stdout, stderr) = (stdout?, stderr?);
     let deadline = cap.map(|cap| {
-        let now = Instant::now();
+        let now = started();
         let at = now
             .checked_add(cap)
             .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
@@ -177,7 +198,10 @@ fn run_with_readers(
                 let secs = deadline.map_or(0, |(_, cap)| cap.as_secs());
                 break Err(format!("no answer in {secs} s: kill requested"));
             }
-            Ok(None) => std::thread::sleep(POLL),
+            Ok(None) => {
+                pending();
+                std::thread::sleep(POLL);
+            }
             Err(e) => {
                 break Err(format!("could not wait for it: {e}"));
             }
@@ -218,18 +242,25 @@ mod tests {
                 let mut starts = Vec::new();
                 let refused = std::thread::scope(|scope| {
                     let mut workers = Vec::new();
-                    let ran = run_with_readers(&absent, &[], cap, |which, work| {
-                        starts.push(which.to_string());
-                        if starts.len() == refuse {
-                            return Err(io::Error::other("injected reader refusal"));
-                        }
-                        workers.push(
-                            std::thread::Builder::new()
-                                .name("bounded-reader-setup-control".to_string())
-                                .spawn_scoped(scope, work)?,
-                        );
-                        Ok(())
-                    });
+                    let ran = run_with_readers(
+                        &absent,
+                        &[],
+                        cap,
+                        |which, work| {
+                            starts.push(which.to_string());
+                            if starts.len() == refuse {
+                                return Err(io::Error::other("injected reader refusal"));
+                            }
+                            workers.push(
+                                std::thread::Builder::new()
+                                    .name("bounded-reader-setup-control".to_string())
+                                    .spawn_scoped(scope, work)?,
+                            );
+                            Ok(())
+                        },
+                        Instant::now,
+                        || {},
+                    );
                     for worker in workers {
                         assert!(worker.join().is_ok(), "the cancelled idle reader ended");
                     }

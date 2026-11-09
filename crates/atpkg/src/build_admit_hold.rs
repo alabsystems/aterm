@@ -266,7 +266,7 @@ fn hold(words: &Words) -> u8 {
     ) else {
         return 1;
     };
-    let Some(claim) = claim.armed() else {
+    let Some(mut claim) = claim.armed() else {
         return 1;
     };
     drop(arming);
@@ -274,6 +274,7 @@ fn hold(words: &Words) -> u8 {
     trace_meter(&meter, words);
     #[cfg(any(test, debug_assertions))]
     let reads = std::env::var_os(READS_ENV).map(std::path::PathBuf::from);
+    let mut phases = aterm_capacity::phase::Phases::new();
     let end = watch.wait(words.serial, &mut || {
         #[cfg(any(test, debug_assertions))]
         if let Some(reads) = &reads {
@@ -281,6 +282,13 @@ fn hold(words: &Words) -> u8 {
         }
         #[cfg(any(test, debug_assertions))]
         trace_meter(&meter, words);
+        let stepped = step_phase(&mut phases, &mut claim, &meter);
+        #[cfg(any(test, debug_assertions))]
+        if let Some(step) = stepped {
+            trace_record(|| aterm_json::json!({"kind": "phase-step", "step": format!("{step:?}")}));
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = stepped;
     });
     #[cfg(any(test, debug_assertions))]
     trace_record(|| {
@@ -311,6 +319,7 @@ fn hold(words: &Words) -> u8 {
     let peak = meter.stop(0);
     #[cfg(any(test, debug_assertions))]
     trace_record(|| aterm_json::json!({"kind": "meter-stopped", "peak": peak}));
+    ended.keep_run(&built, phases.run_peak(), &mut |_| {});
     ended.keep(built, peak, &mut |_| {});
     #[cfg(any(test, debug_assertions))]
     trace_record(|| {
@@ -319,6 +328,19 @@ fn hold(words: &Words) -> u8 {
         })
     });
     0
+}
+
+/// ONE READ OF THE BUILD'S PHASE (CAP3, [`aterm_capacity::phase`]): the processes `meter`'s latest
+/// read found in its tree, each with its footprint and its lifetime peak
+/// ([`aterm_capacity::tree_meter::TreeMeter::members`], no read of its own), each one's program
+/// read from the kernel; `claim` stepped as `phases` says, and the step it took answered.
+#[cfg(target_os = "macos")]
+fn step_phase(
+    phases: &mut aterm_capacity::phase::Phases,
+    claim: &mut aterm_capacity::Claim,
+    meter: &aterm_capacity::tree_meter::TreeMeter,
+) -> Option<aterm_capacity::phase::Step> {
+    phases.read(claim, &meter.members(), &aterm_capacity::phase::image)
 }
 
 /// The front's meter, started (its first read made) before `still_front` reads whether the

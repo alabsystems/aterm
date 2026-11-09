@@ -466,7 +466,7 @@ fn the_ghost_shows_with_the_harness_off_and_writes_only_its_cells() {
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    let hit = key_hit(&app, wid).expect("the ghost, bare");
+    assert!(key_hit(&app, wid).is_some(), "the ghost, bare");
     assert!(top_text(&app, wid).contains(&ghost_text()));
     assert!(!wrote(&app, wid, row, (0, 2)), "nothing left of the lockup");
     assert!(wrote(&app, wid, row, (2, 13)), "the lockup's cells");
@@ -482,17 +482,22 @@ fn the_ghost_shows_with_the_harness_off_and_writes_only_its_cells() {
     );
     assert!(wrote(&app, wid, row, (w - 16, w - 1)), "the ghost's cells");
     let draft = SlashRefusal::Draft.says("", None);
+    // A host draws the harness's chips beside the ghost: a block, whose title slot speaks.
+    let hosted = host(&mut app);
     echo(&app, session, CARET, "hello");
     frame(&mut app, wid);
     assert!(
         app.windows[&wid].claude_lights.shows_block(session),
         "a block"
     );
+    let hit = key_hit(&app, wid).expect("the ghost beside the block");
     click_at(&mut app, wid, (hit.frame_row, hit.cols.0));
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
     assert_eq!(said(&app, wid, session), Some(draft.clone()));
     assert!(app.autopilot_menu.is_none(), "the title slot says it");
-    draw_claude(&app, session, BYPASS);
+    // With no host the harness draws no chip (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
+    app.harness = None;
+    drop(hosted);
     echo(&app, session, CARET, "hello");
     frame(&mut app, wid);
     assert!(
@@ -549,6 +554,7 @@ fn the_keys_title_and_menu_are_its_own() {
         format!("{}: on", key_capitalised())
     );
     let (mut app, wid, session, mut reader) = idle();
+    let _host = host(&mut app);
     claude_with(&app, session, "Opus 5.5", "2.1.304", Some(false));
     frame(&mut app, wid);
     let hit = key_hit(&app, wid).expect("the ghost");

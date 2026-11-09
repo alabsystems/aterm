@@ -1738,6 +1738,14 @@ pub(super) fn managed_agent_twin(program: &str) -> Option<PathBuf> {
     agent_twin_in(&agents_dir()?, program)
 }
 
+/// Whether `exe` is where atpkg lays `program`'s managed twin in the configured layout's
+/// `agents/`, whether or not the build it execs can be read ([`managed_agent_twin`] reads it).
+pub(super) fn is_managed_twin_path(exe: &Path, program: &str) -> bool {
+    agents_dir()
+        .zip(atpkg::store::ToolName::new(program))
+        .is_some_and(|(agents, tool)| agents.join(tool.shim_file()) == exe)
+}
+
 #[cfg(not(test))]
 fn agents_dir() -> Option<PathBuf> {
     Some(atpkg::store::resolve_configured()?.agents_dir())
@@ -2238,6 +2246,13 @@ fn roster_aside_within(
     wait: Duration,
 ) -> Option<Aside> {
     c.bound_by(wait);
+    aside_read(c, agents_off)
+}
+
+/// The host roster's [`Aside`] read on `c` with its bound as it stands: a click's re-read of its
+/// tab's claim on the hand's own connection, just before the signal (`super::relaunch`), where a
+/// claims bound would cut the waits that connection makes after.
+pub(super) fn aside_read(c: &mut Client, agents_off: &[aterm_phase::Program]) -> Option<Aside> {
     let (head, body) = c.request_counted("sessions").ok()?;
     if !crate::is_ok_reply(&head) {
         return None;
@@ -11552,6 +11567,27 @@ pub(super) struct TabRead<'a> {
     pub(super) dim: bool,
 }
 
+/// The facts [`upgrade::press_gate`] reads, off tab read `read` and the session's registry status
+/// `status`, a held tab read at grace 0: what a step's look ([`look_facts`]) and a click's look
+/// (`super::permission_click`) read alike. Every other fact is its default.
+pub(super) fn press_facts(status: &str, read: &TabRead<'_>) -> Facts {
+    let TabRead {
+        scr,
+        status: line,
+        dim,
+    } = *read;
+    Facts {
+        status: status.to_string(),
+        composer_empty: upgrade::composer_is_empty(&scr.rows, scr.cursor, dim),
+        approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
+        busy_footer: turn_shown(scr),
+        held: line.is_none_or(|line| held_by_status(line, 0)),
+        limited: upgrade::limited(&scr.rows),
+        login: upgrade::login_wall(upgrade::Agent::Claude, &scr.rows),
+        ..Facts::default()
+    }
+}
+
 pub(super) fn look_facts(
     opts: &Opts,
     sf: &SessionFile,
@@ -11561,7 +11597,7 @@ pub(super) fn look_facts(
     t: &[ProcRow],
     now: u64,
 ) -> Result<(Facts, String), &'static str> {
-    let TabRead { scr, status, dim } = *read;
+    let TabRead { scr, status, .. } = *read;
     let ours = conversation_typed(opts, tab, Some(&sf.session_id), &[])
         .map_err(|_| "ledger-evidence-unreadable")?;
     let records = Records::of_file(&opts.home, sf);
@@ -11576,13 +11612,8 @@ pub(super) fn look_facts(
         quiet => quiet,
     };
     let mut facts = Facts {
-        status: sf.status.clone(),
         status_age_s: now.saturating_sub(sf.status_updated_at_ms / 1000),
-        composer_empty: upgrade::composer_is_empty(&scr.rows, scr.cursor, dim),
-        approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
-        busy_footer: turn_shown(scr),
         background: own_work(sf.pid, t, &scr.rows),
-        held: status.is_none_or(|line| held_by_status(line, 0)),
         quiet_s: quiet,
         hold_s: 0,
         owner_now: false,
@@ -11590,8 +11621,6 @@ pub(super) fn look_facts(
         background_point: opts.background,
         taskless: matches!(st.phase, Phase::Pending | Phase::Announced { .. })
             && records.tasked(&sf.session_id, &ours) == Some(false),
-        limited: upgrade::limited(&scr.rows),
-        login: upgrade::login_wall(upgrade::Agent::Claude, &scr.rows),
         undelivered: false,
         queued: false,
         ready_s: 0,
@@ -11624,6 +11653,7 @@ pub(super) fn look_facts(
         },
         may_tell: opts.tell != Tell::Off,
         press: upgrade::Press::None,
+        ..press_facts(&sf.status, read)
     };
     let idle_read = ladder.idle_read;
     // An idle look is in a row only over the words the one before it read. Under a status line a reply
@@ -12805,8 +12835,8 @@ fn turn_over_shown(read: &Screen, lagging: bool) -> bool {
 }
 
 /// Whether `read` lets a press's signal go: no turn running ([`turn_shown`]) and no box open on
-/// it.
-fn press_lets_signal(read: &Screen) -> bool {
+/// it. A click's signal reads it too (`super::relaunch`'s `at_rest_for`).
+pub(super) fn press_lets_signal(read: &Screen) -> bool {
     !turn_shown(read) && aterm_phase::prompt::prompt_box_span(&read.rows).is_none()
 }
 
@@ -13283,6 +13313,22 @@ fn restart(
                 ));
             }
             break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
+        }
+        // The raw relaunch admits its account at the shell only once the agent is gone: a route
+        // it would refuse there waits here, before the signal, as the restart in place's does
+        // (`relaunch::relaunch_account_admits`), so an upgrade never ends an agent it cannot
+        // start again.
+        if st.native.is_none()
+            && let Err(why) = super::relaunch::relaunch_account_admits(opts, st, shell)
+        {
+            aterm_log::info!(
+                "harness @{tab}: the upgrade waits before its signal: its relaunch's account \
+                 would wait: {why}"
+            );
+            st.unsent(back);
+            st.cause.clear();
+            save(opts, &sf.session_id, st);
+            break 'signal Some(said(r.clone(), super::relaunch::WAIT_ACCOUNT));
         }
         let signal = if let Some(binding) = st.native.as_ref() {
             super::native_restart::signal(c, tab, binding)

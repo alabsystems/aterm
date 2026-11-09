@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's mode row rewritten on the glass to its jobs, and the glass-column map back to
-//! Claude's cells ([`collect_mode_row`], [`GlassColumns`]).
+//! Claude Code's bypass row rewritten on the glass to its jobs, every other mode's left as Claude
+//! draws it, and the glass-column map back to Claude's cells ([`collect_mode_row`],
+//! [`GlassColumns`]).
 
 use super::*;
 
@@ -191,17 +192,33 @@ fn col_of(row: &str, needle: &str) -> usize {
         .count()
 }
 
-/// What the glass rewrites BYPASS and AUTO to: the job, then the live notice.
+/// What the glass rewrites BYPASS to: the job, then the live notice.
 const JOBS: &str = "14 shells \u{B7} /rc active";
 
 /// THE MODE ROW READS CLAUDE'S JOBS ON THE GLASS AND THE GRID KEEPS CLAUDE'S ROW: under the
-/// gate every known mode's row is rewritten to its jobs and the live notice, each cell-copied
-/// in Claude's own style, flush at column 0 and joined by ` · ` in the ink of Claude's own `·`,
-/// blanks after; the pill, its hint and the key hints are gone (the mode is the lights block's).
-/// The grid keeps Claude's row, and undoing the write puts Claude's cells back and drops the map.
+/// gate a bypass row is rewritten to its jobs and the live notice, each cell-copied in Claude's
+/// own style, flush at column 0 and joined by ` · ` in the ink of Claude's own `·`, blanks after;
+/// the pill, its hint and the key hints are gone (the bit is the light's `yolo`). The grid keeps
+/// Claude's row, and undoing the write puts Claude's cells back and drops the map. CONTROL: a row
+/// of any other pill stands as Claude draws it, unmapped, its pill naming its mode
+/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
 #[test]
 fn the_mode_row_reads_claudes_jobs_and_the_grid_keeps_claudes_row() {
-    for (mode, kept) in [(BYPASS, JOBS), (MANUAL, NOTICE), (AUTO, JOBS)] {
+    for mode in [MANUAL, AUTO] {
+        let (mut app, wid, session, _reader, _host) = app();
+        draw(&app, session, mode);
+        claude(&app, session);
+        frame(&mut app, wid);
+        let row = mode_row(&app, wid);
+        assert_eq!(
+            glass_of(&app, wid, row).trim_end(),
+            grid_text(&app, session, 23).trim_end(),
+            "CONTROL: {mode:?} stands as drawn"
+        );
+        assert_eq!(app.windows[&wid].claude_footer_undo.grid_col(23, 0), 0);
+    }
+    {
+        let (mode, kept) = (BYPASS, JOBS);
         let (mut app, wid, session, _reader, _host) = app();
         draw(&app, session, mode);
         frame(&mut app, wid);
@@ -389,8 +406,8 @@ fn claudes_inverse_highlight_moves_with_its_item() {
 }
 
 /// NO REWRITE WHERE THE ROW IS NOT PLAINLY CLAUDE'S OR THE HARNESS IS OFF: the harness off, no
-/// host, the cursor on the row and a selection in the window each leave Claude's row as drawn
-/// and the columns unmapped. CONTROL: auto's row is rewritten like bypass's.
+/// host, the cursor on the row and a selection in the window each leave Claude's bypass row as
+/// drawn and the columns unmapped. CONTROL: with none of them, the bypass row is rewritten.
 #[test]
 fn no_rewrite_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
     let vendor_after = |mode: &str, setup: &dyn Fn(&mut App, WindowId, u64)| {
@@ -408,11 +425,11 @@ fn no_rewrite_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
         )
     };
     let none = |_: &mut App, _: WindowId, _: u64| {};
-    let (glass, _, col) = vendor_after(AUTO, &none);
-    assert_eq!(glass.trim_end(), JOBS, "CONTROL: auto is rewritten");
+    let (glass, _, col) = vendor_after(BYPASS, &none);
+    assert_eq!(glass.trim_end(), JOBS, "CONTROL: bypass is rewritten");
     assert_eq!(
         usize::from(col),
-        col_of(AUTO, "14 shells"),
+        col_of(BYPASS, "14 shells"),
         "CONTROL: and mapped"
     );
     let off = |app: &mut App, _: WindowId, _: u64| {
@@ -552,10 +569,23 @@ fn a_press_on_the_rewritten_row_reports_claudes_column() {
 }
 
 /// VIM'S INDICATOR LEADS THE REWRITTEN ROW: `-- INSERT --` keeps Claude's cells and ink at
-/// column 0, the jobs after it, each mapped back to Claude's own column.
+/// column 0, the jobs after it, each mapped back to Claude's own column. CONTROL: under vim's
+/// indicator an auto row stands as Claude draws it.
 #[test]
 fn vims_indicator_leads_the_rewritten_row() {
-    for mode in [VIM_BYPASS, VIM_AUTO] {
+    {
+        let (mut app, wid, session, _reader, _host) = app();
+        draw(&app, session, VIM_AUTO);
+        claude(&app, session);
+        frame(&mut app, wid);
+        assert_eq!(
+            glass_of(&app, wid, mode_row(&app, wid)).trim_end(),
+            grid_text(&app, session, 23).trim_end(),
+            "CONTROL: auto stands as drawn"
+        );
+    }
+    {
+        let mode = VIM_BYPASS;
         let (mut app, wid, session, mut reader, _host) = app();
         draw(&app, session, mode);
         frame(&mut app, wid);
@@ -691,6 +721,53 @@ fn the_effort_hint_stays_while_the_rule_names_no_effort() {
                     assert_eq!(below.trim(), "", "CONTROL: {what}");
                 }
             }
+        }
+    }
+}
+
+/// A NOT-YOLO ROW STANDS AS CLAUDE DRAWS IT, ITS EFFORT HINT WITH IT: the cost
+/// `docs/DESIGN-yolo-binary-2026-11-04.md` §2 accepts for naming no mode but the bit. On auto,
+/// with `◆` naming the effort in the rule, Claude's row keeps its pill, its jobs and its
+/// `◐ medium · /effort` hint whole (the effort shown twice), and its columns stay unmapped.
+/// CONTROL: the same row in bypass is rewritten to its jobs, the hint gone from it.
+#[test]
+fn a_not_yolo_row_stands_as_drawn_with_its_effort_hint() {
+    const HINT: &str = "\u{25D0} medium \u{B7} /effort";
+    for (pill, rewritten) in [
+        ("\u{23F5}\u{23F5} auto mode on", false),
+        ("\u{23F5}\u{23F5} bypass permissions on", true),
+    ] {
+        let (mut app, wid, session, _reader, _host) = app();
+        let rule = "\u{2500}".repeat(COLS);
+        let row23 = format!("  {pill} \u{B7} 1 shell  {HINT}");
+        feed(
+            &app,
+            session,
+            format!(
+                "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
+                 \x1b[22;1H{rule}\x1b[23;1H{row23}\x1b[24;1H\x1b[21;3H"
+            )
+            .as_bytes(),
+        );
+        claude_at(&app, session, Some("medium"));
+        frame(&mut app, wid);
+        let at = strip(&app, wid) + 22;
+        let glass = glass_of(&app, wid, at);
+        assert!(
+            glass_of(&app, wid, at - 1).contains("\u{25C6} Opus 5.5 medium"),
+            "{pill}: the rule names the effort: {:?}",
+            glass_of(&app, wid, at - 1)
+        );
+        if rewritten {
+            assert_eq!(glass.trim_end(), "1 shell", "CONTROL: {pill}: rewritten");
+        } else {
+            assert_eq!(glass.trim_end(), row23, "{pill}: Claude's row, whole");
+            assert!(glass.contains(HINT), "{pill}: the effort shown twice");
+            assert_eq!(
+                app.windows[&wid].claude_footer_undo.grid_col(22, 0),
+                0,
+                "{pill}: unmapped"
+            );
         }
     }
 }
@@ -918,9 +995,13 @@ fn the_mode_row_is_read_with_the_rule_not_every_frame() {
     assert_eq!(
         crate::work_counts::take_mode_row_reads(),
         1,
-        "CONTROL: the mode row changed"
+        "CONTROL: the mode row changed, read under any pill"
     );
-    assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with(NOTICE));
+    assert_eq!(
+        glass_of(&app, wid, mode_row(&app, wid)).trim_end(),
+        grid_text(&app, session, 23).trim_end(),
+        "manual's row stands as drawn"
+    );
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! native closure permits burning its returned supplementary bytes.
 
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs::{File, OpenOptions},
     io::{self, Read as _, Write as _},
@@ -18,7 +19,13 @@ use std::{
         },
     },
     path::PathBuf,
+    sync::Arc,
 };
+
+#[path = "retained_gnu_loan.rs"]
+mod loan;
+pub(super) use loan::State as LoanState;
+pub use loan::{Closure as LoanClosure, Loan, NoLaunch, RetiredSubgroup, ReturnError};
 
 fn refused(why: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
@@ -204,6 +211,11 @@ pub(crate) struct Epoch {
     id: String,
     transport: Option<Transport>,
     retired: bool,
+    // This independent ledger, not the FIFO population, pins every outstanding
+    // native borrower. Dropping its public loan never deletes an entry.
+    loans: BTreeMap<u64, LoanState>,
+    loan_origin: Arc<()>,
+    next_loan: u64,
 }
 
 impl Epoch {
@@ -212,6 +224,9 @@ impl Epoch {
             id: aterm_uds::rand::hex_token::<16>()?,
             transport: None,
             retired: false,
+            loans: BTreeMap::new(),
+            loan_origin: Arc::new(()),
+            next_loan: 0,
         })
     }
     pub(crate) fn id(&self) -> &str {
@@ -243,6 +258,12 @@ impl Epoch {
             .handoff()
     }
     pub(super) fn retire(&mut self) -> io::Result<()> {
+        if !self.loans.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original GNU epoch has unresolved native loans",
+            ));
+        }
         if let Some(transport) = &mut self.transport {
             transport.retire()?;
         }

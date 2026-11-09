@@ -668,6 +668,10 @@ pub(crate) struct SessionFactory {
     /// drawers lead ([`shell_children`]).
     #[cfg(unix)]
     pub(crate) shell_children: fn(i32) -> Vec<i32>,
+    /// How a Windows PTY reader lists its session's job for the programs its commands ran
+    /// ([`crate::command_ran::RanJob`]; `None`: it lists nothing, the test App's inert arm).
+    #[cfg(windows)]
+    pub(crate) job_seam: Option<crate::command_ran::JobSeam>,
     /// Whether each PTY reader runs the dev `card-seen` probe
     /// ([`crate::holder_image::card_probe_requested`]).
     pub(crate) card_probe: bool,
@@ -730,6 +734,8 @@ impl SessionFactory {
                 leader_execd: _,
             #[cfg(unix)]
                 shell_children: _,
+            #[cfg(windows)]
+                job_seam: _,
             card_probe: _,
             rekey_deferred: _,
             spare: _,
@@ -3763,6 +3769,15 @@ fn attach_reader_inner(
         session.ctx.ran.watched_by(watching);
         route
     };
+    // A Windows session's programs are heard from its job, listed by its reader.
+    #[cfg(windows)]
+    let jobs = factory.job_seam.map(|seam| {
+        session.ctx.ran.watched_by(crate::command_ran::Watching {
+            watch: crate::command_ran::ExecWatch::Job,
+            connector: crate::command_ran::Connector::NotHere,
+        });
+        crate::command_ran::RanJob::new(session.ctx.ran.clone(), session.pid, seam)
+    });
     let reader = spawn_pty_reader(PtyReaderWiring {
         master: session.master,
         id: session.id,
@@ -3811,6 +3826,8 @@ fn attach_reader_inner(
             execd: factory.leader_execd,
             ran: crate::command_ran::RanFeed::new(session.ctx.ran.clone(), session.pid),
         },
+        #[cfg(windows)]
+        jobs,
         timeline: session.ctx.timeline.clone(),
         screen_moves: session.ctx.screen_moves.clone(),
         job_feed: session.ctx.job_feed.clone(),
@@ -7302,6 +7319,10 @@ struct PtyReaderWiring {
     read_buf: Vec<u8>,
     #[cfg(unix)]
     fg: ForegroundWiring,
+    /// What a Windows reader hears of its session's job for the programs its commands ran
+    /// (`None`: no job seam, the test App's).
+    #[cfg(windows)]
+    jobs: Option<crate::command_ran::RanJob>,
     timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
     screen_moves: Arc<crate::vitals_host::ScreenMoves>,
     job_feed: Arc<crate::vitals_jobs::JobFeed>,
@@ -7647,6 +7668,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
         read_buf,
         #[cfg(unix)]
         fg,
+        #[cfg(windows)]
+        mut jobs,
         timeline,
         screen_moves,
         job_feed,
@@ -8451,6 +8474,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                     }
                 };
                 ingest(&mut temporal_lane, &buf[..r.0], None, 0, None, Some(r.1));
+                // Parsed, and the term lock let go: list the job on this thread, at its pace or
+                // at a block's start (`crate::command_ran::RanJob::batch`).
+                if let Some(jobs) = jobs.as_mut() {
+                    jobs.batch(&buf[..r.0], Instant::now(), crate::command_ran::wall_ms());
+                }
             }
             #[cfg(unix)]
             loop {

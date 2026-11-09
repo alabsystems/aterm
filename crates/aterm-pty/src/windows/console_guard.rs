@@ -500,7 +500,7 @@ fn runs_a_posix_runtime(pid: u32) -> bool {
 }
 
 /// The ids of the processes in `job` (the first [`ffi::JOB_PROCESS_IDS`]).
-fn pids_in(job: HANDLE) -> Vec<u32> {
+pub(super) fn pids_in(job: HANDLE) -> Vec<u32> {
     // SAFETY: a zeroed id list is a valid out-buffer.
     let mut list: ffi::JOBOBJECT_BASIC_PROCESS_ID_LIST = unsafe { std::mem::zeroed() };
     // SAFETY: the session's live job handle and a buffer of the stated size. A job
@@ -522,7 +522,7 @@ fn pids_in(job: HANDLE) -> Vec<u32> {
 }
 
 /// The image path of process `pid`, read and nothing else.
-fn image_of(pid: u32) -> Option<PathBuf> {
+pub(super) fn image_of(pid: u32) -> Option<PathBuf> {
     // SAFETY: plain OpenProcess; the handle is owned below.
     let process =
         Handle::new(unsafe { ffi::OpenProcess(ffi::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });

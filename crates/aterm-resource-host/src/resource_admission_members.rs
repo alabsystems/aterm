@@ -171,6 +171,7 @@ pub(super) fn live(
     request: &Authorization,
 ) -> bool {
     if request.member.session != job.binding.session
+        || job.bootstrap_graph.is_some()
         || request.member.attempt == job.binding.attempt
         || !same_capability(&request.capability, &job.delegation.capability)
         || !job.launched

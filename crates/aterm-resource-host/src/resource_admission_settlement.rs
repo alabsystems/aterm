@@ -46,6 +46,10 @@ pub(super) fn settle(job: &mut Job, fence: &Fence, journal: &journal::Journal) -
         || !job.loans.is_empty()
         || !job.runtime_inputs.preparation_finished()
         || job
+            .bootstrap_graph
+            .as_ref()
+            .is_some_and(|root| !root.preparation_finished())
+        || job
             .workload
             .as_ref()
             .is_some_and(|state| !state.settlement_ready())
@@ -72,6 +76,9 @@ pub(super) fn settle(job: &mut Job, fence: &Fence, journal: &journal::Journal) -
         birth,
     };
     job.runtime_inputs.release(&closed)?;
+    if let Some(root) = job.bootstrap_graph.as_mut() {
+        root.release(&closed)?;
+    }
     job.closed = Some(closed);
     Ok(())
 }

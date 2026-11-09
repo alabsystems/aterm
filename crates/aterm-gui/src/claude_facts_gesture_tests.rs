@@ -1077,3 +1077,66 @@ fn a_reader_press_is_the_click() {
     assert_eq!(app.fact_mask(session), FactMask::default());
     assert!(pty(&mut reader, 0).is_empty());
 }
+
+#[test]
+fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
+    let (mut app, wid, session, _reader) = app();
+    publish_facts(&app, session);
+    draw_claude(&app, session, PLAN);
+    frame(&mut app, wid);
+
+    let branch = fact_hit(&app, wid, Fact::Branch);
+    let (bx, by) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    app.on_cursor_moved(wid, bx, by);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch))),
+        "hovering uncovered Branch fact lights its hover"
+    );
+
+    // Open a stats lens card covering the whole window: it must evict the hovered fact
+    // and shield `claude_glass_at` and `resolve_hover_cursor` while open.
+    {
+        let ws = app.windows.get_mut(&wid).unwrap();
+        ws.stats_lens.open = Some(crate::stats_lens::Lens {
+            focus: crate::stats_paint::Instrument::Cpu,
+            bar: crate::stats_paint::Bar::Global,
+            how: crate::stats_lens::Opened::Pinned,
+        });
+        ws.stats_lens.rect = Some((0, 0, 2_000, 2_000));
+    }
+    app.note_band_covered(wid);
+    app.evict_stale_glass_hover(wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover, None,
+        "opening stats lens over hovered fact evicts its hover"
+    );
+    assert_eq!(
+        app.claude_glass_at(wid, bx, by),
+        None,
+        "open stats lens shields claude_glass_at underneath"
+    );
+    assert!(
+        !app.windows[&wid].hover_pointer,
+        "open stats lens clears hand cursor from covered Claude glass target"
+    );
+
+    // Closing the stats lens and composing the next frame restores the hover under the still pointer.
+    {
+        let ws = app.windows.get_mut(&wid).unwrap();
+        ws.stats_lens.open = None;
+        ws.stats_lens.rect = None;
+    }
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch))),
+        "closing stats lens restores hover on uncovered Branch fact without pointer motion"
+    );
+    assert!(
+        app.windows[&wid].hover_pointer,
+        "closing stats lens restores hand cursor on uncovered Branch fact"
+    );
+}

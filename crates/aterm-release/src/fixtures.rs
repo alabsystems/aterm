@@ -13,6 +13,7 @@ use crate::gates::{
 };
 use crate::ledger::{Error, GitRunner, Origin, RefWrite, Result, git_ok, rev_parse};
 
+#[cfg(test)]
 #[path = "fixture_reader_inputs.rs"]
 mod reader_inputs;
 
@@ -664,6 +665,9 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 /// Main's interpretation of a proposed fixture landing.
 #[derive(Debug, Clone)]
 pub struct Reading {
+    /// Source commit selected for this judgment, including a failed compile;
+    /// absent when no reader lane could be leased.
+    pub checked: Option<String>,
     /// Complete corpus rendered by main, never the release line's reader.
     pub answers: std::result::Result<String, String>,
     /// Verdict including failing test names or why the checks could not run.
@@ -676,7 +680,6 @@ pub struct MainReader {
     scratch: PathBuf,
     _lease: aterm_update_core::FileLock,
     last_binary: Option<PathBuf>,
-    last_reading: Option<(String, Pins, PathBuf, reader_inputs::Inputs, Reading)>,
     failures: Vec<String>,
 }
 
@@ -685,7 +688,7 @@ impl MainReader {
     /// its commit identity for the warm-up log.
     ///
     /// # Errors
-    /// Returns fixture preview construction, preparation or compilation failures.
+    /// Returns fixture preview construction or reader prebuild failures.
     pub fn prebuild_fixtures(
         &mut self,
         targo: &Path,
@@ -702,16 +705,18 @@ impl MainReader {
     }
 
     /// Warm main's reader lane without recording answers or issuing a verdict.
-    /// The eventual preview still goes through Cargo on its exact tree.
+    /// Retain the executable index, never a verdict, for judgment at this commit.
     ///
     /// # Errors
-    /// Returns workspace preparation, compile launch or compile failures.
+    /// Returns workspace preparation, compile launch, compilation, executable
+    /// indexing, hashing or cache-write failures.
     pub fn prebuild(
         &mut self,
         targo: &Path,
         revision: &str,
         run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
     ) -> Result<()> {
+        clear_marker(&self.scratch.join("prebuilt")).map_err(|e| Error::new(e.to_string()))?;
         let tree = self.prepare(revision)?;
         let mut compile = self.compile_command(targo, &tree);
         let output = run(&mut compile).map_err(|e| Error::new(e.to_string()))?;
@@ -721,7 +726,91 @@ impl MainReader {
                 crate::gates::build_error_lines(&String::from_utf8_lossy(&output.stderr))
             )));
         }
+        let git = crate::ledger::GitCli::new(&self.repo);
+        let revision = rev_parse(&git, &format!("{revision}^{{commit}}"))?;
+        let index = aterm_verify::test_index::Index::from_messages(
+            revision.clone(),
+            String::new(),
+            &String::from_utf8_lossy(&output.stdout),
+        )
+        .map_err(|e| Error::new(e.to_string()))?;
+        let binary = index
+            .binaries
+            .iter()
+            .find(|entry| entry.kind == "lib" && entry.name == "aterm_gui");
+        // An incomplete Cargo stream is a warm-up only, never reusable evidence.
+        let Some(binary) = binary else {
+            return Ok(());
+        };
+        let digest = crate::dmg::sha256_file(&binary.path).map_err(Error::new)?;
+        let saved = aterm_json::json!({
+            "revision": revision,
+            "compiler": targo,
+            "messages": String::from_utf8_lossy(&output.stdout).into_owned(),
+            "binary": binary.path,
+            "sha256": digest,
+        });
+        fs::write(self.scratch.join("prebuilt"), saved.to_string())
+            .map_err(|e| Error::new(e.to_string()))?;
         Ok(())
+    }
+
+    // A compiled preview is eligible only for the same fixture edit, based on an
+    // ancestor of today's tip. Inspect every intervening commit, including edits
+    // later reverted: composition must not swallow another writer's fixture work.
+    fn prebuilt(&self, targo: &Path, preview: &str, pins: &Pins) -> Option<(String, String)> {
+        let saved: aterm_json::Value =
+            aterm_json::from_slice(&fs::read(self.scratch.join("prebuilt")).ok()?).ok()?;
+        if saved.get("compiler")?.as_str()? != targo.to_str()? {
+            return None;
+        }
+        let binary = Path::new(saved.get("binary")?.as_str()?);
+        if crate::dmg::sha256_file(binary).ok()? != saved.get("sha256")?.as_str()? {
+            return None;
+        }
+        let previous = saved.get("revision")?.as_str()?;
+        let git = crate::ledger::GitCli::new(&self.repo);
+        let base = rev_parse(&git, &format!("{previous}^")).ok()?;
+        let tip = rev_parse(&git, &format!("{preview}^")).ok()?;
+        if !git
+            .git(&["merge-base", "--is-ancestor", &base, &tip])
+            .ok()?
+            .success()
+        {
+            return None;
+        }
+        let release = format!("{HANDOFF_FIXTURE_ROOT}/{}", pins.tag());
+        let paths = [
+            release.as_str(),
+            HANDOFF_FIXTURE_GUARD,
+            SHIPPED_STATE_CORPUS,
+        ];
+        // A worker may merge main as its second parent. Separate-parent diffs
+        // would report old main edits as new; combined diffs keep actual merge
+        // edits, while ordinary commits retain the branch's own file changes.
+        let mut args = vec![
+            "log",
+            "--format=",
+            "--name-only",
+            "--diff-merges=combined",
+            "--full-history",
+            "--no-renames",
+        ];
+        let range = format!("{base}..{tip}");
+        args.extend([range.as_str(), "--"]);
+        args.extend(paths);
+        if !git_ok(&git, &args).ok()?.stdout.is_empty() {
+            return None;
+        }
+        let mut args = vec!["diff", "--quiet", previous, preview, "--"];
+        args.extend(paths);
+        if !git.git(&args).ok()?.success() {
+            return None;
+        }
+        Some((
+            previous.to_owned(),
+            saved.get("messages")?.as_str()?.to_owned(),
+        ))
     }
 
     fn prepare(&self, revision: &str) -> Result<PathBuf> {
@@ -786,14 +875,12 @@ impl MainReader {
             scratch,
             _lease: lease,
             last_binary,
-            last_reading: None,
             failures: Vec::new(),
         })
     }
 
-    /// Record main's answers and exercise its desk readers. During this landing,
-    /// reuse a reading only across changes confined to Cargo-unrelated packages.
-    /// Failures remain named even when changed reader inputs require a new judgment.
+    /// Record main's answers and exercise its desk readers at the compiled commit.
+    /// Every judgment executes the reader; earlier failures remain named.
     #[must_use]
     pub fn read(
         &mut self,
@@ -803,93 +890,56 @@ impl MainReader {
         run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
     ) -> Reading {
         let started = std::time::Instant::now();
+        let prebuilt = self.prebuilt(targo, preview, pins);
+        let requested = preview;
+        let preview = prebuilt
+            .as_ref()
+            .map_or(preview, |(revision, _)| revision.as_str());
         let git = crate::ledger::GitCli::new(&self.repo);
-        if let Some((previous, identity, compiler, inputs, reading)) = &self.last_reading
-            && identity == pins
-            && compiler == targo
-            && self
-                .last_binary
-                .as_ref()
-                .is_none_or(|binary| check_execution_hold(&self.scratch, binary).is_ok())
-            && git_ok(
-                &git,
-                &[
-                    "diff",
-                    "--no-renames",
-                    "--name-only",
-                    "-z",
-                    previous,
-                    preview,
-                ],
-            )
-            .is_ok_and(|diff| {
-                diff.stdout
-                    .split(|b| *b == 0)
-                    .filter(|p| !p.is_empty())
-                    .all(|path| {
-                        std::str::from_utf8(path).is_ok_and(|path| inputs.ignores(Path::new(path)))
-                    })
-            })
-        {
-            let mut reused = reading.clone();
-            reused.checks.push_str(&format!(
-                "; reused unchanged reader inputs from {previous}, comparison {:.3}s",
-                started.elapsed().as_secs_f64()
-            ));
-            return reused;
-        }
         let mut timings = Vec::new();
         let mut answers = Err("main reader did not record answers".to_string());
-        let mut inputs = None;
         let result = (|| -> Result<String> {
             let tree = self.prepare(preview)?;
-            // Metadata covers normal, build and dev edges, including transitive
-            // dependencies. Failure only disables reuse; it never supplies a verdict.
-            if tree.join("Cargo.toml").is_file() {
-                let mut metadata = aterm_uds::spawnfd::command(targo);
-                metadata
-                    .args(["metadata", "--locked", "--offline", "--format-version", "1"])
-                    .current_dir(&tree)
-                    .env_remove("RUSTFLAGS")
-                    .env_remove("RUSTDOCFLAGS")
-                    .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                    .env_remove("RUSTC")
-                    .env_remove("RUSTC_BOOTSTRAP")
-                    .env_remove("RUSTUP_TOOLCHAIN")
-                    .env_remove("CARGO_TARGET_DIR")
-                    .env_remove("CARGO_BUILD_TARGET");
-                if let Ok(output) = run(&mut metadata)
-                    && output.status.success()
-                {
-                    inputs = reader_inputs::Inputs::from_metadata(&output.stdout, &tree);
-                }
-            }
             // The stable source path keeps its own lane across releases; no live
             // directory is shared with the cut and no cross-root seeding is needed.
             let mut compile = self.compile_command(targo, &tree);
             let compile_start = std::time::Instant::now();
-            let compiled =
-                run(&mut compile).map_err(|e| Error::new(format!("main reader compile: {e}")))?;
-            let units =
-                aterm_verify::compile_account::read(&String::from_utf8_lossy(&compiled.stdout))
-                    .units;
-            timings.push(format!(
-                "compile {:.3}s ({} fresh, {} compiled, {} unknown)",
-                compile_start.elapsed().as_secs_f64(),
-                units.fresh,
-                units.compiled,
-                units.unknown
-            ));
-            if !compiled.status.success() {
-                return Err(Error::new(format!(
-                    "main reader compile failed: {}",
-                    crate::gates::build_error_lines(&String::from_utf8_lossy(&compiled.stderr))
-                )));
-            }
+            let messages = if let Some((_, messages)) = &prebuilt {
+                let at = rev_parse(&git, &format!("{preview}^"))?;
+                let tip = rev_parse(&git, &format!("{requested}^"))?;
+                timings.push(format!(
+                    "main reader at {at}, composed onto {tip} (fixture preview {preview})"
+                ));
+                timings.push("no compile; prebuilt executable".into());
+                messages.clone()
+            } else {
+                let tip = rev_parse(&git, &format!("{requested}^"))
+                    .unwrap_or_else(|_| requested.to_owned());
+                timings.push(format!("compiled {tip} (fixture preview {requested})"));
+                let compiled = run(&mut compile)
+                    .map_err(|e| Error::new(format!("main reader compile: {e}")))?;
+                let units =
+                    aterm_verify::compile_account::read(&String::from_utf8_lossy(&compiled.stdout))
+                        .units;
+                timings.push(format!(
+                    "compile {:.3}s ({} fresh, {} compiled, {} unknown)",
+                    compile_start.elapsed().as_secs_f64(),
+                    units.fresh,
+                    units.compiled,
+                    units.unknown
+                ));
+                if !compiled.status.success() {
+                    return Err(Error::new(format!(
+                        "main reader compile failed: {}",
+                        crate::gates::build_error_lines(&String::from_utf8_lossy(&compiled.stderr))
+                    )));
+                }
+                String::from_utf8_lossy(&compiled.stdout).into_owned()
+            };
             let index = aterm_verify::test_index::Index::from_messages(
                 preview.to_string(),
                 String::new(),
-                &String::from_utf8_lossy(&compiled.stdout),
+                &messages,
             )
             .map_err(|e| Error::new(format!("main reader executable index: {e}")))?;
             let binary = index
@@ -1011,6 +1061,7 @@ impl MainReader {
             }
         })();
         let mut reading = Reading {
+            checked: Some(preview.to_owned()),
             answers,
             checks: format!(
                 "{}; {}; {:.3}s after-cut",
@@ -1029,15 +1080,6 @@ impl MainReader {
                     .push_str(&format!("; earlier main reader: {failure}"));
             }
         }
-        self.last_reading = inputs.map(|inputs| {
-            (
-                preview.to_string(),
-                pins.clone(),
-                targo.to_path_buf(),
-                inputs,
-                reading.clone(),
-            )
-        });
         reading
     }
 }
@@ -1157,7 +1199,8 @@ fn fixture_commit(
          {desks} desks{rendezvous} from build {build} ({short}), written before the claim \
          by the\nin-tree generator ({GENERATOR_SOURCE}) in the\nrelease's cut tree, and \
          the PINNED_DESKS rows that pin them. The next cut's\nhandoff fixture gate reads \
-         them ({HANDOFF_FIXTURE_README}).\n{recorded}\nMain reader checks: {checks}\n",
+         them ({HANDOFF_FIXTURE_README}).\n{recorded}\nFixture-Reader-Checked: {checked}\nMain reader checks: {checks}\n",
+        checked = reading.checked.as_deref().unwrap_or("NOT RUN"),
         checks = reading.checks,
         tag = pins.tag(),
         desks = staged.desks.len(),
@@ -1213,7 +1256,9 @@ impl Landed {
                 pins.tag(),
                 commit.get(..12).unwrap_or(commit),
                 if *attempt > 1 {
-                    format!(" ({attempt} reader judgments: fixture files changed meanwhile)")
+                    format!(
+                        " ({attempt} reader judgments: fixture inputs or main ancestry changed meanwhile)"
+                    )
                 } else {
                     String::new()
                 },
@@ -1261,7 +1306,7 @@ pub fn land(
         let preview = fixture_preview(git, &tip, staged, pins)?;
         let reading = read_main(&preview);
         let (mut commit, answers) = fixture_commit(git, &tip, staged, pins, &reading)?;
-        let checked = preview;
+        let checked = reading.checked.as_deref().unwrap_or("NOT RUN");
         loop {
             let written = origin.write("refs/heads/main", Some(&tip), &commit).map_err(|why| {
             Error::new(format!("handoff fixtures: native main write failed; refusing to reinterpret it as a known compare-and-swap conflict: {why}"))
@@ -1298,6 +1343,13 @@ pub fn land(
                     desks: found.desks,
                 });
             }
+            if !git
+                .git(&["merge-base", "--is-ancestor", &tip, &next])?
+                .success()
+            {
+                tip = next;
+                break;
+            }
             let merged = git_ok(
                 git,
                 &[
@@ -1333,7 +1385,26 @@ pub fn land(
                 .map(<[u8]>::to_vec)
                 .collect())
             };
-            if !files(&tip, &commit)?.is_disjoint(&files(&tip, &next)?) {
+            let range = format!("{tip}..{next}");
+            let touched = git_ok(
+                git,
+                &[
+                    "log",
+                    "--format=",
+                    "--name-only",
+                    "-z",
+                    "--diff-merges=combined",
+                    "--full-history",
+                    "--no-renames",
+                    &range,
+                ],
+            )?
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+            if !files(&tip, &commit)?.is_disjoint(&touched) {
                 tip = next;
                 break;
             }
@@ -1365,6 +1436,7 @@ pub fn land(
 
 fn fixture_preview(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) -> Result<String> {
     let pending = Reading {
+        checked: None,
         answers: Err("main reader has not run".into()),
         checks: "NOT RUN".into(),
     };
@@ -1374,6 +1446,87 @@ fn fixture_preview(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins)
 #[cfg(all(test, unix))]
 mod tests {
     use super::files_under;
+
+    /// Historical forward windows, not a timing assertion or a release operation.
+    #[test]
+    #[ignore = "models seven-minute reader churn from local origin/main history"]
+    fn model_reader_refresh_windows() {
+        use super::*;
+        let root = aterm_tempfile::manifest_dir()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let git = crate::ledger::GitCli::new(&root);
+        let mut metadata = aterm_uds::spawnfd::command(crate::gates::resolve_targo().unwrap());
+        let metadata = metadata
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(metadata.status.success());
+        let inputs = reader_inputs::Inputs::from_metadata(&metadata.stdout, &root).unwrap();
+        let head =
+            std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "origin/main".into());
+        let history = git_ok(
+            &git,
+            &[
+                "log",
+                "--first-parent",
+                "--since=24 hours ago",
+                "--format=%ct %H",
+                &head,
+            ],
+        )
+        .unwrap()
+        .stdout_utf8();
+        let commits: Vec<_> = history
+            .lines()
+            .map(|line| {
+                let (time, sha) = line.split_once(' ').unwrap();
+                (time.parse::<i64>().unwrap(), sha)
+            })
+            .collect();
+        let mut samples = 0;
+        let mut cone = 0;
+        let mut fixtures = 0;
+        for &(time, base) in &commits {
+            if commits[0].0 < time + 420 {
+                continue;
+            }
+            let tip = commits.iter().find(|(t, _)| *t <= time + 420).unwrap().1;
+            let paths = git_ok(&git, &["diff", "--name-only", base, tip])
+                .unwrap()
+                .stdout_utf8();
+            samples += 1;
+            cone += usize::from(paths.lines().any(|p| !inputs.ignores(Path::new(p))));
+            let range = format!("{base}..{tip}");
+            let touched = git_ok(
+                &git,
+                &[
+                    "log",
+                    "--format=",
+                    "--name-only",
+                    "--diff-merges=combined",
+                    "--full-history",
+                    "--no-renames",
+                    &range,
+                ],
+            )
+            .unwrap()
+            .stdout_utf8();
+            fixtures += usize::from(touched.lines().any(|p| {
+                p.starts_with(HANDOFF_FIXTURE_ROOT)
+                    || p == HANDOFF_FIXTURE_GUARD
+                    || p == SHIPPED_STATE_CORPUS
+            }));
+        }
+        println!(
+            "head {head}; 7-minute windows: {samples}; reader cone changed: {cone}; any fixture edit: {fixtures}"
+        );
+        assert!(samples > 0);
+    }
 
     #[test]
     fn files_under_ignores_symlinks() {

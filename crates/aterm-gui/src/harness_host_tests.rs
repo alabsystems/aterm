@@ -8017,6 +8017,7 @@ impl Acting {
                 claim_left: Acts::inert().claim_left,
                 login_pin: Acts::inert().login_pin,
                 window_ending: Acts::inert().window_ending,
+                clicks: Acts::inert().clicks,
             },
             backoff: Arc::new(quick_backoff),
             pause: Arc::new(move |pause| {
@@ -8487,6 +8488,54 @@ fn a_carry_on_owed_holds_the_loops_act_for_a_bounded_wait_a_persons_hold_renews(
     assert!(
         !beside.owns_turn_end(),
         "a lane that carries itself owes this loop no wait"
+    );
+}
+
+/// A STANDING PERMISSION CLICK HOLDS THE LOOP'S OWN ACT FOR ITS OWN BOUND (`docs/DESIGN-yolo-binary-2026-11-04.md`
+/// §A10): the person's click asks a restart at a rest, which a prompt the loop typed there would
+/// take, so while it stands on this worker's tab the worker owns the turn ends; its hold run out
+/// ([`crate::permission_click::CLICK_HOLD`]) it owns nothing, so a lane stuck on a wait never parks
+/// Cruise or Land; a click taken back holds nothing, and a click on another tab holds nothing
+/// here. MUTANT: `owns_turn_end` without `click_holds` fails the first hold; the hold kept with no
+/// bound fails the second.
+#[test]
+fn a_standing_permission_click_holds_the_loops_act_for_its_own_bound() {
+    use aterm_agent::harness::permission_click::Click;
+    use aterm_agent::supervise::policy::turn_end::PermissionTo;
+    let click = |tab: &str| Click {
+        tab: tab.to_owned(),
+        conversation: "c-1".to_owned(),
+        to: PermissionTo::Settings,
+        at: 1,
+    };
+    let world = Arc::new(World::default());
+    let clicks = crate::permission_click::Clicks::default();
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        clicks: clicks.clone(),
+        ..Acts::inert()
+    };
+    let switches = Arc::new(Switches::default());
+    switches.set(&on(), false);
+    let idle = idle_host("s-click", Program::Claude, switches, hooks);
+    assert!(!idle.owns_turn_end(), "no click: nothing held");
+    clicks.stand(click("s-click"), true);
+    assert!(
+        idle.owns_turn_end(),
+        "a standing click holds the loop's act"
+    );
+    clicks.run_hold_out("s-click");
+    assert!(!idle.owns_turn_end(), "its own bound");
+    assert!(clicks.take_back("s-click").is_some());
+    clicks.stand(click("s-click"), false);
+    assert!(idle.owns_turn_end(), "the next click's own hold");
+    assert!(clicks.take_back("s-click").is_some());
+    assert!(!idle.owns_turn_end(), "taken back: nothing held");
+    clicks.stand(click("s-other"), true);
+    assert!(
+        !idle.owns_turn_end(),
+        "another tab's click holds nothing here"
     );
 }
 

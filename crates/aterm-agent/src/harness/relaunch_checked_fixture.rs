@@ -370,7 +370,7 @@ impl World {
             process: self.process.clone(),
             shell: self.shell.clone(),
         };
-        restart_as_authorized(
+        restart_fenced(
             &self.opts,
             why,
             ask,
@@ -378,6 +378,7 @@ impl World {
             Ok(self.snapshot.clone()),
             None,
             &kernel,
+            &|| true,
             Some(authorizer),
         )
     }

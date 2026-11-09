@@ -21,11 +21,13 @@ USAGE
       Two takes run in forward/reverse order (ABBA for two arms).
       Each take retains Cargo's unit timeline in cargo-timings/ and one-second
       process-group observations in build-resources.jsonl (sampled, not accounting).
-  targo --unverified ship profile-pilot --anatomy
-      One fat1 take per slice with detailed front-end/codegen/link timings.
+  targo --unverified ship profile-pilot --anatomy [--arm ARM]...
+      Detailed front-end/codegen/link timings. One arm (fat1 by default) takes
+      one diagnostic take per slice; multiple arms take two in forward/reverse
+      order, judging byte identity and running the host instruments afterward.
       The existing stable compat compiler enables its unstable timing diagnostic
-      with RUSTC_BOOTSTRAP=1 for this measurement only. No runtime or
-      reproducibility judgment; compare sections against a regular take separately.
+      with RUSTC_BOOTSTRAP=1 for this measurement only. Compare sections against
+      a regular take separately; product runtime rows use the macOS guest lane.
   targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
       Recheck a retained take's dSYM and a stripped private copy, without rebuilding.
 

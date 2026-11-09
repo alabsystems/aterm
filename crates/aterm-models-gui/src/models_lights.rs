@@ -1,192 +1,135 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code lights' permission-mode toggle (`aterm-gui`'s `claude_lights`).
+//! The Claude Code lights' permission click (`aterm-gui`'s `permission_click` and
+//! `claude_lights`).
 
 use aterm_spec::derive::*;
 
-/// One mode toggle: a click on the mode light presses shift+tab until Claude shows the state the
-/// light did not: from an expected mode (`mode` 0 bypass, 5 auto) to manual (`mode` 1, `lame`),
-/// from any other back to an expected mode (`goal` 1 and 0). A click is taken at rest and while a
-/// toggle's end is on show (`phase` 2: its notice or refusal), the click back after an arrival.
+/// One click on the permission chip (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, §3): it types
+/// nothing, but stands an ask in the window's memory to restart the tab's conversation on the line
+/// of the bit the chip did not show (`bit` 1 `yolo`, 0 `lame`), fixed at the click (`from`, `to`).
+/// The ask's lane (`lane` 1) looks at the tab at its pace until it may signal the restart (`lane`
+/// 2), which lands once and ends the ask, wherever the pill then reads. Before the signal a click on
+/// the standing ask takes it back; after it nothing can. A refusal ends it and is said; the tab
+/// closing or its conversation leaving it ends it quietly.
 ///
-/// Claude's cycle is the ring `Answer` walks, as `lab footers` measured it on Claude Code 2.1.317
-/// and 2.1.318 (`docs/measured/claude-mode-cycle-2026-11-03.md`): bypass, auto, manual, accept
-/// edits, plan and round to bypass in a session started with bypass; auto, manual, accept edits,
-/// plan and round to auto in one started without it (`bypass_in` 0). The narrower rings are kept
-/// reachable, not measured: one whose cycle has no auto (`auto_in` 0) goes from bypass to manual,
-/// and one with neither from plan to manual. From bypass a click on `yolo` presses through auto,
-/// an expected mode short of its goal, to manual.
+/// The environment: the pill moves by Claude's own steps (`ToYolo`, `ToLame`); a box or a person's
+/// hold makes the lane wait (`held`); a tab where no line can be made (`never`: a job with no
+/// shell, a claim, a coordinated record) can only be refused; a run of presses within a double
+/// click's interval (`run`) is one click until it ends (`Apart`); a refusal on show rests.
+///
+/// Not modelled: the lane's re-key to a conversation its own restart afresh started (`Moved`), and
+/// the take-back that races the signal, which the harness fences with no I/O
+/// (`relaunch::restart_fenced`) and the window tests directly.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn claude_mode_toggle_model() -> Model {
+pub fn claude_permission_click_model() -> Model {
     aterm_spec::ty_model! {
-        ClaudeModeToggle {
+        ClaudePermissionClick {
             const Buggy = 0;
-            const MaxPresses = 4;
-            var mode = 1;
-            var start = 1;
-            var goal = 0;
-            var bypass_in = 1;
-            var auto_in = 1;
-            var busy = 0;
-            var phase = 0;
-            var sent = 0;
-            var auto = 0;
-            var fresh = 0;
-            var covered = 0;
-            var presses = 0;
-            var named = 0;
-            var overshoot = 0;
-            var boxed = 0;
-            var late = 0;
-            var late_press = 0;
+            var bit = 1;
+            var from = 1;
+            var to = 0;
+            var stands = 0;
+            var lane = 0;
+            var conv = 1;
+            var asked = 1;
+            var tab = 1;
+            var held = 0;
+            var never = 0;
+            var run = 0;
+            var ended = 0;
+            var said = 0;
+            var typed = 0;
+            var again = 0;
+            var into_held = 0;
+            var into_never = 0;
 
-            action Click when ((phase == 0 || phase == 2) && covered == 0) {
-                phase = 1;
-                start = mode;
-                goal = if (mode == 0 || mode == 5) && Buggy == 2 {
-                    0
-                } else if mode == 0 || mode == 5 {
-                    1
-                } else {
-                    0
-                };
-                sent = 1;
-                auto = 0;
-                fresh = 0;
-                presses = 1;
-                named = 0;
-                late = 0;
+            action Click when (stands == 0 && lane == 0 && tab == 1 && (run == 0 || Buggy == 3)) {
+                stands = 1;
+                lane = 1;
+                from = bit;
+                to = if Buggy == 1 { bit } else { 1 - bit };
+                asked = conv;
+                run = 1;
+                ended = 0;
+                said = 0;
+                typed = 0;
+                again = if run == 1 { 1 } else { again };
             }
-            action Answer when (sent == 1 && covered == 0) {
-                mode = if mode == 0 && auto_in == 1 {
-                    5
-                } else if mode == 0 || mode == 5 || mode == 4 {
-                    1
-                } else if mode == 3 && bypass_in == 1 {
-                    0
-                } else if mode == 3 && auto_in == 1 {
-                    5
-                } else if mode == 3 {
-                    1
-                } else {
-                    mode + 1
-                };
-                sent = 0;
-                auto = 0;
-                fresh = 0;
+            action TakeBack when (stands == 1 && (lane == 1 || Buggy == 2) && (run == 0 || Buggy == 3)) {
+                stands = 0;
+                lane = if Buggy == 2 { lane } else { 0 };
+                run = 1;
+                again = if run == 1 { 1 } else { again };
             }
-            action TurnStarts when (busy == 0 && covered == 0) {
-                busy = 1;
-                fresh = sent;
+            action Refuse when (lane == 1 && stands == 1 && never == 1) {
+                stands = 0;
+                lane = 0;
+                ended = 1;
+                said = if Buggy == 4 { 0 } else { 1 };
             }
-            action TurnEnds when (busy == 1 && covered == 0) {
-                busy = 0;
-                fresh = 0;
-            }
-            action Cover when (covered == 0 && busy == 1 && (sent == 0 || fresh == 0)) {
-                covered = 1;
-                boxed = if sent == 1 && auto == 1 { 1 } else { boxed };
-            }
-            action Uncover when (covered == 1) {
-                covered = 0;
-            }
-            action Leave when (
-                (phase == 0 || phase == 2) && ((mode == 0 && auto_in == 0) || mode == 5) && covered == 0
+            action Signal when (
+                lane == 1
+                    && stands == 1
+                    && tab == 1
+                    && conv == asked
+                    && typed <= 1
+                    && (held == 0 || Buggy == 5)
+                    && (never == 0 || Buggy == 6)
             ) {
-                mode = 1;
-                phase = 0;
-                named = 0;
+                lane = 2;
+                typed = typed + 1;
+                into_held = if held == 1 { 1 } else { into_held };
+                into_never = if never == 1 { 1 } else { into_never };
             }
-            action DontAsk when (phase == 0 && mode == 0 && covered == 0) {
-                mode = 4;
+            action Land when (lane == 2) {
+                lane = if Buggy == 7 && bit == from { 1 } else { 0 };
+                stands = if Buggy == 7 && bit == from { 1 } else { 0 };
             }
-            action NoBypass when (phase == 0 && bypass_in == 1 && mode > 0) {
-                bypass_in = 0;
+            action CloseTab when (tab == 1) {
+                tab = 0;
+                stands = if Buggy == 8 { stands } else { 0 };
+                lane = if Buggy == 8 { lane } else { 0 };
             }
-            action NoAuto when (phase == 0 && auto_in == 1 && 5 > mode) {
-                auto_in = 0;
+            action Leave when (conv == 1 && lane <= 1 && tab == 1) {
+                conv = 2;
+                stands = if Buggy == 9 { stands } else { 0 };
+                lane = if Buggy == 9 { lane } else { 0 };
             }
-            action Timeout when (phase == 1 && late == 0) {
-                late = 1;
+            action ToYolo when (bit == 0) {
+                bit = 1;
             }
-            action Press when (
-                phase == 1
-                    && sent == 0
-                    && presses <= MaxPresses - 1
-                    && (mode > start || start > mode)
-                    && ((goal == 0 && mode > 0 && 5 > mode) || (goal == 1 && (mode > 1 || 1 > mode)) || Buggy == 1)
-                    && (covered == 0 || Buggy == 1)
-                    && (busy == 0 || Buggy == 1)
-                    && (late == 0 || Buggy == 1)
-            ) {
-                sent = 1;
-                auto = 1;
-                fresh = 0;
-                presses = presses + 1;
-                overshoot = if (goal == 0 && (mode == 0 || mode == 5)) || (goal == 1 && mode == 1) {
-                    1
-                } else {
-                    overshoot
-                };
-                boxed = if covered == 1 { 1 } else { boxed };
-                late_press = if late == 1 { 1 } else { late_press };
-                late = 0;
+            action ToLame when (bit == 1) {
+                bit = 0;
             }
-            action Reject when (
-                phase == 1
-                    && sent == 0
-                    && presses <= MaxPresses - 1
-                    && ((goal == 0 && mode > 0 && 5 > mode) || (goal == 1 && (mode > 1 || 1 > mode)))
-                    && (mode > start || start > mode)
-                    && covered == 0
-                    && busy == 0
-            ) {
-                phase = 2;
-                named = if Buggy == 1 { 0 } else { 1 };
-                late = 0;
+            action Hold when (held == 0) {
+                held = 1;
             }
-            action Lap when (
-                phase == 1
-                    && sent == 0
-                    && ((goal == 0 && mode > 0 && 5 > mode) || (goal == 1 && (mode > 1 || 1 > mode)))
-                    && (mode == start || presses > MaxPresses - 1)
-            ) {
-                phase = 2;
-                named = if Buggy == 1 { 0 } else { 1 };
-                late = 0;
+            action Free when (held == 1) {
+                held = 0;
             }
-            action Arrive when (
-                phase == 1 && sent == 0 && ((goal == 0 && (mode == 0 || mode == 5)) || (goal == 1 && mode == 1))
-            ) {
-                phase = 2;
-                named = 0;
-                late = 0;
+            action NoLine when (never == 0) {
+                never = 1;
             }
-            action Expire when (phase == 1 && (late == 1 || sent == 1 || covered == 1 || busy == 1)) {
-                phase = 2;
-                sent = 0;
-                auto = 0;
-                named = if Buggy == 1 { 0 } else { 1 };
-                late = 0;
+            action Apart when (run == 1) {
+                run = 0;
             }
-            action Rest when (phase == 2) {
-                phase = 0;
-                named = 0;
-                late = 0;
+            action Rest when (ended == 1) {
+                ended = 0;
+                said = 0;
             }
 
-            invariant NeverPressesPastItsGoal: overshoot == 0;
-            invariant NoPressIntoABox: boxed == 0;
-            invariant NoLatePress: late_press == 0;
-            invariant AStopIsNamed: phase <= 1
-                || (goal == 0 && (mode == 0 || mode == 5))
-                || (goal == 1 && mode == 1)
-                || named == 1;
-            invariant AClickTurnsTheLightOver: phase == 0
-                || ((start == 0 || start == 5) && goal == 1)
-                || (start > 0 && 5 > start && goal == 0);
+            invariant AClickAsksTheOtherBit: stands == 0 || to + from == 1;
+            invariant TheSignalKeepsItsAsk: lane <= 1 || stands == 1;
+            invariant ADoubleClickIsOneClick: again == 0;
+            invariant ARefusalIsSaid: ended == 0 || said == 1;
+            invariant NoSignalIntoAWait: into_held == 0;
+            invariant NoLineWhereNoneCanBeMade: into_never == 0;
+            invariant OneRestartPerClick: typed <= 1;
+            invariant NoAskOutlivesItsTab: tab == 1 || stands == 0;
+            invariant NoAskOutlivesItsConversation: stands == 0 || conv == asked;
         }
     }
 }

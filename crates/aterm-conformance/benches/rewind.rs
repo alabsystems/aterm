@@ -54,14 +54,11 @@ mod measuring {
                 chain_bytes: CHAIN,
             }),
         ),
-        // Design §14.5 R4 exit rows, declared before the candidate was measured: parse throughput with recording on at least 0.97x off, ABBA over fresh instances. Judged on the adjacent takes' off/on ratios: their median's 95% sign interval at or above 0.97 passes, wholly below fails, and one holding 0.97 is unproved (`rewind_cost::throughput_disposition`), since a load that comes and goes slows whole takes (`docs/measured/temporal-reader-rekey-2026-11-05.md`) and the arms' pooled medians followed it. Ten blocks give twenty ratios, so the interval is their 6th to 15th (95.9%).
+        // Design §14.5 R4: unchanged 0.97 floor, predeclared looks at 8/16/32/64 ABBA blocks.
+        // The exact sign intervals share a 5% error budget; every decided look stops the take.
         (
             "recording_keeps_parse_throughput_at_or_above_0_97x",
-            Row::Cost(CostRow::Throughput {
-                bytes: 64 << 20,
-                pairs: 10,
-                min_milli: 970,
-            }),
+            Row::Cost(rewind_cost::THROUGHPUT),
         ),
         // One idle pane: recording adds at most `rewind_budget_mb`'s default (8 MiB, one pane's history cap) of resident size, the arms' medians over ABBA pairs of fresh instances. ATERM_DESIGN.md §7.2's 25 MB idle target is the whole app's, which misses it with recording off too, so the row judges it only on a bundle that records by default (the R4 flip it gates) and reports it on every other.
         (
@@ -99,7 +96,7 @@ mod measuring {
                     report.line
                 )),
                 Disposition::Unproved => Outcome::Undecided(format!(
-                    "REWIND COST UNPROVED: the adjacent takes' off/on ratios spread past the bound \
+                    "REWIND COST UNPROVED: the whole blocks' off/on ratios spread past the bound \
                      the row judges, so their median's 95% interval holds it and the takes are no \
                      evidence either way; take it on an unloaded machine.\n  {}",
                     report.line
@@ -166,7 +163,11 @@ mod measuring {
     pub fn diagnostic(args: &[String]) -> Option<std::process::ExitCode> {
         const FLAG: &str = "--recording-cost-diagnostic";
         const REFERENCE: &str = "--recording-reference-diagnostic";
-        if !args.iter().any(|arg| arg == FLAG || arg == REFERENCE) {
+        const CONTROL: &str = "--throughput-control";
+        if !args
+            .iter()
+            .any(|arg| [FLAG, REFERENCE, CONTROL].contains(&arg.as_str()))
+        {
             return None;
         }
         let (_, args) = match super::quiet::parse_args(args.iter().cloned()) {
@@ -178,17 +179,47 @@ mod measuring {
         };
         let [flag, subject, producer, output] = args.as_slice() else {
             eprintln!(
-                "usage: rewind ({FLAG}|{REFERENCE}) SUBJECT PRODUCER EXISTING_PRIVATE_DIRECTORY [--admit now|wait]"
+                "usage: rewind ({FLAG}|{REFERENCE}|{CONTROL}) SUBJECT PRODUCER EXISTING_PRIVATE_DIRECTORY [--admit now|wait]"
             );
             return Some(std::process::ExitCode::from(2));
         };
-        if ![FLAG, REFERENCE].contains(&flag.as_str()) {
+        if ![FLAG, REFERENCE, CONTROL].contains(&flag.as_str()) {
             return Some(std::process::ExitCode::from(2));
         }
         let rig = Rig {
             aterm: std::path::PathBuf::from(subject.as_str()),
             fake_tui: std::path::PathBuf::from(producer.as_str()),
         };
+        if flag == CONTROL {
+            return Some(super::quiet::run("rewind throughput A/A control", || {
+                match rewind_cost::throughput_control(&rig) {
+                    Ok(report) => {
+                        println!(
+                            "A/A instrument control (no recording verdict): {}",
+                            report.line
+                        );
+                        match aterm_conformance::measure::write_fresh(
+                            std::path::Path::new(output).join("throughput-control.txt"),
+                            &report.line,
+                        ) {
+                            Ok(()) => match report.disposition {
+                                Disposition::Pass => std::process::ExitCode::SUCCESS,
+                                Disposition::Fail => std::process::ExitCode::from(1),
+                                Disposition::Unproved => std::process::ExitCode::from(3),
+                            },
+                            Err(error) => {
+                                eprintln!("cannot retain A/A control: {error}");
+                                std::process::ExitCode::from(3)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("A/A control: COULD NOT RUN — {error}");
+                        std::process::ExitCode::from(3)
+                    }
+                }
+            }));
+        }
         Some(super::quiet::run(
             "rewind recording diagnostic",
             || match if flag.as_str() == REFERENCE {

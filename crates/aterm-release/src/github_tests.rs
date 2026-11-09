@@ -119,6 +119,117 @@ fn upload(id: u64, name: &str, file: &std::path::Path) -> RunOut {
     run_once(prepare(OneShotUrl::Uploads(&path), Body::File(file)).unwrap()).unwrap()
 }
 
+/// The engine's loopback GitHub seam with fixed per-upload service delays.
+/// This measures scheduling and real curl/HTTP/byte-verification overhead,
+/// never public GitHub throughput. No release credential is reachable.
+#[test]
+#[ignore = "explicit loopback upload wall measurement"]
+fn concurrent_upload_fixture_walls() {
+    const ASSETS: [(&str, u64); 13] = [
+        ("aterm-0.181.0-mac.zip", 300),
+        ("aterm-0.181.0-mac.zip.sha256", 45),
+        ("aterm-0.181.0.dmg", 369),
+        ("aterm-0.181.0.dmg.sha256", 52),
+        ("aterm-mac.zip", 299),
+        ("aterm-mac.zip.sha256", 43),
+        ("aterm-machines.toml", 15),
+        ("aterm-machines.toml.sig", 15),
+        ("aterm-service-qualification.json", 43),
+        ("aterm.dmg", 258),
+        ("aterm.dmg.sha256", 44),
+        ("aterm-appcast.toml.sig", 42),
+        ("aterm-appcast.toml", 46),
+    ];
+    struct Delayed;
+    impl Spawn for Delayed {
+        fn run(
+            &self,
+            command: &mut Command,
+            stdin: Option<&[u8]>,
+        ) -> std::io::Result<std::process::Output> {
+            if let Some(millis) = command.get_args().find_map(|arg| {
+                let arg = arg.to_str()?;
+                let (_, name) = arg.split_once("/assets?name=")?;
+                ASSETS
+                    .iter()
+                    .find(|(asset, _)| *asset == name)
+                    .map(|(_, millis)| *millis)
+            }) {
+                std::thread::sleep(std::time::Duration::from_millis(millis));
+            }
+            Direct.run(command, stdin)
+        }
+    }
+    for bound in [1, 2, 4, 6, 6, 4, 2, 1] {
+        let w = world(true, Recorder::default());
+        let p = w.fake.ports();
+        let _route = Fixture {
+            origins: Origins::loopback(p.api, p.uploads, p.web, p.cdn),
+            token: Some(w.secret.clone()),
+            spawn: Some(Arc::new(Delayed)),
+        }
+        .enter();
+        let created = create_draft("v0.181.0");
+        assert!(created.success());
+        let id = json_of(&created)["id"].as_u64().unwrap();
+        let dir = scratch();
+        for (name, _) in ASSETS {
+            std::fs::write(dir.path().join(name), name.as_bytes()).unwrap();
+        }
+        let mut cut = crate::publish::CutCtx {
+            credentials: None,
+            apple: crate::sign::AppleTier::Inactive,
+            repo: dir.path().to_owned(),
+            tree: dir.path().to_owned(),
+            dist: dir.path().to_owned(),
+            journal_path: dir.path().join("cut-state.toml"),
+            slug: SLUG.into(),
+            version: "0.181.0".into(),
+            tag: "v0.181.0".into(),
+            build: 1810,
+            commit: "a".repeat(40),
+            min_build: None,
+            artifact: None,
+            macho_sha256: None,
+            linux: None,
+            manifest_signed: true,
+            signature_required: true,
+            signature_pubkey: None,
+            verify_pubkey: None,
+            signature_machine_id: None,
+            attribution: None,
+            roster: None,
+            release_id: Some(id),
+            release_intent: true,
+            upload_intents: Vec::new(),
+            kind: crate::publish::CutKind::DryRun,
+            lease: None,
+            fence: None,
+            notes_section: "0.181.0".into(),
+            journal: None,
+            adopted: false,
+        };
+        let ctx = Mutex::new(&mut cut);
+        let put = |(name, _): &(&str, u64)| {
+            crate::publish::upload_channel_asset(&ctx, SLUG, id, &dir.path().join(name), true)
+        };
+        let started = std::time::Instant::now();
+        crate::publish::upload_pool(&ASSETS[..11], bound, &put).unwrap();
+        for asset in &ASSETS[11..] {
+            put(asset).unwrap();
+        }
+        println!(
+            "upload-http-fixture bound={bound} wall_s={:.6}",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(w.fake.release_state(id).unwrap().1.len(), ASSETS.len());
+        assert_eq!(ctx.lock().unwrap().upload_intents.len(), ASSETS.len());
+        // Resume converges byte-identical objects without minting another POST.
+        crate::publish::upload_pool(&ASSETS, bound, &put).unwrap();
+        assert_eq!(ctx.lock().unwrap().upload_intents.len(), ASSETS.len());
+    }
+}
+
 fn json_of(out: &RunOut) -> Value {
     aterm_json::from_str(std::str::from_utf8(&out.stdout).unwrap()).unwrap()
 }

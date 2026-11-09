@@ -1761,6 +1761,9 @@ fn the_title_says_what_a_pointed_row_waits_on() {
     let t0 = Instant::now();
     let run = |pointed: bool, answered: bool| {
         let (mut app, wid, session) = glass(t0);
+        // A hosted tab: its harness chips are the block whose title slot says it
+        // (`docs/DESIGN-yolo-binary-2026-11-04.md` §2 draws no chip on an unhosted one).
+        let host = supervise(&mut app, session);
         set_test_wall(Some(W0));
         publish_flights(&app, session, bling_probe(bling_bash()));
         let inks = Inks {
@@ -1799,6 +1802,7 @@ fn the_title_says_what_a_pointed_row_waits_on() {
         let engine = engine_text(&app, session)[BOTTOM].clone();
         set_test_wall(None);
         crate::claude_card::set_test_now(None);
+        host.shutdown_and_join();
         (rule, engine)
     };
     let (rule, engine) = run(true, false);

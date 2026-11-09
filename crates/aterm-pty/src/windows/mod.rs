@@ -855,6 +855,44 @@ fn paths_eq_ignore_ascii_case(a: &std::path::Path, b: &std::path::Path) -> bool 
         .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
 }
 
+/// The processes in the job of the session whose shell is `shell_pid`, as the job lists them now,
+/// each with its image's path (`QueryFullProcessImageNameW`): the programs its commands run. The
+/// shell's own process and the console host aterm started for the session ([`console_host_pid`])
+/// are left out, and so is a process whose image cannot be read (gone, or another user's). Nothing
+/// else of a process is read: never a window title, a command line or its memory. Empty for a
+/// session with no job (an adopted handoff) and for a pid no session's shell is.
+#[must_use]
+pub fn job_images(shell_pid: i32) -> Vec<(u32, std::path::PathBuf)> {
+    let Some(s) = session_by_pid(shell_pid) else {
+        return Vec::new();
+    };
+    if s.job == 0 {
+        return Vec::new();
+    }
+    let host = host_pid(&s);
+    console_guard::pids_in(s.job)
+        .into_iter()
+        .filter(|&pid| pid != 0 && pid != s.pid && Some(pid) != host)
+        .filter_map(|pid| console_guard::image_of(pid).map(|image| (pid, image)))
+        .collect()
+}
+
+/// The pid of the console host (conhost or OpenConsole) aterm started for the session whose shell
+/// is `shell_pid`; `None` for an adopted handoff's, which aterm did not start, and for a pid no
+/// session's shell is.
+#[must_use]
+pub fn console_host_pid(shell_pid: i32) -> Option<u32> {
+    session_by_pid(shell_pid).and_then(|s| host_pid(&s))
+}
+
+/// The pid of `s`'s console host, when it holds one.
+fn host_pid(s: &WinSession) -> Option<u32> {
+    // SAFETY: the console host's process handle, owned by the session entry the caller holds.
+    (s.conhost != 0)
+        .then(|| unsafe { ffi::GetProcessId(s.conhost) })
+        .filter(|&pid| pid != 0)
+}
+
 /// HANG UP a spawned shell.
 pub fn hangup(pid: i32) {
     if pid <= 1 {

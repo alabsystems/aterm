@@ -19,18 +19,29 @@ pub use diagnostic::collect_reference as diagnose_reference;
 /// A take's wall-clock limit: every wait and request on its instances ends with it.
 pub const BUDGET_SECS: u64 = 600;
 
+/// Predeclared looks, with a shared 5% error budget. A decided take never collects more data.
+const THROUGHPUT_LOOKS: [usize; 4] = [8, 16, 32, 64];
+const LOOK_COVERAGE_PPM: u64 = 1_000_000 - 50_000 / THROUGHPUT_LOOKS.len() as u64;
+const CONTROL_TARGET_MILLI: u64 = 1000;
+const CONTROL_WIDTH_LT_MILLI: u64 = 30;
+
+/// One parse-throughput row under the predeclared confidence-spending plan.
+pub const THROUGHPUT: CostRow = CostRow::Throughput {
+    bytes: 64 << 20,
+    min_milli: 970,
+};
+
 /// ATERM_DESIGN.md §7.2's idle target for the whole app, in bytes. [`CostRow::IdleRss`] reports it on every bundle and judges it only on one that records by default: it measures the app, not recording (an idle instance with recording off misses it too), and design §14.5 R4 holds the default off until an idle recording pane meets it.
 pub const APP_IDLE_TARGET_BYTES: u64 = 25_000_000;
 
 /// What a cost row measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CostRow {
-    /// `pairs` ABBA blocks (off, on, on, off) of one pane draining `bytes`, each take a fresh instance, judged on the adjacent takes' off/on drain ratios ([`pair_ratios_milli`]) by [`throughput_disposition`]: passes when their median's interval ([`median_interval`]) lies at or above `min_milli` thousandths and no recording input was dropped, fails when it lies below or input was dropped, and is unproved between.
-    Throughput {
-        bytes: usize,
-        pairs: u32,
-        min_milli: u64,
-    },
+    /// Fresh-instance ABBA blocks (off, on, on, off) of one pane draining `bytes`,
+    /// judged on whole-block ratios ([`block_ratios_milli`]). Looks at 8, 16, 32 and
+    /// 64 blocks share a 5% error budget. The first decided interval stops the take;
+    /// only an unproved interval collects more blocks. Dropped input fails at once.
+    Throughput { bytes: usize, min_milli: u64 },
     /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]). Each take's app memory ([`Settled::read`]) is reported beside it and judges nothing.
     IdleRss { pairs: u32, max_extra_bytes: u64 },
     /// `panes` panes each draining `bytes` at once: passes when recording on adds at most `max_extra_bytes` of resident size over recording off and the pool holds no more than its limit.
@@ -254,25 +265,36 @@ pub fn median(v: &[u64]) -> u64 {
     s.get((s.len().saturating_sub(1)) / 2).copied().unwrap_or(0)
 }
 
-/// The off take's drain time over the on take's, in thousandths (1000: recording cost nothing),
-/// for each pair of adjacent takes in an ABBA block: its arms 0 and 1, then its arms 3 and 2.
-/// `off` and `on` hold each arm's takes in take order, so block `p`'s arms 0 and 3 are `off`'s
-/// entries `2p` and `2p + 1`, and its arms 1 and 2 are `on`'s. Adjacent takes, a couple of seconds
-/// apart, share the machine's state: a load that comes and goes between them is in both sides of
-/// a pair, where pooling each arm's takes would put it in one arm's median and not the other's.
-/// A pair with an on take of 0 µs (none was measured) gives no ratio.
+/// One observation per ABBA block: `sqrt(A1*A2/(B1*B2))`, in thousandths, rounded down.
+/// `off` and `on` hold their arms in take order. Averaging the two log ratios cancels a linear
+/// log-time drift over equally spaced takes; the two adjacent ratios need not be independent
+/// observations. The sign interval assumes independent blocks, not independent arms within one.
+/// Missing, zero or overflowing timings invalidate the sample rather than dropping observations.
 #[must_use]
-pub fn pair_ratios_milli(off: &[u64], on: &[u64]) -> Vec<u64> {
-    off.iter()
-        .zip(on)
-        .filter(|(_, on)| **on != 0)
-        .map(|(off, on)| off.saturating_mul(1000) / on)
+pub fn block_ratios_milli(off: &[u64], on: &[u64]) -> Option<Vec<u64>> {
+    if off.is_empty() || off.len() != on.len() || off.len() % 2 != 0 {
+        return None;
+    }
+    off.as_chunks::<2>()
+        .0
+        .iter()
+        .zip(on.as_chunks::<2>().0)
+        .map(|(a, b)| {
+            if a.contains(&0) || b.contains(&0) {
+                return None;
+            }
+            let numerator = u128::from(a[0])
+                .checked_mul(u128::from(a[1]))?
+                .checked_mul(1_000_000)?;
+            let denominator = u128::from(b[0]) * u128::from(b[1]);
+            u64::try_from((numerator / denominator).isqrt()).ok()
+        })
         .collect()
 }
 
 /// An interval holding the median of the population `values` were drawn from with at least
 /// [`MedianInterval::coverage_ppm`] probability, from the sign test (distribution-free: it
-/// assumes only independent draws).
+/// assumes independent draws with a common population median).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MedianInterval {
     /// The sample median (the lower of the middle two).
@@ -288,25 +310,25 @@ pub struct MedianInterval {
 /// The most values [`median_interval`] takes: its binomial sums are exact in `u128` up to here.
 const MAX_INTERVAL_VALUES: usize = 64;
 
-/// `values`' median and its sign-test interval at 95% or more: with `n` values, `k` is the largest
-/// with `P(Binomial(n, 1/2) <= k - 1) <= 2.5%`, so the median lies below the `k`th smallest or
-/// above the `k`th largest with at most 2.5% probability each. `None` for fewer than 6 values (no
-/// such `k`) or more than [`MAX_INTERVAL_VALUES`].
+/// `values`' exact sign-test interval at no less than `min_coverage_ppm` confidence.
+/// With `n` values, `k` is the largest whose two binomial tails total at most
+/// `1 - min_coverage_ppm / 1_000_000`. Returns `None` below 95% confidence, at 100%,
+/// past [`MAX_INTERVAL_VALUES`], or when too few values support the requested confidence.
 #[must_use]
-pub fn median_interval(values: &[u64]) -> Option<MedianInterval> {
+pub fn median_interval(values: &[u64], min_coverage_ppm: u64) -> Option<MedianInterval> {
     let n = values.len();
-    if n > MAX_INTERVAL_VALUES {
+    if n > MAX_INTERVAL_VALUES || !(950_000..1_000_000).contains(&min_coverage_ppm) {
         return None;
     }
     let whole = 1_u128 << n;
     let choose =
         |i: usize| -> u128 { (0..i).fold(1_u128, |c, j| c * (n - j) as u128 / (j + 1) as u128) };
-    // `tail` is P(B <= k - 1) * 2^n for the current `k`; the last `k` whose tail is at most 2.5%.
+    // `tail` is P(B <= k - 1) * 2^n. All products fit u128 at n <= 64.
     let (mut k, mut tail, mut kept) = (0, 0_u128, None);
     while k < n / 2 {
         tail += choose(k);
         k += 1;
-        if tail * 40 > whole {
+        if tail * 2_000_000 > whole * u128::from(1_000_000 - min_coverage_ppm) {
             break;
         }
         kept = Some((k, tail));
@@ -320,6 +342,104 @@ pub fn median_interval(values: &[u64]) -> Option<MedianInterval> {
         hi: sorted[n - k],
         coverage_ppm: u64::try_from(1_000_000 - (tail * 2_000_000).div_ceil(whole)).unwrap_or(0),
     })
+}
+
+/// A union bound over the predeclared looks. No independence between looks is assumed.
+/// Each rounded-down per-look bound makes this rounded aggregate conservative too.
+fn plan_coverage_ppm(looks: &[usize], min_coverage_ppm: u64) -> Option<u64> {
+    if looks.is_empty() {
+        return None;
+    }
+    let zeros = [0; MAX_INTERVAL_VALUES];
+    looks
+        .iter()
+        .try_fold(1_000_000_u64, |coverage, &n| {
+            let interval = median_interval(zeros.get(..n)?, min_coverage_ppm)?;
+            coverage.checked_sub(1_000_000 - interval.coverage_ppm)
+        })
+        .filter(|&coverage| coverage >= 950_000)
+}
+
+struct ThroughputObservation {
+    ratios: Option<Vec<u64>>,
+    dropped_input: u64,
+}
+
+struct ThroughputAssessment {
+    interval: Option<MedianInterval>,
+    interval_blocks: usize,
+    disposition: Disposition,
+}
+
+/// A/A is an instrument control: an interval excluding 1.000 fails the control;
+/// one containing it passes only below the predeclared 0.030 width.
+fn control_disposition(interval: Option<MedianInterval>) -> Disposition {
+    match interval {
+        Some(i) if i.lo > CONTROL_TARGET_MILLI || i.hi < CONTROL_TARGET_MILLI => Disposition::Fail,
+        Some(i) if i.hi.saturating_sub(i.lo) < CONTROL_WIDTH_LT_MILLI => Disposition::Pass,
+        _ => Disposition::Unproved,
+    }
+}
+
+/// Acquire only until the first proof, under the plan fixed before any observation.
+/// A FAIL returns immediately; later favorable blocks can never replace it.
+fn run_throughput_plan(
+    min_milli: u64,
+    same_recording: bool,
+    mut sample: impl FnMut(usize) -> Result<ThroughputObservation, CouldNotRun>,
+) -> Result<ThroughputAssessment, CouldNotRun> {
+    let coverage = plan_coverage_ppm(&THROUGHPUT_LOOKS, LOOK_COVERAGE_PPM)
+        .ok_or_else(|| CouldNotRun::Refused("invalid throughput confidence plan".into()))?;
+    let mut assessment = ThroughputAssessment {
+        interval: None,
+        interval_blocks: 0,
+        disposition: Disposition::Unproved,
+    };
+    for pair in 0..THROUGHPUT_LOOKS[THROUGHPUT_LOOKS.len() - 1] {
+        let observation = sample(pair)?;
+        if observation.dropped_input != 0 {
+            assessment.disposition = Disposition::Fail;
+            return Ok(assessment);
+        }
+        let ratios = observation.ratios.ok_or_else(|| {
+            CouldNotRun::Refused(
+                "throughput supplied missing, zero or overflowing block timings".into(),
+            )
+        })?;
+        if ratios.len() != pair + 1 {
+            return could_not_run(
+                "throughput must supply exactly one observation per completed ABBA block",
+            );
+        }
+        if !THROUGHPUT_LOOKS.contains(&ratios.len()) {
+            continue;
+        }
+        let interval = median_interval(&ratios, LOOK_COVERAGE_PPM);
+        let disposition = if same_recording {
+            control_disposition(interval)
+        } else {
+            throughput_disposition(interval, min_milli, 0)
+        };
+        assessment = ThroughputAssessment {
+            interval,
+            interval_blocks: ratios.len(),
+            disposition,
+        };
+        eprintln!(
+            "measure-look: {}",
+            aterm_json::json!({
+                "measurement": "recording-throughput", "blocks": ratios.len(),
+                "same_recording": same_recording, "coverage_ppm": coverage,
+                "look_coverage_ppm": interval.map(|i| i.coverage_ppm),
+                "lo_milli": interval.map(|i| i.lo), "hi_milli": interval.map(|i| i.hi),
+                "disposition": format!("{disposition:?}"),
+            })
+        );
+        if disposition != Disposition::Unproved {
+            return Ok(assessment);
+        }
+    }
+    Ok(assessment)
 }
 
 /// What recording adds to an idle instance's resident size: the on arm's median less the off arm's, 0 when the on arm is the smaller.
@@ -351,18 +471,31 @@ pub fn idle_verdict(
 /// [`CouldNotRun`] when an instance did not start, a request failed, a drain never reported,
 /// the recording writer ended, or required status counters are unavailable.
 pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
+    measure_with_control(rig, row, false)
+}
+
+/// Run the exact throughput plan with recording off in both arms. This is an instrument noise
+/// control, never evidence that recording meets its floor.
+/// # Errors
+/// The same instance, drain and status failures as [`measure`].
+pub fn throughput_control(rig: &Rig) -> Result<CostReport, CouldNotRun> {
+    measure_with_control(rig, &THROUGHPUT, true)
+}
+
+fn measure_with_control(
+    rig: &Rig,
+    row: &CostRow,
+    same_recording: bool,
+) -> Result<CostReport, CouldNotRun> {
     let _one = super::take(matches!(row, CostRow::Throughput { .. }));
     let budget = Budget::from_now(BUDGET_SECS);
     match *row {
-        CostRow::Throughput {
-            bytes,
-            pairs,
-            min_milli,
-        } => {
+        CostRow::Throughput { bytes, min_milli } => {
             let (mut off, mut on) = (Vec::new(), Vec::new());
             let mut dropped_input = 0_u64;
-            for pair in 0..pairs {
-                for (arm, record) in [false, true, true, false].into_iter().enumerate() {
+            let assessment = run_throughput_plan(min_milli, same_recording, |pair| {
+                for (arm, candidate) in [false, true, true, false].into_iter().enumerate() {
+                    let record = candidate && !same_recording;
                     let take = Take::launch(rig, record, budget)?;
                     let out = take.home.join("drain.us");
                     // Observe both endpoints without changing scheduling or timing the probes.
@@ -386,7 +519,7 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                         "measure-sample: {}",
                         aterm_json::json!({
                             "schema": 1, "measurement": "recording-throughput", "pair": pair,
-                            "arm": arm, "recording": record, "drain_us": us,
+                            "arm": arm, "recording": record, "same_recording": same_recording, "drain_us": us,
                             "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
                             "role_observation": "read_only_endpoints;not_continuous",
                             "subject_role_before": {
@@ -417,12 +550,23 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                     if record {
                         dropped_input = dropped_input.saturating_add(recording_drops(&completed)?);
                     }
-                    if record { &mut on } else { &mut off }.push(us);
+                    if candidate { &mut on } else { &mut off }.push(us);
+                    if dropped_input != 0 {
+                        break;
+                    }
                 }
-            }
-            let ratios = pair_ratios_milli(&off, &on);
-            let interval = median_interval(&ratios);
-            let (median_milli, lo, hi, coverage) = interval.map_or_else(
+                Ok(ThroughputObservation {
+                    ratios: block_ratios_milli(&off, &on),
+                    dropped_input,
+                })
+            })?;
+            let ratios = block_ratios_milli(&off, &on);
+            let interval = assessment.interval;
+            let blocks = off.len().min(on.len()) / 2;
+            let interval_blocks = assessment.interval_blocks;
+            let coverage = plan_coverage_ppm(&THROUGHPUT_LOOKS, LOOK_COVERAGE_PPM)
+                .expect("plan validated before sampling");
+            let (median_milli, lo, hi, look_coverage) = interval.map_or_else(
                 || {
                     (
                         "-".to_owned(),
@@ -442,14 +586,16 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
             );
             Ok(CostReport {
                 line: format!(
-                    "COST throughput bytes={bytes} pairs={pairs} off_us={off:?} on_us={on:?} \
-                     off_median_us={} on_median_us={} pair_ratios_milli={ratios:?} \
+                    "COST throughput bytes={bytes} blocks={blocks} interval_blocks={interval_blocks} \
+                     planned_looks={THROUGHPUT_LOOKS:?} same_recording={same_recording} \
+                     control_target_milli={CONTROL_TARGET_MILLI} control_width_lt_milli={CONTROL_WIDTH_LT_MILLI} off_us={off:?} on_us={on:?} \
+                     off_median_us={} on_median_us={} block_ratios_milli={ratios:?} \
                      ratio_milli={median_milli} interval_milli={lo}..{hi} \
-                     coverage_ppm={coverage} min_milli={min_milli} dropped_input={dropped_input}",
+                     coverage_ppm={coverage} look_coverage_ppm={look_coverage} min_milli={min_milli} dropped_input={dropped_input}",
                     median(&off),
                     median(&on)
                 ),
-                disposition: throughput_disposition(interval, min_milli, dropped_input),
+                disposition: assessment.disposition,
             })
         }
         CostRow::IdleRss {
@@ -541,7 +687,7 @@ fn writer_finished(status: &str) -> Result<bool, CouldNotRun> {
     Ok(number("writer_in_flight")? == 0 && number("writer_queued_bytes")? == 0)
 }
 
-/// The throughput row's disposition from the adjacent takes' ratios' [`MedianInterval`]: a
+/// The throughput row's disposition from the whole blocks' ratios' [`MedianInterval`]: a
 /// recording that dropped input fails, whatever its speed; an interval at or above `min_milli`
 /// passes, and one wholly below it fails (recording cost more than the bound, under whatever load
 /// the takes ran in: the replay mint's cost was real,
@@ -628,17 +774,12 @@ mod tests {
     }
 
     #[test]
-    fn the_ratios_pair_adjacent_takes_and_their_interval_is_the_sign_tests() {
+    fn the_interval_is_the_exact_sign_tests() {
         assert_eq!(median(&[5, 1, 3]), 3);
         assert_eq!(median(&[4, 1, 3, 2]), 2);
-        assert_eq!(
-            pair_ratios_milli(&[970, 1000, 5], &[1000, 1010, 0]),
-            [970, 990],
-            "an unmeasured on take gives no ratio"
-        );
         let ten: Vec<u64> = (1..=10).rev().collect();
         assert_eq!(
-            median_interval(&ten),
+            median_interval(&ten, 950_000),
             Some(MedianInterval {
                 median: 5,
                 lo: 2,
@@ -648,73 +789,233 @@ mod tests {
             "P(B(10, 1/2) <= 1) = 11/1024"
         );
         let twenty: Vec<u64> = (1..=20).collect();
-        let i = median_interval(&twenty).expect("twenty values");
+        let i = median_interval(&twenty, 950_000).expect("twenty values");
         assert_eq!(
             (i.lo, i.hi, i.coverage_ppm),
             (6, 15, 958_610),
             "P(B(20, 1/2) <= 5) = 21700/2^20"
         );
-        assert_eq!(median_interval(&[1, 2, 3, 4, 5]), None, "too few for 95%");
-        assert!(median_interval(&[1; 6]).is_some());
-        assert_eq!(median_interval(&[1; 65]), None, "past the exact sums");
+        let sixty_four: Vec<u64> = (1..=64).collect();
+        let i = median_interval(&sixty_four, 950_000).expect("the full fixed plan");
+        assert_eq!((i.lo, i.hi, i.coverage_ppm), (24, 41, 967_234));
+        assert_eq!(
+            median_interval(&[1, 2, 3, 4, 5], 950_000),
+            None,
+            "too few for 95%"
+        );
+        assert!(median_interval(&[1; 6], 950_000).is_some());
+        assert_eq!(
+            median_interval(&[1; 65], 950_000),
+            None,
+            "past the exact sums"
+        );
+        assert_eq!(
+            median_interval(&[1; 64], 949_999),
+            None,
+            "confidence cannot be lowered"
+        );
+        assert_eq!(
+            median_interval(&[1; 64], 1_000_000),
+            None,
+            "finite data cannot give 100%"
+        );
     }
 
-    /// Retained takes (`off_us`, `on_us` in take order) of three five-block runs.
-    const LOADED_POOLED_955: ([u64; 10], [u64; 10]) = (
-        [
-            1_808_126, 1_844_560, 2_086_444, 1_879_753, 2_001_503, 1_938_782, 1_887_837, 2_636_332,
-            2_758_945, 2_782_664,
-        ],
-        [
-            1_934_805, 1_824_336, 1_952_736, 1_888_877, 2_029_006, 2_081_219, 2_499_644, 2_511_547,
-            2_948_381, 2_884_309,
-        ],
-    );
-    const LOADED_POOLED_1025: ([u64; 10], [u64; 10]) = (
-        [
-            304_384, 291_178, 311_930, 307_422, 309_872, 292_797, 293_213, 786_952, 861_320,
-            726_545,
-        ],
-        [
-            299_894, 291_672, 297_713, 297_672, 305_655, 298_078, 771_557, 821_118, 725_792,
-            813_669,
-        ],
-    );
-    const QUIET_POOLED_999: ([u64; 10], [u64; 10]) = (
-        [
-            1_605_535, 1_614_247, 1_609_860, 1_607_189, 1_596_909, 1_609_144, 1_586_673, 1_607_772,
-            1_593_787, 1_616_058,
-        ],
-        [
-            1_596_980, 1_597_657, 1_655_941, 1_618_460, 1_604_724, 1_642_396, 1_608_202, 1_613_086,
-            1_602_880, 1_610_144,
-        ],
-    );
-
-    fn disposition_of((off, on): ([u64; 10], [u64; 10])) -> Disposition {
-        throughput_disposition(median_interval(&pair_ratios_milli(&off, &on)), 970, 0)
-    }
-
-    /// A take drains for 0.2 to 3 s in a fresh instance (these runs' takes), so a load that
-    /// comes and goes slows whole takes (`docs/measured/temporal-reader-rekey-2026-11-05.md`)
-    /// and the arms' pooled medians follow
-    /// the Mac: retained loaded runs pooled 955, a fail, and 1025, a pass that had one block run
-    /// 2.5 times slow in both arms. Judged on the adjacent takes' ratios, each reads unproved:
-    /// their intervals, 931..1049 and 892..1047, hold the bound. A quiet run's, 979..1005, clears
-    /// it, and takes that cost recording 6% in every pair fail however they spread.
-    /// NEGATIVE CONTROL: a verdict on the ratios' median alone (`median >= min_milli`) fails the
-    /// 955 run (median 964) and passes the 1025 one (998).
     #[test]
-    fn the_row_judges_the_takes_not_the_load_they_ran_in() {
-        assert_eq!(disposition_of(LOADED_POOLED_955), Disposition::Unproved);
-        assert_eq!(disposition_of(LOADED_POOLED_1025), Disposition::Unproved);
-        assert_eq!(disposition_of(QUIET_POOLED_999), Disposition::Pass);
-        let on: [u64; 10] = [
-            300_000, 320_000, 900_000, 310_000, 305_000, 700_000, 301_000, 330_000, 299_000,
-            480_000,
-        ];
-        let off = on.map(|us| us * 94 / 100);
-        assert_eq!(disposition_of((off, on)), Disposition::Fail);
+    fn predeclared_looks_spend_at_most_five_percent_in_total() {
+        for (n, lo, hi, coverage) in [
+            (8, 1, 8, 992_187),
+            (16, 3, 14, 995_819),
+            (32, 9, 24, 992_999),
+            (64, 22, 43, 991_853),
+        ] {
+            let values: Vec<_> = (1..=n).collect();
+            let i = median_interval(&values, LOOK_COVERAGE_PPM).unwrap();
+            assert_eq!((i.lo, i.hi, i.coverage_ppm), (lo, hi, coverage));
+        }
+        assert_eq!(
+            plan_coverage_ppm(&THROUGHPUT_LOOKS, LOOK_COVERAGE_PPM),
+            Some(972_858)
+        );
+        assert_eq!(
+            plan_coverage_ppm(&THROUGHPUT_LOOKS, 950_000),
+            None,
+            "negative control: four ordinary 95% looks cannot claim a 95% stopping interval"
+        );
+        assert_eq!(plan_coverage_ppm(&[], LOOK_COVERAGE_PPM), None);
+    }
+
+    fn simulated_plan(
+        values: &[u64],
+        control: bool,
+        loss_at: Option<usize>,
+    ) -> (ThroughputAssessment, usize) {
+        let CostRow::Throughput { min_milli, .. } = THROUGHPUT else {
+            panic!("the throughput plan measures throughput");
+        };
+        let mut calls = 0;
+        let result = run_throughput_plan(min_milli, control, |pair| {
+            calls += 1;
+            Ok(ThroughputObservation {
+                ratios: Some(values[..=pair].to_vec()),
+                dropped_input: u64::from(loss_at == Some(pair)),
+            })
+        })
+        .unwrap();
+        (result, calls)
+    }
+
+    #[test]
+    fn a_decided_look_stops_acquisition_and_cannot_be_rerolled() {
+        let (below, calls) = simulated_plan(&[969; 64], false, None);
+        assert_eq!((below.disposition, calls), (Disposition::Fail, 8));
+        let (at_floor, calls) = simulated_plan(&[970; 64], false, None);
+        assert_eq!((at_floor.disposition, calls), (Disposition::Pass, 8));
+        let mut values = [1000; 64];
+        values[..8].fill(940);
+        let (failed, calls) = simulated_plan(&values, false, None);
+        assert_eq!(
+            (failed.disposition, failed.interval_blocks, calls),
+            (Disposition::Fail, 8, 8)
+        );
+        assert_eq!(
+            throughput_disposition(median_interval(&values, 950_000), 970, 0),
+            Disposition::Pass,
+            "negative control: collecting the later favorable blocks would erase a proven FAIL"
+        );
+
+        values.fill(940);
+        values[..8].fill(1000);
+        let (passed, calls) = simulated_plan(&values, false, None);
+        assert_eq!((passed.disposition, calls), (Disposition::Pass, 8));
+        let (lost, calls) = simulated_plan(&[1000; 64], false, Some(1));
+        assert_eq!(
+            (lost.disposition, calls),
+            (Disposition::Fail, 2),
+            "loss stops before the first statistical look"
+        );
+        let mut calls = 0;
+        assert!(
+            run_throughput_plan(970, false, |_| {
+                calls += 1;
+                Ok(ThroughputObservation {
+                    ratios: None,
+                    dropped_input: 0,
+                })
+            })
+            .is_err()
+        );
+        assert_eq!(
+            calls, 1,
+            "invalid timings cannot be repaired by collecting later samples"
+        );
+        assert!(
+            run_throughput_plan(970, false, |_| Ok(ThroughputObservation {
+                ratios: Some(vec![1000; 8]),
+                dropped_input: 0,
+            }))
+            .is_err(),
+            "one physical block cannot masquerade as eight observations"
+        );
+    }
+
+    #[test]
+    fn only_undecided_looks_extend_and_the_control_requires_precision() {
+        let mut values = [1000; 64];
+        values[..8].copy_from_slice(&[940, 940, 940, 940, 1000, 1000, 1000, 1000]);
+        let (result, calls) = simulated_plan(&values, false, None);
+        assert_eq!((result.disposition, calls), (Disposition::Pass, 32));
+
+        values[..8].copy_from_slice(&[980, 985, 990, 995, 1005, 1010, 1015, 1020]);
+        let (recording, calls) = simulated_plan(&values, false, None);
+        assert_eq!((recording.disposition, calls), (Disposition::Pass, 8));
+        let (control, calls) = simulated_plan(&values, true, None);
+        assert_eq!(
+            (control.disposition, calls),
+            (Disposition::Pass, 16),
+            "negative control: a wide interval cannot pass A/A by clearing the recording floor"
+        );
+        let (biased, calls) = simulated_plan(&[1001; 64], true, None);
+        assert_eq!(
+            (biased.disposition, calls),
+            (Disposition::Fail, 8),
+            "an A/A interval excluding 1.000 stops as a failed control"
+        );
+        assert_eq!(
+            control_disposition(median_interval(
+                &[985, 985, 985, 985, 1015, 1015, 1015, 1015],
+                LOOK_COVERAGE_PPM
+            )),
+            Disposition::Unproved,
+            "width must be strictly below the 0.030 margin"
+        );
+        let on_floor: Vec<_> = (0..64)
+            .map(|i| if i % 2 == 0 { 940 } else { 1000 })
+            .collect();
+        let (unproved, calls) = simulated_plan(&on_floor, false, None);
+        assert_eq!((unproved.disposition, calls), (Disposition::Unproved, 64));
+    }
+
+    #[test]
+    fn a_block_cancels_log_drift_without_counting_correlated_arms_twice() {
+        // A, B, B, A each takes 10% longer than its predecessor, with no treatment effect.
+        assert_eq!(
+            block_ratios_milli(&[10_000, 13_310], &[11_000, 12_100]),
+            Some(vec![1000])
+        );
+        assert_ne!(
+            10_000 * 1000 / 11_000,
+            1000,
+            "negative control: adjacent ratios retain drift"
+        );
+        assert_eq!(
+            block_ratios_milli(&[10_000, 13_310], &[11_000, 12_100])
+                .unwrap()
+                .len(),
+            1
+        );
+        for (a, b) in [
+            (&[][..], &[][..]),
+            (&[1][..], &[1][..]),
+            (&[1, 1][..], &[1][..]),
+            (&[1, 0][..], &[1, 1][..]),
+            (&[1, 1][..], &[0, 1][..]),
+            (&[u64::MAX; 2][..], &[1, 1][..]),
+        ] {
+            assert_eq!(
+                block_ratios_milli(a, b),
+                None,
+                "invalid blocks cannot be silently omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_blocks_preserve_a_real_cost_and_an_undecided_interval() {
+        let a = [1_000_000; 128];
+        let decide = |b: &[u64]| {
+            throughput_disposition(
+                block_ratios_milli(&a, b)
+                    .as_deref()
+                    .and_then(|values| median_interval(values, 950_000)),
+                970,
+                0,
+            )
+        };
+        assert_eq!(decide(&a), Disposition::Pass);
+        assert_eq!(
+            decide(&[1_040_000; 128]),
+            Disposition::Fail,
+            "negative control: drift cancellation must retain treatment cost"
+        );
+        let b: Vec<_> = (0..128)
+            .map(|n| if n < 64 { 1_000_000 } else { 1_060_000 })
+            .collect();
+        assert_eq!(
+            decide(&b),
+            Disposition::Unproved,
+            "a straddling interval is never a pass"
+        );
         assert_eq!(
             throughput_disposition(None, 970, 0),
             Disposition::Unproved,
@@ -724,7 +1025,7 @@ mod tests {
 
     #[test]
     fn a_fast_recording_cannot_pass_by_losing_input() {
-        let fast = median_interval(&[1000; 10]);
+        let fast = median_interval(&[1000; 10], 950_000);
         assert_eq!(throughput_disposition(fast, 970, 0), Disposition::Pass);
         assert_eq!(throughput_disposition(fast, 970, 1), Disposition::Fail);
         assert_eq!(throughput_disposition(None, 970, 1), Disposition::Fail);
@@ -748,7 +1049,7 @@ mod tests {
         assert!(writer_finished(completed).unwrap());
         assert_eq!(
             throughput_disposition(
-                median_interval(&[1000; 10]),
+                median_interval(&[1000; 10], 950_000),
                 970,
                 recording_drops(completed).unwrap()
             ),

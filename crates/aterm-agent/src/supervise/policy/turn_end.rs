@@ -9858,6 +9858,35 @@ pub enum Restart {
     Route {
         to: RouteTo,
     },
+    /// A person's click on the chip of a Claude Code tab (`docs/DESIGN-yolo-binary-2026-11-04.md`
+    /// §3): the session restarted on its conversation `conversation`, its line rid of every
+    /// permission flag and given the one `to` names. Only the click's lane asks it
+    /// (`harness::permission_click`); the turn-end loop never does.
+    Permission {
+        to: PermissionTo,
+        conversation: String,
+    },
+}
+
+/// Which line a click on the chip asks for ([`Restart::Permission`], the design's §3 table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionTo {
+    /// A click on `yolo`: no permission flag on the line, so the session lands in the mode its
+    /// own settings choose.
+    Settings,
+    /// A click on `lame`: `--dangerously-skip-permissions` on the line, so it lands in bypass.
+    Bypass,
+}
+
+impl PermissionTo {
+    /// The one word a ledger names it by.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+            Self::Bypass => "bypass",
+        }
+    }
 }
 
 /// Which credential a route move puts the session on ([`Restart::Route`]).
@@ -9935,6 +9964,8 @@ impl Restart {
     /// A move back onto the row's stored login's [`Self::word`] ([`Restart::Route`] to
     /// [`RouteTo::Stored`]).
     pub const ROUTE_STORED: &'static str = "route-stored";
+    /// A person's click on the chip's [`Self::word`] ([`Restart::Permission`]), either way.
+    pub const PERMISSION: &'static str = "permission";
 
     /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: a model's way back, an
     /// account move ahead and a route move, which the turn-end state owes until the move is made
@@ -9999,6 +10030,7 @@ impl Restart {
             Restart::Route {
                 to: RouteTo::Stored,
             } => Self::ROUTE_STORED,
+            Restart::Permission { .. } => Self::PERMISSION,
         }
     }
 
@@ -10037,7 +10069,9 @@ impl Restart {
 pub struct RestartAsk(String);
 
 impl RestartAsk {
-    /// The ask of `why` in the loop's restart run of Unix second `run_at`.
+    /// The ask of `why` in the loop's restart run of Unix second `run_at`; a click's
+    /// ([`Restart::Permission`]) is of the second it was clicked, the same at every look of its
+    /// lane.
     #[must_use]
     pub fn of(why: &Restart, run_at: i64) -> Self {
         match why {
@@ -10046,7 +10080,8 @@ impl RestartAsk {
             | Restart::Model { .. }
             | Restart::ModelBack { .. }
             | Restart::Account { .. }
-            | Restart::Route { .. } => Self(format!("{}@{run_at}", why.word())),
+            | Restart::Route { .. }
+            | Restart::Permission { .. } => Self(format!("{}@{run_at}", why.word())),
         }
     }
 
@@ -20577,6 +20612,8 @@ impl TurnEndState {
                 }
             }
             Restart::Route { to } => self.route_unmade = Some((*to, now)),
+            // A click's restart is its lane's to ask, never the loop's: nothing of it is booked.
+            Restart::Permission { .. } => {}
         }
     }
 

@@ -561,6 +561,7 @@ fn queue_owned(
         queued_at: Instant::now(),
         primary: None,
         resolver: None,
+        bootstrap_graph: None,
         submission,
         events,
         recipe: Some(recipe::Recipe {
@@ -1062,7 +1063,7 @@ fn workload_ancestry_slice_waits_without_renewing_or_granting_original_resources
     ];
     pending.submission.request.cpu_units = 2;
     pending.recipe = None;
-    let original = pending.workload_deadline().unwrap();
+    let original = pending.original_deadline().unwrap();
     for _ in 0..2 {
         assert!(
             world
@@ -1070,7 +1071,7 @@ fn workload_ancestry_slice_waits_without_renewing_or_granting_original_resources
                 .workload_inspection_wait_test(&mut pending, Instant::now())
                 .unwrap()
         );
-        assert_eq!(pending.workload_deadline().unwrap(), original);
+        assert_eq!(pending.original_deadline().unwrap(), original);
         assert!(pending.primary.is_none());
         assert!(world.owner.jobs.is_empty());
         assert_eq!(world.owner.debt.reserved().unwrap(), 0);

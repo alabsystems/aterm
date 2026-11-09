@@ -1323,8 +1323,16 @@ pub(super) fn interrupt_slot_preparation(stage: &'static str) {
 /// detects a clock that never advances; it is not a latency assertion or a write retry.
 #[cfg(test)]
 pub(super) fn past_the_clock_tick(backend: &File, victim: &File) {
-    let before = Stamp::read(victim).unwrap();
+    enum Origin {
+        File(Stamp),
+        Directory((u64, u64, u32, i64, i64, i64, i64)),
+    }
     let m = victim.metadata().unwrap();
+    let before = if m.is_dir() {
+        Origin::Directory(directory_origin(victim).unwrap())
+    } else {
+        Origin::File(Stamp::read(victim).unwrap())
+    };
     let victim_tick = (m.ctime(), m.ctime_nsec());
     let observed = aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -1341,11 +1349,18 @@ pub(super) fn past_the_clock_tick(backend: &File, victim: &File) {
         },
     );
     assert!(observed > victim_tick);
-    assert_eq!(
-        Stamp::read(victim).unwrap(),
-        before,
-        "clock probing must leave the victim untouched"
-    );
+    match before {
+        Origin::File(before) => assert_eq!(
+            Stamp::read(victim).unwrap(),
+            before,
+            "clock probing must leave the original file untouched"
+        ),
+        Origin::Directory(before) => assert_eq!(
+            directory_origin(victim).unwrap(),
+            before,
+            "clock probing must leave the original directory untouched"
+        ),
+    }
 }
 
 /// Keep an actual failed filesystem world, including its random generation identities.

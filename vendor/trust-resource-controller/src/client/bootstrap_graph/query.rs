@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use sha2::{Digest as _, Sha256};
 use trust_resource_provenance::{Host, PinnedHelper};
 
-use super::{BootstrapGraphSupport, bounded, finish, live, time};
+use super::{
+    BootstrapGraphSupport, Connection, EnrolledBootstrapGraph, OutputBoundBootstrapGraph,
+    QueryState, bounded, finish, live, time,
+};
 use crate::bootstrap_graph::{query, transport};
 use crate::client::{Client, Delivery};
 use crate::{Channel, MetadataCompletion, MetadataPrepared, Started};
@@ -331,10 +334,60 @@ impl CompletedSdkQuery {
     }
 }
 
+struct QueryRoot<'a> {
+    key: &'a crate::bootstrap_graph::Key,
+    context: &'a crate::ContextReply,
+    deadline: Instant,
+    pin: &'a Arc<PinnedHelper>,
+    queries: &'a mut QueryState,
+}
+impl<'a> QueryRoot<'a> {
+    fn support(support: &'a mut BootstrapGraphSupport) -> Self {
+        Self {
+            key: &support.key,
+            context: &support.context,
+            deadline: support.deadline,
+            pin: &support.pin,
+            queries: &mut support.queries,
+        }
+    }
+    fn connection(original: &'a mut Connection) -> Self {
+        Self {
+            key: &original.request.key,
+            context: &original.context,
+            deadline: original.deadline,
+            pin: &original.pin,
+            queries: &mut original.queries,
+        }
+    }
+}
+impl EnrolledBootstrapGraph {
+    pub fn sdk_query(
+        &mut self,
+        client: &Client,
+        request: query::Request,
+        gnu: &[BorrowedFd<'_>; 2],
+        deadline: Instant,
+    ) -> Result<CompletedSdkQuery, QueryFailure> {
+        let original = self.original.as_mut().expect("same original enrolled graph");
+        original.check(deadline).map_err(QueryFailure::before)?;
+        client.query_with_original(QueryRoot::connection(original), request, gnu, deadline)
+    }
+}
+impl OutputBoundBootstrapGraph {
+    pub fn sdk_query(
+        &mut self,
+        client: &Client,
+        request: query::Request,
+        gnu: &[BorrowedFd<'_>; 2],
+        deadline: Instant,
+    ) -> Result<CompletedSdkQuery, QueryFailure> {
+        let original = self.original.as_mut().expect("same original output graph");
+        original.check(deadline).map_err(QueryFailure::before)?;
+        client.query_with_original(QueryRoot::connection(original), request, gnu, deadline)
+    }
+}
 impl Client {
-    /// The original coordinator retains its actual root scheduler and waits
-    /// synchronously while the Host exclusively borrows that implicit unit.
-    /// No descriptions, numeric credits or new GNU server are passed to a child.
     pub fn bootstrap_sdk_query(
         &self,
         support: &mut BootstrapGraphSupport,
@@ -342,21 +395,30 @@ impl Client {
         gnu: &[BorrowedFd<'_>; 2],
         deadline: Instant,
     ) -> Result<CompletedSdkQuery, QueryFailure> {
+        self.query_with_original(QueryRoot::support(support), request, gnu, deadline)
+    }
+    /// The original coordinator retains its implicit unit and actual scheduler.
+    /// The Host must fund the query with an actual supplementary loan from that
+    /// same paid epoch. A synchronous client wait supplies no quiescence proof,
+    /// CPU grant or authority to construct a replacement GNU server.
+    fn query_with_original(
+        &self,
+        root: QueryRoot<'_>,
+        request: query::Request,
+        gnu: &[BorrowedFd<'_>; 2],
+        deadline: Instant,
+    ) -> Result<CompletedSdkQuery, QueryFailure> {
         let started = Instant::now();
         let preflight = (|| {
-            bounded(support.deadline, deadline)?;
+            bounded(root.deadline, deadline)?;
             request.validate()?;
-            support.queries.check(request.key.sequence)?;
-            if request.key.graph != support.key || !Arc::ptr_eq(&support.pin, &self.host) {
+            root.queries.check(request.key.sequence)?;
+            if &request.key.graph != root.key || !Arc::ptr_eq(root.pin, &self.host) {
                 return Err(crate::wire::invalid());
             }
-            let mut executable = request.sdk_root.clone();
-            executable.extend(b"/bin/targo");
-            if support.context.context.sdk.as_ref().is_none_or(|sdk| sdk.execution != executable) {
-                return Err(crate::wire::invalid());
-            }
+            validate_original_sdk(root.context.context.sdk.as_ref(), &request)?;
             transport::check_gnu_identity(&request.gnu, gnu)?;
-            live(&support.context, deadline)
+            live(root.context, deadline)
         })();
         preflight.map_err(QueryFailure::before)?;
         let payload = request.encode().map_err(QueryFailure::before)?;
@@ -369,7 +431,7 @@ impl Client {
         let deadline = deadline.min(query_bound);
         // One-use before actual connect. No previous attempted sequence is
         // replayed, even if delivery later becomes Unknown.
-        support.queries.begin().map_err(QueryFailure::before)?;
+        root.queries.begin().map_err(QueryFailure::before)?;
         let host = self.host.connect(deadline).map_err(QueryFailure::before)?;
         let channel = Channel::new(host.stream().try_clone().map_err(QueryFailure::before)?)
             .map_err(QueryFailure::before)?;
@@ -389,8 +451,8 @@ impl Client {
                 original.channel.as_mut().expect("same original channel"),
                 &original.request,
                 digest,
-                &support.context.context.host,
-                &support.context.context.boot,
+                &root.context.context.host,
+                &root.context.context.boot,
                 deadline,
                 &mut original.transcript,
             )?;
@@ -401,7 +463,7 @@ impl Client {
             )?;
             original.host.as_ref().expect("same accepted query").revalidate(deadline)?;
             original.pin.validate(deadline)?;
-            live(&support.context, deadline)?;
+            live(root.context, deadline)?;
             transport::check_gnu_identity(&original.request.gnu, gnu)?;
             original.channel.as_mut().expect("same original channel").send(&[1], deadline)?;
             original.host.as_ref().expect("same accepted query").revalidate(deadline)?;
@@ -456,7 +518,7 @@ impl Client {
                 completed: Some(Box::new(completed)),
             });
         }
-        if let Err(error) = support.queries.completed(&completed) {
+        if let Err(error) = root.queries.completed(&completed) {
             return Err(QueryFailure {
                 delivery: Delivery::Unknown,
                 error,
@@ -466,6 +528,19 @@ impl Client {
         }
         Ok(completed)
     }
+}
+
+fn validate_original_sdk(
+    sdk: Option<&crate::SdkCustody>,
+    request: &query::Request,
+) -> io::Result<()> {
+    // Keeper::context and the original inherited SDK capture describe the
+    // execution ROOT here. Request::validate separately binds the selected
+    // exact bin/trustc or bin/targo image and the complete query operation.
+    if sdk.is_none_or(|sdk| sdk.execution != request.sdk_root) {
+        return Err(crate::wire::invalid());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

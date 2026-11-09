@@ -1666,16 +1666,33 @@ impl App {
         true
     }
 
-    /// Settle an in-flight text-selection drag only, for the paths about to drop `selecting`/`gesture` (window blur, a tab or pane switch).
+    /// Settle an in-flight text-selection drag or native control press, for the paths about to drop `selecting`/`gesture` or front custody (window blur, a tab or pane switch).
     pub(crate) fn settle_selection_gesture(&mut self, wid: WindowId) {
+        self.settle_native_pointer_press(wid);
         if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             self.finish_selection(wid, true);
         }
     }
 
-    /// Settle any in-flight pointer drag on `wid` (divider resize, text selection) as their left-release paths in [`Self::on_mouse_input`] would.
+    pub(crate) fn settle_native_pointer_press(&mut self, wid: WindowId) {
+        if let Some((_, view)) = self.active_native_view(wid)
+            && self
+                .native_runtime
+                .view_state(view)
+                .is_some_and(|state| state.common().pressed.is_some())
+        {
+            if let Some(state) = self.native_runtime.view_state_mut(view) {
+                state.common_mut().pressed = None;
+            }
+            self.invalidate_native_pointer_style(wid, view);
+            self.request_redraw_all_windows();
+        }
+    }
+
+    /// Settle any in-flight pointer drag on `wid` (divider resize, text selection, native control press) as their left-release paths in [`Self::on_mouse_input`] would.
     pub(crate) fn settle_pointer_drags(&mut self, wid: WindowId) {
         self.scrollbar_release(wid);
+        self.settle_native_pointer_press(wid);
         if self.finish_divider_drag(wid)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
@@ -3234,6 +3251,10 @@ impl App {
         let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
             return Resolved(None);
         };
+        if self.stats_lens_at(wid, px, py) {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+            return Resolved(None);
+        }
         if self.strip_col_at_with(wid, geom, px, py).is_some() {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return Resolved(None);
@@ -4479,8 +4500,9 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
-            != crate::claude_lights::OverChips::No
+        if self.stats_lens_at(wid, px, py)
+            || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
+                != crate::claude_lights::OverChips::No
         {
             return None;
         }
@@ -4516,8 +4538,9 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
-            != crate::claude_lights::OverChips::No
+        if self.stats_lens_at(wid, px, py)
+            || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
+                != crate::claude_lights::OverChips::No
             || self.claude_glass_hit_at(wid, px, py).is_some()
             || !self.pointer_is_inside_focused_pane(wid)
             || self.glass_swallows_at(wid, px, py)
@@ -5046,7 +5069,12 @@ impl App {
                 }
             } else if self.windows.get(&wid).is_some_and(|ws| {
                 !ws.selecting && ws.held_mouse_button.is_none() && ws.divider_drag.is_none()
-            }) && self.stats_owns_pointer(wid)
+            }) && !(button == WinitMouseButton::Left
+                && self
+                    .active_native_view(wid)
+                    .and_then(|(_, view)| self.native_runtime.view_state(view))
+                    .is_some_and(|state| state.common().pressed.is_some()))
+                && self.stats_owns_pointer(wid)
             {
                 return None;
             }
@@ -5147,7 +5175,8 @@ impl App {
                     .view_state(view)
                     .and_then(|state| state.common().pressed.clone());
                 let release = (self.band_banner_at(wid, px, py).is_none()
-                    && self.find_bar_cell_at(wid, px, py).is_none())
+                    && self.find_bar_cell_at(wid, px, py).is_none()
+                    && !self.stats_owns_pointer(wid))
                 .then(|| self.retained_native_leaf_at_pointer(wid, px, py))
                 .flatten()
                 .and_then(|(artifact, x, y)| {

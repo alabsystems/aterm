@@ -15,6 +15,7 @@ use super::steps::{BASH_INPUT, BASH_STDERR, BASH_STDOUT, INTERRUPTED, TASK_NOTIF
 use super::upgrade_models as models;
 use crate::supervise::approvals::Typed;
 use crate::supervise::policy::turn_end;
+use crate::supervise::policy::turn_end::PermissionTo;
 
 /// Numeric dotted version (`2.1.281`) where missing trailing components compare as 0.
 #[derive(Clone, Debug)]
@@ -534,6 +535,37 @@ const PERMISSION_FLAGS: &[&str] = &[
     "--allow-dangerously-skip-permissions",
     "--permission-mode",
 ];
+
+/// The flag a click on `lame` puts on its line ([`PermissionTo::Bypass`]).
+pub(super) const BYPASS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// `argv` (`argv[0]` first) as a click on the chip relaunches it
+/// ([`crate::supervise::policy::turn_end::Restart::Permission`], the design's §3): every span of
+/// [`PERMISSION_FLAGS`] out, whoever typed it and in any spelling the flag table knows
+/// (`--permission-mode plan`, `--permission-mode=plan`, repeated or mixed with the rest), then the
+/// one flag `to` asks for right after `argv[0]`: none for [`PermissionTo::Settings`],
+/// [`BYPASS_FLAG`] for [`PermissionTo::Bypass`]. Every other word keeps its place, a `--` tail
+/// with it. A spelling the table does not know (`--dangerously-skip-permissions=1`) stays, so the
+/// plan refuses the line ([`ArgvRefusal::UnknownFlag`]) rather than relaunch a flag it never read.
+#[must_use]
+pub(super) fn permission_click_argv(argv: &[String], to: PermissionTo) -> Vec<String> {
+    let Some((program, flags)) = argv.split_first() else {
+        return Vec::new();
+    };
+    let asked = match to {
+        PermissionTo::Settings => None,
+        PermissionTo::Bypass => Some(BYPASS_FLAG.to_string()),
+    };
+    std::iter::once(program.clone())
+        .chain(asked)
+        .chain(
+            parse_flag_spans(flags)
+                .into_iter()
+                .filter(|(name, _)| !name.is_some_and(|name| PERMISSION_FLAGS.contains(&name)))
+                .flat_map(|(_, tokens)| tokens),
+        )
+        .collect()
+}
 
 /// Extracts `argv[0]` plus any permission-mode flags from `argv`.
 #[must_use]

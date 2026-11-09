@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::footer::FooterFacts;
 use aterm_agent::harness::lights::{self, Light};
+use aterm_agent::harness::permission_click::{Look, Wait};
 use aterm_primer::CLAUDE_TOP_EFFORT_KEY as KEY;
 use aterm_window::event::{ElementState, MouseButton};
 
@@ -1191,75 +1192,89 @@ fn the_footer_press_never_waits_for_a_frame_on_the_event_loop() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing written");
 }
 
+/// ONE ATERM INPUT PER SESSION, AND A CLICK IS NONE: a standing permission click types nothing,
+/// so a slash press beside it begins and types, and a second press while that one is in flight is
+/// refused; a click while a press types stands beside it, typing nothing and refused nothing, its
+/// lane waiting on the press's text as on any draft (`wait:draft`, which aterm-agent's
+/// `a_click_waits_on_what_holds_a_press_and_goes_past_the_agents_own_work` reads off a slash
+/// press's text).
 #[test]
 fn one_aterm_input_per_session() {
     let (mut app, wid, session, mut reader) = idle();
-    app.toggle_claude_light(wid, session, Light::Mode);
-    assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+    clickable(&mut app, session, Look::Waits(Wait::Turn));
+    app.click_permission(wid, session, Light::Mode);
+    assert!(pty(&mut reader, 0).is_empty(), "a click types nothing");
+    assert!(standing(&app, session).is_some(), "it stands");
     assert_eq!(
         app.press_slash(wid, session, Slash::ModelPicker),
-        Err(SlashRefusal::InFlight)
+        Ok(()),
+        "a press beside a standing click"
     );
-    assert!(pty(&mut reader, 0).is_empty());
-    feed(
-        &app,
-        session,
-        format!("\x1b[24;1H\x1b[2K{BYPASS}\x1b[22;3H").as_bytes(),
-    );
-    app.on_claude_footer_changed(session);
-    assert!(pty(&mut reader, 0).is_empty());
-    assert_eq!(app.press_slash(wid, session, Slash::ModelPicker), Ok(()));
     assert_eq!(pty(&mut reader, 1), b"/");
+    assert_eq!(
+        app.press_slash(wid, session, Slash::ModelPicker),
+        Err(SlashRefusal::InFlight),
+        "one press at a time"
+    );
 
     let (mut app, wid, session, mut reader) = idle();
     app.press_slash(wid, session, Slash::ModelPicker)
         .expect("begun");
     assert_eq!(pty(&mut reader, 1), b"/");
-    app.toggle_claude_light(wid, session, Light::Mode);
-    assert!(pty(&mut reader, 0).is_empty(), "no shift+tab beside it");
-    assert_eq!(
+    clickable(&mut app, session, Look::Waits(Wait::Draft));
+    app.click_permission(wid, session, Light::Mode);
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "nothing typed beside the press"
+    );
+    assert!(
+        standing(&app, session).is_some(),
+        "the click stands beside it"
+    );
+    assert!(
         app.windows[&wid].claude_lights.sessions[&session]
             .refused
-            .map(|(_, why, _)| why),
-        Some(super::Refusal::Typing)
+            .is_none(),
+        "and is refused nothing"
     );
-    app.note_person_input(
-        session,
-        &InputEvent::KeySequence(b"x".to_vec()),
-        Source::Human,
+    assert!(
+        app.claude_facts
+            .get(&session)
+            .is_some_and(|f| f.press.is_some()),
+        "the press goes on"
     );
-    app.advance_slash_presses(Instant::now());
-    assert_eq!(
-        ended(&app, session),
-        Some(SlashEnd::Stopped(SlashRefusal::Person))
-    );
-    app.toggle_claude_light(wid, session, Light::Mode);
-    assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
 }
 
-/// A light pressed on a rewound pane is refused and begins no toggle, since its press could not reach the program.
+/// A click on a rewound pane is refused and stands nothing, since the pill it would turn over
+/// is not the program's screen.
 #[test]
-fn a_light_on_a_rewound_pane_is_refused_and_begins_no_toggle() {
+fn a_click_on_a_rewound_pane_is_refused_and_stands_nothing() {
     let (mut app, wid, session, mut reader) = idle();
     assert_eq!(session, 0, "fixture: the recording helpers drive session 0");
     crate::rewind::tests::start_recording(&app);
     let _ = crate::rewind::tests::slice(&app, b"\x1b[0m");
     app.rewind_open(session, crate::rewind::Target::Latest, None)
         .expect("open");
-    app.toggle_claude_light(wid, session, Light::Mode);
+    clickable(&mut app, session, Look::Waits(Wait::Turn));
+    app.click_permission(wid, session, Light::Mode);
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
-    let s = &app.windows[&wid].claude_lights.sessions[&session];
-    assert!(s.pending.is_none(), "no toggle began");
+    assert!(standing(&app, session).is_none(), "no click stood");
     assert!(
-        matches!(s.refused, Some((Light::Mode, super::Refusal::NotShown, _))),
+        matches!(
+            app.windows[&wid].claude_lights.sessions[&session].refused,
+            Some((Light::Mode, super::Refusal::NotShown, _))
+        ),
         "refused as not on screen"
     );
     assert!(app.rewind_close(session));
-    app.toggle_claude_light(wid, session, Light::Mode);
-    assert_eq!(
-        pty(&mut reader, 3),
-        lights::SHIFT_TAB,
-        "CONTROL: live, one press"
+    app.click_permission(wid, session, Light::Mode);
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "CONTROL: live, nothing typed"
+    );
+    assert!(
+        standing(&app, session).is_some(),
+        "CONTROL: live, it stands"
     );
 }
 

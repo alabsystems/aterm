@@ -373,7 +373,7 @@ fn named_arg_types(cmd: &str) -> String {
 fn native_args(
     cmd: &str,
     rest: &[String],
-) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+) -> Result<(Option<Vec<bundle::BrewfileEntry>>, Vec<String>), InstallError> {
     let typed_rest = rest;
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
@@ -1128,7 +1128,7 @@ fn native_args(
                 }
             }
         }
-        return bundle_args(rest);
+        return bundle_args(rest).map(|prepared| (prepared, rest.to_vec()));
     }
     let (flags, min, max, names): (&[&str], usize, usize, bool) = match cmd {
         "install" | "reinstall" => (
@@ -1373,6 +1373,7 @@ fn native_args(
                 "--os",
                 "--arch",
                 "--bottle-tag",
+                "--all-platforms",
             ],
             1,
             usize::MAX,
@@ -1508,10 +1509,7 @@ fn native_args(
             "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
         ) || flags.contains(&arg)
             || (cmd == "info" && (arg.starts_with("--days=") || arg.starts_with("--category=")))
-            || (cmd == "cleanup"
-                && arg.strip_prefix("--prune=").is_some_and(|v| {
-                    v == "all" || (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                }))
+            || (cmd == "cleanup" && arg.starts_with("--prune="))
             || (cmd == "deps"
                 && (arg.starts_with("--brewfile=")
                     || arg.starts_with("--os=")
@@ -1534,6 +1532,124 @@ fn native_args(
                             })
                 }))
     };
+    // Brew's known options for this command: abrew's tables
+    // plus the flags in brew's recorded help. Used both to
+    // expand OptionParser abbreviations and to tell brew's
+    // invalid-option errors from native refusals below.
+    let (known_longs, known_shorts) = {
+        let mut longs: Vec<String> = Vec::new();
+        let mut shorts: Vec<char> = Vec::new();
+        let note = |tok: &str, longs: &mut Vec<String>, shorts: &mut Vec<char>| {
+            if let Some(long) = tok.strip_prefix("--") {
+                let long = long.split(['=', '[']).next().unwrap_or(long);
+                if !long.is_empty() && !longs.iter().any(|k| k == long) {
+                    longs.push(long.to_string());
+                }
+            } else if tok.len() == 2 && tok.starts_with('-') {
+                let c = tok.chars().nth(1).unwrap();
+                if !shorts.contains(&c) {
+                    shorts.push(c);
+                }
+            }
+        };
+        for tok in flags.iter().copied().chain(value_flags.iter().copied()) {
+            note(tok, &mut longs, &mut shorts);
+        }
+        for group in conflict_groups {
+            for (name, alts) in *group {
+                note(name, &mut longs, &mut shorts);
+                for alt in *alts {
+                    note(alt, &mut longs, &mut shorts);
+                }
+            }
+        }
+        if let Some((_, text)) = help_texts::TEXTS
+            .iter()
+            .find(|(name, _)| *name == disabled_cmd || *name == cmd)
+        {
+            for line in text.lines() {
+                let line = line.trim_start();
+                if !line.starts_with('-') {
+                    continue;
+                }
+                for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                    if tok.starts_with('-') {
+                        note(tok, &mut longs, &mut shorts);
+                    }
+                }
+            }
+        }
+        for tok in [
+            "--verbose",
+            "--quiet",
+            "--debug",
+            "--help",
+            "-v",
+            "-q",
+            "-d",
+            "-h",
+        ] {
+            note(tok, &mut longs, &mut shorts);
+        }
+        (longs, shorts)
+    };
+    // OptionParser expands an unambiguous long-option prefix
+    // (`--j` for `--json`); rewrite tokens whose unique
+    // expansion is natively admitted so handlers see the
+    // full spelling. Ambiguous/unknown tokens stay as typed
+    // for the error classification below.
+    let expanded: Vec<String> = {
+        let native_long = |name: &str| {
+            flags.iter().any(|f| {
+                f.strip_prefix("--")
+                    .is_some_and(|long| long.split(['=', '[']).next().unwrap_or(long) == name)
+            }) || value_flags
+                .iter()
+                .any(|f| f.strip_prefix("--") == Some(name))
+                || matches!(name, "verbose" | "quiet" | "debug" | "help")
+        };
+        let mut out: Vec<String> = Vec::with_capacity(rest.len());
+        let mut literal = false;
+        let mut skip_value = false;
+        for tok in rest {
+            if literal || skip_value {
+                skip_value = false;
+                out.push(tok.clone());
+                continue;
+            }
+            if tok == "--" {
+                literal = true;
+                out.push(tok.clone());
+                continue;
+            }
+            if value_flags.contains(&tok.as_str()) {
+                skip_value = true;
+                out.push(tok.clone());
+                continue;
+            }
+            let rewritten = tok.strip_prefix("--").and_then(|long| {
+                let (name, value) = match long.split_once('=') {
+                    Some((n, v)) => (n, Some(v)),
+                    None => (long, None),
+                };
+                if native_long(name) || known_longs.iter().any(|k| k == name) {
+                    return None;
+                }
+                let mut candidates = known_longs.iter().filter(|k| k.starts_with(name));
+                let only = candidates.next()?;
+                if candidates.next().is_some() || !native_long(only) {
+                    return None;
+                }
+                Some(match value {
+                    Some(v) => format!("--{only}={v}"),
+                    None => format!("--{only}"),
+                })
+            });
+            out.push(rewritten.unwrap_or_else(|| tok.clone()));
+        }
+        out
+    };
+    let rest: &[String] = &expanded;
     // `--minimum-version` (outdated/upgrade) is a one-name
     // check; brew raises the arity error when the command
     // starts, ahead of its own JSON-version handling. A blank
@@ -1612,8 +1728,8 @@ fn native_args(
             }
             value
         };
-        // --cache additionally accepts "all" (every tag).
-        let cache_all = cmd == "--cache";
+        // --cache and fetch accept "all" (every tag).
+        let cache_all = matches!(cmd, "--cache" | "fetch");
         if cmd == "deps" && last_value("--os") == Some("all") {
             return Err(InstallError::Failed(
                 "Error: Invalid usage: `brew deps --os=all` is not supported.".to_string(),
@@ -1668,67 +1784,37 @@ fn native_args(
             )));
         }
     }
-    if let Some(offender_at) = rest
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .position(|arg| arg.starts_with('-') && arg.len() > 1 && !flag_ok(arg))
-    {
+    // The token after a space-form value flag is its value,
+    // never an option (brew's parser consumes it as such).
+    let offender_at = {
+        let mut at = None;
+        let mut skip_value = false;
+        for (i, arg) in rest.iter().enumerate() {
+            if arg == "--" {
+                break;
+            }
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if value_flags.contains(&arg.as_str()) {
+                skip_value = true;
+                continue;
+            }
+            if arg.starts_with('-') && arg.len() > 1 && !flag_ok(arg) {
+                at = Some(i);
+                break;
+            }
+        }
+        at
+    };
+    if let Some(offender_at) = offender_at {
         // brew reports the token as typed (before abrew's
         // kind-switch canonicalization).
         let typed_offender = typed_rest[offender_at].as_str();
         // An option brew itself does not know for this command
-        // is its OptionParser error, not a native refusal.
-        // Known = abrew's tables plus the flags in brew's own
-        // recorded help for the command; unique long-prefix
-        // abbreviations count as known (OptionParser).
-        let mut known_longs: Vec<String> = Vec::new();
-        let mut known_shorts: Vec<char> = Vec::new();
-        let note = |tok: &str, longs: &mut Vec<String>, shorts: &mut Vec<char>| {
-            if let Some(long) = tok.strip_prefix("--") {
-                let long = long.split(['=', '[']).next().unwrap_or(long);
-                if !long.is_empty() && !longs.iter().any(|k| k == long) {
-                    longs.push(long.to_string());
-                }
-            } else if tok.len() == 2 && tok.starts_with('-') {
-                let c = tok.chars().nth(1).unwrap();
-                if !shorts.contains(&c) {
-                    shorts.push(c);
-                }
-            }
-        };
-        for tok in flags.iter().copied().chain(value_flags.iter().copied()) {
-            note(tok, &mut known_longs, &mut known_shorts);
-        }
-        for group in conflict_groups {
-            for (name, alts) in *group {
-                note(name, &mut known_longs, &mut known_shorts);
-                for alt in *alts {
-                    note(alt, &mut known_longs, &mut known_shorts);
-                }
-            }
-        }
-        if let Some((_, text)) = help_texts::TEXTS
-            .iter()
-            .find(|(name, _)| *name == disabled_cmd || *name == cmd)
-        {
-            for line in text.lines() {
-                let line = line.trim_start();
-                if !line.starts_with('-') {
-                    continue;
-                }
-                for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
-                    if tok.starts_with('-') {
-                        note(tok, &mut known_longs, &mut known_shorts);
-                    }
-                }
-            }
-        }
-        for tok in ["--verbose", "--quiet", "--debug", "--help"] {
-            note(tok, &mut known_longs, &mut known_shorts);
-        }
-        for tok in ["-v", "-q", "-d", "-h"] {
-            note(tok, &mut known_longs, &mut known_shorts);
-        }
+        // is its OptionParser error, not a native refusal
+        // (known set computed above for abbreviation expansion).
         let offender = rest[offender_at].as_str();
         if let Some(long) = offender.strip_prefix("--") {
             let name = long.split('=').next().unwrap_or(long);
@@ -1759,7 +1845,8 @@ fn native_args(
         return Err(unsupported());
     }
     if cmd == "cleanup" {
-        cleanup_max_age(rest).map_err(|error| InstallError::Failed(format!("abrew: {error}")))?;
+        cleanup_max_age(rest)
+            .map_err(|error| InstallError::Failed(format!("Error: Invalid usage: {error}")))?;
     }
     let ops = if cmd == "info" {
         operands_without_flag_values(rest, &["--days", "--category"])
@@ -2079,7 +2166,7 @@ fn native_args(
     if cmd == "deps" {
         deps_brewfile_admission(rest)?;
     }
-    Ok(None)
+    Ok((None, rest.to_vec()))
 }
 
 /// The `--brewfile` flag's value in `rest`, if the flag is
@@ -2573,10 +2660,11 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    let prepared = match native_args(cmd, rest) {
-        Ok(prepared) => prepared,
+    let (prepared, admitted) = match native_args(cmd, rest) {
+        Ok(pair) => pair,
         Err(error) => return from_install(prefix, args, Err(error)),
     };
+    let rest: &[String] = &admitted;
     match cmd {
         "--version" | "-v" if rest.is_empty() => {
             println!("abrew {} (aterm)", aterm_stamp::app_version());
@@ -3535,7 +3623,6 @@ mod admission_tests {
             ("link", vec!["--HEAD", "wget"]),
             ("services", vec!["start", "wget"]),
             ("postinstall", vec!["wget"]),
-            ("cleanup", vec!["--prune=soon"]),
             ("--cache", vec!["-s", "wget"]),
             ("--cache", vec!["--HEAD", "wget"]),
             ("--repository", vec!["notatap"]),
@@ -3994,6 +4081,22 @@ mod admission_tests {
     }
 
     #[test]
+    fn unique_option_abbreviations_expand() {
+        let (_, rest) = native_args("info", &argv(&["--j=v1", "wget"])).unwrap();
+        assert_eq!(rest, argv(&["--json=v1", "wget"]));
+        let (_, rest) = native_args("list", &argv(&["--pin"])).unwrap();
+        assert_eq!(rest, argv(&["--pinned"]));
+        // Ambiguous prefixes stay typed (brew error) and a
+        // value after a value-flag is never rewritten.
+        assert!(matches!(
+            native_args("list", &argv(&["--p"])),
+            Err(InstallError::Failed(_))
+        ));
+        let (_, rest) = native_args("deps", &argv(&["--os", "linux", "--tre", "wget"])).unwrap();
+        assert_eq!(rest, argv(&["--os", "linux", "--tree", "wget"]));
+    }
+
+    #[test]
     fn deps_os_arch_simulation_values_admit() {
         let failed = |cmd: &str, args: &[&str]| match native_args(cmd, &argv(args)) {
             Err(InstallError::Failed(m)) => m,
@@ -4009,11 +4112,11 @@ mod admission_tests {
         );
         assert!(matches!(
             native_args("deps", &argv(&["--os=linux", "--arch=intel", "curl"])),
-            Ok(None)
+            Ok((None, _))
         ));
         assert!(matches!(
             native_args("deps", &argv(&["--os", "sequoia", "curl"])),
-            Ok(None)
+            Ok((None, _))
         ));
     }
 
@@ -4031,22 +4134,22 @@ mod admission_tests {
         );
         assert!(matches!(
             native_args("outdated", &argv(&["--minimum-version=1.0", "jq"])),
-            Ok(None)
+            Ok((None, _))
         ));
         assert!(matches!(
             native_args("outdated", &argv(&["--minimum-version", "1.0", "jq"])),
-            Ok(None)
+            Ok((None, _))
         ));
         // A blank value is absent: no arity demand.
         assert!(matches!(
             native_args("outdated", &argv(&["--minimum-version=", "jq", "wget"])),
-            Ok(None)
+            Ok((None, _))
         ));
         // upgrade shares the arity error and the native flag.
         assert_eq!(failed("upgrade", &["--minimum-version=1.0"]), arity);
         assert!(matches!(
             native_args("upgrade", &argv(&["--minimum-version=1.0", "jq"])),
-            Ok(None)
+            Ok((None, _))
         ));
         // The long spelling wins over the alias, blank included.
         assert!(matches!(
@@ -4054,7 +4157,7 @@ mod admission_tests {
                 "outdated",
                 &argv(&["--min-version=1.0", "--minimum-version=", "jq", "wget"])
             ),
-            Ok(None)
+            Ok((None, _))
         ));
     }
 
@@ -4070,7 +4173,10 @@ mod admission_tests {
             "tap \"me/tools\"\nbrew \"wget\", link: false\ncask \"firefox\"\nmas \"Xcode\", id: 497799835\nvscode \"dbaeumer.vscode-eslint\"\ncask_args appdir: \"/Applications\"\n",
         )
         .unwrap();
-        assert!(matches!(native_args("deps", &argv(&[&flag])), Ok(None)));
+        assert!(matches!(
+            native_args("deps", &argv(&[&flag])),
+            Ok((None, _))
+        ));
         // Ruby the line parser cannot read delegates.
         std::fs::write(&file, "brew \"wget\" if OS.mac?\n").unwrap();
         assert!(matches!(
@@ -4080,7 +4186,10 @@ mod admission_tests {
         // A missing file is admitted: the command reports
         // brew's own "No Brewfile found".
         std::fs::remove_file(&file).unwrap();
-        assert!(matches!(native_args("deps", &argv(&[&flag])), Ok(None)));
+        assert!(matches!(
+            native_args("deps", &argv(&[&flag])),
+            Ok((None, _))
+        ));
     }
 
     #[test]
@@ -4107,11 +4216,11 @@ mod admission_tests {
         );
         assert!(matches!(
             native_args("bundle", &argv(&["add", "wget"])),
-            Ok(None)
+            Ok((None, _))
         ));
         assert!(matches!(
             native_args("bundle", &argv(&["remove", &flag, "wget"])),
-            Ok(None)
+            Ok((None, _))
         ));
         assert_eq!(
             failed(&["remove", &flag]),
@@ -4120,7 +4229,7 @@ mod admission_tests {
         // Bare remove (direct dialect) stays the payload verb.
         assert!(matches!(
             native_args("bundle", &argv(&["remove"])),
-            Ok(None)
+            Ok((None, _))
         ));
     }
 
@@ -4529,6 +4638,12 @@ mod admission_tests {
                 "Error: Invalid usage: `--category` must be one of install, \
                  install-on-request, build-error when querying formulae."
                     .replace("                 ", "")
+            ))
+        );
+        assert_eq!(
+            native_args("cleanup", &argv(&["--prune=soon"])),
+            Err(InstallError::Failed(
+                "Error: Invalid usage: `--prune` expects an integer or `all`.".to_string()
             ))
         );
         let days_args = argv(&["--analytics", "wget", "--days=40"]);

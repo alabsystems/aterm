@@ -5050,6 +5050,8 @@ pub struct InitialSetupParkMark {
     /// A still-owed, unheld Caps setting whose native service set can become available.
     keyboard_run: Option<u64>,
     keyboards: Option<InputServiceSet>,
+    /// Positive native readability, never a verified mapping or an automatic-write receipt.
+    readable_keyboards: InputServiceSet,
     retry_due: Option<u64>,
     mac_settings_retry_due: Option<u64>,
     /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
@@ -5087,7 +5089,10 @@ impl InitialSetupParkMark {
         }
         if self.keyboard_run.is_some()
             && self.keyboard_run == before.keyboard_run
-            && changed(&self.keyboards, &before.keyboards)
+            && (changed(&self.keyboards, &before.keyboards)
+                || self
+                    .readable_keyboards
+                    .gained_from(&before.readable_keyboards))
         {
             return true;
         }
@@ -5139,9 +5144,25 @@ impl InitialSetupParkMark {
         self
     }
 
-    fn with_keyboard_services(mut self, read: impl FnOnce() -> Result<Vec<u64>, String>) -> Self {
+    fn with_keyboard_services(mut self, sys: &dyn aterm_machines::port::System) -> Self {
         if self.keyboard_run.is_some() && self.console == Some(true) {
-            self.keyboards = read().ok().and_then(|ids| InputServiceSet::new(ids).ok());
+            match sys
+                .keyboard_service_observations()
+                .and_then(|rows| InputServiceSet::observed(&rows))
+            {
+                Ok((present, readable)) => {
+                    self.keyboards = Some(present);
+                    self.readable_keyboards = readable;
+                }
+                Err(_) => {
+                    // A failed property read establishes no positive readiness. Preserve
+                    // independent membership observations without probing preferences.
+                    self.keyboards = sys
+                        .keyboard_service_ids()
+                        .ok()
+                        .and_then(|ids| InputServiceSet::new(ids).ok());
+                }
+            }
         }
         self
     }
@@ -5154,6 +5175,13 @@ impl InitialSetupParkMark {
             && self.keyboards.is_none()
         {
             self.keyboards = previous.keyboards.clone();
+        }
+        if self.keyboard_run.is_some()
+            && self.keyboard_run == previous.keyboard_run
+            && let Some(present) = &self.keyboards
+        {
+            self.readable_keyboards
+                .retain_present_from(&previous.readable_keyboards, present);
         }
         if self.workstation_run.is_some()
             && self.workstation_run == previous.workstation_run
@@ -5247,7 +5275,7 @@ pub fn initial_setup_park_mark() -> InitialSetupParkMark {
     .with_git(|| Some(RepositoryGit::read(&sys)))
     .with_repository_inputs(|| aterm_machines::init_github::repository_input_mark(&sys).ok())
     .with_console(|| Some(!aterm_machines::console::remote(&sys)))
-    .with_keyboard_services(|| sys.keyboard_service_ids())
+    .with_keyboard_services(&sys)
 }
 
 fn initial_setup_park_mark_at(
@@ -5368,6 +5396,7 @@ fn initial_setup_park_mark_reading(
         console: None,
         keyboard_run,
         keyboards: None,
+        readable_keyboards: InputServiceSet::default(),
         retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
             secrets_retry::retry_due(root, progress.revision, now)
         }),

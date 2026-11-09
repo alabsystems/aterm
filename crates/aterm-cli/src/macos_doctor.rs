@@ -4877,10 +4877,11 @@ mod tests {
             fn run_tty(
                 &self,
                 cmd: &Cmd,
-                before: &mut dyn FnMut() -> Result<(), RunFailed>,
+                before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
             ) -> Result<Option<i32>, RunFailed> {
-                before()?;
-                self.run(cmd).map(|ran| ran.status)
+                let mut cmd = cmd.clone();
+                before(&mut cmd)?;
+                self.run(&cmd).map(|ran| ran.status)
             }
             fn read_file(&self, _: &Path) -> io::Result<Vec<u8>> {
                 unsupported()

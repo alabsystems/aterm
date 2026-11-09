@@ -1741,6 +1741,18 @@ THE FOOTER
   landing while one is armed, and Harness settings…). `aterm ctl chrome` reports the
   chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds
   `title=`, the title its hover reads).
+  On Claude Code the permission chip beside it says one bit: `yolo` where Claude's pill
+  reads bypass permissions, `lame` in any other mode, `auto` included. Clicking it
+  restarts the conversation: from `yolo` with no permission flag, into the mode Claude
+  Code's own settings choose; from `lame` with `--dangerously-skip-permissions`. The
+  conversation, build, model and login stay, and background shells end (the hover says
+  how many: `· ends 1 shell`). A click waits as a press of ⬆️ does, for a turn, a box, a
+  draft, a held tab, a usage limit or a login, drawn `◐` with what it waits for on its
+  hover; a second click takes it back until the restart begins. Where no restart can be
+  made (not started from a shell, a shell other than zsh, bash or fish, a command line
+  it cannot read or rewrite, another supervisor's tab, a credit claim's worker, or an
+  agent that must end first) the click is refused and the hover says why. Only a bypass
+  row is rewritten: in any other mode Claude's own row stands as it draws it.
   Bundled codex-alab draws its own product version and Autopilot controls. Its native
   menu (`/alab menu`, or right-click the Autopilot controls) offers Cruise, Land, Off,
   timed Cruise, a custom deadline and cancellation of a scheduled landing. Clicking

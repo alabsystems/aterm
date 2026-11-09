@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The Clean islands that prove aterm-mesh-core's safety laws, checked in a unit no compile of the mesh waits for"
+description = "The Clean islands that prove aterm-mesh-core's safety laws and open at most its temporal prelude, checked in a unit no compile of the mesh waits for"
 
 # No dependencies, no proc macros and no anchors (PM-1), and no Rust: the library's compile is the
 # islands' check, so a test harness would check them a second time with no test to run.

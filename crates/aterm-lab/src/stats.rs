@@ -89,10 +89,9 @@ pub fn cmd_account(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The scratch `.claude.json` (`CLAUDE_CONFIG_DIR` is the scratch
-/// `home/.claude`), parsed.
+/// The scratch `.claude.json` in the tab's `CLAUDE_CONFIG_DIR` ([`Run::claude_dir`]), parsed.
 fn claude_json(run: &Run) -> Result<J, Fail> {
-    let p = run.w.join("home/.claude/.claude.json");
+    let p = run.claude_dir().join(".claude.json");
     let text = crate::verbs::read_scratch(&p)?;
     J::parse(&text).map_err(|e| Fail::die(format!("the scratch .claude.json: {e}")))
 }
@@ -108,7 +107,7 @@ pub(crate) fn set_claude_json(run: &Run, key: &str, value: J) -> Result<(), Fail
         j.set(key, value);
     }
     atomic_write(
-        &run.w.join("home/.claude/.claude.json"),
+        &run.claude_dir().join(".claude.json"),
         j.dump(PRETTY).as_bytes(),
     )
     .map_err(|e| Fail::die(e.to_string()))
@@ -274,7 +273,7 @@ pub fn cmd_statusline(args: &[String]) -> Res {
 #[must_use]
 pub fn newest_transcript(run: &Run) -> Option<PathBuf> {
     let mut files = Vec::new();
-    crate::util::walk_files(&run.w.join("home/.claude/projects"), &mut files);
+    crate::util::walk_files(&run.claude_dir().join("projects"), &mut files);
     files
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
@@ -319,8 +318,8 @@ pub fn cmd_transcript(args: &[String]) -> Res {
     let (run, _) = lab(args)?;
     let f = newest_transcript(&run).ok_or_else(|| {
         Fail::die(format!(
-            "no transcript under {}/home/.claude/projects yet",
-            run.w.display()
+            "no transcript under {} yet",
+            run.claude_dir().join("projects").display()
         ))
     })?;
     println!("# {}", scrub(&run, &f.to_string_lossy()));

@@ -249,10 +249,10 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
 #[derive(Debug)]
 pub enum Disk {
     /// Its own claim, its writes measured ([`run_of`]).
-    Held(atpkg::admit_disk::Admitted),
+    Held(Box<atpkg::admit_disk::Admitted>),
     /// The claim the work it is part of holds, named by [`crate::EnvSnapshot::disk_cover`]: its
     /// holder's record. Nothing is walked, claimed or kept.
-    Covered(aterm_capacity::Record),
+    Covered(Box<aterm_capacity::Record>),
     /// None: no check it runs builds, or no ledger could take a claim (said).
     Unclaimed,
 }
@@ -316,7 +316,7 @@ pub fn admit_in(
         match aterm_capacity::covering_disk(ledger, machine, pid, marker, &run.on) {
             Ok(Some(by)) => {
                 eprintln!("verify: {}", covered_line(&by));
-                return Ok(Disk::Covered(by));
+                return Ok(Disk::Covered(Box::new(by)));
             }
             Ok(None) => eprintln!(
                 "verify: disk: the claim {marker} this run was handed covers nothing here (it \
@@ -484,7 +484,7 @@ fn answer(
     admitted: Result<atpkg::admit_disk::Admitted, atpkg::admit_disk::Error>,
 ) -> Result<Disk, String> {
     match admitted {
-        Ok(held) => Ok(Disk::Held(held)),
+        Ok(held) => Ok(Disk::Held(Box::new(held))),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(format!(
             "{why}; it can never be admitted there. Fix: point CARGO_TARGET_DIR at a larger volume"
         )),
@@ -1053,7 +1053,7 @@ mod tests {
             std::fs::write(build.join("unit.rlib"), [0u8; 1 << 16]).expect("the run's writes");
             let log_path = checkout.join("log");
             let mut log = std::fs::File::create(&log_path).expect("the log");
-            crate::let_disk_go(Disk::Held(held), passed, Some(&mut log), None);
+            crate::let_disk_go(Disk::Held(Box::new(held)), passed, Some(&mut log), None);
             assert_eq!(
                 aterm_capacity::Footprints::load(&checkout.join(FOOTPRINT))
                     .runs()

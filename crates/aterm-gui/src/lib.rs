@@ -370,6 +370,7 @@ mod devtools_helper_drive;
 mod frame_clock_drive;
 mod overview;
 mod overview_fabric;
+mod permission_click;
 mod permission_walk;
 pub(crate) use amacs_files::save_words;
 mod clt_install;
@@ -4265,6 +4266,11 @@ enum Wake {
     /// A row the lane of the owner's press of a ⬆️ read (`App::start_press_lane`).
     AgentUpgradePress {
         row: aterm_agent::harness::upgrade_drive::Row,
+    },
+    /// A look of a permission click's lane that moved tab `tab`'s ask (`App::start_click_lane`).
+    PermissionClick {
+        tab: String,
+        look: aterm_agent::harness::permission_click::Look,
     },
     HostNote(harness_host::HostNote),
     HarnessWait {
@@ -10744,6 +10750,8 @@ struct App {
     /// The whole text of the last harness note recorded (`App::record_harness_note`).
     harness_note_recorded: Option<String>,
     upgrade_view: upgrade_host::UpgradeView,
+    /// The tabs' standing permission clicks and what looks at them ([`permission_click`]).
+    permission_clicks: permission_click::ClickView,
     integration_notices: integration_notice::IntegrationNotices,
     update_flow: Option<messages_host::UpdateFlow>,
     update_ctl_checks: u32,
@@ -15272,6 +15280,8 @@ impl App {
             leader_execd: |_| None,
             #[cfg(unix)]
             shell_children: |_| Vec::new(),
+            #[cfg(windows)]
+            job_seam: None,
             card_probe: false,
             rekey_deferred: None,
             spare: None,
@@ -15722,6 +15732,7 @@ impl App {
             managed_current_recorded: None,
             harness_note_recorded: None,
             upgrade_view: upgrade_host::UpgradeView::default(),
+            permission_clicks: permission_click::ClickView::default(),
             integration_notices: integration_notice::IntegrationNotices::default(),
             update_flow: None,
             update_ctl_checks: 0,
@@ -20549,6 +20560,7 @@ impl App {
             } => self.apply_host_upgrades_from(rows, kept, sources),
             Wake::AgentUpgradeWord { ask, result } => self.apply_upgrade_word(&ask, result),
             Wake::AgentUpgradePress { row } => self.apply_press_row(row),
+            Wake::PermissionClick { tab, look } => self.apply_click_look(&tab, look),
             Wake::HostNote(note) => {
                 let moved = !matches!(
                     note,
@@ -27446,6 +27458,8 @@ pub fn main_entry_with_network(
         leader_execd: crate::fg_sample::execd_start,
         #[cfg(unix)]
         shell_children: crate::spawn::shell_children,
+        #[cfg(windows)]
+        job_seam: Some(crate::command_ran::JOB_SHIPPING),
         card_probe: crate::holder_image::card_probe_requested(),
         spare: None,
         #[cfg(windows)]
@@ -28137,6 +28151,9 @@ pub fn main_entry_with_network(
     // The board's mode is the launch policy's before the host's first look (the ring is
     // written only while it observes); the policy's Entry follows once the app is built.
     occupancy_host::set_mode(config.harness.policy.occupancy);
+    // The window's standing permission clicks, shared with the host's workers, whose loop a
+    // standing click holds at a rest.
+    let permission_clicks = permission_click::Clicks::default();
     let harness = sock_plan.as_ref().map(|plan| {
         let host = harness_host::start_default(
             store.clone(),
@@ -28145,7 +28162,10 @@ pub fn main_entry_with_network(
             headless,
             handoff_reader_gate.is_some(),
             event_loop.create_proxy(),
-            account_work.clone(),
+            harness_host::WindowShares {
+                account_work: account_work.clone(),
+                clicks: permission_clicks.clone(),
+            },
         );
         host.defer_adopted_claims(adopted_claim_grace, harness_host::ADOPTED_CLAIM_GRACE);
         host
@@ -28870,6 +28890,10 @@ pub fn main_entry_with_network(
         upgrade_view: upgrade_host::UpgradeView::with_writer(
             upgrade_host::live_word_writer(sock_plan.as_ref().map(|plan| plan.sock_path.clone())),
             upgrade_host::live_presser(sock_plan.as_ref().map(|plan| plan.sock_path.clone())),
+        ),
+        permission_clicks: permission_click::ClickView::with(
+            permission_clicks,
+            permission_click::live_clicker(sock_plan.as_ref().map(|plan| plan.sock_path.clone())),
         ),
         integration_notices: integration_notice::IntegrationNotices::default(),
         update_flow: None,

@@ -342,6 +342,7 @@ pub(super) mod fixture {
     pub struct Native {
         root: PathBuf,
         pub attached: AtomicBool,
+        pub unread: AtomicBool,
         wakes: super::super::SetupWakes,
         events: mpsc::Sender<Event>,
     }
@@ -353,6 +354,7 @@ pub(super) mod fixture {
                 Arc::new(Self {
                     root,
                     attached: AtomicBool::new(false),
+                    unread: AtomicBool::new(false),
                     wakes: super::super::SetupWakes::new(),
                     events,
                 }),
@@ -401,6 +403,17 @@ pub(super) mod fixture {
             .map(Some)
         }
 
+        pub fn system(&self) -> aterm_machines::port::Fake {
+            InitialSetupAdmissionStopTest::keyboard_system(
+                self.attached.load(Ordering::Acquire),
+                if self.unread.load(Ordering::Acquire) {
+                    &[41, 42]
+                } else {
+                    &[]
+                },
+            )
+        }
+
         pub fn wake(&self) {
             self.wakes.raise_facts();
         }
@@ -432,11 +445,7 @@ pub(super) mod fixture {
             let run = |hooks| {
                 InitialSetupAdmissionStopTest::startup(&self.native.root)?.native_input_pass(
                     ticket,
-                    || {
-                        Box::new(InitialSetupAdmissionStopTest::keyboard_system(
-                            self.native.attached.load(Ordering::Acquire),
-                        ))
-                    },
+                    || Box::new(self.native.system()),
                     hooks,
                 )
             };
@@ -448,12 +457,7 @@ pub(super) mod fixture {
         fn mark(&mut self, ticket: &PendingInputAdmission) -> InitialSetupParkMark {
             InitialSetupAdmissionStopTest::startup(&self.native.root)
                 .unwrap()
-                .input_park_mark(
-                    ticket,
-                    &InitialSetupAdmissionStopTest::keyboard_system(
-                        self.native.attached.load(Ordering::Acquire),
-                    ),
-                )
+                .input_park_mark(ticket, &self.native.system())
         }
         fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
             aterm_cli::macos_doctor::claim_initial_setup_rerun_at(&self.native.root)

@@ -47,25 +47,38 @@ pub fn pct_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parses one non-exited `sessions` line from an `aterm` control socket into a [`crate::protocol::HostedSession`].
-#[must_use]
+/// A roster line whose required fields cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnreadRosterLine;
+
+impl std::fmt::Display for UnreadRosterLine {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("unread session roster line")
+    }
+}
+
+impl std::error::Error for UnreadRosterLine {}
+
+/// Parse a roster line without confusing an unread line with an exited session.
+///
+/// # Errors
+/// A required field is missing or its local session id is not an unsigned integer.
 pub fn parse_aterm_roster_line(
     instance_pid: u32,
     line: &str,
-) -> Option<crate::protocol::HostedSession> {
+) -> Result<Option<crate::protocol::HostedSession>, UnreadRosterLine> {
     let mut f = line.trim_end_matches(['\r', '\n']).split(' ');
-    let (id_str, sid, _parent, state, raw_title, _meta) = (
-        f.next()?,
-        f.next()?,
-        f.next()?,
-        f.next()?,
-        f.next()?,
-        f.next()?,
-    );
+    let (Some(id_str), Some(sid), Some(_parent), Some(state), Some(raw_title), Some(_meta)) =
+        (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+    else {
+        return Err(UnreadRosterLine);
+    };
+    let Some(local_id) = crate::parse_uint::<u64>(id_str) else {
+        return Err(UnreadRosterLine);
+    };
     if state == "exited" {
-        return None;
+        return Ok(None);
     }
-    let local_id = crate::parse_uint::<u64>(id_str)?;
     let mut s = crate::protocol::HostedSession {
         instance_pid,
         local_id,
@@ -103,7 +116,7 @@ pub fn parse_aterm_roster_line(
         }
     }
     s.title = user_title.unwrap_or_else(|| pct_decode(raw_title));
-    Some(s)
+    Ok(Some(s))
 }
 
 /// Replace the account's home directory prefix with `~` for compact display.
@@ -278,29 +291,46 @@ fn query_instance_sessions(
     instance_pid: u32,
     sock_path: &Path,
     wait: Duration,
-) -> Vec<crate::protocol::HostedSession> {
+) -> crate::protocol::SessionSnapshot {
+    query_instance_sessions_after(instance_pid, sock_path, wait, Duration::ZERO)
+}
+
+fn query_instance_sessions_after(
+    instance_pid: u32,
+    sock_path: &Path,
+    wait: Duration,
+    elapsed: Duration,
+) -> crate::protocol::SessionSnapshot {
     let Some(token) = read_sock_token(sock_path) else {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     };
     let Ok(mut stream) = UnixStream::connect(sock_path) else {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     };
     if !same_user_peer(&stream) {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     }
-    let _ = stream.set_read_timeout(Some(wait));
-    let _ = stream.set_write_timeout(Some(wait));
+    let remaining = wait.saturating_sub(elapsed);
+    if remaining.is_zero() {
+        if stream.set_nonblocking(true).is_err() {
+            return crate::protocol::SessionSnapshot::default();
+        }
+    } else if stream.set_read_timeout(Some(remaining)).is_err()
+        || stream.set_write_timeout(Some(remaining)).is_err()
+    {
+        return crate::protocol::SessionSnapshot::default();
+    }
     if stream
         .write_all(format!("AUTH {token}\nsessions\n").as_bytes())
         .and_then(|()| stream.flush())
         .is_err()
     {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     }
     let mut reader = BufReader::new(stream);
     let mut header = String::new();
     if reader.by_ref().take(1024).read_line(&mut header).is_err() || !header.ends_with('\n') {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     }
     let Some(count) = header
         .trim_end()
@@ -308,9 +338,10 @@ fn query_instance_sessions(
         .and_then(crate::parse_uint::<usize>)
         .filter(|&c| c <= 1024)
     else {
-        return Vec::new();
+        return crate::protocol::SessionSnapshot::default();
     };
     let mut out = Vec::with_capacity(count);
+    let mut complete = true;
     for _ in 0..count {
         let mut line = String::new();
         if reader
@@ -320,24 +351,27 @@ fn query_instance_sessions(
             .is_err()
             || !line.ends_with('\n')
         {
+            complete = false;
             break;
         }
-        if let Some(session) = parse_aterm_roster_line(instance_pid, &line) {
-            out.push(session);
+        match parse_aterm_roster_line(instance_pid, &line) {
+            Ok(Some(session)) => out.push(session),
+            Ok(None) => {}
+            Err(UnreadRosterLine) => complete = false,
         }
     }
     if wait <= Duration::from_secs(1) {
         enrich_sessions_dims_and_cwd(sock_path, &token, &mut out, Duration::from_millis(80));
     }
-    out
+    crate::protocol::SessionSnapshot {
+        rows: out,
+        complete,
+    }
 }
 
-/// Enumerates live `aterm` control sockets in `dir` and returns all live sessions.
+/// Enumerate this directory's control sockets, retaining unread and partial observations.
 #[must_use]
-pub fn scan_aterm_sessions_in_dir(
-    dir: &Path,
-    wait: Duration,
-) -> Vec<crate::protocol::HostedSession> {
+pub fn scan_aterm_sessions_in_dir(dir: &Path, wait: Duration) -> crate::protocol::SessionSnapshot {
     let mut seen = std::collections::BTreeSet::new();
     let mut targets: Vec<(u32, PathBuf)> = Vec::new();
     let mut remember = |pid: u32, path: PathBuf| {
@@ -347,8 +381,20 @@ pub fn scan_aterm_sessions_in_dir(
         }
     };
 
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
+    let mut complete = true;
+    let entries = std::fs::read_dir(dir);
+    if entries
+        .as_ref()
+        .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+    {
+        complete = false;
+    }
+    if let Ok(entries) = entries {
+        for entry in entries {
+            let Ok(e) = entry else {
+                complete = false;
+                continue;
+            };
             let file_name = e.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
@@ -361,19 +407,37 @@ pub fn scan_aterm_sessions_in_dir(
             }
         }
     }
-    if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
-        for e in entries.flatten() {
-            if !e.file_type().is_ok_and(|t| t.is_file()) {
+    let entries = std::fs::read_dir(dir.join("graph"));
+    if entries
+        .as_ref()
+        .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+    {
+        complete = false;
+    }
+    if let Ok(entries) = entries {
+        for entry in entries {
+            let Ok(e) = entry else {
+                complete = false;
+                continue;
+            };
+            let Ok(kind) = e.file_type() else {
+                complete = false;
+                continue;
+            };
+            if !kind.is_file() {
                 continue;
             }
             let Some(body) = read_owned_text(&e.path(), 64 * 1024) else {
+                complete = false;
                 continue;
             };
             let Some(sock) = aterm_types::control_socket::graph_entry_sock(&body) else {
+                complete = false;
                 continue;
             };
             let path = PathBuf::from(&sock);
             if !path.is_absolute() {
+                complete = false;
                 continue;
             }
             let pid = aterm_types::control_socket::graph_entry_pid(&body).unwrap_or(0);
@@ -383,15 +447,20 @@ pub fn scan_aterm_sessions_in_dir(
     targets.sort_by_key(|(pid, _)| *pid);
     let mut sessions = Vec::new();
     for (pid, sock) in targets {
-        sessions.extend(query_instance_sessions(pid, &sock, wait));
+        let observation = query_instance_sessions(pid, &sock, wait);
+        complete &= observation.complete;
+        sessions.extend(observation.rows);
     }
     sessions.sort_by_key(|s| (s.instance_pid, s.local_id));
-    sessions
+    crate::protocol::SessionSnapshot {
+        rows: sessions,
+        complete,
+    }
 }
 
-/// Enumerate every live `aterm` tab/session in this user's control-socket directory.
+/// Read the account's session inventory without treating an unread instance as empty.
 #[must_use]
-pub fn scan_local_aterm_sessions() -> Vec<crate::protocol::HostedSession> {
+pub fn scan_local_aterm_sessions() -> crate::protocol::SessionSnapshot {
     let mut dirs = Vec::new();
     if let Some(d) = aterm_uds::control_socket_dir() {
         dirs.push(d);
@@ -403,21 +472,229 @@ pub fn scan_local_aterm_sessions() -> Vec<crate::protocol::HostedSession> {
         }
     }
     let mut out = Vec::new();
+    let mut complete = !dirs.is_empty();
     for d in dirs {
-        for s in scan_aterm_sessions_in_dir(&d, SOCKET_WAIT) {
+        let observation = scan_aterm_sessions_in_dir(&d, SOCKET_WAIT);
+        complete &= observation.complete;
+        for s in observation.rows {
             if !out.iter().any(|x| same_hosted_session(x, &s)) {
                 out.push(s);
             }
         }
     }
     out.sort_by_key(|s| (s.instance_pid, s.local_id));
-    out
+    crate::protocol::SessionSnapshot {
+        rows: out,
+        complete,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn live_row(pid: u32, line: &str) -> crate::protocol::HostedSession {
+        parse_aterm_roster_line(pid, line)
+            .expect("a readable fixture")
+            .expect("a live fixture")
+    }
+
+    struct FixtureStream {
+        stream: UnixStream,
+        deadline: std::time::Instant,
+    }
+
+    impl FixtureStream {
+        fn try_clone(&self) -> std::io::Result<Self> {
+            Ok(Self {
+                stream: self.stream.try_clone()?,
+                deadline: self.deadline,
+            })
+        }
+
+        fn ready(&self, interest: aterm_uds::ready::Interest) -> std::io::Result<()> {
+            use std::os::fd::AsFd as _;
+            aterm_uds::ready::until(self.stream.as_fd(), interest, self.deadline)
+        }
+    }
+
+    impl Read for FixtureStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.stream.read(buffer) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.ready(aterm_uds::ready::Interest::Read)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    impl Write for FixtureStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            loop {
+                match self.stream.write(bytes) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.ready(aterm_uds::ready::Interest::Write)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    result => return result,
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    fn accept_fixture(listener: &UnixListener) -> FixtureStream {
+        use std::os::fd::AsFd as _;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native fixture never connected"
+            );
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true).unwrap();
+                    return FixtureStream { stream, deadline };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    aterm_uds::ready::until(
+                        listener.as_fd(),
+                        aterm_uds::ready::Interest::Read,
+                        deadline,
+                    )
+                    .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("native fixture accept: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_native_fixture_drains_the_request_and_eof_when_its_client_already_left() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let socket = root.path().join("already-left.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client.write_all(b"AUTH fixture\nsessions\n").unwrap();
+        drop(client);
+        let mut stream = BufReader::new(accept_fixture(&listener));
+        let mut request = String::new();
+        stream.read_line(&mut request).unwrap();
+        assert_eq!(request, "AUTH fixture\n");
+        request.clear();
+        stream.read_line(&mut request).unwrap();
+        assert_eq!(request, "sessions\n");
+        assert_eq!(stream.read_line(&mut request).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_slow_session_reply_is_unobserved_instead_of_an_empty_inventory() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let sock = root.path().join("aterm-4242.sock");
+        std::fs::write(root.path().join("aterm-4242.token"), "feedbeef\n").unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let stream = accept_fixture(&listener);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "AUTH feedbeef\n");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "sessions\n");
+            finished.recv_timeout(Duration::from_secs(60)).unwrap();
+            drop(stream);
+        });
+        let observed =
+            query_instance_sessions_after(4242, &sock, SOCKET_WAIT, Duration::from_secs(1));
+        finish.send(()).unwrap();
+        producer.join().unwrap();
+        assert!(
+            !observed.complete,
+            "a timed-out response supplies no complete inventory"
+        );
+        assert!(observed.rows.is_empty());
+    }
+
+    fn snapshot_from_reply(reply: &[u8]) -> crate::protocol::SessionSnapshot {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let sock = root.path().join("aterm-4242.sock");
+        std::fs::write(root.path().join("aterm-4242.token"), "feedbeef\n").unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let reply = reply.to_vec();
+        let producer = std::thread::spawn(move || {
+            let mut stream = accept_fixture(&listener);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "AUTH feedbeef\n");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "sessions\n");
+            stream.write_all(&reply).unwrap();
+        });
+        let snapshot = scan_aterm_sessions_in_dir(root.path(), Duration::from_secs(60));
+        producer.join().unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn partial_and_unread_rosters_retain_rows_without_claiming_completeness() {
+        for reply in [
+            b"OK 2\n0 s-first - alive zsh meta=0\n".as_slice(),
+            b"OK 2\n0 s-first - alive zsh meta=0\nunread\n".as_slice(),
+        ] {
+            let snapshot = snapshot_from_reply(reply);
+            assert!(!snapshot.complete);
+            assert_eq!(snapshot.rows.len(), 1);
+            assert_eq!(snapshot.rows[0].sid, "s-first");
+        }
+        for reply in [
+            b"OK 0\n".as_slice(),
+            b"OK 1\n0 s-ended - exited zsh meta=0\n".as_slice(),
+        ] {
+            let snapshot = snapshot_from_reply(reply);
+            assert!(snapshot.complete);
+            assert!(snapshot.rows.is_empty());
+        }
+        for reply in [b"unread\n".as_slice(), b"OK 1025\n".as_slice()] {
+            let snapshot = snapshot_from_reply(reply);
+            assert!(!snapshot.complete);
+            assert!(snapshot.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_unread_instance_directory_or_graph_is_not_a_complete_empty_inventory() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let missing = scan_aterm_sessions_in_dir(&root.path().join("absent"), SOCKET_WAIT);
+        assert!(missing.complete);
+        assert!(missing.rows.is_empty());
+
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "not a directory").unwrap();
+        let unread = scan_aterm_sessions_in_dir(&file, SOCKET_WAIT);
+        assert!(!unread.complete);
+        assert!(unread.rows.is_empty());
+
+        let graph = root.path().join("graph");
+        std::fs::create_dir(&graph).unwrap();
+        std::fs::write(graph.join("instance"), "unread graph entry").unwrap();
+        let unread = scan_aterm_sessions_in_dir(root.path(), SOCKET_WAIT);
+        assert!(!unread.complete);
+        assert!(unread.rows.is_empty());
+    }
 
     #[test]
     fn roster_line_and_socket_dir_scanner_capture_live_tabs_and_ai_cli_telemetry() {
@@ -449,8 +726,10 @@ mod tests {
             .unwrap();
         });
 
-        let rows = scan_aterm_sessions_in_dir(dir.path(), Duration::from_secs(60));
+        let snapshot = scan_aterm_sessions_in_dir(dir.path(), Duration::from_secs(60));
         server.join().unwrap();
+        assert!(snapshot.complete);
+        let rows = snapshot.rows;
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         assert_eq!(r.instance_pid, 4242);
@@ -483,13 +762,12 @@ mod tests {
     #[test]
     fn a_roster_line_carries_the_programs_own_report() {
         let row = |state: &str| {
-            parse_aterm_roster_line(
+            live_row(
                 7,
                 &format!(
                     "2 s-cx - alive codex meta=1 program=codex agent=unknown program_state={state}"
                 ),
             )
-            .expect("a row")
             .program_state
         };
         assert_eq!(
@@ -525,8 +803,8 @@ mod tests {
         });
 
         let mut sessions = vec![
-            parse_aterm_roster_line(77, "0 s-first - alive zsh meta=0").unwrap(),
-            parse_aterm_roster_line(77, "1 s-second - alive zsh meta=0").unwrap(),
+            live_row(77, "0 s-first - alive zsh meta=0"),
+            live_row(77, "1 s-second - alive zsh meta=0"),
         ];
         // The server above always answers: a hang detector, never the roster's 80 ms.
         enrich_sessions_dims_and_cwd(&sock, "abcd", &mut sessions, Duration::from_secs(60));
@@ -543,9 +821,9 @@ mod tests {
         );
         assert_eq!(sessions[1].cwd, None);
 
-        let a = parse_aterm_roster_line(0, "0 s-one - alive zsh meta=0").unwrap();
-        let b = parse_aterm_roster_line(0, "0 s-two - alive zsh meta=0").unwrap();
-        let a_dup = parse_aterm_roster_line(0, "0 s-one - alive zsh meta=0").unwrap();
+        let a = live_row(0, "0 s-one - alive zsh meta=0");
+        let b = live_row(0, "0 s-two - alive zsh meta=0");
+        let a_dup = live_row(0, "0 s-one - alive zsh meta=0");
         assert!(!same_hosted_session(&a, &b));
         assert!(same_hosted_session(&a, &a_dup));
     }

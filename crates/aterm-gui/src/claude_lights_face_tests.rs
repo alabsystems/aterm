@@ -616,7 +616,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         );
         {
             let s = &w.sessions[&7];
-            let on = drawn_at(s, now, None, None, Keep::Drawn);
+            let on = drawn_at(s, Keep::Drawn);
             assert_eq!(
                 chips_width_at(
                     s,
@@ -1110,7 +1110,7 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
             "{what}: Autopilot alone"
         );
         let s = &w.sessions[&7];
-        let on = drawn_at(s, now, None, None, Keep::GlyphOnly);
+        let on = drawn_at(s, Keep::GlyphOnly);
         assert_eq!(
             chips_width_at(
                 s,
@@ -1577,54 +1577,11 @@ fn lands_letters_read_on_every_builtin_theme() {
     );
 }
 
-/// AUTO READS AS A VALUE ON EVERY BUILT-IN THEME: the expected mode's light (`⏵⏵ auto`) wears
-/// the glass's value ink, at 7:1 or more, never its pill's amber. NEGATIVE CONTROL: the pill's
-/// amber fails a light ground.
-#[test]
-fn auto_reads_as_a_value_on_every_builtin_theme() {
-    use crate::chrome_band::contrast;
-    let now = Instant::now();
-    assert_eq!(Mode::Auto.ink(), ModeInk::Value, "auto: the value ink");
-    let mut under = Vec::new();
-    for name in aterm_types::scheme::builtin_names() {
-        let row = theme_row(name);
-        let ground = row.bg;
-        if contrast(PILL_AMBER, ground) < 4.5 {
-            under.push(name);
-        }
-        let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
-        w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(Mode::Auto);
-        w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
-        let at = ChipAt::cruise(row);
-        let block = w.block(7, row, now, at, Keep::Drawn);
-        let pill: String = format!("{} {}", Mode::Auto.glyph(), Mode::Auto.word());
-        let all = text(&block.lights);
-        let first = all
-            .find(&pill)
-            .map(|at| all[..at].chars().count())
-            .unwrap_or_else(|| panic!("{name}: the light drawn: {all:?}"));
-        for cell in block.lights[first..first + pill.chars().count()]
-            .iter()
-            .filter(|c| c.ch != ' ')
-        {
-            assert_eq!(cell.fg, at.value(), "{name}: the value ink");
-            assert!(
-                contrast(cell.fg, ground) >= 6.99,
-                "{name}: {:?} on {ground:?}",
-                cell.fg
-            );
-        }
-    }
-    assert!(
-        under.contains(&"Aterm Day"),
-        "NEGATIVE CONTROL: the pill's amber fails a light ground: {under:?}"
-    );
-}
-
 /// YOLO READS AS A VALUE, NEVER RED (the owner, 2026-11-02): on every built-in theme every cell
-/// of `yolo` (a rewritten row) and of `⏵⏵ bypass` (Claude's own row) wears the glass's value ink,
-/// at 7:1 or more, whatever grey the rule it sits on wears. NEGATIVE CONTROL: Claude's rule grey,
-/// floored to read, is not that ink on some ground, so the rule no longer decides it.
+/// of `yolo` wears the glass's value ink, at 7:1 or more, whatever grey the rule it sits on wears,
+/// and `lame` the row's own ink (`docs/DESIGN-yolo-binary-2026-11-04.md` §2). NEGATIVE CONTROL:
+/// Claude's rule grey, floored to read, is not that ink on some ground, so the rule no longer
+/// decides it.
 #[test]
 fn yolo_wears_the_value_ink_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
@@ -1638,33 +1595,27 @@ fn yolo_wears_the_value_ink_on_every_builtin_theme() {
         if crate::chrome_band::ensure_contrast([0x88; 3], ground, 4.5) != at.value() {
             apart.push(name);
         }
-        for rewritten in [true, false] {
+        for (mode, face, ink) in [
+            (Mode::Bypass, "yolo", at.value()),
+            (Mode::Plan, "lame", Inks::of(row, at).ink),
+        ] {
             let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
-            let s = w.sessions.get_mut(&7).expect("session 7");
-            s.shown.mode = Some(Mode::Bypass);
-            s.rewritten = rewritten;
+            w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(mode);
             w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
             let block = w.block(7, row, now, at, Keep::Drawn);
-            let face = match Mode::Bypass.glyph_on_glass(rewritten) {
-                "" => Mode::Bypass.word_on_glass(rewritten).to_owned(),
-                glyph => format!("{glyph} {}", Mode::Bypass.word_on_glass(rewritten)),
-            };
-            assert_eq!(face == "yolo", rewritten, "{name}");
             let all = text(&block.lights);
             let first = all
-                .find(&face)
+                .find(face)
                 .map(|at| all[..at].chars().count())
                 .unwrap_or_else(|| panic!("{name}: {face:?} drawn: {all:?}"));
-            for cell in block.lights[first..first + face.chars().count()]
-                .iter()
-                .filter(|c| c.ch != ' ')
-            {
-                assert_eq!(cell.fg, at.value(), "{name} rewritten={rewritten}");
+            for cell in block.lights[first..first + face.chars().count()].iter() {
+                assert_eq!(cell.fg, ink, "{name}: {face}");
                 assert_ne!(cell.fg, old_red, "{name}: never Claude's red");
+            }
+            if mode == Mode::Bypass {
                 assert!(
-                    contrast(cell.fg, ground) >= 6.99,
-                    "{name}: {:?} on {ground:?}",
-                    cell.fg
+                    contrast(ink, ground) >= 6.99,
+                    "{name}: {ink:?} on {ground:?}"
                 );
             }
         }

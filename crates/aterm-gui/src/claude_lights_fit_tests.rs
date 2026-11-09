@@ -26,12 +26,12 @@ fn blank() -> RenderCell {
     }
 }
 
-/// An instant an hour on: a refusal or a notice on show.
+/// An instant an hour on: a refusal on show.
 fn later() -> Instant {
     Instant::now() + Duration::from_secs(3600)
 }
 
-/// An instant a second before `w`'s clock: a refusal or a notice whose show ended.
+/// An instant a second before `w`'s clock: a refusal whose show ended.
 fn gone(w: &World) -> Instant {
     w.now
         .checked_sub(Duration::from_secs(1))
@@ -222,24 +222,9 @@ impl World {
     }
 }
 
-/// A toggle of the mode light in flight.
-fn pending() -> Pending {
-    Pending {
-        light: Light::Mode,
-        goal: Goal::On,
-        started: Mode::Plan,
-        mode_at_press: Mode::Plan,
-        seen: Vec::new(),
-        presses: 1,
-        deadline: later(),
-        next_poll: None,
-        held_mid_turn: false,
-    }
-}
-
 fn nothing(_: &mut World) {}
 
-/// Claude in plan mode: the light, a deviation, drawn beside Autopilot.
+/// Claude in plan mode: the light, `lame`, drawn beside Autopilot.
 fn planned(w: &mut World) {
     w.session().shown = Reading {
         mode: Some(Mode::Plan),
@@ -281,8 +266,8 @@ fn refusing(w: &mut World) {
     w.session().refused = Some((Light::Mode, Refusal::NotShown, later()));
 }
 
-fn noticing(w: &mut World) {
-    w.session().notice = Some((Light::Mode, later()));
+fn light_titled(w: &mut World) {
+    w.focus.1 = Some(Chip::Light(Light::Mode));
 }
 
 fn lit(w: &mut World) {
@@ -314,21 +299,34 @@ fn cases() -> Vec<Case> {
                 pill: true,
             };
         }),
-        ("a toggle in flight", nothing, |w| {
-            w.session().pending = Some(pending());
+        ("a click standing", nothing, |w| {
+            w.session().click = Some(ClickShown {
+                when: Some("at turn end"),
+            });
         }),
+        (
+            "a standing click's wait",
+            |w| {
+                w.session().click = Some(ClickShown {
+                    when: Some("at turn end"),
+                });
+            },
+            |w| {
+                w.session().click = Some(ClickShown {
+                    when: Some("once its dialog is answered"),
+                });
+            },
+        ),
         ("a refusal on show", nothing, refusing),
         ("a refusal's show ending", refusing, |w| {
             let gone = gone(w);
             w.session().refused.as_mut().expect("refused").2 = gone;
         }),
         ("a refusal's new reason", refusing, |w| {
-            w.session().refused = Some((Light::Mode, Refusal::StoppedMidTurn(Mode::Plan), later()));
+            w.session().refused = Some((Light::Mode, Refusal::Failed, later()));
         }),
-        ("a notice on show", nothing, noticing),
-        ("a notice's show ending", noticing, |w| {
-            let gone = gone(w);
-            w.session().notice.as_mut().expect("noticed").1 = gone;
+        ("the job words its title names", light_titled, |w| {
+            w.session().jobs = "1 shell".to_owned();
         }),
         ("Autopilot's word", nothing, land),
         ("an Autopilot click in flight", nothing, |w| {
@@ -738,7 +736,7 @@ fn typed(app: &App, session: u64, col: usize, ch: char) {
     super::gesture_tests::feed(app, session, format!("\x1b[22;{col}H{ch}").as_bytes());
 }
 
-/// The script: typing, Claude's mode deviating and back, the pointer and the
+/// The script: typing, Claude's mode leaving bypass and back, the pointer and the
 /// keyboard on each chip, a resize and back, an act lighting and dwelling
 /// out, the Autopilot word cycled, a landing, a timer armed and read, and a
 /// theme change.

@@ -12,6 +12,14 @@ use crate::{ContextQuery, ContextReply, Cpu, FileIdentity, Subject};
 
 pub const PURPOSE: &str = "native-bootstrap-graph-v1";
 pub const SUPPORT_PURPOSE: &str = "native-bootstrap-graph-support-v1";
+/// Exact original Targo purpose prefix, before project aliases/configuration.
+/// The Host independently selects and validates its managed held root image;
+/// these argv bytes grant no resources, enrollment or execution authority.
+pub const ROOT_ARGUMENT_PREFIX: [&str; 3] = ["--unverified", "resource", "bootstrap-runtime"];
+/// Native member/subgroup protocol flags before the purpose prefix. They do
+/// not substitute for original Host custody or a held-image declaration.
+pub const ROOT_WORKER_ARGUMENT_PREFIX: [&str; 2] =
+    ["--resource-worker-v3", "--resource-subgroups-v3"];
 pub const GNU_RIGHTS_MARKER: u8 = 0x72;
 pub const OUTPUT_RIGHTS_MARKER: u8 = 0x73;
 pub const DESCRIPTION_COUNT: usize = 2;

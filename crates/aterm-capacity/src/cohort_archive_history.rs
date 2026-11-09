@@ -228,13 +228,37 @@ impl History {
         receipt: &Value,
         compaction: Option<&envelope::Compaction>,
     ) -> io::Result<Self> {
+        Self::inspect_original(root, receipt, compaction, None)
+    }
+
+    pub(super) fn inspect_hot(
+        root: Option<File>,
+        receipt: &Value,
+        original: &Inventory,
+    ) -> io::Result<Self> {
+        let history = Self::inspect_original(root, receipt, None, Some(original))?;
+        original.recheck()?;
+        Ok(history)
+    }
+
+    fn inspect_original(
+        root: Option<File>,
+        receipt: &Value,
+        compaction: Option<&envelope::Compaction>,
+        original: Option<&Inventory>,
+    ) -> io::Result<Self> {
         let protocol = Protocol::read(receipt)?;
         if let Some(compaction) = compaction {
             compaction.require_receipt(receipt)?;
         }
+        let root = match (root, original) {
+            (Some(named), Some(original)) => Some(original.share_root(&named)?),
+            (None, Some(_)) => return Err(bad("hot archive lost its original history")),
+            (root, None) => root.map(Arc::new),
+        };
         let mut history = Self {
             receipt: receipt.clone(),
-            root: root.map(Arc::new),
+            root,
             origin: None,
             files: Vec::new(),
             directories: Vec::new(),
@@ -263,7 +287,13 @@ impl History {
                 return Err(bad("unbounded archived history"));
             }
             if let Some(expected) = protocol.finite.directories.get(name) {
-                let directory = Arc::new(open(root, name, false, true)?);
+                let directory = {
+                    let named = open(root, name, false, true)?;
+                    match original {
+                        Some(original) => original.share_directory(root, name, &named)?,
+                        None => Arc::new(named),
+                    }
+                };
                 let origin = directory_origin(&directory)?;
                 if identity(&directory, true)? != *expected {
                     return Err(bad("archived epoch directory was replaced"));
@@ -284,7 +314,13 @@ impl History {
                         .files
                         .get(&(name.to_owned(), child.to_owned()))
                         .ok_or_else(|| bad("unknown epoch payload is preserved"))?;
-                    let (file, body, stamp) = held_immutable(&directory, child)?;
+                    let (file, body, stamp) = match original {
+                        Some(original) => original.share_member(&directory, child, true)?,
+                        None => {
+                            let (file, body, stamp) = held_immutable(&directory, child)?;
+                            (Arc::new(file), body, stamp)
+                        }
+                    };
                     if stamp != *expected {
                         return Err(bad("archived epoch member changed or was restored"));
                     }
@@ -386,8 +422,14 @@ impl History {
                     .files
                     .get(&(String::new(), name.into()))
                     .ok_or_else(|| bad("unknown claim payload is preserved"))?;
-                let file = open(root, name, false, false)?;
-                let (body, stamp) = bytes(&file, MAX_ENTRY)?;
+                let (file, body, stamp) = match original {
+                    Some(original) => original.share_member(root, name, false)?,
+                    None => {
+                        let file = open(root, name, false, false)?;
+                        let (body, stamp) = bytes(&file, MAX_ENTRY)?;
+                        (Arc::new(file), body, stamp)
+                    }
+                };
                 if stamp != *expected {
                     return Err(bad("archived claim member changed or was restored"));
                 }

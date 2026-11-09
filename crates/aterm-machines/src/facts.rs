@@ -1616,7 +1616,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         fn run_tty(
             &self,
             cmd: &Cmd,
-            before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+            before: &mut dyn FnMut(&mut Cmd) -> Result<(), crate::port::RunFailed>,
         ) -> Result<Option<i32>, crate::port::RunFailed> {
             self.inner.run_tty(cmd, before)
         }

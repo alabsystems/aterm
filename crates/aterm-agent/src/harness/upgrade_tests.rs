@@ -204,6 +204,74 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
     }
 }
 
+/// A click's line ([`permission_click_argv`]) takes every permission flag off, in every spelling
+/// the table knows and wherever it stood, and then puts on the one its direction asks for: none
+/// for `yolo`, one `--dangerously-skip-permissions` for `lame`. The rest keeps its order, a `--`
+/// tail included, and an unknown spelling stays for the plan to refuse.
+#[test]
+fn a_click_takes_every_permission_flag_off_and_puts_its_own_on() {
+    let typed = argv(&[
+        "claude",
+        "--permission-mode",
+        "plan",
+        "--model",
+        "opus",
+        "--dangerously-skip-permissions",
+        "--settings",
+        "/s.json",
+        "--permission-mode=auto",
+        "--allow-dangerously-skip-permissions",
+        "--resume",
+        ID,
+        "--",
+        "--permission-mode",
+        "plan",
+    ]);
+    let rest = ["--model", "opus", "--settings", "/s.json", "--resume", ID];
+    let tail = ["--", "--permission-mode", "plan"];
+    let settings = permission_click_argv(&typed, PermissionTo::Settings);
+    let plain: Vec<&str> = std::iter::once("claude").chain(rest).chain(tail).collect();
+    assert_eq!(settings, argv(&plain), "yolo: no permission flag");
+    let bypass = permission_click_argv(&typed, PermissionTo::Bypass);
+    let skipped: Vec<&str> = ["claude", BYPASS_FLAG]
+        .into_iter()
+        .chain(rest)
+        .chain(tail)
+        .collect();
+    assert_eq!(bypass, argv(&skipped), "lame: the one bypass flag");
+    assert_eq!(
+        permission_click_argv(
+            &argv(&["claude", BYPASS_FLAG, BYPASS_FLAG]),
+            PermissionTo::Bypass
+        ),
+        argv(&["claude", BYPASS_FLAG]),
+        "never two"
+    );
+    assert_eq!(
+        rewrite_argv(&settings, ID),
+        Ok(argv(&[
+            "--model",
+            "opus",
+            "--settings",
+            "/s.json",
+            "--resume",
+            ID
+        ])),
+        "the resumed line carries none of them"
+    );
+    let unknown = argv(&["claude", "--dangerously-skip-permissions=1"]);
+    let kept = permission_click_argv(&unknown, PermissionTo::Settings);
+    assert_eq!(kept, unknown, "a spelling the table does not know stays");
+    assert_eq!(
+        rewrite_argv(&kept, ID),
+        Err(ArgvRefusal::UnknownFlag(
+            "--dangerously-skip-permissions".to_string()
+        )),
+        "and the plan refuses it"
+    );
+    assert!(permission_click_argv(&[], PermissionTo::Bypass).is_empty());
+}
+
 #[derive(Debug, Default)]
 struct Parsed {
     events: Vec<(String, Option<String>)>,

@@ -72,10 +72,13 @@ impl System for Spawns<'_> {
     fn run_tty(
         &self,
         cmd: &Cmd,
-        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
     ) -> Result<Option<i32>, RunFailed> {
-        self.note(cmd, None);
-        self.live.run_tty(cmd, before)
+        self.live.run_tty(cmd, &mut |final_cmd| {
+            before(final_cmd)?;
+            self.note(final_cmd, None);
+            Ok(())
+        })
     }
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.live.read_file(path)

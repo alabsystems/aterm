@@ -18,7 +18,7 @@ use crate::util::shell_quote as q;
 use crate::{Fail, Res, stop};
 
 pub(crate) const USAGE: &str = "\
-  runtime --app BUNDLE --record DIR [--lane measure|cursor|cat|compare|fabric|floors] [--image REF]
+  runtime --app BUNDLE --record DIR [--lane measure|cursor|rewind|rewind-control|cat|compare|fabric|floors] [--image REF]
       [--cpus N] [--memory-gib N] [--disk-gb N]
       [--display window|headless]
       [--count-mode sequential|together]
@@ -37,6 +37,8 @@ pub(crate) const USAGE: &str = "\
                 cursor-pacing burst, to qualify that clock before the full matrix.
                 --count-mode selects B14's sequential control or concurrent count rows, retained
                 with the experiment's provenance. Timing rows always run alone.
+                rewind runs only recording throughput; rewind-control runs the identical plan
+                with recording off in both arms, an A/A noise control with no recording verdict.
 ";
 
 const ROOT: &str = "/opt/aterm/.ubd/runtime.noindex";
@@ -90,7 +92,14 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
             "--lane"
                 if matches!(
                     value.as_str(),
-                    "measure" | "cursor" | "cat" | "compare" | "fabric" | "floors"
+                    "measure"
+                        | "cursor"
+                        | "rewind"
+                        | "rewind-control"
+                        | "cat"
+                        | "compare"
+                        | "fabric"
+                        | "floors"
                 ) =>
             {
                 lane.clone_from(value)
@@ -422,6 +431,59 @@ fn lane_args(lane: &str) -> Vec<String> {
     }
 }
 
+/// Cargo names executable artifacts, including under Trust's per-unit build layout. Refuse
+/// missing or conflicting paths instead of selecting an arbitrary executable from the cache.
+fn rewind_command(artifacts: &str, control: bool) -> Result<String, Fail> {
+    let mut executables =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for line in artifacts.lines() {
+        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["reason"].as_str() != Some("compiler-artifact") {
+            continue;
+        }
+        if let (Some(name), Some(exe)) = (v["target"]["name"].as_str(), v["executable"].as_str())
+            && exe.starts_with(&format!("{ROOT}/target.noindex/"))
+            && relative_member(exe.trim_start_matches('/'))
+        {
+            executables
+                .entry(name.into())
+                .or_default()
+                .insert(exe.into());
+        }
+    }
+    let one = |name: &str| -> Result<&str, Fail> {
+        let paths = executables
+            .get(name)
+            .filter(|p| p.len() == 1)
+            .ok_or_else(|| {
+                not_run(format!(
+                    "focused rewind needs exactly one Cargo executable for {name}"
+                ))
+            })?;
+        Ok(paths.first().expect("one path").as_str())
+    };
+    let bench = one("rewind")?;
+    let producer = one("fake-tui")?;
+    let subject = format!("{ROOT}/aterm.app/Contents/MacOS/aterm");
+    if control {
+        Ok(format!(
+            "{} --throughput-control {} {} {ROOT}/tmp",
+            q(bench),
+            q(&subject),
+            q(producer)
+        ))
+    } else {
+        Ok(format!(
+            "env ATERM_REWIND_BIN={} CARGO_BIN_EXE_fake-tui={} {} --filter recording_keeps_parse_throughput",
+            q(&subject),
+            q(producer),
+            q(bench)
+        ))
+    }
+}
+
 fn environment(jobs: u32) -> String {
     // This is the guest's compiler, not an override of the host's flags or toolchain.
     format!(
@@ -695,13 +757,30 @@ fn run_in(ask: &Ask) -> Res {
             ));
         }
     }
-    let command = lane_args(&ask.lane)
-        .iter()
-        .map(|a| q(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let focused = matches!(ask.lane.as_str(), "rewind" | "rewind-control");
+    let command = if focused {
+        let out = vm.exec(&format!("{} {ROOT}/toolchain/bin/targo --unverified bench --profile test -p aterm-conformance --bench rewind --no-run --message-format=json", environment(admitted.jobs)), BUILD)?;
+        write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
+        write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
+        if !out.status.success() {
+            return Err(not_run("focused rewind build failed; see prebuild.stderr"));
+        }
+        rewind_command(
+            &String::from_utf8_lossy(&out.stdout),
+            ask.lane == "rewind-control",
+        )?
+    } else {
+        format!(
+            "{ROOT}/target.noindex/debug/aterm-verify {}",
+            lane_args(&ask.lane)
+                .iter()
+                .map(|a| q(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
     let untimed = format!(
-        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {ROOT}/target.noindex/debug/aterm-verify {command}",
+        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {command}",
         environment(admitted.jobs),
         ask.count_mode
     );
@@ -721,7 +800,7 @@ fn run_in(ask: &Ask) -> Res {
     )?;
     let mut codes = vec![warm.status.code()];
     let invocation = format!(
-        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {ROOT}/target.noindex/debug/aterm-verify {command}",
+        "{} export ATERM_MEASURE_COUNT_MODE={}; export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {command}",
         environment(admitted.jobs),
         ask.count_mode
     );
@@ -778,6 +857,50 @@ fn run_in(ask: &Ask) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_rewind_uses_cargos_artifacts_and_keeps_controls_explicit() {
+        let row = |name: &str, path: &str| {
+            json!({"reason":"compiler-artifact", "target":{"name":name}, "executable":path})
+                .to_string()
+        };
+        let artifacts = format!(
+            "{}\n{}",
+            row("rewind", &format!("{ROOT}/target.noindex/build/rewind")),
+            row("fake-tui", &format!("{ROOT}/target.noindex/debug/fake-tui"))
+        );
+        let recording = rewind_command(&artifacts, false).unwrap();
+        assert!(recording.contains("--filter recording_keeps_parse_throughput"));
+        assert!(!recording.contains("--throughput-control"));
+        let control = rewind_command(&artifacts, true).unwrap();
+        assert!(control.contains("--throughput-control"));
+        assert!(!control.contains("--filter"));
+        assert!(rewind_command(&row("rewind", "/tmp/foreign"), false).is_err());
+        assert!(
+            rewind_command(
+                &format!(
+                    "{artifacts}\n{}",
+                    row("rewind", &format!("{ROOT}/target.noindex/other"))
+                ),
+                false
+            )
+            .is_err(),
+            "negative control: ambiguous cached builds cannot be guessed"
+        );
+        for lane in ["rewind", "rewind-control"] {
+            assert!(
+                parse(&[
+                    "--app".into(),
+                    "a".into(),
+                    "--record".into(),
+                    "r".into(),
+                    "--lane".into(),
+                    lane.into()
+                ])
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn runtime_role_probe() {

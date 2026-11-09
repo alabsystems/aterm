@@ -3,13 +3,13 @@
 
 //! Cut gate accounting. CPU is the same reaped-child scope as step-child-finished;
 //! self CPU is separate so hashing in the cutter is visible too. Nested gates are
-//! inclusive. The exclusive row subtracts immediate children, so the root's
-//! remainder and every named phase account for all work without double counting.
+//! inclusive. Serial exclusive rows subtract immediate children. Concurrent
+//! gates retain parent identity and wall intervals; their per-worker CPU and
+//! the parent's exclusive costs are unknown because process counters overlap.
 
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const EXEC_PID_ENV: &str = "ATERM_RELEASE_EXEC_PID";
@@ -39,6 +39,7 @@ struct Cost {
     wall: f64,
     own: Option<f64>,
     child: Option<f64>,
+    parallel: bool,
 }
 
 impl Default for Cost {
@@ -47,6 +48,7 @@ impl Default for Cost {
             wall: 0.0,
             own: Some(0.0),
             child: Some(0.0),
+            parallel: false,
         }
     }
 }
@@ -56,6 +58,7 @@ impl Cost {
         self.wall += other.wall;
         self.own = self.own.zip(other.own).map(|(a, b)| a + b);
         self.child = self.child.zip(other.child).map(|(a, b)| a + b);
+        self.parallel |= other.parallel;
     }
 
     fn excluding(self, children: Self) -> Self {
@@ -67,12 +70,13 @@ impl Cost {
             wall: (self.wall - children.wall).max(0.0),
             own: subtract(self.own, children.own),
             child: subtract(self.child, children.child),
+            parallel: self.parallel || children.parallel,
         }
     }
 }
 
 thread_local! {
-    static STACK: RefCell<Vec<(u64, Weak<RefCell<Cost>>)>> = const { RefCell::new(Vec::new()) };
+    static STACK: RefCell<Vec<(u64, Weak<Mutex<Cost>>)>> = const { RefCell::new(Vec::new()) };
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -90,29 +94,29 @@ pub(crate) fn measure<T>(name: &str, run: impl FnOnce() -> T) -> T {
     result
 }
 
-pub(crate) struct Timer<'a> {
-    name: &'a str,
+pub(crate) struct Timer {
+    name: String,
     start: Instant,
     at: u64,
     cpu: Option<aterm_sysprobe::jobs::Counters>,
-    children: Rc<RefCell<Cost>>,
-    parent: Option<Weak<RefCell<Cost>>>,
+    children: Arc<Mutex<Cost>>,
+    parent: Option<Weak<Mutex<Cost>>>,
     id: u64,
     parent_id: Option<u64>,
     log: Option<std::path::PathBuf>,
 }
 
-impl<'a> Timer<'a> {
-    pub(crate) fn new(name: &'a str) -> Self {
-        let children = Rc::new(RefCell::new(Cost::default()));
+impl Timer {
+    pub(crate) fn new(name: &str) -> Self {
+        let children = Arc::new(Mutex::new(Cost::default()));
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let parent = STACK.with_borrow_mut(|stack| {
             let parent = stack.last().cloned();
-            stack.push((id, Rc::downgrade(&children)));
+            stack.push((id, Arc::downgrade(&children)));
             parent
         });
         Self {
-            name,
+            name: name.to_owned(),
             start: Instant::now(),
             at: now(),
             cpu: aterm_sysprobe::jobs::counters_of(std::process::id()),
@@ -124,8 +128,28 @@ impl<'a> Timer<'a> {
         }
     }
 
+    /// Carry gate identity across a worker boundary. Process CPU counters cannot
+    /// attribute concurrent requests, so their CPU and the parent's exclusive
+    /// accounting are explicitly unknown rather than counted more than once.
+    pub(crate) fn parallel_parent() -> impl Fn(&str) -> Timer + Send + Sync {
+        let parent = STACK.with_borrow(|stack| stack.last().cloned());
+        move |name| {
+            let mut timer = Timer::new(name);
+            timer.parent_id = parent.as_ref().map(|(id, _)| *id);
+            timer.parent = parent.as_ref().map(|(_, cost)| cost.clone());
+            timer.cpu = None;
+            if let Some(cost) = timer.parent.as_ref().and_then(Weak::upgrade) {
+                let mut cost = cost.lock().unwrap();
+                cost.own = None;
+                cost.child = None;
+                cost.parallel = true;
+            }
+            timer
+        }
+    }
+
     /// Keep the same event in the operation's log, including when an error unwinds it.
-    pub(crate) fn start(log: &std::path::Path, name: &'a str) -> Self {
+    pub(crate) fn start(log: &std::path::Path, name: &str) -> Self {
         use std::io::Write as _;
         let mut timer = Self::new(name);
         timer.log = Some(log.to_owned());
@@ -156,7 +180,7 @@ fn delta(before: Option<u64>, after: Option<u64>) -> aterm_json::Value {
         .map_or(aterm_json::Value::Null, |ns| (ns as f64 / 1e9).into())
 }
 
-impl Drop for Timer<'_> {
+impl Drop for Timer {
     fn drop(&mut self) {
         let after = aterm_sysprobe::jobs::counters_of(std::process::id());
         let child = delta(
@@ -172,11 +196,13 @@ impl Drop for Timer<'_> {
             wall,
             own: own.as_f64(),
             child: child.as_f64(),
+            parallel: self.children.lock().unwrap().parallel,
         };
-        let exclusive = cost.excluding(*self.children.borrow());
+        let children = *self.children.lock().unwrap();
+        let exclusive = cost.excluding(children);
         STACK.with_borrow_mut(|stack| stack.retain(|(id, _)| *id != self.id));
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-            parent.borrow_mut().add(cost);
+            parent.lock().unwrap().add(cost);
         }
         println!(
             "  timing     {}: wall {:.3}s · self CPU {}s · child CPU {}s (inclusive)",
@@ -190,7 +216,7 @@ impl Drop for Timer<'_> {
             "execution_s": wall, "self_cpu_s": own,
             "child_cpu": {"scope": "reaped-child-and-waited-descendants", "observed_s": child},
             "inclusive": true,
-            "exclusive": {"execution_s": exclusive.wall, "self_cpu_s": exclusive.own, "child_cpu_s": exclusive.child}
+            "exclusive": {"execution_s": (!exclusive.parallel).then_some(exclusive.wall), "self_cpu_s": exclusive.own, "child_cpu_s": exclusive.child}
         });
         println!("release-event: {event}");
         if let Some(path) = &self.log {
@@ -225,22 +251,47 @@ mod tests {
         assert_eq!(measure("return-value", || 7), 7);
     }
 
+    /// NEGATIVE CONTROL: a plain worker-local Timer loses its parent and
+    /// reports process-wide CPU as though that worker alone consumed it.
+    #[test]
+    fn parallel_gates_keep_parent_identity_without_double_counting_cpu() {
+        let root = Timer::new("parent");
+        let worker_timer = Timer::parallel_parent();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let timer = worker_timer("worker");
+                    assert_eq!(timer.parent_id, Some(root.id));
+                    assert!(timer.cpu.is_none());
+                })
+                .join()
+                .unwrap();
+        });
+        let children = *root.children.lock().unwrap();
+        assert!(children.parallel);
+        assert!(children.own.is_none());
+        assert!(children.child.is_none());
+    }
+
     #[test]
     fn exclusive_cost_keeps_between_gate_work_without_counting_nested_work_twice() {
         let total = Cost {
             wall: 20.0,
             own: Some(8.0),
             child: Some(12.0),
+            parallel: false,
         };
         let phase = Cost {
             wall: 10.0,
             own: Some(4.0),
             child: Some(9.0),
+            parallel: false,
         };
         let nested = Cost {
             wall: 3.0,
             own: Some(1.0),
             child: Some(2.0),
+            parallel: false,
         };
         let mut sum = total.excluding(phase);
         sum.add(phase.excluding(nested));
@@ -261,7 +312,7 @@ mod tests {
         assert_eq!(child.parent_id, Some(root.id));
         assert_ne!(child.id, root.id);
         drop(child);
-        assert!(root.children.borrow().wall > 0.0);
+        assert!(root.children.lock().unwrap().wall > 0.0);
         assert_eq!(STACK.with_borrow(Vec::len), 1);
         drop(root);
         assert!(STACK.with_borrow(Vec::is_empty));

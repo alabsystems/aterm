@@ -341,7 +341,6 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
             .get_mut(&session)
             .expect("session lights");
         s.autopilot_pending = Some((Autopilot::Land, Instant::now() + Duration::from_secs(60)));
-        s.rewritten = true;
     }
     arm(&mut app, false);
     policy(&mut app, MASTER_OFF);
@@ -364,8 +363,8 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
         "agy's bare off read-back updates SessionLights::autopilot to MasterOff"
     );
     assert!(
-        s.autopilot_pending.is_none() && !s.rewritten,
-        "agy's bare off read-back clears in-flight autopilot_pending and rewritten"
+        s.autopilot_pending.is_none(),
+        "agy's bare off read-back clears in-flight autopilot_pending"
     );
     app.windows
         .get_mut(&wid)

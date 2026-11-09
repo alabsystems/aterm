@@ -18,7 +18,7 @@ pub enum InputSetupScope {
 }
 
 /// One bounded, canonical set of native keyboard service identities.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputServiceSet(Vec<u64>);
 
 impl InputServiceSet {
@@ -35,6 +35,45 @@ impl InputServiceSet {
             return Err("duplicate keyboard service identity".into());
         }
         Ok(Self(ids))
+    }
+
+    /// Observe current membership and the services whose complete native state is readable.
+    /// Readability is a wake fact only; it never certifies a mapping or admits a setter.
+    ///
+    /// # Errors
+    /// The observation has unbounded, zero or duplicate service identities.
+    pub fn observed(
+        rows: &[aterm_machines::port::KeyboardServiceObservation],
+    ) -> Result<(Self, Self), String> {
+        let present = Self::new(rows.iter().map(|row| row.registry()).collect())?;
+        let readable = Self::new(
+            rows.iter()
+                .filter(|row| row.unread().is_none())
+                .map(|row| row.registry())
+                .collect(),
+        )?;
+        Ok((present, readable))
+    }
+
+    /// Keep previously observed positive facts only for services still present in this run.
+    /// This scheduling history supplies no current mapping or mutation authority.
+    pub fn retain_present_from(&mut self, before: &Self, present: &Self) {
+        self.0.retain(|id| present.0.binary_search(id).is_ok());
+        self.0.extend(
+            before
+                .0
+                .iter()
+                .filter(|id| present.0.binary_search(id).is_ok())
+                .copied(),
+        );
+        self.0.sort_unstable();
+        self.0.dedup();
+    }
+
+    /// Whether a service gained a positive observation; errors and lost reads add nothing.
+    #[must_use]
+    pub fn gained_from(&self, before: &Self) -> bool {
+        self.0.iter().any(|id| before.0.binary_search(id).is_err())
     }
 
     /// Take the normalized identities without another allocation.

@@ -9,6 +9,10 @@ use crate::LAB;
 use crate::paths::{paths, valid_tag};
 use crate::util::{atomic_write, shell_quote, shell_unquote};
 
+/// `lab claude --stored`'s login directory in the scratch, then the tab's `CLAUDE_CONFIG_DIR`
+/// ([`Run::claude_dir`]).
+pub const STORED_LOGIN: &str = "stored-login";
+
 /// Everything `env.sh` says of a lab.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Run {
@@ -102,6 +106,9 @@ pub struct Run {
     pub broker_pid: i32,
     /// `1` when `up --tab-strip` gave the instance its one-row tab strip (`tab_strip_rows = 1`).
     pub tab_strip: String,
+    /// [`STORED_LOGIN`] when the tab's last `lab claude` ran on `--stored`'s login directory, its
+    /// `CLAUDE_CONFIG_DIR` then ([`Run::claude_dir`]); empty otherwise.
+    pub claude_login: String,
 }
 
 impl Run {
@@ -169,6 +176,7 @@ impl Run {
             ("FABRIC", self.fabric.clone()),
             ("BROKER_PID", self.broker_pid.to_string()),
             ("TAB_STRIP", self.tab_strip.clone()),
+            ("CLAUDE_LOGIN", self.claude_login.clone()),
         ]
     }
 
@@ -234,6 +242,7 @@ impl Run {
                 "FABRIC" => r.fabric = v,
                 "BROKER_PID" => r.broker_pid = pid(&v),
                 "TAB_STRIP" => r.tab_strip = v,
+                "CLAUDE_LOGIN" => r.claude_login = v,
                 _ => {}
             }
         }
@@ -327,10 +336,21 @@ impl Run {
         )
     }
 
-    /// `scratch/home/.claude/settings.json`.
+    /// The `CLAUDE_CONFIG_DIR` the tab's Claude Code reads: `scratch/stored-login` after `lab
+    /// claude --stored` ([`STORED_LOGIN`]), else the scratch home's `.claude`.
+    #[must_use]
+    pub fn claude_dir(&self) -> PathBuf {
+        if self.claude_login == STORED_LOGIN {
+            self.w.join(STORED_LOGIN)
+        } else {
+            self.w.join("home/.claude")
+        }
+    }
+
+    /// The `settings.json` the tab's Claude Code reads ([`Run::claude_dir`]).
     #[must_use]
     pub fn settings(&self) -> PathBuf {
-        self.w.join("home/.claude/settings.json")
+        self.claude_dir().join("settings.json")
     }
 
     /// The instance's state root, `scratch/state`.
@@ -524,6 +544,7 @@ mod tests {
             fabric: "/tmp/at.AbCd/fabric".into(),
             broker_pid: 14,
             tab_strip: "1".into(),
+            claude_login: STORED_LOGIN.into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

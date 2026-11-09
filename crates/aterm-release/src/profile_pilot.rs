@@ -69,6 +69,13 @@ pub(crate) struct Options {
     anatomy: bool,
 }
 
+impl Options {
+    /// One arm is a diagnostic take; comparing arms uses the full two-take experiment.
+    fn diagnostic_anatomy(&self) -> bool {
+        self.anatomy && self.takes == 1
+    }
+}
+
 pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
     let mut takes_named = false;
@@ -108,11 +115,13 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         }
     }
     if opts.anatomy {
-        if opts.inspect.is_some() || !opts.arms.is_empty() || takes_named {
-            return Err("--anatomy takes no --arm, --inspect or --takes override".into());
+        if opts.inspect.is_some() || takes_named {
+            return Err("--anatomy takes no --inspect or --takes override".into());
         }
-        opts.arms.push(Arm::Fat1);
-        opts.takes = 1;
+        if opts.arms.is_empty() {
+            opts.arms.push(Arm::Fat1);
+        }
+        opts.takes = if opts.arms.len() == 1 { 1 } else { 2 };
         return Ok(opts);
     }
     if opts.inspect.is_some() && !opts.arms.is_empty() {
@@ -419,9 +428,9 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
                 "vm_rows": "not run: Q4 profile runtime qualification is not integrated", "linux_rows": "not run",
                 "anatomy": opts.anatomy,
-                "reproducibility": if opts.anatomy { "not judged: one take" } else { "pending" },
-                "library_benches": if opts.anatomy { "not run: anatomy only" } else { "pending" },
-                "wasm_ceilings": if opts.anatomy { "not run: anatomy only" } else { "pending" }});
+                "reproducibility": if opts.diagnostic_anatomy() { "not judged: one take" } else { "pending" },
+                "library_benches": if opts.diagnostic_anatomy() { "not run: anatomy only" } else { "pending" },
+                "wasm_ceilings": if opts.diagnostic_anatomy() { "not run: anatomy only" } else { "pending" }});
             crate::durable::write_fresh(&root.join("report.json"), report.to_string())
                 .map_err(|e| e.to_string())?;
             if let Some(error) = inspection_error {
@@ -436,7 +445,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
     {
         return Err("pilot compiler or SDK inputs changed during the comparison".into());
     }
-    if opts.anatomy {
+    if opts.diagnostic_anatomy() {
         println!(
             "profile-pilot: anatomy recorded; one take does not judge reproducibility; report {}",
             root.join("report.json").display()
@@ -455,7 +464,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         b"vte-engine vte-marks wasm\n",
     )
     .map_err(|e| e.to_string())?;
-    let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
+    let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows, "anatomy": opts.anatomy,
         "vm_rows": "not run: Q4 profile runtime qualification is not integrated",
         "linux_rows": if cfg!(target_os = "linux") { "recorded" } else { "not run: invoke on native Linux" },
         "library_benches": "commands completed with exit 0; judgments in per-arm host-checks-{1,2}/vte-engine.log and vte-marks.log",
@@ -848,13 +857,38 @@ mod tests {
     }
 
     #[test]
-    fn anatomy_is_one_baseline_take_without_a_qualification_claim() {
+    fn anatomy_comparisons_use_two_interleaved_takes_and_single_arms_are_diagnostic() {
         let opts = parse(["--anatomy"].into_iter().map(str::to_owned)).unwrap();
         assert_eq!(order(&opts), vec![(0, Arm::Fat1)]);
         assert!(opts.anatomy);
+        assert!(opts.diagnostic_anatomy());
+        let candidate = parse(
+            ["--anatomy", "--arm", "fat16"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(order(&candidate), vec![(0, Arm::Fat16)]);
+        assert!(candidate.diagnostic_anatomy());
+        let comparison = parse(
+            ["--anatomy", "--arm", "fat1", "--arm", "fat16"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(!comparison.diagnostic_anatomy());
+        assert_eq!(
+            order(&comparison),
+            vec![
+                (0, Arm::Fat1),
+                (0, Arm::Fat16),
+                (1, Arm::Fat16),
+                (1, Arm::Fat1)
+            ]
+        );
         for flags in [
             vec!["--takes", "1", "--arm", "fat1"],
-            vec!["--anatomy", "--arm", "fat1-lines"],
+            vec!["--anatomy", "--arm", "fat16", "--arm", "fat16"],
             vec!["--anatomy", "--inspect", "take"],
             vec!["--anatomy", "--takes", "1"],
             vec!["--anatomy", "--takes", "2"],

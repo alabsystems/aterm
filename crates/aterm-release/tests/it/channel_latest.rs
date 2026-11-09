@@ -343,6 +343,12 @@ impl<'a> FakeChannel<'a> {
 }
 
 impl ChannelRelease for FakeChannel<'_> {
+    fn upload_payloads(&mut self, files: &[PathBuf]) -> Result<()> {
+        for file in files {
+            self.upload(file)?;
+        }
+        Ok(())
+    }
     fn head_made(&mut self) -> Result<bool> {
         if self.github.forget_head || self.github.journal_release != Some(self.id) {
             return Ok(false);
@@ -548,6 +554,13 @@ fn the_adopted_source_release_takes_latest_only_after_its_appcast_pair() {
     let uploads = &github.uploads;
     let sig = position(uploads, manifest_out::MANIFEST_SIG_ASSET);
     let toml = position(uploads, manifest_out::MANIFEST_ASSET);
+    // NEGATIVE CONTROL: placing the signature before even one payload breaks
+    // this invariant, even if the appcast itself is still the last upload.
+    assert_eq!(
+        sig,
+        uploads.len() - 2,
+        "every payload must precede the appcast pair"
+    );
     assert!(
         sig < toml,
         "the signature must land before the appcast: {uploads:?}"
@@ -1265,6 +1278,12 @@ impl ModelBound<'_> {
 }
 
 impl ChannelRelease for ModelBound<'_> {
+    fn upload_payloads(&mut self, files: &[PathBuf]) -> Result<()> {
+        for file in files {
+            self.upload(file)?;
+        }
+        Ok(())
+    }
     fn head_made(&mut self) -> Result<bool> {
         let made = self.inner.head_made()?;
         if made != (self.state["headed"] == 1) {

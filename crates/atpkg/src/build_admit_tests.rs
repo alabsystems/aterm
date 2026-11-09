@@ -805,6 +805,128 @@ fn a_succeeded_build_keeps_its_peak_and_a_failed_one_keeps_none() {
     assert_eq!(next.claim().record().need.mem, 6 * GIB, "5 GiB and a fifth");
 }
 
+/// A TEST BUILD'S RUN PHASE IS KEPT APART FROM ITS COMPILE, AND ITS NEXT CLAIM ASKS IT (CAP3): a
+/// build whose tree ran a program it built keeps that phase's peak under its run phase's key
+/// beside its whole peak, and the next claim of its key asks it, a fifth more and at least 1 GiB
+/// more, as the memory its holder steps it down to once its tree runs what it built: 10 GiB kept
+/// whole and 2 GiB of run claim 12 GiB stepping to 3. A run heavier than the compile is the next
+/// claim's peak, with no step: 15 GiB of run claims 18 GiB from its start. NEGATIVE CONTROL: a
+/// build that never ran what it built keeps no run phase, and the first claim asks none.
+#[test]
+fn a_test_builds_run_phase_is_kept_apart_and_its_next_claim_asks_it() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(61));
+    let b = test_build();
+    let claimed = |s: &Seat<'_>| match admit(&b, dir.path(), s, &mut |_| {}) {
+        Admission::Claimed(h) => h,
+        other => panic!("expected a claim, got {other:?}"),
+    };
+    let first = claimed(&s);
+    assert_eq!(first.claim().record().need.mem, 12 * GIB, "cold");
+    assert_eq!(
+        first.claim().record().need.run_mem,
+        None,
+        "no run phase kept"
+    );
+    let ended = first.let_go();
+    assert_eq!(
+        ended.keep_run(&BuildEnd::Success(true), None, &mut |_| {}),
+        None,
+        "it never ran what it built"
+    );
+    assert_eq!(
+        ended.keep_run(&BuildEnd::Success(true), Some(2 * GIB), &mut |_| {}),
+        Some(2 * GIB)
+    );
+    assert_eq!(
+        ended.keep(BuildEnd::Success(true), 10 * GIB, &mut |_| {}),
+        Some(10 * GIB)
+    );
+    let next = claimed(&s);
+    assert_eq!(
+        next.claim().record().need.mem,
+        12 * GIB,
+        "10 GiB and a fifth"
+    );
+    assert_eq!(
+        next.claim().record().need.run_mem,
+        Some(3 * GIB),
+        "2 GiB and at least 1 GiB more"
+    );
+    let ended = next.let_go();
+    assert_eq!(
+        ended.keep_run(&BuildEnd::Success(true), Some(15 * GIB), &mut |_| {}),
+        Some(15 * GIB)
+    );
+    drop(ended);
+    let heavy = claimed(&s);
+    assert_eq!(
+        heavy.claim().record().need.mem,
+        18 * GIB,
+        "its run phase's peak"
+    );
+    assert_eq!(heavy.claim().record().need.run_mem, None, "no step");
+}
+
+/// A WIDER SELECTION'S RUN PHASE ONLY BOUNDS A NARROWER BUILD'S STEP (CAP3): with a wider
+/// selection's whole run (10 GiB) and run phase (6 GiB) kept in its checkout, a narrower test build
+/// with nothing of its own claims the wider whole run's 12 GiB and plans its step to the wider run
+/// phase's 7.2 GiB. Once its own whole run is kept at 0.5 GiB, it claims 1.5 GiB and plans no
+/// step: its own whole run bounds its run phase, which the wider figure never raises. A run phase
+/// of its own kept at 2 GiB does raise it, to 3 GiB. NEGATIVE CONTROL: a front that took any run
+/// figure as the peak it claims at least would claim 7.2 GiB for the 0.5 GiB build.
+#[test]
+fn a_wider_selections_run_phase_bounds_a_narrower_builds_step_and_never_raises_it() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(67));
+    let narrow = test_build();
+    let wide = classify(
+        &words(&["--unverified", "test", "-p", "a", "-p", "b"]),
+        Tool::Targo,
+    )
+    .expect("claims");
+    let book = dir.path().join("targo-memory.json");
+    let wide_key = key(&wide, dir.path());
+    Records::keep(&book, wide_key.clone(), 10 * GIB, 1).expect("kept");
+    Records::keep(&book, aterm_capacity::phase::run_key(&wide_key), 6 * GIB, 2).expect("kept");
+    let claimed = |s: &Seat<'_>| match admit(&narrow, dir.path(), s, &mut |_| {}) {
+        Admission::Claimed(h) => h,
+        other => panic!("expected a claim, got {other:?}"),
+    };
+    let mem = |h: &Held| {
+        let need = &h.claim().record().need;
+        (need.mem, need.run_mem)
+    };
+    let wide_run = aterm_capacity::peak_claim(6 * GIB);
+    let first = claimed(&s);
+    assert_eq!(
+        mem(&first),
+        (12 * GIB, Some(wide_run)),
+        "the wider whole run, stepping to the wider run phase"
+    );
+    drop(first);
+    let narrow_key = key(&narrow, dir.path());
+    Records::keep(&book, narrow_key.clone(), GIB / 2, 3).expect("kept");
+    let own = claimed(&s);
+    assert_eq!(
+        mem(&own),
+        (aterm_capacity::peak_claim(GIB / 2), None),
+        "its own whole run bounds it"
+    );
+    drop(own);
+    Records::keep(
+        &book,
+        aterm_capacity::phase::run_key(&narrow_key),
+        2 * GIB,
+        4,
+    )
+    .expect("kept");
+    let heavy = claimed(&s);
+    assert_eq!(mem(&heavy), (3 * GIB, None), "its own run phase raises it");
+}
+
 /// THE BUILD ROW READS THE RECORD (Continuum TM-1): a real claim's run names the checkout its
 /// record holds (a laid record takes its need's, leaving the need's own field empty), so its row's
 /// `dir=` is that checkout's digest, and finds the claim held in its ledger: a holder's claim's

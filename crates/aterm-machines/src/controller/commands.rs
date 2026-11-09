@@ -234,7 +234,7 @@ fn make_key(sys: &dyn System, path: &Path, comment: &str, asked: bool) -> Result
             .arg(path.as_os_str())
     };
     if asked {
-        return match sys.run_tty(&keygen(&["-t", "ed25519"]), &mut || Ok(())) {
+        return match sys.run_tty(&keygen(&["-t", "ed25519"]), &mut |_| Ok(())) {
             Ok(Some(0)) => require_passphrase(sys, path),
             Ok(code) => Err(format!("did not make the key (status {code:?})")),
             Err(e) => Err(e.to_string()),
@@ -252,7 +252,7 @@ fn add_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
         &Cmd::new("/usr/bin/ssh-keygen")
             .args(["-p", "-f"])
             .arg(path.as_os_str()),
-        &mut || Ok(()),
+        &mut |_| Ok(()),
     ) {
         Ok(Some(0)) => require_passphrase(sys, path),
         Ok(code) => Err(format!("did not change the passphrase (status {code:?})")),
@@ -804,6 +804,21 @@ fn instance_header(pid: u32, tabs: &[&crate::protocol::HostedSession], dims: &st
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionExtent {
+    Unobserved,
+    Partial,
+    Complete,
+}
+
+fn session_extent(inventory: Option<&crate::protocol::SessionSnapshot>) -> SessionExtent {
+    match inventory {
+        Some(inventory) if inventory.complete => SessionExtent::Complete,
+        Some(inventory) if !inventory.rows.is_empty() => SessionExtent::Partial,
+        _ => SessionExtent::Unobserved,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_host_tabs_rows(
     host_name: &str,
@@ -814,10 +829,10 @@ fn print_host_tabs_rows(
     services_display: &str,
     why_not: Option<&str>,
     vitals: Option<&crate::protocol::HostVitals>,
-    sessions: Option<&[crate::protocol::HostedSession]>,
+    inventory: Option<&crate::protocol::SessionSnapshot>,
 ) {
-    let observed = sessions.is_some();
-    let sessions = sessions.unwrap_or_default();
+    let extent = session_extent(inventory);
+    let sessions = inventory.map_or(&[][..], |inventory| inventory.rows.as_slice());
     let mut by_instance: BTreeMap<u32, Vec<&crate::protocol::HostedSession>> = BTreeMap::new();
     for s in sessions {
         by_instance.entry(s.instance_pid).or_default().push(s);
@@ -837,15 +852,20 @@ fn print_host_tabs_rows(
     let active_ai = working_ai_sessions(sessions);
     let summary = if let Some(why) = why_not {
         format!("unreachable ({})", shown(why))
-    } else if !observed {
+    } else if extent == SessionExtent::Unobserved {
         "sessions unobserved".to_owned()
     } else if tab_count == 0 {
         "0 aterm · 0 tabs · no AI CLI".to_owned()
     } else {
-        format!(
+        let counts = format!(
             "{inst_count} aterm · {tab_count} {} · {ai_count} AI ({active_ai} working)",
             if tab_count == 1 { "tab" } else { "tabs" }
-        )
+        );
+        if extent == SessionExtent::Complete {
+            counts
+        } else {
+            format!("observed {counts} · inventory incomplete")
+        }
     };
     outln!(
         "{:<35}  {:<13}  {:<42}  {:<38}  {:<34}  {:<24}  {}",
@@ -1070,7 +1090,8 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     "os_ssh": os_display,
                     "services": local_services,
                     "vitals": local_vitals,
-                    "sessions": local_sessions,
+                    "sessions": local_sessions.rows,
+                    "sessions_complete": local_sessions.complete,
                 }))
                 .unwrap_or_default()
             );
@@ -1106,10 +1127,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 (false, Some(why.why()), saved_hello(&state))
             }
         };
-        let sessions = hello_opt
-            .as_ref()
-            .map(|h| h.sessions.as_slice())
-            .unwrap_or(&[]);
+        let inventory = hello_opt.as_ref().map(|h| &h.sessions);
         let vitals = hello_opt.as_ref().and_then(|h| h.vitals.as_ref());
         let host_name = inventory::canonical_host_name(&r.host.name, &inv.names);
         let hw_display = hello_opt
@@ -1136,7 +1154,8 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     "os_version": hello_opt.as_ref().map(|h| h.os_version.as_str()).unwrap_or(""),
                     "os_build": hello_opt.as_ref().map(|h| h.os_build.as_str()).unwrap_or(""),
                     "vitals": vitals,
-                    "sessions": sessions,
+                    "sessions": inventory.map_or(&[][..], |inventory| inventory.rows.as_slice()),
+                    "sessions_complete": inventory.is_some_and(|inventory| inventory.complete),
                 }))
                 .unwrap_or_default()
             );
@@ -1150,7 +1169,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 "ssh",
                 why_not.as_deref(),
                 vitals,
-                Some(sessions),
+                inventory,
             );
         }
     }
@@ -1304,6 +1323,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                         "services": svc_list,
                         "vitals": vitals,
                         "sessions": Option::<&[crate::protocol::HostedSession]>::None,
+                        "sessions_complete": false,
                     }))
                     .unwrap_or_default()
                 );
@@ -2981,7 +3001,7 @@ fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), 
     );
     match env.sys.run_tty(
         &ssh_add(&sock, &["-t", AGENT_KEY_LIFETIME]).arg(key.as_os_str()),
-        &mut || Ok(()),
+        &mut |_| Ok(()),
     ) {
         Ok(Some(0)) => Ok((
             Signing::Agent,
@@ -6427,11 +6447,56 @@ mod tests {
     }
 
     #[test]
+    fn session_extent_requires_a_complete_observation_before_claiming_an_empty_host() {
+        use crate::protocol::SessionSnapshot;
+        assert_eq!(session_extent(None), SessionExtent::Unobserved);
+        let mut inventory = SessionSnapshot::default();
+        assert_eq!(session_extent(Some(&inventory)), SessionExtent::Unobserved);
+        inventory.rows.push(crate::protocol::HostedSession {
+            instance_pid: 42,
+            local_id: 1,
+            sid: "s-observed".into(),
+            ..crate::protocol::HostedSession::default()
+        });
+        assert_eq!(session_extent(Some(&inventory)), SessionExtent::Partial);
+        inventory.complete = true;
+        assert_eq!(session_extent(Some(&inventory)), SessionExtent::Complete);
+        inventory.rows.clear();
+        assert_eq!(session_extent(Some(&inventory)), SessionExtent::Complete);
+    }
+
+    #[test]
+    fn hello_carries_partial_session_observations_without_promoting_missing_metadata() {
+        let host = lab(1, UUID_1);
+        let mut hello = hello_of(&host);
+        hello.sessions.rows.push(crate::protocol::HostedSession {
+            instance_pid: 42,
+            local_id: 1,
+            sid: "s-observed".into(),
+            ..crate::protocol::HostedSession::default()
+        });
+        hello.sessions.complete = false;
+        let mut value = aterm_json::to_value(&hello).unwrap();
+        let observed: Hello = aterm_json::from_value(value.clone()).unwrap();
+        assert_eq!(observed.sessions, hello.sessions);
+        assert!(!observed.sessions.complete);
+        value.as_object_mut().unwrap().remove("sessions_complete");
+        let missing: Hello = aterm_json::from_value(value).unwrap();
+        assert_eq!(missing.sessions.rows, hello.sessions.rows);
+        assert!(!missing.sessions.complete);
+        assert_eq!(
+            session_extent(Some(&missing.sessions)),
+            SessionExtent::Partial
+        );
+    }
+
+    #[test]
     fn tabs_sweeps_live_hosts_and_prints_sessions_and_ai_cli_status() {
         let host = lab(1, UUID_1);
         let sys = controller(&[&host], false);
         let mut h = hello_of(&host);
-        h.sessions.push(crate::protocol::HostedSession {
+        h.sessions.complete = true;
+        h.sessions.rows.push(crate::protocol::HostedSession {
             instance_pid: 9001,
             local_id: 2,
             sid: "s-tab2".into(),
@@ -6462,14 +6527,15 @@ mod tests {
         assert_eq!(tabs(&e, &[], false), ExitCode::SUCCESS);
         let saved = state_of(&sys, &host);
         let parsed: Hello = aterm_json::from_str(saved.hello.as_deref().unwrap()).unwrap();
-        assert_eq!(parsed.sessions.len(), 1);
-        assert_eq!(parsed.sessions[0].program.as_deref(), Some("claude"));
+        assert!(parsed.sessions.complete);
+        assert_eq!(parsed.sessions.rows.len(), 1);
+        assert_eq!(parsed.sessions.rows[0].program.as_deref(), Some("claude"));
         assert_eq!(
-            format_session_ai_status(&parsed.sessions[0]),
+            format_session_ai_status(&parsed.sessions.rows[0]),
             "working: thinking (12s)"
         );
-        assert_eq!(working_ai_sessions(&parsed.sessions), 1);
-        let mut quiet = parsed.sessions[0].clone();
+        assert_eq!(working_ai_sessions(&parsed.sessions.rows), 1);
+        let mut quiet = parsed.sessions.rows[0].clone();
         for word in ["waiting", "unknown", "idle"] {
             quiet.agent = Some(word.into());
             assert_eq!(working_ai_sessions(std::slice::from_ref(&quiet)), 0);

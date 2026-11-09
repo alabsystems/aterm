@@ -144,6 +144,7 @@ mod native_restart;
 pub mod netwatch;
 pub mod open_url;
 pub mod outlook;
+pub mod permission_click;
 pub mod profile;
 pub mod provider_read;
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]

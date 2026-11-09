@@ -10466,9 +10466,22 @@ fn prune_downloads(
 pub(super) fn cleanup_max_age(
     rest: &[String],
 ) -> Result<Option<Option<std::time::Duration>>, &'static str> {
-    const INVALID: &str = "cleanup --prune takes all or a whole number of days";
+    const INVALID: &str = "`--prune` expects an integer or `all`.";
     let mut max_age = None;
-    for value in rest.iter().filter_map(|a| a.strip_prefix("--prune=")) {
+    let mut values: Vec<&str> = Vec::new();
+    {
+        let mut it = rest.iter();
+        while let Some(arg) = it.next() {
+            if arg == "--prune" {
+                if let Some(v) = it.next() {
+                    values.push(v);
+                }
+            } else if let Some(v) = arg.strip_prefix("--prune=") {
+                values.push(v);
+            }
+        }
+    }
+    for value in values {
         let age = if value == "all" {
             None
         } else {
@@ -10722,10 +10735,10 @@ pub(super) fn cmd_which_formula(prefix: &Prefix, api: &Api, rest: &[String]) -> 
 pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let max_age = match cleanup_max_age(rest) {
         Ok(age) => age,
-        Err(error) => return usage(error),
+        Err(error) => return failed(&format!("Error: Invalid usage: {error}")),
     };
     let dry = has_flag(rest, "--dry-run", "-n");
-    let named = operands(rest);
+    let named = operands_without_flag_values(rest, &["--prune"]);
     let protected = no_cleanup_names();
     let mut refused = false;
     let scope: Vec<&str> = named
@@ -11671,6 +11684,12 @@ fn fetch_require_sha_env_error(get: impl Fn(&str) -> Option<String>) -> Option<S
 /// `--bottle-tag`/`--os`/`--arch` (brew `Tag.from_arg` over
 /// `os_arch_combinations`); `None` when no cross flag is set.
 fn cross_bottle_tags(rest: &[String]) -> Result<Option<Vec<String>>, String> {
+    if has_flag(rest, "--all-platforms", "") {
+        return Ok(Some(super::machine::bottle_tag_combinations(
+            Some("all"),
+            Some("all"),
+        )));
+    }
     if let Some(tag) = super::valued_flag_last(rest, "--bottle-tag") {
         return match super::machine::bottle_tag_from_symbol(&tag) {
             Some(sym) => Ok(Some(vec![sym])),
@@ -11841,7 +11860,16 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
     for job in &jobs {
         match job {
             FetchJob::Cask(c) => {
-                if cross_tags.is_some() {
+                if has_flag(rest, "--all-platforms", "") {
+                    // brew cannot fetch API casks across platforms;
+                    // it warns and fetches this machine's download.
+                    eprintln!(
+                        "Warning: Cask {} was loaded from the API; cannot fetch all operating \
+                         system and architecture variants. Set `HOMEBREW_NO_INSTALL_FROM_API=1` \
+                         to fetch them all.",
+                        c.token
+                    );
+                } else if cross_tags.is_some() {
                     return super::unsupported("'fetch' with these arguments is not native");
                 }
                 println!(

@@ -19,6 +19,10 @@ use std::{
 
 #[path = "resource_admission_owner.rs"]
 mod owner;
+pub(super) use owner::bootstrap_graph::{
+    EnrollmentAttachment as BootstrapGraphAttachment, OutputTransfer as BootstrapGraphOutput,
+    Preparing as BootstrapGraphPreparing, Support as BootstrapGraphSupport,
+};
 pub(super) use owner::runtime_inputs::Attachment as RuntimeInputsAttachment;
 pub(super) use owner::runtime_inputs::Preparing as RuntimeInputsPreparing;
 pub(super) use owner::workload::MemberOriginalCustody as WorkloadMemberOriginal;
@@ -52,6 +56,44 @@ fn unavailable() -> io::Error {
 
 enum Message {
     Wake,
+    BootstrapGraphSupport {
+        peer: Peer,
+        query: Box<trust_resource_controller::bootstrap_graph::SupportQuery>,
+        reply: SyncSender<io::Result<BootstrapGraphSupport>>,
+    },
+    BootstrapGraphContext {
+        peer: Peer,
+        key: Box<trust_resource_controller::bootstrap_graph::Key>,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    BootstrapGraphBegin {
+        peer: Peer,
+        request: Box<trust_resource_controller::bootstrap_graph::Enrollment>,
+        reply: SyncSender<io::Result<BootstrapGraphPreparing>>,
+    },
+    BootstrapGraphRetain {
+        token: Box<BootstrapGraphAttachment>,
+        descriptions: [std::os::fd::OwnedFd; 2],
+        control: std::os::fd::OwnedFd,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    BootstrapGraphOutputBegin {
+        token: Box<BootstrapGraphOutput>,
+        reply: SyncSender<io::Result<BootstrapGraphOutput>>,
+    },
+    BootstrapGraphOutputRetain {
+        token: Box<BootstrapGraphOutput>,
+        descriptions: [std::os::fd::OwnedFd; 2],
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    SubmitBootstrapQuery {
+        peer: Peer,
+        request: Box<trust_resource_controller::bootstrap_graph::query::Request>,
+        stream: aterm_uds::CtlStream,
+        started: Instant,
+        deadline: Instant,
+        reply: SyncSender<io::Result<()>>,
+    },
     RuntimeInputsBegin {
         peer: Peer,
         request: Box<trust_resource_controller::runtime_input_retention::Request>,
@@ -508,6 +550,96 @@ pub(super) fn workload_output_locks(
     })?;
     receive_reply(read).map_err(|_| unavailable())?
 }
+pub(super) fn bootstrap_graph_support(
+    peer: Peer,
+    query: trust_resource_controller::bootstrap_graph::SupportQuery,
+) -> io::Result<BootstrapGraphSupport> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphSupport {
+        peer,
+        query: Box::new(query),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_context(
+    peer: Peer,
+    key: trust_resource_controller::bootstrap_graph::Key,
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphContext {
+        peer,
+        key: Box::new(key),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_begin(
+    peer: Peer,
+    request: trust_resource_controller::bootstrap_graph::Enrollment,
+) -> io::Result<BootstrapGraphPreparing> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphBegin {
+        peer,
+        request: Box::new(request),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_retain(
+    token: BootstrapGraphAttachment,
+    descriptions: [std::os::fd::OwnedFd; 2],
+    control: std::os::fd::OwnedFd,
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphRetain {
+        token: Box::new(token),
+        descriptions,
+        control,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_output_begin(
+    token: BootstrapGraphOutput,
+) -> io::Result<BootstrapGraphOutput> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphOutputBegin {
+        token: Box::new(token),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_graph_output_retain(
+    token: BootstrapGraphOutput,
+    descriptions: [std::os::fd::OwnedFd; 2],
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapGraphOutputRetain {
+        token: Box::new(token),
+        descriptions,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn submit_bootstrap_query(
+    peer: Peer,
+    request: trust_resource_controller::bootstrap_graph::query::Request,
+    stream: aterm_uds::CtlStream,
+    started: Instant,
+    deadline: Instant,
+) -> io::Result<()> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::SubmitBootstrapQuery {
+        peer,
+        request: Box::new(request),
+        stream,
+        started,
+        deadline,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
 pub(super) fn runtime_inputs_begin(
     peer: Peer,
     request: trust_resource_controller::runtime_input_retention::Request,
@@ -689,6 +821,51 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
         };
         if let Some(message) = message {
             match message {
+                Message::BootstrapGraphSupport { peer, query, reply } => {
+                    let _ = reply.try_send(owner.bootstrap_graph_support(peer, *query));
+                }
+                Message::BootstrapGraphContext { peer, key, reply } => {
+                    let _ = reply.try_send(owner.bootstrap_graph_context(peer, &key));
+                }
+                Message::BootstrapGraphBegin {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.bootstrap_graph_begin(peer, *request));
+                }
+                Message::BootstrapGraphRetain {
+                    token,
+                    descriptions,
+                    control,
+                    reply,
+                } => {
+                    let _ =
+                        reply.try_send(owner.bootstrap_graph_retain(*token, descriptions, control));
+                }
+                Message::BootstrapGraphOutputBegin { token, reply } => {
+                    let _ = reply.try_send(owner.bootstrap_graph_output_begin(*token));
+                }
+                Message::BootstrapGraphOutputRetain {
+                    token,
+                    descriptions,
+                    reply,
+                } => {
+                    let _ =
+                        reply.try_send(owner.bootstrap_graph_output_retain(*token, descriptions));
+                }
+                Message::SubmitBootstrapQuery {
+                    peer,
+                    request,
+                    stream,
+                    started,
+                    deadline,
+                    reply,
+                } => {
+                    let _ = reply.try_send(
+                        owner.submit_bootstrap_query(peer, *request, stream, started, deadline),
+                    );
+                }
                 Message::RuntimeInputsBegin {
                     peer,
                     request,

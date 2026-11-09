@@ -3064,6 +3064,7 @@ impl Wake {
             | Wake::AgentUpgrade { .. }
             | Wake::AgentUpgradeWord { .. }
             | Wake::AgentUpgradePress { .. }
+            | Wake::PermissionClick { .. }
             | Wake::HostNote(..)
             | Wake::HarnessWait { .. }
             | Wake::HarnessFact { .. }

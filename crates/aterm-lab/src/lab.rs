@@ -2226,10 +2226,13 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     for (f, to) in [
         ("claude-debug.log", "claude-debug.log"),
         ("statusline.jsonl", "statusline.jsonl"),
-        ("home/.claude/.claude.json", "claude.json"),
     ] {
         keep_file(&r.w.join(f), &keep.join(to));
     }
+    keep_file(
+        &r.claude_dir().join(".claude.json"),
+        &keep.join("claude.json"),
+    );
     for (_, log) in crate::stats::chain_debug_logs(&r) {
         if let Some(name) = log.file_name() {
             keep_file(&log, &keep.join(name));
@@ -2239,7 +2242,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         &crate::forever::input_hold::dir_of(&r),
         &keep.join(crate::forever::input_hold::DIR),
     );
-    let projects = r.w.join("home/.claude/projects");
+    let projects = r.claude_dir().join("projects");
     let mut transcripts = Vec::new();
     crate::util::walk_files(&projects, &mut transcripts);
     for p in transcripts
@@ -2504,6 +2507,10 @@ pub struct Launch {
     pub relay: bool,
     /// `--subscriber`: a fake claude.ai login.
     pub subscriber: bool,
+    /// `--stored`: the lab's stored login ([`crate::forever::sysmsg::login::lay_stored`]), as a
+    /// person's `/login` leaves one, on [`Self::stub_route_alone`], in a login directory of its
+    /// own ([`stored_login_dir`]).
+    pub stored: bool,
     /// The stub's base URL its only route: no black-hole proxy in the environment, so a stored
     /// login's process is the default route's where the instance's seam admits that base URL
     /// ([`UpOpts::route_seam`]); the jail still denies every connection but loopback.
@@ -2539,6 +2546,10 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
             "--prepare-only" => l.prepare_only = true,
             "--relay" => l.relay = true,
             "--subscriber" => l.subscriber = true,
+            "--stored" => {
+                l.stored = true;
+                l.stub_route_alone = true;
+            }
             "--debug-log" => l.debug_log = true,
             "--by-name" => l.by_name = true,
             "--" => {
@@ -2546,10 +2557,13 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
             }
             other => {
                 return Err(format!(
-                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --prepare-only, --relay, --subscriber, --debug-log, --by-name, -- <claude args>)"
+                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --prepare-only, --relay, --subscriber, --stored, --debug-log, --by-name, -- <claude args>)"
                 ));
             }
         }
+    }
+    if l.stored && l.subscriber {
+        return Err("claude: --stored and --subscriber are two logins; give one".into());
     }
     Ok(l)
 }
@@ -2621,7 +2635,14 @@ pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
                 "PATH",
                 shell_prepend_path(&run.run.join("shim").to_string_lossy()),
             ),
-            pair("CLAUDE_CONFIG_DIR", q(&format!("{w}/home/.claude"))),
+            pair(
+                "CLAUDE_CONFIG_DIR",
+                q(&if l.stored {
+                    stored_login_dir(run).to_string_lossy().into_owned()
+                } else {
+                    format!("{w}/home/.claude")
+                }),
+            ),
             pair(
                 "ANTHROPIC_BASE_URL",
                 q(&format!("http://127.0.0.1:{}", run.port)),
@@ -2766,9 +2787,9 @@ fn prepare_claude_with(
     user: &str,
     witness: impl FnOnce(&Run) -> Result<(), String>,
 ) -> Result<PreparedChild, Fail> {
-    if l.relay || l.subscriber || l.by_name {
+    if l.relay || l.subscriber || l.stored || l.by_name {
         return Err(Fail::usage(
-            "claude --prepare-only takes no --relay, --subscriber or --by-name",
+            "claude --prepare-only takes no --relay, --subscriber, --stored or --by-name",
         ));
     }
     let vars = prepared_child_vars(
@@ -2968,6 +2989,42 @@ fn lay_relay(run: &Run) -> Result<(), Fail> {
     Ok(())
 }
 
+/// The login directory of `claude --stored` (its `CLAUDE_CONFIG_DIR`). It is not the scratch
+/// home's own `.claude`: aterm reads a `CLAUDE_CONFIG_DIR` naming that directory as a custom
+/// home overlapping the default login, and plans no relaunch of it.
+fn stored_login_dir(run: &Run) -> PathBuf {
+    run.w.join(crate::run::STORED_LOGIN)
+}
+
+/// Lay `claude --stored`'s login in its own directory ([`stored_login_dir`], which `run` names
+/// as its [`Run::claude_dir`]): the scratch home's settings and profile as `up` laid them where
+/// it holds none yet (a later launch keeps what `lab settings` and Claude Code wrote there, as a
+/// launch in the home does), owner-only, then the stored login
+/// [`crate::forever::sysmsg::login::lay_stored`] lays there. The scratch home's own `.claude` is
+/// left as it was, so a later launch without `--stored` is the route `up` laid.
+fn lay_stored_login(run: &Run) -> Result<(), Fail> {
+    let (from, to) = (run.w.join("home/.claude"), stored_login_dir(run));
+    debug_assert_eq!(
+        run.claude_dir(),
+        to,
+        "launch_claude names the stored login first"
+    );
+    crate::util::create_private_dir_all(&to)
+        .map_err(|e| Fail::die(format!("the stored login: {}: {e}", to.display())))?;
+    for name in ["settings.json", ".claude.json"] {
+        let at = to.join(name);
+        let held = crate::sys::scratch_read(&at)
+            .map_err(|e| Fail::die(format!("the stored login: {e}")))?;
+        if held.is_some() {
+            continue;
+        }
+        let text = crate::verbs::read_scratch(&from.join(name))?;
+        crate::sys::put(&at, 0o600, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+            .map_err(|e| Fail::die(format!("the stored login: {name}: {e}")))?;
+    }
+    crate::forever::sysmsg::login::lay_stored(run)
+}
+
 /// Type the launch line of the managed Claude Code into the lab's first tab.
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
@@ -2980,9 +3037,21 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     if let Some(why) = by_name_refused(run, l) {
         return Err(Fail::usage(why));
     }
+    if l.stored && run.route_seam != "1" {
+        return Err(Fail::usage(
+            "claude --stored: a stored login's process is the default route's only where the \
+             instance admits the stub's base URL: up the lab with LAB_ROUTE_SEAM=1",
+        ));
+    }
     procs::need_witness(run)?;
     let mut run = run.clone();
     run.agent = "claude".into();
+    run.claude_login = if l.stored {
+        crate::run::STORED_LOGIN
+    } else {
+        ""
+    }
+    .into();
     run.save();
     let run = &run;
     if l.relay {
@@ -2990,6 +3059,9 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     }
     if l.subscriber {
         crate::verbs::settings_merge(run, &J::obj([("apiKeyHelper", J::Null)]))?;
+    }
+    if l.stored {
+        lay_stored_login(run)?;
     }
     let script = run.run.join("claude.sh");
     let text = launcher(run, l);
@@ -3033,8 +3105,8 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     ))
 }
 
-/// `claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber] [--debug-log] [--by-name]
-/// [-- claude args]`.
+/// `claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored]
+/// [--debug-log] [--by-name] [-- claude args]`.
 pub fn cmd_claude(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let tag = take_tag(&mut args)?;
@@ -3063,6 +3135,82 @@ mod prepared_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `CLAUDE_CONFIG_DIR` `l`'s launch in `run` names.
+    fn config_dir(run: &Run, l: &Launch) -> PathBuf {
+        let v = launch_words(run, l)
+            .env
+            .iter()
+            .flatten()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a launch names its CLAUDE_CONFIG_DIR");
+        PathBuf::from(v.trim_matches('\''))
+    }
+
+    /// A STORED LAUNCH KEEPS THE HOME, AND THE LAB WRITES WHERE ITS CLAUDE READS: `claude --stored`
+    /// lays its login in a directory of its own, the one its launch names as `CLAUDE_CONFIG_DIR`,
+    /// and every lab verb reads and writes there (`lab settings`, the newest transcript); a second
+    /// stored launch keeps what `lab settings` wrote; the scratch home's `.claude` stays as `up`
+    /// laid it, so a later plain launch runs the API-key route with no login in it. Measured
+    /// before: `lab settings` wrote the home while the stored Claude Code read its own copy, and
+    /// a plain launch after a stored one ran on the stored OAuth login.
+    #[test]
+    fn a_stored_launch_keeps_the_home_and_the_lab_writes_where_its_claude_reads() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut run = Run {
+            tag: "t".into(),
+            run: root.join("runs/t"),
+            w: root.join("runs/t/scratch"),
+            port: "5".into(),
+            proxy: "http://127.0.0.1:6".into(),
+            claude_bin: "/c/claude".into(),
+            route_seam: "1".into(),
+            ..Run::default()
+        };
+        std::fs::create_dir_all(run.w.join("home/.claude")).unwrap();
+        let (settings, cj) = scratch_claude_config(&run, "/helper", "/proj", &UpOpts::default());
+        std::fs::write(run.settings(), &settings).unwrap();
+        std::fs::write(run.w.join("home/.claude/.claude.json"), &cj).unwrap();
+        // As launch_claude saves it, then lays it; the next verb loads env.sh.
+        run.claude_login = crate::run::STORED_LOGIN.into();
+        lay_stored_login(&run).unwrap();
+        let run = Run::parse(&run.render());
+        let stored = parse_launch(&["--stored".to_string()]).unwrap();
+        let dir = config_dir(&run, &stored);
+        assert_eq!(run.settings(), dir.join("settings.json"));
+        let theirs = crate::util::scratch_text(&dir.join("settings.json"));
+        assert!(
+            theirs.contains("\"tui\": \"default\"") && !theirs.contains("apiKeyHelper"),
+            "{theirs}"
+        );
+        assert!(
+            crate::util::scratch_text(&dir.join(".credentials.json")).contains("claudeAiOauth")
+        );
+        // `lab settings t '{"permissions":{"defaultMode":"plan"}}'`
+        crate::verbs::settings_merge(
+            &run,
+            &J::parse(r#"{"permissions":{"defaultMode":"plan"}}"#).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::util::scratch_text(&dir.join("settings.json")).contains("defaultMode"));
+        let t = dir.join("projects/-proj/a.jsonl");
+        std::fs::create_dir_all(t.parent().unwrap()).unwrap();
+        std::fs::write(&t, "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(crate::stats::newest_transcript(&run), Some(t));
+        // A second --stored launch keeps what `lab settings` wrote there.
+        lay_stored_login(&run).unwrap();
+        assert!(crate::util::scratch_text(&dir.join("settings.json")).contains("defaultMode"));
+        // The home is as `up` laid it: a later plain launch is the API-key route again.
+        let plain = Run {
+            claude_login: String::new(),
+            ..run.clone()
+        };
+        assert_eq!(config_dir(&plain, &Launch::default()), plain.claude_dir());
+        assert_eq!(crate::util::scratch_text(&plain.settings()), settings);
+        assert!(!plain.w.join("home/.claude/.credentials.json").exists());
+    }
 
     #[test]
     fn the_store_names_its_managed_program_with_no_aterm_run() {
@@ -3463,6 +3611,9 @@ mod tests {
         let l = parse_launch(&a).unwrap();
         assert!(l.relay && l.subscriber && !l.no_wait);
         assert!(parse_launch(&["--bogus".to_string()]).is_err());
+        let stored = parse_launch(&["--stored".to_string()]).unwrap();
+        assert!(stored.stored && stored.stub_route_alone);
+        assert!(parse_launch(&["--stored".to_string(), "--subscriber".to_string()]).is_err());
         let run = Run {
             tag: "t".into(),
             run: "/s/runs/t".into(),

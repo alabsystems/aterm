@@ -53,11 +53,12 @@
 //! at every start (most of it, `docs/measured/cli-start-own-2026-11-04.md`): those beyond the
 //! Rust runtime's own, which `all` binds too and so drop out of the difference. Every arm's one
 //! unmeasured probe launch runs with `DYLD_PRINT_LIBRARIES`, and the report attributes the split
-//! by the images each one loaded: the window-only frameworks `cli` loads all the same, the
-//! images `all` loads and `cli` does not, and what aterm loads beyond `all`.
+//! by the image paths dyld announced. These include images dyld later moves to delayed
+//! state, so the inventory does not measure initialized images. It compares the announcements
+//! for window-only frameworks, `all`, `cli`, and aterm.
 //!
 //! The controls link; they do not insert. `DYLD_INSERT_LIBRARIES` naming aterm's dylibs into
-//! the bare control loads the same 588 images as linking them, yet retired 39.03 M instructions
+//! the bare control announces the same 588 image paths as linking them, yet retired 39.03 M instructions
 //! to the linked control's 29.53 M in one run (`docs/measured/cli-start-2026-11-04.md`).
 //!
 //! Judged: each of the three starts' ([`GATED`]) median instructions against a ceiling, its
@@ -250,13 +251,13 @@ impl Takes {
 }
 
 /// A measured arm: its name, what it links (a control's own load commands; empty for aterm's
-/// arms), the images its probe launch loaded (its main executable left out; none when dyld
+/// arms), the image paths dyld announced during its probe (its main executable left out; none when dyld
 /// printed none) and its summary.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Measured {
     pub name: String,
     pub loads: Vec<String>,
-    pub images: Vec<String>,
+    pub announced_images: Vec<String>,
     pub summary: Summary,
 }
 
@@ -427,10 +428,11 @@ pub(crate) fn mislinked(
     ))
 }
 
-/// The images a launch under `DYLD_PRINT_LIBRARIES` loaded, read from what dyld wrote to its
+/// Image-path announcements under `DYLD_PRINT_LIBRARIES`, read from what dyld wrote to its
 /// stderr (`dyld[<pid>]: <<uuid>> <path>`), in load order, the first (its main executable) left
-/// out. Any other line is not dyld's and is passed over.
-pub(crate) fn images_of(stderr: &str) -> Vec<String> {
+/// out. Other lines are passed over, including transitions to delayed state: an announcement
+/// is retained even when dyld later defers that image. This measures no initializer count.
+pub(crate) fn announced_images_of(stderr: &str) -> Vec<String> {
     stderr
         .lines()
         .filter_map(|line| {
@@ -575,7 +577,7 @@ fn listed(names: &[&str]) -> String {
     }
 }
 
-/// The report: one row per arm, the split of each aterm arm and the images that attribute it.
+/// The report: one row per arm, each start's instruction split and dyld announcements.
 pub(crate) fn report(arms: &[Measured]) -> String {
     let mut s = String::from(
         "    arm                  instr M  (min-max)          cycles M  user ms   sys ms  wall ms  \
@@ -632,10 +634,10 @@ pub(crate) fn report(arms: &[Measured]) -> String {
         s.push('\n');
     }
     s.push_str(&format!(
-        "      images at launch: none {}, all {}, cli {}\n",
-        none.images.len(),
-        all.images.len(),
-        cli.images.len()
+        "      dyld announcements: none {}, all {}, cli {}\n",
+        none.announced_images.len(),
+        all.announced_images.len(),
+        cli.announced_images.len()
     ));
     let deferred: Vec<String> = all
         .loads
@@ -645,7 +647,7 @@ pub(crate) fn report(arms: &[Measured]) -> String {
         .collect();
     let kept: Vec<String> = deferred
         .iter()
-        .filter(|l| cli.images.contains(l))
+        .filter(|l| cli.announced_images.contains(l))
         .cloned()
         .collect();
     s.push_str(&format!(
@@ -653,34 +655,34 @@ pub(crate) fn report(arms: &[Measured]) -> String {
         listed(&beyond(&deferred, &[]))
     ));
     s.push_str(&format!(
-        "      of them, `cli` loads through the dylibs it keeps: {}\n",
+        "      of them, dyld announces for `cli`: {}\n",
         listed(&beyond(&kept, &[]))
     ));
-    let dropped = beyond(&all.images, &cli.images);
+    let dropped = beyond(&all.announced_images, &cli.announced_images);
     s.push_str(&format!(
-        "      the {} images `all` loads and `cli` does not: {}\n",
+        "      the {} announced paths in `all` but not `cli`: {}\n",
         dropped.len(),
         listed(&dropped)
     ));
     for start in &starts {
-        if start.images.is_empty() {
+        if start.announced_images.is_empty() {
             s.push_str(&format!(
-                "      {}: dyld printed none of its images (it ignores DYLD_* variables for a \
+                "      {}: dyld printed no image paths (it ignores DYLD_* variables for a \
                  hardened or restricted program)\n",
                 start.name
             ));
             continue;
         }
         s.push_str(&format!(
-            "      {}: {} images; beyond `all`'s: {}",
+            "      {}: {} dyld announcements; beyond `all`'s: {}",
             start.name,
-            start.images.len(),
-            listed(&beyond(&start.images, &all.images))
+            start.announced_images.len(),
+            listed(&beyond(&start.announced_images, &all.announced_images))
         ));
-        let fewer = beyond(&all.images, &start.images);
+        let fewer = beyond(&all.announced_images, &start.announced_images);
         if !fewer.is_empty() {
             s.push_str(&format!(
-                "; `all` loads and it does not: {}",
+                "; announced for `all` but not this arm: {}",
                 listed(&fewer)
             ));
         }
@@ -861,7 +863,8 @@ fn conclude_using(
 }
 
 /// The JSON `--json-out` writes: every arm's summary, what it links (a control's load commands)
-/// and how many images it loaded, and the load the lane met.
+/// and how many image paths dyld announced, and the load the lane met. Announcements may
+/// include images later moved to delayed state; they are not initializer counts.
 fn json(arms: &[Measured], aterm: &Path, load: &str) -> Value {
     let mut rows = aterm_json::Map::new();
     for a in arms {
@@ -881,7 +884,7 @@ fn json(arms: &[Measured], aterm: &Path, load: &str) -> Value {
             "loads".into(),
             Value::Array(a.loads.iter().map(|l| Value::from(l.as_str())).collect()),
         );
-        row.insert("images".into(), count(a.images.len()));
+        row.insert("announced_images".into(), count(a.announced_images.len()));
         rows.insert(a.name.clone(), Value::Object(row));
     }
     let mut out = aterm_json::Map::new();
@@ -1064,9 +1067,9 @@ mod live {
             says: Some(stop.says),
         }));
         arms.extend(controls);
-        let mut images = Vec::with_capacity(arms.len());
+        let mut announced_images = Vec::with_capacity(arms.len());
         for arm in &arms {
-            images.push(probe(arm).map_err(LaneRun::fail)?);
+            announced_images.push(probe(arm).map_err(LaneRun::fail)?);
         }
         let samples = args.samples.unwrap_or(DEFAULT_SAMPLES);
         let load_before = super::super::bench_build::load_average();
@@ -1101,12 +1104,12 @@ mod live {
         let measured = arms
             .into_iter()
             .zip(takes)
-            .zip(images)
-            .filter_map(|((arm, takes), images)| {
+            .zip(announced_images)
+            .filter_map(|((arm, takes), announced_images)| {
                 takes.summary().map(|summary| Measured {
                     name: arm.name,
                     loads: arm.loads,
-                    images,
+                    announced_images,
                     summary,
                 })
             })
@@ -1249,7 +1252,7 @@ mod live {
     /// Launch `arm` once unmeasured, its output kept and `DYLD_PRINT_LIBRARIES` set: it must
     /// end with its code and, a stop, with its refusal's stderr ([`super::ended_elsewhere`];
     /// `ctl-status` must answer `OK`), the program's first exec is behind it before any launch
-    /// is counted, and what it gives back is the images it loaded. Every counted launch runs the
+    /// is counted, and what it gives back is dyld's image-path announcements. Every counted launch runs the
     /// same program on the same words, so the probe is where a stop is placed; the counted ones
     /// are held to their code alone, their output discarded.
     fn probe(arm: &Arm) -> Result<Vec<String>, String> {
@@ -1270,7 +1273,7 @@ mod live {
                 said.lines().next().unwrap_or("")
             ));
         }
-        Ok(super::images_of(&told))
+        Ok(super::announced_images_of(&told))
     }
 
     /// Launch `arm` once: what it retired and its resident size, read before the reap, and its
@@ -1545,7 +1548,7 @@ mod tests {
         Measured {
             name: name.to_string(),
             loads: owned(links),
-            images: owned(images),
+            announced_images: owned(images),
             summary: Summary {
                 n: 1,
                 instructions,
@@ -1836,13 +1839,22 @@ mod tests {
     }
 
     #[test]
-    fn dyld_s_printed_images_are_read_without_the_main_executable() {
+    fn dyld_announcements_retain_delayed_paths_and_omit_the_main_executable() {
         let told = "dyld[22789]: <9F0BFFE1-66F1-3089-90BD-8832CDA4568A> /x/target/release/ctl\n\
                     dyld[22789]: <4FDC9AA6-B344-37FE-B8C6-A4C94A038F57> /usr/lib/libSystem.B.dylib\n\
                     a line of the program's own\n\
-                    dyld[22789]: /usr/lib/libobjc.A.dylib\n";
-        assert_eq!(images_of(told), [SYS, OBJC]);
-        assert_eq!(images_of("no dyld here\n"), Vec::<String>::new());
+                    dyld[22789]: /usr/lib/libobjc.A.dylib\n\
+                    dyld[22789]: /System/Library/Frameworks/ServiceManagement.framework/Versions/A/ServiceManagement\n\
+                    dyld[22789]: move loaded to delayed: ServiceManagement\n";
+        assert_eq!(
+            announced_images_of(told),
+            [
+                SYS,
+                OBJC,
+                "/System/Library/Frameworks/ServiceManagement.framework/Versions/A/ServiceManagement"
+            ]
+        );
+        assert_eq!(announced_images_of("no dyld here\n"), Vec::<String>::new());
     }
 
     #[test]
@@ -2007,7 +2019,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_splits_each_start_and_attributes_it_by_the_images() {
+    fn the_report_splits_instruction_work_with_and_without_stops() {
         let arms = vec![
             arm(
                 "version",
@@ -2037,26 +2049,6 @@ mod tests {
         assert_eq!(row("frameworks (all - none)"), ["34%", "17.00"]);
         assert_eq!(row("window-only deferral (all - cli)"), ["6%", "3.00"]);
         assert_eq!(row("aterm's own (it - all)"), ["36%", "18.00"]);
-        assert!(
-            text.contains("images at launch: none 1, all 5, cli 3\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("window-only frameworks aterm links: AppKit, CoreText\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("of them, `cli` loads through the dylibs it keeps: CoreText\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("the 2 images `all` loads and `cli` does not: AppKit, HIToolbox\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("version: 6 images; beyond `all`'s: libobjc.A.dylib\n"),
-            "{text}"
-        );
         assert!(
             !text.contains("image and runtime"),
             "no stops, no rows: {text}"

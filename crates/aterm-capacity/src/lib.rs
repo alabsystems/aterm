@@ -11,7 +11,11 @@
 //! machine calls [`admit`] before its work starts and holds the [`Claim`] while it runs. Admit
 //! waits until the need fits beside the claims already held and those that waited longer
 //! (first in, first out; a later claim goes first only when it fits beside every earlier one's
-//! reservation), printing one line a minute that names the shortfall and each holder. That is
+//! reservation, or, past a waiter that cannot start yet, within what that waiter SPARES: the most
+//! it may take without delaying that waiter's turn by any claim's end or step, [`spared`]),
+//! printing one line a minute that names the shortfall and each holder. A held build's claim
+//! STEPS down to what its run phase claims once its tree runs a program its build made, and
+//! back up should its run outgrow that ([`mod@phase`], CAP3). That is
 //! admission, not a retry, and it has no deadline: each wait ends when the claims it waits for
 //! end. A waiter whose disk need is more than the volume has free above its floor now
 //! ([`Short::unservable`]) reserves none of it: what a claim wrote stays on the volume once it
@@ -132,6 +136,7 @@ pub mod footprint;
 pub mod ledger;
 pub mod machine_footprint;
 pub mod overrun;
+pub mod phase;
 pub mod reading;
 pub mod room;
 pub mod telemetry;
@@ -151,7 +156,7 @@ mod retained_cohort_tests;
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
     Short, Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory,
-    covering, covering_disk, gib, never, reserved, span,
+    covering, covering_disk, gib, never, reserved, span, spared,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
@@ -346,6 +351,17 @@ pub struct Need {
     pub scratch: bool,
     /// It LEADS the waiters ([`Self::leads`]).
     pub leads: bool,
+    /// The memory its RUN PHASE claims ([`Self::run_mem`], [`mod@phase`], CAP3): what its holder
+    /// steps it down to once its tree runs a program its build made ([`Claim::step_down`]).
+    /// Less than [`Self::mem`] where set: a need whose run phase claims as much or more takes
+    /// that as its peak and asks no step. Every look reckons the step as one more claim end, of
+    /// what it gives back ([`Self::step_gives`], [`spared`]).
+    pub run_mem: Option<u64>,
+    /// In a held claim's [`Record`], what its holder STEPPED it to: its [`Self::run_mem`]
+    /// ([`Claim::step_down`]), or [`Self::mem`] again where its run outgrew that
+    /// ([`Claim::step_back`]). What the claim claims from then on ([`Self::mem_now`]). `None`
+    /// where it never stepped, and in a need asked: a waiter is never stepped.
+    pub stepped: Option<u64>,
     /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
     /// they may make none first. The waiter's own, never in a [`Record`].
     pub stuck_ends: Option<std::time::Duration>,
@@ -393,6 +409,40 @@ impl Need {
     pub const fn mem(mut self, bytes: u64) -> Need {
         self.mem = bytes;
         self
+    }
+
+    /// The memory its run phase claims, `bytes` ([`Self::run_mem`]), so set its peak first. A
+    /// need is admitted with the most of every phase ([`mod@phase`]), so where `bytes` is as
+    /// much as its peak or more, `bytes` is its peak and it asks no step: a run heavier than its
+    /// compile never starts beside claims admitted into the room it lacks.
+    #[must_use]
+    pub const fn run_mem(mut self, bytes: u64) -> Need {
+        if bytes < self.mem {
+            self.run_mem = Some(bytes);
+        } else {
+            self.mem = bytes;
+            self.run_mem = None;
+        }
+        self
+    }
+
+    /// The memory it claims now: its peak ([`Self::mem`]), or its run phase's where its holder
+    /// stepped it down ([`Self::stepped`]); never more than its peak, which is what it was
+    /// admitted with. What every look reserves for a held claim, less its tree's use.
+    #[must_use]
+    pub fn mem_now(&self) -> u64 {
+        self.stepped.map_or(self.mem, |s| s.min(self.mem))
+    }
+
+    /// What its planned step down gives back, bytes: what it claims now less its run phase's
+    /// memory ([`Self::run_mem`]) where it plans a step and has not stepped, else `0`. Every look
+    /// reckons the step as an end of its own, before the claim's ([`spared`]).
+    #[must_use]
+    pub fn step_gives(&self) -> u64 {
+        match self.run_mem {
+            Some(run) if self.stepped.is_none() => self.mem_now().saturating_sub(run),
+            _ => 0,
+        }
     }
 
     /// Its peak memory, `gib` GiB.

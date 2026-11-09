@@ -255,13 +255,16 @@ struct SeenPane {
     leaf_index: usize,
     session: u64,
     lights: LightsRead,
+    /// The tab's standing permission click as the App's table holds it this frame.
+    click: Option<crate::permission_click::ClickShown>,
+    /// What a click's restart would end of Claude's running jobs (`1 shell`,
+    /// [`footer::ModeRow::job_words`]), read only while the mode light's title shows: under the
+    /// pointer or the keyboard, or while the tab's click stands; empty otherwise.
+    jobs: String,
     switch: Option<crate::autopilot::HarnessSwitch>,
     autopilot: Option<(
-        (
-            Option<aterm_agent::supervise::Autopilot>,
-            crate::autopilot::AutopilotView,
-        ),
-        bool,
+        Option<aterm_agent::supervise::Autopilot>,
+        crate::autopilot::AutopilotView,
     )>,
 }
 
@@ -4848,6 +4851,13 @@ impl App {
             let mut goal = goal_term(timeline.goal());
             let cli = TopCli::from_timeline(&timeline).term();
             drop(timeline);
+            // A standing permission click's light, which its lane moves off any frame.
+            let click = self.claude_click_shown(session).map_or(0, |shown| {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                shown.hash(&mut h);
+                h.finish() | 1
+            });
             let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
             let harness = if shows {
                 let (word, view, supervised, _) =
@@ -4888,7 +4898,8 @@ impl App {
                 ^ harness.rotate_left(29)
                 ^ key.rotate_left(41)
                 ^ goal.rotate_left(19)
-                ^ cli.rotate_left(23);
+                ^ cli.rotate_left(23)
+                ^ click.rotate_left(31);
         }
         if claude {
             fp ^= u64::from(usage).rotate_left(47);
@@ -5712,6 +5723,8 @@ impl App {
                         leaf_index,
                         session,
                         lights: None,
+                        click: self.claude_click_shown(session),
+                        jobs: String::new(),
                         switch: crate::autopilot::HarnessSwitch::of(view),
                         autopilot: None,
                     });
@@ -5742,8 +5755,14 @@ impl App {
                     lists.bare.push((session, row_off + r));
                 }
                 let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
-                // Claude's running jobs, which the ⬆️'s words name for a move held by them.
-                let jobs = if top_cli.up.shows() || top_cli.kept.shows() {
+                let click = self.claude_click_shown(session);
+                // Claude's running jobs, read past the ⬆️'s own need for them: its words name them
+                // for a move held by them, and the mode light's title for what a click's restart
+                // ends while that title shows (under the pointer or the keyboard, or with the
+                // tab's click standing), on every mode's row.
+                let up_jobs = top_cli.up.shows() || top_cli.kept.shows();
+                let light_jobs = click.is_some() || ws.claude_lights.light_titled(session);
+                let jobs = if up_jobs || light_jobs {
                     readings
                         .mode
                         .zip(texts.panes.get(leaf_index).and_then(Option::as_ref))
@@ -5765,7 +5784,7 @@ impl App {
                     .then(|| crate::term_try_lock(&entry.term).and_then(|t| press_wait_on(&t)))
                     .flatten();
                     paint
-                        .with_jobs(&jobs)
+                        .with_jobs(if up_jobs { &jobs } else { "" })
                         .with_press(press)
                         .refused_with(ws.claude_lights.up_refused(session))
                 });
@@ -5775,7 +5794,6 @@ impl App {
                 let gate = agent.is_some_and(|prog| {
                     rewrites_mode_row(prog, border.is_some()) && !agy_switch_off
                 });
-                let mut row_rewritten = false;
                 let top_rule = readings.reach.and_then(|r| r.rules()).map(|(top, _)| top);
                 if let Some(
                     prog @ (aterm_phase::Program::Claude
@@ -5866,9 +5884,10 @@ impl App {
                             skip: 0,
                         });
                     }
-                    // Claude's effort hint goes only where the session's facts name an effort for
-                    // the bottom rule's `◆`, whether the rule has room to show it or the person hid
-                    // it by a click; else it stays on the row.
+                    // On the bypass row the glass rewrites, Claude's effort hint goes only where
+                    // the session's facts name an effort for the bottom rule's `◆`, whether the
+                    // rule has room to show it or the person hid it by a click; else it stays on
+                    // the row. Any other mode's row stands whole, its hint with it.
                     let names_effort =
                         rule.is_some() && texts.footers[leaf_index].shown().effort.is_some();
                     if gate
@@ -5880,7 +5899,7 @@ impl App {
                         }
                         && let Some(Some(cached)) = texts.panes.get(leaf_index)
                     {
-                        row_rewritten = collect_mode_row(
+                        collect_mode_row(
                             &ws.input_scratch,
                             &cached.rows,
                             region,
@@ -5951,8 +5970,10 @@ impl App {
                     leaf_index,
                     session,
                     lights: readings.lights,
+                    click,
+                    jobs: if light_jobs { jobs } else { String::new() },
                     switch: crate::autopilot::HarnessSwitch::of(view),
-                    autopilot: Some(((word, view), row_rewritten)),
+                    autopilot: Some((word, view)),
                 });
                 let Some((frame_row, term_row, run, rule)) = rule else {
                     continue;
@@ -5978,9 +5999,9 @@ impl App {
             );
         }
         for pane in lists.seen.drain(..) {
-            self.observe_claude_lights(wid, pane.session, pane.lights);
-            if let Some((autopilot, row_rewritten)) = pane.autopilot {
-                self.note_claude_autopilot(wid, pane.session, autopilot, row_rewritten);
+            self.observe_claude_lights(wid, pane.session, pane.lights, pane.click, pane.jobs);
+            if let Some(autopilot) = pane.autopilot {
+                self.note_claude_autopilot(wid, pane.session, autopilot);
             } else if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.claude_lights.note_switch_face(pane.session, pane.switch);
             }
@@ -7379,9 +7400,14 @@ pub(crate) fn up_wait(wait: &str) -> &'static str {
         ("attended", _) => "once you stop typing",
         ("draft" | "left-typed", _) => DRAFT_WAIT,
         ("held", _) => HOLD_WAIT,
+        ("account", _) => ACCOUNT_WAIT,
         _ => "",
     }
 }
+
+/// [`up_wait`]'s words for a relaunch whose account cannot yet be checked at its shell (the
+/// restart then ends nothing: `relaunch::WAIT_ACCOUNT`).
+const ACCOUNT_WAIT: &str = "once its account can be checked";
 
 /// [`up_wait`]'s words for a running turn.
 const TURN_WAIT: &str = "at turn end";
@@ -9757,8 +9783,8 @@ fn render_agy_markdown_row(
     Some(out)
 }
 
-/// Whether Claude's mode row is rewritten on this pane's glass ([`collect_mode_row`]): Claude,
-/// bordered, the harness on.
+/// Whether Claude's mode row may be rewritten on this pane's glass: Claude, bordered, the harness
+/// on; [`collect_mode_row`] then takes a bypass row alone.
 fn rewrites_mode_row(program: aterm_phase::Program, bordered: bool) -> bool {
     program == aterm_phase::Program::Claude && bordered
 }
@@ -9873,10 +9899,12 @@ fn rewritable(
 /// ([`footer::ModeRow`]): its kept items cell-copied in Claude's own styles, their inks floored to
 /// read as words do on a page Claude's own do not ([`relaid`]), flush at the pane's column 0 and
 /// joined by ` · ` in the ink of a `·` of Claude's, blanks after; and the row its effort hint
-/// wrapped to, blanked. `false`, the row standing as drawn, where it is not
-/// plainly Claude's ([`rewritable`]), where a cell differs from the text read, is wide or
-/// presented, or a dropped item has a ground of its own (Claude's highlight), or where the
-/// window keeps [`GLASS_SHIFTS`] rows already.
+/// wrapped to, blanked. Only a bypass row is rewritten, its pill the chip's `yolo`
+/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): any other mode's row stands as Claude draws it,
+/// its own pill naming plan or auto, so aterm names no mode but the bit. `false`, the row standing
+/// as drawn, for a row of any other pill, where it is not plainly Claude's ([`rewritable`]), where
+/// a cell differs from the text read, is wide or presented, or a dropped item has a ground of its
+/// own (Claude's highlight), or where the window keeps [`GLASS_SHIFTS`] rows already.
 #[allow(clippy::too_many_arguments)]
 fn collect_mode_row(
     scratch: &RenderInput,
@@ -9892,7 +9920,9 @@ fn collect_mode_row(
     let frame_row = region.strip + term_row;
     let from = region.col_off;
     let written = from..from + mode.end;
-    if out.len() >= GLASS_SHIFTS
+    if aterm_agent::harness::lights::Mode::of_indicator(mode.mode)
+        != Some(aterm_agent::harness::lights::Mode::Bypass)
+        || out.len() >= GLASS_SHIFTS
         || mode.end > region.cols
         || !rewritable(scratch, frame_row, &written, chrome_owned(term_row))
     {
@@ -11458,16 +11488,12 @@ mod tests {
             "autopilot: cruise \u{2014} {} \u{b7} click: land  ",
             crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
         );
-        let plan = aterm_agent::harness::lights::Mode::Plan.gist();
-        let (plan_title, plan_short) = (
-            format!("{plan} \u{b7} click: bypass or auto  "),
-            format!("{plan}  "),
-        );
+        let (lame_title, lame_short) = ("not yolo \u{b7} click: yolo  ", "not yolo  ");
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
             for chips in [1usize, 3, 6, 8, 10, 14] {
                 for (title, short) in [
                     ("", ""),
-                    (plan_title.as_str(), plan_short.as_str()),
+                    (lame_title, lame_short),
                     (cruise.as_str(), "autopilot: cruise  "),
                 ] {
                     let block = crate::claude_lights::Block::of_chips(

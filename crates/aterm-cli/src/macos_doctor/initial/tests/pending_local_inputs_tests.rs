@@ -50,7 +50,10 @@ fn scrolling(console: u32) -> NativeHost {
 
 fn keyboard(attached: bool) -> NativeHost {
     let mut host = NativeHost::over(
-        Box::new(InitialSetupAdmissionStopTest::keyboard_system(attached)),
+        Box::new(InitialSetupAdmissionStopTest::keyboard_system(
+            attached,
+            &[],
+        )),
         Box::new(aterm_machines::init::prepare_workstation_selected),
     );
     host.select(selected(&[Setting::CapsLock]).selection);
@@ -88,7 +91,7 @@ fn a_parked_first_caps_pass_resumes_when_a_new_keyboard_arrives_at_the_same_cons
             panic!("Caps-only setup reads no network")
         })
         .with_console(|| Some(true))
-        .with_keyboard_services(|| keyboard(attached.get()).sys.keyboard_service_ids())
+        .with_keyboard_services(keyboard(attached.get()).sys.as_ref())
     };
     let parked = mark();
     assert_eq!(parked.next_due(), None);
@@ -189,9 +192,14 @@ fn console_facts_belong_only_to_current_unheld_pending_preferences() {
         input_setup_scope_at(root).unwrap(),
         InputSetupScope::Inactive
     );
+    let no_hardware = Machine::root();
     let _ = initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
         .with_console(|| Some(true))
-        .with_keyboard_services(|| panic!("scrolling alone observes no keyboard service"));
+        .with_keyboard_services(&no_hardware);
+    assert!(
+        no_hardware.calls().is_empty(),
+        "scrolling alone observes no keyboard service"
+    );
     let retired = || {
         let mark = initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
             .with_console(|| panic!("held or retired preferences read no console fact"));
@@ -299,10 +307,12 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
     let root = dir.path();
     let plan = selected(&[Setting::CapsLock]);
     let revision = authorize_at(root, &plan).unwrap().unwrap();
-    let mark = |ids| {
+    let mark = |ids: Vec<u64>| {
+        let mut sys = Machine::root();
+        sys.keyboard_services = Some(Ok(ids));
         initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
             .with_console(|| Some(true))
-            .with_keyboard_services(|| Ok(ids))
+            .with_keyboard_services(&sys)
     };
     let known = mark(vec![41, 42]);
     assert_eq!(mark(vec![42, 41]), known);
@@ -312,9 +322,14 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
         unread.retain_known_from(&known);
         assert_eq!(unread, known);
     }
+    let no_hardware = Machine::root();
     let _ = initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
         .with_console(|| Some(false))
-        .with_keyboard_services(|| panic!("another console reads no keyboard facts"));
+        .with_keyboard_services(&no_hardware);
+    assert!(
+        no_hardware.calls().is_empty(),
+        "another console reads no keyboard facts"
+    );
 
     let retired = || {
         assert_eq!(
@@ -323,7 +338,11 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
         );
         let _ = initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
             .with_console(|| Some(true))
-            .with_keyboard_services(|| panic!("held Caps reads no hardware"));
+            .with_keyboard_services(&no_hardware);
+        assert!(
+            no_hardware.calls().is_empty(),
+            "held Caps reads no hardware"
+        );
     };
     for hung in [false, true] {
         ledger::update(root, revision, |ledger| {
@@ -369,5 +388,9 @@ fn first_caps_observation_is_bounded_and_cannot_borrow_a_held_or_retired_scope()
     );
     let _ = initial_setup_park_mark_with(Some(root), None, 1_800_000_600, || None)
         .with_console(|| Some(true))
-        .with_keyboard_services(|| panic!("completed Caps has no pending hardware observation"));
+        .with_keyboard_services(&no_hardware);
+    assert!(
+        no_hardware.calls().is_empty(),
+        "completed Caps has no pending hardware observation"
+    );
 }

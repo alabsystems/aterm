@@ -956,6 +956,19 @@ fn external_from_env(
     .map(Some)
 }
 
+/// Whether the raw relaunch's account admission ([`relaunch`]: [`account_execution`], then
+/// [`external_at_shell`]) passes for `st`'s saved intent at `shell` now, each guard let go at once.
+/// Every raw restart asks it before its signal: the restart in place's ([`restart_locked`]) and
+/// the upgrade's (`upgrade_drive::restart`). An agent whose relaunch checks no account passes.
+pub(super) fn relaunch_account_admits(opts: &Opts, st: &St, shell: u32) -> Result<(), String> {
+    if !checks_account_execution(&st.agent) {
+        return Ok(());
+    }
+    drop(account_execution(opts, st.account_intent.as_ref())?);
+    drop(external_at_shell(opts, st.account_intent.as_ref(), shell)?);
+    Ok(())
+}
+
 fn checks_account_execution(agent: &upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -2121,7 +2134,13 @@ fn relaunch_held(
     let account_guard = if checks_account_execution(&st.agent) && !deferred_cold {
         match account_execution(opts, st.account_intent.as_ref()) {
             Ok(guard) => guard,
-            Err(_) => return said(r, WAIT_ACCOUNT),
+            Err(why) => {
+                aterm_log::info!(
+                    "harness @{}: the relaunch's account admission waits: {why}",
+                    st.tab
+                );
+                return said(r, WAIT_ACCOUNT);
+            }
         }
     } else {
         None
@@ -2135,7 +2154,13 @@ fn relaunch_held(
         if checks_account_execution(&st.agent) {
             match external_at_shell(opts, st.account_intent.as_ref(), shell) {
                 Ok(guard) => guard.or(account_guard),
-                Err(_) => return said(r, WAIT_ACCOUNT),
+                Err(why) => {
+                    aterm_log::info!(
+                        "harness @{}: the relaunch's external account at its shell waits: {why}",
+                        st.tab
+                    );
+                    return said(r, WAIT_ACCOUNT);
+                }
             }
         } else {
             account_guard
@@ -3326,10 +3351,12 @@ fn autopilot_on(c: &mut Client, tab: &str) -> bool {
         .is_some_and(|line| matches!(autopilot_by_status(&line), Some("cruise" | "land")))
 }
 
-/// Whether a restart of `cause` is carried on with nothing typed.
+/// Whether a restart of `cause` is carried on with nothing typed: an account move's, a click's
+/// (aterm types only its relaunch line, under any Autopilot or with the harness off), or a quiet
+/// move's that names no relaunch's cause.
 #[must_use]
 pub fn carried_quietly(cause: &str, quiet: bool) -> bool {
-    cause.starts_with(CAUSE_ACCOUNT) || (quiet && !relaunch_cause(cause))
+    cause.starts_with(CAUSE_ACCOUNT) || clicked(cause) || (quiet && !relaunch_cause(cause))
 }
 
 fn resumes_quietly(st: &St) -> bool {
@@ -4233,9 +4260,11 @@ pub(super) const CAUSE_FRESH: &str = "exit-fresh";
 /// The [`St::cause`] of the upgrade's restart of a conversation nobody has asked anything ([`super::upgrade::Step::Fresh`]).
 pub(super) const CAUSE_UPGRADE_FRESH: &str = "upgrade-fresh";
 
-/// Whether a record of `cause` starts its agent afresh.
+/// Whether a record of `cause` starts its agent afresh: a relaunch of an agent with no
+/// conversation to resume, the upgrade's of one nobody asked anything, or a click's whose line
+/// has no `--resume` ([`CAUSE_PERMISSION_FRESH`]).
 pub(super) fn starts_afresh(cause: &str) -> bool {
-    cause == CAUSE_FRESH || cause == CAUSE_UPGRADE_FRESH
+    cause == CAUSE_FRESH || cause == CAUSE_UPGRADE_FRESH || cause == CAUSE_PERMISSION_FRESH
 }
 
 /// The [`St::cause`] of a restart the host made for Claude Code's critical-memory banner ([`restart_here`], [`Restart::Memory`]).
@@ -4268,8 +4297,47 @@ pub(super) const CAUSE_ACCOUNT: &str = "account:";
 /// `route:` then `token` or `stored` ([`Restart::Route`]).
 pub(super) const CAUSE_ROUTE: &str = "route:";
 
-/// What an account move answers where a restart of another kind was in flight for the conversation ([`restart_as`], [`carried_word`]).
+/// The [`St::cause`] of a click's restart whose line resumes its conversation
+/// ([`Restart::Permission`], [`Launch::resume`]): it ends its own agent ([`ends_its_agent`]), and
+/// its relaunch types nothing but its line ([`carried_quietly`]), so it is carried on quietly and
+/// its restore look opens ([`confirm`]).
+pub(super) const CAUSE_PERMISSION: &str = "permission";
+
+/// [`CAUSE_PERMISSION`] for a click whose line has no `--resume` (a tab with no transcript): its
+/// relaunch starts the agent afresh ([`starts_afresh`]), and its record is done at `done:fresh`.
+pub(super) const CAUSE_PERMISSION_FRESH: &str = "permission-fresh";
+
+/// Whether `cause` is a click's ([`CAUSE_PERMISSION`], [`CAUSE_PERMISSION_FRESH`]).
+fn clicked(cause: &str) -> bool {
+    cause == CAUSE_PERMISSION || cause == CAUSE_PERMISSION_FRESH
+}
+
+/// What an account move or a click answers where a restart of another kind was in flight for the
+/// conversation ([`restart_as`], [`carried_word`]).
 pub const IN_FLIGHT_OTHER: &str = "wait:restart-in-flight";
+
+/// What a click answers where the owner's press of the ⬆️ stands on the conversation's record
+/// ([`St::press_stands`]): the press goes first, and the click restarts over its record after.
+pub const CLICK_PRESSED: &str = "wait:pressed";
+
+/// What a click answers where its ask no longer stands at the fence before its signal (a click on
+/// `◐` took it back, or its one restart was signalled already): nothing is signalled, and the
+/// record stands as it was.
+pub const CLICK_TAKEN_BACK: &str = "wait:taken-back";
+
+/// What a click answers where the tab's record holds native coordination (a cold relaunch's) and
+/// no native constructor this host enables could restart it: refused before the hand is taken or
+/// any record written, until the tab's agent ends and its record is coordinated no more.
+pub const CLICK_COORDINATED: &str = "refused:native-coordinated";
+
+/// What a click answers where a supervisor other than a window's own host claims its tab, read
+/// at its look and again just before its signal.
+pub const CLICK_CLAIMED: &str = "refused:claimed";
+
+/// What a click's plan answers where the line would type the managed twin and the build the twin
+/// execs cannot be read: the twin reads a plain line as yolo, so the click waits rather than type
+/// it.
+pub(super) const TWIN_BUILD_UNREAD: &str = "twin-build-unread";
 
 /// What a restart in place answers where it would supersede the conversation's record
 /// ([`supersedes`]) but for the native restart's operation still in it (`St::native`,
@@ -4322,7 +4390,9 @@ pub(super) fn asked_of(why: &Restart, snap: &Snapshot) -> bool {
 /// completes (`native_restart::complete`), [`restart_as`] carries it first and answers
 /// [`NATIVE_CARRIED`] ([`native_carried`]): asked again, the restart supersedes the record the
 /// carry left with no native move in it. Never for an account move, whose record of the same
-/// account is the move asked ([`carried_word`]), nor where the record is the asked restart's own
+/// account is the move asked ([`carried_word`]), nor for a click, which ends no process another
+/// restart's relaunch started (it stands until that record lands, [`carried_word`]), nor where
+/// the record is the asked restart's own
 /// ([`its_own`], by its `ask`): asked again after its relaunch answered a wait (the process it
 /// started not yet registered, its ledger's evidence unread), carrying it adopts the process that
 /// restart started, which a restart made over it would end.
@@ -4334,7 +4404,7 @@ pub(super) fn supersedes(
     session: &str,
     k: &dyn Kernel,
 ) -> bool {
-    !matches!(why, Restart::Account { .. })
+    !matches!(why, Restart::Account { .. } | Restart::Permission { .. })
         && !its_own(why, ask, st)
         && matches!(st.phase, upgrade::Phase::Relaunched { .. })
         && landed_in(st, sf, session, k)
@@ -4432,12 +4502,17 @@ pub(super) fn its_own(why: &Restart, ask: &RestartAsk, st: &St) -> bool {
         Restart::InputLost { .. } => cause == CAUSE_INPUT_LOST,
         Restart::Account { .. } => false,
         Restart::Route { to } => cause.strip_prefix(CAUSE_ROUTE) == Some(to.word()),
+        Restart::Permission { .. } => clicked(cause),
     };
     of_cause && st.ask == ask.word()
 }
 
-/// The word [`restart_as`] answers after carrying the conversation's in-flight restart (cause `cause`, the carry's word `step`) instead of making the restart `why`.
-pub(super) fn carried_word(why: &Restart, cause: &str, step: String) -> String {
+/// The word [`restart_as`] answers after carrying the conversation's in-flight restart (cause
+/// `cause`, the carry's word `step`, `own` where the record is the restart `why`'s own,
+/// [`its_own`]) instead of making the restart `why`. A click over a record not its own answers
+/// [`IN_FLIGHT_OTHER`] whatever the carry said, `failed:` included: the other restart's word is
+/// not the click's, and the click stands until that record is no longer in flight.
+pub(super) fn carried_word(why: &Restart, own: bool, cause: &str, step: String) -> String {
     match why {
         Restart::Account { to, .. }
             if cause.strip_prefix(CAUSE_ACCOUNT) != Some(to.as_str())
@@ -4445,6 +4520,7 @@ pub(super) fn carried_word(why: &Restart, cause: &str, step: String) -> String {
         {
             IN_FLIGHT_OTHER.to_string()
         }
+        Restart::Permission { .. } if !own => IN_FLIGHT_OTHER.to_string(),
         _ => step,
     }
 }
@@ -4497,6 +4573,16 @@ pub(super) fn model_restart(
             fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
             model: riding.or(hand),
             cause: format!("{CAUSE_ROUTE}{}", to.word()),
+            launch_model: launched,
+        },
+        // A click changes the line's permission flags and moves no model: nothing rides, and a
+        // model picked by hand stays, as a press of the ⬆️ keeps it. Its cause is the resumed
+        // one; a line with no `--resume` takes [`CAUSE_PERMISSION_FRESH`] where the restart reads
+        // that ([`restart_fenced`]).
+        Restart::Permission { .. } => ModelRestart {
+            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
+            model: riding.or(hand),
+            cause: CAUSE_PERMISSION.to_string(),
             launch_model: launched,
         },
     }
@@ -4571,6 +4657,7 @@ pub(super) fn ends_its_agent(cause: &str) -> bool {
         || cause.starts_with(CAUSE_MODEL)
         || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
+        || clicked(cause)
 }
 
 /// The continuation typed to a relaunched agent once it holds its conversation.
@@ -4652,7 +4739,7 @@ pub fn restart_here_authorized(
     ask: &RestartAsk,
     authorizer: &dyn RelaunchAuthorizer,
 ) -> Restarted {
-    restart_as_authorized(
+    restart_fenced(
         opts,
         why,
         ask,
@@ -4660,6 +4747,7 @@ pub fn restart_here_authorized(
         snapshot(opts),
         None,
         &Live,
+        &|| true,
         Some(authorizer),
     )
 }
@@ -5210,11 +5298,17 @@ pub(super) fn restart_as(
     selected: Option<&AccountRestart>,
     k: &dyn Kernel,
 ) -> Restarted {
-    restart_as_authorized(opts, why, ask, roster, snap, selected, k, None)
+    restart_fenced(opts, why, ask, roster, snap, selected, k, &|| true, None)
 }
 
+/// [`restart_as`] under the asker's own fence `stands`, a read of its ask that performs no I/O
+/// (a click's, still standing in its window's memory: `super::permission_click`): read wherever
+/// an account move's selection is read, and again just before the signal, a false one answers
+/// [`CLICK_TAKEN_BACK`] with nothing signalled and the record as it stood. A built-in host's
+/// private exact-session hook `authorizer` ([`restart_here_authorized`]) takes a coordinated
+/// record's checked relaunch ([`super::native_restart::begin_relaunch`]).
 #[allow(clippy::too_many_arguments)]
-fn restart_as_authorized(
+pub(super) fn restart_fenced(
     opts: &Opts,
     why: &Restart,
     ask: &RestartAsk,
@@ -5222,6 +5316,7 @@ fn restart_as_authorized(
     snap: Result<Snapshot, &'static str>,
     selected: Option<&AccountRestart>,
     k: &dyn Kernel,
+    stands: &dyn Fn() -> bool,
     authorizer: Option<&dyn RelaunchAuthorizer>,
 ) -> Restarted {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
@@ -5248,23 +5343,67 @@ fn restart_as_authorized(
         Err(why) => return Restarted::unread(said(r, format!("busy:{why}"))),
     };
     let mut met = Met::Unread;
+    let fence = Fence { selected, stands };
     let report = restart_locked(
-        opts, why, ask, snap, selected, k, r, target, &mut met, authorizer,
+        opts, why, ask, snap, &fence, k, r, target, &mut met, authorizer,
     );
     let claim = claim_of(opts, why, ask, &report, met);
     Restarted { report, claim }
 }
 
+/// What [`restart_locked`] reads of its asker's own standing, with no I/O: an account move's
+/// selection ([`AccountRestart::is_current`]) and a click's ask ([`restart_fenced`]).
+struct Fence<'a> {
+    selected: Option<&'a AccountRestart>,
+    stands: &'a dyn Fn() -> bool,
+}
+
+impl Fence<'_> {
+    /// The wait a read of the fence answers now, `None` while it holds.
+    fn broken(&self) -> Option<&'static str> {
+        if self.selected.is_some_and(|s| !s.is_current()) {
+            Some("wait:account-changed")
+        } else if !(self.stands)() {
+            Some(CLICK_TAKEN_BACK)
+        } else {
+            None
+        }
+    }
+}
+
+/// The build a click's line types for the agent's program `exe`, so no twin reads the line
+/// ([`Restart::Permission`]): the managed twin's build where `exe` is that twin
+/// ([`super::upgrade_drive::twin_build`]), else `exe` itself. A twin whose build cannot be read
+/// waits ([`TWIN_BUILD_UNREAD`]): typed, the twin would make a plain line yolo.
+fn click_build(exe: &Path) -> Result<PathBuf, &'static str> {
+    if !super::upgrade_drive::is_managed_twin_path(exe, "claude") {
+        return Ok(exe.to_path_buf());
+    }
+    super::upgrade_drive::twin_build(exe, "claude").ok_or(TWIN_BUILD_UNREAD)
+}
+
 /// [`restart_as`] past its admission, under the sweep's lock: `r` the report so far, `target` the
 /// login an account move's line carries, `met` set to how far it went with the conversation's
 /// record ([`Met`]).
+///
+/// A CLICK ([`Restart::Permission`]) differs from every other restart here: it is of its own
+/// conversation alone; a standing press of the ⬆️ goes first ([`CLICK_PRESSED`]); its line is
+/// the launch's rid of every permission flag and given its own
+/// ([`upgrade::permission_click_argv`]), with no mode read, no model moved and the store build
+/// typed ([`click_build`]); its cause is read off whether that line resumes
+/// ([`CAUSE_PERMISSION`], [`CAUSE_PERMISSION_FRESH`]); a record under native coordination no
+/// constructor here could restart is refused before the hand is taken or any record written
+/// ([`CLICK_COORDINATED`]); its signal goes as a press's does, past the agent's background shells
+/// and its own work, held only by a turn, a box, a draft or a held tab ([`at_rest_for`]); and a
+/// claim of its tab by another supervisor is read again just before its record is written
+/// ([`CLICK_CLAIMED`]).
 #[allow(clippy::too_many_arguments)]
 fn restart_locked(
     opts: &Opts,
     why: &Restart,
     ask: &RestartAsk,
     snap: Result<Snapshot, &'static str>,
-    selected: Option<&AccountRestart>,
+    fence: &Fence<'_>,
     k: &dyn Kernel,
     mut r: Report,
     target: Option<String>,
@@ -5272,6 +5411,10 @@ fn restart_locked(
     authorizer: Option<&dyn RelaunchAuthorizer>,
 ) -> Report {
     let tab = r.tab.clone();
+    let clicked = match why {
+        Restart::Permission { to, conversation } => Some((*to, conversation.as_str())),
+        _ => None,
+    };
     let snap = match snap {
         Ok(snap) if snap.tab == tab => snap,
         Ok(_) => return said(r, "wait:tab-identity-conflict"),
@@ -5293,6 +5436,9 @@ fn restart_locked(
         return said(r, "wait:no-session-record");
     };
     let session = sf.session_id.clone();
+    if clicked.is_some_and(|(_, conversation)| conversation != session) {
+        return said(r, "wait:conversation-changed");
+    }
     r.session.clone_from(&session);
     r.from.clone_from(&sf.version);
     r.to = format!("{}(same)", sf.version);
@@ -5316,15 +5462,15 @@ fn restart_locked(
         if st.tab != tab {
             return said(r, "wait:conversation-in-other-tab");
         }
-        if selected.is_some_and(|s| !s.is_current()) {
-            return said(r, "wait:account-changed");
+        if let Some(wait) = fence.broken() {
+            return said(r, wait);
         }
         if let Some(authorizer) = authorizer
             && let Some(report) = retry_checked_relaunch(
                 opts,
                 (why, ask),
                 (&snap, &records, &sf),
-                selected,
+                fence.selected,
                 k,
                 (r.clone(), st.clone()),
                 authorizer,
@@ -5337,12 +5483,13 @@ fn restart_locked(
         let native = st.native.is_some() || !st.native_prepare.is_empty();
         if !supersedes || native {
             let cause = st.cause.clone();
+            let own = its_own(why, ask, &st);
             *met = Met::Carried;
             let carried = carry_in_flight(opts, r, st, &session, &tab);
             let step = if supersedes {
                 native_carried(carried.step.clone())
             } else {
-                carried_word(why, &cause, carried.step.clone())
+                carried_word(why, own, &cause, carried.step.clone())
             };
             return said(carried, step);
         }
@@ -5353,6 +5500,13 @@ fn restart_locked(
     {
         *met = Met::Made;
         return said(r, ALREADY_MADE);
+    }
+    if clicked.is_some()
+        && prior
+            .as_ref()
+            .is_some_and(|st| st.press_stands(&tab, now_s()))
+    {
+        return said(r, CLICK_PRESSED);
     }
     *met = Met::Claiming(prior.clone().map(Box::new));
     if upgrade::one_shot(&snap.argv) {
@@ -5383,7 +5537,7 @@ fn restart_locked(
     let riding_move = riding.is_some();
     let ModelRestart {
         model,
-        cause,
+        mut cause,
         launch_model,
         fallback_from,
     } = model_restart(why, prior.as_ref(), launched, riding, hand);
@@ -5394,16 +5548,30 @@ fn restart_locked(
     ) {
         return said(r, "refused:model-on-credits");
     }
-    let mode = resume_mode(&records, &session, tab_mode(opts, &tab));
+    let resume = records.transcript_exists(&session) != Some(false);
+    let (argv, exe, mode) = match clicked {
+        Some((to, _)) => match click_build(&snap.program) {
+            Ok(exe) => (upgrade::permission_click_argv(&snap.argv, to), exe, None),
+            Err(why) => return said(r, format!("wait:{why}")),
+        },
+        None => (
+            snap.argv.clone(),
+            snap.program.clone(),
+            resume_mode(&records, &session, tab_mode(opts, &tab)),
+        ),
+    };
+    if clicked.is_some() && !resume {
+        cause = CAUSE_PERMISSION_FRESH.to_string();
+    }
     let moves_account = target.is_some();
     let login = target.or_else(|| snap.login.clone());
     let launch = Launch {
         session: &session,
-        resume: records.transcript_exists(&session) != Some(false),
+        resume,
         cwd: &sf.cwd,
         agent: snap.pid,
-        argv: &snap.argv,
-        exe: &snap.program,
+        argv: &argv,
+        exe: &exe,
         model: model.as_deref(),
         mode: mode.as_deref(),
         home: snap.home.as_deref(),
@@ -5437,6 +5605,26 @@ fn restart_locked(
     if let Some(prior) = prior.as_ref() {
         prior.kept_by_restart(&tab, &mut st);
     }
+    // A click on a record under native coordination that no constructor here restarts is refused
+    // here, before the hand is taken or a record written: `native_restart::begin` would refuse it
+    // at admission (`ATERM-KI-1106-3`), and the click would stand on a wait nothing ends.
+    if clicked.is_some() && super::native_restart::coordinated(&st) {
+        let restartable = opts.token.is_some()
+            && match connect(opts, &tab) {
+                Ok(mut c) => super::native_restart::constructor_enabled(&mut c, &tab),
+                Err(_) => return said(r, "wait:no-socket"),
+            };
+        if !restartable {
+            return said(
+                r,
+                if opts.dry_run {
+                    CLICK_COORDINATED.replacen("refused:", "would-refuse:", 1)
+                } else {
+                    CLICK_COORDINATED.to_string()
+                },
+            );
+        }
+    }
     let planned =
         home_carried(&opts.home, snap.home.as_deref(), &sf.cwd, &records).and_then(|homedir| {
             let launch = Launch {
@@ -5466,8 +5654,8 @@ fn restart_locked(
             },
         );
     }
-    if selected.is_some_and(|s| !s.is_current()) {
-        return said(r, "wait:account-changed");
+    if let Some(wait) = fence.broken() {
+        return said(r, wait);
     }
     let Ok(mut c) = connect(opts, &tab) else {
         return said(r, "wait:no-socket");
@@ -5483,7 +5671,7 @@ fn restart_locked(
             (why, checked_step),
             (&snap, &records, &sf),
             shell,
-            selected,
+            fence.selected,
             k,
             &mut c,
         ) {
@@ -5496,8 +5684,19 @@ fn restart_locked(
         let recent = records
             .transcript(&session)
             .map(|p| tail_to_end(&p, TAIL_BYTES));
-        if selected.is_some_and(|s| !s.is_current()) {
-            break 'signal Some(said(r.clone(), "wait:account-changed"));
+        if let Some(wait) = fence.broken() {
+            break 'signal Some(said(r.clone(), wait));
+        }
+        // A click refuses a tab another supervisor (no window's own host) claims, read again
+        // here on the hand's connection: the claim may have come since the click's look.
+        if clicked.is_some() {
+            match super::upgrade_drive::aside_read(&mut c, &[])
+                .map(|aside| aside.claimed.contains(&tab))
+            {
+                Some(false) => {}
+                Some(true) => break 'signal Some(said(r.clone(), CLICK_CLAIMED)),
+                None => break 'signal Some(said(r.clone(), "wait:roster-unread")),
+            }
         }
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
         st.bind(snap.pid, &snap.start);
@@ -5537,7 +5736,7 @@ fn restart_locked(
                 &mut st,
                 &session,
                 super::contract::Scope::Relaunch,
-                PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
+                PlannedCommand::expects(command.as_ref(), &exe),
                 command.as_ref(),
                 None,
                 checked.as_ref().map(|(source, host)| (source, *host)),
@@ -5549,7 +5748,7 @@ fn restart_locked(
                 &mut st,
                 &session,
                 super::contract::Scope::Relaunch,
-                PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
+                PlannedCommand::expects(command.as_ref(), &exe),
                 command.as_ref(),
                 None,
             )
@@ -5602,18 +5801,21 @@ fn restart_locked(
                 break 'signal Some(said(r.clone(), format!("wait:{why}")));
             }
         }
-        let signal_check = if st.native.is_some() {
+        // A click taken back since its admission signals nothing ([`Fence::broken`]).
+        let signal_check = if st.native.is_none() {
+            Ok(None)
+        } else if fence.broken().is_some() {
+            Err("changed")
+        } else {
             restart_source_current(
                 opts,
                 (why, checked.as_ref().map(|_| CheckedRelaunchStep::Signal)),
                 (&snap, &records, &sf),
                 shell,
-                selected,
+                fence.selected,
                 k,
                 &mut c,
             )
-        } else {
-            Ok(None)
         };
         if signal_check.is_err() {
             if super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
@@ -5660,6 +5862,24 @@ fn restart_locked(
         } else {
             None
         };
+        // The raw path's relaunch admits its account at the shell only once the agent is gone
+        // ([`relaunch`]): a route it would refuse there waits here, before the signal, so a
+        // restart never ends an agent it cannot start again.
+        if st.native.is_none()
+            && let Err(why) = relaunch_account_admits(opts, &st, shell)
+        {
+            aterm_log::info!(
+                "harness @{tab}: the restart waits before its signal: its relaunch's account \
+                 would wait: {why}"
+            );
+            if super::native_restart::coordinated(&st) {
+                let _ =
+                    super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
+            } else {
+                restore(opts, &session, prior.as_ref());
+            }
+            break 'signal Some(said(r.clone(), WAIT_ACCOUNT));
+        }
         let signal = if let Some(binding) = st.native.as_ref() {
             super::native_restart::signal(&mut c, &tab, binding)
         } else {
@@ -5755,7 +5975,8 @@ pub(super) const fn serve_for(why: &Restart) -> Serve {
         | Restart::InputLost { .. }
         | Restart::Model { .. }
         | Restart::ModelBack { .. }
-        | Restart::Account { .. } => Serve::Judge,
+        | Restart::Account { .. }
+        | Restart::Permission { .. } => Serve::Judge,
     }
 }
 
@@ -5767,8 +5988,14 @@ pub(super) const fn serve_for(why: &Restart) -> Serve {
 /// lose and the login the move leaves is the menu's own. The processes under the agent (a shell,
 /// a monitor) are the process table's to say too ([`live_background`]); this reads the work the
 /// screen names, among it the work no process row names ([`aterm_phase::phase::unlisted_work`]:
-/// the work Claude Code runs in its own process, any other work its footer's pill counts).
+/// the work Claude Code runs in its own process, any other work its footer's pill counts). A
+/// click goes as a person's press of the ⬆️ goes, past the agent's own work: only a running turn,
+/// a box ([`super::upgrade_drive::press_lets_signal`]) and a draft in the composer hold it, a
+/// slash press's text among them.
 fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
+    if matches!(why, Restart::Permission { .. }) {
+        return super::upgrade_drive::press_lets_signal(scr) && composer_empty(c, tab, scr);
+    }
     (over_own_work(why) || aterm_phase::phase::work_running(&scr.rows).is_none())
         && (composer_empty(c, tab, scr)
             || (matches!(why, Restart::Account { .. })
@@ -5780,7 +6007,11 @@ fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
 }
 
 /// The actual source checks shared by initial admission, exact replay and first Signal.
-/// Memory overrides agent-own-work alone; every source still protects draft/background work.
+/// Memory overrides agent-own-work alone; every source still protects a draft. Background work
+/// (the agent's shells, or an unreadable table, where none can be ruled out) holds every source
+/// but a click ([`Restart::Permission`]), which goes past it as a person's press does, its agent
+/// at rest read off the screen ([`at_rest_for`]) rather than off a status that a background
+/// shell holds at `shell`.
 fn restart_source_current(
     opts: &Opts,
     purpose: (&Restart, Option<CheckedRelaunchStep>),
@@ -5792,6 +6023,7 @@ fn restart_source_current(
 ) -> Result<Option<u64>, &'static str> {
     let (why, checked_step) = purpose;
     let (snap, records, original) = source;
+    let clicked = matches!(why, Restart::Permission { .. });
     let human = if checked_step.is_some() {
         Some(
             super::upgrade_drive::status_line(client, &snap.tab)
@@ -5810,7 +6042,7 @@ fn restart_source_current(
     if !records.session_file(snap.pid).is_some_and(|now| {
         let actual_start = k.process_start(snap.pid);
         now.session_id == original.session_id
-            && now.status == "idle"
+            && (clicked || now.status == "idle")
             && actual_start.as_deref() == Some(squash(&now.proc_start).as_str())
             && actual_start.as_deref() == Some(squash(&snap.start).as_str())
     }) || foreground_shell(k.job(snap.pid)) != Ok(shell)
@@ -5819,7 +6051,7 @@ fn restart_source_current(
             .as_ref()
             .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
         || !screen(client, &snap.tab).is_some_and(|scr| at_rest_for(why, client, &snap.tab, &scr))
-        || !k.restart_background(snap.pid).is_empty()
+        || (!clicked && !k.restart_background(snap.pid).is_empty())
         || held(client, &snap.tab, opts.human_grace_s)
     {
         return Err("changed");
@@ -6031,7 +6263,8 @@ fn retry_checked_relaunch(
 /// ([`super::upgrade_drive`]'s `turn_over_shown`): a lost line's restart, for a process that runs
 /// on and whose line the loop holds meanwhile (`custody::Rest::working`); a model's move onto its
 /// fallback, or back at its reset, and an account move, each a move a later turn's end makes as
-/// well, where the work it would end costs the session more than the wait.
+/// well, where the work it would end costs the session more than the wait. A click is none of
+/// these: [`at_rest_for`] reads a press's gate for it instead.
 const fn over_own_work(why: &Restart) -> bool {
     match why {
         Restart::Memory => true,
@@ -6039,7 +6272,8 @@ const fn over_own_work(why: &Restart) -> bool {
         | Restart::Model { .. }
         | Restart::ModelBack { .. }
         | Restart::Account { .. }
-        | Restart::Route { .. } => false,
+        | Restart::Route { .. }
+        | Restart::Permission { .. } => false,
     }
 }
 

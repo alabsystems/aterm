@@ -785,4 +785,138 @@ mod presses {
         );
         assert!(split.app.structural_invariants_ok());
     }
+
+    #[test]
+    fn native_control_press_settles_across_stats_lens_release_blur_and_pane_switch() {
+        let mut split = page_beside_terminal();
+        let wid = split.window;
+        return_to_page(&mut split);
+        let (cx, cy, key) = {
+            let artifact = split
+                .app
+                .retained_native_leaf_artifact(wid, split.page, true)
+                .expect("presented System State leaf");
+            let hit = artifact
+                .compiled
+                .hits
+                .iter()
+                .find(|hit| hit.rect.y > 40.0)
+                .expect("actionable System State control");
+            let scale = artifact.scale;
+            (
+                artifact.device_x as f64 + f64::from(hit.rect.x + hit.rect.width * 0.5) * scale,
+                artifact.device_y as f64 + f64::from(hit.rect.y + hit.rect.height * 0.5) * scale,
+                hit.key.clone(),
+            )
+        };
+
+        // 1. Press the native control, then open a stats lens covering the release location
+        // and release the left button over the lens: the armed press must clear without firing.
+        split.app.on_cursor_moved(wid, cx, cy);
+        split
+            .app
+            .mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            Some(key.clone()),
+            "pressing the control arms state.common().pressed"
+        );
+        {
+            let ws = split.app.windows.get_mut(&wid).unwrap();
+            ws.stats_lens.open = Some(crate::stats_lens::Lens {
+                focus: crate::stats_paint::Instrument::Cpu,
+                bar: crate::stats_paint::Bar::Global,
+                how: crate::stats_lens::Opened::Pinned,
+            });
+            ws.stats_lens.rect = Some((0, 0, 2_000, 1_000));
+        }
+        assert!(
+            split.app.stats_owns_pointer(wid),
+            "stats lens owns the pointer at the release position"
+        );
+        split
+            .app
+            .mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            None,
+            "releasing over the stats lens clears the armed native control press"
+        );
+        split.app.windows.get_mut(&wid).unwrap().stats_lens.open = None;
+        split.app.windows.get_mut(&wid).unwrap().stats_lens.rect = None;
+        present_mixed(&mut split.app, wid);
+
+        // 2. Press the native control, then lose window focus: `on_focus(wid, false)` must clear
+        // the armed press via `settle_selection_gesture`.
+        split.app.on_cursor_moved(wid, cx, cy);
+        split
+            .app
+            .mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            Some(key.clone())
+        );
+        split.app.on_focus(wid, false);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            None,
+            "window blur settles an armed native control press"
+        );
+        split.app.on_focus(wid, true);
+        present_mixed(&mut split.app, wid);
+
+        // 3. Press the native control, then switch focus to the terminal sibling: `sync_window`
+        // must settle the armed native control press on the outgoing view.
+        split.app.on_cursor_moved(wid, cx, cy);
+        split
+            .app
+            .mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            Some(key)
+        );
+        assert!(split.app.focus_pane_in(wid, crate::pane::FocusDir::Right));
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .pressed,
+            None,
+            "switching pane focus settles an armed native control press"
+        );
+        assert!(split.app.structural_invariants_ok());
+    }
 }

@@ -673,6 +673,7 @@ fn the_ring_holds_a_bounded_entry_whatever_an_exec_was_given() {
                 env_path: Some(Arc::from(format!("{word}:{i}"))),
                 file: Some(test_id("x")),
                 linked: false,
+                any_case: false,
             },
             ..exec(i, "x")
         });
@@ -1040,16 +1041,26 @@ fn a_lookup_is_made_once_per_window_and_again_for_a_new_image() {
 struct Stalled {
     open: Mutex<bool>,
     opened: std::sync::Condvar,
+    /// How many questions reached it.
+    entered: std::sync::atomic::AtomicUsize,
     table: Table,
 }
 
 impl Stalled {
     fn wait_open(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
         let _open = self
             .opened
             .wait_timeout_while(open, aterm_spec::wait::MUST_HAPPEN, |open| !*open)
             .unwrap_or_else(|p| p.into_inner());
+    }
+
+    /// It answers from now on.
+    fn open(&self) {
+        *self.open.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.opened.notify_all();
     }
 }
 
@@ -1138,4 +1149,373 @@ fn a_word_whose_lookup_is_pending_gets_no_stand_in() {
     );
     let alias = command_reading("qzl", &heard).expect("the alias's job's program");
     assert_eq!((alias.text.as_str(), alias.own), ("zoxide", false));
+}
+
+/// A scripted Windows job reader: each listing in turn, then none; it asserts it is asked for
+/// the session's shell.
+fn scripted_job(shell: i32, listings: Vec<Vec<(u32, &str)>>) -> ListJob {
+    let mut listings: std::collections::VecDeque<Vec<(u32, PathBuf)>> = listings
+        .into_iter()
+        .map(|l| {
+            l.into_iter()
+                .map(|(pid, p)| (pid, PathBuf::from(p)))
+                .collect()
+        })
+        .collect();
+    Box::new(move |asked| {
+        assert_eq!(asked, shell, "the job of the session's own shell");
+        listings.pop_front().unwrap_or_default()
+    })
+}
+
+/// Each exec of a ran log, by pid and name, oldest first.
+fn heard_names(ran: &Ran) -> Vec<(i32, String)> {
+    ran.within(Some(Window { from: 0, to: None }))
+        .iter()
+        .map(|e| {
+            (
+                e.pid,
+                e.names.image.as_deref().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A WINDOWS SESSION'S PROGRAMS ARE HEARD FROM ITS JOB (J0-1, gap G1-g19): a job listed twice
+/// as [the shell 100, the console host 101, 200 running `PING.EXE`] notes ping once, and the
+/// shell's and the console host's pids nothing; a block whose typed word is `ping` reads ping
+/// (the image's name in any case, as cmd and pwsh find it), and a pid reused by another image is
+/// heard again. NEGATIVE CONTROL (in the test): a session with no feed, today's no-source arm,
+/// reads only builtins for the same block. NEGATIVE CONTROLS (scratch, `J01_NC`): names compared
+/// byte for byte (`case`), the console host heard (`host`), and a pid heard once whatever it
+/// maps (`pid`) each fail it.
+#[test]
+fn a_windows_jobs_programs_are_heard_once_each_and_name_their_typed_word() {
+    use crate::session_status::command_detail;
+    const PS: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    const HOST: &str = r"C:\Windows\System32\conhost.exe";
+    const PING: &str = r"C:\Windows\System32\PING.EXE";
+    let ran = Arc::new(Ran::default());
+    let job = vec![(100, PS), (101, HOST), (200, PING)];
+    let mut feed = RanJob::listing(
+        Arc::clone(&ran),
+        100,
+        Some(101),
+        scripted_job(
+            100,
+            vec![
+                job.clone(),
+                job,
+                vec![(200, r"C:\Windows\System32\ipconfig.exe")],
+            ],
+        ),
+    );
+    feed.list_at(5_000);
+    feed.list_at(5_050);
+    assert_eq!(
+        heard_names(&ran),
+        [(200, "PING".to_owned())],
+        "ping once, and neither the shell nor the console host"
+    );
+    let window = Window::of(Some(4_900), None, None, None);
+    let block = ran.heard(7, window, Some(r"C:\Users\jsmith"));
+    assert_eq!(
+        command_detail("ping -n 1 localhost", &block).as_deref(),
+        Some("ping"),
+        "the typed word names the image that ran"
+    );
+    assert_eq!(
+        command_detail("Ping.exe -n 1 localhost", &block).as_deref(),
+        Some("Ping"),
+        "in any case, with its extension"
+    );
+    assert_eq!(command_detail("tracert localhost", &block), None);
+    feed.list_at(5_100);
+    assert_eq!(
+        heard_names(&ran),
+        [(200, "PING".to_owned()), (200, "ipconfig".to_owned())],
+        "a pid reused by another image is heard again"
+    );
+    let silent = Ran::default();
+    let block = silent.heard(7, window, Some(r"C:\Users\jsmith"));
+    assert_eq!(
+        command_detail("ping -n 1 localhost", &block),
+        None,
+        "with no source, no program"
+    );
+    assert_eq!(
+        command_detail(r"cd C:\Users", &block).as_deref(),
+        Some("cd"),
+        "only builtins"
+    );
+}
+
+/// A WINDOWS IMAGE'S NAME (J0-1): its file name after the last `\` or `/`, with `.exe` or
+/// `.com` cut in any case, equal to a bare word in any ASCII case; a unix image's name is equal
+/// byte for byte, as before. NEGATIVE CONTROL (scratch, `J01_NC=case`): names compared byte for
+/// byte fail the third assertion.
+#[test]
+fn a_windows_images_name_is_its_file_name_in_any_case_and_a_unix_ones_is_exact() {
+    let of = |path: &str| ExecNames::of_windows_image(Path::new(path));
+    let name = |path: &str| of(path).image.map(String::from);
+    assert_eq!(
+        name(r"C:\Windows\System32\PING.EXE").as_deref(),
+        Some("PING")
+    );
+    assert_eq!(name("C:/tools/7z.Com").as_deref(), Some("7z"));
+    assert_eq!(name(r"C:\tools\make.bat").as_deref(), Some("make.bat"));
+    assert_eq!(name(r"C:\tools\.exe").as_deref(), Some(".exe"));
+    assert_eq!(name(r"C:\tools\"), None);
+    let ping = of(r"C:\Windows\System32\PING.EXE");
+    assert!(ping.same("PING", "ping") && ping.same("PING", "Ping"));
+    assert!(!ping.same("PING", "pin"));
+    let unix = ExecNames::of_path(Path::new("/usr/bin/PING"));
+    assert!(unix.same("PING", "PING"));
+    assert!(!unix.same("PING", "ping"), "a unix name is exact");
+}
+
+/// A WINDOWS JOB IS LISTED AT ITS PACE (J0-1): at the first batch, not again within
+/// [`JOB_PACE`] of it, again once that has passed, and at once when a batch carries a block's
+/// start or end (an OSC 133/633 C or D, even one cut across two batches) and again at the batch
+/// after it, the command's first output or the prompt; a prompt's own marks (A, B) are neither.
+/// Instants are set by hand. NEGATIVE CONTROLS (scratch): a batch's C not looked for
+/// (`J01_NC=start`) fails the third assertion, a start that leaves the next batch to the pace
+/// (`J01_NC=armed`) the fourth, and a batch's D not looked for (J0-1 lander, `J01_NC=end`) the
+/// first assertion about an end.
+#[test]
+fn a_windows_job_is_listed_at_its_pace_and_at_once_at_a_blocks_start_and_end() {
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&listings);
+    let mut feed = RanJob::listing(
+        Arc::new(Ran::default()),
+        100,
+        None,
+        Box::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }),
+    );
+    let listed = || listings.load(std::sync::atomic::Ordering::SeqCst);
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    feed.batch(b"out", at(0), 0);
+    assert_eq!(listed(), 1, "the first batch lists it");
+    feed.batch(b"out", at(50), 0);
+    assert_eq!(listed(), 1, "within the pace, not again");
+    feed.batch(b"\x1b]133;C\x07", at(60), 0);
+    assert_eq!(listed(), 2, "a block's start lists it at once");
+    feed.batch(b"out", at(70), 0);
+    assert_eq!(listed(), 3, "and its command's first output again");
+    feed.batch(b"out", at(120), 0);
+    assert_eq!(listed(), 3, "the pace runs from the last listing");
+    feed.batch(b"out", at(170), 0);
+    assert_eq!(listed(), 4, "the pace has passed");
+    feed.batch(b"\x1b]13", at(175), 0);
+    assert_eq!(listed(), 4);
+    feed.batch(b"3;C\x07", at(180), 0);
+    assert_eq!(listed(), 5, "a start cut across two batches");
+    feed.batch(b"out", at(185), 0);
+    assert_eq!(listed(), 6);
+    feed.batch(b"out", at(190), 0);
+    assert_eq!(listed(), 6, "past the start's two listings, the pace again");
+    feed.batch(b"out", at(300), 0);
+    assert_eq!(listed(), 7, "the pace has passed again");
+    feed.batch(b"\x1b]133;D;0\x07", at(310), 0);
+    assert_eq!(listed(), 8, "a block's end lists it at once");
+    feed.batch(b"PS> ", at(320), 0);
+    assert_eq!(listed(), 9, "and the prompt after it again");
+    feed.batch(b"\x1b]63", at(330), 0);
+    assert_eq!(listed(), 9);
+    feed.batch(b"3;D\x1b\\", at(340), 0);
+    assert_eq!(listed(), 10, "an end cut across two batches");
+    feed.batch(b"x", at(350), 0);
+    assert_eq!(listed(), 11);
+    feed.batch(b"\x1b]133;A\x07PS> \x1b]133;B\x07", at(360), 0);
+    assert_eq!(listed(), 11, "a prompt's marks are no block's start or end");
+}
+
+/// A PROGRAM A COMMAND LEAVES RUNNING IS PLACED IN ITS OWN BLOCK (J0-1 lander, review finding
+/// 2): a pwsh block starts at wall 1000 (its C) and its first output is listed at 1010; it
+/// starts a silent background program at 1050 and ends at 1060 (its D), within the pace of the
+/// last listing. The listing at its D stamps the program there, inside the block's window, so
+/// the block's word names it and the next block's, typed 1.2 s later and started at 2900, does
+/// not, though that block's typing echo and its C list the job again while the program still
+/// runs. NEGATIVE CONTROL (scratch, `J01_NC=end`): a D not looked for leaves the program to the
+/// next listing, the typing echo at 2200, outside its own block's window (the first detail
+/// assertion fails) and inside the next block's, where it would name that block's word.
+#[test]
+fn a_program_a_command_leaves_running_is_placed_in_its_own_block() {
+    use crate::session_status::command_detail;
+    const BG: &str = r"C:\tools\qzpbgsvc.exe";
+    let ran = Arc::new(Ran::default());
+    let mut feed = RanJob::listing(
+        Arc::clone(&ran),
+        100,
+        Some(101),
+        scripted_job(
+            100,
+            vec![
+                vec![(100, "pwsh.exe")],
+                vec![(100, "pwsh.exe")],
+                vec![(100, "pwsh.exe"), (300, BG)],
+                vec![(100, "pwsh.exe"), (300, BG)],
+                vec![(100, "pwsh.exe"), (300, BG)],
+            ],
+        ),
+    );
+    let t0 = Instant::now();
+    let mut batch = |bytes: &[u8], ms: u64| {
+        feed.batch(bytes, t0 + Duration::from_millis(ms), 1_000 + ms);
+    };
+    batch(b"\x1b]133;C\x07", 0);
+    batch(b"started\r\n", 10);
+    batch(b"\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07", 60);
+    batch(b"qzpbgsvc", 1_200);
+    batch(b"\r\n\x1b]133;C\x07", 1_900);
+    assert_eq!(
+        heard_names(&ran),
+        [(300, "qzpbgsvc".to_owned())],
+        "heard once, while the job holds it"
+    );
+    let own = Window::of(Some(1_000), Some(1_060), None, Some(2_900));
+    let after = own.and_then(|w| w.to);
+    let next = Window::of(Some(2_900), None, after, None);
+    let cwd = Some(r"C:\Users\jsmith");
+    assert_eq!(
+        command_detail("qzpbgsvc", &ran.heard(7, own, cwd)).as_deref(),
+        Some("qzpbgsvc"),
+        "the block that started it names it"
+    );
+    assert_eq!(
+        command_detail("qzpbgsvc", &ran.heard(8, next, cwd)),
+        None,
+        "the next block, which did not run it, does not"
+    );
+}
+
+/// One worker's count, read now.
+fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    counter.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `n` sessions on `worker`, each reader waiting `wait`.
+fn sessions_on(files: &Arc<Stalled>, worker: &Arc<Worker>, n: usize, wait: Duration) -> Vec<Ran> {
+    (0..n)
+        .map(|_| {
+            Ran::on_worker(
+                Arc::clone(files) as Arc<dyn Files>,
+                Arc::clone(worker),
+                wait,
+            )
+        })
+        .collect()
+}
+
+/// Session `i`'s read of its own bare word `k<i>`, in a window where that program ran.
+fn look_own(sessions: &[Ran], i: usize) -> Look {
+    let word = format!("k{i}");
+    let heard = Heard::of(
+        &sessions[i],
+        vec![exec(0, &word)],
+        Some("/w"),
+        Some("/usr/bin"),
+    );
+    heard.look(Word::Bare(&word))
+}
+
+/// `/usr/bin/k<i>` for each of `n`, each its own program.
+fn k_table(n: usize) -> Table {
+    (0..n).fold(Table::default(), |t, i| {
+        t.program(&format!("/usr/bin/k{i}"), &format!("k{i}"))
+    })
+}
+
+/// A STALLED WORKER COSTS THE UI THREAD ONE WAIT, NOT ONE PER NEW LOOKUP (J0-1, gap H1-g14):
+/// with a reader's wait of 50 ms and the worker stuck on the first lookup, more readers than
+/// [`JOBS_MAX`] ask their own new word: none queues more than the bound, every reader after the
+/// first returns Pending, and only the first began a wait (counted, never timed). Once the file
+/// system answers, the next read of the first word gets its answer. NEGATIVE CONTROLS (scratch,
+/// `J01_NC`): readers that wait on a stalled worker (`stall`) count `JOBS_MAX + 1` waits; that
+/// and an unbounded queue together (`old`, the code before J0-1) count one wait per reader and
+/// queue all but the first.
+#[test]
+fn a_stalled_worker_costs_readers_one_wait_and_queues_at_most_its_bound() {
+    const WAIT: Duration = Duration::from_millis(50);
+    let n = JOBS_MAX + 4;
+    let files = Arc::new(Stalled {
+        table: k_table(n),
+        ..Stalled::default()
+    });
+    let worker = Worker::start().expect("a worker thread");
+    let sessions = sessions_on(&files, &worker, n, WAIT);
+    assert_eq!(
+        look_own(&sessions, 0),
+        Look::Pending,
+        "the first reader waited"
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the worker on the first lookup",
+        || (count(&files.entered) > 0).then_some(()),
+    );
+    for i in 1..n {
+        assert_eq!(look_own(&sessions, i), Look::Pending, "reader {i}");
+    }
+    assert!(
+        count(&worker.counts.most_queued) <= JOBS_MAX,
+        "queued {}",
+        count(&worker.counts.most_queued)
+    );
+    assert_eq!(
+        count(&worker.counts.waits),
+        1,
+        "one wait, the first reader's"
+    );
+    files.open();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the first lookup's answer",
+        || (look_own(&sessions, 0) == Look::Ran).then_some(()),
+    );
+}
+
+/// A FULL LOOKUP QUEUE REFUSES A LOOKUP, WHICH IS ASKED AGAIN (J0-1, gap H1-g14): with the
+/// worker held back, more readers than [`JOBS_MAX`] ask their own new word: the queue takes
+/// `JOBS_MAX` and refuses the rest, each read Pending at once; once the worker has answered the
+/// queued ones, a refused word's next read asks again and gets its answer. NEGATIVE CONTROLS
+/// (scratch, `J01_NC`): an unbounded queue (`queue`) queues every reader; a refused lookup
+/// marked asked (`asked`) is never asked again.
+#[test]
+fn a_full_lookup_queue_refuses_a_lookup_and_a_later_read_asks_it_again() {
+    let n = JOBS_MAX + 4;
+    let files = Arc::new(Stalled {
+        table: k_table(n),
+        ..Stalled::default()
+    });
+    let gate = Arc::clone(&files);
+    let worker = Worker::start_after(move || gate.wait_open()).expect("a worker thread");
+    let sessions = sessions_on(&files, &worker, n, Duration::ZERO);
+    for i in 0..n {
+        assert_eq!(look_own(&sessions, i), Look::Pending, "reader {i}");
+    }
+    assert_eq!(count(&worker.counts.posted), JOBS_MAX, "the queue's bound");
+    assert!(count(&worker.counts.most_queued) <= JOBS_MAX);
+    files.open();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the queued lookups' answers",
+        || (count(&worker.counts.answered) == JOBS_MAX).then_some(()),
+    );
+    let last = n - 1;
+    assert_eq!(look_own(&sessions, last), Look::Pending, "asked again");
+    assert_eq!(
+        count(&worker.counts.posted),
+        JOBS_MAX + 1,
+        "a refused word is asked again"
+    );
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the refused word's answer",
+        || (look_own(&sessions, last) == Look::Ran).then_some(()),
+    );
 }

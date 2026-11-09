@@ -19,6 +19,8 @@ use fixture_wait::{HANG as FIXTURE_HANG, deadline as fixture_deadline};
 #[cfg(unix)]
 mod actor;
 #[cfg(unix)]
+mod bootstrap_graph_transport;
+#[cfg(unix)]
 mod client;
 #[cfg(unix)]
 mod enrollment;

@@ -8021,9 +8021,24 @@ impl App {
                         self.note_system_state_cut_off_at_commit();
                         cut_off_noted = true;
                     }
+                    let clicks = self.permission_clicks.clicks.standing();
                     let committed = sources.as_deref().and_then(|sources| {
                         let write = || {
                             write_attempted = true;
+                            // A standing permission click lives in this process alone: a written
+                            // Commit ends it (design §9 of DESIGN-yolo-binary-2026-11-04); one
+                            // that returns leaves it standing, as the line after it says.
+                            for click in &clicks {
+                                aterm_log::info!(
+                                    "harness @{}: the update's Commit, once written, drops the standing click on {}",
+                                    click.click.tab,
+                                    if click.from_yolo {
+                                        aterm_agent::harness::footer::YOLO_ON
+                                    } else {
+                                        aterm_agent::harness::footer::YOLO_OFF
+                                    }
+                                );
+                            }
                             crate::seamless::commit_and_exit(commit_fd, proof)
                         };
                         match self.harness.as_ref() {
@@ -8052,6 +8067,15 @@ impl App {
                      every one of those connections",
                     left_out.len()
                 );
+            }
+            if write_attempted && commit_result.as_ref().is_some_and(Result::is_err) {
+                for click in self.permission_clicks.clicks.standing() {
+                    aterm_log::info!(
+                        "harness @{}: the update's Commit was not written, so the standing \
+                         click stands",
+                        click.click.tab
+                    );
+                }
             }
             #[cfg(target_os = "macos")]
             if commit_result.as_ref().is_some_and(Result::is_err)

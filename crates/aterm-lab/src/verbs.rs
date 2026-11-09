@@ -1060,7 +1060,7 @@ pub fn fixture_header_on(run: &Run, door: &Door<'_>, tab: Option<&str>, what: &s
     let launcher = launch_record(run, &sid);
     let settings = scratch_text(&run.settings());
     let creds = match claude_route(&launcher) {
-        ClaudeRoute::Stub => run.w.join("home/.claude/.credentials.json"),
+        ClaudeRoute::Stub => run.claude_dir().join(".credentials.json"),
         ClaudeRoute::Default => {
             launcher_value(&launcher, aterm_agent::harness::accounts::LOGIN_ENV)
                 .map_or_else(|| run.w.join("home/.claude"), std::path::PathBuf::from)
@@ -1568,11 +1568,12 @@ pub fn twin(run: &Run, a: &[String]) -> Res {
         }
         let ver = given;
         let dest = pkg.join(format!("store/claude/lab-{ver}-crashing/bin/claude"));
-        let script = format!(
-            "#!/bin/sh\n# aterm-lab twin --crashing: a stand-in build that exits at once (crates/aterm-lab)\ncase \"$1\" in --version) echo \"{ver} (Claude Code)\"; exit 0 ;; esac\necho \"lab stand-in {ver}: this build exits at once\" >&2\nexit 1\n"
-        );
-        put(&dest, 0o755, &PutSrc::Bytes(script.as_bytes()))
-            .map_err(|e| Fail::die(format!("twin: cannot write {}: {e}", dest.display())))?;
+        put(
+            &dest,
+            0o755,
+            &PutSrc::Bytes(crashing_build(&ver).as_bytes()),
+        )
+        .map_err(|e| Fail::die(format!("twin: cannot write {}: {e}", dest.display())))?;
         (ver, dest)
     } else {
         let src = crate::paths::from_caller(src);
@@ -1612,12 +1613,10 @@ pub fn twin(run: &Run, a: &[String]) -> Res {
         crate::lab::release_scratch(&run.run, &build);
         (ver, dest)
     };
-    let q = dest.to_string_lossy().replace('\'', "'\\''");
-    let shim = format!(
-        "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n# aterm-lab twin: a newer managed build presented the way atpkg lays one (crates/aterm-lab)\nexport DISABLE_AUTOUPDATER='1'\nexec '{q}' \"$@\"\n"
-    );
     let twin = pkg.join("agents/claude");
-    put(&twin, 0o755, &PutSrc::Bytes(shim.as_bytes()))
+    let shim = atpkg_twin(&pkg, &twin, &dest)
+        .map_err(|e| Fail::die(format!("twin: cannot render the twin: {e}")))?;
+    put(&twin, 0o755, &PutSrc::Bytes(&shim))
         .map_err(|e| Fail::die(format!("twin: cannot write the twin: {e}")))?;
     put(
         &pkg.join("activation-notices/claude"),
@@ -1639,6 +1638,32 @@ pub fn twin(run: &Run, a: &[String]) -> Res {
         );
     }
     Ok(0)
+}
+
+/// `twin --crashing`'s stand-in build of version `ver`: it answers `--version` and exits 1 on
+/// anything else. Its interpreter is `/bin/bash`, not `/bin/sh`: a version probe reads a `/bin/sh`
+/// script the twin forwards to as another producer shim, and pins none it does not recognize.
+fn crashing_build(ver: &str) -> String {
+    format!(
+        "#!/bin/bash\n# aterm-lab twin --crashing: a stand-in build that exits at once (crates/aterm-lab)\ncase \"$1\" in --version) echo \"{ver} (Claude Code)\"; exit 0 ;; esac\necho \"lab stand-in {ver}: this build exits at once\" >&2\nexit 1\n"
+    )
+}
+
+/// The `agents/claude` twin an activation lays at `twin` under the prefix `pkg` for the build
+/// `build`: its whole prelude and the managed env the lab has always set. A version probe runs a
+/// shebang file at `agents/claude` only as a producer shim it recognizes (fd3b937ea1), so a twin
+/// written any other way leaves the live upgrade with no version to read and nothing to move.
+fn atpkg_twin(pkg: &Path, twin: &Path, build: &Path) -> std::io::Result<Vec<u8>> {
+    let mut prelude = atpkg::platform::twin_prelude(
+        "claude",
+        pkg,
+        None,
+        atpkg::selfupdate::verbs_of("claude"),
+        &atpkg::yolo::policy_of("claude"),
+    );
+    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", None));
+    let env = atpkg::shim_env::ShimEnv::from_lines("DISABLE_AUTOUPDATER=1\n");
+    Ok(atpkg::platform::twin_executable_to_env(twin, build, &env, &prelude)?.body)
 }
 
 /// Selftest check that [`twin`] refuses a symlinked `home/Library` inside the jail.
@@ -2104,5 +2129,44 @@ mod tests {
                 && !semver_like("x.1.2")
                 && !semver_like("2.1")
         );
+    }
+
+    /// The live upgrade reads a newer build's version through a probe that pins the twin's
+    /// launch, and pins only a twin atpkg would have laid over a build that is an image to it. A
+    /// twin it refuses leaves the upgrade with no version, so nothing moves (the lab's hand-written
+    /// twin did that from fd3b937ea1 on). The two refusals are the controls.
+    #[test]
+    fn a_version_probe_pins_the_twin_the_lab_lays_over_its_build() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-twin-")
+            .tempdir()
+            .unwrap();
+        let pkg = fs::canonicalize(top.path()).unwrap().join("pkg");
+        let (twin, build) = (
+            pkg.join("agents/claude"),
+            pkg.join("store/claude/lab-1/bin/claude"),
+        );
+        let lay = |path: &Path, text: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let forwarder = atpkg::platform::ProbeForwarder {
+            executable: std::env::current_exe().unwrap(),
+            parent_pid: std::process::id(),
+        };
+        let pinned = |text: &str| atpkg::platform::probe_shim(&twin, text, &forwarder).is_some();
+        let laid = String::from_utf8(atpkg_twin(&pkg, &twin, &build).unwrap()).unwrap();
+        lay(&twin, &laid);
+        lay(&build, &crashing_build("99.0.0"));
+        assert!(pinned(&laid), "the twin the lab lays: {laid}");
+        let hand = format!(
+            "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n# aterm-lab twin: a newer managed build\nexport DISABLE_AUTOUPDATER='1'\nexec '{}' \"$@\"\n",
+            build.display()
+        );
+        assert!(!pinned(&hand), "a twin atpkg would not lay");
+        lay(&build, "#!/bin/sh\necho '99.0.0 (Claude Code)'\n");
+        assert!(!pinned(&laid), "a build the probe reads as another shim");
     }
 }

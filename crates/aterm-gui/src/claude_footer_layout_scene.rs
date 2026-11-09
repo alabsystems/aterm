@@ -328,7 +328,6 @@ fn paint_chip_and_effort_samples(
             AutopilotView::Land,
             "  \u{23f8} plan mode on (shift+tab to cycle)",
             true,
-            false,
         ),
     );
     let footer = &mut layouts.footers[7];
@@ -453,7 +452,6 @@ fn paint_quota_samples(
             AutopilotView::Cruise,
             "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)",
             false,
-            true,
         ),
     );
     let cases = layouts.cases.get_or_insert_with(quota_scenes::cases);
@@ -689,7 +687,7 @@ mod tests {
                 row(23).contains("land"),
                 "the sample uses a worded Land chip"
             );
-            assert!(row(23).contains("plan"), "its permission chip follows it");
+            assert!(row(23).contains("lame"), "its permission chip follows it");
             assert!(
                 row(23).contains(" ─ "),
                 "worded chips are set apart by the rule"

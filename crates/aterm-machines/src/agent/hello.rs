@@ -43,7 +43,7 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
         sessions: if sys.own_uuid().is_some() && crate::sessions::is_live_account() {
             crate::sessions::scan_local_aterm_sessions()
         } else {
-            Vec::new()
+            crate::protocol::SessionSnapshot::default()
         },
         vitals,
     }

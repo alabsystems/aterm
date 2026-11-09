@@ -110,6 +110,9 @@ pub struct Tally {
     group: Option<u32>,
     /// The members that descended from the root at the last read made while it lived.
     within: Vec<(u32, u64)>,
+    /// The members the latest read of its group booked inside the tree, each with its footprint
+    /// then and its lifetime peak ([`Self::members`]).
+    last: Vec<Member>,
     #[cfg(any(test, debug_assertions))]
     observation: Observation,
 }
@@ -152,6 +155,7 @@ impl Tally {
     /// find it the tree's. Only a decided answer is kept for the member's life.
     pub fn book(&mut self, members: &[Member], in_tree: &mut dyn FnMut(u32) -> Option<bool>) {
         let mut sum = 0u64;
+        self.last.clear();
         for m in members {
             let inside = match self.seen.get(&(m.pid, m.start)) {
                 Some(&inside) => inside,
@@ -166,9 +170,18 @@ impl Tally {
             if inside {
                 sum = sum.saturating_add(m.footprint);
                 self.one = self.one.max(m.peak);
+                self.last.push(*m);
             }
         }
         self.together = self.together.max(sum);
+    }
+
+    /// The members the latest [`Self::book`] took inside the tree, each with its footprint then
+    /// and its lifetime peak: what a reader of the tree's phases ([`crate::phase::Phases::read`])
+    /// sums and floors by its members' peaks as [`Self::peak`] does.
+    #[must_use]
+    pub fn members(&self) -> &[Member] {
+        &self.last
     }
 
     /// The peak read so far, bytes: [`Self::book`]'s sums and lifetime peaks, the most of them.
@@ -487,6 +500,19 @@ impl TreeMeter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .peak()
+    }
+
+    /// The members its latest read of the tree's group found inside it ([`Tally::members`]),
+    /// each with its footprint then and its lifetime peak: the read its phases are judged by
+    /// ([`crate::phase::Phases::read`]), with no read of its own. Empty where no read found the
+    /// group, and off macOS.
+    #[must_use]
+    pub fn members(&self) -> Vec<Member> {
+        self.tally
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .members()
+            .to_vec()
     }
 
     /// Stop reading: the peak, never less than `floor` (the reaped tree's largest resident peak,

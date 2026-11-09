@@ -163,8 +163,8 @@ fn split_flags(flags: &str) -> Vec<String> {
 enum Cycle {
     /// The launch mode's, under the lab's settings.
     Launch,
-    /// A `--dangerously-skip-permissions` launch's, from bypass: how many presses a leave of
-    /// bypass takes to reach each mode (the mode light's click from `yolo` to `lame`).
+    /// A `--dangerously-skip-permissions` launch's, from bypass: how many presses of a person's
+    /// shift+tab a leave of bypass takes to reach each mode.
     FromBypass,
 }
 

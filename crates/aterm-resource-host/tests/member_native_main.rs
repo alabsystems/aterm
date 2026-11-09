@@ -14,6 +14,9 @@
 #[path = "../src/actor.rs"]
 mod actor;
 #[cfg(unix)]
+#[path = "../src/bootstrap_graph_transport.rs"]
+mod bootstrap_graph_transport;
+#[cfg(unix)]
 #[path = "../src/fixture_wait.rs"]
 mod fixture_wait;
 #[cfg(unix)]

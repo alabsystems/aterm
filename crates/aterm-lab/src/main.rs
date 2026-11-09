@@ -497,9 +497,11 @@ usage: targo --unverified lab <command> [tag] [args]
                                  LAB_ROUTE_SEAM=1: the instance reads the stub's base URL as Claude Code's default
                                  route (ATERM_DEBUG_LAB_DEFAULT_ROUTE), so a tab launched on a roster row's stored
                                  login (no --subscriber) is that row's process to the accounts host
-  claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
+  claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber | --stored] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
-                                 fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log;
+                                 fake claude.ai OAuth token, for `limit` headers; --stored: the stored login a /login
+                                 leaves, in a login directory of its own, so a relaunch can admit its account;
+                                 LAB_ROUTE_SEAM=1 labs only; --debug-log: a scratch debug log;
                                  --by-name: types `claude` at the prompt as a person does, the lab's environment as
                                  assignment words before it; LAB_REROUTE=1 labs only)
                                  --prepare-only: write the canonical launcher and emit JSON argv/cwd for `instance --`;

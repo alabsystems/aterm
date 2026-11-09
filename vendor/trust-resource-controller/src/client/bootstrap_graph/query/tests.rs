@@ -6,6 +6,31 @@ use std::os::unix::net::UnixStream;
 
 use super::*;
 
+#[test]
+fn original_sdk_root_observation_matches_keeper_without_relabeling_program() {
+    let mut request = query::tests::request();
+    let mut sdk = crate::SdkCustody {
+        execution: request.sdk_root.clone(),
+        build: 1,
+        lease_path: b"/sdk/lease".to_vec(),
+        lease: crate::FileIdentity { device: 1, inode: 2 },
+        inherited_fd: 5,
+    };
+    // These are Keeper field semantics, not an actual Host/SDK authority
+    // fixture. Exercise the exact production preconnect equality check.
+    request.validate().unwrap();
+    validate_original_sdk(Some(&sdk), &request).unwrap();
+    assert!(validate_original_sdk(None, &request).is_err());
+    sdk.execution = b"/sdk/bin/targo".to_vec();
+    assert!(validate_original_sdk(Some(&sdk), &request).is_err());
+    sdk.execution = b"/foreign-sdk".to_vec();
+    assert!(validate_original_sdk(Some(&sdk), &request).is_err());
+    sdk.execution = request.sdk_root.clone();
+    validate_original_sdk(Some(&sdk), &request).unwrap();
+    request.program.path = b"/sdk/bin/targo".to_vec();
+    assert!(request.validate().is_err(), "root equality never changes the selected tool profile");
+}
+
 fn frames(request: &query::Request, digest: [u8; 32]) -> Vec<Vec<u8>> {
     use crate::bootstrap_graph::query::tests::{prepared, started, terminal};
     let mut frames = [

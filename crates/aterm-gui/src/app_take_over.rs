@@ -16,6 +16,9 @@ pub(crate) const LONG_HOLD: Duration = Duration::from_secs(30 * 60);
 
 const LONG_HOLD_RESTATE: Duration = Duration::from_secs(60);
 
+/// Allowance for the requested fleet hold change's owned command.
+const HOLD_ACTION_HANG: Duration = Duration::from_secs(60);
+
 /// Why a control client's copy or paste did nothing ([`App::refuse_clipboard_gesture`]).
 pub(crate) const CLIPBOARD_REFUSED: &str = "the clipboard is the person's own: a control client \
      cannot copy to it or paste from it (send text with the `paste` verb)";
@@ -421,11 +424,10 @@ impl CliVerb {
 
     const fn cap(self) -> Option<Duration> {
         match self {
-            Self::ReadThisMac
-            | Self::ReadFleet
-            | Self::FleetPeers
-            | Self::ReadPeer
-            | Self::DrivePeer => Some(crate::bounded_child::READ_CAP),
+            Self::ReadThisMac | Self::ReadFleet | Self::FleetPeers | Self::ReadPeer => {
+                Some(crate::bounded_child::READ_CAP)
+            }
+            Self::DrivePeer => Some(HOLD_ACTION_HANG),
             Self::BusStatus | Self::BusOn | Self::BusOff => None,
         }
     }
@@ -1578,6 +1580,159 @@ mod tests {
     use crate::palette::PaletteState;
     use crate::session_timeline::MetaField;
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned native child exercised by the hold-action parent"]
+    fn native_hold_action_child() {
+        use std::io::Write as _;
+        let args: Vec<String> = std::env::args().collect();
+        let Some(gate) = args.iter().find_map(|arg| arg.strip_prefix("hold-gate=")) else {
+            return;
+        };
+        let port: u16 = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("hold-port="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        println!("owned hold action started");
+        let mut proof = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        proof.write_all(b"ready\n").unwrap();
+        let _writer = aterm_update_core::FileLock::acquire(Path::new(gate)).unwrap();
+        println!("owned hold action completed");
+        eprintln!("owned hold action diagnostic");
+        if let Some(code) = args.iter().find_map(|arg| arg.strip_prefix("hold-exit=")) {
+            std::process::exit(code.parse().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_required_fleet_hold_action_waits_for_its_native_command() {
+        use std::cell::RefCell;
+        use std::io::Read as _;
+
+        assert_eq!(
+            CliVerb::ReadThisMac.cap(),
+            Some(crate::bounded_child::READ_CAP)
+        );
+        assert_eq!(
+            CliVerb::ReadFleet.cap(),
+            Some(crate::bounded_child::READ_CAP)
+        );
+        assert_eq!(
+            CliVerb::FleetPeers.cap(),
+            Some(crate::bounded_child::READ_CAP)
+        );
+        assert_eq!(
+            CliVerb::ReadPeer.cap(),
+            Some(crate::bounded_child::READ_CAP)
+        );
+        for verb in [CliVerb::BusStatus, CliVerb::BusOn, CliVerb::BusOff] {
+            assert_eq!(verb.cap(), None);
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let gate = root.path().join("hold.lock");
+        let child = std::env::current_exe().unwrap();
+        for (age, exit) in [(31, 0), (61, 0), (0, 0), (31, 7)] {
+            let held = RefCell::new(Some(aterm_update_core::FileLock::acquire(&gate).unwrap()));
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let proof = RefCell::new(None);
+            let mut released = false;
+            let args = vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "app_take_over::tests::native_hold_action_child".into(),
+                "--nocapture".into(),
+                format!("hold-gate={}", gate.display()),
+                format!("hold-port={port}"),
+                format!("hold-exit={exit}"),
+            ];
+            let got = crate::bounded_child::run_bounded_observing(
+                &child,
+                &args,
+                CliVerb::DrivePeer.cap(),
+                || {
+                    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                    let mut connected = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < until,
+                                    "owned child did not reach its writer"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("owned native child proof: {error}"),
+                        }
+                    };
+                    // macOS hands accept() the listener's O_NONBLOCK, so a read
+                    // that comes before the child's write would be WouldBlock,
+                    // not a wait; the read timeout below needs a blocking socket.
+                    connected.set_nonblocking(false).unwrap();
+                    connected
+                        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                        .unwrap();
+                    let mut ready = [0; 6];
+                    connected.read_exact(&mut ready).unwrap();
+                    assert_eq!(&ready, b"ready\n");
+                    *proof.borrow_mut() = Some(connected);
+                    Instant::now() - Duration::from_secs(age)
+                },
+                || {
+                    if !released {
+                        assert_eq!(
+                            aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO)
+                                .err()
+                                .unwrap()
+                                .kind(),
+                            std::io::ErrorKind::TimedOut,
+                        );
+                        drop(held.borrow_mut().take());
+                        released = true;
+                    }
+                },
+            );
+            if age == 61 {
+                assert!(
+                    got.is_err(),
+                    "the actual expired child is killed and reaped"
+                );
+                assert!(!released, "an expired allowance cannot release custody");
+                assert!(held.borrow().is_some());
+                assert_eq!(
+                    aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO)
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::TimedOut,
+                );
+            } else {
+                let got = got.expect("the requested command retains its completion allowance");
+                assert!(released);
+                assert_eq!(got.code, Some(exit));
+                assert!(
+                    got.stdout.contains("owned hold action completed"),
+                    "{got:?}"
+                );
+                assert!(
+                    got.stderr.contains("owned hold action diagnostic"),
+                    "{got:?}"
+                );
+            }
+            assert_eq!(
+                proof.borrow_mut().as_mut().unwrap().read(&mut [0]).unwrap(),
+                0,
+                "the actual child ended before its owned scratch is removed"
+            );
+            drop(held.into_inner());
+            drop(aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO).unwrap());
+        }
+    }
 
     fn app_with_stub() -> (App, WindowId, u64, Arc<crate::SessionCtx>) {
         let mut app = App::headless_for_test();

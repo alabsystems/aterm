@@ -24,6 +24,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "resource_admission_bootstrap_graph.rs"]
+pub(super) mod bootstrap_graph;
+
+#[path = "resource_admission_bootstrap_query.rs"]
+mod bootstrap_query;
 #[path = "resource_admission_compiler.rs"]
 mod compiler;
 #[path = "resource_admission_context.rs"]
@@ -111,12 +116,14 @@ struct Pending {
     scope_reference: Option<aterm_capacity::CohortClosureRef>,
     cancelled: bool,
     resolver: Option<resolver_root::Preparation>,
+    bootstrap_graph: Option<bootstrap_graph::Root>,
 }
 impl Pending {
     /// The new workload's original whole-attempt clock includes admission.
     /// Repeated inspections and final GO cannot renew that selected bound.
-    fn workload_deadline(&self) -> io::Result<Option<Instant>> {
-        if !workload::purpose(&self.submission.request) {
+    fn original_deadline(&self) -> io::Result<Option<Instant>> {
+        let graph = bootstrap_graph::purpose(&self.submission.request);
+        if !workload::purpose(&self.submission.request) && !graph {
             return Ok(None);
         }
         let millis = self
@@ -124,7 +131,13 @@ impl Pending {
             .request
             .timeout_ms
             .filter(|ms| {
-                *ms > 0 && *ms <= trust_resource_controller::workload::host::MAX_ROOT_TIMEOUT_MS
+                *ms > 0
+                    && *ms
+                        <= if graph {
+                            bootstrap_graph::MAX_ROOT_TIMEOUT_MS
+                        } else {
+                            trust_resource_controller::workload::host::MAX_ROOT_TIMEOUT_MS
+                        }
             })
             .ok_or_else(|| refused("original workload deadline unavailable"))?;
         self.queued_at
@@ -181,6 +194,7 @@ struct Job {
     resolver: Option<resolver_root::Preparation>,
     compiler: Option<compiler::Selection>,
     runtime_inputs: runtime_inputs::State,
+    bootstrap_graph: Option<bootstrap_graph::Root>,
     events: job::Events,
     custody: Custody,
     child: aterm_capacity::cohort::launch::CohortChild,

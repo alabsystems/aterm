@@ -2886,12 +2886,13 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// What the lights block names Claude's bypass mode (`⏵⏵ bypass permissions on`) where the glass
-/// rewrites its mode row ([`mode_row_rewrite_under`]): yolo, the default, full auto and named
-/// quietly, in the ink of the rule it sits on.
+/// What the lights block names the bit set, wherever it is read: Claude's pill reads bypass
+/// (`⏵⏵ bypass permissions on`): yolo, the default, full auto and named quietly, in the glass's
+/// value ink (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
 pub const YOLO_ON: &str = "yolo";
-/// What it names the manual mode (`⏸ manual mode on`), the mode that asks before each tool and
-/// the one a click on `yolo` turns to: yolo turned off is lame (the owner's word, 2026-11-02).
+/// What it names the bit clear: any other mode its pill reads, `auto` included, and the side a
+/// click on `yolo` restarts toward (the settings' own mode): yolo turned off is lame (the owner's
+/// word, 2026-11-02), widened from manual to every mode that is not yolo (§8).
 pub const YOLO_OFF: &str = "lame";
 
 /// How many items a rewritten mode row keeps ([`ModeRow`]); a row with more stands as drawn.
@@ -2943,12 +2944,14 @@ impl Kept {
 }
 
 /// Claude's mode row as [`mode_row_rewrite_under`] read it, in PANE COLUMNS of the GUI's pane
-/// text (one char per cell), for the glass to rewrite: only the jobs, then the live states and
-/// the items this build does not know, each as Claude drew it, flush at column 0 and joined by
-/// [`MODE_ROW_SEP`], blanks after. The pill, its cycle hint, the key hints, the `⧉` items, the
-/// effort hint and the auto-compact reading are dropped: the mode is the lights block's, the
-/// effort the bottom rule's `◆` where the session's facts name one (else the hint is kept,
-/// [`ModeRow::keeping_effort`]), the context its fact's.
+/// text (one char per cell), under every pill: its jobs ([`Self::job_words`]) and the effort its
+/// hint says ([`Self::effort_said`]) are read on any mode's row, and on a bypass row alone the
+/// glass rewrites it to these items (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): only the jobs,
+/// then the live states and the items this build does not know, each as Claude drew it, flush at
+/// column 0 and joined by [`MODE_ROW_SEP`], blanks after. The pill, its cycle hint, the key hints,
+/// the `⧉` items, the effort hint and the auto-compact reading are dropped there: the mode is the
+/// lights block's, the effort the bottom rule's `◆` where the session's facts name one (else the
+/// hint is kept, [`ModeRow::keeping_effort`]), the context its fact's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeRow {
     /// The mode row.
@@ -3171,8 +3174,9 @@ fn begins_job(cut: &str) -> bool {
     })
 }
 
-/// Claude Code's mode row under the composer bottom rule `bottom`, read for the glass to rewrite
-/// ([`ModeRow`]): `None` where the row is not one this build reads whole, a cut or unknown pill,
+/// Claude Code's mode row under the composer bottom rule `bottom`, under any pill this build knows
+/// ([`ModeRow`]: its jobs and effort read on every mode's row, the glass's rewrite on a bypass
+/// row alone): `None` where the row is not one this build reads whole, a cut or unknown pill,
 /// a cut item or hint, or more items than [`MODE_ROW_ITEMS`]. A cut last item whose shown text
 /// can only begin an item the rewrite drops (`← for ag…`) is dropped as that item.
 #[must_use]
@@ -4176,7 +4180,7 @@ pub struct LightsWidth {
     pub lean: [usize; LEAN_FORMS],
     /// The short form and its gap.
     pub short: usize,
-    /// The title says why (a stopped mode return, a refusal, a switch note) rather than what the pointer or selection shows.
+    /// The title says why (a light's refusal, or what a permission click's restart waits for or ends) rather than what the pointer or selection shows.
     pub reason: bool,
 }
 

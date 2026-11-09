@@ -580,11 +580,13 @@ impl Held {
             claim, key, own, ..
         } = self;
         let claimed = claim.record().need.mem;
+        let run_claimed = claim.record().need.run_mem.unwrap_or(claimed);
         let run = telemetry::Run::of(&claim);
         (
             claim,
             Ended {
                 claimed,
+                run_claimed,
                 key,
                 own,
                 run,
@@ -620,10 +622,12 @@ impl Held {
             claim, key, own, ..
         } = self;
         let claimed = claim.record().need.mem;
+        let run_claimed = claim.record().need.run_mem.unwrap_or(claimed);
         let run = telemetry::Run::of(&claim);
         drop(claim);
         Ended {
             claimed,
+            run_claimed,
             key,
             own,
             run,
@@ -637,6 +641,8 @@ impl Held {
 #[derive(Debug)]
 pub struct Ended {
     claimed: u64,
+    /// What its run phase claimed: its need's run phase memory, else its peak.
+    run_claimed: u64,
     key: Key,
     own: Option<PathBuf>,
     run: telemetry::Run,
@@ -657,6 +663,29 @@ impl Ended {
         self.keep_then(end, peak, say, telemetry::ended)
     }
 
+    /// Keep its RUN PHASE's peak, `run_peak` (the most its tree held at one read once it ran a
+    /// program its build made, [`aterm_capacity::phase::Phases::run_peak`]; `None` where it never
+    /// did), under its key's run phase key ([`aterm_capacity::phase::run_key`]), by the rule
+    /// [`Self::keep`] keeps its whole peak by, against what its run phase claimed: apart from its
+    /// compile's, so the next claim of its key steps down to it (CAP3). The bytes kept; `None`
+    /// when nothing was.
+    pub fn keep_run(
+        &self,
+        end: &BuildEnd,
+        run_peak: Option<u64>,
+        say: &mut dyn FnMut(&str),
+    ) -> Option<u64> {
+        let peak = run_peak?;
+        keep_peak(
+            self.own.as_deref(),
+            aterm_capacity::phase::run_key(&self.key),
+            peak,
+            self.run_claimed,
+            end.succeeded(),
+            say,
+        )
+    }
+
     /// [`Self::keep`], its row handed to `row` once the book is done.
     fn keep_then(
         self,
@@ -670,32 +699,44 @@ impl Ended {
             key,
             own,
             run,
+            ..
         } = self;
-        let succeeded = end.succeeded();
-        let raises = aterm_capacity::peak_claim(peak) > claimed;
         // The row goes after the book, so its lock wait and first host read never hold up the
         // peak a next claim of this key reads.
         let stage = key.stage.clone();
-        let kept = match own.filter(|_| peak > 0 && (succeeded || raises)) {
-            Some(path) => {
-                let at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                match Records::keep_unless_light(&path, key, peak, at) {
-                    Ok(kept) => kept.then_some(peak),
-                    Err(e) => {
-                        say(&format!(
-                            "{SAYS}: its peak was not kept in {}: {e}",
-                            path.display()
-                        ));
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        let kept = keep_peak(own.as_deref(), key, peak, claimed, end.succeeded(), say);
         row(&run, &stage, &end, peak);
         kept
+    }
+}
+
+/// Keep `peak` under `key` in the book at `own` where something was read and the build
+/// `succeeded`, or where it failed with a peak that would claim more than `claimed` did, unless
+/// the run was light beside the heavy peak its key keeps ([`Records::keep_unless_light`]): the
+/// rule [`Ended::keep`] says. The bytes kept; `None` when nothing was, or the record could not be
+/// written (said in one line).
+fn keep_peak(
+    own: Option<&Path>,
+    key: Key,
+    peak: u64,
+    claimed: u64,
+    succeeded: bool,
+    say: &mut dyn FnMut(&str),
+) -> Option<u64> {
+    let raises = aterm_capacity::peak_claim(peak) > claimed;
+    let path = own.filter(|_| peak > 0 && (succeeded || raises))?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    match Records::keep_unless_light(path, key, peak, at) {
+        Ok(kept) => kept.then_some(peak),
+        Err(e) => {
+            say(&format!(
+                "{SAYS}: its peak was not kept in {}: {e}",
+                path.display()
+            ));
+            None
+        }
     }
 }
 
@@ -846,20 +887,28 @@ fn admit_for(
         .unwrap_or_default();
     let reading = seat.machine.read(None);
     let need = need(build, &key, &own, &verify, reading.physical);
+    // What its run phase claims, kept apart from its compile's (CAP3): its holder steps the claim
+    // down to it once its tree runs what it built, and a run heavier than its compile is its peak.
+    let run = aterm_capacity::phase::run_need(&own, &key, reading.physical);
+    let phased = aterm_capacity::phase::phased(need.bytes, run);
     let budget = reading.reachable().unwrap_or(u64::MAX);
     let what = format!("{} {}", key.stage, key.selection());
     let ask = |alone: bool| {
-        let n = Need::new(what.clone())
-            .mem(need.bytes)
+        let mut n = Need::new(what.clone())
+            .mem(phased.mem)
             .checkout(key.checkout.clone())
             .covers();
+        n.run_mem = phased.run_mem;
         if alone { n.alone() } else { n }
     };
-    let beyond = need.bytes >= budget;
+    let beyond = phased.mem >= budget;
     let mut told = false;
     let mut speak = |line: &str| {
         if !std::mem::replace(&mut told, true) {
-            say(&format!("{SAYS}: {what} claims {need}"));
+            say(&format!(
+                "{SAYS}: {what} claims {need}{}",
+                run_words(run, &phased)
+            ));
         }
         say(line);
     };
@@ -918,6 +967,28 @@ fn admit_for(
             Admission::Stopped(e)
         }
         Err(e) => refuse(say, &format!("{what}: its memory claim failed ({e})")),
+    }
+}
+
+/// What a build's claim line adds for its run phase ([`aterm_capacity::phase`], CAP3): `run`, what
+/// its run phase claims where its key or a wider selection keeps one, and `phased`, the need it
+/// then asks ([`aterm_capacity::phase::phased`]).
+fn run_words(run: Option<aterm_capacity::phase::RunNeed>, phased: &Need) -> String {
+    let Some(run) = run else {
+        return String::new();
+    };
+    let kept = if run.same_work {
+        "the most its run phase took and a fifth more"
+    } else {
+        "the most a wider selection's run phase took and a fifth more"
+    };
+    let bytes = aterm_capacity::size(run.bytes);
+    match phased.run_mem {
+        Some(_) => format!("; {bytes} once it runs what it built, {kept}"),
+        None if run.same_work => {
+            format!("; its run phase claims more, {bytes} ({kept}), which it claims from its start")
+        }
+        None => format!("; no step down: {kept}, {bytes}, is no less than it claims"),
     }
 }
 

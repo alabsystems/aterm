@@ -46,7 +46,7 @@ fn context() -> ContextReply {
                 guard: fid(2),
             },
             sdk: Some(SdkCustody {
-                execution: b"/sdk/bin/targo".to_vec(),
+                execution: b"/sdk".to_vec(),
                 build: 1,
                 lease_path: b"/sdk/lease".to_vec(),
                 lease: fid(3),

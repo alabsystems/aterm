@@ -132,6 +132,31 @@ fn reserves(
     aterm_capacity::reserved(claims, trees, &volumes)
 }
 
+/// What each claim spares as a waiter of memory that cannot start now ([`aterm_capacity::spared`],
+/// CAP3): the most a claim behind it may take and go first without delaying its turn. `None`
+/// for each claim where no memory was read.
+fn spares(
+    r: &Reading,
+    claims: &[Record],
+    trees: Option<&HashMap<u32, TreeUse>>,
+) -> Vec<Option<u64>> {
+    match r.available.or(r.physical) {
+        Some(available) => aterm_capacity::spared(claims, trees, available),
+        None => vec![None; claims.len()],
+    }
+}
+
+/// What a claim's memory says of its phases ([`aterm_capacity::phase`], CAP3): what its holder
+/// stepped it to, or what its run phase will claim once it runs what its build made.
+fn phase_words(c: &Record) -> String {
+    match (c.need.stepped, c.need.run_mem) {
+        (Some(s), _) if s < c.need.mem => format!(", stepped to {} as its run began", gib(s)),
+        (Some(_), Some(run)) => format!(", stepped back up as its run outgrew {}", gib(run)),
+        (None, Some(run)) => format!(", {} once it runs what it built", gib(run)),
+        _ => String::new(),
+    }
+}
+
 /// The mark on a waiting claim's disk whose need is more than its volume has free above the
 /// floor now ([`Reserve::unservable`]): it reserves no disk while it is so, and is refused if
 /// its relief leaves it so with no scratch claim held there that could meet it.
@@ -216,8 +241,20 @@ fn lines(
                 claims.len() - held
             ));
             let overruns = overruns(claims, trees);
-            for (c, reserve) in claims.iter().zip(reserves(r, volumes, claims, trees)) {
-                out.push(claim_line(c, reserve, trees, overrun(c, &overruns), now));
+            let spares = spares(r, claims, trees);
+            for ((c, reserve), spare) in claims
+                .iter()
+                .zip(reserves(r, volumes, claims, trees))
+                .zip(spares)
+            {
+                out.push(claim_line(
+                    c,
+                    reserve,
+                    spare,
+                    trees,
+                    overrun(c, &overruns),
+                    now,
+                ));
             }
         }
     }
@@ -282,10 +319,12 @@ fn tree_use(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse
 /// the current holder's tree ([`aterm_capacity::Procs::trees`]); the other policies retain an
 /// original record PID without attributing a current process to it. A holder's tree is the same
 /// for every claim that process holds, and so is `overrun`, what that tree holds past its held
-/// claims of memory ([`overrun`]).
+/// claims of memory ([`overrun`]). A waiter of memory that cannot start now names what it
+/// `spare`s ([`spares`]).
 fn claim_line(
     c: &Record,
     reserve: Reserve,
+    spare: Option<u64>,
     trees: Option<&HashMap<u32, TreeUse>>,
     overrun: Option<&Overrun>,
     now: u64,
@@ -308,8 +347,9 @@ fn claim_line(
         let vm = credited(c, trees).filter(|_| !c.credit.is_empty());
         let past = overrun.map_or_else(String::new, |o| format!(": {}", o.beyond()));
         parts.push(format!(
-            "mem {}{}, reserves {}",
+            "mem {}{}{}, reserves {}{}",
             gib(c.need.mem),
+            phase_words(c),
             match (using, vm) {
                 (Some(u), Some(v)) => format!(
                     " (its holder's tree holds {}, the {} processes credited to it {}{past})",
@@ -320,7 +360,15 @@ fn claim_line(
                 (Some(u), None) => format!(" (its holder's tree holds {}{past})", holds(u)),
                 (None, _) => String::new(),
             },
-            gib(reserve.mem)
+            gib(reserve.mem),
+            match spare {
+                Some(0) => ": it cannot start yet, and no claim behind it goes first".to_owned(),
+                Some(s) => format!(
+                    ": it cannot start yet, and a claim behind it of {} or less may go first",
+                    gib(s)
+                ),
+                None => String::new(),
+            }
         ));
     }
     if c.need.cores > 0 {
@@ -395,7 +443,10 @@ fn volume_json(v: &Volume) -> Value {
 /// and swapped pages included: each `null` without a process sweep or unless holder accounting
 /// permits those observations. `past_claims` is what its holder holds past its held claims of
 /// memory ([`Overrun::past`]; `null` for a waiting claim, one of no memory, one of other
-/// accounting, or a holder less than a tenth of a GiB past them).
+/// accounting, or a holder less than a tenth of a GiB past them). `run_mem` is what its run
+/// phase claims, `stepped` what its holder stepped it to, and `spares` what a waiter of memory
+/// that cannot start now lets a claim behind it take and go first ([`spares`]), each `null`
+/// where it has none (CAP3).
 fn json_of(
     r: &Reading,
     volumes: &[Volume],
@@ -436,10 +487,12 @@ fn json_of(
         }
         Ok(claims) => {
             let overruns = overruns(claims, trees);
+            let spares = spares(r, claims, trees);
             let rows = claims
                 .iter()
                 .zip(reserves(r, volumes, claims, trees))
-                .map(|(c, reserve)| {
+                .zip(spares)
+                .map(|((c, reserve), spare)| {
                     let used = tree_use(c, trees);
                     let (accounting, lifetime) = accounting(c);
                     let mut m = Map::new();
@@ -469,6 +522,9 @@ fn json_of(
                     m.insert("cores".to_owned(), Value::from(c.need.cores));
                     m.insert("disk".to_owned(), Value::from(c.need.disk));
                     m.insert("reserved_mem".to_owned(), Value::from(reserve.mem));
+                    m.insert("run_mem".to_owned(), Value::from(c.need.run_mem));
+                    m.insert("stepped".to_owned(), Value::from(c.need.stepped));
+                    m.insert("spares".to_owned(), Value::from(spare));
                     m.insert("reserved_disk".to_owned(), Value::from(reserve.disk));
                     m.insert(
                         "unservable".to_owned(),

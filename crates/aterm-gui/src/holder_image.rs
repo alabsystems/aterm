@@ -551,14 +551,23 @@ impl EdgeInbox {
     }
 }
 
-/// The C-cut scan (card engine §3.6): where each OSC 133/633 `C` in the PTY bytes ends, an
-/// unfinished one carried into the next batch.
+/// A block's start, an OSC 133/633 `C`, as a [`MarkScan`] mark.
+pub(crate) const MARK_C: u8 = 1;
+
+/// A block's end, an OSC 133/633 `D`, as a [`MarkScan`] mark.
+pub(crate) const MARK_D: u8 = 2;
+
+/// The C-cut scan (card engine §3.6): where each OSC 133/633 `C` in the PTY bytes ends.
+pub(crate) type CScan = MarkScan<MARK_C>;
+
+/// Where each OSC 133/633 mark among `MARKS` ([`MARK_C`], [`MARK_D`], or both) in the PTY bytes
+/// ends, an unfinished one carried into the next batch.
 #[derive(Debug, Default)]
-pub(crate) struct CScan {
+pub(crate) struct MarkScan<const MARKS: u8> {
     carry: Vec<u8>,
 }
 
-impl CScan {
+impl<const MARKS: u8> MarkScan<MARKS> {
     /// Clear `ends` and fill it with the cut offsets in `batch`, ascending, each in
     /// `1..=batch.len()`.
     pub(crate) fn ends(&mut self, batch: &[u8], ends: &mut Vec<usize>) {
@@ -571,7 +580,7 @@ impl CScan {
             }
         }
         while let Some(esc) = find_osc(batch, at) {
-            match osc_c_end(batch, esc) {
+            match osc_mark_end(batch, esc, MARKS) {
                 OscEnd::C { end, resume } => {
                     ends.push(end);
                     at = resume;
@@ -593,7 +602,7 @@ impl CScan {
         let carried = joined.len();
         let take = batch.len().min(C_MAX);
         joined.extend_from_slice(&batch[..take]);
-        let next = match osc_c_end(&joined, 0) {
+        let next = match osc_mark_end(&joined, 0, MARKS) {
             OscEnd::C { end, resume } => {
                 if end > carried {
                     ends.push(end - carried);
@@ -601,7 +610,7 @@ impl CScan {
                 resume
             }
             OscEnd::Open => {
-                debug_assert_eq!(take, batch.len(), "an open C fits its bound");
+                debug_assert_eq!(take, batch.len(), "an open mark fits its bound");
                 self.carry = joined;
                 return None;
             }
@@ -611,12 +620,12 @@ impl CScan {
     }
 }
 
-/// What [`osc_c_end`] found at an ESC.
+/// What [`osc_mark_end`] found at an ESC.
 #[derive(Debug, PartialEq, Eq)]
 enum OscEnd {
-    /// A complete OSC 133/633 `C`, dispatched by the engine once `end` bytes
-    /// are parsed: one past its BEL, its ST's `\`, or the ESC that broke it
-    /// off.
+    /// A complete OSC 133/633 mark of those scanned for (a `C`, else a `D`
+    /// where one is), dispatched by the engine once `end` bytes are parsed:
+    /// one past its BEL, its ST's `\`, or the ESC that broke it off.
     C { end: usize, resume: usize },
     /// A prefix of one, cut by the end of the bytes.
     Open,
@@ -624,7 +633,8 @@ enum OscEnd {
     NotC,
 }
 
-fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
+/// What the OSC at `esc` is: a complete mark among `marks`, an open prefix of one, or neither.
+fn osc_mark_end(bytes: &[u8], esc: usize, marks: u8) -> OscEnd {
     enum Part {
         /// The number: whether a `+` or a digit came, and its value.
         Number {
@@ -660,7 +670,7 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
             0x07 | 0x1b => {
                 let is_c = match &part {
                     Part::Number { .. } => false,
-                    Part::Code(code) => is_c_code(code),
+                    Part::Code(code) => is_mark_code(code, marks),
                     Part::Rest => true,
                 };
                 if !is_c {
@@ -690,7 +700,7 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
                     ..
                 } => part = Part::Code(Vec::new()),
                 Part::Number { .. } => return OscEnd::NotC,
-                Part::Code(code) if is_c_code(code) => part = Part::Rest,
+                Part::Code(code) if is_mark_code(code, marks) => part = Part::Rest,
                 Part::Code(_) => return OscEnd::NotC,
                 Part::Rest => {}
             },
@@ -713,7 +723,7 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
                     }
                 }
                 Part::Code(code) => {
-                    if code.is_empty() && b != b'C' {
+                    if code.is_empty() && !is_mark(b, marks) {
                         return OscEnd::NotC;
                     }
                     code.push(b);
@@ -725,8 +735,19 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
     }
 }
 
-fn is_c_code(code: &[u8]) -> bool {
-    code.first() == Some(&b'C') && std::str::from_utf8(code).is_ok()
+/// Whether `letter` opens a mark among `marks`.
+fn is_mark(letter: u8, marks: u8) -> bool {
+    match letter {
+        b'C' => marks & MARK_C != 0,
+        b'D' => marks & MARK_D != 0,
+        _ => false,
+    }
+}
+
+/// Whether `code`, an OSC 133/633 second parameter, is a mark among `marks`: the engine reads
+/// the mark by its first letter.
+fn is_mark_code(code: &[u8], marks: u8) -> bool {
+    code.first().is_some_and(|&b| is_mark(b, marks)) && std::str::from_utf8(code).is_ok()
 }
 
 fn find_osc(bytes: &[u8], from: usize) -> Option<usize> {

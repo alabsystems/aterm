@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 // The temporal prelude every one-mesh island shares (TLA style: behaviors, Always, Act, a state
-// machine with stuttering, Satisfies, and the invariant and action rules). The list of spec
-// islands (aterm-mesh-core-islands' islands.rs) mounts it first, so each property's island opens
-// `AtermMeshTemporal`.
+// machine with stuttering, Satisfies, and the invariant and action rules). Each islands crate's
+// lib.rs and aterm-mesh-core's Trust lane mount it before the islands that open it
+// (`AtermMeshTemporal`).
 clean {
     -- The temporal prelude every one-mesh island shares: behaviors, Always, Act,
     -- a state machine (an initial predicate and a next-state relation, with

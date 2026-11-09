@@ -109,6 +109,10 @@ impl QueryState {
     }
 }
 impl BootstrapGraphSupport {
+    /// Original binding observation, not a constructor for graph/Root custody.
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
     pub fn observation(&self) -> &ContextReply {
         &self.context
     }
@@ -122,6 +126,7 @@ struct Connection {
     request: Enrollment,
     context: ContextReply,
     deadline: Instant,
+    queries: QueryState,
     // Preserve the actual accepted boundary even on an unwind between typed
     // wrappers. Only a future consuming native closure path may dispose it.
     channel: ManuallyDrop<Channel>,
@@ -193,6 +198,18 @@ pub struct OutputBoundBootstrapGraph {
     original: Option<Connection>,
     output: OutputAttachment,
 }
+impl EnrolledBootstrapGraph {
+    /// Observation of this actual accepted enrollment, never a constructor.
+    pub fn enrollment(&self) -> &Enrollment {
+        &self.original.as_ref().expect("private original enrolled graph").request
+    }
+    pub fn revalidate(&self, deadline: Instant) -> io::Result<()> {
+        let original =
+            self.original.as_ref().ok_or_else(|| io::Error::other("original graph consumed"))?;
+        original.queries.enrollment_allowed()?;
+        original.check(deadline)
+    }
+}
 impl Drop for EnrolledBootstrapGraph {
     fn drop(&mut self) {
         if let Some(original) = self.original.take() {
@@ -218,16 +235,34 @@ impl OutputBoundBootstrapGraph {
         self.original.as_ref().expect("private original graph").deadline
     }
     pub fn revalidate(&self, deadline: Instant) -> io::Result<()> {
-        self.original
-            .as_ref()
-            .ok_or_else(|| io::Error::other("original graph consumed"))?
-            .check(deadline)
+        let original =
+            self.original.as_ref().ok_or_else(|| io::Error::other("original graph consumed"))?;
+        original.queries.enrollment_allowed()?;
+        original.check(deadline)
     }
     // No launch, completion or release API exists until its native counterpart
     // consumes actual operation/retirement owners under this SAME connection.
 }
 
 impl Client {
+    /// Recheck this exact opaque observation before installing a restrictive
+    /// in-process dispatcher. It grants no launch, admission or graph closure.
+    pub fn revalidate_bootstrap_graph_support(
+        &self,
+        support: &BootstrapGraphSupport,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        bounded(support.deadline, deadline)?;
+        support.queries.enrollment_allowed()?;
+        if !Arc::ptr_eq(&support.pin, &self.host) {
+            return Err(crate::wire::invalid());
+        }
+        finish(deadline, || {
+            self.host.validate(deadline)?;
+            live(&support.context, deadline)
+        })
+    }
+
     pub fn bootstrap_graph_support(
         &self,
         query: &SupportQuery,
@@ -316,6 +351,7 @@ impl Client {
             request,
             context: support.context,
             deadline: support.deadline,
+            queries: support.queries,
             original: ManuallyDrop::new(original),
             channel: ManuallyDrop::new(channel),
             pin: ManuallyDrop::new(Arc::clone(&self.host)),
@@ -394,6 +430,7 @@ impl EnrolledBootstrapGraph {
         let mut original = self.original.take().expect("private original enrolled graph");
         let preflight = (|| {
             bounded(original.deadline, deadline)?;
+            original.queries.enrollment_allowed()?;
             if request.key != original.request.key {
                 return Err(crate::wire::invalid());
             }

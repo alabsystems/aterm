@@ -12,6 +12,8 @@ use std::process::ExitCode;
 
 // The proofs of the mesh kernels this binary ships: a build of it checks them (Cargo.toml).
 use aterm_mesh_core_islands as _;
+use aterm_mesh_core_islands_no_lost_edit as _;
+use aterm_mesh_core_islands_p1 as _;
 
 mod lab_window;
 
@@ -14382,7 +14384,7 @@ mod initial_setup_result_tests {
             InitialSetupAdmissionStopTest, StageEvent, run_workstation_readback,
         };
         use aterm_machines::init::{WorkstationGroup, prepare_workstation_selected};
-        let native = InitialSetupAdmissionStopTest::keyboard_system(true);
+        let native = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
         let caps = Subject::Setting(Setting::CapsLock);
         let mut selection = aterm_types::macos_setup::Selection::none();
         selection.set(Setting::CapsLock, true);
@@ -14757,7 +14759,7 @@ mod initial_setup_result_tests {
             owned.worker.take().unwrap().join().unwrap();
             drop(owned);
             if attached && !old_choice {
-                let actor = InitialSetupAdmissionStopTest::keyboard_system(true);
+                let actor = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
                 let (activation, retired) =
                     super::input_attachments::activate_observing(|invalidate| {
                         aterm_machines::init::activate_keyboard_attachments(

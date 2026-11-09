@@ -41,6 +41,11 @@ pub(crate) struct FixtureGuard(Option<Fixture>);
 
 #[cfg(test)]
 impl Fixture {
+    /// Capture the caller's route before starting scoped request workers.
+    pub(crate) fn current() -> Option<Self> {
+        FIXTURE.with(|f| f.borrow().clone())
+    }
+
     /// Route this thread's GitHub calls to `self` until the guard drops.
     pub(crate) fn enter(self) -> FixtureGuard {
         FixtureGuard(FIXTURE.with(|f| f.replace(Some(self))))

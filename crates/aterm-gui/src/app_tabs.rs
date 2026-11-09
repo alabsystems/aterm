@@ -6639,6 +6639,7 @@ impl App {
         self.autopilot_recorded.remove(&id);
         self.spare_poke();
         if let Some(stable) = stable {
+            self.permission_clicks.clicks.close_tab(stable.as_str());
             self.resume_stories.remove(stable.as_str());
             crate::occupancy_wakes::forget(stable.as_str());
             crate::self_claim::forget_read(stable.as_str());

@@ -4372,6 +4372,8 @@ struct Answers {
     on_native: Option<NativeObserver>,
     /// A process that dies as the `await` for its first idle arrives, before that is answered.
     dies_at_await: Option<std::sync::Arc<std::sync::Mutex<Option<aterm_uds::spawnfd::Child>>>>,
+    /// The `meta` reply (the session's folders: `trusted_cwd=`).
+    meta: String,
 }
 
 /// What [`Answers::prompt`]'s stand-in prompt holds and how it is drawn.
@@ -4436,6 +4438,7 @@ impl Default for Answers {
             native: "ERR unscripted",
             on_native: None,
             dies_at_await: None,
+            meta: "ERR unscripted".to_string(),
         }
     }
 }
@@ -4589,6 +4592,7 @@ fn instance_for(
                 answers.native.to_string()
             }
             "key" => "OK seq=1".to_string(),
+            "meta" => answers.meta.clone(),
             "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
             "signal" => match line
                 .split_whitespace()
@@ -9684,6 +9688,17 @@ impl Drop for ShellChild {
 }
 
 fn stand_in_shell_at(cwd: Option<&Path>) -> ShellChild {
+    stand_in_shell_with(cwd, &[])
+}
+
+/// The outside route a stand-in agent's [`Snapshot`] names (`AuthRoute::Outside`) as its shell
+/// passes it on: a gateway's base URL, with no credential. The raw relaunch reads the route
+/// again at the shell (`relaunch::external_at_shell`), before its restart signals.
+const OUTSIDE_ROUTE: (&str, Option<&str>) = ("ANTHROPIC_BASE_URL", Some("https://gateway.invalid"));
+
+/// [`stand_in_shell_at`] with `env` changed in the shell's environment: each name set to its
+/// value, or taken out where it has none.
+fn stand_in_shell_with(cwd: Option<&Path>, env: &[(&str, Option<&str>)]) -> ShellChild {
     let mut image = shell_image(Path::new("/bin/bash"), "bash");
     let mut command = Command::new(image.path().join("bash"));
     command
@@ -9692,6 +9707,12 @@ fn stand_in_shell_at(cwd: Option<&Path>) -> ShellChild {
         .stdout(aterm_uds::spawnfd::Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
     }
     let mut child = command.spawn().expect("bash");
     aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::ECHO_HANG);
@@ -12142,7 +12163,7 @@ fn restart_driven(
         ..drive(&dir)
     };
     seed_builds(&opts);
-    let mut shell = stand_in_shell();
+    let mut shell = stand_in_shell_with(None, &[OUTSIDE_ROUTE]);
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
     register(&opts.home, agent.id(), SESSION);
@@ -19433,6 +19454,13 @@ fn slave_left(slave: &std::os::fd::OwnedFd) -> String {
 /// relaunch waits to hold its terminal again.
 #[cfg(unix)]
 fn tty_zsh() -> TtyChild {
+    tty_zsh_with(&[])
+}
+
+/// [`tty_zsh`] with `env` changed in the shell's environment: each name set to its value, or
+/// taken out where it has none.
+#[cfg(unix)]
+fn tty_zsh_with(env: &[(&str, Option<&str>)]) -> TtyChild {
     let image = zsh_image();
     let exe = image.path().join("zsh");
     let proof = image.path().join("ran");
@@ -19445,6 +19473,12 @@ fn tty_zsh() -> TtyChild {
             .arg(&sleeper)
             .stdout(tty()?)
             .stderr(tty()?);
+        for (name, value) in env {
+            match value {
+                Some(value) => zsh.env(name, value),
+                None => zsh.env_remove(name),
+            };
+        }
         Ok(zsh)
     })
     .unwrap_or_else(|err| {
@@ -22962,6 +22996,78 @@ fn an_attended_ready_session_is_never_signalled_without_the_owners_now() {
     shell.end();
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{r:?}");
     assert_eq!(h.details("terminated"), ["SIGTERM"], "{r:?}");
+}
+
+/// AN UPGRADE ENDS NO AGENT ITS RELAUNCH COULD NOT ADMIT, as a restart in place ends none
+/// (`permission_click::a_click_ends_no_agent_its_relaunch_could_not_admit`): an agent on an
+/// outside route records no launch environment, so its relaunch reads the route again at the
+/// shell, and a shell whose environment names no `HOME` admits none there. The upgrade waits
+/// `account` with nothing signalled and the announced record as it was. NEGATIVE CONTROL: the
+/// same upgrade over the shell with its `HOME` signals its agent.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_ends_no_agent_its_relaunch_could_not_admit() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    let route = ("ANTHROPIC_BASE_URL", Some("https://gateway.invalid"));
+    for no_home in [true, false] {
+        let dir = scratch(&format!("upgrade-account-{no_home}"));
+        let (sock, asked) = instance_with(&dir, Answers::default());
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        let agent = parked_bare()
+            .env(route.0, route.1.expect("a value"))
+            .spawn()
+            .expect("agent");
+        wait_exec(agent.id());
+        let sf = register_idle_since(&opts.home, agent.id(), SESSION, 3600);
+        file_transcript_in(&opts.home.join(".claude"), "p");
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let mut h = Parked {
+            dir,
+            opts,
+            agent: Some(agent),
+            handed: None,
+            sf,
+            asked,
+        };
+        transcript_says(&h, &format!("Saved; nothing is running.\\n{marker}"));
+        let announced = St {
+            seq_since_s: now_s() - 3_600,
+            last_seq: 77,
+            ..announced_to(&h, marker)
+        };
+        std::fs::write(state_path(&h.opts, SESSION), announced.to_json()).expect("state");
+        let ended = h.reaped();
+        let shell = if no_home {
+            tty_zsh_with(&[route, ("HOME", None)])
+        } else {
+            tty_zsh_with(&[route])
+        };
+        let r = h.visit_under(shell.id());
+        if no_home {
+            shell.end();
+            assert_eq!(r.step, crate::harness::relaunch::WAIT_ACCOUNT, "{r:?}");
+            let asked = h.asked.lock().map(|a| a.clone()).unwrap_or_default();
+            assert!(
+                !asked.iter().any(|l| l.contains(" signal ")),
+                "never signalled: {asked:#?}"
+            );
+            assert!(h.details("terminated").is_empty(), "{r:?}");
+            assert_eq!(
+                load(&h.opts, SESSION).map(|st| st.phase),
+                Some(announced.phase.clone()),
+                "the announced record as it was"
+            );
+        } else {
+            let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+            shell.end();
+            assert_eq!(status.signal(), Some(libc::SIGTERM), "control: {r:?}");
+            assert_eq!(h.details("terminated"), ["SIGTERM"], "control: {r:?}");
+        }
+    }
 }
 
 /// A newer target keeps how long the session has been behind and the request word (except a skip,
@@ -26912,7 +27018,10 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             std::fs::create_dir(&record).expect("a directory at the claim path");
             std::fs::write(&kept, b"keep the existing destination").expect("owned marker");
         }
-        let shell = dead_pid();
+        // A live shell passing the outside route the snapshot names, so the relaunch's account
+        // check before the signal admits it (`relaunch::relaunch_account_admits`).
+        let stand_in = stand_in_shell_with(None, &[OUTSIDE_ROUTE]);
+        let shell = stand_in.id();
         let script = Script::new(shell, usize::MAX, None);
         let kernel = ParkedProcess {
             script: &script,
@@ -26956,7 +27065,7 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             &mut c,
             TAB,
             &h.sf,
-            &[(shell, 1, "zsh".into())],
+            &[(shell, 1, "bash".into())],
             &kernel,
             &how,
         );
@@ -29988,6 +30097,10 @@ fn a_stop_that_repeats_rests_longer_and_never_for_good() {
 /// The login wall: no notice into it, no ask spent on a notice it answered, a late ready honoured.
 #[path = "upgrade_login_wall_tests.rs"]
 mod login_wall;
+
+/// A click on the permission chip: its gate, its line and the records it stands over.
+#[path = "permission_click_tests.rs"]
+mod permission_click;
 
 /// The record's progress stamp and its deadlines.
 #[path = "upgrade_watch_tests.rs"]

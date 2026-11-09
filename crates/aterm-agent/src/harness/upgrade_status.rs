@@ -4001,13 +4001,8 @@ pub enum Ask {
     Skip,
 }
 
-/// How long [`ask`] waits for a step that holds the lock.
-#[cfg(not(test))]
-const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The same bound in this crate's tests, short.
-#[cfg(test)]
-const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+/// Hang detector for recording an owner's word behind an actual sweep writer.
+const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Prefix of [`ask`]'s refusal of `--now` for a stopped round the owner's word may not re-arm.
 pub const REFUSED_STOPPED: &str = "stopped:";
@@ -4184,7 +4179,24 @@ fn ask_within(
     wait: std::time::Duration,
     held_of: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
 ) -> Result<(Row, Vec<Holder>), String> {
-    let started = std::time::Instant::now();
+    ask_with_wait(
+        opts,
+        sid,
+        what,
+        shown,
+        (wait, std::time::Instant::now(), || {}),
+        held_of,
+    )
+}
+
+fn ask_with_wait(
+    opts: &Opts,
+    sid: &str,
+    what: Ask,
+    shown: Option<Shown<'_>>,
+    (wait, started, mut blocked): (std::time::Duration, std::time::Instant, impl FnMut()),
+    held_of: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
+) -> Result<(Row, Vec<Holder>), String> {
     let _held = loop {
         match sweep_lock(&Opts {
             dry_run: false,
@@ -4192,6 +4204,7 @@ fn ask_within(
         }) {
             Ok(held) => break held,
             Err("another-sweep") if started.elapsed() < wait => {
+                blocked();
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(why) => return Err(format!("busy:{why}")),

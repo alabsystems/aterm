@@ -128,7 +128,7 @@ fn a_clicks_mode_name_holds_then_fades_a_step_at_a_time_and_goes() {
 
 /// THE NAME FOLLOWS THE GLYPH, IS THE CHIP'S, AND GIVES WAY FIRST: Land at rest is `⤓` alone;
 /// with its name, `⤓ land` in the chip's letter, the whole of it the chip's (a click on the name
-/// cycles too), set off from the next chip as any word is (`⤓ land ─ ⏸ plan`),
+/// cycles too), set off from the next chip as any word is (`⤓ land ─ lame`),
 /// [`super::Block::word`] counting what it adds; a rule with room for the rest alone lays the rest, never a narrower
 /// rung; a name for another mode, or a click in flight, lays none.
 #[test]
@@ -169,14 +169,14 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     let rest_plan = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
-    assert_eq!(text(&rest_plan.lights), "\u{2913} \u{23F8} plan");
+    assert_eq!(text(&rest_plan.lights), "\u{2913} lame");
     w.sessions.get_mut(&S).expect("noted").word = word;
     let beside = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(
         text(&beside.lights),
-        "\u{2913} land \u{2500} \u{23F8} plan",
+        "\u{2913} land \u{2500} lame",
         "set off as a word is"
     );
     assert_eq!(
@@ -237,7 +237,7 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert!(
-        text(&other.lights).starts_with("\u{25cb} \u{23F8}"),
+        text(&other.lights).starts_with("\u{25cb} lame"),
         "Land's name never names Off"
     );
     assert_eq!(other.word, 0);
@@ -436,13 +436,14 @@ fn frame_at(app: &mut App, wid: WindowId, now: Instant) {
     super::at_clock(now, || frame(app, wid));
 }
 
-/// Each chip's painted cells but the Autopilot chip's, in frame columns.
+/// Each chip's painted cells but the Autopilot chip's, in frame columns: the blanks between chips
+/// apart, which a name's ` ─ ` widens.
 fn others(app: &App, wid: WindowId) -> Vec<(Option<Chip>, usize)> {
     app.windows[&wid]
         .claude_lights
         .hits
         .iter()
-        .filter(|h| h.chip != Some(Chip::Autopilot))
+        .filter(|h| h.chip.is_some_and(|chip| chip != Chip::Autopilot))
         .map(|h| (h.chip, h.col))
         .collect()
 }

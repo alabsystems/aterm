@@ -167,7 +167,7 @@ fn standin_run_reports_once_interrupted() {
     }
     let scratch = ctx.scratch.clone();
     crate::let_disk_go(
-        crate::disk::Disk::Held(disk),
+        crate::disk::Disk::Held(Box::new(disk)),
         code == crate::exit::PASS,
         Some(&mut log),
         ctx.events.as_ref(),

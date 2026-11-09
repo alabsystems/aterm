@@ -893,13 +893,13 @@ pub trait System: Sync {
     }
 
     /// Run `cmd` with inherited stdio and no deadline on the controlling terminal. After
-    /// validating the command and owning the terminal, call `before` immediately before
-    /// spawning; its refusal starts no child. The same terminal lease covers its prelude
-    /// and the child's whole owning wait.
+    /// owning the terminal, call `before` with a private command copy. Validate and build
+    /// that final command after the prelude; its refusal starts no child. The same terminal
+    /// lease covers the prelude and the child's whole owning wait.
     fn run_tty(
         &self,
         cmd: &Cmd,
-        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
     ) -> Result<Option<i32>, RunFailed>;
 
     /// Whether `/dev/tty` can be opened for reading and writing.
@@ -2081,7 +2081,7 @@ impl System for Live {
     fn run_tty(
         &self,
         cmd: &Cmd,
-        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
     ) -> Result<Option<i32>, RunFailed> {
         if !cmd.program.is_absolute() {
             return Err(RunFailed::Refused(format!(
@@ -2089,18 +2089,26 @@ impl System for Live {
                 cmd.program.display()
             )));
         }
-        let (program, args) = self.argv(cmd)?;
-        let mut child = aterm_uds::spawnfd::command(&program);
-        for (key, value) in &cmd.env {
-            child.env(key, value);
-        }
-        if let Some(dir) = &cmd.cwd {
-            child.current_dir(dir);
-        }
+        self.argv(cmd)?;
+        let mut cmd = cmd.clone();
         let status = owning_terminal(|| {
             self.capture_current()?;
-            before()?;
+            before(&mut cmd)?;
             self.capture_current()?;
+            if !cmd.program.is_absolute() {
+                return Err(RunFailed::Refused(format!(
+                    "{} is not an absolute path",
+                    cmd.program.display()
+                )));
+            }
+            let (program, args) = self.argv(&cmd)?;
+            let mut child = aterm_uds::spawnfd::command(&program);
+            for (key, value) in &cmd.env {
+                child.env(key, value);
+            }
+            if let Some(dir) = &cmd.cwd {
+                child.current_dir(dir);
+            }
             let mut started = child
                 .args(&args)
                 .stdin(aterm_uds::spawnfd::Stdio::inherit())
@@ -4520,15 +4528,23 @@ mod fake {
         fn run_tty(
             &self,
             cmd: &Cmd,
-            before: &mut dyn FnMut() -> Result<(), RunFailed>,
+            before: &mut dyn FnMut(&mut Cmd) -> Result<(), RunFailed>,
         ) -> Result<Option<i32>, RunFailed> {
+            let mut cmd = cmd.clone();
             super::owning_terminal(|| {
-                before()?;
+                before(&mut cmd)?;
+                if !cmd.program.is_absolute() {
+                    return Err(RunFailed::Refused(format!(
+                        "{} is not an absolute path",
+                        cmd.program.display()
+                    )));
+                }
+                super::Live::argv_from(self.euid(), &cmd)?;
                 let key = format!("tty {}", cmd.display());
                 self.calls.lock().unwrap().push(key.clone());
                 let model = self.tty_hook.lock().unwrap().clone();
                 if let Some(model) = model
-                    && let Some(output) = model(self, cmd)
+                    && let Some(output) = model(self, &cmd)
                 {
                     return Ok(output.status);
                 }
@@ -5912,6 +5928,74 @@ mod tests {
         let live = Live::new();
         let err = live.run(&Cmd::new("defaults")).unwrap_err();
         assert!(matches!(err, RunFailed::Refused(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_terminal_prelude_runs_only_its_final_validated_command() {
+        let live = Live::new();
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("earlier");
+        let current = dir.path().join("current");
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::create_dir(&current).unwrap();
+        let mut initial = Cmd::new("/usr/bin/false")
+            .arg("old argument")
+            .env("ATERM_TTY_TEST_VALUE", "old value");
+        initial.cwd = Some(earlier.clone());
+        let unchanged = initial.clone();
+        let mut final_command = Cmd::new("/bin/sh")
+            .args([
+                "-c",
+                "{ printf '%s\\n%s\\n' \"$1\" \"$ATERM_TTY_TEST_VALUE\"; pwd -P; } > \"$2\"",
+                "terminal-prelude",
+                "new argument",
+                "result.txt",
+            ])
+            .env("ATERM_TTY_TEST_VALUE", "new value");
+        final_command.cwd = Some(current.clone());
+        let spawns = super::spawns::Spawns::new(&live);
+        let result = spawns.run_tty(&initial, &mut |command| {
+            assert!(terminal_free().is_none(), "the prelude owns stdin");
+            assert_eq!(*command, initial);
+            *command = final_command.clone();
+            Ok(())
+        });
+        assert_eq!(result.unwrap(), Some(0));
+        assert_eq!(initial, unchanged, "the caller's command is immutable");
+        assert_eq!(spawns.record(), [(final_command, None)]);
+        assert_eq!(
+            std::fs::read_to_string(current.join("result.txt")).unwrap(),
+            format!(
+                "new argument\nnew value\n{}\n",
+                std::fs::canonicalize(&current).unwrap().display()
+            )
+        );
+        assert!(!earlier.join("result.txt").exists());
+
+        let mut would_write = Cmd::new("/bin/sh").args(["-c", "printf child > child.txt"]);
+        would_write.cwd = Some(current.clone());
+        for refused in [true, false] {
+            let result = live.run_tty(&would_write, &mut |command| {
+                assert!(terminal_free().is_none());
+                if refused {
+                    return Err(RunFailed::Refused("the work is no longer owed".into()));
+                }
+                command.program = "relative-program".into();
+                Ok(())
+            });
+            assert!(matches!(result, Err(RunFailed::Refused(_))), "{result:?}");
+            assert!(!current.join("child.txt").exists());
+        }
+        if live.euid() != 0 {
+            let mut other = alice();
+            other.uid = live.euid() ^ 1;
+            let result = live.run_tty(&would_write, &mut |command| {
+                command.user = Some(other.clone());
+                Ok(())
+            });
+            assert!(matches!(result, Err(RunFailed::Refused(_))), "{result:?}");
+            assert!(!current.join("child.txt").exists());
+        }
     }
 
     /// A `System` that never says where GitHub is reaches none of it: its agh client's transport

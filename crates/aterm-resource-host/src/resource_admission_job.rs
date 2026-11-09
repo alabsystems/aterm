@@ -97,16 +97,22 @@ pub(super) fn inspection(
 impl Owner {
     pub(super) fn tick_jobs(&mut self) {
         self.tick_resolver_roots();
+        self.tick_bootstrap_roots();
+        self.tick_bootstrap_queries();
         let fence = &self.fence;
         let journal = &self.journal;
         let faulted = &mut self.faulted;
         self.jobs.retain(|_, job| {
             if job.cleanup_at.is_none()
-                && job
-                    .workload
+                && (job
+                    .bootstrap_graph
                     .as_ref()
-                    .and_then(|state| state.control.as_ref())
-                    .is_some_and(|link| link.closed() && !link.drained())
+                    .is_some_and(|root| root.query_failed())
+                    || job
+                        .workload
+                        .as_ref()
+                        .and_then(|state| state.control.as_ref())
+                        .is_some_and(|link| link.closed() && !link.drained()))
             {
                 // EOF caused by our existing cancellation/timeout is not a
                 // second resource failure. Preserve the original accepted
@@ -117,7 +123,7 @@ impl Owner {
             // This is sampled governance over actual owned groups, not a hard
             // kernel quota or evidence of closure. Unknown coverage is never
             // treated as zero. Original custody remains held during cleanup.
-            if (job.launched || job.resolver.is_some())
+            if (job.launched || job.resolver.is_some() || job.bootstrap_graph.is_some())
                 && !job.is_settled()
                 && (!job.reaped || job.members.values().any(|member| member.group().is_some()))
                 && job.memory_at.elapsed() >= Duration::from_millis(100)
@@ -128,6 +134,13 @@ impl Owner {
                     .values()
                     .filter_map(|member| member.group())
                     .collect();
+                if let Some(root) = &job.bootstrap_graph {
+                    match root.query_sampling_group() {
+                        Ok(Some(group)) => groups.push(group),
+                        Ok(None) => {}
+                        Err(_) => job.memory_fault = true,
+                    }
+                }
                 if !job.reaped {
                     if let Ok(group) = i32::try_from(job.child.child_mut().id()) {
                         groups.push(group);
@@ -204,6 +217,10 @@ impl Owner {
                 // Signal only while the original unreaped leader still pins
                 // its group identity. Reaping never grants later numeric control.
                 let drained = exited
+                    && job
+                        .bootstrap_graph
+                        .as_ref()
+                        .is_none_or(|root| root.native_queries_drained())
                     && crate::resource_memory::other_members_exited(job.child.child_mut().id());
                 if job
                     .cleanup_at

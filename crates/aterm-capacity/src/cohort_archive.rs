@@ -21,6 +21,12 @@ mod envelope;
 
 #[path = "cohort_archive_history.rs"]
 mod history;
+#[path = "cohort_archive_shared.rs"]
+mod shared;
+
+#[cfg(test)]
+#[path = "cohort_archive_shared_tests.rs"]
+mod shared_tests;
 
 #[cfg(test)]
 #[path = "cohort_archive_envelope_tests.rs"]
@@ -31,12 +37,13 @@ const RECEIPT: &str = "receipt.json";
 const HISTORY: &str = "claim.noindex";
 const COMPACTED: &str = "compacted.json";
 
-// Share the SAME original directory description among its retained members;
-// each file still owns its own original descriptor and all origin checks.
+// Logical readers retain their complete original inputs. The hot History may
+// share these SAME descriptions after fresh named-entry/byte/stamp checks;
+// it never adopts an input from the receipt's serialized inventory.
 struct HeldFile {
     parent: Arc<File>,
     name: String,
-    file: File,
+    file: Arc<File>,
     stamp: Stamp,
 }
 
@@ -96,7 +103,7 @@ impl Inventory {
                 inventory.files.push(HeldFile {
                     parent: Arc::clone(&root),
                     name: name.into(),
-                    file,
+                    file: Arc::new(file),
                     stamp,
                 });
                 continue;
@@ -146,7 +153,7 @@ impl Inventory {
                 inventory.files.push(HeldFile {
                     parent: Arc::clone(&directory),
                     name: child.into(),
-                    file,
+                    file: Arc::new(file),
                     stamp,
                 });
             }
@@ -461,7 +468,9 @@ pub(super) fn publish(
     capture.check(&transaction.anchor.directory, guard)?;
     let receipt_value =
         aterm_json::from_str::<Value>(&receipt).map_err(|_| bad("invalid own archive receipt"))?;
-    let mut history = history::History::inspect(slot.history()?, &receipt_value, None)?;
+    #[cfg(test)]
+    shared_tests::before_hot_inspect(&inventory)?;
+    let mut history = history::History::inspect_hot(slot.history()?, &receipt_value, &inventory)?;
     let compacted_value = aterm_json::json!({"v":3u64,"kind":"cohort-terminal-compaction",
         "reference":reference.to_json(),"slot":slot.identity(),"claim":identity(&transaction.anchor.directory,true)?,
         "receipt":receipt_stamp.value(),"inventory":inventory.value()?});

@@ -18,7 +18,7 @@ impl Owner {
         let result: io::Result<(spawnfd::Command, aterm_types::resource_subgroup::JobContext)> =
             (|| {
                 if pending
-                    .workload_deadline()?
+                    .original_deadline()?
                     .is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     return Err(refused(
@@ -31,7 +31,27 @@ impl Owner {
                     .ok_or_else(|| refused("missing admitted recipe"))?;
                 let mut command = recipe.command(&pending.submission.request);
                 let resolver = matches!(recipe.kind, recipe::Kind::Resolver);
-                if matches!(recipe.kind, recipe::Kind::Workload) {
+                if matches!(recipe.kind, recipe::Kind::BootstrapGraph) {
+                    let sdk = service_sdk
+                        .as_ref()
+                        .ok_or_else(|| refused("Bootstrap Root SDK keeper missing"))?;
+                    let deadline = pending
+                        .original_deadline()?
+                        .ok_or_else(|| refused("Bootstrap queued deadline missing"))?;
+                    let Custody::Fixed(original) = &mut custody else {
+                        return Err(refused(
+                            "Bootstrap Root requires actual retained fixed custody",
+                        ));
+                    };
+                    let ceiling = std::num::NonZeroU32::new(recipe.width)
+                        .ok_or_else(|| refused("Bootstrap fixed ceiling is empty"))?;
+                    let gnu = original.prepare_gnu(&self.fence, ceiling)?;
+                    let (root, prelude) =
+                        bootstrap_graph::Root::new(&mut command, gnu, sdk.clone(), deadline)?;
+                    pending.sdk = Some(sdk.context()?);
+                    pending.bootstrap_graph = Some(root);
+                    command = prelude;
+                } else if matches!(recipe.kind, recipe::Kind::Workload) {
                     let sdk = service_sdk
                         .as_ref()
                         .ok_or_else(|| refused("original workload SDK missing"))?;
@@ -57,10 +77,12 @@ impl Owner {
                 }
                 // Locator only: the helper itself accepts custody lookup only
                 // from this exact cached image and a validated native ancestor.
-                command.env(
-                    "ATERM_RESOURCE_INSPECTOR",
-                    crate::runtime::inspector_program()?,
-                );
+                if !matches!(recipe.kind, recipe::Kind::BootstrapGraph) {
+                    command.env(
+                        "ATERM_RESOURCE_INSPECTOR",
+                        crate::runtime::inspector_program()?,
+                    );
+                }
                 let mut secret = [0; 32];
                 aterm_uds::rand::fill(&mut secret)?;
                 let delegation = aterm_types::resource_subgroup::JobContext {
@@ -68,6 +90,11 @@ impl Owner {
                     capability: aterm_types::resource_subgroup::Capability::from_bytes(secret),
                 };
                 command.env("ATERM_RESOURCE_JOB_V3", delegation.encode()?);
+                if let Some(root) = pending.bootstrap_graph.as_mut() {
+                    // Capture the actual original locator together with all
+                    // original transport descriptions before the first ARM.
+                    root.configured(&command)?;
+                }
                 if resolver {
                     let sdk = service_sdk
                         .as_ref()
@@ -180,7 +207,7 @@ impl Owner {
         metadata_gnu: Option<metadata::RootGnu>,
         service_sdk: Option<std::sync::Arc<sdk::Keeper>>,
     ) {
-        let original_deadline = pending.workload_deadline();
+        let original_deadline = pending.original_deadline();
         let binding = pending.submission.request.binding;
         let pid = child.child_mut().id();
         let birth = i32::try_from(pid)
@@ -196,7 +223,10 @@ impl Owner {
             .map(|recipe| recipe.program.clone())
             .unwrap_or_default();
         let native_targo = pending.recipe.as_ref().is_some_and(|recipe| {
-            matches!(recipe.kind, recipe::Kind::Targo | recipe::Kind::Workload)
+            matches!(
+                recipe.kind,
+                recipe::Kind::Targo | recipe::Kind::Workload | recipe::Kind::BootstrapGraph
+            )
         });
         let metadata_root = pending
             .recipe
@@ -225,7 +255,7 @@ impl Owner {
         };
         // Check the SAME start stored in the original owner, after all paid
         // preparation/durable writes; an earlier now() is not this deadline.
-        let deadline_supported = workload.is_none()
+        let deadline_supported = (workload.is_none() && pending.bootstrap_graph.is_none())
             || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
                 && timeout.is_some_and(|timeout| started.checked_add(timeout).is_some());
         let mut job = Job {
@@ -268,6 +298,7 @@ impl Owner {
             launched: false,
             closed: None,
             runtime_inputs: runtime_inputs::State::default(),
+            bootstrap_graph: pending.bootstrap_graph,
             settlement_at: None,
         };
         if prepared.is_ok()
@@ -278,6 +309,7 @@ impl Owner {
             && job.metadata_sdk.as_ref().is_none_or(|sdk| {
                 sdk.validate().is_ok()
                     && (job.resolver.is_some()
+                        || job.bootstrap_graph.is_some()
                         || (sdk.validate_loaded(pid).is_ok()
                             && aterm_uds::process::LoadedImage::read(pid as i32).is_some_and(
                                 |image| image.matches_file(&job.program) == Some(true),
@@ -291,11 +323,15 @@ impl Owner {
                 .workload
                 .as_ref()
                 .is_none_or(|owner| owner.primary.bind_child(pid).is_ok())
+            && job
+                .bootstrap_graph
+                .as_ref()
+                .is_none_or(|root| root.bind_child(pid).is_ok())
         {
             // The first hold is the trusted prelude, not the selected resolver.
             // Its owned preparation performs the two-stop transition; only a
             // positively validated selected image may receive final GO/Started.
-            if job.resolver.is_some() {
+            if job.resolver.is_some() || job.bootstrap_graph.is_some() {
                 self.jobs.insert((binding.session, binding.attempt), job);
                 return;
             }

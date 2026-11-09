@@ -41,6 +41,9 @@ fn cpu_pool_width(fixture: &CohortFixture, width: u32) -> RetainedPool {
     .unwrap()
 }
 
+#[path = "retained_cohort_loan_tests.rs"]
+mod loans;
+
 #[test]
 fn retained_bundle_covers_registered_subgroup_after_original_root_exits() {
     let fixture = CohortFixture::new();

@@ -401,7 +401,7 @@ pub(crate) fn the_agent(run: &Run) -> Option<(i64, String)> {
     if tree.is_empty() {
         return None;
     }
-    agents_of(&run.w.join("home/.claude/sessions"), &tree)
+    agents_of(&run.claude_dir().join("sessions"), &tree)
         .into_iter()
         .next()
 }

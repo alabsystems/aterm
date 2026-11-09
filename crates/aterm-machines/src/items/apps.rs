@@ -3079,7 +3079,7 @@ pub(crate) mod tests {
             fn run_tty(
                 &self,
                 c: &Cmd,
-                before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+                before: &mut dyn FnMut(&mut Cmd) -> Result<(), crate::port::RunFailed>,
             ) -> Result<Option<i32>, crate::port::RunFailed> {
                 self.0.run_tty(c, before)
             }
@@ -3667,7 +3667,7 @@ pub(crate) mod tests {
             fn run_tty(
                 &self,
                 c: &Cmd,
-                before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+                before: &mut dyn FnMut(&mut Cmd) -> Result<(), crate::port::RunFailed>,
             ) -> Result<Option<i32>, crate::port::RunFailed> {
                 self.inner.run_tty(c, before)
             }

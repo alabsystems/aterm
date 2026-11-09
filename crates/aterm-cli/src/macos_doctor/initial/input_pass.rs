@@ -156,6 +156,7 @@ pub(super) fn park_mark(
         console: None,
         keyboard_run: run,
         keyboards: None,
+        readable_keyboards: InputServiceSet::default(),
         retry_due: None,
         mac_settings_retry_due: deadline.filter(|deadline| *deadline <= now),
         retry_ahead: deadline.filter(|deadline| *deadline > now),
@@ -171,7 +172,7 @@ pub fn initial_setup_input_park_mark(expected: &PendingInputAdmission) -> Initia
     let sys = aterm_machines::port::Live::new();
     park_mark(root.as_deref(), expected, ledger::now_secs())
         .with_console(|| Some(!aterm_machines::console::remote(&sys)))
-        .with_keyboard_services(|| sys.keyboard_service_ids())
+        .with_keyboard_services(&sys)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -220,7 +221,7 @@ mod tests {
         let pass = setup
             .native_input_pass(
                 &ticket,
-                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[])),
                 SetupHooks::NONE,
             )
             .unwrap()
@@ -255,7 +256,7 @@ mod tests {
         let pass = setup
             .native_input_pass(
                 &ticket,
-                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(false)),
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(false, &[])),
                 SetupHooks::NONE,
             )
             .unwrap()
@@ -297,7 +298,7 @@ mod tests {
         let pass = setup
             .native_input_pass(
                 &ticket,
-                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[])),
                 SetupHooks::NONE,
             )
             .unwrap()
@@ -335,7 +336,7 @@ mod tests {
                 setup
                     .native_input_pass(
                         &ticket,
-                        || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                        || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[])),
                         SetupHooks::NONE
                     )
                     .unwrap()

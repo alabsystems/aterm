@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::{Act, TaskFace};
 use aterm_agent::harness::footer::{FactKind, FactMask};
-use aterm_agent::harness::lights::{self, Goal, Light, LightState, Mode, ModeInk, Reading, Screen};
+use aterm_agent::harness::lights::{self, Light, Mode, Reading, Screen};
 use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_effects::glass_inks::{GlassInks, field};
@@ -17,13 +17,14 @@ use aterm_window::event::KeyEvent;
 use aterm_window::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::autopilot::{AutopilotView, ChipTone, PENDING_GLYPH};
+use crate::permission_click::{ClickRefusal, ClickShown};
 use crate::{App, WindowId};
 
 /// `chrome`'s `autopilot` lines.
 #[path = "claude_lights_drawn.rs"]
 mod drawn;
 
-/// How long a toggle that did not take keeps saying so.
+/// How long a click that did not take keeps saying so.
 const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
 
 /// One chip of aterm's span in the rule.
@@ -172,7 +173,7 @@ impl ChipAt {
         Inks::of(RenderCell::default(), self).quiet
     }
 
-    /// The value ink: a title's and an expected mode's ([`GlassInks::value`]).
+    /// The value ink: a title's and the mode light's `yolo` ([`GlassInks::value`]).
     pub(crate) fn value(self) -> [u8; 3] {
         Inks::of(RenderCell::default(), self).title
     }
@@ -187,10 +188,10 @@ struct Inks {
     letter: [u8; 3],
     /// The row's own ink ([`GlassInks::lit`]).
     ink: [u8; 3],
-    /// The quiet words and marks: the off chips, a worker's, a manager's, an unknown mode
+    /// The quiet words and marks: the off chips, a worker's, a manager's
     /// ([`GlassInks::quiet`]).
     quiet: [u8; 3],
-    /// A chip's title and an expected mode's word ([`GlassInks::value`]).
+    /// A chip's title and the mode light's `yolo` ([`GlassInks::value`]).
     title: [u8; 3],
     ground: [u8; 3],
     at: ChipAt,
@@ -401,126 +402,56 @@ pub(crate) enum ChipFace {
     Unhosted,
 }
 
-/// How a block gives way in a rule short of room.
+/// How a block gives way in a rule short of room. The mode light keeps its place at every rung
+/// wherever it is drawn: on a plain line it is the only way back
+/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keep {
-    /// Every chip, the keyboard's reveal of the lights at rest included.
-    Revealed,
-    /// Every chip drawn without the reveal.
+    /// Every chip drawn.
     Drawn,
-    /// The light given up as well.
-    NoLight,
-    /// Team given up as well (who drives is on the tab's hover and its strip marks too).
-    AutopilotOnly,
-    /// Autopilot's glyph alone.
+    /// Team given up (who drives is on the tab's hover and its strip marks too).
+    NoTeam,
+    /// Autopilot's glyph alone, beside the light.
     GlyphOnly,
 }
 
 impl Keep {
     /// Every rung, in the order a rule short of room tries them.
-    const LADDER: [Keep; 5] = [
-        Keep::Revealed,
-        Keep::Drawn,
-        Keep::NoLight,
-        Keep::AutopilotOnly,
-        Keep::GlyphOnly,
-    ];
+    const LADDER: [Keep; 3] = [Keep::Drawn, Keep::NoTeam, Keep::GlyphOnly];
 
     /// Whether this rung keeps `chip`, where it is drawn at all.
     const fn keeps(self, chip: Chip) -> bool {
         match chip {
-            Chip::Autopilot => true,
-            Chip::Light(_) => matches!(self, Keep::Revealed | Keep::Drawn),
-            Chip::Team => !matches!(self, Keep::AutopilotOnly | Keep::GlyphOnly),
+            Chip::Autopilot | Chip::Light(_) => true,
+            Chip::Team => matches!(self, Keep::Drawn),
         }
     }
 }
 
-/// Why a toggle did not happen, as its light's title says it.
+/// Why a click did not stand or did not take, as its light's title says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Refusal {
     /// The light is not on Claude's screen right now.
     NotShown,
-    /// A toggle stopped short of its goal in this mode, which the light names.
-    StoppedIn(Mode),
-    /// A toggle stopped in this mode because Claude stayed mid-turn past the press deadline.
-    StoppedMidTurn(Mode),
-    /// The mode cycle came back round without the toggle's goal; it is in this mode.
-    NotInCycle(Goal, Mode),
-    /// The input seam did not accept the click's press.
-    InputRejected,
-    /// A footer fact's slash press is typing into the session (`crate::claude_slash`).
-    Typing,
+    /// The tab's conversation has not been read, so there is none to restart.
+    Unread,
+    /// The click can never be made here ([`ClickRefusal`]).
+    Click(ClickRefusal),
+    /// The click's restart failed.
+    Failed,
 }
 
 impl Refusal {
-    /// Whether it names the mode a toggle stopped in.
-    #[cfg(all(test, unix))]
-    fn names_mode(self) -> bool {
-        matches!(
-            self,
-            Refusal::StoppedIn(_) | Refusal::StoppedMidTurn(_) | Refusal::NotInCycle(..)
-        )
-    }
-
     /// What the light's title says of it: the reason, which a short title keeps whole.
-    fn says(self, rewritten: bool) -> String {
-        let named = |mode: Mode| mode.named_on_glass(rewritten);
+    const fn says(self) -> &'static str {
         match self {
             Refusal::NotShown => "not on screen right now",
-            Refusal::StoppedIn(mode) => return format!("stopped in {}", named(mode)),
-            Refusal::StoppedMidTurn(mode) => {
-                return format!("stopped in {} mid-turn", named(mode));
-            }
-            Refusal::NotInCycle(goal, mode) => {
-                let goal = match goal {
-                    Goal::On => goal.words(rewritten),
-                    Goal::Off => named(Mode::Manual),
-                };
-                return format!("no {goal} in this cycle; in {}", named(mode));
-            }
-            Refusal::InputRejected => "input was not accepted; try again",
-            Refusal::Typing => "aterm is already typing here",
-        }
-        .to_owned()
-    }
-
-    /// Where a click goes from the stop, which the whole title says after the reason: a stop
-    /// short of the goal can be clicked on from the mode it names, a lap only laps again.
-    const fn click(self) -> Option<Goal> {
-        match self {
-            Refusal::StoppedIn(mode) | Refusal::StoppedMidTurn(mode) => Some(Goal::of_mode(mode)),
-            Refusal::NotShown
-            | Refusal::NotInCycle(..)
-            | Refusal::InputRejected
-            | Refusal::Typing => None,
+            Refusal::Unread => "its conversation isn't read yet",
+            Refusal::Click(why) => why.says(),
+            Refusal::Failed => "the restart failed",
         }
     }
 }
-
-/// A toggle in flight: what was sent, and what the next frames must see.
-#[derive(Debug, Clone)]
-struct Pending {
-    light: Light,
-    /// Where the toggle goes: the state the light did not show when it was clicked.
-    goal: Goal,
-    /// The mode when the toggle began (a cycle that leaves it is done).
-    started: Mode,
-    /// The mode when the last shift+tab was sent.
-    mode_at_press: Mode,
-    /// Every mode the cycle has shown since it began.
-    seen: Vec<Mode>,
-    presses: u8,
-    /// Past this, the toggle is given up.
-    deadline: Instant,
-    /// The loop's next look at the engine while one is armed.
-    next_poll: Option<Instant>,
-    /// Claude answered the last press but was mid-turn.
-    held_mid_turn: bool,
-}
-
-/// How often a toggle in flight reads the engine for Claude's answer.
-const MODE_POLL: Duration = Duration::from_millis(80);
 
 /// Whether a press at `now` belongs to the gesture whose last press was at `*last`: within a
 /// double click's interval of it ([`crate::multi_click_ms`]), its last instant included. A press
@@ -535,28 +466,20 @@ fn continues_gesture(last: &mut Option<Instant>, now: Instant) -> bool {
     continues
 }
 
-/// What a toggle in flight does next, decided from the engine's reading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Advance {
-    /// Nothing yet: the last press is unanswered, or the composer is not on screen.
-    Wait,
-    /// Claude answered with `expect`, a mode short of the toggle's goal.
-    Press { expect: Mode },
-    /// The goal shows: done, never a press on from there.
-    Arrived,
-    /// The cycle came back round.
-    Lapped,
-}
-
 /// One session's lights in one window.
 #[derive(Debug, Clone, Default)]
 struct SessionLights {
     /// The last state each light was seen in, kept while a box covers the composer.
     shown: Reading,
-    pending: Option<Pending>,
+    /// The tab's standing permission click, as this frame copied it from the App's table
+    /// ([`App::observe_claude_lights`]): its light drawn with the glass's in-flight `◌` and titled with what it waits for.
+    click: Option<ClickShown>,
     refused: Option<(Light, Refusal, Instant)>,
-    /// A toggle that took: its light stays drawn, titled with its new state, until this instant.
-    notice: Option<(Light, Instant)>,
+    /// What a click's restart would end of Claude's running jobs (`1 shell`,
+    /// [`aterm_agent::harness::footer::ModeRow::job_words`]), as the frame read them off Claude's
+    /// mode row under any pill while the light's title shows; empty otherwise, so a frame at rest
+    /// reads no job words.
+    jobs: String,
     /// The session's Autopilot as the last frame that drew its footer read it.
     autopilot: Option<AutopilotView>,
     /// An Autopilot click in flight.
@@ -578,9 +501,6 @@ struct SessionLights {
     team: Option<TeamFace>,
     /// The harness's glass on the Autopilot chip as the same frame read it ([`App::chip_glass`]).
     glass: ChipGlass,
-    /// Whether the glass rewrote Claude's mode row on this pane this frame, its pill dropped:
-    /// the lights block is then the mode's one home ([`lights::Mode::word_on_glass`]).
-    rewritten: bool,
     /// What a fact menu's row just did here (a copy, a new tab).
     fact_notice: Option<(FactNotice, Instant)>,
     /// The mode's name a click on the Autopilot chip brought up beside its glyph.
@@ -665,6 +585,13 @@ impl SessionLights {
     fn harness_chips(&self) -> bool {
         self.autopilot
             .is_some_and(|view| view != AutopilotView::Unhosted)
+    }
+
+    /// Whether the mode light is drawn (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): on a hosted
+    /// session, wherever the bit is read, and with no bit read only while a click stands, its
+    /// light then the one way to take it back.
+    fn light_drawn(&self) -> bool {
+        self.harness_chips() && (self.shown.mode.is_some() || self.click.is_some())
     }
 
     /// Whether a rule short of room for the Autopilot chip's face may keep its glyph alone.
@@ -1249,14 +1176,13 @@ struct FitKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LightsKey {
     shown: Reading,
-    pending: Option<(Light, Goal)>,
+    click: Option<ClickShown>,
     refused: Option<(Light, Refusal)>,
-    notice: Option<Light>,
+    /// The job words' hash ([`SessionLights::jobs`]), `0` with none.
+    jobs: u64,
     autopilot: Option<AutopilotView>,
     autopilot_pending: bool,
     glass: ChipGlass,
-    /// The mode row's rewrite ([`SessionLights::rewritten`]).
-    rewritten: bool,
     team: Option<u64>,
     /// A fact notice's hash: a slash press's words are text.
     fact_notice: Option<u64>,
@@ -1268,30 +1194,27 @@ impl SessionLights {
     /// This session's [`LightsKey`] at the instant `now` gives.
     fn block_key(&self, now: impl FnOnce() -> Instant) -> LightsKey {
         let active_word = self.active_word();
-        let now = (self.refused.is_some()
-            || self.notice.is_some()
-            || self.fact_notice.is_some()
-            || active_word.is_some())
-        .then(now);
+        let now = (self.refused.is_some() || self.fact_notice.is_some() || active_word.is_some())
+            .then(now);
         let showing = |until: Instant| now.is_some_and(|now| until > now);
         LightsKey {
             word: active_word
                 .zip(now)
                 .and_then(|((named, word), now)| Some((named, word.step(now)?))),
             shown: self.shown,
-            pending: self.pending.as_ref().map(|p| (p.light, p.goal)),
+            click: self.click,
             refused: self
                 .refused
                 .filter(|(_, _, until)| showing(*until))
                 .map(|(light, why, _)| (light, why)),
-            notice: self
-                .notice
-                .filter(|(_, until)| showing(*until))
-                .map(|(light, _)| light),
+            jobs: if self.jobs.is_empty() {
+                0
+            } else {
+                aterm_hash::fnv1a_64(self.jobs.as_bytes()) | 1
+            },
             autopilot: self.autopilot,
             autopilot_pending: self.autopilot_pending.is_some(),
             glass: self.glass,
-            rewritten: self.rewritten,
             team: self.team.as_ref().map(|face| {
                 use std::hash::{Hash as _, Hasher as _};
                 let mut h = std::hash::DefaultHasher::new();
@@ -1449,9 +1372,8 @@ impl WindowLights {
             .sessions
             .iter()
             .filter(|(_, s)| {
-                s.pending.is_some()
+                s.click.is_some()
                     || s.refused.is_some_and(|(_, _, until)| shows(until))
-                    || s.notice.is_some_and(|(_, until)| shows(until))
                     || s.fact_notice
                         .as_ref()
                         .is_some_and(|(_, until)| shows(*until))
@@ -1468,18 +1390,13 @@ impl WindowLights {
         active.sort_by_key(|(id, _)| **id);
         for (id, s) in active {
             id.hash(&mut h);
-            if let Some(p) = &s.pending {
-                (p.light, p.goal, p.presses).hash(&mut h);
+            if let Some(click) = s.click {
+                click.hash(&mut h);
             }
             if let Some((light, why, until)) = s.refused
                 && shows(until)
             {
                 (light, why).hash(&mut h);
-            }
-            if let Some((light, until)) = s.notice
-                && shows(until)
-            {
-                (light, "notice").hash(&mut h);
             }
             if let Some((notice, until)) = &s.fact_notice
                 && shows(*until)
@@ -1491,19 +1408,6 @@ impl WindowLights {
             }
         }
         h.finish() | 1
-    }
-
-    /// Keep one poll armed for `session`'s toggle in flight.
-    fn arm_poll(&mut self, session: u64, now: Instant, every: Duration) {
-        if let Some(p) = self
-            .sessions
-            .get_mut(&session)
-            .and_then(|s| s.pending.as_mut())
-            && p.next_poll.is_none_or(|at| now >= at)
-        {
-            p.next_poll = Some(now + every);
-            wake_after(session, every);
-        }
     }
 
     /// Forget every painted light and footer rule.
@@ -1596,12 +1500,12 @@ impl WindowLights {
     /// row's order: the chips, the facts, then the top rule's harness switch.
     fn revealable(&self, session: u64) -> Vec<Target> {
         let s = self.sessions.get(&session);
-        let shown = s.map(|s| s.shown).unwrap_or_default();
+        let light = s.is_some_and(SessionLights::light_drawn);
         let harness = s.is_some_and(SessionLights::harness_chips);
         let team = s.is_some_and(|s| s.team.is_some());
         Chip::row()
             .filter(|chip| match chip {
-                Chip::Light(light) => revealed(*light, &shown),
+                Chip::Light(_) => light,
                 Chip::Autopilot => harness,
                 Chip::Team => team,
             })
@@ -1694,7 +1598,6 @@ impl WindowLights {
                 Some(crate::autopilot::HarnessSwitch::Off(crate::autopilot::SwitchOff::Master)) => {
                     s.autopilot = Some(AutopilotView::MasterOff);
                     s.autopilot_pending = None;
-                    s.rewritten = false;
                     s.word = None;
                 }
                 Some(crate::autopilot::HarnessSwitch::Off(crate::autopilot::SwitchOff::Agent(
@@ -1702,18 +1605,15 @@ impl WindowLights {
                 ))) => {
                     s.autopilot = Some(AutopilotView::AgentOff(agent));
                     s.autopilot_pending = None;
-                    s.rewritten = false;
                     s.word = None;
                 }
                 Some(crate::autopilot::HarnessSwitch::Turning) => {
                     s.autopilot_pending = None;
-                    s.rewritten = false;
                     s.word = None;
                 }
                 None => {
                     s.autopilot = Some(AutopilotView::Unhosted);
                     s.autopilot_pending = None;
-                    s.rewritten = false;
                     s.word = None;
                 }
             }
@@ -1789,12 +1689,6 @@ impl WindowLights {
                 Some(word.next_at(now).unwrap_or(now))
             })
             .min()
-    }
-
-    /// Note the row `session`'s footer is drawn on this frame: whether the glass rewrote Claude's
-    /// mode row.
-    fn note_row(&mut self, session: u64, rewritten: bool) {
-        self.sessions.entry(session).or_default().rewritten = rewritten;
     }
 
     /// [`Self::note_autopilot_at`] at `now`.
@@ -1935,118 +1829,59 @@ impl WindowLights {
         session: u64,
         rows: &[String],
         read: impl FnOnce(&[String]) -> Option<Reading>,
-    ) -> Step {
+    ) {
         let read =
             crate::reader_guard::read_or_none(session, "Claude Code lights", rows, || read(rows));
-        self.observe_read(session, read)
+        self.observe_read(session, read);
     }
 
     /// Fold a frame's reading of `session`'s rows in ([`Self::observe`]).
-    fn observe_read(&mut self, session: u64, read: crate::claude_footer::LightsRead) -> Step {
-        match read {
-            Some(reading) => self.observe(session, reading),
-            None => Step::default(),
+    fn observe_read(&mut self, session: u64, read: crate::claude_footer::LightsRead) {
+        if let Some(reading) = read {
+            self.observe(session, reading);
         }
     }
 
     /// Fold one frame's reading of `session`'s screen.
-    fn observe(&mut self, session: u64, reading: Option<Reading>) -> Step {
+    fn observe(&mut self, session: u64, reading: Option<Reading>) {
         let s = self.sessions.entry(session).or_default();
         s.shown.fold(&reading.unwrap_or(Reading::UNKNOWN));
-        let Some(p) = s.pending.as_ref() else {
-            return Step::default();
-        };
-        Step {
-            wake: reading.is_some_and(|r| r.mode.is_some_and(|m| m != p.mode_at_press)),
+    }
+
+    /// `session`'s standing permission click as this frame reads the App's table, and the job
+    /// words its light's title names ([`SessionLights::jobs`]).
+    fn note_click(&mut self, session: u64, click: Option<ClickShown>, jobs: String) {
+        let s = self.sessions.entry(session).or_default();
+        if s.click != click {
+            s.click = click;
+        }
+        if s.jobs != jobs {
+            s.jobs = jobs;
         }
     }
 
-    /// Move `session`'s toggle along from the engine's `screen` (`None` without a composer).
-    fn advance(&mut self, session: u64, screen: Option<&Screen>, now: Instant) -> Advance {
-        let Some(s) = self.sessions.get_mut(&session) else {
-            return Advance::Wait;
-        };
-        let Some(p) = s.pending.as_mut() else {
-            return Advance::Wait;
-        };
-        let Some((mode, busy)) = screen.and_then(|screen| Some((screen.mode?, screen.busy))) else {
-            return Advance::Wait;
-        };
-        s.shown.mode = Some(mode);
-        if p.goal.reached(mode) {
-            s.pending = None;
-            s.refused = None;
-            s.notice = Some((Light::Mode, now + REFUSAL_SHOWN));
-            return Advance::Arrived;
-        }
-        if p.deadline <= now || mode == p.mode_at_press {
-            return Advance::Wait;
-        }
-        if mode == p.started || p.seen.contains(&mode) || p.presses >= lights::MAX_MODE_PRESSES {
-            let goal = p.goal;
-            s.pending = None;
-            s.refused = Some((
-                Light::Mode,
-                Refusal::NotInCycle(goal, mode),
-                now + REFUSAL_SHOWN,
-            ));
-            return Advance::Lapped;
-        }
-        if busy {
-            p.held_mid_turn = true;
-            return Advance::Wait;
-        }
-        p.presses += 1;
-        p.seen.push(mode);
-        p.mode_at_press = mode;
-        p.held_mid_turn = false;
-        p.deadline = now + Duration::from_millis(lights::SETTLE_MS);
-        Advance::Press { expect: mode }
+    /// Whether `session`'s mode light is under the pointer or the keyboard, its title showing:
+    /// the frame then reads the job words the title names ([`SessionLights::jobs`]).
+    pub(crate) fn light_titled(&self, session: u64) -> bool {
+        let light = Some((session, Target::Chip(Chip::Light(Light::Mode))));
+        self.hover == light || self.selected == light
     }
 
-    /// Give up on every toggle past its deadline.
+    /// Let every word on show past its time go: a refusal, a fact notice, an Autopilot click's
+    /// word.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Expire",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
+            machine = "claude_permission_click",
             action = "Rest",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
+            project = "claude_lights::click_tests::project_permission_click"
         )
     )]
-    fn expire(&mut self, now: Instant) -> (bool, Vec<u64>) {
+    fn expire(&mut self, now: Instant) -> bool {
         let mut any = false;
-        let mut refused = Vec::new();
-        for (session, s) in &mut self.sessions {
-            if let Some(p) = &s.pending
-                && p.deadline <= now
-            {
-                let why = match s.shown.mode.unwrap_or(p.mode_at_press) {
-                    at if p.goal.reached(at) => None,
-                    at if p.held_mid_turn => Some(Refusal::StoppedMidTurn(at)),
-                    at => Some(Refusal::StoppedIn(at)),
-                };
-                match why {
-                    Some(why) => s.refused = Some((p.light, why, now + REFUSAL_SHOWN)),
-                    None => s.notice = Some((p.light, now + REFUSAL_SHOWN)),
-                }
-                s.pending = None;
-                refused.push(*session);
-                any = true;
-            }
+        for s in self.sessions.values_mut() {
             if s.refused.is_some_and(|(_, _, until)| until <= now) {
                 s.refused = None;
-                any = true;
-            }
-            if s.notice.is_some_and(|(_, until)| until <= now) {
-                s.notice = None;
                 any = true;
             }
             if s.fact_notice
@@ -2079,7 +1914,7 @@ impl WindowLights {
                 any = true;
             }
         }
-        (any, refused)
+        any
     }
 
     /// Why the owner's last press of `session`'s ⬆️ was refused, while its label's slot says so
@@ -2314,12 +2149,11 @@ impl WindowLights {
         let inks = Inks::of(blank, chips_at);
         let glyph_rung = s.glyph_rung();
         let width_at = |keep: Keep, named: Option<(&'static str, u32)>| {
-            let drawn = drawn_at(s, now, selected, hover, keep);
+            let drawn = drawn_at(s, keep);
             chips_width_at(s, Chip::row().filter(|c| drawn(*c)), keep, inks, named)
         };
         let Some(keep) = Keep::LADDER
             .into_iter()
-            .filter(|keep| *keep != Keep::Revealed || selected.is_some())
             .filter(|keep| *keep != Keep::GlyphOnly || glyph_rung)
             .find(|keep| (1..=room).contains(&width_at(*keep, None)))
         else {
@@ -2329,8 +2163,8 @@ impl WindowLights {
         // leaves, and never a chip's place.
         let named = s
             .word_at(now)
-            .filter(|_| named && matches!(keep, Keep::Revealed | Keep::Drawn))
-            .filter(|_| drawn_at(s, now, selected, hover, keep)(Chip::Autopilot))
+            .filter(|_| named && keep == Keep::Drawn)
+            .filter(|_| drawn_at(s, keep)(Chip::Autopilot))
             .filter(|&word| width_at(keep, Some(word)) <= room);
         self.block_into(
             session,
@@ -2343,7 +2177,7 @@ impl WindowLights {
             titles,
             block,
         );
-        if !matches!(keep, Keep::Revealed | Keep::Drawn) {
+        if keep != Keep::Drawn {
             block.holds = room;
         }
         true
@@ -2379,7 +2213,7 @@ impl WindowLights {
                 self.sessions
                     .get(&session)
                     .and_then(|s| s.word_at(now))
-                    .filter(|_| matches!(keep, Keep::Revealed | Keep::Drawn)),
+                    .filter(|_| keep == Keep::Drawn),
             ),
             (autopilot, None, None),
             &mut block,
@@ -2410,22 +2244,17 @@ impl WindowLights {
         let s = self.sessions.get(&session).unwrap_or(&at_rest);
         let focus = selected.or(hover);
         let refused = s.refused.filter(|(_, _, until)| *until > now);
-        let noticed = s
-            .notice
-            .filter(|(_, until)| *until > now)
-            .map(|(light, _)| light);
-        let pending = s.pending.as_ref().map(|p| p.light);
+        let clicked = s.click.map(|_| Light::Mode);
         let fact_noticed = s
             .fact_notice
             .as_ref()
             .filter(|(_, until)| *until > now)
             .map(|(notice, _)| (notice.text(), matches!(notice, FactNotice::Said(_))));
-        let drawn = drawn_at(s, now, selected, hover, keep);
+        let drawn = drawn_at(s, keep);
         let titled = [
             focus,
-            pending.map(Chip::Light),
+            clicked.map(Chip::Light),
             refused.map(|(l, _, _)| Chip::Light(l)),
-            noticed.map(Chip::Light),
         ]
         .into_iter()
         .flatten()
@@ -2513,10 +2342,8 @@ impl WindowLights {
                 let words = title_of(s, chip, refused);
                 *reason = words.reason;
                 lay(&words.whole, title_ink, title);
-                match (chip, &words.lean) {
-                    (Chip::Autopilot, _) => lay_lean(&words.whole, lean),
-                    (_, Some(form)) => lay(form, title_ink, &mut lean[LEAN_FORMS - 1]),
-                    (_, None) => {}
+                if chip == Chip::Autopilot {
+                    lay_lean(&words.whole, lean);
                 }
                 lay(&words.short, title_ink, short_title);
             }
@@ -2596,50 +2423,18 @@ impl WindowLights {
     }
 }
 
-/// Whether the keyboard's reveal draws and walks `light` in a session that shows `shown`.
-fn revealed(light: Light, shown: &Reading) -> bool {
-    shown.state(light) != LightState::Unknown
-}
-
-/// Whether `s`'s block draws a chip at `keep`.
-fn drawn_at(
-    s: &SessionLights,
-    now: Instant,
-    selected: Option<Chip>,
-    hover: Option<Chip>,
-    keep: Keep,
-) -> impl Fn(Chip) -> bool + '_ {
-    let focus = selected.or(hover);
-    let refused = s
-        .refused
-        .filter(|(_, _, until)| *until > now)
-        .map(|(light, _, _)| light);
-    let noticed = s
-        .notice
-        .filter(|(_, until)| *until > now)
-        .map(|(light, _)| light);
-    let pending = s.pending.as_ref().map(|p| p.light);
+/// Whether `s`'s block draws a chip at `keep`: the mode light wherever
+/// [`SessionLights::light_drawn`], at every rung ([`Keep`]).
+fn drawn_at(s: &SessionLights, keep: Keep) -> impl Fn(Chip) -> bool + '_ {
     let harness = s.harness_chips();
     let team = s.team.is_some();
-    // The mode's one home on a rewritten row: its light is kept at every rung, the pill being
-    // gone (a row too narrow for the whole pill is never rewritten).
-    let home = s.rewritten;
+    let light = s.light_drawn();
     move |chip: Chip| {
-        (keep.keeps(chip) || (home && matches!(chip, Chip::Light(_))))
+        keep.keeps(chip)
             && match chip {
                 Chip::Autopilot => harness,
                 Chip::Team => team,
-                Chip::Light(light) => {
-                    lights::deviates(light, &s.shown)
-                        || (s.rewritten && s.shown.mode.is_some())
-                        || pending == Some(light)
-                        || refused == Some(light)
-                        || noticed == Some(light)
-                        || focus == Some(chip)
-                        || (keep == Keep::Revealed
-                            && selected.is_some()
-                            && revealed(light, &s.shown))
-                }
+                Chip::Light(_) => light,
             }
     }
 }
@@ -2687,14 +2482,13 @@ fn gap_after(chip: Chip, worded: bool) -> usize {
     }
 }
 
-/// A chip's title: whole, a leaner form where it has one, short, and whether it is a light's
-/// refusal (its reason outranks the facts, `footer::fit_rule`).
+/// A chip's title: whole, short, and whether it is a reason (a light's refusal, or what a click's
+/// restart waits for or ends), which outranks the facts and keeps its short form in the rule
+/// (`footer::fit_rule`). The Autopilot chip's leaner forms are cut from its whole
+/// ([`lean_titles`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TitleText {
     whole: String,
-    /// The light's one lean form, laid in the last lean slot ([`LEAN_FORMS`]); the Autopilot
-    /// chip's lean forms are cut from its whole ([`lean_titles`]).
-    lean: Option<String>,
     short: String,
     reason: bool,
 }
@@ -2715,79 +2509,113 @@ fn sentence(words: &str) -> String {
     format!("{}{}.", first.unwrap_or_default(), chars.as_str())
 }
 
-/// What `light`'s title says: what its state does (the mode's gist; Claude Code's own name for the
-/// mode where the chip wears aterm's word for it, `yolo` or `lame`), then where a click goes
-/// (`· click: lame`); a toggle in flight says where it is going, a refusal its reason. The chip
-/// already shows the state's word, so the title explains it rather than repeating it.
+/// What `light`'s title says (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): on `yolo` that no
+/// permission prompt is asked, on `lame` that it is not yolo, then where a click goes
+/// (`· click: lame`) and what its restart would end of Claude's running jobs (`· ends 1 shell`); a
+/// standing click says what its restart waits for, what it ends and that a click takes it back,
+/// a refusal its reason. The chip already shows the bit's word, so the title says what it means
+/// rather than repeating it, and names no mode but the bit. A title that says what a restart
+/// waits for or ends is a reason, its short form keeping that clause ([`TitleText::reason`]).
+/// Where the host `restarts` nothing ([`crate::permission_click::RESTARTS`]) the title says the
+/// bit's meaning alone, with no click and nothing a restart would end.
 fn light_title(
     s: &SessionLights,
     light: Light,
     refused: Option<(Light, Refusal, Instant)>,
+    restarts: bool,
 ) -> LightTitle {
-    let rewritten = s.rewritten;
-    let click = |goal: Goal| format!("{TITLE_CLICK}{}", goal.words(rewritten));
-    let spoken_click = |goal: Goal| format!(" Click for {}.", goal.words(rewritten));
     if let Some((l, why, _)) = refused
         && l == light
     {
-        let short = why.says(rewritten);
-        let goal = why.click();
+        let short = why.says().to_owned();
         return LightTitle {
-            spoken: format!(
-                "{}{}",
-                sentence(&short),
-                goal.map_or_else(String::new, spoken_click)
-            ),
+            spoken: sentence(&short),
             text: TitleText {
-                whole: format!("{short}{}", goal.map_or_else(String::new, click)),
-                lean: None,
+                whole: short.clone(),
                 short,
                 reason: true,
             },
         };
     }
-    if let Some(p) = s.pending.as_ref().filter(|p| p.light == light) {
-        let to = p.goal.words(rewritten);
-        return LightTitle {
-            spoken: format!("Switching to {to}."),
-            text: TitleText {
-                whole: format!("switching to {to}\u{2026}"),
-                lean: None,
-                short: "switching\u{2026}".to_owned(),
-                reason: false,
-            },
+    let ends = crate::claude_footer::ends_words(
+        &s.jobs,
+        aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND,
+    );
+    let ends_said = if ends.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Ends {}.",
+            s.jobs
+                .replace(aterm_agent::harness::footer::MODE_ROW_SEP, ", ")
+        )
+    };
+    if let Some(click) = s.click {
+        return match click.when {
+            Some(when) => {
+                let short = format!("restarts {when}{ends}");
+                LightTitle {
+                    spoken: format!(
+                        "{}{ends_said} Click to take it back.",
+                        sentence(&format!("restarts {when}"))
+                    ),
+                    text: TitleText {
+                        whole: format!("{short}{TITLE_CLICK}take back"),
+                        short,
+                        reason: true,
+                    },
+                }
+            }
+            None => {
+                let words = format!("restarting\u{2026}{ends}");
+                LightTitle {
+                    spoken: format!("Restarting.{ends_said}"),
+                    text: TitleText {
+                        whole: words.clone(),
+                        short: words,
+                        reason: !ends.is_empty(),
+                    },
+                }
+            }
         };
     }
-    let Some(mode) = s.shown.mode else {
+    let Some(yolo) = s.shown.yolo() else {
         let words = "not on screen right now";
         return LightTitle {
             spoken: sentence(words),
             text: TitleText {
                 whole: words.to_owned(),
-                lean: None,
                 short: words.to_owned(),
                 reason: false,
             },
         };
     };
-    let goal = Goal::of_mode(mode);
-    let gist = mode.gist();
-    let named = (mode.word_on_glass(rewritten) != mode.word()).then(|| mode.claude_name());
-    let lean = format!("{gist}{}", click(goal));
-    let spoken = match named {
-        Some(name) => format!("{} ({name}).", sentence(gist).trim_end_matches('.')),
-        None => sentence(gist),
+    // A click restarts onto the bit the chip does not show (`docs/DESIGN-yolo-binary-2026-11-04.md`
+    // §3): from bypass to the settings' mode, from any other to bypass.
+    let (head, to) = if yolo {
+        (
+            "no permission prompts",
+            aterm_agent::harness::footer::YOLO_OFF,
+        )
+    } else {
+        ("not yolo", aterm_agent::harness::footer::YOLO_ON)
     };
+    if !restarts {
+        return LightTitle {
+            spoken: sentence(head),
+            text: TitleText {
+                whole: head.to_owned(),
+                short: head.to_owned(),
+                reason: false,
+            },
+        };
+    }
     LightTitle {
-        spoken: format!("{spoken}{}", spoken_click(goal)),
+        spoken: format!("{} Click for {to}.{ends_said}", sentence(head)),
         text: TitleText {
-            whole: named.map_or_else(
-                || lean.clone(),
-                |name| format!("{gist}{TITLE_EXPLAINS}{name}{}", click(goal)),
-            ),
-            lean: named.map(|_| lean),
-            short: gist.to_owned(),
-            reason: false,
+            whole: format!("{head}{TITLE_CLICK}{to}{ends}"),
+            short: format!("{head}{ends}"),
+            reason: !ends.is_empty(),
         },
     }
 }
@@ -2800,12 +2628,13 @@ fn title_of(
 ) -> TitleText {
     let plain = |(whole, short): (String, String)| TitleText {
         whole,
-        lean: None,
         short,
         reason: false,
     };
     match chip {
-        Chip::Light(light) => light_title(s, light, refused).text,
+        Chip::Light(light) => {
+            light_title(s, light, refused, crate::permission_click::RESTARTS).text
+        }
         Chip::Autopilot if s.autopilot_pending.is_some() => plain((
             "autopilot: switching\u{2026}".to_owned(),
             "switching\u{2026}".to_owned(),
@@ -2892,7 +2721,7 @@ impl<'a> Face<'a> {
     }
 
     /// The cells it takes: two for a wide character (`✋`, a cjk name). A face with no glyph
-    /// (on a rewritten row `yolo`, `auto`, `lame`) is its words alone, no blank before them.
+    /// (the mode light's `yolo` or `lame` at rest) is its words alone, no blank before them.
     fn width(&self) -> usize {
         cells_of(self.glyph)
             + if self.worded() {
@@ -2937,10 +2766,7 @@ fn face_of<'a>(
     let ink_of = |tone: ChipTone| inks.of_tone(tone);
     let ink = inks.ink;
     match chip {
-        Chip::Light(light) => {
-            let (glyph, word, ink) = light_face(light, s, inks);
-            Face::plain(glyph, Some(word), ink)
-        }
+        Chip::Light(_) => light_face(s, inks),
         Chip::Autopilot => {
             let view = s.autopilot.unwrap_or(AutopilotView::Unhosted);
             if s.autopilot_pending.is_some() {
@@ -2993,26 +2819,24 @@ enum ChipTitle {
     Act(Act),
 }
 
-/// A light's glyph, word and ink: on a rewritten row `yolo`, `auto` and `lame` stand as words
-/// alone ([`Mode::glyph_on_glass`]), `◌` stands for the glyph while a toggle is in flight, and the
-/// ink is the mode's ([`Mode::ink`]): an expected mode in the value ink, the rest in the row's.
-fn light_face(
-    light: Light,
-    s: &SessionLights,
-    inks: Inks,
-) -> (&'static str, &'static str, [u8; 3]) {
-    let switching = s.pending.as_ref().is_some_and(|p| p.light == light);
-    let glyph = |own: &'static str| if switching { PENDING_GLYPH } else { own };
-    match s.shown.mode {
-        Some(mode) => (
-            glyph(mode.glyph_on_glass(s.rewritten)),
-            mode.word_on_glass(s.rewritten),
-            match mode.ink() {
-                ModeInk::Value => inks.title,
-                ModeInk::Row => inks.ink,
-            },
+/// The mode light's face (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): `yolo` in bypass, in the
+/// glass's value ink; `lame` in any other mode, in the row's; [`PENDING_GLYPH`] before the word while
+/// a click stands, and alone where no bit is read (the light is drawn there only while a click
+/// stands, [`SessionLights::light_drawn`]).
+fn light_face(s: &SessionLights, inks: Inks) -> Face<'static> {
+    let glyph = if s.click.is_some() { PENDING_GLYPH } else { "" };
+    match s.shown.yolo() {
+        Some(true) => Face::plain(
+            glyph,
+            Some(aterm_agent::harness::footer::YOLO_ON),
+            inks.title,
         ),
-        None => (glyph("\u{25CC}"), light.word(), inks.quiet),
+        Some(false) => Face::plain(
+            glyph,
+            Some(aterm_agent::harness::footer::YOLO_OFF),
+            inks.ink,
+        ),
+        None => Face::plain(PENDING_GLYPH, None, inks.ink),
     }
 }
 
@@ -3600,13 +3424,6 @@ pub(crate) fn glass_bits(glass: ChipGlass, reading: bool) -> u64 {
     act << 24 | face << 32 | timer << 36 | u64::from(other_day) << 47 | trail << 48 | weekday << 56
 }
 
-/// What one frame's reading of a pane asks of the host.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Step {
-    /// Claude answered a toggle's input.
-    wake: bool,
-}
-
 /// Row `r` of `t`'s live screen as text, trailing blanks trimmed.
 pub(crate) fn row_text(t: &aterm_core::terminal::Terminal, r: usize) -> String {
     let mut line = t
@@ -3659,16 +3476,17 @@ pub(crate) fn wake_after(session: u64, delay: Duration) {
 /// What the painter needs for one pane.
 #[derive(Debug, Default)]
 pub(crate) struct Block {
-    /// The mode light's title ([`light_title`]: what its state does, Claude Code's name for the
-    /// mode where the chip wears aterm's word, then `· click: <goal>`), or a harness chip's title.
+    /// The mode light's title ([`light_title`]: what the bit means, then `· click: <goal>` and
+    /// what a click's restart ends), or a harness chip's title.
     pub(crate) title: Vec<RenderCell>,
     /// The whole title with parts given up, widest first.
     pub(crate) lean: [Vec<RenderCell>; LEAN_FORMS],
-    /// The title's head alone (the light's gist, a refusal's reason or `switching…`; a harness
-    /// chip's short form), for a pane with no room for the whole title.
+    /// The title's head alone (what the light's bit means and what a click's restart ends, a
+    /// refusal's reason or `switching…`; a harness chip's short form), for a pane with no room for
+    /// the whole title.
     pub(crate) short_title: Vec<RenderCell>,
-    /// The title is a reason (a refusal's, [`light_title`]), which outranks the branch and the path
-    /// in the rule.
+    /// The title is a reason (a refusal's, or what a click's restart waits for or ends,
+    /// [`light_title`]), which outranks the branch and the path in the rule.
     pub(crate) reason: bool,
     /// The chips, one blank apart, a worded Autopilot chip ` ─ ` ([`Block::rule_gaps`]); the
     /// rule's layout pads the block.
@@ -3687,16 +3505,16 @@ pub(crate) struct Block {
 impl Block {
     /// Synthetic private-dev input through the production lights reading and chip composition:
     /// Autopilot `view`'s chip over Claude Code's mode row `mode` (`  ⏸ plan mode on (shift+tab
-    /// to cycle)`), the mode's name worded on the chip where `worded`, as a click that just
-    /// reached it shows it (`⤓ land ─ ⏸ plan`), else its glyph alone; where `rewritten`, the
-    /// glass has rewritten the mode row, as it does a live pane's, so the mode's one home is its
-    /// light even where the mode is the expected one (`∞ yolo`). A sample laid under a palette
-    /// wears the chip of that palette's mode, so the two agree.
+    /// to cycle)`), Autopilot's name worded on its chip where `worded`, as a click that just
+    /// reached it shows it (`⤓ land ─ lame`), else its glyph alone. The light beside it says the
+    /// bit the row reads, as on a live pane: `yolo` on a bypass row (`∞ yolo`), `lame` on any
+    /// other. A sample laid under a palette wears the chip of that palette's mode, so the two
+    /// agree.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     pub(crate) fn layout_scene(
         blank: RenderCell,
         at: ChipAt,
-        (view, mode, worded, rewritten): (AutopilotView, &str, bool, bool),
+        (view, mode, worded): (AutopilotView, &str, bool),
     ) -> Block {
         let mut lights = WindowLights::default();
         let rows = [
@@ -3706,7 +3524,6 @@ impl Block {
             mode.to_owned(),
         ];
         lights.observe(0, lights::read_lights(&rows));
-        lights.note_row(0, rewritten);
         let now = Instant::now();
         lights.note_autopilot_at(0, view.mode(), view, ChipGlass::default(), || now);
         let s = lights.sessions.entry(0).or_default();
@@ -3725,7 +3542,7 @@ impl Block {
             at,
             None,
             None,
-            (Keep::Revealed, named),
+            (Keep::Drawn, named),
             (None, None, None),
             &mut block,
         );
@@ -3785,20 +3602,30 @@ impl Block {
 }
 
 impl App {
-    /// Fold one Claude Code pane's reading of its screen into its lights.
+    /// Fold one Claude Code pane's reading of its screen into its lights, with its tab's
+    /// standing permission click as the frame read the App's table ([`Self::claude_click_shown`])
+    /// and the job words its light's title names ([`SessionLights::jobs`]).
     pub(crate) fn observe_claude_lights(
         &mut self,
         wid: WindowId,
         session: u64,
         read: crate::claude_footer::LightsRead,
+        click: Option<ClickShown>,
+        jobs: String,
     ) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let step = ws.claude_lights.observe_read(session, read);
-        if step.wake {
-            crate::claude_footer::post_changed(session);
-        }
+        ws.claude_lights.observe_read(session, read);
+        ws.claude_lights.note_click(session, click, jobs);
+    }
+
+    /// Session `session`'s standing permission click as a frame draws it.
+    pub(crate) fn claude_click_shown(&self, session: u64) -> Option<ClickShown> {
+        let entry = self.pool.get(session)?;
+        self.permission_clicks
+            .clicks
+            .shown(entry.ctx.self_id.as_str())
     }
 
     /// The harness's glass on session `local_id`'s Autopilot chip ([`ChipGlass`]).
@@ -3823,7 +3650,6 @@ impl App {
         wid: WindowId,
         session: u64,
         (word, view): (Option<Autopilot>, AutopilotView),
-        rewritten: bool,
     ) {
         let glass = self.chip_glass(session);
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -3833,7 +3659,6 @@ impl App {
                     crate::work_counts::harness_clock_read();
                     Instant::now()
                 });
-            ws.claude_lights.note_row(session, rewritten);
         }
     }
 
@@ -4125,7 +3950,7 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<Chip>)> {
-        if self.windows.get(&wid)?.claude_lights.hits.is_empty() {
+        if self.stats_lens_at(wid, x, y) || self.windows.get(&wid)?.claude_lights.hits.is_empty() {
             return None;
         }
         self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)
@@ -4184,7 +4009,11 @@ impl App {
         grid: Option<crate::app_mouse::GlassGrid>,
     ) {
         let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
-            || self.close_band(wid).is_some();
+            || self.close_band(wid).is_some()
+            || self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.stats_lens.open.is_some() && ws.stats_lens.rect.is_some());
         let focused = self.focused_session_id(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -4263,6 +4092,9 @@ impl App {
         let Some((x, y)) = ws.claude_lights.glass_hover_px else {
             return;
         };
+        if self.stats_lens_at(wid, x, y) {
+            self.note_band_covered(wid);
+        }
         let at = self.claude_glass_at(wid, x, y);
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
@@ -4441,6 +4273,9 @@ impl App {
 
     /// What of the harness's glass is under window pixel `(x, y)`.
     pub(crate) fn claude_glass_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, GlassAt)> {
+        if self.stats_lens_at(wid, x, y) {
+            return None;
+        }
         let ws = self.windows.get(&wid)?;
         let lights = &ws.claude_lights;
         if lights.hits.is_empty()
@@ -4496,6 +4331,9 @@ impl App {
     /// The quota row's chart column under window pixel `(x, y)` ([`RowPart::Chart`]): its
     /// session, the chart's cells a day and the cell.
     fn quota_column_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, u8, usize)> {
+        if self.stats_lens_at(wid, x, y) {
+            return None;
+        }
         let (row, col) = self.glass_cell_at(wid, x, y)?;
         self.windows
             .get(&wid)?
@@ -4659,17 +4497,6 @@ impl App {
             s.fact_notice = None;
             redraw(ws);
         }
-    }
-
-    /// Whether a mode toggle of the lights is in flight for `session` in any window.
-    #[must_use]
-    pub(crate) fn mode_toggle_in_flight(&self, session: u64) -> bool {
-        self.windows.values().any(|ws| {
-            ws.claude_lights
-                .sessions
-                .get(&session)
-                .is_some_and(|s| s.pending.is_some())
-        })
     }
 
     /// A press, at `at`, of session `session`'s harness switch in window `wid`.
@@ -5027,7 +4854,7 @@ impl App {
     /// What a click at `at` on `chip` of `session` does. A press of the mode light within a double
     /// click's interval of the last one that reached it is that gesture's, and does nothing: a
     /// double click, or a slower triple click each of whose presses comes within the interval of
-    /// the one before, turns the light over once, never over and back.
+    /// the one before, stands one click, never a click and its take-back.
     pub(crate) fn press_claude_chip(
         &mut self,
         wid: WindowId,
@@ -5048,7 +4875,7 @@ impl App {
                     .entry(session)
                     .or_default()
                     .light_pressed = Some(at);
-                self.toggle_claude_light(wid, session, light);
+                self.click_permission(wid, session, light);
             }
             Chip::Autopilot => self.press_autopilot_chip(wid, session, at),
             Chip::Team => self.press_team_chip(wid, session),
@@ -5123,28 +4950,29 @@ impl App {
         wake_after(session, settle);
     }
 
-    /// Flip `light` of `session` with Claude's own input: shift+tab, pressed on until Claude shows
-    /// the state the light did not ([`Goal::of_mode`]): `yolo` or auto to manual (`lame`), any
-    /// other mode back to yolo or auto.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Click",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    pub(crate) fn toggle_claude_light(&mut self, wid: WindowId, session: u64, light: Light) {
-        let now = Instant::now();
-        if self.windows.values().any(|w| {
-            w.claude_lights
-                .sessions
-                .get(&session)
-                .is_some_and(|s| s.pending.is_some())
-        }) {
+    /// A click on `session`'s permission light `light` (`docs/DESIGN-yolo-binary-2026-11-04.md`
+    /// §2, §3): it types nothing. Where the tab's click stands it takes it back, until its
+    /// restart is signalled (after that it does nothing); else it stands a
+    /// click asking the bit the pill does not show, whose lane restarts the tab's conversation
+    /// on that line when it may. A pill it cannot read, or a conversation not read, refuses it. On
+    /// a host with no restart ([`crate::permission_click::RESTARTS`]) it does nothing.
+    pub(crate) fn click_permission(&mut self, wid: WindowId, session: u64, light: Light) {
+        if !crate::permission_click::RESTARTS {
+            return;
+        }
+        let Some(tab) = self
+            .pool
+            .get(session)
+            .map(|entry| entry.ctx.self_id.as_str().to_owned())
+        else {
+            return;
+        };
+        if self.permission_clicks.clicks.get(&tab).is_some() {
+            self.take_back_click(wid, session, &tab);
             return;
         }
         let refuse = |ws: &mut crate::WindowState, why: Refusal| {
+            let now = Instant::now();
             ws.claude_lights
                 .sessions
                 .entry(session)
@@ -5153,59 +4981,175 @@ impl App {
             redraw(ws);
             wake_after(session, REFUSAL_SHOWN);
         };
-        if self.slash_in_flight(session) {
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                refuse(ws, Refusal::Typing);
-            }
-            return;
-        }
-        if self.pool.is_rewound(session) {
+        let pill = if self.pool.is_rewound(session) {
+            None
+        } else {
+            self.claude_screen_now(session)
+                .and_then(|screen| screen.mode)
+        };
+        let Some(pill) = pill else {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 refuse(ws, Refusal::NotShown);
             }
             return;
-        }
-        let screen = self.claude_screen_now(session);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        };
+        let Some(conversation) = crate::harness_host::published_snapshot(&tab)
+            .and_then(|snap| snap.session)
+            .or_else(|| self.footer_conversation(session))
+        else {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                refuse(ws, Refusal::Unread);
+            }
             return;
         };
-        let reading = lights::read(screen.as_ref());
-        let Some(mode) = reading.mode else {
-            refuse(ws, Refusal::NotShown);
-            return;
+        self.stand_click(wid, session, &tab, pill, conversation);
+    }
+
+    /// Stand tab `tab`'s click from pill `pill` on `conversation`, and start its lane.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "claude_permission_click",
+            action = "Click",
+            project = "claude_lights::click_tests::project_permission_click"
+        )
+    )]
+    fn stand_click(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        tab: &str,
+        pill: Mode,
+        conversation: String,
+    ) {
+        use aterm_agent::supervise::policy::turn_end::PermissionTo;
+        let from_yolo = pill == Mode::Bypass;
+        let click = aterm_agent::harness::permission_click::Click {
+            tab: tab.to_owned(),
+            conversation,
+            to: if from_yolo {
+                PermissionTo::Settings
+            } else {
+                PermissionTo::Bypass
+            },
+            at: aterm_time::unix_secs()
+                .and_then(|now| i64::try_from(now).ok())
+                .unwrap_or(0),
         };
-        let outcome = self.input_to_session(
-            wid,
-            crate::input::InputEvent::KeySequence(lights::SHIFT_TAB.to_vec()),
-            crate::input::Source::Human,
-            Some(session),
-            crate::app_input::PressPhase::Initial,
+        aterm_log::info!(
+            "harness @{tab}: a permission click stands: {} asks {}",
+            if from_yolo {
+                aterm_agent::harness::footer::YOLO_ON
+            } else {
+                aterm_agent::harness::footer::YOLO_OFF
+            },
+            click.to.word()
         );
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        self.permission_clicks.clicks.stand(click, from_yolo);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            let s = ws.claude_lights.sessions.entry(session).or_default();
+            s.refused = None;
+        }
+        self.start_click_lane(tab);
+        self.redraw_click(session);
+    }
+
+    /// A click on tab `tab`'s standing click: taken back until its restart is signalled
+    /// ([`crate::permission_click::Clicks::take_back`]).
+    fn take_back_click(&mut self, wid: WindowId, session: u64, tab: &str) {
+        if let Some(taken) = self.permission_clicks.clicks.take_back(tab) {
+            aterm_log::info!(
+                "harness @{tab}: the permission click on {} is taken back",
+                if taken.from_yolo {
+                    aterm_agent::harness::footer::YOLO_ON
+                } else {
+                    aterm_agent::harness::footer::YOLO_OFF
+                }
+            );
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.claude_lights
+                .sessions
+                .entry(session)
+                .or_default()
+                .refused = None;
+        }
+        self.redraw_click(session);
+    }
+
+    /// Redraw every window that draws `session`'s lights.
+    fn redraw_click(&mut self, session: u64) {
+        for ws in self.windows.values_mut() {
+            if ws.claude_lights.sessions.contains_key(&session) {
+                redraw(ws);
+            }
+        }
+        crate::claude_footer::post_changed(session);
+    }
+
+    /// What a look of tab `tab`'s click lane found, once it moved the ask
+    /// (`Wake::PermissionClick`, or [`App::step_click`]): a refusal or a failure said on its light,
+    /// and every look's change drawn.
+    pub(crate) fn apply_click_look(
+        &mut self,
+        tab: &str,
+        look: aterm_agent::harness::permission_click::Look,
+    ) {
+        use aterm_agent::harness::permission_click::Look;
+        let session = self
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_sid(&aterm_session::SessionId::new(tab))
+            .map(|h| h.local_id);
+        let Some(session) = session else {
             return;
         };
-        if outcome != crate::input::InputOutcome::Ok {
-            refuse(ws, Refusal::InputRejected);
-            return;
+        match look {
+            Look::Refused(why) => {
+                self.say_click_refusal(session, Refusal::Click(ClickRefusal::of(&why)))
+            }
+            Look::Failed(_) => self.say_click_refusal(session, Refusal::Failed),
+            Look::Waits(_) | Look::InFlight(_) | Look::Done | Look::Ended(_) | Look::Moved(_) => {}
         }
-        let settle = Duration::from_millis(lights::SETTLE_MS);
-        let s = ws.claude_lights.sessions.entry(session).or_default();
-        s.shown.fold(&reading);
-        s.refused = None;
-        s.pending = Some(Pending {
-            light,
-            goal: Goal::of_mode(mode),
-            started: mode,
-            mode_at_press: mode,
-            seen: Vec::new(),
-            presses: 1,
-            deadline: now + settle,
-            next_poll: Some(now + MODE_POLL),
-            held_mid_turn: false,
-        });
-        redraw(ws);
-        wake_after(session, settle);
-        wake_after(session, MODE_POLL);
+        self.redraw_click(session);
+    }
+
+    /// Say `why` on `session`'s permission light, in every window that draws it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "claude_permission_click",
+            action = "Refuse",
+            project = "claude_lights::click_tests::project_permission_click"
+        )
+    )]
+    fn say_click_refusal(&mut self, session: u64, why: Refusal) {
+        let until = Instant::now() + REFUSAL_SHOWN;
+        for ws in self.windows.values_mut() {
+            if let Some(s) = ws.claude_lights.sessions.get_mut(&session) {
+                s.refused = Some((Light::Mode, why, until));
+            }
+        }
+        wake_after(session, REFUSAL_SHOWN);
+    }
+
+    /// The conversation Claude Code's own registry names for `session`'s program in front, as its
+    /// footer facts were read ([`aterm_agent::harness::footer::FactsOwner`]). A click keys on it
+    /// where the host published no snapshot: a tab whose agent started under Off, which no
+    /// harness supervises. The lane's own look reads the agent again before anything is taken.
+    fn footer_conversation(&self, session: u64) -> Option<String> {
+        let entry = self.pool.get(session)?;
+        let timeline = entry
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        timeline
+            .claude_footer()?
+            .owner
+            .as_ref()
+            .map(|owner| owner.session_id.clone())
     }
 
     /// `session`'s screen read straight from its engine (behind the reader's panic fence), with
@@ -5237,113 +5181,11 @@ impl App {
     pub(crate) fn drain_claude_lights(&mut self) {
         let now = Instant::now();
         self.advance_slash_presses(now);
-        self.advance_claude_mode_toggles(now);
         for ws in self.windows.values_mut() {
-            let (changed, refused) = ws.claude_lights.expire(now);
-            if changed {
+            if ws.claude_lights.expire(now) {
                 redraw(ws);
             }
-            for session in refused {
-                wake_after(session, REFUSAL_SHOWN);
-            }
         }
-    }
-
-    /// Every mode toggle in flight.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Press",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Arrive",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Lap",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "claude_mode_toggle",
-            action = "Reject",
-            project = "claude_lights::gesture_tests::project_mode_toggle"
-        )
-    )]
-    fn advance_claude_mode_toggles(&mut self, now: Instant) {
-        let returns: Vec<(WindowId, u64)> = self
-            .windows
-            .iter()
-            .flat_map(|(wid, ws)| {
-                ws.claude_lights
-                    .sessions
-                    .iter()
-                    .filter(|(_, s)| s.pending.is_some())
-                    .map(|(session, _)| (*wid, *session))
-            })
-            .collect();
-        for (wid, session) in returns {
-            let screen = self.claude_screen_now(session);
-            let Some(ws) = self.windows.get_mut(&wid) else {
-                continue;
-            };
-            let step = ws.claude_lights.advance(session, screen.as_ref(), now);
-            if step != Advance::Wait {
-                redraw(ws);
-            }
-            match step {
-                Advance::Press { expect } => {
-                    debug_assert_eq!(screen.as_ref().and_then(|s| s.mode), Some(expect));
-                    let outcome = self.input_to_session(
-                        wid,
-                        crate::input::InputEvent::KeySequence(lights::SHIFT_TAB.to_vec()),
-                        crate::input::Source::Controller,
-                        Some(session),
-                        crate::app_input::PressPhase::Initial,
-                    );
-                    if outcome != crate::input::InputOutcome::Ok {
-                        self.abandon_claude_light(wid, session, Refusal::StoppedIn(expect));
-                        continue;
-                    }
-                    wake_after(session, Duration::from_millis(lights::SETTLE_MS));
-                }
-                Advance::Arrived | Advance::Lapped => {
-                    wake_after(session, REFUSAL_SHOWN);
-                    continue;
-                }
-                Advance::Wait => {}
-            }
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.claude_lights.arm_poll(session, now, MODE_POLL);
-            }
-        }
-    }
-
-    /// Stop `session`'s toggle in flight and say why on its light.
-    fn abandon_claude_light(&mut self, wid: WindowId, session: u64, why: Refusal) {
-        let now = Instant::now();
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        let s = ws.claude_lights.sessions.entry(session).or_default();
-        let Some(p) = s.pending.take() else {
-            return;
-        };
-        s.refused = Some((p.light, why, now + REFUSAL_SHOWN));
-        redraw(ws);
-        wake_after(session, REFUSAL_SHOWN);
     }
 
     /// Keyboard navigation and activation for rule chips and facts.
@@ -5957,12 +5799,14 @@ impl App {
 /// 2.5.3), what the state does and where a click goes as its description.
 #[cfg(a11y_tree)]
 fn light_spoken(s: &SessionLights, light: Light, now: Instant) -> (String, Option<String>) {
-    let word = s
-        .shown
-        .mode
-        .map_or("unknown", |mode| mode.word_on_glass(s.rewritten));
+    let word = match s.shown.yolo() {
+        Some(true) => aterm_agent::harness::footer::YOLO_ON,
+        Some(false) => aterm_agent::harness::footer::YOLO_OFF,
+        None => "unknown",
+    };
     let refused = s.refused.filter(|(_, _, until)| *until > now);
-    let LightTitle { spoken, .. } = light_title(s, light, refused);
+    let LightTitle { spoken, .. } =
+        light_title(s, light, refused, crate::permission_click::RESTARTS);
     (format!("{}: {word}.", light.title()), Some(spoken))
 }
 
@@ -6116,25 +5960,21 @@ mod tests {
     const ACCEPT: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
     const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
 
-    fn observe(w: &mut WindowLights, rows: &[String]) -> Step {
-        w.observe_rows(7, rows, lights::read_lights)
+    fn observe(w: &mut WindowLights, rows: &[String]) {
+        w.observe_rows(7, rows, lights::read_lights);
     }
 
     #[test]
     fn a_reader_panic_folds_nothing_in_and_types_nothing() {
-        let now = Instant::now();
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Mode::Manual, now);
         let shown = w.sessions[&7].shown;
         let boom = |_: &[String]| -> Option<Reading> { panic!("stand-in reader panic") };
         let plan = screen(&rule, PLAN, "");
-        assert_eq!(w.observe_rows(7, &plan, boom), Step::default());
+        w.observe_rows(7, &plan, boom);
         let s = &w.sessions[&7];
         assert_eq!(s.shown, shown, "the lights keep what they showed");
-        let p = s.pending.as_ref().expect("the toggle is still in flight");
-        assert_eq!((p.presses, p.mode_at_press), (1, Mode::Manual));
         assert!(
             fenced_screen_now(7, &plan, || -> Option<Screen> {
                 panic!("stand-in reader panic")
@@ -6145,97 +5985,133 @@ mod tests {
             fenced_screen_now(7, &plan, || lights::read_screen(&plan, None)).is_some(),
             "the real reader sees the composer"
         );
-        assert!(observe(&mut w, &plan).wake);
+        observe(&mut w, &plan);
+        assert_eq!(
+            w.sessions[&7].shown.mode,
+            Some(Mode::Plan),
+            "the real read folds"
+        );
     }
 
-    fn start(w: &mut WindowLights, light: Light, mode: Mode, now: Instant) {
-        let s = w.sessions.entry(7).or_default();
-        s.pending = Some(Pending {
-            light,
-            goal: Goal::of_mode(mode),
-            started: mode,
-            mode_at_press: mode,
-            seen: Vec::new(),
-            presses: 1,
-            deadline: now + Duration::from_millis(lights::SETTLE_MS),
-            next_poll: None,
-            held_mid_turn: false,
-        });
-    }
-
+    /// THE LIGHT SAYS THE BIT, ON A HOSTED SESSION, AND KEEPS WHAT IT SAW
+    /// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): bypass wears `yolo` in the glass's value ink,
+    /// every other pill `lame` in the row's, each beside Autopilot at rest; a covered composer
+    /// keeps the last reading; a hover titles it apart from the chips. With no bit read the light
+    /// is drawn only while a click stands, as `◌` alone. CONTROL: an unhosted session draws no
+    /// chip under any pill.
     #[test]
-    fn only_deviations_are_drawn_and_the_block_keeps_what_it_saw() {
+    fn the_light_says_the_bit_on_a_hosted_session_and_keeps_what_it_saw() {
         let now = Instant::now();
         let bare = "\u{2500}".repeat(60);
-        let mut w = WindowLights::default();
-        for mode in [BYPASS, AUTO] {
+        let at = ChipAt::cruise(blank());
+        let inks = Inks::of(blank(), at);
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        for (mode, word, ink) in [
+            (BYPASS, "yolo", inks.title),
+            (AUTO, "lame", inks.ink),
+            (PLAN, "lame", inks.ink),
+            (ACCEPT, "lame", inks.ink),
+            (MANUAL, "lame", inks.ink),
+        ] {
+            let mut w = WindowLights::default();
             observe(&mut w, &screen(&bare, mode, ""));
-            let rest = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
+            w.note_autopilot(7, None, AutopilotView::Unhosted, now);
             assert!(
-                rest.lights.is_empty() && rest.cols.is_empty() && rest.title.is_empty(),
-                "nothing at rest: {mode:?}"
+                w.block(7, blank(), now, at, Keep::Drawn).cols.is_empty(),
+                "CONTROL: no host, no chip: {mode:?}"
+            );
+            w.note_autopilot(7, None, AutopilotView::Cruise, now);
+            let block = w.block(7, blank(), now, at, Keep::Drawn);
+            assert_eq!(text(&block.lights), format!("\u{221e} {word}"), "{mode:?}");
+            assert_eq!(
+                block.cols,
+                vec![(0..1, Chip::Autopilot), (2..6, MODE)],
+                "{mode:?}"
+            );
+            assert!(
+                block.lights[2..].iter().all(|c| c.fg == ink),
+                "{mode:?}: {word} in its ink"
+            );
+            assert!(block.title.is_empty(), "nothing asked for a title");
+            w.observe(7, None);
+            assert_eq!(
+                w.block(7, blank(), now, at, Keep::Drawn).lights,
+                block.lights,
+                "a covered composer keeps the last reading"
+            );
+            w.hover = Some((7, Target::from(MODE)));
+            let hovered = w.block(7, blank(), now, at, Keep::Drawn);
+            let (title, short) = if word == "yolo" {
+                (
+                    "no permission prompts \u{b7} click: lame",
+                    "no permission prompts",
+                )
+            } else {
+                ("not yolo \u{b7} click: yolo", "not yolo")
+            };
+            assert_eq!(text(&hovered.title), format!("{title}  "), "{mode:?}");
+            assert_eq!(text(&hovered.short_title), format!("{short}  "), "{mode:?}");
+            assert!(!hovered.reason, "{mode:?}: a hover's title gives way first");
+            assert_eq!(
+                hovered.lights.len(),
+                block.lights.len(),
+                "the title is apart"
+            );
+            assert!(
+                hovered.lights[2..].iter().all(|c| c.bold),
+                "the whole hovered chip is marked"
             );
         }
-        observe(&mut w, &screen(&bare, PLAN, ""));
-        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
-        let text: String = block.lights.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "\u{23F8} plan");
-        assert_eq!(block.cols, vec![(0..6, MODE)]);
-        assert!(block.title.is_empty(), "nothing asked for a title");
-        assert_eq!(block.lights[0].fg, blank().fg, "plan, in the row's ink");
-        w.observe(7, None);
-        assert_eq!(
-            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
-                .lights,
-            block.lights,
-            "a covered composer keeps the last reading"
-        );
-        w.hover = Some((7, Target::from(MODE)));
-        let hovered = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
-        assert!(!hovered.title.is_empty(), "a hover asks for the title");
-        assert_eq!(
-            hovered.lights.len(),
-            block.lights.len(),
-            "the title is apart"
-        );
-        assert!(
-            hovered.lights.iter().all(|c| c.bold),
-            "the whole hovered chip is marked"
-        );
-
         let mut w = WindowLights::default();
-        observe(&mut w, &screen(&bare, BYPASS, ""));
-        w.note_autopilot(7, None, AutopilotView::Unhosted, now);
-        assert!(
-            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
-                .cols
-                .is_empty(),
-            "no host: no chip"
-        );
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
-        let rest = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
-        let text: String = rest.lights.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "\u{221e}", "at rest: Autopilot alone");
-        assert_eq!(rest.cols, vec![(0..1, Chip::Autopilot)]);
         assert_eq!(
-            rest.lights[0].fg,
-            ChipAt::cruise(blank()).letter_at(0),
-            "cruise in its column's letter"
+            w.block(7, blank(), now, at, Keep::Drawn).cols,
+            vec![(0..1, Chip::Autopilot)],
+            "no bit read: Autopilot alone"
         );
-        assert!(rest.title.is_empty(), "nothing asked for a title");
-        observe(&mut w, &screen(&bare, PLAN, ""));
-        let text: String = w
-            .block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
-            .lights
-            .iter()
-            .map(|c| c.ch)
-            .collect();
-        assert_eq!(text, "\u{221e} \u{23F8} plan", "the light follows");
+        w.sessions.get_mut(&7).unwrap().click = Some(ClickShown {
+            when: Some("after this turn"),
+        });
+        let block = w.block(7, blank(), now, at, Keep::Drawn);
+        assert_eq!(text(&block.lights), format!("\u{221e} {PENDING_GLYPH}"));
+        assert_eq!(
+            block.cols[1],
+            (2..3, MODE),
+            "a standing click's light, its glyph alone"
+        );
+    }
+
+    /// NO CLICK WHERE NOTHING RESTARTS (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): on a host
+    /// with no restart the light's title says the bit's meaning alone, with no `click:` and no job a
+    /// restart would end, spoken the same. CONTROL: a host that restarts offers the click and names
+    /// the job.
+    #[test]
+    fn the_light_offers_no_click_on_a_host_with_no_restart() {
+        for (mode, head, to) in [
+            (BYPASS, "no permission prompts", "lame"),
+            (PLAN, "not yolo", "yolo"),
+        ] {
+            let mut w = WindowLights::default();
+            observe(&mut w, &screen(&"\u{2500}".repeat(60), mode, ""));
+            let s = w.sessions.get_mut(&7).unwrap();
+            s.jobs = "1 shell".to_owned();
+            let none = light_title(s, Light::Mode, None, false);
+            assert_eq!(none.text.whole, head, "{mode:?}");
+            assert_eq!(none.text.short, head, "{mode:?}");
+            assert!(!none.text.reason, "{mode:?}");
+            assert_eq!(none.spoken, sentence(head), "{mode:?}");
+            let offered = light_title(s, Light::Mode, None, true);
+            assert_eq!(
+                offered.text.whole,
+                format!("{head} \u{b7} click: {to} \u{b7} ends 1 shell"),
+                "CONTROL: {mode:?}"
+            );
+        }
     }
 
     /// A WORDED CHIP NEVER RUNS INTO THE NEXT: after `⊘ off` the rule threads between the chips
-    /// (` ─ `, the rule's own cell once laid in the rule), so `⊘ off ─ ⏸ plan` never reads as one
-    /// phrase, nor does a click's mode name (`⤓ land ─ ⏸ plan`); the block's width counts it (the
+    /// (` ─ `, the rule's own cell once laid in the rule), so `⊘ off ─ lame` never reads as one
+    /// phrase, nor does a click's mode name (`⤓ land ─ lame`); the block's width counts it (the
     /// name's cells apart, [`Block::word`]) and no chip's hit takes it. CONTROL: a bare glyph
     /// (`∞`, `⤓`, `○`) stays one blank from the next chip.
     #[test]
@@ -6261,12 +6137,8 @@ mod tests {
                     asked: 0,
                 });
             }
-            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
-            assert_eq!(
-                text(&block.lights),
-                format!("{lead}\u{23F8} plan"),
-                "{view:?}"
-            );
+            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
+            assert_eq!(text(&block.lights), format!("{lead}lame"), "{view:?}");
             let gaps: Vec<usize> = block.rule_gaps().collect();
             let worded = lead.contains('\u{2500}');
             assert_eq!(
@@ -6285,12 +6157,12 @@ mod tests {
             );
             let s = &w.sessions[&7];
             let inks = Inks::of(blank(), ChipAt::cruise(blank()));
-            let drawn = drawn_at(s, now, None, None, Keep::Revealed);
+            let drawn = drawn_at(s, Keep::Drawn);
             assert_eq!(
                 chips_width_at(
                     s,
                     Chip::row().filter(|c| drawn(*c)),
-                    Keep::Revealed,
+                    Keep::Drawn,
                     inks,
                     None
                 ) + block.word,
@@ -6302,7 +6174,7 @@ mod tests {
 
     /// THE MODE'S CHIP KEEPS ONE BLANK BEFORE THE TEAM CHIP: the rule sets off the Autopilot
     /// chip's word alone, where `⊘ off yolo` would misread; after the mode's word the Team chip's
-    /// own glyph sets it off (`∞ ⏸ plan ⇠ lab-sweep`), as before the rule was drawn, and the fit
+    /// own glyph sets it off (`∞ lame ⇠ lab-sweep`), as before the rule was drawn, and the fit
     /// counts what is drawn. CONTROL: a harness held off keeps the rule before the mode.
     #[test]
     fn the_mode_chip_keeps_one_blank_before_the_team_chip() {
@@ -6317,28 +6189,24 @@ mod tests {
             task: None,
         });
         for (view, want, gaps) in [
-            (
-                AutopilotView::Cruise,
-                "\u{221e} \u{23F8} plan \u{21e0} lab-sweep",
-                0,
-            ),
+            (AutopilotView::Cruise, "\u{221e} lame \u{21e0} lab-sweep", 0),
             (
                 AutopilotView::MasterOff,
-                "\u{2298} off \u{2500} \u{23F8} plan \u{21e0} lab-sweep",
+                "\u{2298} off \u{2500} lame \u{21e0} lab-sweep",
                 1,
             ),
         ] {
             w.note_autopilot(7, view.mode(), view, now);
-            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
+            let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
             assert_eq!(text(&block.lights), want, "{view:?}");
             assert_eq!(block.rule_gaps().count(), gaps, "{view:?}: the rule cells");
             let s = &w.sessions[&7];
-            let drawn = drawn_at(s, now, None, None, Keep::Revealed);
+            let drawn = drawn_at(s, Keep::Drawn);
             assert_eq!(
                 chips_width_at(
                     s,
                     Chip::row().filter(|c| drawn(*c)),
-                    Keep::Revealed,
+                    Keep::Drawn,
                     Inks::of(blank(), ChipAt::cruise(blank())),
                     None,
                 ),
@@ -6424,11 +6292,6 @@ mod tests {
             cruise.letter_at(0),
             "CONTROL: the view's palette decides the letter"
         );
-        assert_eq!(
-            ModeInk::Value,
-            Mode::Auto.ink(),
-            "auto reads as a value, not the pill's amber"
-        );
 
         w.hover = None;
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
@@ -6452,8 +6315,8 @@ mod tests {
         );
         w.sessions.get_mut(&7).unwrap().autopilot_pending =
             Some((Autopilot::Off, now + Duration::from_secs(1)));
-        assert_eq!(w.expire(now), (false, Vec::new()), "still in time");
-        assert_eq!(w.expire(now + Duration::from_secs(1)), (true, Vec::new()));
+        assert!(!w.expire(now), "still in time");
+        assert!(w.expire(now + Duration::from_secs(1)));
         assert!(w.sessions[&7].autopilot_pending.is_none());
         assert_eq!(
             w.fingerprint(|| now),
@@ -6504,7 +6367,7 @@ mod tests {
             w.hover = None;
             w.sessions.get_mut(&7).unwrap().refused = Some((
                 Light::Mode,
-                Refusal::StoppedIn(Mode::Plan),
+                Refusal::Click(ClickRefusal::Claimed),
                 now + REFUSAL_SHOWN,
             ));
             let refused = w.block(7, blank, now, at, Keep::Drawn);
@@ -6595,8 +6458,9 @@ mod tests {
             }
             assert_eq!(
                 gave_up,
-                [MODE, Chip::Team, Chip::Autopilot],
-                "{face:?}: the light, Team, then Autopilot"
+                [Chip::Team, Chip::Autopilot, MODE],
+                "{face:?}: Team first, then Autopilot and the light together, which every rung \
+                 keeps"
             );
         }
     }
@@ -6639,13 +6503,22 @@ mod tests {
         assert_eq!(team_title(None, now), (String::new(), String::new()));
     }
 
+    /// A NARROW RULE GIVES UP TEAM, NEVER THE LIGHT (`docs/DESIGN-yolo-binary-2026-11-04.md`
+    /// §2): `yolo` and `lame` keep their place at every rung beside Autopilot, the only way back on
+    /// a plain line, so a rule too narrow for the two draws no chip; each rung's fit counts what
+    /// it draws, and the chips drawn only go as the room does. CONTROL: Team is given up first.
     #[test]
-    fn a_narrow_rule_gives_up_the_reveal_the_light_then_autopilot() {
+    fn a_narrow_rule_gives_up_team_and_never_the_light() {
         let now = Instant::now();
         let bare = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&bare, PLAN, ""));
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
+        w.sessions.get_mut(&7).unwrap().team = Some(TeamFace::Worker {
+            manager: Some(3),
+            label: std::sync::Arc::from("lab-sweep"),
+            task: None,
+        });
         let fitted = |w: &WindowLights, selected: Option<Chip>, room: usize| {
             w.fitted(
                 7,
@@ -6658,59 +6531,28 @@ mod tests {
             )
             .map(|b| b.lights.iter().map(|c| c.ch).collect::<String>())
         };
-        for room in 8..=10 {
-            assert_eq!(
-                fitted(&w, None, room).as_deref(),
-                Some("\u{221e} \u{23F8} plan"),
-                "{room}: every chip"
-            );
-        }
-        for room in 1..=7 {
-            assert_eq!(
-                fitted(&w, None, room).as_deref(),
-                Some("\u{221e}"),
-                "{room}: then the light, Autopilot last"
-            );
-        }
-        assert_eq!(fitted(&w, None, 0), None, "then every chip");
-        let fits = |w: &WindowLights, chip: Chip, room: usize| {
-            w.fitted(
-                7,
-                blank(),
-                now,
-                ChipAt::cruise(blank()),
-                Some(chip),
-                None,
-                room,
-            )
-            .is_some_and(|b| b.shows(chip))
-        };
-        assert!(fits(&w, MODE, 8) && !fits(&w, MODE, 7));
-        assert!((1..=10).all(|room| fits(&w, Chip::Autopilot, room)));
-        assert!(!fits(&w, Chip::Autopilot, 0));
-        observe(&mut w, &screen(&bare, ACCEPT, ""));
+        let team = "\u{221e} lame \u{21e0} lab-sweep";
         assert_eq!(
-            fitted(&w, None, 17).as_deref(),
-            Some("\u{221e} \u{23F5}\u{23F5} accept edits")
+            fitted(&w, None, cells_of(team)).as_deref(),
+            Some(team),
+            "CONTROL: every chip"
         );
-        for room in 1..=16 {
+        for room in 6..cells_of(team) {
             assert_eq!(
                 fitted(&w, None, room).as_deref(),
-                Some("\u{221e}"),
-                "{room}: then the light, and never back"
+                Some("\u{221e} lame"),
+                "{room}: Team first"
+            );
+        }
+        for room in 0..6 {
+            assert_eq!(
+                fitted(&w, None, room),
+                None,
+                "{room}: never the light alone"
             );
         }
         observe(&mut w, &screen(&bare, BYPASS, ""));
-        assert_eq!(
-            fitted(&w, Some(Chip::Autopilot), 11).as_deref(),
-            Some("\u{221e} \u{23F5}\u{23F5} bypass"),
-            "revealed"
-        );
-        assert_eq!(
-            fitted(&w, Some(Chip::Autopilot), 10).as_deref(),
-            Some("\u{221e}"),
-            "the reveal first"
-        );
+        assert_eq!(fitted(&w, Some(MODE), 6).as_deref(), Some("\u{221e} yolo"));
         let drawn = |w: &WindowLights, selected: Option<Chip>, room: usize| -> Vec<Chip> {
             w.fitted(
                 7,
@@ -6731,13 +6573,14 @@ mod tests {
                 for selected in [None, Some(Chip::Autopilot), Some(MODE)] {
                     let mut wider = drawn(&w, selected, 24);
                     assert!(
-                        wider.contains(&Chip::Autopilot),
+                        wider.contains(&Chip::Autopilot) && wider.contains(&MODE),
                         "{view:?} {mode_row:?} {selected:?}: control, every chip in 24 cells"
                     );
                     for room in (0..24).rev() {
                         let narrower = drawn(&w, selected, room);
                         assert!(
-                            narrower.iter().all(|chip| wider.contains(chip)),
+                            narrower.iter().all(|chip| wider.contains(chip))
+                                && (narrower.is_empty() || narrower.contains(&MODE)),
                             "{view:?} {mode_row:?} {selected:?} {room}: {narrower:?} after \
                              {wider:?}"
                         );
@@ -6756,7 +6599,8 @@ mod tests {
                             keep,
                             None,
                         );
-                        let on = drawn_at(s, now, selected, None, keep);
+                        let on = drawn_at(s, keep);
+                        assert!(on(MODE), "{view:?} {mode_row:?} {keep:?}: the light kept");
                         assert_eq!(
                             chips_width_at(
                                 s,
@@ -6774,30 +6618,73 @@ mod tests {
         }
     }
 
+    /// A HOVER THAT SAYS WHAT A CLICK ENDS IS A REASON (`docs/DESIGN-yolo-binary-2026-11-04.md`
+    /// §2, Appendix "Chip"): with Claude's shells running, the light's title adds
+    /// `· ends 1 shell` to its whole and keeps it in its short form, a reason, which
+    /// `footer::fit_rule` keeps in a rule where a plain hover's title gives way to the facts.
+    /// CONTROL: with no job running the short form is the head alone, and no reason.
     #[test]
-    fn the_keyboard_selection_reveals_the_light_at_rest() {
+    fn a_hover_that_says_what_a_click_ends_keeps_it_in_its_short_form() {
+        use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
         let now = Instant::now();
-        let mut w = WindowLights::default();
-        observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
-        assert!(
-            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed)
-                .cols
-                .is_empty(),
-            "at rest"
-        );
-        w.selected = Some((7, Target::from(MODE)));
-        let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Revealed);
-        assert!(!block.title.is_empty(), "the selection asks for the title");
-        assert_eq!(
-            block.lights[0].ch, '\u{23F5}',
-            "the expected mode, revealed"
-        );
-        assert!(block.lights[0].bold);
-        assert!(
-            w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn)
-                .shows(Light::Mode),
-            "the selection itself is drawn without the reveal"
-        );
+        let at = ChipAt::cruise(blank());
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        let facts = FooterFacts {
+            model: Some("Opus 5.5".into()),
+            effort: Some("xhigh".into()),
+            path: Some("~/aterm".into()),
+            branch: Some("main".into()),
+            ..FooterFacts::default()
+        };
+        for (mode, head, to) in [
+            (BYPASS, "no permission prompts", "lame"),
+            (PLAN, "not yolo", "yolo"),
+        ] {
+            let mut w = WindowLights::default();
+            observe(&mut w, &screen(&"\u{2500}".repeat(60), mode, ""));
+            w.note_autopilot(7, None, AutopilotView::Cruise, now);
+            w.hover = Some((7, Target::from(MODE)));
+            let mut titled = Vec::new();
+            for jobs in ["", "1 shell"] {
+                w.sessions.get_mut(&7).unwrap().jobs = jobs.to_owned();
+                let block = w.block(7, blank(), now, at, Keep::Drawn);
+                let ends = if jobs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \u{b7} ends {jobs}")
+                };
+                assert_eq!(
+                    text(&block.title),
+                    format!("{head} \u{b7} click: {to}{ends}  "),
+                    "{mode:?} {jobs:?}"
+                );
+                assert_eq!(
+                    text(&block.short_title),
+                    format!("{head}{ends}  "),
+                    "{mode:?} {jobs:?}"
+                );
+                assert_eq!(block.reason, !jobs.is_empty(), "{mode:?} {jobs:?}");
+                let widths = LightsWidth {
+                    chips: block.holds,
+                    title: block.title.len(),
+                    lean: block.lean.each_ref().map(Vec::len),
+                    short: block.short_title.len(),
+                    reason: block.reason,
+                };
+                titled.push(
+                    (0..200)
+                        .filter(|room| {
+                            footer::fit_rule(&facts, *room, Some(widths)).title != TitleFit::None
+                        })
+                        .collect::<std::collections::BTreeSet<_>>(),
+                );
+            }
+            let (plain, ends) = (&titled[0], &titled[1]);
+            assert!(
+                ends.difference(plain).next().is_some(),
+                "{mode:?}: some rule keeps the reason's title where a plain hover's gives way"
+            );
+        }
     }
 
     #[test]
@@ -6822,7 +6709,8 @@ mod gesture_tests {
     use std::time::{Duration, Instant};
 
     use aterm_agent::harness::footer::FooterFacts;
-    use aterm_agent::harness::lights::{self, Goal, Light, Mode};
+    use aterm_agent::harness::lights::Light;
+    use aterm_agent::harness::permission_click::{Look, Wait};
     use aterm_agent::supervise::Autopilot;
     use aterm_core::terminal::RenderCell;
     use aterm_session::sink::SinkWriter;
@@ -6863,31 +6751,75 @@ mod gesture_tests {
     pub(super) const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)";
     pub(super) const AUTO: &str = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)";
     pub(super) const PLAN: &str = "  \u{23F8} plan mode on (shift+tab to cycle)";
-    const ACCEPT: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
     const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
     /// Claude Code's foreground process group, as the resolver names it.
     pub(super) const PGID: i32 = 4242;
 
-    /// Close the private PTY observer so the next write through the session's sink fails.
-    fn hang_up(app: &App, session: u64, reader: UnixStream) {
-        let sink = app.pool.get(session).expect("session").ctx.sink.clone();
-        drop(reader);
-        let mut pfd = libc::pollfd {
-            fd: sink.master(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while pfd.revents & libc::POLLHUP == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "the PTY observer's socket never hung up (a copy outlived the drop)"
-            );
-            pfd.revents = 0;
-            // SAFETY: `pfd` is one live, initialized pollfd; poll writes only
-            // its `revents`, and the sink keeps `fd` open for this call.
-            unsafe { libc::poll(&mut pfd, 1, 100) };
+    /// The conversation the stand-in Claude Code's published snapshot names ([`clickable`]).
+    pub(super) const FIRST: &str = "0badf00d-1111-2222-3333-444455556666";
+
+    /// `session`'s tab sid.
+    pub(super) fn sid_of(app: &App, session: u64) -> String {
+        app.pool
+            .get(session)
+            .expect("session")
+            .ctx
+            .self_id
+            .as_str()
+            .to_owned()
+    }
+
+    /// A relaunch snapshot of the stand-in Claude Code in tab `sid`, on `conversation`.
+    pub(super) fn snapshot(
+        sid: &str,
+        conversation: &str,
+    ) -> aterm_agent::harness::relaunch::Snapshot {
+        aterm_agent::harness::relaunch::Snapshot {
+            launch_env: None,
+            auth_observed: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
+            profile: None,
+            tab: sid.to_owned(),
+            pid: 4243,
+            start: "Thu Sep 24 01:02:03 2026".to_owned(),
+            shell: PGID.unsigned_abs(),
+            program: std::path::PathBuf::from("/opt/claude"),
+            argv: vec!["/opt/claude".to_owned()],
+            session: Some(conversation.to_owned()),
+            cwd: "/".to_owned(),
+            version: Some("2.1.318".to_owned()),
+            run: aterm_agent::harness::relaunch::AgentRun::Claude,
+            dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
+            login: None,
+            home: None,
+            claude_dir: None,
         }
+    }
+
+    /// Ready `session` for a permission click: its conversation [`FIRST`] read off a published
+    /// snapshot, and every look of its lane answering `look`.
+    pub(super) fn clickable(app: &mut App, session: u64, look: Look) {
+        let sid = sid_of(app, session);
+        crate::harness_host::publish_snapshot_for_test(&sid, Some(&snapshot(&sid, FIRST)));
+        app.permission_clicks
+            .set_clicker(crate::permission_click::Clicker::new(move |_, _, _| {
+                look.clone()
+            }));
+    }
+
+    /// `session`'s standing permission click.
+    pub(super) fn standing(app: &App, session: u64) -> Option<crate::permission_click::Standing> {
+        app.permission_clicks.clicks.get(&sid_of(app, session))
+    }
+
+    /// Whether a press reached `session`'s permission light: a click stands, or a refusal shows.
+    pub(super) fn light_reached(app: &App, wid: WindowId, session: u64) -> bool {
+        standing(app, session).is_some()
+            || app.windows[&wid]
+                .claude_lights
+                .sessions
+                .get(&session)
+                .is_some_and(|s| s.refused.is_some())
     }
 
     /// A headless App whose one session writes its PTY input to a private socket.
@@ -7071,12 +7003,6 @@ mod gesture_tests {
         }
     }
 
-    /// The ink an expected mode (`yolo`, bypass) and a title are drawn in on `wid`'s pane: the
-    /// glass's value ink.
-    pub(super) fn value_ink(app: &App, wid: WindowId) -> [u8; 3] {
-        chips_at(app, wid, None, 0).value()
-    }
-
     /// The quiet ink of `wid`'s pane: the off chips' (`○`, `⊘ off`).
     pub(super) fn quiet_ink(app: &App, wid: WindowId) -> [u8; 3] {
         chips_at(app, wid, None, 0).quiet()
@@ -7224,219 +7150,13 @@ mod gesture_tests {
         }
     }
 
-    #[test]
-    fn a_click_on_the_mode_light_presses_forward_to_bypass_and_reads_each_answer_back() {
-        for tracking in [false, true] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, MANUAL);
-            if tracking {
-                feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
-            }
-            frame(&mut app, wid);
-            let mode = hit(&app, wid, Light::Mode);
-            let text = row_text(&app, wid, mode.0);
-            assert!(
-                text.contains("\u{25C6} Opus 5.5 xhigh"),
-                "the footer is painted: {text:?}"
-            );
-            assert_eq!(cell_at(&app, wid, mode).ch, '\u{23F8}', "{text:?}");
-            assert!(text.contains("\u{23F8} manual"), "{text:?}");
-            let claude = row_text(&app, wid, mode_row(&app, wid));
-            assert!(
-                claude.contains("\u{23F8} manual mode on"),
-                "the chip never takes the pill's place: Claude's row is whole: {claude:?}"
-            );
-            assert!(pty(&mut reader, 0).is_empty(), "a frame types nothing");
-
-            let (x, y) = px_of(&app, wid, (mode.0, mode.1 - 1));
-            app.on_cursor_moved(wid, x, y);
-            assert_eq!(app.windows[&wid].claude_lights.hover, None);
-            let (x, y) = px_of(&app, wid, mode);
-            app.on_cursor_moved(wid, x, y);
-            assert_eq!(
-                app.windows[&wid].claude_lights.hover,
-                Some((session, Target::from(MODE)))
-            );
-            assert!(pty(&mut reader, 0).is_empty(), "hover types nothing");
-
-            // Each click a gesture of its own: a double click's interval and more apart.
-            let first = a_minute_ago();
-            let apart = interval() + Duration::from_millis(1);
-            press_at(&mut app, wid, first);
-            assert_eq!(
-                pty(&mut reader, lights::SHIFT_TAB.len()),
-                lights::SHIFT_TAB,
-                "tracking={tracking}"
-            );
-            {
-                let p = app.windows[&wid].claude_lights.sessions[&session]
-                    .pending
-                    .clone()
-                    .expect("the toggle is in flight");
-                assert_eq!(
-                    (p.light, p.started, p.presses),
-                    (Light::Mode, Mode::Manual, 1)
-                );
-            }
-            press_at(&mut app, wid, first + apart);
-            assert!(pty(&mut reader, 0).is_empty(), "one toggle in flight");
-
-            frame(&mut app, wid);
-            let mode = hit(&app, wid, Light::Mode);
-            assert_eq!(cell_at(&app, wid, mode).ch, '\u{25CC}');
-            let text = row_text(&app, wid, mode.0);
-            // At pitch 1 the whole facts leave an 80-column pane the title's short form: the title
-            // gives way before any fact does.
-            assert!(
-                text.contains("switching\u{2026}") && text.contains(WHOLE_FACTS),
-                "the title, short in an 80-column pane, beside the whole facts: {text:?}"
-            );
-            assert_ne!(app.windows[&wid].claude_lights.fingerprint(Instant::now), 0);
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty(), "no answer, no second press");
-
-            for answer in [ACCEPT, PLAN] {
-                redraw_mode_row(&app, session, answer);
-                frame(&mut app, wid);
-                assert!(
-                    pty(&mut reader, 0).is_empty(),
-                    "no input from the render path"
-                );
-                app.on_claude_footer_changed(session);
-                assert_eq!(
-                    pty(&mut reader, lights::SHIFT_TAB.len()),
-                    lights::SHIFT_TAB,
-                    "the next press"
-                );
-                frame(&mut app, wid);
-                app.on_claude_footer_changed(session);
-                assert!(pty(&mut reader, 0).is_empty(), "one press per answer");
-            }
-
-            redraw_mode_row(&app, session, BYPASS);
-            frame(&mut app, wid);
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty());
-            frame(&mut app, wid);
-            let s = &app.windows[&wid].claude_lights.sessions[&session];
-            assert!(s.pending.is_none() && s.refused.is_none(), "resolved");
-            let mode = hit(&app, wid, Light::Mode);
-            let cell = cell_at(&app, wid, mode);
-            assert_eq!(
-                (cell.ch, cell.fg),
-                ('\u{23F5}', value_ink(&app, wid)),
-                "the arrival is said on the chip for a moment, in the value ink, never red"
-            );
-            let text = row_text(&app, wid, mode.0);
-            assert!(
-                text.contains("\u{23F5}\u{23F5} bypass  no permission prompts ")
-                    && text.contains(WHOLE_FACTS),
-                "the hover's title says what bypass does, beside the whole facts: {text:?}"
-            );
-            let (x, y) = px_of(&app, wid, mode);
-            app.on_cursor_moved(wid, x, y);
-            press_at(&mut app, wid, first + apart * 2);
-            assert_eq!(
-                pty(&mut reader, lights::SHIFT_TAB.len()),
-                lights::SHIFT_TAB,
-                "a click on bypass turns it off"
-            );
-            let p = app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .clone()
-                .expect("the turn-off is in flight");
-            assert_eq!((p.goal, p.started), (Goal::Off, Mode::Bypass));
-            redraw_mode_row(&app, session, MANUAL);
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty(), "manual: arrived, no press");
-            let s = &app.windows[&wid].claude_lights.sessions[&session];
-            assert!(s.pending.is_none() && s.refused.is_none(), "resolved");
-            assert!(s.notice.is_some(), "the arrival is said");
-        }
-    }
-
-    /// Auto is expected, so no chip is drawn for it at rest; a click on its light (a reveal, a
-    /// screen reader's press) turns it to manual with one shift+tab, and stops there.
-    #[test]
-    fn auto_mode_draws_no_mode_chip_and_a_click_turns_it_to_manual() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, AUTO);
-        frame(&mut app, wid);
-        assert!(
-            !app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.chip == Some(MODE)),
-            "auto is expected: no chip"
-        );
-        app.toggle_claude_light(wid, session, Light::Mode);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "auto: one press");
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert_eq!(s.pending.as_ref().map(|p| p.goal), Some(Goal::Off));
-        redraw_mode_row(&app, session, MANUAL);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "manual: no press on");
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none() && s.refused.is_none(), "arrived");
-        redraw_mode_row(&app, session, PLAN);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Mode);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "plan: one press");
-    }
-
-    #[test]
-    fn a_toggle_is_never_decided_on_half_a_frame() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, PLAN);
-        frame(&mut app, wid);
-        feed(
-            &app,
-            session,
-            "\x1b[?2026h\x1b[22;1H\x1b[2K\u{276F} ".as_bytes(),
-        );
-        let term = app.pool.get(session).expect("session").term.clone();
-        assert!(
-            term_lock(&term).frame_unfinished_at(Instant::now()),
-            "precondition: the frame is unfinished"
-        );
-        app.toggle_claude_light(wid, session, Light::Mode);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "nothing pressed on half a frame"
-        );
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none(), "no toggle began");
-        assert!(
-            matches!(s.refused, Some((Light::Mode, super::Refusal::NotShown, _))),
-            "refused as not on screen"
-        );
-        feed(
-            &app,
-            session,
-            format!("\x1b[24;1H\x1b[2K{AUTO}\x1b[22;3H\x1b[?2026l").as_bytes(),
-        );
-        app.toggle_claude_light(wid, session, Light::Mode);
-        assert_eq!(
-            pty(&mut reader, 3),
-            lights::SHIFT_TAB,
-            "the whole frame: auto, turned off with one press"
-        );
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert_eq!(
-            s.pending.as_ref().map(|p| (p.goal, p.started)),
-            Some((Goal::Off, Mode::Auto)),
-            "decided on the whole frame's mode"
-        );
-    }
-
+    /// AT REST THE RULE CARRIES THE FACTS AND THE HARNESS CHIPS ALONE: a hosted session's rule
+    /// draws Autopilot and the bit (`yolo` on bypass, `lame` on auto) and no title, Claude's row
+    /// as drawn (no rewrite asked). CONTROL: an unhosted session's rule draws no chip.
     #[test]
     fn at_rest_the_rule_carries_the_facts_and_the_harness_chips_alone() {
         for hosted in [true, false] {
-            for mode in [BYPASS, AUTO] {
+            for (mode, word) in [(BYPASS, "yolo"), (AUTO, "lame")] {
                 let (mut app, wid, session, _reader) = app();
                 let _host = hosted.then(|| host(&mut app));
                 publish_facts(&app, session);
@@ -7446,7 +7166,7 @@ mod gesture_tests {
                 let mut chips: Vec<Chip> = lights.hits.iter().filter_map(|h| h.chip).collect();
                 chips.dedup();
                 let want = if hosted {
-                    vec![Chip::Autopilot]
+                    vec![Chip::Autopilot, MODE]
                 } else {
                     Vec::new()
                 };
@@ -7467,20 +7187,18 @@ mod gesture_tests {
                     "\u{25CF}",
                     "\u{23F5}",
                     "autopilot",
-                    Mode::Bypass.gist(),
-                    Mode::Auto.gist(),
+                    "no permission prompts",
+                    "not yolo",
                     "click: ",
                 ] {
-                    assert!(
-                        !text.contains(gone),
-                        "{gone:?} in {text:?}: no light, no title"
-                    );
+                    assert!(!text.contains(gone), "{gone:?} in {text:?}: no title");
                 }
                 assert_eq!(
                     text.contains('\u{221e}'),
                     hosted,
                     "the harness's mark: {text:?}"
                 );
+                assert_eq!(text.contains(word), hosted, "the bit's word: {text:?}");
                 if hosted {
                     let at = hit(&app, wid, Chip::Autopilot);
                     assert_eq!(
@@ -7495,83 +7213,81 @@ mod gesture_tests {
         }
     }
 
-    /// THE KEYBOARD REACHES EVERY CHIP AT REST (macOS): with no light drawn,
-    /// `ctrl+shift+tab` walks the row in its order — Autopilot, always
-    /// revealable where a host draws it, then the known light, the expected
-    /// mode `⏵⏵ bypass`, revealed — each selection painted on the glass and
-    /// typing nothing; Return on the expected mode turns it off with one
-    /// shift+tab, and the reveal goes with the selection; Autopilot stays.
+    /// THE KEYBOARD WALKS THE HARNESS CHIPS AT REST (macOS): on a hosted session
+    /// `ctrl+shift+tab` walks the row in its order, Autopilot then the light (`yolo`, drawn at
+    /// rest), each selection painted on the glass and typing nothing; Return on the light stands a
+    /// click, typing nothing, the selection let go and the standing click's light drawn `◌`;
+    /// Autopilot stays. CONTROL: an unhosted session draws no chip, and the chord selects the
+    /// first fact on the glass.
     #[cfg(target_os = "macos")]
     #[test]
-    fn ctrl_shift_tab_reveals_the_lights_at_rest() {
+    fn ctrl_shift_tab_walks_the_harness_chips_at_rest() {
         use aterm_window::keyboard::{KeyCode, NamedKey};
 
-        for hosted in [true, false] {
-            let (mut app, wid, session, mut reader) = app();
-            let _host = hosted.then(|| host(&mut app));
+        {
+            let (mut app, wid, session, _reader) = app();
             publish_facts(&app, session);
             draw_claude(&app, session, BYPASS);
             frame(&mut app, wid);
-            assert!(!painted(&app, wid, MODE), "at rest");
-            let walk: &[Chip] = if hosted {
-                &[Chip::Autopilot, MODE]
-            } else {
-                &[MODE]
-            };
-            for want in walk {
-                chord(&mut app, wid);
-                assert_eq!(
-                    app.windows[&wid].claude_lights.selected,
-                    Some((session, Target::from(*want))),
-                    "hosted={hosted}"
-                );
-                frame(&mut app, wid);
-                let at = hit(&app, wid, *want);
-                assert_eq!(
-                    cell_at(&app, wid, at).underline,
-                    super::UnderlineStyle::Single,
-                    "{want:?}: the selection is on the glass"
-                );
-            }
-            assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
-            let text = row_text(&app, wid, footer_row(&app, wid));
             assert!(
-                text.contains("\u{23F5}\u{23F5} bypass"),
-                "the known light, revealed: {text:?}"
+                app.windows[&wid].claude_lights.hits.is_empty(),
+                "CONTROL: no host, no chip"
             );
-            tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+            chord(&mut app, wid);
+            let facts = app.windows[&wid].claude_lights.facts_on_glass(session);
             assert_eq!(
-                pty(&mut reader, lights::SHIFT_TAB.len()),
-                lights::SHIFT_TAB,
-                "Return on the expected mode turns it off, and is not typed"
-            );
-            assert_eq!(
-                app.windows[&wid].claude_lights.selected, None,
-                "the reveal goes with the selection"
-            );
-            redraw_mode_row(&app, session, MANUAL);
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty(), "manual: arrived");
-            frame(&mut app, wid);
-            assert_eq!(
-                cell_at(&app, wid, hit(&app, wid, MODE)).ch,
-                '\u{23F8}',
-                "manual deviates: its chip is drawn"
-            );
-            assert_eq!(
-                painted(&app, wid, Chip::Autopilot),
-                hosted,
-                "Autopilot stays"
+                app.windows[&wid].claude_lights.selected,
+                facts.first().map(|fact| (session, Target::Fact(*fact))),
+                "CONTROL: the walk starts at the facts"
             );
         }
+        let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
+        publish_facts(&app, session);
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        assert!(painted(&app, wid, MODE), "the bit, at rest");
+        for want in [Chip::Autopilot, MODE] {
+            chord(&mut app, wid);
+            assert_eq!(
+                app.windows[&wid].claude_lights.selected,
+                Some((session, Target::from(want)))
+            );
+            frame(&mut app, wid);
+            let at = hit(&app, wid, want);
+            assert_eq!(
+                cell_at(&app, wid, at).underline,
+                super::UnderlineStyle::Single,
+                "{want:?}: the selection is on the glass"
+            );
+        }
+        assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
+        let text = row_text(&app, wid, footer_row(&app, wid));
+        assert!(text.contains("yolo"), "the bit: {text:?}");
+        clickable(&mut app, session, Look::Waits(Wait::Turn));
+        tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "Return on the light stands a click, and is not typed"
+        );
+        assert!(standing(&app, session).is_some(), "a click stands");
+        assert_eq!(app.windows[&wid].claude_lights.selected, None);
+        frame(&mut app, wid);
+        assert_eq!(
+            cell_at(&app, wid, hit(&app, wid, MODE)).ch,
+            crate::autopilot::IN_FLIGHT,
+            "the standing click's chip is drawn"
+        );
+        assert!(painted(&app, wid, Chip::Autopilot), "Autopilot stays");
     }
 
-    /// The keyboard route (macOS): the chord selects the focused pane's light and types
-    /// nothing (again, it goes on to the facts the glass shows, and round to the light);
-    /// Return toggles it with one shift+tab, not the Return, and lets go.
+    /// The keyboard route (macOS): the chord walks a hosted pane's Autopilot chip, then its light,
+    /// and types nothing (again, it goes on to the facts and the switch the glass shows, and round
+    /// to the light); Return clicks it, typing neither the Return nor anything else, and lets go;
+    /// the click's restart landed, a Return at rest is the program's.
     #[cfg(target_os = "macos")]
     #[test]
-    fn ctrl_shift_tab_selects_a_light_and_return_toggles_it() {
+    fn ctrl_shift_tab_selects_a_light_and_return_clicks_it() {
         use aterm_window::keyboard::{KeyCode, ModifiersState, NamedKey};
 
         fn set_mods(app: &mut App, wid: WindowId, mods: ModifiersState) {
@@ -7579,6 +7295,7 @@ mod gesture_tests {
         }
 
         let (mut app, wid, session, mut reader) = wide_app();
+        let _host = host(&mut app);
         publish_facts(&app, session);
         draw_claude(&app, session, PLAN);
         frame(&mut app, wid);
@@ -7588,119 +7305,100 @@ mod gesture_tests {
             wid,
             ModifiersState::CONTROL | ModifiersState::SHIFT,
         );
-        tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
+        let walk = app.windows[&wid].claude_lights.revealable(session);
         assert_eq!(
-            app.windows[&wid].claude_lights.selected,
-            Some((session, Target::from(MODE)))
+            walk[..2],
+            [Target::from(Chip::Autopilot), Target::from(MODE)],
+            "the harness chips lead the walk"
         );
-        let facts = app.windows[&wid].claude_lights.facts_on_glass(session);
-        assert!(!facts.is_empty(), "the facts are on the glass");
-        for fact in facts {
+        assert!(
+            walk.iter().any(|t| matches!(t, Target::Fact(_))),
+            "the facts are on the glass"
+        );
+        for want in walk.iter().chain(&walk[..2]) {
             tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
             assert_eq!(
                 app.windows[&wid].claude_lights.selected,
-                Some((session, Target::Fact(fact))),
-                "the walk goes on to the facts"
+                Some((session, *want)),
+                "the walk goes on, and round to the light"
             );
         }
-        tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
-        assert_eq!(
-            app.windows[&wid].claude_lights.selected,
-            Some((session, Target::from(MODE))),
-            "and round to the one light"
-        );
         assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
         frame(&mut app, wid);
         let auto = hit(&app, wid, Light::Mode);
         let text = row_text(&app, wid, auto.0);
-        assert!(text.contains("click: bypass or auto"), "{text:?}");
+        assert!(text.contains("click: yolo"), "{text:?}");
         assert_eq!(
             cell_at(&app, wid, auto).underline,
             super::UnderlineStyle::Single,
             "the selected light is marked"
         );
 
+        clickable(&mut app, session, Look::Waits(Wait::Turn));
         set_mods(&mut app, wid, ModifiersState::empty());
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "the click, and not the Return"
+        );
         assert_eq!(
-            pty(&mut reader, lights::SHIFT_TAB.len()),
-            lights::SHIFT_TAB,
-            "the toggle, and not the Return"
+            standing(&app, session).map(|s| s.click.to),
+            Some(aterm_agent::supervise::policy::turn_end::PermissionTo::Bypass),
+            "plan is not yolo: the click asks bypass"
         );
         assert_eq!(app.windows[&wid].claude_lights.selected, None);
         frame(&mut app, wid);
         assert_eq!(
             cell_at(&app, wid, hit(&app, wid, Light::Mode)).ch,
-            '\u{25CC}'
+            crate::autopilot::IN_FLIGHT
         );
+        let text = row_text(&app, wid, hit(&app, wid, Light::Mode).0);
+        assert!(text.contains("restarts at turn end"), "{text:?}");
 
+        let tab = sid_of(&app, session);
+        let id = standing(&app, session).expect("standing").id;
+        assert_eq!(
+            app.permission_clicks
+                .clicks
+                .note(&tab, id, &Look::Done, Instant::now()),
+            crate::permission_click::Noted::Changed
+        );
+        app.apply_click_look(&tab, Look::Done);
         redraw_mode_row(&app, session, BYPASS);
         frame(&mut app, wid);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty());
-        assert!(
-            app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .is_none()
-        );
-        frame(&mut app, wid);
-        let auto = hit(&app, wid, Light::Mode);
-        assert_eq!(cell_at(&app, wid, auto).ch, '\u{23F5}');
-        let text = row_text(&app, wid, auto.0);
-        assert!(
-            text.contains(Mode::Bypass.gist()),
-            "the arrival's notice says what bypass does: {text:?}"
-        );
-        let past = Instant::now() - Duration::from_millis(1);
-        if let Some((_, until)) = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.notice.as_mut())
-        {
-            *until = past;
-        }
-        app.on_claude_footer_changed(session);
-        frame(&mut app, wid);
-        assert!(
-            !app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.chip == Some(MODE)),
-            "back at rest, no mode chip"
-        );
-
+        assert!(standing(&app, session).is_none(), "landed, it ends");
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(pty(&mut reader, 1), b"\r");
     }
 
     #[test]
-    fn a_pending_mode_toggle_keeps_its_lights_in_an_80_column_pane() {
+    fn a_standing_click_keeps_its_lights_in_an_80_column_pane() {
         let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
         publish_facts(&app, session);
         draw_claude(&app, session, PLAN);
         frame(&mut app, wid);
+        clickable(&mut app, session, Look::Waits(Wait::Turn));
         let approve = hit(&app, wid, Light::Mode);
         let (x, y) = px_of(&app, wid, approve);
         app.on_cursor_moved(wid, x, y);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+        assert!(pty(&mut reader, 0).is_empty(), "a click types nothing");
         frame(&mut app, wid);
         assert!(
             !app.windows[&wid].claude_lights.hits.is_empty(),
-            "the lights stay while the toggle is in flight: {:?}",
+            "the lights stay while the click stands: {:?}",
             row_text(&app, wid, approve.0)
         );
         let text = row_text(&app, wid, approve.0);
         assert!(
             text.contains(WHOLE_FACTS),
-            "the facts stay whole while the toggle is in flight: {text:?}"
+            "the facts stay whole while the click stands: {text:?}"
         );
         assert!(
-            text.contains("switching\u{2026}"),
-            "the title, short beside the lights and the whole facts (it gives way first): {text:?}"
+            text.contains("restarts at turn end"),
+            "the title's reason, beside the lights and the facts: {text:?}"
         );
         assert_eq!(
             hit(&app, wid, Light::Mode),
@@ -7709,51 +7407,47 @@ mod gesture_tests {
         );
     }
 
+    /// A REFUSAL SAYS ITS REASON, NEVER IN THE MODEL'S ROOM: the lane's refusal of a click (an
+    /// unknown flag's spelling on its line) titles the light with the plain reason, which outranks
+    /// the facts in a narrow rule and stands beside them whole in a wide one.
     #[test]
-    fn a_stop_too_long_to_title_in_full_says_the_reason_alone() {
+    fn a_click_refused_says_the_reason_alone() {
+        use aterm_agent::harness::permission_click::Refusal;
         for cols in [80_u16, 120] {
             let (mut app, wid, session, mut reader) = app();
+            let _host = host(&mut app);
             if cols != 80 {
                 assert!(app.apply_term_resize(wid, 24, cols));
             }
             publish_facts(&app, session);
             draw_claude(&app, session, MANUAL);
             frame(&mut app, wid);
+            clickable(
+                &mut app,
+                session,
+                Look::Refused(Refusal::Other("unknown-flag".into())),
+            );
             click(&mut app, wid, Light::Mode);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            redraw_mode_row(&app, session, ACCEPT);
-            app.on_claude_footer_changed(session);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            past_deadline(&mut app, wid, session);
-            app.on_claude_footer_changed(session);
+            assert!(pty(&mut reader, 0).is_empty(), "{cols}: nothing typed");
+            assert!(standing(&app, session).is_none(), "{cols}: it ends");
             frame(&mut app, wid);
             let chip = hit(&app, wid, Light::Mode);
             let text = row_text(&app, wid, chip.0);
             assert!(
-                text.contains("stopped in accept edits mode"),
+                text.contains("its command line can't be rewritten"),
                 "{cols}: the reason: {text:?}"
             );
             assert!(
                 text.contains("\u{25C6} Opus 5.5 xhigh"),
                 "{cols}: never the model's or the effort's room: {text:?}"
             );
-            if cols == 80 {
+            if cols != 80 {
                 assert!(
-                    !text.contains("click: ") && !text.contains("\u{2387} main"),
-                    "no room for the whole title: the reason alone, in the branch's \
-                     and the path's room: {text:?}"
-                );
-            } else {
-                assert!(
-                    text.contains("stopped in accept edits mode \u{b7} click: bypass or auto")
-                        && text.contains(WHOLE_FACTS),
-                    "{cols}: the whole title beside the whole facts: {text:?}"
+                    text.contains(WHOLE_FACTS),
+                    "{cols}: the reason beside the whole facts: {text:?}"
                 );
             }
-            assert!(
-                text.contains("\u{23F5}\u{23F5} accept edits"),
-                "{cols}: control: the chip: {text:?}"
-            );
+            assert!(text.contains("lame"), "{cols}: control: the chip: {text:?}");
         }
     }
 
@@ -7771,6 +7465,7 @@ mod gesture_tests {
             app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
         }
         let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
         let other = app.split_active_stub_tab(wid);
         let (rows, cols) = {
             let terminal = term_lock(&app.pool.get(session).unwrap().term);
@@ -7795,6 +7490,7 @@ mod gesture_tests {
         frame(&mut app, wid);
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
+        tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
@@ -7816,545 +7512,6 @@ mod gesture_tests {
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
     }
 
-    fn refusal(app: &App, wid: WindowId, session: u64) -> Option<(Light, super::Refusal)> {
-        app.windows[&wid].claude_lights.sessions[&session]
-            .refused
-            .map(|(light, why, _)| (light, why))
-    }
-
-    /// Put `session`'s toggle past its deadline, as the timer would.
-    fn past_deadline(app: &mut App, wid: WindowId, session: u64) {
-        app.windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.pending.as_mut())
-            .expect("in flight")
-            .deadline = Instant::now() - Duration::from_millis(1);
-    }
-
-    /// Check the press received its full `SETTLE_MS`, then set the deadline a minute from now.
-    pub(super) fn press_not_due(app: &mut App, wid: WindowId, session: u64, since: Instant) {
-        let p = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.pending.as_mut())
-            .expect("in flight");
-        let settle = Duration::from_millis(lights::SETTLE_MS);
-        assert!(
-            since + settle <= p.deadline && p.deadline <= Instant::now() + settle,
-            "the drive gives the press its own deadline"
-        );
-        p.deadline = Instant::now() + Duration::from_secs(60);
-    }
-
-    #[test]
-    fn a_mode_return_finishes_from_the_engine_with_no_frames() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, MANUAL);
-        frame(&mut app, wid);
-        let clock = |app: &App| app.pool.get(session).unwrap().ctx.human_input.last();
-        let before = clock(&app);
-        click(&mut app, wid, Light::Mode);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-        let after_click = clock(&app);
-        assert_ne!(after_click, before, "control: the click is the person's");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "control: no answer, no press"
-        );
-        for answer in [ACCEPT, PLAN] {
-            redraw_mode_row(&app, session, answer);
-            app.on_claude_footer_changed(session);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "{answer:?}");
-        }
-        assert_eq!(
-            clock(&app),
-            after_click,
-            "aterm's own presses do not stamp a person"
-        );
-        redraw_mode_row(&app, session, BYPASS);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "bypass: done");
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none() && s.refused.is_none());
-        assert!(matches!(s.notice, Some((Light::Mode, _))));
-    }
-
-    /// The model's `mode` of the pill `screen` shows.
-    fn model_mode(mode: Mode) -> i64 {
-        match mode {
-            Mode::Bypass => 0,
-            Mode::Auto => 5,
-            Mode::Manual => 1,
-            Mode::AcceptEdits => 2,
-            Mode::Plan => 3,
-            Mode::DontAsk => 4,
-        }
-    }
-
-    /// Project the mode-return model state from the genuine [`App`].
-    pub(super) fn project_mode_toggle(
-        app: &App,
-        wid: WindowId,
-        session: u64,
-        expected: &aterm_spec::interp::State,
-    ) -> aterm_spec::interp::State {
-        let mut observed = expected.clone();
-        let screen = app.claude_screen_now(session);
-        observed.insert("covered", i64::from(screen.is_none()));
-        let shown = screen.as_ref().and_then(|screen| screen.mode);
-        if let Some(mode) = shown {
-            observed.insert("mode", model_mode(mode));
-        }
-        if let Some(screen) = &screen {
-            observed.insert("busy", i64::from(screen.busy));
-        }
-        let s = app.windows[&wid]
-            .claude_lights
-            .sessions
-            .get(&session)
-            .cloned()
-            .unwrap_or_default();
-        let now = Instant::now();
-        let phase = if s.pending.is_some() {
-            1
-        } else if s.refused.is_some_and(|(_, _, until)| until > now)
-            || s.notice.is_some_and(|(_, until)| until > now)
-        {
-            2
-        } else {
-            0
-        };
-        observed.insert("phase", phase);
-        if let Some(p) = &s.pending {
-            observed.insert("presses", i64::from(p.presses));
-            observed.insert("start", model_mode(p.started));
-            observed.insert(
-                "goal",
-                match p.goal {
-                    Goal::On => 0,
-                    Goal::Off => 1,
-                },
-            );
-            observed.insert("late", i64::from(p.deadline <= now));
-            if let Some(mode) = shown {
-                observed.insert("sent", i64::from(mode == p.mode_at_press));
-            }
-        } else {
-            observed.insert("sent", 0);
-            observed.insert("late", 0);
-        }
-        observed.insert(
-            "named",
-            i64::from(matches!(
-                s.refused,
-                Some((Light::Mode, why, until)) if until > now && why.names_mode()
-            )),
-        );
-        observed
-    }
-
-    pub(super) fn drive_mode_toggle_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
-        use aterm_spec::xref;
-
-        assert!(xref::reset_entered_anchors());
-        let result = drive();
-        let entered = xref::entered_anchor_ids();
-        xref::disarm_entered_anchors();
-        let anchor = xref::refinements()
-            .find(|anchor| anchor.machine == "claude_mode_toggle" && anchor.action == action)
-            .expect("the mode-toggle action has a shipping anchor");
-        assert!(
-            entered.contains(anchor.entry_id),
-            "{action} missed its shipping function"
-        );
-        result
-    }
-
-    /// Fire `action` on the model and verify the App's projected state and optional negative control.
-    pub(super) fn check_mode_toggle_transition(
-        app: &App,
-        wid: WindowId,
-        session: u64,
-        action: &str,
-        state: &mut aterm_spec::interp::State,
-        historical: Option<&[(&'static str, i64)]>,
-    ) {
-        let model = aterm_models_gui::claude_mode_toggle_model();
-        let before = state.clone();
-        assert!(model.fire(action, state), "{action} is enabled");
-        let observed = project_mode_toggle(app, wid, session, state);
-        let (ok, evidence) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &observed,
-            Some(action),
-            "Claude mode toggle real conformance",
-        );
-        assert!(ok, "{action}: {evidence}");
-        if let Some(changes) = historical {
-            let mut old = observed.clone();
-            for &(var, value) in changes {
-                old.insert(var, value);
-            }
-            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &before,
-                &old,
-                Some(action),
-                "Claude mode toggle negative control",
-            );
-            assert!(
-                !ok,
-                "{action} must reject the retired post-state {changes:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_mode_toggle_conforms_to_its_model() {
-        const DONT_ASK: &str = "  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)";
-        for dont_ask in [false, true] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            let model = aterm_models_gui::claude_mode_toggle_model();
-            let mut state = model.init_state();
-            let mut answers = vec![ACCEPT, PLAN, BYPASS];
-            if dont_ask {
-                state.insert("mode", 0);
-                draw_claude(&app, session, DONT_ASK);
-                check_mode_toggle_transition(&app, wid, session, "DontAsk", &mut state, None);
-                answers.insert(0, MANUAL);
-            } else {
-                draw_claude(&app, session, MANUAL);
-            }
-            frame(&mut app, wid);
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || click(&mut app, wid, Light::Mode));
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(
-                pty(&mut reader, 3),
-                lights::SHIFT_TAB,
-                "the click presses at once"
-            );
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Click",
-                &mut state,
-                Some(&[("sent", 0)][..]),
-            );
-            let last = answers.len() - 1;
-            for (i, answer) in answers.into_iter().enumerate() {
-                redraw_mode_row(&app, session, answer);
-                check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-                if i < last {
-                    let since = Instant::now();
-                    drive_mode_toggle_action("Press", || app.on_claude_footer_changed(session));
-                    press_not_due(&mut app, wid, session, since);
-                    assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "{answer:?}");
-                    check_mode_toggle_transition(&app, wid, session, "Press", &mut state, None);
-                }
-            }
-            drive_mode_toggle_action("Arrive", || app.on_claude_footer_changed(session));
-            assert!(
-                pty(&mut reader, 0).is_empty(),
-                "no press on from bypass, the goal"
-            );
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Arrive",
-                &mut state,
-                Some(&[("phase", 1), ("sent", 1), ("overshoot", 1)][..]),
-            );
-        }
-    }
-
-    /// A CLICK ON YOLO TURNS IT OFF (the owner, 2026-11-02): from bypass the toggle's goal is
-    /// manual. On Claude Code 2.1.316's cycle (bypass, auto, manual, measured by `lab footers`)
-    /// the first shift+tab answers auto, an expected mode short of the goal, so aterm presses
-    /// once more, Claude answers manual and nothing more is pressed; a cycle without auto answers
-    /// manual at once. A click back while the arrival's notice shows turns it over again. The
-    /// model rejects the retired goal (back to an expected mode), and its `Buggy = 2` mutant, a
-    /// click on an On light aimed back at an expected mode, breaks `AClickTurnsTheLightOver`.
-    #[test]
-    fn a_click_on_yolo_turns_it_off_and_conforms_to_its_model() {
-        for auto_in in [true, false] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            let model = aterm_models_gui::claude_mode_toggle_model();
-            let mut state = model.init_state();
-            state.insert("mode", 0);
-            if !auto_in {
-                assert!(model.fire("NoAuto", &mut state));
-            }
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || {
-                app.toggle_claude_light(wid, session, Light::Mode);
-            });
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(
-                pty(&mut reader, 3),
-                lights::SHIFT_TAB,
-                "the click presses at once"
-            );
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Click",
-                &mut state,
-                Some(&[("goal", 0)][..]),
-            );
-            if auto_in {
-                redraw_mode_row(&app, session, AUTO);
-                check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-                let since = Instant::now();
-                drive_mode_toggle_action("Press", || app.on_claude_footer_changed(session));
-                press_not_due(&mut app, wid, session, since);
-                assert_eq!(
-                    pty(&mut reader, 3),
-                    lights::SHIFT_TAB,
-                    "auto is short of manual: a press on"
-                );
-                check_mode_toggle_transition(&app, wid, session, "Press", &mut state, None);
-            }
-            redraw_mode_row(&app, session, MANUAL);
-            check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-            drive_mode_toggle_action("Arrive", || app.on_claude_footer_changed(session));
-            assert!(pty(&mut reader, 0).is_empty(), "no press on from manual");
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Arrive",
-                &mut state,
-                Some(&[("phase", 1), ("sent", 1), ("overshoot", 1)][..]),
-            );
-
-            // The click back, while the arrival's notice is on show (`phase` 2), turns it over.
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || {
-                app.toggle_claude_light(wid, session, Light::Mode);
-            });
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(
-                pty(&mut reader, 3),
-                lights::SHIFT_TAB,
-                "the click back presses at once"
-            );
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Click",
-                &mut state,
-                Some(&[("phase", 2)][..]),
-            );
-
-            let buggy = aterm_spec::interp::with_buggy(&model, 2);
-            let mut retired = buggy.init_state();
-            retired.insert("mode", 0);
-            assert!(buggy.fire("Click", &mut retired), "a click on an On light");
-            assert!(
-                !buggy.check_invariant("AClickTurnsTheLightOver", &retired),
-                "the retired goal breaks the law"
-            );
-        }
-    }
-
-    #[test]
-    fn an_overdue_mode_answer_sends_no_late_follow_up_key() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, MANUAL);
-        frame(&mut app, wid);
-        let model = aterm_models_gui::claude_mode_toggle_model();
-        let mut state = model.init_state();
-        drive_mode_toggle_action("Click", || click(&mut app, wid, Light::Mode));
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-        check_mode_toggle_transition(&app, wid, session, "Click", &mut state, None);
-
-        past_deadline(&mut app, wid, session);
-        check_mode_toggle_transition(&app, wid, session, "Timeout", &mut state, None);
-        redraw_mode_row(&app, session, ACCEPT);
-        check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-        assert!(
-            model.successors("Press", &state).is_empty(),
-            "a timed-out answer cannot enable another press"
-        );
-        drive_mode_toggle_action("Expire", || app.on_claude_footer_changed(session));
-        assert!(pty(&mut reader, 0).is_empty(), "no late shift+tab");
-        check_mode_toggle_transition(
-            &app,
-            wid,
-            session,
-            "Expire",
-            &mut state,
-            Some(&[("phase", 1), ("presses", 2)][..]),
-        );
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Mode, super::Refusal::StoppedIn(Mode::AcceptEdits)))
-        );
-
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        let mut late = buggy.init_state();
-        for action in ["Click", "Timeout", "Answer", "Press"] {
-            assert!(buggy.fire(action, &mut late), "{action}");
-        }
-        assert!(!buggy.check_invariant("NoLatePress", &late));
-    }
-
-    /// Claude answers mid-turn (a plan row with `esc to interrupt`).
-    const BUSY_PLAN: &str = "  \u{23F8} plan mode on \u{00B7} esc to interrupt";
-    /// A turn in flight before Claude answered: accept edits, busy.
-    const BUSY_ACCEPT_ROW: &str = "  \u{23F5}\u{23F5} accept edits on \u{00B7} esc to interrupt";
-
-    #[test]
-    fn the_mode_toggles_stops_conform_to_its_model_and_are_named() {
-        let model = aterm_models_gui::claude_mode_toggle_model();
-        {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, MANUAL);
-            frame(&mut app, wid);
-            let mut state = model.init_state();
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || click(&mut app, wid, Light::Mode));
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            check_mode_toggle_transition(&app, wid, session, "Click", &mut state, None);
-            redraw_mode_row(&app, session, ACCEPT);
-            check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-            let since = Instant::now();
-            drive_mode_toggle_action("Press", || app.on_claude_footer_changed(session));
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            check_mode_toggle_transition(&app, wid, session, "Press", &mut state, None);
-            redraw_mode_row(&app, session, BUSY_ACCEPT_ROW);
-            check_mode_toggle_transition(&app, wid, session, "TurnStarts", &mut state, None);
-            redraw_mode_row(&app, session, BUSY_PLAN);
-            check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-            app.on_claude_footer_changed(session);
-            assert!(
-                pty(&mut reader, 0).is_empty(),
-                "answered mid-turn: aterm's own press is held"
-            );
-            assert!(
-                model.successors("Press", &state).is_empty(),
-                "and the model has no press there either"
-            );
-            feed(&app, session, b"\x1b[2J\x1b[10;1H Do you want to proceed?");
-            check_mode_toggle_transition(&app, wid, session, "Cover", &mut state, None);
-            assert_eq!(state["boxed"], 0);
-            past_deadline(&mut app, wid, session);
-            drive_mode_toggle_action("Expire", || app.on_claude_footer_changed(session));
-            assert!(pty(&mut reader, 0).is_empty(), "nothing into the box");
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Expire",
-                &mut state,
-                Some(&[("named", 0)][..]),
-            );
-            assert_eq!(
-                refusal(&app, wid, session),
-                Some((Light::Mode, super::Refusal::StoppedMidTurn(Mode::Plan)))
-            );
-            let buggy = aterm_spec::interp::with_buggy(&model, 1);
-            let mut raced = buggy.init_state();
-            for action in ["TurnStarts", "Click", "Answer", "Press", "Cover"] {
-                assert!(buggy.fire(action, &mut raced), "{action}");
-            }
-            assert!(!buggy.check_invariant("NoPressIntoABox", &raced));
-        }
-        {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, ACCEPT);
-            frame(&mut app, wid);
-            let mut state = model.init_state();
-            state.insert("mode", 2);
-            state.insert("start", 2);
-            assert!(model.fire("NoBypass", &mut state));
-            assert!(model.fire("NoAuto", &mut state));
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || click(&mut app, wid, Light::Mode));
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            check_mode_toggle_transition(&app, wid, session, "Click", &mut state, None);
-            for answer in [PLAN, MANUAL] {
-                redraw_mode_row(&app, session, answer);
-                check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-                let since = Instant::now();
-                drive_mode_toggle_action("Press", || app.on_claude_footer_changed(session));
-                press_not_due(&mut app, wid, session, since);
-                assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "{answer:?}");
-                check_mode_toggle_transition(&app, wid, session, "Press", &mut state, None);
-            }
-            redraw_mode_row(&app, session, ACCEPT);
-            check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-            drive_mode_toggle_action("Lap", || app.on_claude_footer_changed(session));
-            assert!(pty(&mut reader, 0).is_empty(), "no second lap");
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Lap",
-                &mut state,
-                Some(&[("named", 0)][..]),
-            );
-            assert_eq!(
-                refusal(&app, wid, session),
-                Some((
-                    Light::Mode,
-                    super::Refusal::NotInCycle(Goal::On, Mode::AcceptEdits)
-                ))
-            );
-        }
-        {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, MANUAL);
-            frame(&mut app, wid);
-            let mut state = model.init_state();
-            let since = Instant::now();
-            drive_mode_toggle_action("Click", || click(&mut app, wid, Light::Mode));
-            press_not_due(&mut app, wid, session, since);
-            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-            check_mode_toggle_transition(&app, wid, session, "Click", &mut state, None);
-            redraw_mode_row(&app, session, ACCEPT);
-            check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
-            hang_up(&app, session, reader);
-            drive_mode_toggle_action("Reject", || app.on_claude_footer_changed(session));
-            check_mode_toggle_transition(
-                &app,
-                wid,
-                session,
-                "Reject",
-                &mut state,
-                Some(&[("named", 0)][..]),
-            );
-            assert_eq!(
-                refusal(&app, wid, session),
-                Some((Light::Mode, super::Refusal::StoppedIn(Mode::AcceptEdits))),
-                "the mode it stopped in, not \"input was not accepted\""
-            );
-        }
-    }
-
     /// Draw Claude Code's bottom block `cols` wide.
     #[cfg(target_os = "macos")]
     fn draw_claude_cols(app: &App, session: u64, mode: &str, cols: usize) {
@@ -8366,19 +7523,22 @@ mod gesture_tests {
         feed(app, session, screen.as_bytes());
     }
 
-    /// NO SELECTION NOBODY CAN SEE: the keyboard selects only a chip the pane
-    /// has ROOM for, the reveal giving way first.
+    /// NO SELECTION NOBODY CAN SEE: the keyboard selects only a chip the pane has ROOM for. The
+    /// light keeps its place beside Autopilot while the two fit, and a rule too narrow for both
+    /// draws neither, its Return Claude's, not an unseen light's.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keyboard_never_selects_a_chip_the_pane_has_no_room_for() {
         use aterm_window::keyboard::{KeyCode, NamedKey};
         const ACCEPT_SHORT: &str = "  \u{23F5}\u{23F5} accept edits on";
         let (mut app, wid, session, mut reader) = app();
+        let _host = host(&mut app);
         publish_facts(&app, session);
         assert!(app.apply_term_resize(wid, 24, 40));
         draw_claude_cols(&app, session, ACCEPT_SHORT, 40);
         frame(&mut app, wid);
         let at_rest = hit(&app, wid, Light::Mode);
+        chord(&mut app, wid);
         chord(&mut app, wid);
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
@@ -8386,16 +7546,19 @@ mod gesture_tests {
         );
         frame(&mut app, wid);
         let text = row_text(&app, wid, at_rest.0);
-        assert!(
-            text.contains("\u{23F5}\u{23F5} accept edits"),
-            "the chip stays: {text:?}"
-        );
+        assert!(text.contains("lame"), "the chip stays: {text:?}");
         assert_eq!(hit(&app, wid, Light::Mode).0, at_rest.0);
         assert!(pty(&mut reader, 0).is_empty());
-        assert!(app.apply_term_resize(wid, 24, 30));
-        draw_claude_cols(&app, session, ACCEPT_SHORT, 30);
-        frame(&mut app, wid);
-        assert!(app.windows[&wid].claude_lights.hits.is_empty(), "no room");
+        let narrowest = u16::try_from(ACCEPT_SHORT.chars().count()).unwrap();
+        let no_room = (narrowest..40)
+            .rev()
+            .find(|&cols| {
+                assert!(app.apply_term_resize(wid, 24, cols));
+                draw_claude_cols(&app, session, ACCEPT_SHORT, usize::from(cols));
+                frame(&mut app, wid);
+                app.windows[&wid].claude_lights.hits.is_empty()
+            })
+            .expect("a rule too narrow for the two chips");
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(
             pty(&mut reader, 1),
@@ -8419,14 +7582,10 @@ mod gesture_tests {
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(pty(&mut reader, 1), b"\r");
 
-        let (mut app, wid, session, mut reader) = self::app();
-        let _host = host(&mut app);
-        publish_facts(&app, session);
-        // At 36 columns the model, set at pitch 1, leaves no room for the mode's chip.
         for (cols, chips) in [
             (40_u16, &[Chip::Autopilot, MODE][..]),
-            (36, &[Chip::Autopilot][..]),
-            (30, &[Chip::Autopilot][..]),
+            (no_room + 1, &[Chip::Autopilot, MODE][..]),
+            (no_room, &[][..]),
         ] {
             assert!(app.apply_term_resize(wid, 24, cols));
             draw_claude_cols(&app, session, ACCEPT_SHORT, usize::from(cols));
@@ -8435,13 +7594,13 @@ mod gesture_tests {
             let switch = app.windows[&wid]
                 .claude_lights
                 .shows(session, Target::Switch);
-            let walk: Vec<Target> = chips
+            let mut walk: Vec<Target> = chips
                 .iter()
                 .map(|chip| Target::Chip(*chip))
                 .chain(facts.into_iter().map(Target::Fact))
                 .chain(switch.then_some(Target::Switch))
-                .chain([Target::Chip(Chip::Autopilot)])
                 .collect();
+            walk.push(walk[0]);
             for want in walk {
                 chord(&mut app, wid);
                 assert_eq!(
@@ -8455,13 +7614,59 @@ mod gesture_tests {
                     "{cols}: {want:?} on the glass"
                 );
             }
-            assert_eq!(painted(&app, wid, MODE), cols == 40, "{cols}");
+            assert_eq!(painted(&app, wid, MODE), cols != no_room, "{cols}");
+            assert_eq!(
+                painted(&app, wid, Chip::Autopilot),
+                painted(&app, wid, MODE),
+                "{cols}: the light beside Autopilot, or neither"
+            );
             tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
             assert_eq!(app.windows[&wid].claude_lights.selected, None);
         }
         assert!(pty(&mut reader, 0).is_empty(), "the walk types nothing");
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(pty(&mut reader, 1), b"\r", "the Return is Claude's");
+    }
+
+    /// THE HOVER SAYS WHAT A CLICK'S RESTART ENDS, READ PAST THE ⬆️'S GATE
+    /// (`docs/DESIGN-yolo-binary-2026-11-04.md` Appendix "Chip"): with no ⬆️ on show, a hover on
+    /// the light reads Claude's running jobs off its row under any pill (auto's left as Claude
+    /// draws it) and its title adds `· ends 1 shell`. CONTROL: at rest the frame reads no job
+    /// words.
+    #[test]
+    fn the_hover_says_what_a_clicks_restart_ends() {
+        for (mode, head) in [
+            ("  \u{23F5}\u{23F5} auto mode on \u{B7} 1 shell", "not yolo"),
+            (
+                "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell",
+                "no permission prompts",
+            ),
+        ] {
+            let (mut app, wid, session, _reader) = wide_app();
+            let _host = host(&mut app);
+            publish_facts(&app, session);
+            draw_claude(&app, session, mode);
+            frame(&mut app, wid);
+            let jobs = |app: &App| {
+                app.windows[&wid].claude_lights.sessions[&session]
+                    .jobs
+                    .clone()
+            };
+            assert_eq!(
+                jobs(&app),
+                "",
+                "CONTROL: {mode:?}: at rest no job words are read"
+            );
+            let (x, y) = px_of(&app, wid, hit(&app, wid, MODE));
+            app.on_cursor_moved(wid, x, y);
+            frame(&mut app, wid);
+            assert_eq!(jobs(&app), "1 shell", "{mode:?}");
+            let text = row_text(&app, wid, footer_row(&app, wid));
+            assert!(
+                text.contains(head) && text.contains("\u{b7} ends 1 shell"),
+                "{mode:?}: {text:?}"
+            );
+        }
     }
 
     /// The session's own Autopilot word and the posture it is read under.
@@ -8557,8 +7762,13 @@ mod gesture_tests {
         );
         redraw_mode_row(&app, session, PLAN);
         frame(&mut app, wid);
+        clickable(&mut app, session, Look::Waits(Wait::Turn));
         click(&mut app, wid, Light::Mode);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "the light presses");
+        assert!(pty(&mut reader, 0).is_empty(), "the light types nothing");
+        assert!(
+            standing(&app, session).is_some(),
+            "the light stands a click"
+        );
     }
 
     #[test]
@@ -8627,12 +7837,7 @@ mod gesture_tests {
                 .is_none(),
             "no Settings opened"
         );
-        assert!(
-            app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .is_none(),
-            "no light toggled"
-        );
+        assert!(!light_reached(&app, wid, session), "no light clicked");
         press(&mut app, (first.0, first.1 - 1));
         assert!(
             pty(&mut reader, 1).starts_with(b"\x1b[<0;"),
@@ -8772,12 +7977,7 @@ mod gesture_tests {
                 .is_none(),
             "no Settings opened"
         );
-        assert!(
-            app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .is_none(),
-            "no light toggled"
-        );
+        assert!(!light_reached(&app, wid, session), "no light clicked");
     }
 
     #[test]
@@ -8789,7 +7989,8 @@ mod gesture_tests {
         let _host = host(&mut app);
         app.tab_strip_rows = 1;
         publish_facts(&app, session);
-        draw_claude(&app, session, PLAN);
+        // A bypass row, the one the rule rewrites, so a claimed session's row has vacated cells.
+        draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
         let tab = app.windows[&wid].tab_set.active_id().expect("Claude's tab");
         let pinned = |app: &App| {
@@ -8975,7 +8176,7 @@ mod gesture_tests {
                     "{width}: {rule:?}"
                 );
                 2
-            } else if rule.contains("\u{221e}  autopilot: cruise ") {
+            } else if rule.contains("\u{221e} yolo  autopilot: cruise ") {
                 assert!(
                     !rule.contains("click") && !rule.contains("\u{2014}"),
                     "{width}: the short form is the mode phrase alone: {rule:?}"
@@ -9261,7 +8462,9 @@ mod gesture_tests {
             chips: (bool, bool),
             text: String,
         }
-        const LADDER: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
+        // The light keeps its place beside Autopilot at every rung wherever the bit is read
+        // (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): the chips go together or not at all.
+        const LADDER: [(bool, bool); 2] = [(true, true), (false, false)];
         const PLAN_SHORT: &str = "  \u{23F8} plan mode on";
         const ACCEPT_SHORT: &str = "  \u{23F5}\u{23F5} accept edits on";
         for pill in [None, Some(PLAN_SHORT), Some(ACCEPT_SHORT)] {
@@ -9354,10 +8557,6 @@ mod gesture_tests {
                     .any(|s| s.model && !s.rest && s.chips == widest.chips),
                 "{pill:?}: every chip beside the model alone: {seen:#?}"
             );
-            assert!(
-                shows((true, false)),
-                "{pill:?}: the light given up, Autopilot kept: {seen:#?}"
-            );
             if pill.is_none() {
                 assert!(
                     shows((false, false)),
@@ -9423,8 +8622,8 @@ mod gesture_tests {
 mod face_tests;
 
 #[cfg(all(test, unix))]
-#[path = "claude_lights_yolo_tests.rs"]
-mod yolo_tests;
+#[path = "claude_lights_click_tests.rs"]
+mod click_tests;
 
 #[cfg(all(test, unix))]
 #[path = "claude_facts_gesture_tests.rs"]
@@ -9446,73 +8645,50 @@ mod ticker_tests;
 #[path = "claude_lights_word_tests.rs"]
 mod word_tests;
 
-/// `claude_mode_toggle` environment actions.
+/// `claude_permission_click` environment actions.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "Answer",
-    reason = "Claude Code's own step: its pill moves on after a shift+tab. The Tier-1 test \
-              redraws the real engine's mode row and projects the App state."
+    machine = "claude_permission_click",
+    action = "ToYolo",
+    reason = "Claude Code's own step: its pill moves to bypass (a person's shift+tab, or a \
+              restart that lands there). The Tier-1 test redraws the real engine's mode row."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "Cover",
-    reason = "Claude Code's own step: a box over the composer. The Tier-1 test draws one on \
-              the real engine and checks nothing is pressed into it."
+    machine = "claude_permission_click",
+    action = "ToLame",
+    reason = "Claude Code's own step: its pill leaves bypass (a person's shift+tab, the plan \
+              tool, a restart that lands in the settings' mode)."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "Uncover",
-    reason = "Claude Code's own step: the box answered and the composer back."
+    machine = "claude_permission_click",
+    action = "Hold",
+    reason = "The tab's own state: a box over the composer or a person's hold, which the \
+              harness's look reads (`upgrade::press_gate`); the Tier-1 test scripts the look's \
+              wait."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "Leave",
-    reason = "A person's own shift+tab in Claude, away from an expected mode, with no toggle \
-              in flight: aterm's own way out of bypass or auto, a click on yolo or auto, is the \
-              modeled Click and Press."
+    machine = "claude_permission_click",
+    action = "Free",
+    reason = "The tab's own state: the box answered, the hold ended."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "DontAsk",
-    reason = "A person's own choice of don't ask in Claude: aterm has no gesture that sets \
-              it. The Tier-1 test draws the don't-ask pill and returns from it."
+    machine = "claude_permission_click",
+    action = "NoLine",
+    reason = "The tab's own facts: a job with no shell, a claim, a coordinated record, which the \
+              harness's look reads; the Tier-1 test scripts its refusal."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "NoBypass",
-    reason = "The session's own cycle, without bypass (a session started without it): the \
-              Tier-1 tests answer each press from such a ring."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "NoAuto",
-    reason = "The session's own cycle, without auto (a build or an account without it, bypass \
-              to manual): the Tier-1 tests answer each press from such a ring."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "TurnStarts",
-    reason = "Claude Code's own step: a turn starts. The Tier-1 test draws the busy mode row \
-              on the real engine."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "TurnEnds",
-    reason = "Claude Code's own step: the turn ends, the busy hint gone from the mode row."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "claude_mode_toggle",
-    action = "Timeout",
-    reason = "The clock crosses a press's deadline outside an aterm transition. The Tier-1 \
-              late-answer test advances the real deadline, then checks the App stops."
+    machine = "claude_permission_click",
+    action = "Apart",
+    reason = "The clock passes a double click's interval after the run's last press \
+              (`crate::multi_click_ms`); the Tier-1 test presses at instants past it."
 )]
 #[allow(
     dead_code,
     reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
               not an expect: rustc does not lint a fn the declarative anchors rebuild"
 )]
-fn mode_toggle_environment_waivers() {}
+fn permission_click_environment_waivers() {}
 #[cfg(all(test, unix))]
 #[path = "claude_lights_fit_tests.rs"]
 mod fit_tests;

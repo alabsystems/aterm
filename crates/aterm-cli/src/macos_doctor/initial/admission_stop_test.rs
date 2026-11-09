@@ -161,13 +161,13 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
     ) -> InitialSetupParkMark {
         input_pass::park_mark(Some(self.root), expected, ledger::now_secs())
             .with_console(|| Some(!aterm_machines::console::remote(sys)))
-            .with_keyboard_services(|| sys.keyboard_service_ids())
+            .with_keyboard_services(sys)
     }
 
     /// The same inert native input ports shared by coordinator and headless startup tests.
     /// The first observation lacks a service model; the attached observation can verify both
     /// current keyboard interfaces without invoking a setter.
-    pub fn keyboard_system(attached: bool) -> aterm_machines::port::Fake {
+    pub fn keyboard_system(attached: bool, unread: &[u64]) -> aterm_machines::port::Fake {
         use aterm_machines::items::keyboard::{Model, caps_to_control};
         use aterm_machines::model::{PValue, User};
         use aterm_machines::port::{Fake as Machine, Ran, Stat};
@@ -211,12 +211,17 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
             "Fixture keyboard"
         );
         let filter = |id| {
+            let class = if unread.contains(&id) {
+                "UnavailableKeyboardFilter"
+            } else {
+                "IOHIDKeyboardFilter"
+            };
             format!(
                 "<dict><key>IORegistryEntryID</key><integer>{id}</integer>\
                  <key>PrimaryUsagePage</key><integer>1</integer>\
                  <key>PrimaryUsage</key><integer>6</integer>\
                  <key>ServiceFilterDebug</key><array><dict><key>plugin</key><dict>\
-                 <key>Class</key><string>IOHIDKeyboardFilter</string>\
+                 <key>Class</key><string>{class}</string>\
                  <key>HIDKeyboardModifierMappingPairs</key><array/>\
                  <key>UserKeyMapping</key><array><dict>\
                  <key>Src</key><integer>30064771129</integer>\

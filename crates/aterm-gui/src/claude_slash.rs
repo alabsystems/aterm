@@ -119,7 +119,7 @@ pub(crate) fn key_capitalised() -> String {
 /// Why a press did not begin, or stopped short — each said in words ([`Self::says`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SlashRefusal {
-    /// A press, or a mode toggle of the lights, is in flight for the session.
+    /// A press is in flight for the session.
     InFlight,
     /// The session is halted (`fabric`).
     Halted,
@@ -726,7 +726,7 @@ impl App {
         let Some(foreground) = foreground else {
             return Err(SlashRefusal::NotReady);
         };
-        if self.slash_in_flight(session) || self.mode_toggle_in_flight(session) {
+        if self.slash_in_flight(session) {
             return Err(SlashRefusal::InFlight);
         }
         if let Some(why) = slash_holds(&ctx) {

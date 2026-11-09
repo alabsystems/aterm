@@ -26,7 +26,7 @@ struct Keeper {
 struct Inputs {
     keeper: Keeper,
     live: Option<(u64, LiveKeyboardMapping)>,
-    pending: Option<(u64, InputServiceSet)>,
+    pending: Option<(u64, InputServiceSet, InputServiceSet)>,
     seen: Option<Sample>,
 }
 
@@ -286,13 +286,25 @@ impl Inputs {
                 result
             }
             InputSetupScope::Pending(revision) => {
-                let services = services().and_then(InputServiceSet::new).inspect_err(|_| {
-                    self.seen = None;
-                    invalidated();
-                })?;
+                let (services, mut readable) = observations()
+                    .and_then(|rows| InputServiceSet::observed(&rows))
+                    .or_else(|_| {
+                        services()
+                            .and_then(InputServiceSet::new)
+                            .map(|ids| (ids, InputServiceSet::default()))
+                    })
+                    .inspect_err(|_| {
+                        self.seen = None;
+                        invalidated();
+                    })?;
                 self.observe(scope, Some(services.clone()), None, invalidated);
                 self.keeper = Keeper::default();
-                let current = (revision, services);
+                if let Some((before, _, known)) = &self.pending
+                    && *before == revision
+                {
+                    readable.retain_present_from(known, &services);
+                }
+                let current = (revision, services, readable);
                 if self.pending.as_ref() != Some(&current) {
                     self.pending = Some(current);
                     // The first sample also nudges: a device can arrive after the parked pass
@@ -804,7 +816,8 @@ mod tests {
     fn mapped_keyboard_system(registries: &[u64]) -> aterm_machines::port::Fake {
         use aterm_machines::items::keyboard::{CAPS_LOCK, LEFT_CONTROL};
         use aterm_machines::port::Ran;
-        let mut sys = aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true);
+        let mut sys =
+            aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
         sys.keyboard_services = Some(Ok(registries.to_vec()));
         let mut census = format!(
             "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n",
@@ -878,7 +891,7 @@ mod tests {
             .unwrap();
         let (report, next) = setup
             .native_workstation_pass(revision, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(false))
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(false, &[]))
             })
             .unwrap()
             .unwrap();
@@ -953,7 +966,7 @@ mod tests {
                                 FIRST_RETRY_MS,
                                 || input_setup_scope_at(&root),
                                 || Ok(vec![41]),
-                                || panic!("pending input reads only service identities"),
+                                || observations(&[41]),
                                 |_, _| panic!("pending input has no setter authority"),
                                 &|| {},
                                 &|| {},
@@ -1099,7 +1112,7 @@ mod tests {
         let (ready, revision) = native_pending_caps(positive.path());
         let (report, next) = ready
             .native_workstation_pass(revision, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[]))
             })
             .unwrap()
             .unwrap();
@@ -1107,57 +1120,85 @@ mod tests {
         assert_eq!(next, SetupNext::Done);
         assert_eq!(ready.input_activation_revision().unwrap(), Some(revision));
 
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let (setup, revision) = native_pending_caps(dir.path());
-        let mut actor = InitialSetupAdmissionStopTest::keyboard_system(false);
-        actor.terminal = false;
-        let (native, events) = fixture::Native::new(dir.path().to_path_buf());
-        let mut coordinator = Coordinator::default();
-        let mut inputs = Inputs::default();
-        spawn_background_with(&actor, |_, _, owner| {
-            for attached in [false, true] {
-                native.attached.store(attached, Ordering::Release);
-                let scope = input_setup_scope_at(dir.path());
-                owner
-                    .coordinate(
-                        &mut coordinator,
-                        &scope,
-                        true,
-                        0,
-                        |revision| native.start(revision),
-                        || native.wake(),
-                    )
-                    .unwrap();
-                let hand_off = || native.wake();
-                assert!(
-                    !inputs
-                        .round(
+        for same_ids in [false, true] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let (setup, revision) = native_pending_caps(dir.path());
+            let mut actor = InitialSetupAdmissionStopTest::keyboard_system(false, &[]);
+            actor.terminal = false;
+            let (native, events) = fixture::Native::new(dir.path().to_path_buf());
+            let mut coordinator = Coordinator::default();
+            let mut inputs = Inputs::default();
+            let nudges = std::cell::Cell::new(0);
+            spawn_background_with(&actor, |_, _, owner| {
+                for ready in [false, true] {
+                    native.attached.store(same_ids || ready, Ordering::Release);
+                    native.unread.store(same_ids && !ready, Ordering::Release);
+                    let sys = native.system();
+                    if same_ids {
+                        assert_eq!(sys.keyboard_service_ids().unwrap(), [41, 42]);
+                        assert_eq!(
+                            sys.keyboard_service_observations()
+                                .unwrap()
+                                .iter()
+                                .all(|row| row.unread().is_none()),
+                            ready,
+                            "the same native records become positively readable"
+                        );
+                    }
+                    let scope = input_setup_scope_at(dir.path());
+                    owner
+                        .coordinate(
+                            &mut coordinator,
+                            &scope,
                             true,
                             0,
-                            || scope,
-                            || {
-                                InitialSetupAdmissionStopTest::keyboard_system(attached)
-                                    .keyboard_service_ids()
-                            },
-                            || panic!("pending input reads only service identities"),
-                            |_, _| panic!("a pending pass has no attachment-setter authority"),
-                            &hand_off,
-                            &|| {},
+                            |revision| native.start(revision),
+                            || native.wake(),
                         )
-                        .unwrap()
-                );
-                if !attached {
-                    fixture::waiting(&events);
+                        .unwrap();
+                    let before = nudges.get();
+                    let hand_off = || {
+                        nudges.set(nudges.get() + 1);
+                        native.wake();
+                    };
+                    assert!(
+                        !inputs
+                            .round(
+                                true,
+                                0,
+                                || scope,
+                                || sys.keyboard_service_ids(),
+                                || sys.keyboard_service_observations(),
+                                |_, _| panic!("a pending pass has no attachment-setter authority"),
+                                &hand_off,
+                                &|| {},
+                            )
+                            .unwrap()
+                    );
+                    if !ready {
+                        fixture::waiting(&events);
+                    } else if same_ids && nudges.get() == before {
+                        // The old producer loses this real same-ID readiness edge. Retire and
+                        // join its owned worker before reporting the short causal failure.
+                        setup.stop_revision(revision).unwrap();
+                        native.wake();
+                        fixture::finished(&events, &mut coordinator);
+                        assert_ne!(
+                            nudges.get(),
+                            before,
+                            "readable filters wake the pending input task"
+                        );
+                    }
                 }
-            }
-        });
-        fixture::finished(&events, &mut coordinator);
-        assert_eq!(
-            input_setup_scope_at(dir.path()).unwrap(),
-            InputSetupScope::Applied(revision),
-            "the actual owned retry coordinator checkpoints verified Caps in the original run"
-        );
-        assert_eq!(setup.input_activation_revision().unwrap(), Some(revision));
+            });
+            fixture::finished(&events, &mut coordinator);
+            assert_eq!(
+                input_setup_scope_at(dir.path()).unwrap(),
+                InputSetupScope::Applied(revision),
+                "the actual owned retry coordinator checkpoints verified Caps in the original run"
+            );
+            assert_eq!(setup.input_activation_revision().unwrap(), Some(revision));
+        }
     }
 
     #[test]
@@ -1172,7 +1213,7 @@ mod tests {
             input_setup_scope_at(dir.path()).unwrap(),
             InputSetupScope::Inactive
         );
-        let actor = InitialSetupAdmissionStopTest::keyboard_system(true);
+        let actor = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
         let started = Cell::new(false);
         let mut inputs = Inputs::default();
         spawn_background_with(&actor, |_, _, owner| {
@@ -1217,7 +1258,8 @@ mod tests {
         let claim = claim_initial_setup_rerun_at(dir.path()).unwrap().unwrap();
         let (native, events) = fixture::Native::new(dir.path().to_path_buf());
         native.attached.store(true, Ordering::Release);
-        let actor = aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true);
+        let actor =
+            aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
         let mut coordinator = Coordinator::default();
         spawn_background_with(&actor, |_, _, owner| {
             let scope = input_setup_scope_at(dir.path());
@@ -1257,7 +1299,7 @@ mod tests {
             let dir = aterm_tempfile::tempdir().unwrap();
             let (setup, revision) = native_pending_caps(dir.path());
             let (native, events) = fixture::Native::new(dir.path().to_path_buf());
-            let actor = InitialSetupAdmissionStopTest::keyboard_system(false);
+            let actor = InitialSetupAdmissionStopTest::keyboard_system(false, &[]);
             let mut coordinator = Coordinator::default();
             spawn_background_with(&actor, |_, _, owner| {
                 owner
@@ -1276,7 +1318,7 @@ mod tests {
                 } else {
                     setup
                         .native_workstation_pass(revision, || {
-                            Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+                            Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[]))
                         })
                         .unwrap()
                         .unwrap();
@@ -1324,18 +1366,66 @@ mod tests {
         let invalidations = std::cell::Cell::new(0);
         let invalidate = || invalidations.set(invalidations.get() + 1);
         let mut inputs = Inputs::default();
-        let observe = |inputs: &mut Inputs, ids| {
+        let observe = |inputs: &mut Inputs, ids: Vec<u64>| {
             inputs.round(
                 true,
                 0,
                 scope,
-                || Ok(ids),
-                || panic!("pending observation reads only service identities"),
+                || Ok(ids.clone()),
+                || observations(&ids),
                 |_, _| panic!("pending observation has no setter authority"),
                 &changed,
                 &invalidate,
             )
         };
+        // Readability is keyed by service, not a count or an error string. Losing a
+        // positive read cannot repeatedly rearm the same pending service's retry budget.
+        let mut partial = Inputs::default();
+        let partial_wakes = crate::SetupWakes::new();
+        for (unread, expected_nudge) in [
+            (&[41, 42][..], true),
+            (&[41, 42][..], false),
+            (&[42][..], true),
+            (&[41][..], true),
+            (&[][..], false),
+            (&[41, 42][..], false),
+            (&[41][..], false),
+        ] {
+            let sys = InitialSetupAdmissionStopTest::keyboard_system(true, unread);
+            let before = partial_wakes.marks();
+            assert!(
+                !partial
+                    .round(
+                        true,
+                        0,
+                        scope,
+                        || sys.keyboard_service_ids(),
+                        || sys.keyboard_service_observations(),
+                        |_, _| panic!("readability authorizes no attachment setter"),
+                        &|| partial_wakes.raise_facts(),
+                        &|| {},
+                    )
+                    .unwrap()
+            );
+            assert_eq!(partial_wakes.marks().facts != before.facts, expected_nudge);
+        }
+        let before_error = partial_wakes.marks();
+        assert!(
+            !partial
+                .round(
+                    true,
+                    0,
+                    scope,
+                    || Ok(vec![41, 42]),
+                    || Err("native properties unavailable".into()),
+                    |_, _| panic!("an unread native source authorizes no setter"),
+                    &|| partial_wakes.raise_facts(),
+                    &|| {},
+                )
+                .unwrap()
+        );
+        assert_eq!(partial_wakes.marks(), before_error);
+
         let before = wakes.marks();
         assert!(!observe(&mut inputs, vec![41]).unwrap());
         assert_eq!(
@@ -1389,12 +1479,12 @@ mod tests {
         let before_completion = invalidations.get();
         setup
             .native_workstation_pass(revision, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true, &[]))
             })
             .unwrap()
             .unwrap();
         assert_eq!(scope().unwrap(), InputSetupScope::Applied(revision));
-        let no_op = InitialSetupAdmissionStopTest::keyboard_system(true);
+        let no_op = InitialSetupAdmissionStopTest::keyboard_system(true, &[]);
         assert!(
             inputs
                 .round(

@@ -2477,7 +2477,8 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
         to: label.to_string(),
         at: crate::supervise::policy::turn_end::AccountAt::Wall,
     };
-    let word = |why: &Restart, cause: &str, step: &str| carried_word(why, cause, step.to_string());
+    let word =
+        |why: &Restart, cause: &str, step: &str| carried_word(why, false, cause, step.to_string());
     for cause in [
         "",
         CAUSE_MEMORY,
@@ -2513,6 +2514,119 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
         word(&to("work"), "account:work-2", "adopted"),
         IN_FLIGHT_OTHER
     );
+}
+
+/// The ask of a click on the permission chip toward `to`, at Unix second `at`.
+fn click_ask(
+    to: crate::supervise::policy::turn_end::PermissionTo,
+    at: i64,
+) -> (Restart, RestartAsk) {
+    let why = Restart::Permission {
+        to,
+        conversation: "0badf00d-1111-2222-3333-4444555566ac".to_string(),
+    };
+    let ask = RestartAsk::of(&why, at);
+    (why, ask)
+}
+
+/// A CLICK OVER A RECORD NOT ITS OWN STANDS (decision 5): whatever the carry of that record says,
+/// `failed:` included, the click reads [`IN_FLIGHT_OTHER`], since that word is the other
+/// restart's; over its own record the carry's word is its own.
+#[test]
+fn a_click_over_a_record_not_its_own_reads_another_restart_in_flight() {
+    let (why, _) = click_ask(
+        crate::supervise::policy::turn_end::PermissionTo::Bypass,
+        1_762_000_500,
+    );
+    for step in [
+        "adopted",
+        "relaunched",
+        "done:resumed",
+        "wait:held",
+        "failed:relaunch:ERR",
+        "refused:no-resume",
+    ] {
+        for cause in [CAUSE_MEMORY, CAUSE_PERMISSION] {
+            assert_eq!(
+                carried_word(&why, false, cause, step.to_string()),
+                IN_FLIGHT_OTHER,
+                "{cause} {step}"
+            );
+        }
+        assert_eq!(
+            carried_word(&why, true, CAUSE_PERMISSION, step.to_string()),
+            step
+        );
+    }
+}
+
+/// A CLICK'S TWO CAUSES (decision 7): resumed and afresh, chosen as `exit` and `exit-fresh` are;
+/// each is the click's own by its ask alone (an earlier click's record is not), each ends its
+/// agent and is carried quietly, and only the afresh one starts afresh.
+#[test]
+fn a_clicks_causes_are_its_own_and_only_the_fresh_one_starts_afresh() {
+    let (why, ask) = click_ask(
+        crate::supervise::policy::turn_end::PermissionTo::Settings,
+        1_762_000_500,
+    );
+    let (_, earlier) = click_ask(
+        crate::supervise::policy::turn_end::PermissionTo::Settings,
+        1_762_000_440,
+    );
+    let of = |cause: &str| St {
+        cause: cause.to_string(),
+        ask: ask.word().to_string(),
+        ..St::default()
+    };
+    for cause in [CAUSE_PERMISSION, CAUSE_PERMISSION_FRESH] {
+        assert!(its_own(&why, &ask, &of(cause)), "{cause}");
+        assert!(
+            !its_own(&why, &earlier, &of(cause)),
+            "{cause}: another click's"
+        );
+        assert!(ends_its_agent(cause), "{cause}");
+        assert!(carried_quietly(cause, false), "{cause}");
+        assert_eq!(
+            starts_afresh(cause),
+            cause == CAUSE_PERMISSION_FRESH,
+            "{cause}"
+        );
+    }
+    assert!(
+        !its_own(&why, &ask, &of(CAUSE_MEMORY)),
+        "a memory restart's record is no click's"
+    );
+}
+
+/// A CLICK'S LINE TYPES THE STORE BUILD, NEVER THE TWIN (design §3, decision 2): the managed
+/// twin's build where the agent runs the twin, any other program as it is; a twin whose build
+/// cannot be read waits ([`TWIN_BUILD_UNREAD`]) rather than type the twin, which would make a
+/// plain line yolo.
+#[cfg(unix)]
+#[test]
+fn a_clicks_line_types_the_store_build_never_the_twin() {
+    let world = aterm_tempfile::tempdir().expect("a world");
+    let agents = world.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("agents");
+    let build = world
+        .path()
+        .join("store/claude/1000002000001000318/bin/claude");
+    std::fs::create_dir_all(build.parent().expect("a bin")).expect("the store");
+    std::fs::write(&build, "a build").expect("the build");
+    let twin = agents.join("claude");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display()),
+    )
+    .expect("the twin");
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+    let other = PathBuf::from("/opt/claude/bin/claude");
+    let read = (click_build(&twin), click_build(&other));
+    std::fs::remove_file(&build).expect("the build goes");
+    let unread = click_build(&twin);
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+    assert_eq!(read, (Ok(build), Ok(other)));
+    assert_eq!(unread, Err(TWIN_BUILD_UNREAD));
 }
 
 /// A record the restart asked supersedes but for its native move is carried, and the carry's

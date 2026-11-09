@@ -2609,10 +2609,11 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<&'static str>)> {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.claude_card.glass_hits.is_empty())
+        if self.stats_lens_at(wid, x, y)
+            || self
+                .windows
+                .get(&wid)
+                .is_none_or(|ws| ws.claude_card.glass_hits.is_empty())
         {
             return None;
         }

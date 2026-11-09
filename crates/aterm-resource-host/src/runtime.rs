@@ -395,6 +395,15 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         Some("native-context") if hello["version"].as_u64() == Some(3) => {
             crate::resource_context::serve(stream, peer, &hello, deadline, crate::actor::context)
         }
+        Some("native-bootstrap-graph-support-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::bootstrap_graph_transport::support(stream, peer, &hello, deadline)
+        }
+        Some("native-bootstrap-graph-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::bootstrap_graph_transport::serve(stream, peer, &hello, deadline)
+        }
+        Some("native-bootstrap-sdk-query-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::bootstrap_graph_transport::query(stream, peer, &hello, deadline)
+        }
         Some("runtime-input-retention-v1") if hello["version"].as_u64() == Some(3) => {
             crate::runtime_input_transport::serve(stream, peer, &hello, deadline)
         }

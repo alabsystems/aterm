@@ -25,6 +25,9 @@ const COMPAT_CHECK_EPOCH: u64 = 1;
 const LIPO_ARM64: &str = "arm64";
 const LIPO_X86_64: &str = "x86_64";
 
+/// The cut's persistent log directory, supplied to its build child.
+pub(crate) const SLICE_LOGS_ENV: &str = "ATERM_RELEASE_SLICE_LOGS";
+
 /// Platform policy, independent of the shared core pool and per-slice memory admission.
 pub enum Sequencing {
     /// macOS slices borrow from one Release jobserver.
@@ -857,7 +860,8 @@ fn log_tail(log: &Path, n: usize) -> String {
 fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<BuildOutput, String> {
     snapshot::private_dir(symbol_out, "release symbol stage")?;
 
-    let (slices, slice_builds) = build_slices(plan, take, &take.stage)?;
+    let logs = std::env::var_os(SLICE_LOGS_ENV).map(PathBuf::from);
+    let (slices, slice_builds) = build_slices(plan, take, logs.as_deref().unwrap_or(&take.stage))?;
     // Keep Cargo's linked outputs untouched: a fresh hop copies, stamps and signs those same
     // bytes again. Mutating a target output would invalidate its output-integrity evidence.
     let mut stamped = Vec::new();

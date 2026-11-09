@@ -445,6 +445,8 @@ pub trait ChannelRelease {
     /// Converge one asset onto the release under a durable one-shot upload intent,
     /// re-downloaded and proved byte-identical to the local file.
     fn upload(&mut self, file: &Path) -> Result<()>;
+    /// Upload independent payloads, joining every started upload before returning.
+    fn upload_payloads(&mut self, files: &[PathBuf]) -> Result<()>;
     /// From a fresh listing: the release carries exactly the asset set the deployed
     /// updater elects, each byte-identical to this cut's artifact.
     fn prove_assets(&mut self) -> Result<()>;
@@ -487,7 +489,17 @@ pub fn publish_on_channel(release: &mut dyn ChannelRelease) -> Result<()> {
     });
     release.ratchet()?;
     release.bind()?;
-    for file in &files {
+    let payloads = files.partition_point(|file| {
+        channel_upload_rank(
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+        ) == 0
+    });
+    // Invariant: every named payload is confirmed before the signature, and the
+    // signature is confirmed before the appcast that clients can elect.
+    release.upload_payloads(&files[..payloads])?;
+    for file in &files[payloads..] {
         release.upload(file)?;
     }
     release.prove_assets()?;

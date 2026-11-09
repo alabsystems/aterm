@@ -254,6 +254,7 @@ fn wrap(
             )
         })
         .flatten();
+    let queued = timestamp();
     let claim = match (&unit, units.spare) {
         (Some(unit), Some(spare)) => {
             let records = aterm_capacity::book::Records::load(&units.record);
@@ -290,10 +291,32 @@ fn wrap(
         }
         _ => None,
     };
+    let started = timestamp();
     let child = command
         .spawn()
         .map_err(|e| format!("start {}: {e}", words.first().map_or("", String::as_str)))?;
-    let (status, peak) = wait(child).map_err(|e| format!("wait for the compiler: {e}"))?;
+    if let Some(unit) = &unit {
+        let mut event = unit_event(units, unit, "started", queued, started, None, None);
+        if let aterm_json::Value::Object(fields) = &mut event {
+            fields.insert("compiler_pid".to_owned(), child.id().into());
+        }
+        eprintln!("{event}");
+    }
+    let (status, peak, cpu) = wait(child).map_err(|e| format!("wait for the compiler: {e}"))?;
+    if let Some(unit) = &unit {
+        eprintln!(
+            "{}",
+            unit_event(
+                units,
+                unit,
+                "ended",
+                queued,
+                timestamp(),
+                cpu,
+                Some(status.success())
+            )
+        );
+    }
     drop(claim);
     // A compiler that failed or was killed stopped short of its peak.
     if status.success()
@@ -310,6 +333,31 @@ fn wrap(
         .code()
         .and_then(|c| u8::try_from(c).ok())
         .unwrap_or(1))
+}
+
+fn timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// One compiler's timeline event. Epoch seconds align slices with the tree's event stream;
+/// the wrapper PID distinguishes repeated invocations of the same Cargo unit.
+fn unit_event(
+    units: &Units,
+    unit: &aterm_verify::unitgraph::UnitName,
+    phase: &str,
+    queued: f64,
+    at: f64,
+    cpu: Option<f64>,
+    success: Option<bool>,
+) -> aterm_json::Value {
+    aterm_json::json!({
+        "event": "release-slice-unit", "phase": phase,
+        "triple": units.triple, "package": unit.package, "unit": unit.kind,
+        "pid": std::process::id(), "queued_unix_s": queued, "at_unix_s": at,
+        "cpu_s": cpu, "success": success,
+    })
 }
 
 /// Keep `peak` for `unit` where it reaches [`FLOOR`] or the unit is kept already.
@@ -334,16 +382,20 @@ fn keep(units: &Units, unit: &aterm_verify::unitgraph::UnitName, peak: u64) -> s
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait(
     mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
+) -> std::io::Result<(std::process::ExitStatus, Option<u64>, Option<f64>)> {
     let usage = child.wait_with_rusage()?;
-    Ok((usage.status, Some(usage.maxrss).filter(|b| *b > 0)))
+    Ok((
+        usage.status,
+        Some(usage.maxrss).filter(|b| *b > 0),
+        Some(usage.cpu.as_secs_f64()),
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn wait(
     mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
-    Ok((child.wait()?, None))
+) -> std::io::Result<(std::process::ExitStatus, Option<u64>, Option<f64>)> {
+    Ok((child.wait()?, None, None))
 }
 
 #[cfg(test)]

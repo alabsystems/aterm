@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code light beside aterm's footer: the permission mode, the one setting the owner always expects on.
+//! The Claude Code light beside aterm's footer: the permission mode, read as one bit
+//! (`docs/DESIGN-yolo-binary-2026-11-04.md` §1): yolo where Claude's pill reads bypass, not yolo in
+//! any other mode.
 
 use crate::harness::footer;
 
-/// How long one shift+tab of a mode return may take to show on Claude's screen before the host calls it failed.
+/// How long an Autopilot chip's click waits for its word to read back before the chip lets it go.
 pub const SETTLE_MS: u64 = 2500;
-
-/// How many shift+tab presses a mode toggle may spend on its way to its [`Goal`].
-pub const MAX_MODE_PRESSES: u8 = 5;
 
 /// One light of the row; the permission mode is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Light {
-    /// Claude's permission mode, one setting whatever its pill names: on in an expected mode ([`Mode::is_expected`]: bypass or auto), off otherwise.
+    /// Claude's permission mode, one bit whatever its pill names: yolo in bypass
+    /// ([`footer::YOLO_ON`]), not yolo in every other mode ([`footer::YOLO_OFF`]).
     Mode,
 }
 
@@ -22,86 +22,15 @@ impl Light {
     /// Every light, in the order the row draws them.
     pub const ALL: [Light; 1] = [Light::Mode];
 
-    /// The light's word on its chip while its state is not known; the mode light's chip names its mode ([`Mode::word`]) once one is.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Light::Mode => "mode",
-        }
-    }
-
     /// The light's name, as an accessibility label names it (`Permission mode: yolo.`); the
-    /// glass title says what the state does instead ([`Mode::gist`]), beside a chip that already
-    /// shows the state's word.
+    /// glass title says what the state does instead, beside a chip that already shows the
+    /// state's word.
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
             Light::Mode => "Permission mode",
         }
     }
-}
-
-/// Where a click on a light sends it: the state it does not show.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Goal {
-    /// Back to an expected mode (bypass or auto): the click on an Off light.
-    On,
-    /// To manual mode (`lame` on a rewritten row): the click on an On light.
-    Off,
-}
-
-impl Goal {
-    /// The goal a click on the light showing `mode` has, the state it does not show:
-    /// [`Goal::Off`] from an expected mode (the light On), [`Goal::On`] from any other.
-    #[must_use]
-    pub const fn of_mode(mode: Mode) -> Goal {
-        if mode.is_expected() {
-            Goal::Off
-        } else {
-            Goal::On
-        }
-    }
-
-    /// Whether `mode` is where the toggle is going: an expected mode for [`Goal::On`], manual
-    /// mode for [`Goal::Off`].
-    #[must_use]
-    pub const fn reached(self, mode: Mode) -> bool {
-        match self {
-            Goal::On => mode.is_expected(),
-            Goal::Off => matches!(mode, Mode::Manual),
-        }
-    }
-
-    /// Where it goes, as a title's click clause names it (`yolo or auto`, `lame`; on Claude's own
-    /// row `bypass or auto`, `manual`).
-    #[must_use]
-    pub fn words(self, rewritten: bool) -> String {
-        match self {
-            Goal::On => format!("{} or auto", Mode::Bypass.word_on_glass(rewritten)),
-            Goal::Off => Mode::Manual.word_on_glass(rewritten).to_owned(),
-        }
-    }
-}
-
-/// The ink a mode's chip is drawn in ([`Mode::ink`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModeInk {
-    /// The glass's value ink: a mode the owner expects (bypass, the default, and auto) named as
-    /// a fact's value is, with no hue of its own.
-    Value,
-    /// The row's plain ink: a mode the owner does not expect, drawn as plainly as Claude's text.
-    Row,
-}
-
-/// What a light shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LightState {
-    /// The setting is on.
-    On,
-    /// The setting is off.
-    Off,
-    /// No screen has shown it yet, or the pill drawn is one this module does not know (a box over the composer keeps the last state shown).
-    Unknown,
 }
 
 /// Claude Code's permission mode, as its pill names it.
@@ -135,106 +64,9 @@ impl Mode {
             _ => return None,
         })
     }
-
-    /// Whether the owner expects this mode: bypass (auto-approve) or auto.
-    #[must_use]
-    pub const fn is_expected(self) -> bool {
-        matches!(self, Mode::Bypass | Mode::Auto)
-    }
-
-    /// The mode's short word, as the light names it: `bypass`, `auto`, `accept edits`, `don't ask`, `plan`, `manual`.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Mode::Bypass => "bypass",
-            Mode::Auto => "auto",
-            Mode::AcceptEdits => "accept edits",
-            Mode::DontAsk => "don't ask",
-            Mode::Plan => "plan",
-            Mode::Manual => "manual",
-        }
-    }
-
-    /// The mode's word where the glass rewrites Claude's mode row (`rewritten`: the host dropped the pill this frame, under its gate and only where the glass took it, [`footer::mode_row_rewrite_under`]), so the lights block is the mode's one home: bypass is [`footer::YOLO_ON`] and manual mode [`footer::YOLO_OFF`]; one state has one name on screen.
-    #[must_use]
-    pub const fn word_on_glass(self, rewritten: bool) -> &'static str {
-        match self {
-            Mode::Bypass if rewritten => footer::YOLO_ON,
-            Mode::Manual if rewritten => footer::YOLO_OFF,
-            _ => self.word(),
-        }
-    }
-
-    /// The glyph the light draws before its word: none on a rewritten row for the two ends of a
-    /// click, an expected mode and manual (`yolo`, `auto`, `lame`), so the toggle between them is a
-    /// word for a word; Claude's pill glyph ([`Self::glyph`]) everywhere else (`⏸ plan`).
-    #[must_use]
-    pub fn glyph_on_glass(self, rewritten: bool) -> &'static str {
-        if rewritten && (self.is_expected() || matches!(self, Mode::Manual)) {
-            ""
-        } else {
-            self.glyph()
-        }
-    }
-
-    /// How a title names the mode as a place: its word on glass and ` mode` (`stopped in plan mode`, `stopped in lame mode`, [`Self::word_on_glass`]).
-    #[must_use]
-    pub fn named_on_glass(self, rewritten: bool) -> String {
-        format!("{} mode", self.word_on_glass(rewritten))
-    }
-
-    /// What the mode does, as the light's title says it first: a phrase with no ` — ` or ` · `,
-    /// so a title cut to its head ([`Self::claude_name`] and the click clause follow it) is this.
-    #[must_use]
-    pub const fn gist(self) -> &'static str {
-        match self {
-            Mode::Bypass => "no permission prompts",
-            Mode::Auto => "a classifier answers prompts",
-            Mode::AcceptEdits => "edits without asking",
-            Mode::DontAsk => "denies unapproved",
-            Mode::Plan => "plans before it acts",
-            Mode::Manual => "asks before each tool",
-        }
-    }
-
-    /// Claude Code's own name for the mode: its pill's words without the trailing ` on`
-    /// (`bypass permissions`, `manual mode`), which a title gives where the chip wears aterm's word
-    /// for it instead (`yolo`, `lame`).
-    #[must_use]
-    pub fn claude_name(self) -> &'static str {
-        footer::PILLS
-            .iter()
-            .find(|pill| Mode::of_indicator(pill.id) == Some(self))
-            .map_or("", |pill| {
-                let words = aterm_phase::anchor(pill.id);
-                words.strip_suffix(" on").unwrap_or(words)
-            })
-    }
-
-    /// The pill glyph Claude draws before the mode, from the vendor's table (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
-    #[must_use]
-    pub fn glyph(self) -> &'static str {
-        footer::PILLS
-            .iter()
-            .find(|pill| Mode::of_indicator(pill.id) == Some(self))
-            .map_or("", |pill| pill.glyph)
-    }
-
-    /// The ink the mode's chip is drawn in: an expected mode (bypass, the default, and auto) in
-    /// the glass's value ink, never Claude's red nor its pill's amber (`yolo` reads as a value,
-    /// the owner, 2026-11-02; `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1), every
-    /// other mode in the row's plain ink.
-    #[must_use]
-    pub const fn ink(self) -> ModeInk {
-        if self.is_expected() {
-            ModeInk::Value
-        } else {
-            ModeInk::Row
-        }
-    }
 }
 
-/// What one Claude Code screen says about the light's setting and the turn, read off the engine where a toggle's next press is decided and for a live upgrade's note; a frame folds in [`read_lights`] instead.
+/// What one Claude Code screen says about the light's setting and the turn, read off the engine where a click on the light is decided and for a live upgrade's note; a frame folds in [`read_lights`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
     /// The permission mode its pill names (every mode draws one, default included: `⏸ manual mode on`).
@@ -269,7 +101,7 @@ pub fn read_screen(rows: &[String], title: Option<&str>) -> Option<Screen> {
     })
 }
 
-/// What the lights show of `rows`: [`read`] of [`read_screen`], without the turn.
+/// What the lights show of `rows`: [`read_screen`]'s mode and pill, without the turn.
 #[must_use]
 pub fn read_lights(rows: &[String]) -> Option<Reading> {
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
@@ -310,18 +142,11 @@ impl Reading {
         pill: false,
     };
 
-    /// `light`'s state: the mode light is On in an expected mode ([`Mode::is_expected`]) and Off in any other.
+    /// The bit, where a pill this build knows is drawn: `Some(true)` in bypass (yolo), `Some(false)`
+    /// in any other mode, `None` with no mode read.
     #[must_use]
-    pub fn state(&self, light: Light) -> LightState {
-        match light {
-            Light::Mode => self.mode.map_or(LightState::Unknown, |m| {
-                if m.is_expected() {
-                    LightState::On
-                } else {
-                    LightState::Off
-                }
-            }),
-        }
+    pub fn yolo(&self) -> Option<bool> {
+        self.mode.map(|m| m == Mode::Bypass)
     }
 
     /// Fold a newer screen reading in.
@@ -331,24 +156,6 @@ impl Reading {
         }
     }
 }
-
-/// Whether `light` shows something the owner does not expect: the reason a light is drawn at rest on Claude's own row (on a row the glass rewrites every known mode is drawn, the light being the mode's one home); a click acts in either state ([`Goal::of_mode`]).
-#[must_use]
-pub fn deviates(light: Light, reading: &Reading) -> bool {
-    reading.state(light) == LightState::Off
-}
-
-/// What `screen` says of each light; [`Reading::UNKNOWN`] without one.
-#[must_use]
-pub fn read(screen: Option<&Screen>) -> Reading {
-    screen.map_or(Reading::UNKNOWN, |s| Reading {
-        mode: s.mode,
-        pill: s.pill,
-    })
-}
-
-/// shift+tab, as a terminal sends it: the mode light's one input, pressed until its [`Goal`].
-pub const SHIFT_TAB: &[u8] = b"\x1b[Z";
 
 #[cfg(test)]
 mod tests {
@@ -368,30 +175,31 @@ mod tests {
     const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7} \u{2190} for agents";
 
     /// The mode shown survives a box (no composer) and a menu (no pill row),
-    /// but a drawn pill this build cannot name turns it Unknown.
+    /// but a drawn pill this build cannot name leaves the bit unread.
     #[test]
     fn a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown() {
         let rule = "\u{2500}".repeat(60);
-        let bypass = read_screen(&screen(&rule, BYPASS), None).unwrap();
-        let fold_from_bypass = |newer: Option<&Screen>| {
-            let mut shown = read(Some(&bypass));
-            shown.fold(&read(newer));
-            shown.state(Light::Mode)
+        let bypass = read_lights(&screen(&rule, BYPASS)).unwrap();
+        let fold_from_bypass = |newer: Option<Reading>| {
+            let mut shown = bypass;
+            shown.fold(&newer.unwrap_or(Reading::UNKNOWN));
+            shown.yolo()
         };
-        assert_eq!(fold_from_bypass(None), LightState::On, "a box keeps it");
-        let menu = read_screen(&screen(&rule, "  /model   Set the AI model"), None).unwrap();
+        assert_eq!(fold_from_bypass(None), Some(true), "a box keeps it");
+        let menu = screen(&rule, "  /model   Set the AI model");
         assert_eq!(
-            fold_from_bypass(Some(&menu)),
-            LightState::On,
+            fold_from_bypass(read_lights(&menu)),
+            Some(true),
             "so does a menu"
         );
         for row in ["  \u{23F5}\u{23F5} turbo mode on", "  \u{23F8} plan mo"] {
-            let s = read_screen(&screen(&rule, row), None).unwrap();
+            let rows = screen(&rule, row);
+            let s = read_screen(&rows, None).unwrap();
             assert!(s.pill && s.mode.is_none(), "{row:?}");
-            assert_eq!(fold_from_bypass(Some(&s)), LightState::Unknown, "{row:?}");
+            assert_eq!(fold_from_bypass(read_lights(&rows)), None, "{row:?}");
         }
-        let plan = read_screen(&screen(&rule, "  \u{23F8} plan mode on"), None).unwrap();
-        assert_eq!(fold_from_bypass(Some(&plan)), LightState::Off);
+        let plan = screen(&rule, "  \u{23F8} plan mode on");
+        assert_eq!(fold_from_bypass(read_lights(&plan)), Some(false));
     }
 
     /// A pill whose `(shift+tab to cycle)` hint a narrow pane cut, between
@@ -409,42 +217,14 @@ mod tests {
             ("  \u{23F5}\u{23F5} auto mode on (shif", Mode::Auto),
         ];
         for (row, mode) in cases {
-            let s = read_screen(&screen(&rule, row), None).expect("a composer");
+            let rows = screen(&rule, row);
+            let s = read_screen(&rows, None).expect("a composer");
             assert_eq!(s.mode, Some(mode), "{row:?}");
-            let r = read(Some(&s));
-            assert_eq!(deviates(Light::Mode, &r), !mode.is_expected(), "{row:?}");
-        }
-    }
-
-    /// THE LIGHT IS THE MODE'S ONE NAME (review C8): where the glass rewrites the
-    /// mode row bypass reads `yolo` and manual `lame`, each with no glyph, and a title
-    /// names every mode as its word and ` mode` (`stopped in lame mode`).
-    #[test]
-    fn the_lights_word_follows_the_rewritten_row_and_only_under_its_gate() {
-        assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
-        assert_eq!(Mode::Bypass.word_on_glass(true), "yolo");
-        assert_eq!(Mode::Manual.word_on_glass(true), footer::YOLO_OFF);
-        assert_eq!(Mode::Manual.word_on_glass(true), "lame");
-        assert_eq!(Mode::Manual.named_on_glass(true), "lame mode");
-        assert_eq!(Mode::Bypass.word_on_glass(false), "bypass");
-        assert_eq!(Mode::Manual.word_on_glass(false), "manual");
-        assert_eq!(Mode::Manual.named_on_glass(false), "manual mode");
-        for mode in [Mode::Auto, Mode::AcceptEdits, Mode::DontAsk, Mode::Plan] {
-            for rewritten in [true, false] {
-                assert_eq!(mode.word_on_glass(rewritten), mode.word(), "{mode:?}");
-            }
-        }
-        for mode in ALL_MODES {
-            for rewritten in [true, false] {
-                assert_eq!(
-                    mode.named_on_glass(rewritten),
-                    format!("{} mode", mode.word_on_glass(rewritten)),
-                    "{mode:?}"
-                );
-            }
-            let bare = mode.is_expected() || mode == Mode::Manual;
-            assert_eq!(mode.glyph_on_glass(true).is_empty(), bare, "{mode:?}");
-            assert_eq!(mode.glyph_on_glass(false), mode.glyph(), "{mode:?}");
+            assert_eq!(
+                read_lights(&rows).and_then(|r| r.yolo()),
+                Some(mode == Mode::Bypass),
+                "{row:?}"
+            );
         }
     }
 
@@ -458,88 +238,41 @@ mod tests {
         Mode::Manual,
     ];
 
-    /// WHAT THE LIGHT'S TITLE SAYS: each mode's gist is a phrase a title can be cut to (no
-    /// ` — `, no ` · `), Claude's own name is its pill's words without ` on`, and the click's
-    /// goal is the state the light does not show: yolo and auto go to manual (`lame`), every
-    /// other mode back to yolo or auto.
+    /// A box over the composer: nothing is known, so the bit is unread.
     #[test]
-    fn each_mode_says_what_it_does_and_where_a_click_takes_it() {
+    fn no_composer_no_lights_and_no_drive() {
+        assert_eq!(read_screen(&["$ ls".to_owned()], None), None);
+        assert_eq!(read_lights(&["$ ls".to_owned()]), None);
+        assert_eq!(Reading::UNKNOWN.yolo(), None);
+    }
+
+    /// EVERY MODE HAS ONE PILL (`lights-mode-pill-table`): each mode is named by exactly one entry
+    /// of the footer's pill table and each entry names a mode, so the bit, the bypass row's
+    /// rewrite and a restart's carried mode (`relaunch::screen_mode`) read every pill Claude draws.
+    #[test]
+    fn every_mode_has_one_pill_and_every_pill_a_mode() {
         for mode in ALL_MODES {
-            let gist = mode.gist();
-            assert!(
-                !gist.is_empty() && !gist.contains(" \u{2014} ") && !gist.contains(" \u{b7} "),
-                "{mode:?}: {gist:?}"
-            );
-            let id = footer::PILLS
+            let pills = footer::PILLS
                 .iter()
-                .find(|pill| Mode::of_indicator(pill.id) == Some(mode))
-                .expect("a pill")
-                .id;
-            assert_eq!(
-                format!("{} on", mode.claude_name()),
-                aterm_phase::anchor(id),
-                "{mode:?}"
-            );
+                .filter(|pill| Mode::of_indicator(pill.id) == Some(mode))
+                .count();
+            assert_eq!(pills, 1, "{mode:?}");
+        }
+        for pill in &footer::PILLS {
+            assert!(Mode::of_indicator(pill.id).is_some(), "{}", pill.id);
+        }
+    }
+
+    /// THE BIT IS BYPASS ALONE (`docs/DESIGN-yolo-binary-2026-11-04.md` §1): yolo where the pill
+    /// reads bypass, not yolo in every other mode, `auto` included.
+    #[test]
+    fn the_bit_is_yolo_in_bypass_alone() {
+        for mode in ALL_MODES {
             let at = Reading {
                 mode: Some(mode),
                 pill: true,
             };
-            let goal = Goal::of_mode(mode);
-            assert_eq!(
-                goal == Goal::Off,
-                at.state(Light::Mode) == LightState::On,
-                "{mode:?}"
-            );
-            assert!(
-                !goal.reached(mode),
-                "{mode:?}: a click always moves the mode"
-            );
-        }
-        assert_eq!(Mode::Bypass.claude_name(), "bypass permissions");
-        assert_eq!(Mode::Manual.claude_name(), "manual mode");
-        assert!(Goal::Off.reached(Mode::Manual));
-        assert!(Goal::On.reached(Mode::Bypass) && Goal::On.reached(Mode::Auto));
-        assert_eq!(Goal::On.words(true), "yolo or auto");
-        assert_eq!(Goal::Off.words(true), "lame");
-        assert_eq!(Goal::On.words(false), "bypass or auto");
-        assert_eq!(Goal::Off.words(false), "manual");
-    }
-
-    /// YOLO AND AUTO ARE VALUES, NEVER RED NOR AMBER (the owner, 2026-11-02; the glass's one
-    /// token set): an expected mode takes the glass's value ink, every other mode the row's
-    /// plain ink.
-    #[test]
-    fn expected_modes_wear_the_value_ink_and_the_rest_the_rows() {
-        assert_eq!(Mode::Bypass.ink(), ModeInk::Value);
-        assert_eq!(Mode::Auto.ink(), ModeInk::Value);
-        for mode in ALL_MODES {
-            assert_eq!(mode.ink() == ModeInk::Row, !mode.is_expected(), "{mode:?}");
-        }
-    }
-
-    /// A box over the composer: nothing is known, so nothing deviates.
-    #[test]
-    fn no_composer_no_lights_and_no_drive() {
-        assert_eq!(read_screen(&["$ ls".to_owned()], None), None);
-        assert_eq!(read(None), Reading::UNKNOWN);
-        for light in Light::ALL {
-            assert!(!deviates(light, &Reading::UNKNOWN));
-        }
-    }
-
-    /// The mode light deviates in every mode but bypass and auto (on Claude's own row, the reason
-    /// it is drawn at rest).
-    #[test]
-    fn only_a_mode_the_owner_does_not_expect_deviates() {
-        let at = |mode: Mode| Reading {
-            mode: Some(mode),
-            pill: true,
-        };
-        for mode in [Mode::Manual, Mode::AcceptEdits, Mode::Plan, Mode::DontAsk] {
-            assert!(deviates(Light::Mode, &at(mode)), "{mode:?}");
-        }
-        for mode in [Mode::Bypass, Mode::Auto] {
-            assert!(!deviates(Light::Mode, &at(mode)), "{mode:?}: expected");
+            assert_eq!(at.yolo(), Some(mode == Mode::Bypass), "{mode:?}");
         }
     }
 
@@ -556,13 +289,9 @@ mod tests {
             let Some(s) = read_screen(&rows, None) else {
                 continue;
             };
-            let got = read(Some(&s));
+            let got = read_lights(&rows).expect("a composer, as read_screen saw");
             let pill = footer::mode_row(&rows).is_some();
-            assert!(
-                (got.state(Light::Mode) != LightState::Unknown) == pill,
-                "{}: {got:?}",
-                path.display()
-            );
+            assert!(got.yolo().is_some() == pill, "{}: {got:?}", path.display());
             // The prompt-history search (Ctrl-R) heads the mode row with its words and query
             // (measured on 2.1.318): no mode row is read there, so the glass leaves the row whole.
             if rows
@@ -581,7 +310,7 @@ mod tests {
     }
 
     /// On every recorded screen in `aterm-phase`'s fixtures, [`read_lights`] is
-    /// [`read`] of [`read_screen`], and [`reading_under`] the composer's bottom
+    /// [`read_screen`]'s mode and pill, and [`reading_under`] the composer's bottom
     /// rule gives the same reading.
     #[test]
     fn the_lights_reading_is_the_screens_without_its_turn() {
@@ -595,7 +324,10 @@ mod tests {
             let reading = read_lights(&rows);
             assert_eq!(
                 reading,
-                screen.as_ref().map(|s| read(Some(s))),
+                screen.as_ref().map(|s| Reading {
+                    mode: s.mode,
+                    pill: s.pill
+                }),
                 "{}",
                 path.display()
             );
@@ -845,7 +577,7 @@ mod tests {
     }
 
     /// A reply drawn under a status line shows no busy sign (2.1.311 lab `mr`, MEASURED): the
-    /// window title's `◐`/`◑` is the turn the light's next press waits out, while the pill still
+    /// window title's `◐`/`◑` is the turn a restart waits out, while the pill still
     /// names auto mode. A title at rest, one with no glyph, or none held reads the screen alone
     /// (not busy), and the done row ends the turn whatever the title says.
     #[test]

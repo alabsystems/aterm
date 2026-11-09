@@ -35,12 +35,12 @@ impl NoLazyFetch {
     /// How `user`'s git ([`git`]) keeps a read from fetching lazily: [`NoLazyFetch::Flag`] where
     /// `git --no-lazy-fetch --version` succeeds; otherwise [`NoLazyFetch::Variable`] where git
     /// was seen to obey the variable ([`obeys_variable`]); otherwise `None`, where git's read
-    /// fetched or attempted to fetch the object, or a signal ended it. Only a git that refuses
+    /// fetched or attempted to fetch the object. Only a git that refuses
     /// the option is asked more than the one `--version`.
     ///
     /// # Errors
-    /// git could not be asked: a run did not start or finish, the scratch folder its question
-    /// needs could not be made, a setup step failed, its trace was unavailable or incomplete,
+    /// git could not be asked: a run did not start, finish or exit normally, the scratch folder
+    /// its question needs could not be made, a setup step failed, its trace was unavailable or incomplete,
     /// or the local-fetch control did not establish the observation ([`asked`]).
     pub(crate) fn of(sys: &dyn System, user: &User) -> Result<Option<Self>, String> {
         Self::of_git(sys, &|| git(sys, user, None))
@@ -55,6 +55,12 @@ impl NoLazyFetch {
         let flag = sys
             .run_complete_stdout(&command.clone().args(["--no-lazy-fetch", "--version"]))
             .map_err(|_| "cannot ask Git whether it takes --no-lazy-fetch")?;
+        if flag.status.is_none() {
+            return Err(format!(
+                "cannot ask Git whether it takes --no-lazy-fetch: {}",
+                flag.describe()
+            ));
+        }
         if flag.success() {
             return Ok(Some(Self::Flag));
         }
@@ -100,7 +106,7 @@ struct Probe {
 ///
 /// # Errors
 /// The question could not be asked, so nothing shows what git's read would do: the scratch
-/// folder could not be made, a run did not start or finish, or a step setting the question up
+/// folder could not be made, a run did not start or finish normally, or a step setting the question up
 /// failed (where the temporary folder is full or unwritable, say), named with the first line
 /// git said, or `hash-object` named no object. Missing, oversized or incomplete traces and an
 /// unsuccessful local-fetch control also establish no capability and return an error.
@@ -193,7 +199,13 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
         trace::observe(&bytes, object, code).map_err(|why| format!("{WHY}: {why}"))
     };
     let (subject, path, uid) = read("1", "subject.trace")?;
-    let Some(code) = subject.status.filter(|code| *code != 0) else {
+    let code = subject.status.ok_or_else(|| {
+        format!(
+            "{WHY}: Git read did not exit normally ({})",
+            subject.describe()
+        )
+    })?;
+    if code == 0 {
         return Ok(Probe {
             read: subject,
             no_fetch: false,

@@ -7,6 +7,13 @@ enrollment, output attachment and SDK query exchanges. These data exchanges
 do not enable Bootstrap execution: the original Host resource, SDK, output
 and graph closure owners still require integration and qualification. Existing
 consumer observation-deadline and fixture-deadline overlays are preserved.
+The owner-view refinement is the separate engineering commit
+`8a300ddc8b1cd7751547c52da913d1726743071e`, whose sole parent is that original
+protocol commit. It retains the same query lifetime after enrollment/output
+attachment, preserves the Host's SDK-root field meaning, and names the exact
+Root argument prefixes. The wire and image marker are unchanged. This composed
+consumer source requires fresh qualification; earlier codec results do not
+qualify the new Host or activate the graph.
 
 The canonical metadata implementation was recovered from the maintained aterm
 source at `77bd657741` after its advertised vendor commits could not be resolved

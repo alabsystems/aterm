@@ -180,7 +180,7 @@ pub fn lay_stored(run: &Run) -> Result<(), Fail> {
             ("tui", J::s("default")),
         ]),
     )?;
-    let dir = run.w.join("home/.claude");
+    let dir = run.claude_dir();
     let put = |name: &str, text: &str| {
         let p = dir.join(name);
         crate::sys::put(&p, 0o600, &crate::sys::PutSrc::Bytes(text.as_bytes()))

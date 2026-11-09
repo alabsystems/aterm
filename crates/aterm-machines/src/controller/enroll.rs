@@ -2042,7 +2042,7 @@ fn run_install(
             );
             return match sys.run_tty(
                 &remote_sh(master, &install_command(install, sudo), true),
-                &mut || Ok(()),
+                &mut |_| Ok(()),
             ) {
                 Ok(Some(0)) => Ok(()),
                 Ok(code) => Err(format!(

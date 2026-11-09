@@ -6075,6 +6075,15 @@ impl crate::App {
             serial: 0,
             delta: None,
         });
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.claude_lights.glass_hover_px())
+            .is_some_and(|(x, y)| self.stats_lens_at(wid, x, y))
+        {
+            self.note_band_covered(wid);
+            self.evict_stale_glass_hover(wid);
+        }
     }
 
     /// The open lens laid out, not drawn, for the accessibility tree.

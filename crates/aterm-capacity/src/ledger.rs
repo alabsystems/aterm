@@ -274,6 +274,9 @@ impl Record {
         if self.need.leads {
             o.insert("leads".to_owned(), Value::from(true));
         }
+        if let Some(run) = self.need.run_mem.filter(|run| *run < self.need.mem) {
+            o.insert("run_mem".to_owned(), Value::from(run));
+        }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
             q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
@@ -355,6 +358,14 @@ impl Record {
         line_of(o)
     }
 
+    /// The line a step adds ([`crate::Claim::step_down`], [`crate::Claim::step_back`]): the
+    /// latest one read whole stands.
+    pub(crate) fn stepped_line(bytes: u64) -> String {
+        let mut o = Map::new();
+        o.insert("stepped".to_owned(), Value::from(bytes));
+        line_of(o)
+    }
+
     /// The line its holder's measured writes take ([`Self::wrote`]), always [`WROTE_LINE`] bytes, so
     /// a later figure is written over it in place and a reader never finds the record cut short.
     fn wrote_line(bytes: u64) -> String {
@@ -433,6 +444,8 @@ impl Record {
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
             scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
             leads: head.get("leads").and_then(Value::as_bool) == Some(true),
+            run_mem: None,
+            stepped: None,
             stuck_ends: None,
             at_bound: crate::AtBound::Refuse,
         };
@@ -446,6 +459,7 @@ impl Record {
         let mut next_ms: Option<u64> = None;
         let mut credit: Vec<u32> = Vec::new();
         let mut wrote: Option<u64> = None;
+        let mut stepped: Option<u64> = None;
         let mut timing: Option<crate::TimingEvidence> = None;
         for l in lines {
             if l.starts_with('@') {
@@ -484,6 +498,9 @@ impl Record {
             if wrote.is_none() {
                 wrote = num(&v, "wrote");
             }
+            if let Some(s) = num(&v, "stepped") {
+                stepped = Some(s);
+            }
             if let Some(t) = v.get("timing") {
                 timing = Some(crate::TimingEvidence::read(t));
             }
@@ -494,12 +511,21 @@ impl Record {
         if detached && (explicit_held.is_none() || malformed_after) {
             return None;
         }
+        let mut need = need;
+        // A run phase's memory is less than the peak or none (CAP3). A step is a held claim's
+        // own: a waiter is never stepped, and one stepped below what it was admitted with is held
+        // as any other, no longer alone: its reservation is counted beside the other claims'.
+        need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
+        need.stepped = stepped.filter(|_| held);
+        let stepped_down = need.mem_now() < need.mem;
         let held = held.then(|| {
-            explicit_held.unwrap_or(Held {
+            let mut h = explicit_held.unwrap_or(Held {
                 admitted_ms: start_ms,
                 cores: need.cores,
                 alone: false,
-            })
+            });
+            h.alone &= !stepped_down;
+            h
         });
         let wrote = held.and(wrote);
         // Keep the live reservation even when the newest proof is malformed; never retain an

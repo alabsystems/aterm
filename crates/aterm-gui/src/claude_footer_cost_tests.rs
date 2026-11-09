@@ -721,13 +721,22 @@ fn each_reading_follows_its_rows() {
         assert_eq!(read.reads, 1, "{what}: read anew: {read:?}");
         assert_eq!(facts_on(&app), on, "{what}");
     }
+    // The mode light draws on a hosted session alone (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
+    struct Hosted(crate::harness_host::HostHandle);
+    impl Drop for Hosted {
+        fn drop(&mut self) {
+            self.0.shutdown_and_join();
+        }
+    }
     let (mut app, wid, session) = probe_glass();
-    let rule = AT_REST.bottom();
-    assert!(
-        !glass_row(&app, wid, rule).contains("plan"),
-        "CONTROL: bypass draws no light"
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
     );
-    for (mode, drawn) in [(PLAN, true), (BYPASS, false)] {
+    app.harness = Some(host.clone());
+    let _host = Hosted(host);
+    let rule = AT_REST.bottom();
+    for (mode, word, not) in [(PLAN, "lame", "yolo"), (BYPASS, "yolo", "lame")] {
         feed(
             &app,
             session,
@@ -739,11 +748,10 @@ fn each_reading_follows_its_rows() {
         refill(&mut app, wid);
         let read = cost(&mut app, wid);
         assert_eq!(read.reads, 1, "{mode}: the pill read anew: {read:?}");
-        assert_eq!(
-            glass_row(&app, wid, rule).contains("\u{23F8} plan"),
-            drawn,
-            "{mode}: {:?}",
-            glass_row(&app, wid, rule)
+        let glass = glass_row(&app, wid, rule);
+        assert!(
+            glass.contains(word) && !glass.contains(not),
+            "{mode}: the light follows the pill: {glass:?}"
         );
     }
     let banner = aterm_phase::anchor!("launch.banner");
