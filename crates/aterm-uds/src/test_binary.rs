@@ -16,6 +16,8 @@ const LIFECYCLE_CASE: &str = "ATERM_ISOLATED_LIFECYCLE_CASE";
 /// test waits for actual body entry and a successful child exit, then returns
 /// false; the child returns true. Stores created afterward cannot be inherited
 /// by unrelated parallel tests between fork and exec. No lease retry is involved.
+/// Output and process-tree CPU/I/O progress renew the one-minute inactivity
+/// detector, so a body doing durable work has no total runtime budget.
 /// The body starts with SIGHUP, SIGINT, SIGQUIT and SIGTERM at their default
 /// actions, set in its process before it returns true, not the runner's: a
 /// test binary run as a `&` job or under `nohup` starts with some ignored, and
@@ -45,7 +47,12 @@ pub fn isolated_lifecycle(case: &str) -> bool {
     command
         .args(["--exact", case, "--test-threads=1", "--nocapture"])
         .env(CHILD, case);
-    let output = crate::deadline::ends_within(&mut command, crate::deadline::ECHO_HANG);
+    let output = crate::deadline::output_while_process_progressing(
+        &mut command,
+        crate::deadline::ECHO_HANG,
+        format!("isolated lifecycle {case}"),
+    )
+    .unwrap_or_else(|error| panic!("isolated lifecycle {case}: {error}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.lines().any(|line| line.ends_with(&marker)),

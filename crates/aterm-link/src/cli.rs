@@ -1341,7 +1341,7 @@ mod tests {
     #[test]
     fn a_socket_renamed_over_the_path_as_the_broker_starts_ends_it() {
         use aterm_uds::listener::Named;
-        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let scratch = crate::test_scratch_dir("cli");
         let sock = scratch.path().join("b.sock");
         let theirs = scratch.path().join("t.sock");
         let held = scratch.path().join("held.sock");
@@ -1392,9 +1392,8 @@ mod tests {
 
     #[test]
     fn a_broker_exits_only_for_a_settled_replacement_of_its_executable() {
-        let dir = std::env::temp_dir().join(format!("atlink-exe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("exe");
+        let dir = scratch.path();
         let exe = dir.join("aterm");
         std::fs::write(&exe, b"build one").expect("write");
         let start = FileId::of(&exe).expect("start");
@@ -1428,7 +1427,6 @@ mod tests {
         assert!(!replaced(&image, second.as_ref().ok(), &gone));
         std::fs::create_dir(&exe).expect("a directory where the file was");
         assert!(FileId::of(&exe).is_err(), "not a regular file");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1436,7 +1434,7 @@ mod tests {
         use std::ffi::OsStr;
         use std::os::unix::fs::{symlink, PermissionsExt};
 
-        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let scratch = crate::test_scratch_dir("cli");
         let dir = scratch.path();
         let old = dir.join("build-one");
         let new = dir.join("build-two");
@@ -1480,7 +1478,7 @@ mod tests {
 
     #[test]
     fn an_executable_watch_keeps_its_running_identity_across_readiness() {
-        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let scratch = crate::test_scratch_dir("cli");
         let invocation = scratch.path().join("aterm");
         std::fs::write(&invocation, b"running image").expect("old image");
         let original = FileId::of(&invocation).expect("image at startup");
@@ -1644,9 +1642,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_token_file_is_refused() {
-        let dir = std::env::temp_dir().join(format!("atlk-tokfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("tokfile");
+        let dir = scratch.path();
         let elsewhere = dir.join("elsewhere");
         std::fs::write(&elsewhere, "feed1234\n").expect("a token-shaped file");
         let planted = dir.join("a.sock.token");
@@ -1660,6 +1657,5 @@ mod tests {
             refused.as_ref().is_err_and(|e| e.contains("--token-file")),
             "the symlink was followed: {refused:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

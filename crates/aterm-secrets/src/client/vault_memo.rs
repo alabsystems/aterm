@@ -588,6 +588,20 @@ pub(super) struct InputStamps {
     records: crate::records_storage::Standing,
 }
 
+/// Source inputs and the record limits of a stage-owned materialization selection.
+#[derive(PartialEq, Eq)]
+pub(super) struct SelectionInputs {
+    inputs: InputStamps,
+    bounds: RecordBounds,
+}
+
+pub(super) fn selection_inputs(paths: &Paths) -> Option<SelectionInputs> {
+    Some(SelectionInputs {
+        inputs: stamp_inputs(paths, observation_inputs)?,
+        bounds: record_bounds(),
+    })
+}
+
 /// Every file `inputs`' stamps stand for: its own and the membership records' selection's
 /// ([`records_storage::standing_files`](crate::records_storage::standing_files)).
 #[cfg(test)]

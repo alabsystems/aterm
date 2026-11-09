@@ -4,7 +4,13 @@ use std::time::Duration;
 use super::*;
 
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(30)
+    deadline_from(Instant::now())
+}
+
+const NATIVE_INPUT_HANG: Duration = Duration::from_secs(60);
+
+fn deadline_from(started: Instant) -> Instant {
+    started + NATIVE_INPUT_HANG
 }
 
 #[test]
@@ -57,12 +63,22 @@ fn actual_native_system_command_holds_original_image_without_an_sdk() {
 
 #[test]
 fn exact_original_input_survives_neither_byte_drift_nor_same_byte_replacement() {
+    original_input_with_age(Duration::ZERO);
+}
+
+#[test]
+fn required_native_input_keeps_its_original_start_without_a_latency_budget() {
+    original_input_with_age(Duration::from_secs(31));
+}
+
+fn original_input_with_age(age: Duration) {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
     let path = root.join("native-command");
     std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let original = HeldSystemCommand::open(&path, deadline()).unwrap();
+    let original_deadline = deadline_from(Instant::now() - age);
+    let original = HeldSystemCommand::open(&path, original_deadline).unwrap();
     let replacement = root.join("replacement");
     std::fs::copy(&path, &replacement).unwrap();
     std::fs::rename(&replacement, &path).unwrap();

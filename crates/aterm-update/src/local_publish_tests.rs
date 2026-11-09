@@ -4,7 +4,7 @@
 use super::*;
 
 fn fixture() -> (aterm_tempfile::TempDir, Staging, PathBuf) {
-    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let dir = crate::paths::scratch_dir("local-publish").into_tempdir();
     let root = dir.path().join("live");
     let staging = Staging {
         apply_lock: root.join("apply.lock"),

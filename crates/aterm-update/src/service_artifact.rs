@@ -616,7 +616,7 @@ mod tests {
     }
     #[test]
     fn authenticated_store_rechecks_all_bytes_and_authority() {
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         let input = tmp.path().join("input");
         std::fs::create_dir(&input).unwrap();
         std::fs::write(input.join("aterm"), b"signed executable").unwrap();
@@ -679,7 +679,7 @@ mod tests {
     fn shipped_bundle_aliases_survive_materialization_and_bind_their_targets() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         let input = tmp.path().join("aterm.app");
         let binaries = input.join("Contents/MacOS");
         let resources = input.join("Contents/Resources");
@@ -752,7 +752,7 @@ mod tests {
     }
     #[test]
     fn absent_declaration_and_revoked_signer_refuse() {
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         std::fs::write(tmp.path().join("aterm"), b"exe").unwrap();
         let (mut signed, key, report) = fixture(tmp.path());
         let signer = Ed25519KeyPair::from_seed_unchecked(&[22; 32]).unwrap();
@@ -770,7 +770,7 @@ mod tests {
     }
     #[test]
     fn new_roster_reauthorizes_old_release_and_revocation_removes_authority() {
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         std::fs::write(tmp.path().join("aterm"), b"exe").unwrap();
         let (mut signed, key, report) = fixture(tmp.path());
         let master = Ed25519KeyPair::from_seed_unchecked(&[21; 32]).unwrap();
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn restaging_refreshes_authority_atomically_without_replacing_the_image() {
         use std::os::unix::fs::MetadataExt;
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         let input = tmp.path().join("input");
         std::fs::create_dir(&input).unwrap();
         std::fs::write(input.join("aterm"), b"image bytes").unwrap();
@@ -848,7 +848,7 @@ mod tests {
     }
     #[test]
     fn even_authentically_signed_failed_or_different_qualifications_refuse() {
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         std::fs::write(tmp.path().join("aterm"), b"exe").unwrap();
         let (signed, key, report) = fixture(tmp.path());
         let signer = Ed25519KeyPair::from_seed_unchecked(&[22; 32]).unwrap();
@@ -876,7 +876,7 @@ mod tests {
     }
     #[test]
     fn linked_escape_and_protocol_gaps_refuse() {
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         std::os::unix::fs::symlink("/etc/passwd", tmp.path().join("escape")).unwrap();
         assert!(image_digest(tmp.path()).is_err());
         let p = ProtocolRange { min: 2, max: 4 };
@@ -897,7 +897,7 @@ mod tests {
     fn reentering_symlinks_symlinked_executables_and_open_or_unknown_receipts_refuse() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         let reenter = tmp.path().join("reenter");
         std::fs::create_dir(&reenter).unwrap();
         std::fs::write(reenter.join("aterm"), b"exe").unwrap();
@@ -963,7 +963,7 @@ mod tests {
     fn symlinked_store_ancestors_and_non_directory_slots_refuse() {
         use std::os::unix::fs::symlink;
 
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::scratch_dir("service-artifact");
         let canonical = tmp.path().canonicalize().unwrap();
         let real_parent = canonical.join("real");
         std::fs::create_dir(&real_parent).unwrap();

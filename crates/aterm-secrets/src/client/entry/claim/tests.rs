@@ -5,7 +5,7 @@ use super::super::tests::Fixture;
 use super::*;
 use aterm_spec::interp::State as ModelState;
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let f = Fixture::new();
     seed_vault_genesis(&f.paths, &f._root.path().join("claim.genesis")).unwrap();
     f.publish(|doc| {
@@ -15,17 +15,17 @@ fn fixture() -> Fixture {
     f
 }
 
-fn snapshot(f: &Fixture) -> EntrySnapshot {
+pub(super) fn snapshot(f: &Fixture) -> EntrySnapshot {
     f.read_token().unwrap().snapshot
 }
 
-fn update(f: &Fixture, value: &[u8]) {
+pub(super) fn update(f: &Fixture, value: &[u8]) {
     f.publish(|doc| {
         doc.set_entry(&Audience::Everyone, "token", value).unwrap();
     });
 }
 
-fn envelope_fallback(f: &Fixture) {
+pub(super) fn envelope_fallback(f: &Fixture) {
     let admin = admin_open(&f.paths).unwrap();
     let mut state = load_state(&f.paths).unwrap();
     state.seq += 1;
@@ -193,7 +193,7 @@ pub(crate) fn transition(state: &ModelState, action: &str) -> ModelState {
             guarded = Some(relation.unwrap());
         }
         17 => {
-            guarded = Some(historical_roster_denial_relation());
+            guarded = Some(historical_roster_denial_checks().0);
             current = initial;
         }
         18 => {
@@ -338,7 +338,7 @@ fn entry_claim_authority_checks_are_independent_of_recipient_and_selection() {
     );
 }
 
-fn historical_roster_denial_relation() -> EntryClaimRelation {
+pub(super) fn historical_roster_denial_checks() -> (EntryClaimRelation, bool) {
     let _answering = ServersAnswering::set();
     let lab = crate::client::log_entries_tests::two_macs_with(
         &[(Audience::Everyone, "token", b"initial")],
@@ -431,7 +431,10 @@ fn historical_roster_denial_relation() -> EntryClaimRelation {
             .holds(&claim.operation)
     );
     lab.server.stop();
-    current.compare_claim(&lab.m7, &claim).unwrap()
+    (
+        current.compare_claim(&lab.m7, &claim).unwrap(),
+        current.follows_claim(&lab.m7, &claim).unwrap(),
+    )
 }
 
 #[test]

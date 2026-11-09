@@ -130,6 +130,46 @@ fn a_candidate_that_exits_on_its_own_is_read_as_its_own_exit_not_our_kill() {
     );
 }
 
+/// Kernel exit statuses preserve the negotiated distinction when the parent decodes them.
+#[test]
+fn a_reaped_verification_exit_keeps_its_retry_disposition() {
+    use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
+    for (code, expected) in [
+        (
+            0,
+            HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+        ),
+        (
+            crate::seamless::EXIT_SUCCESSOR_PASSING,
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        ),
+        (
+            crate::seamless::EXIT_SUCCESSOR_VERIFICATION,
+            HandoffFailureLane::VerificationDeferred,
+        ),
+    ] {
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .spawn()
+            .expect("spawn an exiting candidate");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits");
+        wait_for_probe(pid, HandoffCandidateProbe::Exited);
+        let status = child.wait().expect("reap the actual exit");
+        let death = handoff_child_death(false, Some(status));
+        assert_eq!(death, Death::Exited { code });
+        assert_eq!(
+            HandoffFailureLane::classify(
+                crate::native_updater_service::ApplyMode::Automatic,
+                crate::UpdateHandoffOutcome::ChildDied,
+                death,
+                false
+            ),
+            expected,
+        );
+    }
+}
+
 /// A candidate killed with `SIGKILL` before the reject path runs is classified as `Death::Signalled { signal: SIGKILL }`.
 #[test]
 fn a_candidate_the_machine_killed_is_read_as_the_machine_s_kill() {

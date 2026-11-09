@@ -493,6 +493,7 @@ impl Real {
     ) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         Self {
@@ -840,6 +841,7 @@ impl Model {
     fn new(tier: Tier, retain: Option<astream_broker::Retention>, mutant: ArmMutant) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01-sim")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let broker = bus::Broker::new(tier, table(tier));

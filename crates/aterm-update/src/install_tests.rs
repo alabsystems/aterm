@@ -32,11 +32,8 @@ fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
 fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
     super::preverify_installed_rollback_source(None, 100, Some("abcdef0"))
         .expect_err("no replaceable bundle cannot host a swap");
-    let root = std::env::temp_dir().join(format!(
-        "aterm-rollback-source-{}-{}",
-        std::process::id(),
-        super::unix_now_secs()
-    ));
+    let scratch = crate::paths::scratch_dir("rollback-source");
+    let root = scratch.join("missing.app");
     let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
         .expect_err("a path that is not a bundle cannot be a rollback source");
     assert!(
@@ -175,8 +172,6 @@ fn rfc3339_delta_round_trips_and_fails_closed() {
 }
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
-
-static SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn temp_staging() -> (crate::paths::ScratchStaging, std::path::PathBuf) {
     let s = Staging::scratch("rr");
@@ -1171,11 +1166,7 @@ fn the_floor_check_alone_refuses_only_below_the_floor() {
 /// clear.
 #[test]
 fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-update-installed-timeout-{}-{}",
-        std::process::id(),
-        unix_now_secs()
-    ));
+    let root = crate::paths::scratch_dir("installed-timeout");
     let app = root.join("aterm.app");
     let _ = unsigned_bundle_with_a_policy(&app, 10);
     let commit = Some("0123456789abcdef0123456789abcdef01234567");
@@ -1207,7 +1198,6 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
     let wrapped = rollback_source_refusal(&app, &refusal);
     assert!(is_rollback_source_refusal(&wrapped));
     assert!(!crate::refusal_needs_person(&wrapped), "{wrapped}");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A `codesign` run that ended without a verdict (`CodesignError::judged_nothing_at`) does not
@@ -1215,11 +1205,7 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
 #[test]
 fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refusal() {
     use std::os::unix::fs::PermissionsExt as _;
-    let root = std::env::temp_dir().join(format!(
-        "aterm-update-installed-unreadable-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = crate::paths::scratch_dir("installed-unread");
     let app = root.join("aterm.app");
     let _ = unsigned_bundle_with_a_policy(&app, 10);
     let commit = Some("0123456789abcdef0123456789abcdef01234567");
@@ -1232,7 +1218,6 @@ fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refu
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     let verdict =
         preverify_installed_rollback_source_with(Some(&app), 10, commit, &verified_bundle_identity);
-    let _ = std::fs::remove_dir_all(&root);
 
     if premise {
         let refusal = unread.expect_err("a check that did not pass must refuse");
@@ -1252,11 +1237,7 @@ fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refu
 /// A bundle modified after signing produces a verdict through the real reader and `codesign`.
 #[test]
 fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-update-tampered-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = crate::paths::scratch_dir("tampered");
     let signed = root.join("signed").join("aterm.app");
     let _ = unsigned_bundle_with_a_policy(&signed, 10);
     let sign = std::process::Command::new("/usr/bin/codesign")
@@ -1332,7 +1313,6 @@ fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
         );
         assert!(!crate::is_passing_refusal(&installed), "{installed}");
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The pre-park check refuses a non-writable install location before the park, naming
@@ -1342,11 +1322,7 @@ fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
 fn a_non_writable_install_location_is_refused_before_the_park_as_a_person_s() {
     use std::os::unix::fs::PermissionsExt;
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
-    let root = std::env::temp_dir().join(format!(
-        "aterm-update-ro-install-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = crate::paths::scratch_dir("ro-install");
     let ro = root.join("ro");
     let app = ro.join("aterm.app");
     std::fs::create_dir_all(&app).unwrap();
@@ -1359,7 +1335,6 @@ fn a_non_writable_install_location_is_refused_before_the_park_as_a_person_s() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
     let refused = preverify_installed_rollback_source_with(Some(&app), 7, Some(COMMIT), &identity);
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _ = std::fs::remove_dir_all(&root);
     let refusal = refused.expect_err("a folder this user cannot write is refused");
     assert!(crate::is_install_location_refusal(&refusal), "{refusal}");
     assert!(
@@ -1984,12 +1959,8 @@ fn assert_real_disk_projection(
     assert_eq!(state["receipt_exact"], i64::from(receipt_exact));
 }
 /// A same-volume temp root (both bundles must share a volume for RENAME_SWAP).
-fn swap_root(label: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("aterm-swap-{label}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    root
+fn swap_root(label: &str) -> crate::paths::ScratchDir {
+    crate::paths::scratch_dir(&format!("swap-{label}"))
 }
 
 /// A swap's parents take the tier its caller found (aterm-durable's counting seam):
@@ -3723,23 +3694,17 @@ fn eocd(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
 const ZIP_PREFIX: &[u8] = b"PK\x03\x04stub!!";
 
 /// Write `bytes` to a fresh temp path and hand back a guard that removes it.
-struct TempZip(std::path::PathBuf);
+struct TempZip(
+    std::path::PathBuf,
+    #[expect(dead_code, reason = "RAII cleanup guard")] crate::paths::ScratchDir,
+);
 
 impl TempZip {
     fn new(label: &str, bytes: &[u8]) -> Self {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aterm-zipbound-{label}-{}-{n}.zip",
-            std::process::id()
-        ));
+        let dir = crate::paths::scratch_dir(&format!("zip-{label}"));
+        let path = dir.join("archive.zip");
         std::fs::write(&path, bytes).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempZip {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        Self(path, dir)
     }
 }
 

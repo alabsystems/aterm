@@ -690,10 +690,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> Scratch {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-health-test-{name}-"))
-            .tempdir()
-            .unwrap();
+        let dir = crate::paths::scratch_dir(&format!("health-{name}")).into_tempdir();
         Scratch {
             file: dir.path().join("health.toml"),
             _dir: dir,

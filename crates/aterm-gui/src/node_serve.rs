@@ -33,6 +33,7 @@ use aterm_net::fleet::link::{
 use aterm_net::fleet::{FleetOp, FleetScope, NodeIdentity};
 use aterm_session::SessionId;
 use aterm_types::MutexExt as _;
+use aterm_uds::stop::Stop;
 use aterm_uds::{CtlListener, CtlStream};
 
 #[path = "node_serve/health.rs"]
@@ -1324,7 +1325,7 @@ pub struct NodeServeConfig {
     /// Maximum wait for a woken window's `wf-<pid>.sock` relay on windowless `spawn`.
     pub wake_timeout: Duration,
     /// The node job's stop, set by its updater or a test to end the run cleanly.
-    pub stop: Arc<NodeStop>,
+    pub stop: Arc<Stop>,
     /// Window launcher seam for windowless `Drive` `spawn` (§7.4).
     pub launcher: Arc<dyn WindowLauncher>,
     /// Why this job cannot use the local network now, in the LAN broker's words
@@ -1564,7 +1565,7 @@ impl NodeUpdates {
         self.updater.trial_pending()
     }
 
-    fn confirm_checkpoint(&self, stop: &NodeStop) {
+    fn confirm_checkpoint(&self, stop: &Stop) {
         if !stop.is_set() && self.active_trial() && !stop.is_set() {
             // Confirmation rechecks headless ownership under the apply lock. A
             // window may have acquired it since active_trial; its true return
@@ -1573,7 +1574,7 @@ impl NodeUpdates {
         }
     }
 
-    fn failed_trial(&self, stop: &NodeStop, why: &str) {
+    fn failed_trial(&self, stop: &Stop, why: &str) {
         if !stop.is_set() && self.active_trial() && !stop.is_set() {
             self.updater.restart(&format!(
                 "the active node update trial could not prove its listener: {why}"
@@ -1590,7 +1591,7 @@ impl NodeUpdates {
             &Option<(String, aterm_net::fleet::NodeKey)>,
             &str,
         ),
-        stop: &NodeStop,
+        stop: &Stop,
     ) -> bool {
         self.settle_service_with(inputs, (addr, secret, node, listen), stop, |basis| {
             basis.prove(addr, HANDSHAKE)
@@ -1606,7 +1607,7 @@ impl NodeUpdates {
             &Option<(String, aterm_net::fleet::NodeKey)>,
             &str,
         ),
-        stop: &NodeStop,
+        stop: &Stop,
         prove: impl FnOnce(&health::Basis) -> Result<health::Proven, String>,
     ) -> bool {
         if stop.is_set() {
@@ -1658,7 +1659,7 @@ impl NodeUpdates {
         !stop.is_set()
     }
 
-    fn confirm_service(&self, stop: &NodeStop, _proof: health::Proven) {
+    fn confirm_service(&self, stop: &Stop, _proof: health::Proven) {
         self.confirm_checkpoint(stop);
     }
 }
@@ -1834,7 +1835,7 @@ fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path)
 /// [`NodeUpdater::look_every`], the look minds the checker ([`NodeUpdater::mind_checker`]) and
 /// [`why_the_run_ends`] decides. Once it names a reason the run ends through
 /// [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set.
-fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<NodeStop>) {
+fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Stop>) {
     let (noticed, notices) = std::sync::mpsc::sync_channel::<()>(1);
     let updater = Arc::clone(&updates.updater);
     let boot = updates.boot;
@@ -1873,7 +1874,7 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<NodeS
 /// launchd's `KeepAlive` starts the job again).
 #[cfg(target_os = "macos")]
 struct LiveNodeUpdater {
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     /// What the job's checker watchdog remembers between looks ([`mind_node_checker`]).
     checker_watch: Mutex<crate::update_checker_watch::CheckerWatchState>,
 }
@@ -2030,7 +2031,7 @@ fn node_relay_dir(state_dir: &Path) -> PathBuf {
 /// This Mac's updater for a run that `stop` ends: production's on macOS, and none on scratch
 /// state (a lab instance, a test) or a CI runner ([`node_run_updates_and_claims_nothing`]) or on
 /// another platform.
-fn live_node_updater(stop: &Arc<NodeStop>) -> Option<Arc<dyn NodeUpdater>> {
+fn live_node_updater(stop: &Arc<Stop>) -> Option<Arc<dyn NodeUpdater>> {
     if node_run_updates_and_claims_nothing() {
         return None;
     }
@@ -2053,7 +2054,7 @@ fn live_node_updater(stop: &Arc<NodeStop>) -> Option<Arc<dyn NodeUpdater>> {
 /// ([`live_node_updater`]).
 fn apply_node_update_at_boot() -> NodeBoot {
     // A boot asks no restart: no run has started for one to end.
-    let no_run = Arc::new(NodeStop::default());
+    let no_run = Arc::new(Stop::new());
     match (live_node_updater(&no_run), aterm_types::dirs::state_dir()) {
         (Some(updater), Some(state_dir)) => {
             apply_at_node_boot(&*updater, &node_relay_dir(&state_dir))
@@ -2187,7 +2188,7 @@ fn run_node_serve(
     let members = vault_paths
         .as_ref()
         .map(|paths| Arc::new(aterm_agent::fleet_log::LocalLog::of(paths)));
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let updates = live_node_updater(&stop).map(|updater| NodeUpdates::new(updater, boot));
     let cfg = NodeServeConfig {
         state_dir,
@@ -2267,7 +2268,7 @@ fn arm_claims_off_on_quit(relay_dir: PathBuf, off: fn()) {
 }
 
 /// Run [`claims_upkeep`] now and every `claims::RECHECK_S` until `stop`.
-fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<NodeStop>) {
+fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<Stop>) {
     let every = Duration::from_secs(aterm_agent::harness::claims::RECHECK_S.unsigned_abs());
     let spawned = std::thread::Builder::new()
         .name("aterm-node-claims".to_owned())
@@ -2540,7 +2541,7 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
         .spawn(move || {
             aterm_secrets::client::run_node_pass(&aterm_secrets::client::NodePassHost {
                 paths: &paths,
-                stop: stop.flag(),
+                stop: &stop,
                 held: &|| sharing_held(&state_dir, config_path.as_deref()),
                 may_post: &|| lan_unavailable().is_none(),
                 routes: &aterm_secrets::server::route_sources,
@@ -2901,7 +2902,7 @@ struct WindowNeedsReads {
 /// What [`WindowNeedsReads`]' threads share.
 struct NeedsReads {
     /// Set as the reads stop.
-    stop: NodeStop,
+    stop: Stop,
     /// Each window's latest row, by pid: the map the sink is handed.
     rows: Mutex<BTreeMap<u32, NeedsRow>>,
     /// A copy of the stream each window is read on, by pid, to hang up on as the reads stop.
@@ -2929,7 +2930,7 @@ impl WindowNeedsReads {
     /// The spawn of the thread that looks for windows.
     fn start(relay_dir: PathBuf, every: Duration, sink: WindowNeeds) -> std::io::Result<Self> {
         let shared = Arc::new(NeedsReads {
-            stop: NodeStop::default(),
+            stop: Stop::new(),
             rows: Mutex::default(),
             streams: Mutex::default(),
             readers: Mutex::default(),
@@ -3164,7 +3165,7 @@ pub(crate) fn activity_of_windows(windows: &WindowRelays, at: u64) -> Option<Act
 /// it made. Dropping it stops the thread and joins it, which waits out a survey under way
 /// (`SURVEY_ANSWER_WITHIN` at most).
 struct WindowActivityReads {
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -3178,7 +3179,7 @@ impl WindowActivityReads {
         every: Duration,
         sink: WindowActivity,
     ) -> std::io::Result<Self> {
-        let stop = Arc::new(NodeStop::default());
+        let stop = Arc::new(Stop::new());
         let thread = std::thread::Builder::new()
             .name("aterm-node-activity".to_owned())
             .spawn({
@@ -3294,58 +3295,6 @@ fn mesh_hints(state_dir: PathBuf) -> aterm_mesh::overlay::Hints {
             })
             .collect()
     })
-}
-
-/// A stop every loop that sleeps on it hears at once ([`NodeStop::sleep`]): the sleep waits on a
-/// condition variable rather than polling a flag, so an idle loop wakes only at its own tick. Set
-/// once, never cleared.
-#[derive(Debug, Default)]
-pub(crate) struct NodeStop {
-    stopped: AtomicBool,
-    asleep: Mutex<()>,
-    wake: std::sync::Condvar,
-}
-
-impl NodeStop {
-    /// Stop: every [`Self::sleep`] under way returns now, and every later one at once.
-    pub(crate) fn set(&self) {
-        // Set and rung under the sleepers' lock, so a sleeper that has checked the flag and not
-        // yet waited cannot miss the ring.
-        let _asleep = self.asleep.lock_or_recover();
-        self.stopped.store(true, Ordering::Release);
-        self.wake.notify_all();
-    }
-
-    /// Whether [`Self::set`] ran.
-    pub(crate) fn is_set(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-    }
-
-    /// The flag [`Self::set`] sets, for a reader that only reads it (aterm-secrets'
-    /// `NodePassHost`). A store into it wakes no [`Self::sleep`].
-    pub(crate) fn flag(&self) -> &AtomicBool {
-        &self.stopped
-    }
-
-    /// Sleep `total`, or until [`Self::set`].
-    pub(crate) fn sleep(&self, total: Duration) {
-        let now = Instant::now();
-        let deadline = now
-            .checked_add(total)
-            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
-        let mut asleep = self.asleep.lock_or_recover();
-        while !self.is_set() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return;
-            }
-            asleep = self
-                .wake
-                .wait_timeout(asleep, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-    }
 }
 
 /// Whether the node job holds its LAN uses now: this Mac left the fleet, or its `aterm.toml`'s

@@ -11,6 +11,13 @@ use std::{
 
 #[test]
 fn original_query_pipe_requires_physical_eof_and_preserves_binary_prefix() {
+    // A parallel test's fork can retain the writer until exec. Create the
+    // original pipes only after entering the exact test's owned process.
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::bootstrap_query::tests::original_query_pipe_requires_physical_eof_and_preserves_binary_prefix",
+    ) {
+        return;
+    }
     let (mut capture, mut writer) = capture::Capture::pipe().unwrap();
     let bytes = [0, 255, b'\n', b'\r', 0, b'x'];
     writer.write_all(&bytes).unwrap();
@@ -25,6 +32,11 @@ fn original_query_pipe_requires_physical_eof_and_preserves_binary_prefix() {
 
 #[test]
 fn overflow_remains_incomplete_after_eof_and_keeps_original_bounded_prefix() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::bootstrap_query::tests::overflow_remains_incomplete_after_eof_and_keeps_original_bounded_prefix",
+    ) {
+        return;
+    }
     let (mut capture, mut writer) = capture::Capture::pipe().unwrap();
     let chunk = [0xa5; wire::MAX_CHUNK];
     // Bound the real pipe population: no large synthetic unrelated FD reserve
@@ -46,6 +58,11 @@ fn overflow_remains_incomplete_after_eof_and_keeps_original_bounded_prefix() {
 
 #[test]
 fn stdout_and_stderr_are_separate_original_pipes() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::bootstrap_query::tests::stdout_and_stderr_are_separate_original_pipes",
+    ) {
+        return;
+    }
     let (mut stdout, mut out) = capture::Capture::pipe().unwrap();
     let (mut stderr, mut err) = capture::Capture::pipe().unwrap();
     out.write_all(b"out\0").unwrap();

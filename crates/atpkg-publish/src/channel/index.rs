@@ -12,7 +12,7 @@ use atpkg::net::MANIFEST_CAP;
 use atpkg::{Channel, Program};
 
 use super::mirror::{self, MirrorOptions};
-use super::{Log, Scratch, download_retried, flag_value, horizon, host_error, probe_served};
+use super::{Log, Scratch, download_retried, flag_value, horizon, host_error};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, Published, TripleDrop, Yank};
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
@@ -1031,6 +1031,7 @@ fn within(e: Error, what: &str) -> Error {
             code,
             message: format!("{what}: {message}"),
         },
+        committed @ Error::PublishedUnconfirmed { .. } => committed,
     }
 }
 
@@ -1374,15 +1375,50 @@ fn publish_quad(
         )
     })?;
     compare_and_swap(ctx, plan, out, log)?;
-    match probe_served(&*ctx.hosts.channel, &slug, &tag, QUAD_FILES[0]) {
-        Probe::Present => log.say(format!(
-            "published {tag} to {slug} ({} answers)",
-            slug.download_url(&tag, QUAD_FILES[0])
-        )),
-        other => {
+    confirm_public_quad(ctx, new).map_err(|cause| Error::PublishedUnconfirmed {
+        index_build: plan.index_build,
+        directory: out.clone(),
+        cause: Box::new(cause),
+    })?;
+    log.say(format!(
+        "published {tag} to {slug}; all four anonymous public files match the signed quad"
+    ));
+    Ok(())
+}
+
+/// Confirm the bytes that clients can fetch, rather than a HEAD response that
+/// may disagree with GET. `new` has already passed the normal signature chain;
+/// exact equality closes this readback without repeating cryptographic checks.
+fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
+    let slug = ctx.index_slug();
+    let tag = index_tag(new.index.index_build);
+    let scratch = Scratch::new("published-quad")?;
+    for name in QUAD_FILES {
+        let expected = crate::identity::read_regular_bytes(&new.file(name), MANIFEST_CAP)
+            .map_err(|e| Error::io(format!("read committed {name}"), &e))?;
+        let path = scratch.path().join(name);
+        match ctx
+            .hosts
+            .channel
+            .fetch_public(&slug, &tag, name, &path, expected.len() as u64)
+        {
+            Probe::Present => {}
+            Probe::Absent => {
+                return Err(Error::cannot_run(format!(
+                    "the anonymous download route does not yet serve {tag}/{name}"
+                )));
+            }
+            Probe::Unknown(why) => {
+                return Err(Error::cannot_run(format!(
+                    "anonymous readback of {tag}/{name} did not complete: {why}"
+                )));
+            }
+        }
+        let actual = crate::identity::read_regular_bytes(&path, expected.len() as u64)
+            .map_err(|e| Error::io(format!("read public {name}"), &e))?;
+        if actual != expected {
             return Err(Error::refused(format!(
-                "{tag} was published to {slug} but {} answers {other:?} — is the repo public?",
-                slug.download_url(&tag, QUAD_FILES[0])
+                "anonymous {tag}/{name} differs from the committed signed quad"
             )));
         }
     }

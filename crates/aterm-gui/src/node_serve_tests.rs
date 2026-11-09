@@ -20,10 +20,11 @@ use aterm_net::fleet_member::{
 use aterm_secrets::age;
 use aterm_secrets::commons::binding::Request;
 use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, encode_records};
+use aterm_uds::stop::Stop;
 
 use super::{
-    NodeBoot, NodeMesh, NodeServeConfig, NodeStop, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER,
-    RelayHeader, WindowLauncher, WindowRelays, a_window_relay_answers, apply_at_node_boot,
+    NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
+    WindowLauncher, WindowRelays, a_window_relay_answers, apply_at_node_boot,
     arm_claims_off_on_quit, claims_off_on_quit, claims_upkeep, has_live_window_relay,
     keeps_port_after, mind_node_checker, own_node_job, query_window_survey_facts, read_line_raw,
     relay_ask, relay_socket_path, restart_for, run_node_serve_with, serve_window_relay_at,
@@ -428,7 +429,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         ),
     );
 
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let relay_stop = Arc::new(AtomicBool::new(false));
     let launcher = Arc::new(MockWindowLauncher::new(
         false,
@@ -718,7 +719,7 @@ fn serve_node(
     relay_dir: &Path,
     state: &Path,
     members: Option<Arc<LocalLog>>,
-) -> (SocketAddr, Arc<NodeStop>, std::thread::JoinHandle<ExitCode>) {
+) -> (SocketAddr, Arc<Stop>, std::thread::JoinHandle<ExitCode>) {
     let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind node job");
     let addr = prebound.local_addr().unwrap();
     let (stop, server) = serve_node_on(prebound, root, relay_dir, state, members);
@@ -732,7 +733,7 @@ fn serve_node_on(
     relay_dir: &Path,
     state: &Path,
     members: Option<Arc<LocalLog>>,
-) -> (Arc<NodeStop>, std::thread::JoinHandle<ExitCode>) {
+) -> (Arc<Stop>, std::thread::JoinHandle<ExitCode>) {
     serve_node_reading(prebound, root, relay_dir, state, (members, None))
 }
 
@@ -744,14 +745,14 @@ fn serve_node_reading(
     relay_dir: &Path,
     state: &Path,
     (members, vault_paths): (Option<Arc<LocalLog>>, Option<aterm_secrets::client::Paths>),
-) -> (Arc<NodeStop>, std::thread::JoinHandle<ExitCode>) {
+) -> (Arc<Stop>, std::thread::JoinHandle<ExitCode>) {
     let addr = prebound.local_addr().unwrap();
     let config_path = root.join(format!("node-{}.toml", addr.port()));
     crate::test_scratch::write_config(
         &config_path,
         format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n"),
     );
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = NodeServeConfig {
         state_dir: state.to_path_buf(),
         relay_dir: relay_dir.to_path_buf(),
@@ -1170,7 +1171,7 @@ fn a_moved_member_is_found_by_its_alab_tcp_advert() {
         &config_path,
         format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n"),
     );
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = NodeServeConfig {
         state_dir: here.clone(),
         relay_dir: relay_scratch.path().to_path_buf(),
@@ -1257,7 +1258,7 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
         &config_path,
         format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n"),
     );
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = NodeServeConfig {
         state_dir,
         relay_dir: relay_scratch.path().to_path_buf(),
@@ -1454,7 +1455,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
 
     assert!(!node_job_holds_lock(&state_dir));
 
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = NodeServeConfig {
         state_dir: state_dir.clone(),
         relay_dir: relay_scratch.path().to_path_buf(),
@@ -1506,7 +1507,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         launcher: Arc::new(MockWindowLauncher::new(
             false,
             false,
@@ -1609,7 +1610,7 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
 
     let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
     let addr = prebound.local_addr().unwrap();
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let relay_stop = Arc::new(AtomicBool::new(false));
     let launcher = Arc::new(MockWindowLauncher::new(true, true, Arc::clone(&relay_stop)));
     let cfg = NodeServeConfig {
@@ -1688,7 +1689,7 @@ fn the_port_lock_is_held_only_while_the_node_serves_the_port() {
         &config_path,
         format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n"),
     );
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let tick = Duration::from_millis(20);
     let cfg = NodeServeConfig {
         state_dir: state_dir.clone(),
@@ -1751,7 +1752,7 @@ fn the_node_job_waits_for_the_lan_broker_before_it_serves_the_lan() {
         &config_path,
         format!("[fleet]\nlisten = \"{addr}\"\nallow = \"facts\"\n"),
     );
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = NodeServeConfig {
         state_dir: state_dir.clone(),
         relay_dir: relay_scratch.path().to_path_buf(),
@@ -1826,7 +1827,7 @@ fn an_aterm_toml_the_node_cannot_read_starts_no_listener() {
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         members: None,
         alab_browse: None,
         launcher: idle_launcher(),
@@ -1886,7 +1887,7 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the window's relay", || {
         has_live_window_relay(relay_scratch.path()).then_some(())
     });
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let launcher = Arc::new(MockWindowLauncher::new(
         true,
         false,
@@ -2075,74 +2076,6 @@ fn the_node_job_looks_at_the_account_claims_only_while_no_window_runs() {
         .expect("a live window's relay");
     assert!(!claims_upkeep(relay.path(), &look));
     assert_eq!(looks.load(Ordering::SeqCst), 1);
-}
-
-/// This thread's `voluntary_ctxt_switches` (Linux): each time it blocked.
-#[cfg(target_os = "linux")]
-fn blocks_of_this_thread() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/status")
-        .expect("this thread's status")
-        .lines()
-        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
-        .expect("a voluntary_ctxt_switches line")
-        .trim()
-        .parse()
-        .expect("a count")
-}
-
-/// A node loop's sleep hears its stop at once and wakes for nothing else: a loop an hour from its
-/// tick returns as the stop is set, and an unstopped sleep blocks once, where the poll it replaced
-/// woke every 25 ms to look at the flag (40 wakeups a second in each idle loop of the job).
-///
-/// NEGATIVE CONTROLS (2026-11-09): `NodeStop::set` without its `notify_all` fails the first half
-/// at the one-minute hang detector, and a `sleep` in 25 ms `std::thread::sleep` slices (the old
-/// `sleep_interruptible`) fails the second with 12 blocks.
-#[test]
-fn a_node_stop_wakes_its_sleepers_at_once_and_only_then() {
-    let stop = Arc::new(NodeStop::default());
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-    let sleeper = std::thread::spawn({
-        let stop = Arc::clone(&stop);
-        move || {
-            let _ = tid_tx.send(std::fs::read_link("/proc/thread-self").ok());
-            stop.sleep(Duration::from_secs(3600));
-        }
-    });
-    // Set once the sleeper waits (Linux reads its state; elsewhere the set may land first, and
-    // the sleep must return either way).
-    if let Some(task) = tid_rx.recv().expect("the sleeper's task") {
-        let stat = Path::new("/proc").join(task).join("stat");
-        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the sleeper waits", || {
-            let stat = std::fs::read_to_string(&stat).ok()?;
-            let state = stat.rsplit_once(") ")?.1.split(' ').next()?;
-            (state == "S").then_some(())
-        });
-    }
-    stop.set();
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the sleeper an hour from its tick returns as the stop is set",
-        || sleeper.is_finished().then_some(()),
-    );
-    sleeper.join().expect("the sleeper");
-    let started = Instant::now();
-    stop.sleep(Duration::from_secs(3600));
-    assert!(
-        started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-        "a sleep on a set stop returns at once"
-    );
-
-    #[cfg(target_os = "linux")]
-    {
-        let idle = NodeStop::default();
-        let before = blocks_of_this_thread();
-        idle.sleep(Duration::from_millis(300));
-        let blocks = blocks_of_this_thread() - before;
-        assert!(
-            blocks <= 3,
-            "an unstopped 300 ms sleep blocks once, not once per poll: {blocks}"
-        );
-    }
 }
 
 /// The node job stopping with no window open gives up this Mac's account claims
@@ -2477,7 +2410,7 @@ fn an_unreadable_swarm_switch_ends_the_node_jobs_generation() {
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || Some("no root LAN broker answers".to_owned()),
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         members: None,
         alab_browse: None,
         launcher: idle_launcher(),
@@ -2732,7 +2665,7 @@ struct ScriptedUpdater {
     trial_pending: AtomicBool,
     trial_reads: AtomicUsize,
     restarts: std::sync::Mutex<Vec<String>>,
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     started: Instant,
     advanced: std::sync::Mutex<Duration>,
 }
@@ -2755,7 +2688,7 @@ impl ScriptedUpdater {
             trial_pending: AtomicBool::new(true),
             trial_reads: AtomicUsize::new(0),
             restarts: std::sync::Mutex::new(Vec::new()),
-            stop: Arc::new(NodeStop::default()),
+            stop: Arc::new(Stop::new()),
             started: Instant::now(),
             advanced: std::sync::Mutex::new(Duration::ZERO),
         }
@@ -3852,7 +3785,7 @@ const NEW_IMAGE_RUNS: &str = "build 2 runs";
 /// running is build 1; the stage is build 2. Its restart ends the run, as production's does.
 struct FixtureStage {
     scratch: PathBuf,
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     restarted: AtomicBool,
 }
 
@@ -3926,7 +3859,7 @@ impl NodeUpdater for FixtureStage {
 fn run_staging_node_job(scratch: &Path) {
     let updater = Arc::new(FixtureStage {
         scratch: scratch.to_path_buf(),
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         restarted: AtomicBool::new(false),
     });
     let relay = scratch.join("relay");

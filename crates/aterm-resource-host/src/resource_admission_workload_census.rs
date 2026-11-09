@@ -179,6 +179,10 @@ impl Owner {
         request: &wire::Request,
     ) -> io::Result<wire::Reply> {
         request.encode()?;
+        self.fence.check_current()?;
+        if self.faulted {
+            return Err(refused("workload census custody is faulted"));
+        }
         let job = self
             .jobs
             .get_mut(&(session.to_owned(), request.root_attempt))

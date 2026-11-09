@@ -7914,6 +7914,9 @@ struct WindowState {
     /// What the client last read of this window's terminals.
     #[cfg(a11y_tree)]
     a11y_reads: a11y_tree::ClientReads,
+    /// Refilled from terminal state, independently of composed paint frames.
+    #[cfg(a11y_tree)]
+    a11y_document_frames: std::cell::RefCell<accessibility::DocumentFrames>,
     /// When a parked window may next tell its client.
     #[cfg(a11y_tree)]
     a11y_parked_next: Option<Instant>,
@@ -9051,6 +9054,8 @@ impl WindowState {
             #[cfg(a11y_tree)]
             a11y_reads: a11y_tree::ClientReads::default(),
             #[cfg(a11y_tree)]
+            a11y_document_frames: Default::default(),
+            #[cfg(a11y_tree)]
             a11y_parked_next: None,
             #[cfg(a11y_tree)]
             a11y_parked_due: None,
@@ -9172,12 +9177,11 @@ fn active_terminal_projection<'a>(
     views: &tab_model::ViewStore,
 ) -> Option<&'a pane::PaneTree> {
     let tab = ws.tab_set.active()?;
-    tab.root
-        .leaves()
-        .into_iter()
-        .all(|view| matches!(views.get(view), Some(tab_model::View::Terminal(_))))
-        .then(|| ws.layouts.get(ws.tabs.active))
-        .flatten()
+    (!tab
+        .root
+        .any_leaf(&mut |view| !matches!(views.get(*view), Some(tab_model::View::Terminal(_)))))
+    .then(|| ws.layouts.get(ws.tabs.active))
+    .flatten()
 }
 
 /// Whether `ws`'s active tab shows a view `shows` picks: its focused view while the tab is
@@ -9531,6 +9535,8 @@ enum UpdateHandoffOutcome {
     PreparationFailed,
     ProducerFailed,
     StageUnconfirmed,
+    /// Authentication ended without a verdict; this is not evidence against the image.
+    VerificationDeferred,
     CaptureRefused,
     ChildDied,
     TimedOut,
@@ -14792,9 +14798,9 @@ impl App {
     pub(crate) fn window_contains_session(&self, wid: WindowId, session: u64) -> bool {
         self.windows.get(&wid).is_some_and(|window| {
             window.tab_set.tabs().iter().any(|tab| {
-                tab.root.leaves().into_iter().any(|view| {
+                tab.root.any_leaf(&mut |view| {
                     self.view_store
-                        .get(view)
+                        .get(*view)
                         .copied()
                         .and_then(tab_model::View::terminal_session)
                         == Some(session)
@@ -14804,17 +14810,15 @@ impl App {
     }
 
     fn active_tree_mut(&mut self, wid: WindowId) -> Option<&mut pane::PaneTree> {
-        let terminal_only = self
+        let terminal_only = !self
             .windows
             .get(&wid)?
             .tab_set
             .active()?
             .root
-            .leaves()
-            .into_iter()
-            .all(|view| {
-                matches!(
-                    self.view_store.get(view),
+            .any_leaf(&mut |view| {
+                !matches!(
+                    self.view_store.get(*view),
                     Some(tab_model::View::Terminal(_))
                 )
             });
@@ -16069,6 +16073,9 @@ impl App {
     }
 
     fn pane_focus_neighbor(&self, owner: WindowId, dir: pane::FocusDir) -> Option<PaneFocusTarget> {
+        if !self.active_tab_has_multiple_visible_panes(owner) {
+            return None;
+        }
         if let Some(tree) = self.active_tree(owner) {
             if tree.len() == 1 {
                 return None;
@@ -16547,8 +16554,14 @@ impl App {
 
     fn shared_target_geometry(&self, id: u64) -> (u16, u16) {
         self.windows
-            .keys()
-            .filter_map(|wid| {
+            .iter()
+            .filter_map(|(wid, ws)| {
+                if !active_tab_displays_session(ws, &self.view_store, id) {
+                    return None;
+                }
+                if self.active_tab_is_single_focused_pane(*wid) {
+                    return Some((ws.rows.max(1), ws.cols.max(1)));
+                }
                 let plan = self.active_visible_leaf_plan(*wid)?;
                 plan.leaves.into_iter().find_map(|leaf| {
                     (self
@@ -27262,7 +27275,7 @@ pub fn main_entry_with_network(
         app_account_work::Drain::for_launch(&account_work, handoff_reader_gate.is_some());
     let incoming_socket_identity = control_socket_identity::consume_incoming_from(&mut handoff_env);
     #[cfg(unix)]
-    let parent_reads_passing_exit = seamless::take_parent_reads_passing_exit_from(&mut handoff_env);
+    let parent_exit_caps = seamless::take_parent_exit_caps_from(&mut handoff_env);
     drop(handoff_env);
     #[cfg(not(unix))]
     let _ = &incoming_socket_identity;
@@ -27289,7 +27302,7 @@ pub fn main_entry_with_network(
             build_info::build_number().parse::<u64>().unwrap_or(0),
         );
         crate::crash_signal::clean_exit_now(seamless::endpoint_refusal_exit(
-            parent_reads_passing_exit,
+            parent_exit_caps.passing,
         ))
     }
 
@@ -27327,12 +27340,12 @@ pub fn main_entry_with_network(
             &boot_apply,
             target_names_this_build,
             seamless_target_admitted,
-            parent_reads_passing_exit,
+            parent_exit_caps,
         ) {
             aterm_log::warn!(
                 "overlap handoff: the boot swap into the authorized build did not happen for \
                  a reason that is no verdict on it ({boot_apply:?}); exiting {code} so the \
-                 outgoing process retries on its transient schedule instead of filing a \
+                 outgoing process uses its declared retry policy instead of filing a \
                  verdict on the build"
             );
             let _ = aterm_update::forgive_own_trial_launch(
@@ -27345,7 +27358,7 @@ pub fn main_entry_with_network(
             let leave = seamless::refused_intake_leave(
                 adopted_count,
                 incoming_refusal,
-                parent_reads_passing_exit,
+                parent_exit_caps.passing,
             );
             let _ = seamless::give_back_refused_intake_launch(
                 leave,

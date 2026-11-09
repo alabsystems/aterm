@@ -32,7 +32,11 @@ fn main() -> std::process::ExitCode {
             }),
         ];
         support::run("aterm-update-dmg", &rows, |take| {
-            let result = aterm_tempfile::tempdir().and_then(|scratch| take(scratch.path()));
+            let result = aterm_tempfile::Builder::new()
+                .prefix("aterm-dmg-")
+                .suffix(".noindex")
+                .tempdir()
+                .and_then(|scratch| take(scratch.path()));
             match result {
                 Ok(()) => support::Outcome::Pass("real mounted-volume controls completed".into()),
                 Err(why) => support::Outcome::CouldNotRun(why.to_string()),

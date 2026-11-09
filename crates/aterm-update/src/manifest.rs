@@ -1180,9 +1180,7 @@ mod tests {
 
     #[test]
     fn a_vacuous_marker_reads_as_absent_not_as_an_empty_memo() {
-        let dir = std::env::temp_dir().join(format!("aterm-vacuous-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::paths::scratch_dir("vacuous");
         let path = dir.join("failed.toml");
 
         std::fs::write(&path, "").unwrap();
@@ -1204,15 +1202,11 @@ mod tests {
             strays.is_empty(),
             "durable write leaves no scratch: {strays:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_stage_failure_suppresses_then_expires_instead_of_being_permanent() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-failedmark-ttl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("failedmark-ttl");
         let path = root.join("failed.toml");
         const BUILD: u64 = 1785125098;
         const SHA: &str = "62605231daafe06037584df32414f02120f0f040b2b20ba77bdaff214ba028d6";
@@ -1228,16 +1222,11 @@ mod tests {
 
         assert!(!m.suppresses(BUILD + 1, SHA, 1_000));
         assert!(!m.suppresses(BUILD, &"a".repeat(64), 1_000));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn the_retry_budget_widens_saturates_and_resets_on_a_new_artifact() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-failedmark-widen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("failedmark-widen");
         let path = root.join("failed.toml");
         const SHA: &str = "deadbeef";
 
@@ -1255,8 +1244,6 @@ mod tests {
         let m = FailedMark::read(&path).unwrap();
         assert_eq!(m.attempts, 1);
         assert_eq!(m.retry_after, RETRY_BACKOFF_SECS[0]);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1582,10 +1569,7 @@ mod tests {
 
     #[test]
     fn installed_receipt_is_exact_and_requires_sealed_bundle_identity() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-installed-receipt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("installed-receipt");
         let path = root.join("installed.toml");
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let digest = "ab".repeat(32);
@@ -1625,15 +1609,11 @@ mod tests {
 
         InstalledReceipt::clear(&path);
         assert!(InstalledReceipt::read(&path).is_none());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn concurrent_floor_writers_cannot_lose_independent_maxima() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-floor-transaction-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("floor-txn");
         let path = root.join("floor.toml");
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
 
@@ -1661,7 +1641,6 @@ mod tests {
             },
             "read/max/write is one locked transaction; no coordinate may regress"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1732,19 +1711,8 @@ changelog = '''
 
     #[test]
     fn publishable_ready_requires_real_directory_and_binds_available_plist() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-publishable-ready-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("download")).unwrap();
-        let staging = crate::paths::Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged/aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root: root.clone(),
-        };
+        let staging = crate::paths::Staging::scratch("publishable-ready");
+        let root = &staging.root;
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let ready = Ready {
             build_number: 54,
@@ -1816,7 +1784,6 @@ changelog = '''
             !ready.is_publishable(&staging),
             "a staged-app symlink never grants publishable authority"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1893,11 +1860,8 @@ changelog = '''
 
     #[test]
     fn floor_ratchets_monotonically_and_reads_default() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-floor-")
-            .tempdir()
-            .unwrap();
-        let p = dir.path().join("floor.toml");
+        let dir = crate::paths::scratch_dir("floor-ratchet");
+        let p = dir.join("floor.toml");
         assert_eq!(Floor::read(&p).min_build, 0);
         assert_eq!(Floor::read(&p).high_water, 0);
         assert_eq!(Floor::read(&p).roster_seq, 0);
@@ -1925,9 +1889,7 @@ changelog = '''
             #[serde(default)]
             roster_seq: u64,
         }
-        let root = std::env::temp_dir().join(format!("aterm-floor-mixed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("floor-mixed");
         let path = root.join("floor.toml");
         let revoked = vec!["m11".to_string()];
         Floor::observe_and_write(
@@ -2002,14 +1964,11 @@ changelog = '''
         };
         assert_eq!(yank.withdraws(5, None), None);
         assert!(yank.withdraws(4, None).is_some());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_floor_that_cannot_be_committed_is_reported_and_leaves_no_temp_file() {
-        let root = std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::paths::scratch_dir("floor-commit");
         let path = root.join("floor.toml");
         std::fs::create_dir(&path).unwrap();
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
@@ -2034,17 +1993,13 @@ changelog = '''
         assert_eq!(Floor::read(&ok_path).roster_seq, 3);
         let ok_tmp = ok_path.with_extension(format!("toml.{}.tmp", std::process::id()));
         assert!(!ok_tmp.exists(), "a successful commit leaves no temp file");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_floor_the_write_could_not_read_is_never_replaced_with_defaults() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-floor-unreadable-")
-            .tempdir()
-            .unwrap();
+        let dir = crate::paths::scratch_dir("floor-unread");
         let recorded = "min_build = 500\nhigh_water = 600\nroster_seq = 10\n\
                         revoked_machines = [\"m11\"]\n";
         let observation = FloorObservation {
@@ -2056,7 +2011,7 @@ changelog = '''
             floor.roster_seq == 10 && floor.min_build == 500 && floor.revokes(Some("m11"))
         };
 
-        let path = dir.path().join("floor.toml");
+        let path = dir.join("floor.toml");
         std::fs::write(&path, recorded).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let outcome = Floor::observe_reporting(&path, &observation);
@@ -2071,7 +2026,7 @@ changelog = '''
             "the refused advance must be reported: {outcome:?}"
         );
 
-        let ok_path = dir.path().join("ok.toml");
+        let ok_path = dir.join("ok.toml");
         std::fs::write(&ok_path, recorded).unwrap();
         assert_eq!(Floor::observe_reporting(&ok_path, &observation), Ok(()));
         let floor = Floor::read(&ok_path);
@@ -2081,8 +2036,8 @@ changelog = '''
 
     #[test]
     fn failed_mark_matches_on_build_and_hash_only() {
-        let p = std::env::temp_dir().join(format!("aterm-failed-{}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        let dir = crate::paths::scratch_dir("failed-match");
+        let p = dir.join("failed.toml");
         assert!(FailedMark::read(&p).is_none());
         FailedMark::record(&p, 42, "ABCdef");
         let m = FailedMark::read(&p).unwrap();

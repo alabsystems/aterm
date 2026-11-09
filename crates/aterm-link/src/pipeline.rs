@@ -463,6 +463,7 @@ mod tests {
     ) {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
@@ -600,6 +601,7 @@ mod tests {
     fn a_pipelined_commit_is_owed_in_order_and_a_try_waits_for_nothing() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
@@ -682,6 +684,7 @@ mod tests {
     fn a_commit_and_a_burst_of_publishes_go_in_one_write_and_one_batch() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
@@ -827,6 +830,7 @@ mod tests {
     fn a_refused_batch_lands_the_publish_sent_after_it() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
@@ -893,6 +897,7 @@ mod tests {
     fn a_gap_fenced_broker_holds_the_publish_sent_after_a_refused_batch() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-g")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");

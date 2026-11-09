@@ -544,6 +544,7 @@ mod tests {
     fn a_close_hangs_up_the_socket_the_view_holds() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-pv")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
@@ -588,6 +589,7 @@ mod tests {
         };
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-pv-gap")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");

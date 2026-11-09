@@ -44,7 +44,7 @@ impl Machine {
 }
 
 struct Node {
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     relay_stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<ExitCode>>,
     log: Arc<LocalLog>,
@@ -56,7 +56,7 @@ struct Node {
 impl Node {
     fn start(machine: &Machine, listener: TcpListener) -> Self {
         let relay = crate::test_scratch::short_dir("fresh-enrollment-relay");
-        let stop = Arc::new(NodeStop::default());
+        let stop = Arc::new(Stop::new());
         let relay_stop = Arc::new(AtomicBool::new(false));
         let log = Arc::new(LocalLog::of(&machine.vault));
         let served = Arc::new(std::sync::Mutex::new(Vec::new()));

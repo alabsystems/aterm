@@ -1133,6 +1133,46 @@ fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
 }
 
 #[test]
+fn a_negotiated_verification_exit_does_not_spend_the_physical_budget() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    let current = app.native_updater_service.snapshot().current_build;
+    let failures = aterm_update::status(current).unwrap().failing_applies;
+    let deferred = crate::ChildDeathEvidence::Exited {
+        code: crate::seamless::EXIT_SUCCESSOR_VERIFICATION,
+    };
+    for _ in 0..3 {
+        let before = std::time::Instant::now();
+        reduce_one_returned_failure(
+            &mut app,
+            ApplyMode::AutomaticPastGrace,
+            build,
+            &"ab".repeat(32),
+            crate::UpdateHandoffOutcome::ChildDied,
+            deferred,
+        );
+        let retry_at = app
+            .auto_apply_intent
+            .expect("the parent rechecks without a manual latch")
+            .retry_at;
+        assert!(retry_at >= before + crate::app_native::PREVERIFY_RETRY_AFTER);
+        assert!(retry_at <= std::time::Instant::now() + crate::app_native::PREVERIFY_RETRY_AFTER);
+        assert!(app.auto_apply_physical_retry.is_none());
+        assert!(app.auto_apply_manual_only.is_none());
+        assert_eq!(
+            aterm_update::status(current).unwrap().failing_applies,
+            failures
+        );
+    }
+    assert!(super::forgives_the_counted_trial_launch(
+        deferred,
+        build - 1,
+        build
+    ));
+}
+
+#[test]
 fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
     use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1173,7 +1213,7 @@ fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
 }
 
 #[test]
-fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
+fn a_pre_park_check_that_did_not_finish_defers_without_a_launch_failure() {
     use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
     let passing = format!(
         "bundle policy: codesign --verify (team-pinned) ran past this apply's \
@@ -1188,7 +1228,7 @@ fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
         let outcome = super::pre_park_refusal_outcome(error);
         assert_eq!(
             outcome,
-            crate::UpdateHandoffOutcome::ProducerFailed,
+            crate::UpdateHandoffOutcome::VerificationDeferred,
             "{error}"
         );
         assert_eq!(
@@ -1198,8 +1238,18 @@ fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
                 crate::ChildDeathEvidence::Unobserved,
                 false,
             ),
-            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            HandoffFailureLane::VerificationDeferred,
             "{error}"
+        );
+        assert_eq!(
+            HandoffFailureLane::classify(
+                ApplyMode::Immediate,
+                outcome,
+                crate::ChildDeathEvidence::Unobserved,
+                false,
+            ),
+            HandoffFailureLane::Manual,
+            "a person's attempt retains its existing outcome"
         );
     }
     let verdict = "bundle policy: codesign --verify (team-pinned requirement) failed: code \
@@ -1216,6 +1266,90 @@ fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
             false,
         ),
         HandoffFailureLane::Physical(PhysicalFailureShape::Structural)
+    );
+    assert_eq!(
+        HandoffFailureLane::classify(
+            ApplyMode::AutomaticPastGrace,
+            crate::UpdateHandoffOutcome::ProducerFailed,
+            crate::ChildDeathEvidence::Unobserved,
+            false,
+        ),
+        HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        "an actual producer failure keeps its budget"
+    );
+}
+
+#[test]
+fn an_inconclusive_worker_verification_rearms_without_spending_prior_failures() {
+    use crate::app_native::{PREVERIFY_RETRY_AFTER, PhysicalFailureShape};
+    use std::time::Instant;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    let current = app.native_updater_service.snapshot().current_build;
+    let before = aterm_update::status(current).unwrap();
+    let prior = crate::AutoOverlapRetry {
+        build,
+        dmg_sha256: [0xab; 32],
+        activation: false,
+        cycles: 2,
+        last_attempt: Instant::now(),
+    };
+    app.auto_apply_physical_retry = Some(prior);
+    let started = Instant::now();
+    reduce_one_returned_failure(
+        &mut app,
+        ApplyMode::AutomaticPastGrace,
+        build,
+        &"ab".repeat(32),
+        crate::UpdateHandoffOutcome::VerificationDeferred,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    let intent = app
+        .auto_apply_intent
+        .expect("the read is retried automatically");
+    assert_eq!(
+        (intent.build, intent.dmg_sha256, intent.attempts),
+        (build, [0xab; 32], 0)
+    );
+    assert!(intent.retry_at >= started + PREVERIFY_RETRY_AFTER);
+    assert!(intent.retry_at <= Instant::now() + PREVERIFY_RETRY_AFTER);
+    assert_eq!(app.auto_apply_physical_retry.unwrap().cycles, prior.cycles);
+    assert_eq!(
+        app.auto_apply_physical_retry.unwrap().last_attempt,
+        prior.last_attempt
+    );
+    assert!(app.auto_apply_manual_only.is_none());
+    assert!(app.auto_overlap_retry.is_none());
+    assert!(!app.update_handoff_in_flight());
+    assert_eq!(
+        aterm_update::status(current).unwrap().failing_applies,
+        before.failing_applies
+    );
+    let read = app
+        .handoff_preverify_in_flight
+        .as_ref()
+        .expect("a completed read is retained for retry");
+    assert_eq!(read.build, build);
+    assert!(read.ended_passing(Instant::now()).is_some());
+
+    // A real producer failure still advances the same physical budget.
+    reduce_one_returned_failure(
+        &mut app,
+        ApplyMode::AutomaticPastGrace,
+        build,
+        &"ab".repeat(32),
+        crate::UpdateHandoffOutcome::ProducerFailed,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    assert_eq!(
+        app.auto_apply_physical_retry.unwrap().cycles,
+        prior.cycles + 1
+    );
+    assert_eq!(
+        crate::app_native::PhysicalFailureShape::cached_refusal_shape(None),
+        PhysicalFailureShape::Transient
     );
 }
 

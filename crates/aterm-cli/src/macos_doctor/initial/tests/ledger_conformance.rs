@@ -17,10 +17,12 @@ use aterm_spec::interp::{self, State};
 use aterm_spec::xref::StepEvidence;
 
 use super::*;
-use ledger::{Admit, Defect, Ledger, Stamp};
+use ledger::{Admit, Defect, Ledger, Software, SoftwareEpoch, Stamp};
 
-const PROJECTED: [&str; 17] = [
+const PROJECTED: [&str; 19] = [
     "alive",
+    "software_known_a",
+    "software_known_b",
     "done_a",
     "run_a",
     "att_a",
@@ -39,7 +41,9 @@ const PROJECTED: [&str; 17] = [
     "wrote_kept",
 ];
 
-const ANCHORED: [&str; 17] = [
+const ANCHORED: [&str; 23] = [
+    "AdoptSoftwareA",
+    "AdoptSoftwareB",
     "ApplyKey",
     "BeginA",
     "BeginB",
@@ -52,10 +56,14 @@ const ANCHORED: [&str; 17] = [
     "HangA",
     "HangB",
     "NoteQuit",
+    "NewSoftwareA",
+    "NewSoftwareB",
     "PersonChanges",
     "RefuseQuit",
     "Relaunch",
     "Restore",
+    "RetainSoftwareA",
+    "RetainSoftwareB",
     "UnattendedPass",
 ];
 
@@ -82,6 +90,12 @@ const STAMP: Stamp = Stamp {
     at: 1_800_000_000,
     awake: Some(600),
     run: Some(9),
+    software: None,
+};
+
+const SOFTWARE: SoftwareEpoch = SoftwareEpoch {
+    build: 100,
+    commit: [0x11; 20],
 };
 
 /// The real ledger and record, and what the model reads of the environment: whether the
@@ -175,6 +189,15 @@ fn project(rig: &Rig, model_state: &State) -> State {
     let mut state = model_state.clone();
     let ledger = &rig.ledger;
     state.insert("alive", i64::from(!rig.dead));
+    for (stage, name) in [(A, "software_known_a"), (B, "software_known_b")] {
+        state.insert(
+            name,
+            i64::from(matches!(
+                ledger.software[stage as usize],
+                Software::Known(_)
+            )),
+        );
+    }
     for (stage, done, run, att, park, ever, quit) in [
         (A, "done_a", "run_a", "att_a", "park_a", "ever_a", "quit_a"),
         (B, "done_b", "run_b", "att_b", "park_b", "ever_b", "quit_b"),
@@ -223,6 +246,70 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
         }
         "CheckAgain" => {
             ev.step(action, || rig.ledger.retry());
+        }
+        "AdoptSoftwareA" | "AdoptSoftwareB" => {
+            let stage = stage(action);
+            assert!(matches!(
+                rig.ledger.software[stage as usize],
+                Software::Unattributed
+            ));
+            assert!(ev.step(action, || rig.ledger.software_for(
+                stage,
+                rig.done,
+                Some(SOFTWARE),
+                &rig.root
+            )));
+        }
+        "NewSoftwareA" | "NewSoftwareB" => {
+            let stage = stage(action);
+            let Software::Known(old) = rig.ledger.software[stage as usize] else {
+                panic!("{action} requires a recorded software identity");
+            };
+            let mut commit = old.commit;
+            commit[0] ^= 1;
+            let newer = SoftwareEpoch {
+                build: old.build.checked_add(100).expect("finite replay"),
+                commit,
+            };
+            assert!(ev.step(action, || rig.ledger.software_for(
+                stage,
+                rig.done,
+                Some(newer),
+                &rig.root
+            )));
+        }
+        "RetainSoftwareA" | "RetainSoftwareB" => {
+            let stage = stage(action);
+            let (inputs, count) = if let Software::Known(old) = rig.ledger.software[stage as usize]
+            {
+                let mut commit = old.commit;
+                commit[0] ^= 1;
+                (
+                    [
+                        None,
+                        Some(old),
+                        Some(SoftwareEpoch {
+                            build: old.build - 1,
+                            commit,
+                        }),
+                        Some(SoftwareEpoch { commit, ..old }),
+                        Some(SoftwareEpoch {
+                            build: old.build + 1,
+                            ..old
+                        }),
+                    ],
+                    5,
+                )
+            } else {
+                ([None; 5], 1)
+            };
+            for current in inputs.into_iter().take(count) {
+                let before = rig.ledger;
+                assert!(!ev.step(action, || {
+                    rig.ledger.software_for(stage, rig.done, current, &rig.root)
+                }));
+                assert_eq!(rig.ledger, before, "{action}: {current:?}");
+            }
         }
         "Crash" => rig.ends(),
         // As `ledger::interrupt_at`: the latch first, then the note.
@@ -410,6 +497,98 @@ fn the_walk_conforms() {
 #[test]
 fn the_ledger_and_the_kept_record_conform_to_the_model() {
     the_walk_conforms();
+
+    // These native refusal inputs share the model's RetainSoftware stutter. In particular,
+    // unread persisted identity is not the legacy fact an AdoptSoftware action requires.
+    let mut rig = Rig::new();
+    let newer = SoftwareEpoch {
+        build: 200,
+        commit: [0x22; 20],
+    };
+    let foreign = SoftwareEpoch {
+        build: SOFTWARE.build,
+        commit: newer.commit,
+    };
+    rig.ledger.attempts[A as usize].began = 2;
+    rig.ledger.crashed = A.bit();
+    assert!(rig.ledger.software_for(A, 0, Some(SOFTWARE), &rig.root));
+    assert_eq!(rig.ledger.software[A as usize], Software::Known(SOFTWARE));
+    assert_eq!(rig.ledger.attempt(A).began, 0);
+    assert_eq!(rig.ledger.parked(A), None);
+
+    // Adoption was spent: exhausting this code's budget again cannot adopt it again.
+    rig.ledger.attempts[A as usize].began = 2;
+    rig.ledger.crashed = A.bit();
+    for current in [
+        None,
+        Some(SOFTWARE),
+        Some(SoftwareEpoch {
+            build: 99,
+            ..foreign
+        }),
+        Some(foreign),
+        Some(SoftwareEpoch {
+            build: 200,
+            ..SOFTWARE
+        }),
+        Some(SoftwareEpoch { build: 0, ..newer }),
+        Some(SoftwareEpoch {
+            commit: [0; 20],
+            ..newer
+        }),
+    ] {
+        let before = rig.ledger;
+        assert!(!rig.ledger.software_for(A, 0, current, &rig.root));
+        assert_eq!(rig.ledger, before, "{current:?} leaves the spent budget");
+    }
+
+    rig.ledger.software[A as usize] = Software::Unread;
+    rig.read_back();
+    let unread = rig.ledger;
+    assert!(!rig.ledger.software_for(A, 0, Some(newer), &rig.root));
+    assert_eq!(rig.ledger, unread, "unread identity survives a round trip");
+    rig.ledger.software[A as usize] = Software::Known(SOFTWARE);
+
+    for (done, running, quit, noting) in [
+        (A.bit(), 0, 0, false),
+        (0, A.bit(), 0, false),
+        (0, 0, A.bit(), false),
+        (0, 0, 0, true),
+    ] {
+        rig.ledger.running = running;
+        rig.ledger.quit = quit;
+        ledger::set_quitting(&rig.root, noting);
+        let before = rig.ledger;
+        assert!(!rig.ledger.software_for(A, done, Some(newer), &rig.root));
+        assert_eq!(
+            rig.ledger, before,
+            "software never clears an admission hold"
+        );
+    }
+    ledger::set_quitting(&rig.root, false);
+    rig.ledger.running = B.bit();
+    rig.ledger.quit = 0;
+    rig.ledger.software[B as usize] = Software::Known(SOFTWARE);
+    rig.ledger.attempts[B as usize].began = 2;
+    rig.ledger.hung = B.bit();
+    let before_b = rig.ledger;
+    assert!(rig.ledger.software_for(A, 0, Some(newer), &rig.root));
+    assert_eq!(rig.ledger.software[A as usize], Software::Known(newer));
+    assert_eq!(rig.ledger.attempt(A).began, 0);
+    assert_eq!(rig.ledger.parked(A), None);
+    assert_eq!(
+        rig.ledger.software[B as usize],
+        before_b.software[B as usize]
+    );
+    assert_eq!(rig.ledger.attempt(B), before_b.attempt(B));
+    assert_eq!(rig.ledger.parked(B), before_b.parked(B));
+    assert_eq!(rig.ledger.running, before_b.running);
+    // Once B's own dead work has been recovered, A has not consumed its software change.
+    rig.ledger.recover_scoped(0, None, B.bit());
+    assert!(rig.ledger.software_for(B, 0, Some(newer), &rig.root));
+    assert_eq!(rig.ledger.software[B as usize], Software::Known(newer));
+    assert_eq!(rig.ledger.attempt(B).began, 0);
+    assert_eq!(rig.ledger.parked(B), None);
 }
 
 /// Each Buggy=1 mutant's step, played on the real code with its defect planted there: only the

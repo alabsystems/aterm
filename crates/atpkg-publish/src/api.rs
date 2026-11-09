@@ -286,5 +286,7 @@ pub trait Indexer {
     /// Plan the delta over the baseline, sign, self-verify and (maybe) publish.
     /// # Errors
     /// Any refusal (a downgrade, an omission, a triple drop, a lost compare-and-swap).
+    /// `Error::PublishedUnconfirmed` retains an already committed index when its
+    /// subsequent anonymous readback does not confirm the complete signed quad.
     fn publish(&self, ctx: &Ctx, request: &IndexRequest) -> Result<Published>;
 }

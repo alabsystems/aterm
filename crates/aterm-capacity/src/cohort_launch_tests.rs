@@ -105,6 +105,26 @@ fn a_capture_across_a_childs_exit_never_refuses_it() {
     }
 }
 
+/// A group request to a leader that has exited, unreaped and alone in its group, is no refusal:
+/// macOS answers `EPERM` for it, and a refusal here faults a whole resource host.
+/// NEGATIVE CONTROL: return `last_os_error` from `request_group` unsettled and this fails on macOS.
+#[test]
+fn a_group_request_to_a_leader_that_alone_has_ended_is_not_a_refusal() {
+    let fixture = CohortFixture::new();
+    let mut claim = fixture.claim();
+    let launched = claim.launch_cohort(&mut cat()).unwrap();
+    let mut leader = Leader::new(launched);
+    leader.input.take();
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the leader's exit", || {
+        leader.launched.child_mut().exited().unwrap().then_some(())
+    });
+    leader.launched.child_mut().wait_exited().unwrap();
+    assert!(!leader.launched.child_mut().is_reaped());
+    leader.launched.request_group(CohortSignal::Kill).unwrap();
+    leader.end();
+    claim.finish_cohort().unwrap();
+}
+
 #[test]
 fn group_requests_keep_full_custody_and_require_the_original_unreaped_birth() {
     use std::os::unix::process::ExitStatusExt as _;

@@ -42,6 +42,15 @@ const BUTTON: LocalId = LocalId(2);
 const LINK: LocalId = LocalId(3);
 const SLIDER: LocalId = LocalId(4);
 
+fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("a11y-{short}-"))
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .expect("a11y scratch")
+}
+
 fn run(text: &str) -> Node {
     let mut node = Node::new(Role::TextRun);
     node.set_value(text.to_owned());
@@ -597,12 +606,10 @@ fn unknown_objects_interfaces_and_members_answer_as_zbus_did() {
         super::serve::parse_machine_id("  0123456789abcdef0123456789abcdef\n"),
         Some("0123456789abcdef0123456789abcdef")
     );
-    let mid_dir = std::env::temp_dir().join(format!("aterm-a11y-mid-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&mid_dir);
-    std::fs::create_dir_all(&mid_dir).unwrap();
-    let empty_etc = mid_dir.join("etc-machine-id");
-    let uninit_etc = mid_dir.join("uninit-machine-id");
-    let valid_var = mid_dir.join("dbus-machine-id");
+    let mid_dir = scratch_dir("mid");
+    let empty_etc = mid_dir.path().join("etc-machine-id");
+    let uninit_etc = mid_dir.path().join("uninit-machine-id");
+    let valid_var = mid_dir.path().join("dbus-machine-id");
     std::fs::write(&empty_etc, "").unwrap();
     std::fs::write(&uninit_etc, "uninitialized\n").unwrap();
     std::fs::write(&valid_var, "89abcdef0123456789abcdef01234567\n").unwrap();
@@ -611,10 +618,9 @@ fn unknown_objects_interfaces_and_members_answer_as_zbus_did() {
         Some("89abcdef0123456789abcdef01234567")
     );
     assert_eq!(
-        super::serve::machine_id_from_files(&[&empty_etc, &uninit_etc, &mid_dir]),
+        super::serve::machine_id_from_files(&[&empty_etc, &uninit_etc, mid_dir.path()]),
         None
     );
-    let _ = std::fs::remove_dir_all(&mid_dir);
 }
 
 #[test]
@@ -1850,8 +1856,20 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
 
 #[test]
 fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
-    let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let dir = scratch_dir("frozen");
+    assert!(
+        dir.path().to_string_lossy().ends_with(".noindex"),
+        "scratch dir must exclude Spotlight: {}",
+        dir.path().display()
+    );
+    assert!(
+        scratch_dir("éééééé")
+            .path()
+            .to_string_lossy()
+            .ends_with(".noindex"),
+        "UTF-8 tag truncation must split on a char boundary"
+    );
+    let path = dir.path().join("b.sock");
     let address = format!("unix:path={}", path.display());
     // The join's own bound, not the handshake default's: with none of it left the join gives up
     // before it connects, where the default would have found no bus there.
@@ -1874,7 +1892,6 @@ fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
         waited < HANG,
         "the join to a silent bus never gave up: {waited:?}"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

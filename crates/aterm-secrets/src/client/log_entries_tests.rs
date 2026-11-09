@@ -1216,6 +1216,157 @@ pub(super) fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::Me
     (bootstrap, actor, incarnation)
 }
 
+/// A real apply under the former host-wrapper selector, with the current signed heads.
+/// The current selector chooses `current`, while the materialized file still holds `stale`.
+pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMacs, Paths) {
+    let lab = two_macs(&[
+        (Audience::Everyone, "shared", b"initial"),
+        (
+            Audience::Everyone,
+            crate::entry_class::GITHUB_REPOSITORIES,
+            br#"{"schema":2,"account":"fixture","repositories":[]}"#,
+        ),
+    ]);
+    let (reader, name) = if log_only {
+        let (reader, request, allowed) = newcomer(lab.root.path(), &lab.m7, "m8");
+        let (bundle, logged) = hand(&lab.m7, &request, &allowed, true);
+        assert!(logged);
+        write_from_log_bundle(&reader, &bundle).unwrap();
+        (reader, "m8")
+    } else {
+        (lab.m7.clone(), "m7")
+    };
+    let mut log = load_records(&lab.m7).unwrap().log().unwrap().clone();
+    let writer7 = member_key(&lab.m7);
+    let writer22 = member_key(&lab.m22);
+    let audience = |mut hosts: Vec<String>| {
+        hosts.sort();
+        hosts.dedup();
+        Audience::Hosts(hosts)
+    };
+    let pair = audience(vec!["m7".into(), name.into()]);
+    let trio = audience(vec!["m22".into(), "m7".into(), name.into()]);
+    let epoch = |log: &mut crate::membership_log::Log,
+                 writer: &(Bootstrap, crate::membership_log::MemberId, [u8; 16]),
+                 audience: &Audience,
+                 generation| {
+        let (draft, key) = log
+            .draft_epoch(&writer.1, 3_000, audience.clone(), generation)
+            .unwrap();
+        let record = writer
+            .0
+            .device()
+            .with_seed(|seed| draft.sign(seed, writer.2).unwrap());
+        let id = *record.id();
+        log.insert(record).unwrap();
+        let mut wrapped = BTreeSet::new();
+        for (host, paths) in [("m7", &lab.m7), ("m22", &lab.m22), (name, &reader)] {
+            let recipient = read_identity(paths).unwrap().unwrap().recipient();
+            if audience.includes(host) && wrapped.insert(recipient) {
+                let record = writer.0.device().with_seed(|seed| {
+                    log.draft_wrap(&writer.1, 3_001, id, &key, recipient)
+                        .unwrap()
+                        .sign(seed, writer.2)
+                        .unwrap()
+                });
+                log.insert(record).unwrap();
+            }
+        }
+        (id, key)
+    };
+    let put = |log: &mut crate::membership_log::Log,
+               writer: &(Bootstrap, crate::membership_log::MemberId, [u8; 16]),
+               audience: &Audience,
+               epoch,
+               key: &[u8; 32],
+               value: &[u8]| {
+        let record = writer.0.device().with_seed(|seed| {
+            log.draft_put(
+                &writer.1,
+                3_100,
+                epoch,
+                key,
+                &Entry {
+                    name: "shared".into(),
+                    value: SecretBytes::from(value),
+                    audience: audience.clone(),
+                    if_absent: false,
+                    anchor: None,
+                },
+            )
+            .unwrap()
+            .sign(seed, writer.2)
+            .unwrap()
+        });
+        log.insert(record).unwrap();
+    };
+    let (first, first_key) = epoch(&mut log, &writer7, &pair, 1);
+    let (second, second_key) = epoch(&mut log, &writer22, &trio, 1);
+    put(&mut log, &writer7, &pair, first, &first_key, b"stale");
+    put(&mut log, &writer22, &trio, second, &second_key, b"current");
+    let (carried, carried_key) = epoch(&mut log, &writer7, &pair, 2);
+    put(&mut log, &writer7, &pair, carried, &carried_key, b"stale");
+    save_records(&reader, &encode_records(log.records())).unwrap();
+    crate::membership_log::Log::with_host_wrapper_precedence(|| {
+        let outcome = if log_only {
+            apply_response_until(
+                &reader,
+                configured(&reader).unwrap(),
+                load_state(&reader).unwrap(),
+                Err(Error::new("offline fixture")),
+                None,
+                None,
+                true,
+            )
+        } else {
+            // An actual HTTP body gives the old apply a genuine network receipt.
+            sync_admitted(&reader, &|| Ok(()))
+        }
+        .unwrap();
+        assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+        assert_eq!(
+            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            b"stale"
+        );
+    });
+    if legacy {
+        // A real old process saved the same state without the new optional receipt.
+        // Remove only that field, never synthesize a source, manifest or network proof.
+        let saved = std::fs::read_to_string(reader.state_file()).unwrap();
+        let without: String = saved
+            .lines()
+            .filter(|line| {
+                line.split_once('=')
+                    .is_none_or(|(key, _)| key.trim() != "materialization_selection")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fsx::write_atomic(&reader.state_file(), without.as_bytes(), 0o600).unwrap();
+    }
+    let state = load_state(&reader).unwrap();
+    assert_eq!(
+        state.records_digest,
+        Some(log_entries::records_heads_digest(&log))
+    );
+    let selected = log
+        .open_entries(&read_identity(&reader).unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .find(|entry| entry.name == "shared")
+            .unwrap()
+            .value
+            .as_slice(),
+        b"current"
+    );
+    assert!(changed_files(&reader, &state).is_empty());
+    assert!(gaps(&reader, &state).is_empty());
+    assert_eq!(state.network_materialization.is_none(), log_only);
+    (lab, reader)
+}
+
 /// A one-admin vault on a loopback server: `m22` (admin) and `m7` (member), Commons enrolled,
 /// `entries` published, Genesis v2 signed and synced to `m7`.
 pub(crate) struct TwoMacs {
@@ -5847,6 +5998,43 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
     s2.stop();
     macs.server.stop();
     drop(macs.root);
+
+    // A previous selector's intact files are not the current selector's materialization,
+    // even when its applied signed heads are unchanged. The registered inventory itself
+    // stays legal and unchanged; stale unrelated meaning blocks the ordinary capture guard.
+    for (log_only, legacy) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (lab, reader) = stale_host_materialization(log_only, legacy);
+        let config = configured(&reader).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let capture = with_materialization_ready_for_entries(
+            &reader,
+            &config,
+            &[crate::entry_class::GITHUB_REPOSITORIES],
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let ready = materialization_ready(&reader).unwrap();
+        let blocked = matches!(
+            observe_materialization(&reader, &config, || Ok(())).unwrap(),
+            MaterializationObservation::Blocked(MaterializationBlocker::LocalFilesIncomplete)
+        );
+        let stale = read_verified_entry(&reader, &config, "shared").unwrap();
+        lab.server.stop();
+        assert!(
+            stale.is_none(),
+            "the current entry reader rejects the old file"
+        );
+        assert!(!ready, "same heads do not prove current selected meaning");
+        assert!(blocked, "the ordinary observation must stay pending");
+        assert!(
+            capture.is_none(),
+            "repository input capture must stay pending"
+        );
+        assert_eq!(calls.get(), 0, "no capture callback uses the old meaning");
+    }
 }
 
 #[test]

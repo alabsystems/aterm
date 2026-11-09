@@ -52,12 +52,12 @@ fn wrapped(paths: &Paths, recipient: &Recipient) -> bool {
 
 /// Sets its loop's stop when the test leaves it.
 struct Running<'scope> {
-    stop: &'scope AtomicBool,
+    stop: &'scope aterm_uds::stop::Stop,
 }
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
     }
 }
 
@@ -66,7 +66,7 @@ impl Drop for Running<'_> {
 fn spawn_pass<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     paths: &'scope Paths,
-    stop: &'scope AtomicBool,
+    stop: &'scope aterm_uds::stop::Stop,
     clock: &'scope AtomicU64,
     held: &'scope (dyn Fn() -> bool + Sync),
 ) -> Running<'scope> {
@@ -119,7 +119,7 @@ fn a_mac_with_no_subscriber_heals_a_gap_and_materializes_a_new_record() {
     let (m22, m7) = (&macs.m22, &macs.m7);
     let start = aterm_time::unix_millis().unwrap();
     let (clock22, clock7) = (AtomicU64::new(start), AtomicU64::new(start));
-    let (stop22, stop7) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (stop22, stop7) = (aterm_uds::stop::Stop::new(), aterm_uds::stop::Stop::new());
     std::thread::scope(|scope| {
         let _m22 = spawn_pass(scope, m22, &stop22, &clock22, &|| false);
         let _m7 = spawn_pass(scope, m7, &stop7, &clock7, &|| false);
@@ -161,7 +161,7 @@ fn a_held_pass_leaves_the_gap_and_writes_no_file() {
     let (m22, m7) = (&macs.m22, &macs.m7);
     let start = aterm_time::unix_millis().unwrap();
     let clock = AtomicU64::new(start + PAST_EVERY_RANK);
-    let (stop22, stop7) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (stop22, stop7) = (aterm_uds::stop::Stop::new(), aterm_uds::stop::Stop::new());
     let asked = AtomicUsize::new(0);
     let held = || {
         asked.fetch_add(1, Ordering::AcqRel);
@@ -190,7 +190,7 @@ fn a_person_who_turned_the_agent_off_holds_the_pass() {
     let m22 = &macs.m22;
     crate::service::record_subscriber_off(&m22.home).unwrap();
     let clock = AtomicU64::new(aterm_time::unix_millis().unwrap() + PAST_EVERY_RANK);
-    let stop = AtomicBool::new(false);
+    let stop = aterm_uds::stop::Stop::new();
     let asked = AtomicUsize::new(0);
     let not_held = || {
         asked.fetch_add(1, Ordering::AcqRel);
@@ -211,7 +211,8 @@ fn a_person_who_turned_the_agent_off_holds_the_pass() {
 #[test]
 fn a_stopped_node_does_not_make_inputs_or_start_convergence() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
-    let stop = AtomicBool::new(true);
+    let stop = aterm_uds::stop::Stop::new();
+    stop.set();
     run_node_pass(&NodePassHost {
         paths: &macs.m7,
         stop: &stop,
@@ -449,7 +450,7 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
     let m22 = &macs.m22;
     let start = aterm_time::unix_millis().unwrap();
     let clock = AtomicU64::new(start);
-    let stop = AtomicBool::new(false);
+    let stop = aterm_uds::stop::Stop::new();
     let writer = StateLock::take(m22).unwrap();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -485,7 +486,7 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
                     .map(|_| ())
             },
         );
-        stop.store(true, Ordering::Release);
+        stop.set();
     });
     let wait = |n| node_pass_wait(&NodePassPace::LIVE, n);
     assert_eq!(wait(0), Duration::from_secs(60));
@@ -504,7 +505,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let (m22, m7) = (&macs.m22, &macs.m7);
     let start = aterm_time::unix_millis().unwrap();
     let clock = AtomicU64::new(start);
-    let stop = AtomicBool::new(false);
+    let stop = aterm_uds::stop::Stop::new();
     let lan = AtomicBool::new(false);
     let held = AtomicBool::new(false);
     let runners = AtomicUsize::new(0);
@@ -632,7 +633,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                 "a resumed node owes one refresh with unchanged records and clock"
             );
         }
-        stop.store(true, Ordering::Release);
+        stop.set();
         assert_eq!(made_inputs.load(Ordering::Acquire), 1);
         assert_eq!(load_records(m7).unwrap().encode(), records);
         assert_eq!(clock.load(Ordering::Acquire), start);

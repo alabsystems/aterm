@@ -118,20 +118,9 @@ mod tests {
         let _serialized = crate::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("aterm-unread-status-{}", std::process::id()));
+        let staging = Staging::scratch("unread-status");
         let explanation = "aterm cannot read its release channel github.com/o/r: this \
                            machine stays on its current version until the channel is fixed";
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let staging = Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged").join("aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root: root.clone(),
-        };
         announce(&staging, 1234, explanation);
         let (_, body) = notification();
         assert!(body.contains("github.com/o/r"), "{body}");
@@ -144,6 +133,5 @@ mod tests {
             !is_stranded(),
             "and disarms as soon as the channel reads again"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -145,6 +145,9 @@ pub enum Selection {
         /// nothing that changed, and the test compile, which takes all of `crates`, fires any
         /// compile error in their tests.
         unlinted: Vec<String>,
+        /// The members, by name, one edge from a seed, normal, build or dev ([`Reach::direct`]):
+        /// those whose code can name what the change touched.
+        direct_dependents: Vec<String>,
     },
 }
 
@@ -199,6 +202,10 @@ pub struct Reach {
     /// The member dev dependents of those that are not among them: only their test, bench and
     /// example targets link the change.
     pub dev_only: Vec<String>,
+    /// The members one edge from the package, normal, build or dev: the code that can name its
+    /// items. A target only a feature switches on (`required-features`) can name them where no
+    /// other target of that member does ([`crate::scope::Changed::direct_dependents`]).
+    pub direct: Vec<String>,
 }
 
 /// Impact of a change to one of [`REPLANNING_PATHS`].
@@ -454,6 +461,7 @@ pub fn select(
     seeds.extend(replanned);
     seeds.extend(forks_touched(paths, &packages));
     let mut dev_only: BTreeSet<String> = BTreeSet::new();
+    let mut direct_dependents: BTreeSet<String> = BTreeSet::new();
     for seed in &seeds {
         let Some(found) = dependents(seed.as_str()) else {
             return Selection::Widened(format!(
@@ -474,6 +482,7 @@ pub fn select(
         }
         cone.extend(found.links.into_iter().filter(|n| names.contains(n)));
         dev_only.extend(found.dev_only.into_iter().filter(|n| names.contains(n)));
+        direct_dependents.extend(found.direct.into_iter().filter(|n| names.contains(n)));
     }
     dev_only.retain(|n| !cone.contains(n));
     cone.extend(dev_only.iter().cloned());
@@ -502,6 +511,7 @@ pub fn select(
         any_lib,
         all_targets,
         unlinted,
+        direct_dependents: direct_dependents.into_iter().collect(),
     }
 }
 
@@ -573,6 +583,7 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             any_lib,
             all_targets,
             unlinted,
+            direct_dependents,
         } => {
             let dependents = crates.iter().filter(|c| !seeds.contains(c)).count();
             let more = if dependents == 0 {
@@ -584,7 +595,8 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
                 Scope::changed(base, crates.clone(), *any_lib)
                     .with_seeds(seeds.clone())
                     .with_all_targets(all_targets.clone())
-                    .with_unlinted(unlinted.clone()),
+                    .with_unlinted(unlinted.clone())
+                    .with_direct_dependents(direct_dependents.clone()),
                 format!("the change cone since {base}: {}{more}", seeds.join(" ")),
             )
         }
@@ -621,6 +633,17 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         Ok(found) => found,
         Err(why) => return Selection::Widened(why),
     };
+    resolve_paths(root, tools, path_env, &merge_base, paths)
+}
+
+/// Resolve an explicit committed path selection through the ordinary dependency cone.
+pub fn resolve_paths(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    merge_base: &str,
+    paths: Vec<String>,
+) -> Selection {
     let members = read_members(root, tools, path_env);
     let paths = match with_shared_inputs(root, path_env, paths, &members) {
         Ok(paths) => paths,
@@ -633,7 +656,7 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         &members,
         &|| read_path_packages(root, tools, path_env, &members),
         &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
-        &|p| replan_of(root, path_env, &merge_base, p),
+        &|p| replan_of(root, path_env, merge_base, p),
     )
 }
 
@@ -1199,7 +1222,8 @@ fn tree_package(entry: &str) -> Option<&str> {
 /// that anchors a model, so a change to any of them brings its source-spec closure test into the
 /// cone), but its own dependents build no dev-dependency of it. X is in the closure as the tree's
 /// root, so a package only dev edges reach (`astream-term`, which `aterm-conformance`'s differential
-/// oracle runs on a bump of) still reaches its dev dependents.
+/// oracle runs on a bump of) still reaches its dev dependents. The members one line under the
+/// root, under any section header, are its direct dependents ([`Reach::direct`]).
 ///
 /// `None` on a non-empty line that is neither a section header nor a package one level under what
 /// is printed above it: a misread must widen the cone, never narrow it to whatever did parse. An
@@ -1207,6 +1231,7 @@ fn tree_package(entry: &str) -> Option<&str> {
 fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
     let mut member_of: BTreeMap<&str, String> = BTreeMap::new();
     let mut closure: BTreeSet<&str> = BTreeSet::new();
+    let mut roots: BTreeSet<&str> = BTreeSet::new();
     let mut edges: Vec<(&str, &str, bool)> = Vec::new();
     // The package at each depth of the line being read, and whether the edges below it are dev.
     let mut path: Vec<(&str, bool)> = Vec::new();
@@ -1235,6 +1260,7 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
             Some((dependency, dev)) => edges.push((*dependency, package, *dev)),
             None => {
                 closure.insert(package);
+                roots.insert(package);
             }
         }
         path.push((package, false));
@@ -1252,6 +1278,13 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
         })
         .map(|(_, dependent, _)| *dependent)
         .collect();
+    let direct: BTreeSet<&str> = edges
+        .iter()
+        .filter(|(dependency, dependent, _)| {
+            roots.contains(dependency) && !roots.contains(dependent)
+        })
+        .map(|(_, dependent, _)| *dependent)
+        .collect();
     let names = |packages: &BTreeSet<&str>| {
         packages
             .iter()
@@ -1261,6 +1294,7 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
     Some(Reach {
         links: names(&closure),
         dev_only: names(&final_hop),
+        direct: names(&direct),
     })
 }
 
@@ -1630,7 +1664,7 @@ mod tests {
     fn linking(links: Vec<String>) -> Reach {
         Reach {
             links,
-            dev_only: Vec::new(),
+            ..Reach::default()
         }
     }
 
@@ -1916,6 +1950,7 @@ checksum = "aaa"
             Some(Reach {
                 links: owned(links),
                 dev_only: owned(dev_only),
+                direct: Vec::new(),
             })
         };
         let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
@@ -1972,6 +2007,49 @@ checksum = "aaa"
             ["aterm-update", "both", "dev", "normal", "seed"]
         );
         assert!(unlinted.is_empty(), "{unlinted:?}");
+    }
+
+    /// What depends directly on a seed, over any edge, reaches the scope: its required-features
+    /// targets are linted beside the seed's, and those of a member further away are not. A direct
+    /// dependent outside the workspace is no member. CONTROL: one only further away, `far`.
+    #[test]
+    fn the_direct_dependents_of_a_seed_reach_the_scope() {
+        let m = members(&["seed", "near", "far", "dev"]);
+        let reach = |name: &str| {
+            let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect();
+            (name == "seed").then(|| Reach {
+                links: owned(&["far", "near", "seed"]),
+                dev_only: owned(&["dev"]),
+                direct: owned(&["dev", "near", "registry-only"]),
+            })
+        };
+        let manifests: Manifests = ["crates/seed"].into_iter().collect();
+        let selection = super::select(
+            &paths(&["crates/seed/src/lib.rs"]),
+            &manifests,
+            &m,
+            &|| Some(Vec::new()),
+            &reach,
+            &|_| Replan::Nothing,
+        );
+        let Selection::Narrowed {
+            direct_dependents, ..
+        } = &selection
+        else {
+            panic!("widened unexpectedly: {selection:?}");
+        };
+        assert_eq!(direct_dependents, &["dev", "near"]);
+        let (scope, _) = cone("main", &selection);
+        let gated = |name: &str| scope.gated_spec_of(name);
+        assert_eq!(
+            ["seed", "near", "dev", "far"].map(gated),
+            [
+                Some("seed".to_string()),
+                Some("near".to_string()),
+                Some("dev".to_string()),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -2342,9 +2420,10 @@ checksum = "aaa"
         let owned = |names: &[&str]| -> Vec<String> {
             names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>()
         };
-        let reach = |links: &[&str], dev_only: &[&str]| Reach {
+        let reach = |links: &[&str], dev_only: &[&str], direct: &[&str]| Reach {
             links: owned(links),
             dev_only: owned(dev_only),
+            direct: owned(direct),
         };
         let (anchored, vendored, macros) = (found("anchored"), found("vendored"), found("macros"));
         let offhost = found("offhost");
@@ -2361,10 +2440,15 @@ checksum = "aaa"
         let _ = std::fs::remove_dir_all(&made);
         assert_eq!(
             anchored,
-            reach(&["anchored", "linked"], &["closure", "tested_linked"])
+            reach(
+                &["anchored", "linked"],
+                &["closure", "tested_linked"],
+                &["closure", "linked"]
+            ),
+            "a dev dependent is direct; what depends on a direct dependent is not"
         );
-        assert_eq!(vendored, reach(&[], &["conformance"]));
-        assert_eq!(macros, reach(&["abi", "consumer", "macros"], &[]));
+        assert_eq!(vendored, reach(&[], &["conformance"], &["conformance"]));
+        assert_eq!(macros, reach(&["abi", "consumer", "macros"], &[], &["abi"]));
         assert_eq!(
             offhost,
             Reach::default(),
@@ -2548,6 +2632,7 @@ checksum = "aaa"
             Some(Reach {
                 links: ["a", "c", "x"].map(String::from).to_vec(),
                 dev_only: ["b", "d"].map(String::from).to_vec(),
+                direct: ["a", "c", "d"].map(String::from).to_vec(),
             })
         );
         let coloured = "x v1.0.0 (/r/x)\n\

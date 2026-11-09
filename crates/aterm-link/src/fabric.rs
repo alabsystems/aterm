@@ -6335,6 +6335,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = aterm_tempfile::Builder::new()
             .prefix("fabric-io-")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .unwrap();
         let endpoint = scratch.path().join("ctl.sock");
@@ -6391,7 +6392,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_fabric_command_reads_through_a_linked_aterm_toml() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("fab");
         let real = dir.path().join("dotfiles.toml");
         aterm_uds::atomic_file::write(&real, b"[fabric]\ncommand = \"astream serve\"\n", 0o600)
             .expect("write");
@@ -6407,7 +6408,7 @@ mod tests {
     #[test]
     fn refused_config_does_not_enable_receipts_or_presence_metadata() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("fab");
         let path = dir.path().join("aterm.toml");
         aterm_uds::atomic_file::write(
             &path,
@@ -6713,9 +6714,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
-        let dir = std::env::temp_dir().join(format!("atlink-tail-json-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("tail");
+        let dir = scratch.path();
         let broker = crate::test_broker(dir.join("t.log")).expect("a broker");
         let sock = dir.join("t.sock");
         let mut server = broker.serve(&sock).expect("serves");
@@ -6803,7 +6803,6 @@ mod tests {
             }
         }
         server.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A fetch of face `face` of `log` from `from` on a broker whose head is `head`: the face's
@@ -7051,6 +7050,7 @@ mod tests {
         use aterm_spec::wait::MUST_HAPPEN;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-tail-faces")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let secret = vec![0x5a_u8; 32];
@@ -7356,6 +7356,7 @@ mod tests {
         use aterm_spec::wait::MUST_HAPPEN;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-tail-older")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let mut world = TwoFaces::new(dir.path());
@@ -7416,6 +7417,7 @@ mod tests {
     fn the_tails_fetch_link_waits_the_idle_mark_deadline_never_a_requests_timeout() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-tail-link")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let world = TwoFaces::new(dir.path());
@@ -7443,6 +7445,7 @@ mod tests {
         use aterm_spec::wait::MUST_HAPPEN;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-tail-stall")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let mut world = TwoFaces::new(dir.path());
@@ -7742,7 +7745,8 @@ mod tests {
 
     #[test]
     fn the_program_row_names_a_development_build_by_cargos_tag() {
-        let dir = std::env::temp_dir().join(format!("atfab-prog-{}", std::process::id()));
+        let scratch = crate::test_scratch_dir("prog");
+        let dir = scratch.path();
         let debug = dir.join("target").join("debug");
         std::fs::create_dir_all(&debug).expect("scratch");
         let aterm = debug.join("aterm");
@@ -7759,13 +7763,12 @@ mod tests {
         r.program_in_target_dir = true;
         r.warnings = warned(&r);
         assert_eq!(exit_of(&r), 0, "informational, never a warning");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_env_overrides_the_file_and_a_missing_file_is_off() {
-        let dir = std::env::temp_dir().join(format!("atfab-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("cfg");
+        let dir = scratch.path();
         let path = dir.join("aterm.toml");
         aterm_uds::atomic_file::write(
             &path,
@@ -7794,7 +7797,6 @@ mod tests {
         assert_eq!(resolve_command(None, None), Ok(None));
         aterm_uds::atomic_file::write(&path, b"[fabric\n", 0o600).expect("write");
         assert!(resolve_command(None, Some(&path)).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7834,7 +7836,8 @@ mod tests {
     fn a_bridges_program_is_the_file_it_runs_under_any_spelling() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-prog")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let at = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
         std::fs::write(at("aterm"), b"#!/bin/sh\n").expect("program");
@@ -8120,7 +8123,7 @@ mod tests {
     /// Mac's node, and the body its lane holds, `by=h-andrew` beside the seal.
     fn carried_post(kind: &str) -> (String, Body) {
         use crate::person_key::{post_address, read_cert, vouch, PersonKey, BY_TOKEN};
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("fab");
         aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
         let seed = [51u8; 32];
         assert!(vouch(dir.path(), &seed, CARRIED_AT).is_ok());
@@ -8538,7 +8541,8 @@ mod tests {
     fn only_a_locally_served_broker_is_diagnosed_from_local_supervisor_stderr() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("broker-role")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .unwrap();
         let root = dir.path();
         std::fs::write(root.join("broker.err"), "old-local-broker-refusal\n").unwrap();
@@ -8590,7 +8594,8 @@ mod tests {
         use astream_broker::proto::{encode_response, read_frame, write_frame, Response};
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-answers")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let endpoint = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
 
@@ -8648,7 +8653,8 @@ mod tests {
         let probe_against = |version: u8| {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("al-proto")
-                .tempdir()
+                .suffix(".noindex")
+                .tempdir_in("/tmp")
                 .expect("scratch");
             let sock = dir.path().join("bus.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
@@ -8761,7 +8767,20 @@ mod tests {
 
     #[test]
     fn a_withheld_fabric_row_says_why_and_probes_nothing() {
-        let absent = std::env::temp_dir().join(format!("atl-withheld-{}", std::process::id()));
+        let scratch = crate::test_scratch_dir("withheld");
+        assert!(
+            scratch.path().to_string_lossy().ends_with(".noindex"),
+            "scratch dir must exclude Spotlight: {}",
+            scratch.path().display()
+        );
+        assert!(
+            crate::test_scratch_dir("éééééé")
+                .path()
+                .to_string_lossy()
+                .ends_with(".noindex"),
+            "UTF-8 tag truncation must split on a char boundary"
+        );
+        let absent = scratch.path().join("absent");
         let bridge = words(&format!(
             "aterm link serve --fleet lab --broker {b} --cap-file /c --state {s}",
             b = absent.join("b.sock").display(),
@@ -8797,7 +8816,8 @@ mod tests {
     fn a_broker_that_does_not_answer_is_shown_with_its_supervisors_last_line() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-err")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let cfg = unix_config(&dir.path().join("bus.sock"));
         let (view, _) = reach_broker(&cfg);
@@ -8840,7 +8860,8 @@ mod tests {
     fn a_poisoned_brokers_exit_line_gets_its_remedy_at_real_lengths() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-poison")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let role = crate::enable::Role::default();
         let fix = |w: &Warning| crate::enable::fix_for(&w.kind, &role);
@@ -8917,7 +8938,8 @@ mod tests {
     fn a_sealed_logs_refusal_gets_its_remedy_at_real_lengths() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-sealed")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path().join("Users/someone/.local/share/aterm-fabric");
         std::fs::create_dir_all(&root).expect("root");
@@ -8990,7 +9012,8 @@ mod tests {
     fn the_at_rest_row_reads_the_served_log_or_with_none_serving_the_roots() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-rest")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let log = dir.path().join("bus.log");
         let seal = dir.path().join("bus.log.seal");
@@ -9512,7 +9535,8 @@ mod tests {
         use std::io::ErrorKind as K;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-dial")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let cfg = unix_config(&dir.path().join("bus.sock"));
         let role = crate::enable::Role::default();
@@ -9585,7 +9609,8 @@ mod tests {
     fn a_lapsed_ring_is_named_and_its_fix_is_a_renewal() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-lapsed")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let secret = vec![0x5a_u8; 32];
         let broker = astream_broker::Broker::open_guarded(dir.path().join("b.log"), secret.clone())
@@ -9711,8 +9736,8 @@ mod tests {
 
     #[test]
     fn the_readable_faces_are_the_caps_filters_under_the_fleet() {
-        let dir = std::env::temp_dir().join(format!("atfab-faces-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("faces");
+        let dir = scratch.path();
         let cap = dir.join("node.cap");
         let lines: String = crate::enable::node_rules("lab", "n-a")
             .iter()
@@ -9739,14 +9764,14 @@ mod tests {
             ["/f/lab/in/*/*/n-a/*", "/f/lab/in/n-a/>"]
         );
         assert_eq!(in_filters("lab", None), ["/f/lab/in/>"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_process_whose_executable_was_replaced_is_named() {
-        let root = std::env::temp_dir().join(format!("atfab-exe-{}", std::process::id()));
+        let mut kept =
+            aterm_uds::deadline::KeptUntilRan::new(crate::test_scratch_dir("exe").keep());
+        let root = kept.path().to_path_buf();
         let dir = root.join("a b");
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&dir).expect("scratch");
         let exe = dir.join("slp");
         let copy = |to: &Path| aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), to);
@@ -9767,6 +9792,7 @@ mod tests {
             aterm_uds::deadline::cat_echoes(&mut child),
             aterm_uds::deadline::cat_echoes(&mut linked),
         ];
+        kept.ran();
         let shown = exe.to_string_lossy().into_owned();
         let via = link.to_string_lossy().into_owned();
         let before = replaced_build(child.id(), &shown);
@@ -9789,7 +9815,6 @@ mod tests {
             let _ = c.wait();
         }
         drop(fed);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(before, None, "it runs the file at its path");
         assert_eq!(
             after.as_deref(),
@@ -10221,10 +10246,7 @@ mod tests {
     #[cfg(unix)]
     fn held_ask_bus(tag: &str) -> HeldAsk {
         const BODY: u64 = 4096;
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(tag)
-            .tempdir_in("/tmp")
-            .expect("scratch");
+        let dir = crate::test_scratch_dir(tag);
         let socket = dir.path().join("b.sock");
         let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
         broker.set_retention_interval(Duration::from_secs(3600));
@@ -10371,6 +10393,7 @@ mod tests {
         const BODY: u64 = 4096;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-unjudged")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let socket = dir.path().join("b.sock");
@@ -10563,7 +10586,8 @@ mod tests {
     fn the_status_reports_only_a_halt_a_bridge_applies() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-halt")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("the broker dir");
         let socket = dir.path().join("b.sock");
         let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
@@ -10771,7 +10795,8 @@ mod tests {
         let mut r = healthy();
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-kept")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("a state dir");
         r.cfg.state_dir = dir.path().to_string_lossy().into_owned();
         let st = crate::state::StateDir::open(dir.path()).expect("open");
@@ -10971,7 +10996,8 @@ mod tests {
         let secret = [5u8; 32];
         let dir = aterm_tempfile::Builder::new()
             .prefix("atfab-subj")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let socket = dir.path().join("b.sock");
         let broker =
@@ -11324,7 +11350,7 @@ mod running_argv_tests {
     #[cfg(unix)]
     #[test]
     fn the_holders_socket_word_names_the_endpoint_as_its_listener_does() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("fab");
         let base = dir.path().canonicalize().expect("its own spelling");
         let (real, link) = (base.join("real"), base.join("link"));
         std::fs::create_dir(&real).expect("the real folder");
@@ -11437,6 +11463,7 @@ mod running_argv_tests {
         #[cfg(any(target_vendor = "apple", target_os = "linux"))]
         {
             let dir = aterm_tempfile::Builder::new()
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("a scratch folder short enough for sun_path");
             let (stale, live) = (dir.path().join("stale.sock"), dir.path().join("live.sock"));

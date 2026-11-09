@@ -43,6 +43,7 @@ pub enum EntryClaimRelation {
 std::thread_local! {
     static MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static PREFIX_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FOLLOWS_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 impl std::fmt::Debug for EntryClaim {
@@ -264,90 +265,14 @@ impl EntrySnapshot {
         else {
             return Ok(Unproven);
         };
-        let Some(signer) = self.config.signer else {
-            return Ok(Unproven);
-        };
         if self.name != claim.name
-            || self.config.host != claim.host
-            || self.recipient != claim.recipient
             || current.audience != claim.audience
             || current.ambiguous
             || !current.complete
         {
             return Ok(Unproven);
         }
-        let version = AuthenticatedVersion::from_source(
-            &self.config.name,
-            signer,
-            self.config.followed.iter().copied(),
-            self.envelope_context.clone(),
-            Some(history),
-        )?;
-        if !matches!(
-            version.relation(&claim.version),
-            VersionRelation::Same | VersionRelation::Advanced
-        ) {
-            return Ok(Unproven);
-        }
-        let Some(identity) = read_identity(paths)? else {
-            return Ok(Unproven);
-        };
-        if identity.recipient() != self.recipient {
-            return Ok(Unproven);
-        }
-        let check_old = || -> crate::Result<bool> {
-            #[cfg(test)]
-            if PREFIX_ERROR.get() {
-                return Err(invalid());
-            }
-            let Some(prefix) = claim.version.log() else {
-                return Ok(false);
-            };
-            // relation above requires every head to be held before project_heads,
-            // whose ancestor closure alone would silently omit unknown heads.
-            let old = history.project_heads(&prefix.heads)?;
-            if old.heads() != prefix.heads {
-                return Ok(false);
-            }
-            let Some(selected) = old.open_selection(
-                &identity,
-                Some(&[claim.name.as_str(), crate::SWARM_ROSTER_ENTRY]),
-            )?
-            else {
-                return Ok(false);
-            };
-            let authorized = log_entry_reader_allowed(&old, &identity)
-                && selected_entry_reader_allowed(
-                    &selected.opened.entries,
-                    Some(&old),
-                    &self.config,
-                    &self.name,
-                    self.recipient,
-                );
-            #[cfg(test)]
-            let authorized = authorized || MUTANT.get() == 4;
-            if !authorized {
-                return Ok(false);
-            }
-            let key = (claim.audience.clone(), claim.name.clone());
-            Ok(selected
-                .opened
-                .entries
-                .iter()
-                .any(|entry| entry.name == claim.name && entry.audience == claim.audience)
-                && selected.operations.get(&key) == Some(&claim.operation)
-                && selected.puts.get(&key) == Some(&claim.wrapper)
-                && !selected.opened.conflicts.contains(&key)
-                && selected.complete.contains(&claim.audience))
-        };
-        let old_result = check_old();
-        #[cfg(test)]
-        let old_result = if MUTANT.get() == 5 {
-            Ok(old_result?)
-        } else {
-            old_result
-        };
-        let old_selected = old_result.unwrap_or(false);
+        let old_selected = self.claimed_prefix(paths, history, claim)?.is_some();
         #[cfg(test)]
         let old_selected = old_selected || MUTANT.get() == 1;
         if !old_selected {
@@ -372,7 +297,179 @@ impl EntrySnapshot {
             Ok(Unproven)
         }
     }
+
+    /// Prove that this entry's selected semantic write strictly follows the
+    /// entire authenticated frontier of a retained claim, possibly for another
+    /// entry. The old claim must resolve to its exact authorized selection for
+    /// this host and recipient. A re-encryption, unrelated edit, concurrent
+    /// write, incomplete history or envelope fallback does not establish this.
+    ///
+    /// This is a causal fact, not a source-policy or account-activation grant.
+    /// Decide durable transitions with the fresh snapshot inside [`Self::admit`]
+    /// and independently check which source and transition the application allows.
+    /// # Errors
+    /// The local identity cannot be read. Unverifiable historical evidence
+    /// returns false, including a prefix that cannot be opened or reconstructed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbEntryFrontier",
+            action = "Case",
+            reason = "The environment chooses a retained claim and authenticated current graph."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryFrontier",
+            action = "Read",
+            project = "aterm_secrets::client::entry::claim::frontier_tests::transition"
+        )
+    )]
+    pub fn follows_claim(&self, paths: &Paths, claim: &EntryClaim) -> crate::Result<bool> {
+        let Some(frontier) = claim.version.log().map(|log| &log.heads) else {
+            return Ok(false);
+        };
+        let Source::Log {
+            history,
+            register: Some(current),
+        } = &self.source
+        else {
+            return Ok(false);
+        };
+        let complete = current.complete && !current.ambiguous;
+        #[cfg(test)]
+        let complete = complete || FOLLOWS_MUTANT.get() == 4;
+        if !complete {
+            return Ok(false);
+        }
+        let old = self.claimed_prefix(paths, history, claim)?;
+        #[cfg(test)]
+        let old = if FOLLOWS_MUTANT.get() == 1 {
+            old.or_else(|| history.project_heads(&claim.version.log()?.heads).ok())
+        } else {
+            old
+        };
+        let Some(old) = old else {
+            return Ok(false);
+        };
+        let operation = current.operation;
+        #[cfg(test)]
+        let operation = if FOLLOWS_MUTANT.get() == 2 {
+            current.wrapper
+        } else {
+            operation
+        };
+        let fresh = old.get(&operation).is_none();
+        #[cfg(test)]
+        let fresh = fresh || FOLLOWS_MUTANT.get() == 5;
+        let past = history.past_of(&[operation]);
+        let follows = frontier.iter().all(|head| past.holds(head));
+        #[cfg(test)]
+        let follows = if FOLLOWS_MUTANT.get() == 3 {
+            past.holds(&claim.operation)
+        } else {
+            follows
+        };
+        let proved = fresh && follows;
+        #[cfg(test)]
+        let proved = proved && FOLLOWS_MUTANT.get() != 6;
+        Ok(proved)
+    }
+
+    /// Re-establish the claimed selection under the same public trust context
+    /// and this reader's historical access. Shared by same-entry comparison
+    /// and cross-entry frontier proofs, so neither can bypass old admission.
+    fn claimed_prefix(
+        &self,
+        paths: &Paths,
+        history: &crate::membership_log::Log,
+        claim: &EntryClaim,
+    ) -> crate::Result<Option<crate::membership_log::Log>> {
+        if self.config.host != claim.host || self.recipient != claim.recipient {
+            return Ok(None);
+        }
+        let Some(signer) = self.config.signer else {
+            return Ok(None);
+        };
+        let version = AuthenticatedVersion::from_source(
+            &self.config.name,
+            signer,
+            self.config.followed.iter().copied(),
+            self.envelope_context.clone(),
+            Some(history),
+        )?;
+        if !matches!(
+            version.relation(&claim.version),
+            VersionRelation::Same | VersionRelation::Advanced
+        ) {
+            return Ok(None);
+        }
+        let Some(identity) = read_identity(paths)? else {
+            return Ok(None);
+        };
+        if identity.recipient() != self.recipient {
+            return Ok(None);
+        }
+        let check_old = || -> crate::Result<Option<crate::membership_log::Log>> {
+            #[cfg(test)]
+            if PREFIX_ERROR.get() {
+                return Err(invalid());
+            }
+            let Some(prefix) = claim.version.log() else {
+                return Ok(None);
+            };
+            // relation above requires every head to be held before project_heads,
+            // whose ancestor closure alone would silently omit unknown heads.
+            let old = history.project_heads(&prefix.heads)?;
+            if old.heads() != prefix.heads {
+                return Ok(None);
+            }
+            let Some(selected) = old.open_selection(
+                &identity,
+                Some(&[claim.name.as_str(), crate::SWARM_ROSTER_ENTRY]),
+            )?
+            else {
+                return Ok(None);
+            };
+            let authorized = log_entry_reader_allowed(&old, &identity)
+                && selected_entry_reader_allowed(
+                    &selected.opened.entries,
+                    Some(&old),
+                    &self.config,
+                    &claim.name,
+                    self.recipient,
+                );
+            #[cfg(test)]
+            let authorized = authorized || MUTANT.get() == 4;
+            if !authorized {
+                return Ok(None);
+            }
+            let key = (claim.audience.clone(), claim.name.clone());
+            let exact = selected
+                .opened
+                .entries
+                .iter()
+                .any(|entry| entry.name == claim.name && entry.audience == claim.audience)
+                && selected.operations.get(&key) == Some(&claim.operation)
+                && selected.puts.get(&key) == Some(&claim.wrapper)
+                && !selected.opened.conflicts.contains(&key)
+                && selected.complete.contains(&claim.audience);
+            Ok(exact.then_some(old))
+        };
+        let old_result = check_old();
+        #[cfg(test)]
+        let old_result = if MUTANT.get() == 5 {
+            Ok(old_result?)
+        } else {
+            old_result
+        };
+        Ok(old_result.unwrap_or(None))
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frontier_tests;

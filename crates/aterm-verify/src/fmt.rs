@@ -63,6 +63,10 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     };
     let files = match rs_files(ctx) {
         Ok(f) if !f.is_empty() => f,
+        Ok(_) if ctx.input_paths.is_some() => {
+            r.pass("trustfmt: no unchecked Rust files");
+            return;
+        }
         Ok(_) => {
             r.cannot_run("trustfmt — `git ls-files` named no `.rs` file");
             return;
@@ -193,7 +197,13 @@ fn record_editions(r: &mut Report, gaps: &[EditionGap]) {
 }
 
 fn rs_files(ctx: &Ctx) -> Result<Vec<String>, String> {
-    rs_files_in(&ctx.root, &ctx.path_env)
+    let mut files = rs_files_in(&ctx.root, &ctx.path_env)?;
+    if let Some(paths) = &ctx.input_paths
+        && !paths.iter().any(|p| p.ends_with("rustfmt.toml"))
+    {
+        files.retain(|p| paths.contains(p));
+    }
+    Ok(files)
 }
 
 fn rs_files_in(root: &Path, path_env: &std::ffi::OsStr) -> Result<Vec<String>, String> {

@@ -824,7 +824,7 @@ impl Terminal {
         rows: usize,
         cols: usize,
     ) {
-        self.cell_frame_fill(scratch, rows, cols, None);
+        self.cell_frame_fill::<true>(scratch, rows, cols, None);
     }
 
     /// Damage-scoped variant of [`cell_frame_into`](Self::cell_frame_into) that also consumes the
@@ -847,7 +847,7 @@ impl Terminal {
                     rows_refilled += 1;
                 }
             }
-            self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            self.cell_frame_fill::<true>(scratch, rows, cols, Some(&mask));
             self.refill_mask_scratch = mask;
             self.take_damage();
             scratch.extract_gen = self.extract_gen;
@@ -858,12 +858,12 @@ impl Terminal {
         {
             let mut mask = std::mem::take(&mut self.refill_mask_scratch);
             Self::rotate_scrolled_scratch(scratch, rows, delta, &mut mask);
-            self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            self.cell_frame_fill::<true>(scratch, rows, cols, Some(&mask));
             self.refill_mask_scratch = mask;
             #[cfg(debug_assertions)]
             {
                 let mut oracle = scratch.clone();
-                self.cell_frame_fill(&mut oracle, rows, cols, None);
+                self.cell_frame_fill::<true>(&mut oracle, rows, cols, None);
                 debug_assert!(
                     *scratch == oracle,
                     "SCR-2: a rotated scratch diverged from a full extraction (delta {delta})"
@@ -875,7 +875,7 @@ impl Terminal {
                 rows_refilled: delta.unsigned_abs(),
             };
         }
-        self.cell_frame_fill(scratch, rows, cols, None);
+        self.cell_frame_fill::<true>(scratch, rows, cols, None);
         self.take_damage();
         scratch.extract_gen = self.extract_gen;
         crate::render::FrameRefill::Full { cause }
@@ -1107,7 +1107,7 @@ impl Terminal {
         clippy::too_many_lines,
         reason = "one fill boundary stamps every RenderInput channel coherently"
     )]
-    fn cell_frame_fill(
+    pub(super) fn cell_frame_fill<const PAINT: bool>(
         &mut self,
         scratch: &mut crate::render::RenderInput,
         rows: usize,
@@ -1118,8 +1118,10 @@ impl Terminal {
         scratch.cols = cols;
 
         scratch.cells.resize_with(rows, Vec::new);
-        scratch.clusters.resize_with(rows, Vec::new);
-        scratch.combining.resize_with(rows, Vec::new);
+        if PAINT {
+            scratch.clusters.resize_with(rows, Vec::new);
+            scratch.combining.resize_with(rows, Vec::new);
+        }
         for r in 0..rows {
             // Row granularity only.
             if let Some(mask) = refill_mask
@@ -1130,35 +1132,43 @@ impl Terminal {
             self.render_row_into_impl(
                 r,
                 &mut scratch.cells[r],
-                Some((&mut scratch.clusters[r], &mut scratch.combining[r])),
+                if PAINT {
+                    Some((&mut scratch.clusters[r], &mut scratch.combining[r]))
+                } else {
+                    None
+                },
                 false,
             );
         }
-        self.apron_row_into(scratch, rows);
+        if PAINT {
+            self.apron_row_into(scratch, rows);
 
-        self.images_frame_into(&mut scratch.images, rows);
+            self.images_frame_into(&mut scratch.images, rows);
 
-        scratch.line_sizes.clear();
-        scratch.line_sizes.extend((0..rows).map(|r| {
-            u16::try_from(r)
-                .ok()
-                .and_then(|vr| self.grid().row(vr))
-                .map_or(
-                    crate::grid::LineSize::SingleWidth,
-                    crate::grid::Row::line_size,
-                )
-        }));
-        scratch.line_size_spans.resize_with(rows, Vec::new);
-        for spans in &mut scratch.line_size_spans {
-            spans.clear();
-        }
-        scratch.default_bg_spans.resize_with(rows, Vec::new);
-        for spans in &mut scratch.default_bg_spans {
-            spans.clear();
+            scratch.line_sizes.clear();
+            scratch.line_sizes.extend((0..rows).map(|r| {
+                u16::try_from(r)
+                    .ok()
+                    .and_then(|vr| self.grid().row(vr))
+                    .map_or(
+                        crate::grid::LineSize::SingleWidth,
+                        crate::grid::Row::line_size,
+                    )
+            }));
+            scratch.line_size_spans.resize_with(rows, Vec::new);
+            for spans in &mut scratch.line_size_spans {
+                spans.clear();
+            }
+            scratch.default_bg_spans.resize_with(rows, Vec::new);
+            for spans in &mut scratch.default_bg_spans {
+                spans.clear();
+            }
         }
         scratch.selection_clip = None;
         scratch.selections.clear();
-        scratch.retire_chrome_rasters();
+        if PAINT {
+            scratch.retire_chrome_rasters();
+        }
 
         let cur = self.cursor();
         scratch.cursor_col = cur.col as usize;
@@ -1219,17 +1229,19 @@ impl Terminal {
         scratch.shifted_fill_seq = scratch.snapshot_seq;
         scratch.composed_fill_seq = 0;
 
-        scratch.row_rev.clear();
-        {
-            let revisions = self.grid.row_revisions();
-            scratch.row_rev.extend_from_slice(revisions);
+        if PAINT {
+            scratch.row_rev.clear();
+            {
+                let revisions = self.grid.row_revisions();
+                scratch.row_rev.extend_from_slice(revisions);
+            }
+            scratch.row_rev.resize(rows, 0);
+            scratch.row_rev_lane = if self.grid().damage().is_full() || display_offset != 0 {
+                0
+            } else {
+                self.extract_identity
+            };
         }
-        scratch.row_rev.resize(rows, 0);
-        scratch.row_rev_lane = if self.grid().damage().is_full() || display_offset != 0 {
-            0
-        } else {
-            self.extract_identity
-        };
 
         for map in &mut scratch.visual_to_logical {
             map.clear();

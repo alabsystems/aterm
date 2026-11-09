@@ -275,17 +275,59 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
     }
     let mut pids = [0i32; MAX_GROUP_PIDS];
     let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
+    crate::holders::clear_errno();
     // SAFETY: `pids` is `bytes` writable bytes of pid slots; libproc (`holders`' declaration)
-    // writes at most that many and answers how many bytes it wrote, or a negative number.
+    // writes at most that many and answers how many bytes it wrote, or a number [`group_listing`]
+    // reads as a failure.
     let got = unsafe {
         crate::holders::ffi::proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr(), bytes)
     };
+    group_listing(got, crate::holders::errno(), &pids)
+}
+
+/// `proc_listpids`'s answer, `got` bytes and the `errno` read after it, as a listing of `pids`.
+/// libproc answers 0 both for a group with no process and for a failure, a sandbox's denial
+/// among them, which alone sets `errno`; read as a whole empty listing, a failure would prove the
+/// group empty.
+#[cfg(target_vendor = "apple")]
+fn group_listing(got: i32, errno: i32, pids: &[i32; MAX_GROUP_PIDS]) -> Option<GroupMembers> {
+    if got == 0 && errno != 0 {
+        return None;
+    }
     let got = usize::try_from(got).ok()?;
     let n = (got / std::mem::size_of::<i32>()).min(MAX_GROUP_PIDS);
     Some(GroupMembers {
         pids: pids[..n].iter().copied().filter(|p| *p > 0).collect(),
         complete: n < MAX_GROUP_PIDS,
     })
+}
+
+/// A failed read is no listing, whatever it wrote: 0 with `errno` set and a negative count are
+/// `None`, while 0 with no `errno` is a whole, empty group. NEGATIVE CONTROL: drop the `errno`
+/// check from [`group_listing`] and a denied read lists a group as empty.
+#[cfg(all(test, target_vendor = "apple"))]
+#[test]
+fn a_failed_group_listing_is_no_listing() {
+    let pids = [0i32; MAX_GROUP_PIDS];
+    assert_eq!(group_listing(0, libc::EPERM, &pids), None);
+    assert_eq!(group_listing(-1, 0, &pids), None);
+    assert_eq!(
+        group_listing(0, 0, &pids),
+        Some(GroupMembers {
+            pids: Vec::new(),
+            complete: true,
+        })
+    );
+    let mut one = pids;
+    one[0] = 4242;
+    assert_eq!(
+        group_listing(4, libc::EPERM, &one),
+        Some(GroupMembers {
+            pids: vec![4242],
+            complete: true,
+        }),
+        "errno means nothing beside a count"
+    );
 }
 
 /// See the Apple twin: every `/proc/<pid>/stat` ([`super::stat_row`]), judged by

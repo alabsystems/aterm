@@ -2232,7 +2232,7 @@ pub(crate) fn pre_park_refusal_outcome(error: &str) -> crate::UpdateHandoffOutco
     if aterm_update::is_roster_confirmation_wait(error) {
         crate::UpdateHandoffOutcome::StageUnconfirmed
     } else if aterm_update::is_passing_refusal(error) {
-        crate::UpdateHandoffOutcome::ProducerFailed
+        crate::UpdateHandoffOutcome::VerificationDeferred
     } else {
         crate::UpdateHandoffOutcome::PreparationFailed
     }
@@ -8466,10 +8466,13 @@ impl App {
                     return Ok(());
                 }
                 if let Some(reason) = read.and_then(|read| read.ended_passing(now)) {
-                    return Err(crate::UpdateHandoffStartError::failed(format!(
-                        "{reason}; the app was not relaunched, and the update is tried again \
+                    return Err(crate::UpdateHandoffStartError::activity(
+                        crate::native_update_lane_hold::LaneHold::PreparkRead,
+                        format!(
+                            "{reason}; the app was not relaunched, and the update is tried again \
                          later"
-                    )));
+                        ),
+                    ));
                 }
                 if read.is_some_and(|read| read.running_for(attempt.target_build(), now)) {
                     return Err(preverify_read_activity(
@@ -8835,13 +8838,16 @@ impl App {
                 {
                     return None;
                 }
-                return Some(crate::UpdateHandoffStartError::failed(
-                    if mode.is_automatic() {
-                        format!("{reason}; the update is tried again later")
-                    } else {
-                        format!("{reason}; press again to check again")
-                    },
-                ));
+                return Some(if mode.is_automatic() {
+                    crate::UpdateHandoffStartError::activity(
+                        crate::native_update_lane_hold::LaneHold::PreparkRead,
+                        format!("{reason}; the update is tried again later"),
+                    )
+                } else {
+                    crate::UpdateHandoffStartError::failed(format!(
+                        "{reason}; press again to check again"
+                    ))
+                });
             }
             *self.sessionless_waited.of(mode) = self.in_flight_read_deadline();
             let until = now + crate::HANDOFF_PREVERIFY_READ_CEILING;
@@ -9044,6 +9050,7 @@ impl App {
         let routine = matches!(
             lane,
             crate::app_native::HandoffFailureLane::ActivityRevoked
+                | crate::app_native::HandoffFailureLane::VerificationDeferred
                 | crate::app_native::HandoffFailureLane::AwaitsRosterConfirmation { .. }
         ) || (pending.mode.is_automatic()
             && attempted_build.is_some_and(|build| self.automatic_apply_retry_scheduled(build)));

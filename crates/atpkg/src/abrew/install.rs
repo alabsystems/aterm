@@ -3111,7 +3111,10 @@ pub fn uninstall(
     force: bool,
     dry_run: bool,
 ) -> Result<(), InstallError> {
-    let short = Formula::short_name(name);
+    // An alias names its canonical formula's keg, as in brew.
+    let canon =
+        super::commands::canonical_installed_name(prefix, api, Formula::short_name(name), false);
+    let short = canon.as_str();
     let Some(inst) = prefix.installed_one(Kind::Formula, short) else {
         // Brew's resolution order: a known formula is a missing
         // keg, a known cask is its not-installed error, and a

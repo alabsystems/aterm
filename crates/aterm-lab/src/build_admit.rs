@@ -578,7 +578,7 @@ fn sweep_group(group: u32) -> Result<(), String> {
     let clear = group_clear(group);
     match signal {
         Ok(()) => clear,
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) => clear,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => clear,
         Err(error) => Err(format!(
             "signal owned group {group}: {error}; group observation: {clear:?}"
         )),

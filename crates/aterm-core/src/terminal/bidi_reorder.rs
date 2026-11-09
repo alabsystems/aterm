@@ -204,9 +204,15 @@ impl Terminal {
                 }
                 entries.sort_by_key(|(c, _)| *c);
             }
-            remap_cols(&mut frame.clusters[r], &scratch.inv);
-            remap_cols(&mut frame.combining[r], &scratch.inv);
-            remap_cols(&mut frame.images[r], &scratch.inv);
+            if let Some(entries) = frame.clusters.get_mut(r) {
+                remap_cols(entries, &scratch.inv);
+            }
+            if let Some(entries) = frame.combining.get_mut(r) {
+                remap_cols(entries, &scratch.inv);
+            }
+            if let Some(entries) = frame.images.get_mut(r) {
+                remap_cols(entries, &scratch.inv);
+            }
             if frame.cursor_row == r && frame.cursor_col < scratch.inv.len() {
                 frame.cursor_col = scratch.inv[frame.cursor_col];
             }

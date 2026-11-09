@@ -495,6 +495,7 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
 fn a_window_below_the_retained_floor_reads_from_it() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-brief-kept")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let sock = dir.path().join("b.sock");
@@ -1445,6 +1446,7 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
 fn a_one_shot_brief_reads_the_row_that_says_which_incarnation_hosted_a_session() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-brief-lived")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let sock = dir.path().join("b.sock");
@@ -1723,6 +1725,7 @@ fn a_derived_record_takes_no_seq_a_body_of_the_space_holds() {
 fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window_holds() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-brief-quit")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let sock = dir.path().join("b.sock");

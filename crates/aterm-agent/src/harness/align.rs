@@ -228,9 +228,11 @@ impl CaptureOwner {
                         aterm_spec::wait::MUST_HAPPEN,
                     ),
                 };
-                // Darwin can make a dying group unsignalable before waitid publishes
-                // its terminal exit. Accept these errors only after the owning wait below
-                // positively settles that exit; a one-shot WNOHANG probe here races it.
+                // `kill_group_until_empty` has already settled a group of the ended. What is
+                // left is `ESRCH`, or an `EPERM` it could not settle: on Apple a group it could
+                // not list, elsewhere a real refusal. Accept these errors only after the owning
+                // wait below positively settles the child's exit; a one-shot WNOHANG probe here
+                // races it.
                 match result {
                     Ok(()) => Ok(()),
                     Err(error)

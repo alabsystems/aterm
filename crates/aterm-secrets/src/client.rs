@@ -50,6 +50,7 @@ mod lab_labels;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod materialization_selection;
 mod member_authority;
 mod member_routes;
 mod mirrors;
@@ -2370,6 +2371,8 @@ struct State {
     seq: u64,
     digest: Option<[u8; 32]>,
     records_digest: Option<[u8; 32]>,
+    /// Complete selected entry semantics processed by the last actual materialization.
+    materialization_selection: Option<materialization_selection::Meaning>,
     /// The source, vault name and signer this version and membership belong to.
     source_identity: Option<[u8; 32]>,
     /// The last successful actual URL body admission, kept separately from heartbeats.
@@ -2418,6 +2421,7 @@ pub(crate) fn service_health_version(paths: &Paths) -> crate::Result<[u8; 32]> {
         "sequence":state.seq,
         "envelope":state.digest.map(|d|hex(&d)),
         "records":state.records_digest.map(|d|hex(&d)),
+        "materialization_selection":state.materialization_selection.map(|meaning| hex(meaning.as_bytes())),
         "retained_history":hex(&retained_history::version(paths)?),
         "state_source":state.source_identity.map(|d|hex(&d)),
         "configured_source":source.map(|d|hex(&d)),
@@ -2465,6 +2469,8 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
         seq: int("seq"),
         digest: digest("digest"),
         records_digest: digest("records_digest"),
+        materialization_selection: digest("materialization_selection")
+            .map(materialization_selection::Meaning::from_digest),
         source_identity: digest("source_identity"),
         network_materialization: network_observation::Receipt::parse(&table),
         http204_response: http204_observation::Receipt::parse(&table),
@@ -2535,6 +2541,12 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
         text.push_str(&format!(
             "records_digest = {}\n",
             toml_str(&hex(records_digest))
+        ));
+    }
+    if let Some(selection) = &state.materialization_selection {
+        text.push_str(&format!(
+            "materialization_selection = {}\n",
+            toml_str(&hex(selection.as_bytes()))
         ));
     }
     if let Some(identity) = &state.source_identity {
@@ -2672,6 +2684,7 @@ fn log_only_intact(paths: &Paths, config: &Config, state: &State) -> bool {
 fn prepare_materialization(paths: &Paths, state: &mut State) -> crate::Result<()> {
     state.failed = true;
     state.source_identity = None;
+    state.materialization_selection = None;
     save_state(paths, state)
 }
 
@@ -3021,9 +3034,9 @@ pub fn read_verdict_within_admitted(
     Ok(refused)
 }
 
-/// Whether an admitted vault's last sync finished and its tracked files still match.
+/// Whether an admitted vault applied the current selected entries and its tracked files match.
 pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
-    materialization_ready_with(paths, None, files_intact)
+    materialization_ready_with(paths, None, local_files_intact)
 }
 
 /// Setup readiness, including an owned legacy lock that ordinary sync can repair.
@@ -3042,7 +3055,7 @@ pub fn materialization_ready_for_setup(paths: &Paths) -> crate::Result<bool> {
 
 /// Observe readiness only while `expected` is still configured.
 pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Result<bool> {
-    materialization_ready_with(paths, Some(expected), files_intact)
+    materialization_ready_with(paths, Some(expected), local_files_intact)
 }
 
 /// Local materialization facts that can change a setup retry's answer.
@@ -3119,6 +3132,7 @@ pub struct MaterializationSnapshot {
     /// A caller's registered input entries; `None` observes the whole materialization.
     entries: Option<BTreeSet<String>>,
     network_materialization: Option<VaultNetworkMaterialization>,
+    selection: std::sync::Arc<materialization_selection::Fact>,
 }
 
 impl PartialEq for MaterializationSnapshot {
@@ -3247,12 +3261,20 @@ impl MaterializationSnapshot {
                 "the captured version does not cover this credential want",
             ));
         }
-        match with_ready_state(paths, Some(&self.config), files_intact, None, |now| {
-            if now.seq != self.seq || now.digest != self.digest || !now.holds_the_files_of(self) {
-                return Err(Error::new("the captured credential version changed"));
-            }
-            read()
-        })? {
+        match with_ready_state_reusing(
+            paths,
+            Some(&self.config),
+            local_files_intact,
+            None,
+            Some(&self.selection),
+            |now| {
+                if now.seq != self.seq || now.digest != self.digest || !now.holds_the_files_of(self)
+                {
+                    return Err(Error::new("the captured credential version changed"));
+                }
+                read()
+            },
+        )? {
             MaterializationObservation::Ready(ready) => Ok(ready.inputs),
             MaterializationObservation::Blocked(_) => {
                 Err(Error::new("the captured credential source is not ready"))
@@ -3280,15 +3302,19 @@ impl MaterializationSnapshot {
         let until = Instant::now() + CURRENT_WAIT;
         let mut looked_again = false;
         loop {
-            match with_materialization_ready(paths, &self.config, || Ok(()))? {
-                Some(current) => return Ok(current.snapshot.holds_the_files_of(self)),
+            match self.observe_current(paths)? {
+                MaterializationObservation::Ready(current) => {
+                    return Ok(current.snapshot.holds_the_files_of(self));
+                }
                 // A writer may have let go between the read and this look: one more read
                 // settles it, and a busy lock is waited for.
-                None if (!looked_again || state_lock_busy(paths)?) && Instant::now() < until => {
+                MaterializationObservation::Blocked(_)
+                    if (!looked_again || state_lock_busy(paths)?) && Instant::now() < until =>
+                {
                     looked_again = true;
                     std::thread::sleep(CURRENT_LOOK);
                 }
-                None => return Ok(false),
+                MaterializationObservation::Blocked(_) => return Ok(false),
             }
         }
     }
@@ -3299,8 +3325,21 @@ impl MaterializationSnapshot {
     /// # Errors
     /// The local configuration or state cannot be safely read.
     pub fn is_current_now(&self, paths: &Paths) -> crate::Result<bool> {
-        Ok(with_materialization_ready(paths, &self.config, || Ok(()))?
-            .is_some_and(|current| current.snapshot.holds_the_files_of(self)))
+        Ok(match self.observe_current(paths)? {
+            MaterializationObservation::Ready(current) => current.snapshot.holds_the_files_of(self),
+            MaterializationObservation::Blocked(_) => false,
+        })
+    }
+
+    fn observe_current(&self, paths: &Paths) -> crate::Result<MaterializationObservation<()>> {
+        with_ready_state_reusing(
+            paths,
+            Some(&self.config),
+            local_files_intact,
+            None,
+            Some(&self.selection),
+            |_| Ok(()),
+        )
     }
 
     /// Whether the captured source's recorded membership and input digests still hold.
@@ -3383,9 +3422,13 @@ pub fn with_materialization_ready_for_entries<T>(
             "entry-scoped materialization needs at least one registered entry",
         ));
     }
-    with_ready_state(paths, Some(expected), files_intact, Some(entries), |_| {
-        read()
-    })
+    with_ready_state(
+        paths,
+        Some(expected),
+        local_files_intact,
+        Some(entries),
+        |_| read(),
+    )
     .map(|observation| match observation {
         MaterializationObservation::Ready(inputs) => Some(*inputs),
         MaterializationObservation::Blocked(_) => None,
@@ -3403,7 +3446,7 @@ pub fn observe_materialization<T>(
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state(paths, Some(expected), files_intact, None, |_| read())
+    with_ready_state(paths, Some(expected), local_files_intact, None, |_| read())
 }
 
 fn materialization_ready_with(
@@ -3462,6 +3505,33 @@ fn with_ready_state<T>(
     entries: Option<&[&str]>,
     read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
+    with_ready_state_reusing(paths, expected, intact, entries, None, read)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVaultNetworkMaterializationProjection",
+        action = "StaleSelection",
+        project = "aterm_secrets::client::network_observation::conformance_tests::projection_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVaultNetworkMaterializationProjection",
+        action = "ReappliedSelection",
+        project = "aterm_secrets::client::network_observation::conformance_tests::projection_transition"
+    )
+)]
+fn with_ready_state_reusing<T>(
+    paths: &Paths,
+    expected: Option<&Config>,
+    intact: impl FnOnce(&Paths, &State) -> bool,
+    entries: Option<&[&str]>,
+    prior: Option<&std::sync::Arc<materialization_selection::Fact>>,
+    read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
+) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
     let blocked = |why| Ok(MaterializationObservation::Blocked(why));
     let Some(observation) = StateLock::observe(paths)? else {
@@ -3481,6 +3551,19 @@ fn with_ready_state<T>(
     if !intact(paths, &state) {
         return blocked(Blocker::LocalFilesIncomplete);
     }
+    let Some(applied) = state.materialization_selection else {
+        return blocked(Blocker::LocalFilesIncomplete);
+    };
+    let Some(selection) =
+        materialization_selection::observe(paths, &config, &state, &observation, prior)
+            .ok()
+            .flatten()
+    else {
+        return blocked(Blocker::LocalFilesIncomplete);
+    };
+    if selection.meaning != applied {
+        return blocked(Blocker::LocalFilesIncomplete);
+    }
     let entries = if let Some(entries) = entries {
         if entries
             .iter()
@@ -3494,6 +3577,7 @@ fn with_ready_state<T>(
     };
     let snapshot = MaterializationSnapshot {
         network_materialization: network_observation::project(paths, &config, &state),
+        selection,
         config,
         seq: state.seq,
         digest: state.digest.or(state.records_digest),
@@ -3772,6 +3856,18 @@ pub struct CommonsSourceRead {
 /// The existing lock cannot be opened safely or its shared lock fails.
 pub fn try_commons_source_read(paths: &Paths) -> crate::Result<Option<CommonsSourceRead>> {
     Ok(StateLock::observe(paths)?.map(|lock| CommonsSourceRead { _lock: lock }))
+}
+
+/// How long a file must have stood unchanged before a Commons journal view or a kept file digest
+/// keeps what it read of it (`fsx`'s settled rule; a file changed since is read again at each
+/// ask): a measurement of quiet rounds waits it out, and a tenth of a second past it, after its
+/// fixture's last write, so its rounds read the vault as an idle Mac's do (`aterm-db`'s
+/// `quiet_rounds`).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub const fn test_settled_after() -> Duration {
+    crate::fsx::SETTLED
 }
 
 pub(crate) fn hold_commons_source(paths: &Paths) -> crate::Result<CommonsSourceRead> {
@@ -4324,6 +4420,7 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
             let mut ahead = load_state(paths)?;
             ahead.manifest = held.clone();
             ahead.pending = pending.clone();
+            ahead.materialization_selection = None;
             save_state(paths, &ahead)
         },
     );
@@ -4332,6 +4429,7 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
             state.pending = landed(&paths.home, pended, &report.failed);
             state.own = Some(own_entries(entries, &manifest, &report));
             state.manifest = manifest;
+            state.materialization_selection = Some(materialization_selection::Meaning::of(entries));
             state.kept.retain(|name| names.contains(name.as_str()));
             Ok(report)
         }
@@ -4453,6 +4551,11 @@ fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
 }
 
 fn files_intact(paths: &Paths, state: &State) -> bool {
+    local_files_intact(paths, state) && materialization_selection_current(paths, state)
+}
+
+/// Physical ownership and cache checks, separate from the current selected meaning.
+fn local_files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
         && (cache_intact(paths, state)
@@ -4461,6 +4564,13 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
                 .flatten()
                 .is_some_and(|config| log_only_intact(paths, &config, state)))
         && unsettled(paths, state).is_empty()
+}
+
+fn materialization_selection_current(paths: &Paths, state: &State) -> bool {
+    state.materialization_selection.is_some_and(|applied| {
+        materialization_selection::current(paths, state)
+            .is_ok_and(|current| current.is_some_and(|current| current.meaning == applied))
+    })
 }
 
 /// The files a pass would write again at the version `state` holds: [`changed_files`] and
@@ -6464,9 +6574,47 @@ fn sync_repairing_inner(
     subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
     posts_by: Option<Instant>,
 ) -> crate::Result<SyncOutcome> {
-    let config = configured(paths)?;
-    let before = load_state(paths)?;
+    let mut config = configured(paths)?;
+    let mut before = load_state(paths)?;
     let browsed = subscribing.map(|(found, _)| found);
+    let selected = (before.membership == Stored::In
+        && !before.failed
+        && before.pending.is_empty()
+        && (source_bound(&config, &before) || log_only_source_bound(&config, &before)))
+    .then(|| materialization_selection::current(paths, &before));
+    let selection_due = selected.as_ref().is_some_and(|selected| {
+        !selected.as_ref().is_ok_and(|current| {
+            current
+                .as_ref()
+                .is_some_and(|current| Some(current.meaning) == before.materialization_selection)
+        })
+    });
+    // A missing or unreadable cached selection needs incoming records/bytes, not an
+    // unconditional local apply error before the network has its chance to heal it. Once
+    // a usable selection enters canonical apply, all effect/ownership errors still stand.
+    if selection_due
+        && matches!(&selected, Some(Ok(Some(current))) if current.records == before.records_digest)
+    {
+        let repaired_locally = apply_until(
+            paths,
+            config.clone(),
+            before.clone(),
+            ApplyInput::CachedAtAppliedHeads,
+            repaired.as_deref_mut(),
+            None,
+            true,
+        )?;
+        if !matches!(repaired_locally, SyncOutcome::Unchanged { .. }) {
+            if let Some((_, said)) = subscribing {
+                said.set(SourceSaid::Nothing);
+            }
+            return Ok(repaired_locally);
+        }
+        // The locked local attempt may have observed a newer applied version or frontier.
+        // The ordinary fetch must use a fresh baseline rather than the scheduling reading.
+        config = configured(paths)?;
+        before = load_state(paths)?;
+    }
     if matches!(config.source, Source::Url(_)) {
         let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
     }
@@ -6480,7 +6628,8 @@ fn sync_repairing_inner(
         remove::vault_pass(paths, posts_by);
     }
     let pending_records = log_entries::current_records_digest(paths, &config, &before)
-        .is_some_and(|digest| Some(digest) != before.records_digest);
+        .is_some_and(|digest| Some(digest) != before.records_digest)
+        || selection_due;
     let waited_on_primary =
         matches!(&config.source, Source::Url(_)) && wait.is_some() && !pending_records;
     let outcome = network_refresh::run(paths, &config, |refresh| {
@@ -6961,6 +7110,8 @@ fn apply_response_until(
 enum ApplyInput {
     Response(crate::Result<network_observation::Received>),
     Cached,
+    /// Reinterpret the applied version only while its actual selected frontier still holds.
+    CachedAtAppliedHeads,
 }
 
 fn apply_until(
@@ -6999,9 +7150,41 @@ fn apply_until_admitted(
     }
     let requested_config = config.clone();
     let mut state = load_state(paths)?;
-    if matches!(&input, ApplyInput::Cached | ApplyInput::Response(Err(_)))
-        && let Some(configured) = peer_selection::configured_log_recovery(paths, &config, &state)
+    let at_applied_heads = matches!(&input, ApplyInput::CachedAtAppliedHeads);
+    if at_applied_heads {
+        let version = |state: &State| {
+            (
+                state.seq,
+                state.digest,
+                state.records_digest,
+                state.source_identity,
+                state.membership,
+            )
+        };
+        if version(&state) != version(&before)
+            || state.membership != Stored::In
+            || state.failed
+            || !state.pending.is_empty()
+            || !materialization_selection::current(paths, &state)
+                .ok()
+                .flatten()
+                .is_some_and(|current| current.records == state.records_digest)
+        {
+            // No effect has started. New records or an unavailable cached selection belong
+            // to the normal fetch, not to a local replay that would hide its newer envelope.
+            return Ok(SyncOutcome::Unchanged { seq: state.seq });
+        }
+    }
+    if matches!(
+        &input,
+        ApplyInput::Cached | ApplyInput::CachedAtAppliedHeads | ApplyInput::Response(Err(_))
+    ) && let Some(configured) = peer_selection::configured_log_recovery(paths, &config, &state)
     {
+        if at_applied_heads
+            && Some(log_entries::records_heads_digest(&configured.log)) != state.records_digest
+        {
+            return Ok(SyncOutcome::Unchanged { seq: state.seq });
+        }
         current()?;
         return apply_configured_log(paths, &config, &mut state, configured);
     }
@@ -7010,7 +7193,7 @@ fn apply_until_admitted(
         mut body,
     } = match input {
         ApplyInput::Response(Ok(received)) => received,
-        ApplyInput::Cached => {
+        ApplyInput::Cached | ApplyInput::CachedAtAppliedHeads => {
             let Some(copy) = peer_selection::cached_materialization(
                 paths,
                 &config,
@@ -7202,7 +7385,9 @@ fn apply_until_admitted(
             && source_bound(&config, &state)
             && !state.failed
             && state.pending.is_empty()
-            && state.own.is_some();
+            && state.own.is_some()
+            && state.materialization_selection
+                == Some(materialization_selection::Meaning::of(&entries));
         if settled
             && repaired.is_some_and(|repaired| !put_back_due(paths, &state, version, repaired))
         {
@@ -7229,6 +7414,7 @@ fn apply_until_admitted(
         envelope::verify_for_reader(&bytes, &config.name, &pin, &config.followed, held.as_ref());
     let (envelope, pinned, verdict) = match verified {
         Ok(verified) => verified,
+        Err(_) if at_applied_heads => return Ok(SyncOutcome::Unchanged { seq: state.seq }),
         Err(error) => {
             // The source went back to a version older than this Mac's (restored, or put back
             // by a Mac that slept, maybe one signed before a rotation): a pass that did not
@@ -7272,11 +7458,17 @@ fn apply_until_admitted(
             });
         }
     };
-    state.heard = now();
+    if at_applied_heads && (verdict != Verdict::Unchanged || !matches!(pinned, Pin::Same)) {
+        return Ok(SyncOutcome::Unchanged { seq: state.seq });
+    }
+    if !at_applied_heads {
+        state.heard = now();
+    }
     // A server serves the version a publish of this Mac left `[everyone]` writes pending on: they
     // wait for the new key from now, whatever became of that publish's reply. Best effort: a
     // pending set that does not land stays pending for the next read of that version.
-    if log_entries::waiting_pending(paths)
+    if !at_applied_heads
+        && log_entries::waiting_pending(paths)
         && let Ok(Some(identity)) = read_identity(paths)
     {
         current()?;
@@ -7305,6 +7497,15 @@ fn apply_until_admitted(
         log_entries::trusted_seeded_log(paths, &next_config, &envelope)?
     };
     let current_records_digest = seeded_log.as_ref().map(|(_, d)| *d);
+    // Record intake has its own custody. Check the source actually retained for apply,
+    // not just the earlier scheduling or locked observation, before any effects. All
+    // subsequent entry selection uses this owned log; this path never adopts a later draft.
+    if at_applied_heads {
+        if current_records_digest != state.records_digest {
+            return Ok(SyncOutcome::Unchanged { seq: state.seq });
+        }
+        state.heard = now();
+    }
     if !matches!(pinned, Pin::Replaced(_))
         && peer_selection::awaiting_applied_log(&state, current_records_digest)
     {
@@ -7322,6 +7523,7 @@ fn apply_until_admitted(
             || (!state.failed
                 && state.pending.is_empty()
                 && cache_intact(paths, &state)
+                && materialization_selection_current(paths, &state)
                 && repaired.is_some_and(|repaired| {
                     !put_back_due(
                         paths,
@@ -7354,6 +7556,9 @@ fn apply_until_admitted(
         &envelope,
         &identity,
     )?;
+    if at_applied_heads && base == log_entries::LogBase::Behind {
+        return Ok(SyncOutcome::Unchanged { seq: state.seq });
+    }
     let mut seeded_log = seeded_log;
     // A version this Mac published whose records it held back when the publish was cut short
     // after a server stored it: taken in here, the next records pass sends them to every server
@@ -7469,18 +7674,21 @@ fn apply_configured_log(
     configured: log_entries::ConfiguredLog,
 ) -> crate::Result<SyncOutcome> {
     let digest = log_entries::records_heads_digest(&configured.log);
+    let identity = read_identity(paths)?
+        .ok_or_else(|| Error::new("this machine has no key: run aterm secrets join"))?;
+    let opened = log_entries::configured_entries(&configured.log, &identity)?;
     if state.records_digest == Some(digest)
         && state.membership == Stored::In
         && log_only_source_bound(config, state)
         && state.own.is_some()
-        && files_intact(paths, state)
+        && opened.as_ref().is_some_and(|entries| {
+            state.materialization_selection == Some(materialization_selection::Meaning::of(entries))
+        })
+        && local_files_intact(paths, state)
     {
         save_state(paths, state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
-    let identity = read_identity(paths)?
-        .ok_or_else(|| Error::new("this machine has no key: run aterm secrets join"))?;
-    let opened = log_entries::configured_entries(&configured.log, &identity)?;
     state.records_digest = Some(digest);
     let Some(entries) = opened else {
         state.membership = match state.membership {
@@ -7882,7 +8090,7 @@ fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
         return false;
     }
     let version = (source, state.seq);
-    if !cache_intact(paths, &state) {
+    if !cache_intact(paths, &state) || !materialization_selection_current(paths, &state) {
         *repaired = Some((version, BTreeSet::new()));
         return true;
     }

@@ -1621,7 +1621,8 @@ mod tests {
     ) {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .unwrap();
         let secret = vec![0x51; 32];
         let broker =
@@ -1761,6 +1762,7 @@ mod tests {
         };
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-inbox")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("the fixture dir");
         let socket = dir.path().join("b.sock");
@@ -2554,10 +2556,9 @@ mod tests {
 
     #[test]
     fn the_person_is_read_off_the_cap_files() {
-        let dir = std::env::temp_dir().join(format!("atl-person-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch_dir("person");
         let write = |name: &str, grants: &[String]| {
-            let path = dir.join(name);
+            let path = dir.path().join(name);
             let lines: String = grants
                 .iter()
                 .map(|g| format!("{g} {}\n", "ab".repeat(32)))
@@ -2581,6 +2582,5 @@ mod tests {
         );
         assert!(person_of(&[person.clone(), other], "f1").is_err());
         assert!(person_of(&[person], "f2").is_err(), "another fleet");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

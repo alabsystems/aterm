@@ -41,32 +41,53 @@ fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
 /// Probing `candidate_gone` on the launched lane preserves the queued exit status.
 #[test]
 fn asking_whether_a_launched_candidate_is_gone_keeps_its_exit_status() {
-    let (orphan, gate) = spawn_orphan("exit 7");
-    let candidate = super::HandoffCandidate::of_attested_peer(orphan);
-    let handle = super::HandoffCandidateHandle::Launched(Some(
-        CandidateExitWatch::watch(orphan)
-            .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL"),
-    ));
-    assert!(
-        !handle.candidate_gone(candidate),
-        "held at its gate, the orphan is alive"
-    );
-    gate.release();
-    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while !handle.candidate_gone(candidate) {
+    use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
+
+    for (code, lane) in [
+        (7, Lane::Physical(Shape::Structural)),
+        (
+            crate::seamless::EXIT_SUCCESSOR_PASSING,
+            Lane::Physical(Shape::Transient),
+        ),
+        (
+            crate::seamless::EXIT_SUCCESSOR_VERIFICATION,
+            Lane::VerificationDeferred,
+        ),
+    ] {
+        let (orphan, gate) = spawn_orphan(&format!("exit {code}"));
+        let candidate = super::HandoffCandidate::of_attested_peer(orphan);
+        let handle = super::HandoffCandidateHandle::Launched(Some(
+            CandidateExitWatch::watch(orphan)
+                .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL"),
+        ));
         assert!(
-            std::time::Instant::now() < deadline,
-            "launchd reaps an exited orphan, and its pid falls vacant"
+            !handle.candidate_gone(candidate),
+            "held at its gate, the orphan is alive"
         );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert_eq!(
-        handle
+        gate.release();
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !handle.candidate_gone(candidate) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launchd reaps an exited orphan, and its pid falls vacant"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let status = handle
             .witnessed_exit_status()
-            .expect("the exit event is still queued after the probe")
-            .code(),
-        Some(7)
-    );
+            .expect("the exit event is still queued after the probe");
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(
+            Lane::classify(
+                crate::native_updater_service::ApplyMode::AutomaticPastGrace,
+                crate::UpdateHandoffOutcome::ChildDied,
+                super::handoff_child_death(true, Some(status)),
+                false,
+            ),
+            lane,
+            "the launched lane preserves the successor's retry disposition"
+        );
+    }
 }
 
 /// An orphan candidate killed by `SIGKILL` on the launched lane is classified as retryable.

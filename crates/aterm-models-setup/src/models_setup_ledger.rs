@@ -20,9 +20,16 @@ use aterm_spec::derive::*;
 /// off is one it noted. A stage that has not ended within the hang limit parks while it
 /// runs; one the process then leaves, however it leaves, counts that as one crash, so the next
 /// launch resumes it once and parks it the second time. Check again clears every park and the
-/// attempts. A key read back as aterm set it is recorded as applied; when a later read differs,
-/// the person changed it, and no unattended pass writes it again until Restore or turning its
-/// group on forgets that.
+/// attempts. After dead work is recovered, a valid software identity adopts a legacy ledger
+/// once, and strictly newer software gives unfinished stages a fresh budget. The model keeps
+/// only whether each stage recorded an identity: every NewSoftware input is a freshly proved
+/// higher build with a different full commit, not another observation of the same installed
+/// software.
+/// Unknown, same, older and otherwise ineligible identities leave the budget unchanged. None
+/// of these transitions cuts off a live stage or a quit, changes finished progress, or forgets
+/// a key the person kept. A key read back as aterm set it is recorded as applied; when a later
+/// read differs, the person changed it, and no unattended pass writes it again until Restore or
+/// turning its group on forgets that.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn setup_ledger_model() -> Model {
@@ -31,6 +38,8 @@ pub fn setup_ledger_model() -> Model {
             const Buggy = 0;
 
             var alive = 1;
+            var software_known_a = 0;
+            var software_known_b = 0;
             var done_a = 0;
             var run_a = 0;
             var att_a = 0;
@@ -99,6 +108,44 @@ pub fn setup_ledger_model() -> Model {
                 att_a = 0;
                 park_b = 0;
                 att_b = 0;
+            }
+            // A legacy stage receives one valid installed identity. Real identities and
+            // their ordering are native inputs; each bit remembers that adoption was spent.
+            // Adoption also requires an actually unattributed legacy record: unread record
+            // identity is a native refusal input, not evidence for either positive action.
+            // A pass owning only A cannot consume B's software change or its fresh budget.
+            action AdoptSoftwareA when (alive == 1 && noting == 0 && done_a == 0 && run_a == 0 &&
+                software_known_a == 0) {
+                software_known_a = 1;
+                park_a = 0;
+                att_a = 0;
+            }
+            action AdoptSoftwareB when (alive == 1 && noting == 0 && done_b == 0 && run_b == 0 &&
+                software_known_b == 0) {
+                software_known_b = 1;
+                park_b = 0;
+                att_b = 0;
+            }
+            // Each firing has a distinct, strictly newer native witness. The quotient need
+            // not grow a build counter to permit any number of genuine software changes.
+            action NewSoftwareA when (alive == 1 && noting == 0 && done_a == 0 && run_a == 0 &&
+                software_known_a == 1) {
+                park_a = 0;
+                att_a = 0;
+            }
+            action NewSoftwareB when (alive == 1 && noting == 0 && done_b == 0 && run_b == 0 &&
+                software_known_b == 1) {
+                park_b = 0;
+                att_b = 0;
+            }
+            // Native refusal inputs include unreadable identity, the recorded identity,
+            // older builds, an equal build with another commit and a newer build of the
+            // recorded commit. None supplies the fresh fact NewSoftware requires.
+            action RetainSoftwareA when (alive == 1 && noting == 0 && done_a == 0 && run_a == 0) {
+                software_known_a = software_known_a;
+            }
+            action RetainSoftwareB when (alive == 1 && noting == 0 && done_b == 0 && run_b == 0) {
+                software_known_b = software_known_b;
             }
             action Crash when (alive == 1) {
                 alive = 0;

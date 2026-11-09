@@ -984,33 +984,8 @@ fn remaining(deadline: WakeDeadline) -> Result<Duration, Error> {
         .ok_or(Error::Deadline)
 }
 
-fn group_is_exited(
-    leader: i32,
-    members: &aterm_uds::process::GroupMembers,
-    mut presence: impl FnMut(i32) -> aterm_uds::process::ProcessPresence,
-    members_again: impl FnOnce() -> Option<aterm_uds::process::GroupMembers>,
-) -> bool {
-    members.complete
-        && members.pids.contains(&leader)
-        && members.pids.iter().all(|pid| {
-            matches!(
-                presence(*pid),
-                aterm_uds::process::ProcessPresence::Exited
-                    | aterm_uds::process::ProcessPresence::Absent
-            )
-        })
-        // A live member that could not be signalled may fork after the first listing and exit
-        // before its own presence read. A second complete listing must find no new member.
-        && members_again().is_some_and(|current| {
-            current.complete
-                && current.pids.contains(&leader)
-                && current.pids.iter().all(|pid| members.pids.contains(pid))
-        })
-}
-
-/// End the child's unreaped process group. XNU refuses a signal with `EPERM` when only zombies
-/// remain, so prove that case from complete kernel group listings around per-process exit reads
-/// instead of treating a normal successful child exit as a process-control failure.
+/// End the child's unreaped process group, where an `ESRCH` is an ordinary end for a leader this
+/// process has already seen exit or reap.
 pub(super) fn finish_exited_group(leader: i32) -> std::io::Result<()> {
     match aterm_uds::process::kill_group_until_empty(leader) {
         Ok(()) => Ok(()),
@@ -1020,24 +995,6 @@ pub(super) fn finish_exited_group(leader: i32) -> std::io::Result<()> {
                 | aterm_uds::process::ProcessPresence::Absent => Ok(()),
                 _ => Err(error),
             }
-        }
-        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-            let ended = u32::try_from(leader)
-                .ok()
-                .and_then(aterm_uds::process::group_members)
-                .is_some_and(|members| {
-                    group_is_exited(
-                        leader,
-                        &members,
-                        aterm_uds::process::process_presence,
-                        || {
-                            u32::try_from(leader)
-                                .ok()
-                                .and_then(aterm_uds::process::group_members)
-                        },
-                    )
-                });
-            if ended { Ok(()) } else { Err(error) }
         }
         Err(error) => Err(error),
     }
@@ -2244,79 +2201,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_a_stable_complete_group_of_exited_members_settles_permission_denial() {
-        use aterm_uds::process::{GroupMembers, ProcessPresence};
-
-        let mut group = GroupMembers {
-            pids: vec![41, 42],
-            complete: true,
-        };
-        let exited = |pid| {
-            if pid == 41 {
-                ProcessPresence::Exited
-            } else {
-                ProcessPresence::Absent
-            }
-        };
-        let snapshot = || Some(group.clone());
-        assert!(group_is_exited(41, &group, exited, snapshot));
-        assert!(group_is_exited(41, &group, exited, || {
-            Some(GroupMembers {
-                pids: vec![41],
-                complete: true,
-            })
-        }));
-        assert!(!group_is_exited(41, &group, exited, || {
-            Some(GroupMembers {
-                pids: vec![41, 42, 43],
-                complete: true,
-            })
-        }));
-        assert!(!group_is_exited(41, &group, exited, || {
-            Some(GroupMembers {
-                pids: vec![41, 42],
-                complete: false,
-            })
-        }));
-        assert!(!group_is_exited(41, &group, exited, || {
-            Some(GroupMembers {
-                pids: vec![42],
-                complete: true,
-            })
-        }));
-        group.complete = false;
-        assert!(!group_is_exited(41, &group, exited, || None));
-        group.complete = true;
-        group.pids.remove(0);
-        assert!(!group_is_exited(41, &group, exited, || None));
-        group.pids.insert(0, 41);
-        assert!(!group_is_exited(
-            41,
-            &group,
-            |pid| {
-                if pid == 42 {
-                    ProcessPresence::Present
-                } else {
-                    ProcessPresence::Exited
-                }
-            },
-            || None,
-        ));
-        assert!(!group_is_exited(
-            41,
-            &group,
-            |pid| {
-                if pid == 42 {
-                    ProcessPresence::Unknown
-                } else {
-                    ProcessPresence::Exited
-                }
-            },
-            || None,
-        ));
-    }
-
     #[cfg(target_vendor = "apple")]
     #[test]
     fn xnu_zombie_only_group_is_a_completed_cleanup() {
@@ -2377,12 +2261,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        let refused = aterm_uds::process::kill_group_until_empty(pid).unwrap_err();
-        assert_eq!(
-            refused.raw_os_error(),
-            Some(libc::EPERM),
-            "the former direct cleanup rejects an ordinary exited group"
-        );
         finish_exited_group(pid).expect("a complete zombie-only group is already ended");
 
         let mut status = 0;

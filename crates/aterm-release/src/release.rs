@@ -1375,6 +1375,15 @@ pub trait Backend {
     fn origin_tag(&mut self, tag: &str) -> Option<String>;
     fn origin_tag_now(&mut self, tag: &str) -> Result<Option<String>, String>;
     fn local_tag(&mut self, tag: &str) -> bool;
+    /// Judge source changes not covered by landing evidence before any qualification work.
+    fn input_checks(
+        &mut self,
+        _base: &str,
+        _tip: &str,
+        _prover: &Prover,
+    ) -> Result<String, Refusal> {
+        Ok("release input checked".into())
+    }
     fn ledger_versions(&mut self, rev: &str) -> Vec<String>;
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows;
     fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String>;
@@ -2868,6 +2877,17 @@ impl Run<'_> {
         }
 
         self.choose_candidate(false)?;
+        let candidate = self.commit_r();
+        let version = self.version();
+        if let Some(previous) = self.prev_release(&candidate, &version)
+            && let Some(base) = self.b.origin_tag(&format!("v{previous}"))
+            && let Some(prover) = self.prover.clone()
+        {
+            match self.b.input_checks(&base, &candidate, &prover) {
+                Ok(note) => notes.push(note),
+                Err(refusal) => self.refuse(refusal)?,
+            }
+        }
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_none()) {
             self.public_state();
         }

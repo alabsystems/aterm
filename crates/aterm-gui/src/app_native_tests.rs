@@ -6427,6 +6427,230 @@ fn force_auto_apply_attempt_now(app: &mut App) {
     });
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn inconclusive_preverification_retries_without_spending_the_launch_budget() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Instant;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 5_041;
+    stage_one_build_for_test(&mut app, build);
+    *app.handoff_preverified.lock().unwrap() = None;
+    let before = aterm_update::status(current).unwrap();
+    let reason = format!(
+        "native verification reached its time limit ({})",
+        aterm_update::PASSING_REFUSAL_KEY
+    );
+    let ended = Instant::now();
+    let passing = Arc::new(OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason: reason.clone(),
+            ended,
+        })
+        .unwrap();
+    let deadline = ended + crate::HANDOFF_PREVERIFY_READ_CEILING;
+    app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+        build,
+        commit: PREFLIGHT_TEST_COMMIT.into(),
+        artifact: "ab".repeat(32),
+        deadline,
+        done: Arc::new(AtomicBool::new(true)),
+        passing,
+    });
+    force_auto_apply_attempt_now(&mut app);
+    app.try_pending_native_auto_apply(false);
+    let intent = app
+        .auto_apply_intent
+        .expect("the automatic intent remains armed");
+    assert_eq!(intent.retry_at, ended + PREVERIFY_RETRY_AFTER);
+    assert_eq!(intent.attempts, 0);
+    assert!(app.auto_apply_physical_retry.is_none());
+    assert!(app.auto_apply_manual_only.is_none());
+    assert_eq!(
+        app.handoff_preverify_in_flight.as_ref().unwrap().deadline,
+        deadline
+    );
+
+    // The same non-verdict returned by an already admitted attempt takes the typed
+    // deferral path too, including its durable outcome.
+    let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+        build,
+        PREFLIGHT_TEST_COMMIT,
+        &"ab".repeat(32),
+    );
+    let error = app
+        .cold_lane_verdict_gate(ApplyMode::Automatic, Some(&ticket))
+        .unwrap_err();
+    let outcome = app.unstarted_native_apply_outcome(&ticket, ApplyMode::Automatic, error);
+    assert!(matches!(
+        outcome,
+        UpdateOutcome::Deferred {
+            hold: crate::native_update_lane_hold::LaneHold::PreparkRead,
+            ..
+        }
+    ));
+    app.record_apply_outcome_in_ledger(&outcome);
+    assert_eq!(
+        aterm_update::status(current).unwrap().failing_applies,
+        before.failing_applies
+    );
+    assert!(app.auto_apply_physical_retry.is_none());
+
+    // Advance the observation, not wall time: once spacing expires the poll starts
+    // a fresh authentication read of the same artifact, without parking any PTY.
+    let read = app.handoff_preverify_in_flight.as_mut().unwrap();
+    let past = Instant::now() - PREVERIFY_RETRY_AFTER;
+    let passing = Arc::new(OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason,
+            ended: past,
+        })
+        .unwrap();
+    read.passing = passing;
+    force_auto_apply_attempt_now(&mut app);
+    app.try_pending_native_auto_apply(false);
+    assert_ne!(
+        app.handoff_preverify_in_flight.as_ref().unwrap().deadline,
+        deadline
+    );
+    assert_eq!(app.auto_apply_intent.unwrap().attempts, 0);
+    assert!(app.auto_apply_physical_retry.is_none());
+    assert!(!app.update_handoff_in_flight());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fresh_verdict_supersedes_an_earlier_inconclusive_read() {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Instant;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 5_042;
+    stage_one_build_for_test(&mut app, build);
+    let done = preverify_read_running(&mut app, build);
+    let passing = Arc::new(OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason: format!(
+                "previous read timed out ({})",
+                aterm_update::PASSING_REFUSAL_KEY
+            ),
+            ended: Instant::now(),
+        })
+        .unwrap();
+    app.handoff_preverify_in_flight.as_mut().unwrap().passing = passing;
+    done.store(true, Ordering::Release);
+    // The stage helper supplied a fresh accepted verdict. A dirty settings draft
+    // catches the attempt after admission so this test starts no GUI or handoff.
+    let _ = park_a_settings_draft_in_a_background_tab(&mut app);
+    force_auto_apply_attempt_now(&mut app);
+    app.try_pending_native_auto_apply(false);
+    assert_eq!(
+        app.auto_apply_intent.unwrap().attempts,
+        1,
+        "the fresh verdict reached preflight"
+    );
+    assert!(!app.update_handoff_in_flight());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_verification_deferral_preserves_a_running_read_and_disabled_updates() {
+    use std::sync::Arc;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 5_043;
+    stage_one_build_for_test(&mut app, build);
+    let done = preverify_read_running(&mut app, build);
+    let deadline = app.handoff_preverify_in_flight.as_ref().unwrap().deadline;
+    let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+        build,
+        PREFLIGHT_TEST_COMMIT,
+        &"ab".repeat(32),
+    );
+    app.auto_apply_intent = None;
+    app.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    // The worker already published its inconclusive read. A newer cached answer
+    // survives the later GUI completion, whether it names these or other bytes.
+    for matching in [false, true] {
+        app.handoff_preverified
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .artifact = if matching { "ab" } else { "cd" }.repeat(32);
+        app.defer_worker_verification(&ticket, "the verifier did not decide");
+        assert!(app.handoff_preverified.lock().unwrap().is_some());
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "the disabled policy is retained"
+        );
+        let read = app.handoff_preverify_in_flight.as_ref().unwrap();
+        assert_eq!(read.deadline, deadline);
+        assert!(
+            Arc::ptr_eq(&read.done, &done),
+            "the concurrent read retains ownership"
+        );
+        assert!(read.passing.get().is_none());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_inconclusive_worker_verification_of_superseded_bytes_does_not_report_failure() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 5_044;
+    stage_one_build_for_test(&mut app, build);
+    let before = aterm_update::status(current).unwrap().failing_applies;
+    let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+        build,
+        PREFLIGHT_TEST_COMMIT,
+        &"ab".repeat(32),
+    );
+    ticket.make_current_apply_for_test(&mut app.native_updater_service);
+    let newer = durable_download_status(&app, build + 1);
+    let outcome = app
+        .finish_async_native_update_handoff(
+            ticket.clone(),
+            reconcile_facts(1, 1, Some(newer)),
+            "the old candidate could not be authenticated".to_string(),
+            HandoffFailureLane::VerificationDeferred,
+        )
+        .expect("the retired attempt has an outcome");
+    assert!(matches!(outcome, UpdateOutcome::Deferred { .. }));
+    app.record_apply_outcome_in_ledger(&outcome);
+    assert_eq!(
+        aterm_update::status(current).unwrap().failing_applies,
+        before
+    );
+    assert!(
+        !app.auto_apply_intent
+            .is_some_and(|intent| intent.build == build)
+    );
+    // A duplicate/stale completion is also no evidence of an image failure.
+    let stale = app.abort_reaped_native_apply_before_reconcile(
+        &ticket,
+        "late authentication result".to_string(),
+        HandoffFailureLane::VerificationDeferred,
+    );
+    assert!(matches!(stale, UpdateOutcome::Deferred { .. }));
+    assert!(app.auto_apply_physical_retry.is_none());
+}
+
 fn spend_one_preflight_block_budget(app: &mut App) {
     for attempt in 1..=u32::from(MAX_AUTOMATIC_UPDATE_CYCLES) {
         force_auto_apply_attempt_now(app);
@@ -6906,7 +7130,12 @@ fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
     assert_eq!(app.auto_apply_roster_wait, None);
-    assert_eq!(app.auto_apply_intent.map(|intent| intent.attempts), Some(1));
+    assert_eq!(
+        app.auto_apply_intent.map(|intent| intent.attempts),
+        Some(0),
+        "the roster hold ended, but the lock wait is still no authentication verdict"
+    );
+    assert!(app.auto_apply_physical_retry.is_none());
 }
 
 /// A cold relaunch whose boot swap waits for a roster confirmation books nothing. On a desk with

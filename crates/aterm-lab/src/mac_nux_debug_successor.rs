@@ -11,7 +11,8 @@ use super::{Fail, GUEST_HELPER, GUEST_NUX, Guest, Row, Value, first_session, sta
 use crate::{instance::CONFIG_OFF, stop, util::shell_quote};
 
 const WAIT: Duration = Duration::from_secs(60);
-const SOCKET: &str = "/var/tmp/aterm-nux/debug-successor.sock";
+const REQUIRED_QUERY_HANG: Duration = Duration::from_secs(60);
+pub(super) const SOCKET: &str = "/var/tmp/aterm-nux/debug-successor.sock";
 const LAUNCHED_ROUTE: &str = "this successor owns a launchd application job of its own";
 
 fn ctl(g: &Guest, words: &str) -> Result<String, Fail> {
@@ -46,13 +47,29 @@ fn wait_owner(g: &Guest, before: Option<Identity>) -> Result<Option<Identity>, F
     }
 }
 
+fn required_query<T>(
+    started: Instant,
+    end: Instant,
+    run: impl FnOnce(Duration) -> Result<T, Fail>,
+) -> Result<T, Fail> {
+    let left = end
+        .min(started + REQUIRED_QUERY_HANG)
+        .saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Fail::die("guest process query exceeded its hang detector"));
+    }
+    run(left)
+}
+
 fn wait_gone(g: &Guest, pid: i32) -> Result<bool, Fail> {
     let end = Instant::now() + WAIT;
     loop {
-        let alive = g.run(
-            &format!("kill -0 {pid} >/dev/null 2>&1 && echo alive || echo gone"),
-            Duration::from_secs(5),
-        )?;
+        let alive = required_query(Instant::now(), end, |left| {
+            g.run(
+                &format!("kill -0 {pid} >/dev/null 2>&1 && echo alive || echo gone"),
+                left,
+            )
+        })?;
         if alive.trim() == "gone" {
             return Ok(true);
         }
@@ -120,6 +137,20 @@ fn same_image(before: &str, after: &str) -> bool {
 }
 
 pub(super) fn run(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    // This disposable guest deliberately asks native restoration to do the opposite of the
+    // application's process-local policy. The app must start without rewriting these settings.
+    g.sh(
+        "/usr/bin/defaults write com.aterm.aterm NSQuitAlwaysKeepsWindows -bool true; \
+         /usr/bin/defaults write com.aterm.aterm ApplePersistenceIgnoreState -bool false",
+        WAIT,
+    )?;
+    let native_preferences = "/usr/bin/defaults read com.aterm.aterm NSQuitAlwaysKeepsWindows && \
+                              /usr/bin/defaults read com.aterm.aterm ApplePersistenceIgnoreState";
+    let preferences_before = g.run(native_preferences, WAIT)?;
+    if preferences_before.trim() != "1\n0" {
+        row.fail("the guest did not seed the native restoration preferences".into());
+        return Ok(());
+    }
     let config = format!("{GUEST_NUX}/config");
     g.sh(&format!(
         "chmod 700 {GUEST_NUX}; mkdir -p {config}/aterm; printf %s {} > {config}/aterm/aterm.toml; chmod 600 {config}/aterm/aterm.toml; \
@@ -205,12 +236,70 @@ pub(super) fn run(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             row.cell("successor closed", Value::Text("true".into()));
         }
     }
+    let preferences_after = g.run(native_preferences, WAIT)?;
+    if preferences_before == preferences_after {
+        row.cell(
+            "native preferences preserved",
+            Value::Text(preferences_after.trim().replace('\n', "/")),
+        );
+    } else {
+        row.fail("the application rewrote persistent native restoration preferences".into());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_query_completes_native_command_after_the_old_query_limit() {
+        const ACTOR: &str = "ATERM_NUX_REQUIRED_QUERY_ACTOR";
+        if std::env::var_os(ACTOR).is_some() {
+            use std::io::Write as _;
+            println!("required-query-executed");
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+        let started = Instant::now() - Duration::from_secs(6);
+        let out = required_query(started, started + WAIT, |left| {
+            let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "mac_nux::debug_successor::tests::required_query_completes_native_command_after_the_old_query_limit",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(ACTOR, "1");
+            aterm_uds::deadline::output_within(&mut command, left)
+                .map_err(|error| Fail::die(format!("{error:?}")))
+        })
+        .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == "required-query-executed")
+        );
+    }
+
+    #[test]
+    fn expired_required_query_does_not_start_another_command() {
+        let started = Instant::now() - Duration::from_secs(61);
+        assert!(
+            required_query(started, started + WAIT, |_| -> Result<(), Fail> {
+                panic!("expired query ran");
+            })
+            .is_err()
+        );
+        assert!(
+            required_query(Instant::now(), started + WAIT, |_| -> Result<(), Fail> {
+                panic!("query restarted the enclosing wait");
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn only_a_new_launched_gui_with_the_same_live_shell_qualifies() {

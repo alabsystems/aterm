@@ -34,7 +34,7 @@ struct MeshNode {
     table: Arc<Neighbours>,
     clock: Arc<ManualClock>,
     notes: mpsc::Receiver<Proven>,
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     server: std::thread::JoinHandle<ExitCode>,
 }
 
@@ -80,7 +80,7 @@ impl MeshNode {
         let noted = Mutex::new(noted);
         let (told, tables) = mpsc::channel();
         let told = Mutex::new(told);
-        let stop = Arc::new(NodeStop::default());
+        let stop = Arc::new(Stop::new());
         let cfg = NodeServeConfig {
             state_dir: state.to_path_buf(),
             relay_dir: relay_dir.to_path_buf(),

@@ -7,7 +7,14 @@ use std::time::Duration;
 
 use super::*;
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(30)
+    pin_deadline(Instant::now())
+}
+
+const REQUIRED_PIN_HANG: Duration = Duration::from_secs(60);
+const REQUIRED_READY_HANG: Duration = Duration::from_secs(60);
+
+fn pin_deadline(started: Instant) -> Instant {
+    started + REQUIRED_PIN_HANG
 }
 fn write(path: &Path, bytes: &[u8]) {
     fs::OpenOptions::new()
@@ -73,9 +80,24 @@ impl Drop for OwnedChild {
 }
 #[test]
 fn once_hashed_pin_validates_native_cached_child_and_rejects_changed_backing() {
+    cached_pin_with_age(Duration::ZERO, Duration::ZERO);
+}
+
+#[test]
+fn required_cached_pin_keeps_its_original_start_without_a_latency_budget() {
+    cached_pin_with_age(Duration::from_secs(31), Duration::ZERO);
+}
+
+#[test]
+fn required_cached_execution_proof_keeps_its_original_start_without_a_latency_budget() {
+    cached_pin_with_age(Duration::ZERO, Duration::from_secs(31));
+}
+
+fn cached_pin_with_age(pin_age: Duration, ready_age: Duration) {
     let fixture = Fixture::new();
     assert!(fixture.store.pin_program(&std::env::current_exe().unwrap(), deadline()).is_err());
-    let pin = fixture.store.pin_program(&fixture.path, deadline()).unwrap();
+    let pin = fixture.store.pin_program(&fixture.path, pin_deadline(Instant::now() - pin_age)).unwrap();
+    let ready_started = Instant::now() - ready_age;
     let mut child = OwnedChild(
         Command::new(&fixture.path)
             .args(["--exact", "reader::image_pin::tests::cached_image_actor", "--nocapture"])
@@ -103,7 +125,11 @@ fn once_hashed_pin_validates_native_cached_child_and_rejects_changed_backing() {
             }
         }
     });
-    received.recv_timeout(Duration::from_secs(30)).unwrap();
+    let ready_remaining = REQUIRED_READY_HANG
+        .checked_sub(ready_started.elapsed())
+        .filter(|left| !left.is_zero())
+        .expect("owned execution proof hang detector expired");
+    received.recv_timeout(ready_remaining).unwrap();
     let native = process::read_identity(child.0.id()).unwrap();
     pin.validate_cached_process(native, deadline()).unwrap();
     let mut wrong = native;

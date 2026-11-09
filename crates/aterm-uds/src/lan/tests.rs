@@ -281,6 +281,8 @@ fn a_broker_of_another_protocol_is_outdated() {
 
 /// A stand-in broker at `path` that admits nothing on its one connection: it sends `told` instead
 /// of its hello, as the broker does, or (`None`) reads the client's hello and closes.
+/// A sent verdict retains the connection until the client closes, so dialing and kernel peer
+/// identification finish before this fixture retires its transport.
 fn admitting_nothing_at(
     path: &std::path::Path,
     told: Option<Frame>,
@@ -294,7 +296,13 @@ fn admitting_nothing_at(
         )
         .unwrap();
         match told {
-            Some(frame) => wire::send(&stream, &frame).unwrap(),
+            Some(frame) => {
+                use std::io::Read as _;
+                wire::send(&stream, &frame).unwrap();
+                stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+                let mut hello = Vec::new();
+                (&stream).read_to_end(&mut hello).unwrap();
+            }
             None => {
                 let hello = Reader::new(0)
                     .frame(&stream, Some(Instant::now() + MUST_HAPPEN))

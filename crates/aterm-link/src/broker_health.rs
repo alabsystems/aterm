@@ -396,6 +396,7 @@ fn fired_marker(log: &Path) -> PathBuf {
 pub(crate) fn astream_poisoned_reason() -> String {
     let dir = aterm_tempfile::Builder::new()
         .prefix("bhr")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let log = dir.path().join("b.log");
@@ -528,6 +529,7 @@ mod tests {
     fn the_armed_seam_poisons_a_relaxed_log_at_its_first_escalated_record() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("bhs")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let log = dir.path().join("b.log");
@@ -570,6 +572,7 @@ mod tests {
         use astream_broker::{HealthWriter, ServedReason, Tier};
         let dir = aterm_tempfile::Builder::new()
             .prefix("bhf")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let log = dir.path().join("b.log");
@@ -796,6 +799,7 @@ mod tests {
     fn a_healthy_log_reads_unpoisoned_after_its_listeners_go() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("bhh")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let log = dir.path().join("b.log");

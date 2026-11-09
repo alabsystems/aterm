@@ -341,7 +341,7 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
         return;
     }
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::paths::scratch_dir("real-curl");
     let release = dir.path().join("release");
     std::fs::create_dir_all(&release).unwrap();
     let app = stand_in_app(&release);

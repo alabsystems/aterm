@@ -495,6 +495,8 @@ pub fn raised_soft_nofile_target(soft: u64, hard: u64) -> Option<u64> {
 pub mod sqlite_read;
 /// A verb's answer on stdout, where a reader that closed the pipe (`| head -1`) ends the answer instead of panicking the process.
 pub mod stdout;
+/// A latched stop a thread sleeps on between rounds and is woken by at once ([`stop::Stop`]), in place of a flag it reads every few milliseconds.
+pub mod stop;
 /// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
 pub mod sudo;
 /// A Cargo test binary's own per-user root, under which [`control_socket_dir`] and `aterm_types::dirs` answer in a test, so no test reaches the person's live socket, state, logs or config.

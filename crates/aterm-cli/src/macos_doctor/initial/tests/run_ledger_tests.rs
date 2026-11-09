@@ -115,6 +115,191 @@ fn a_crash_resumes_once_and_a_second_parks_while_the_others_complete() {
     launch(&mut host, root.path());
     assert_eq!(host.calls[before..], [Stage::Spotlight]);
     assert!(finished_at(root.path()).unwrap());
+
+    // A software update resumes the same admitted run, not a newly authorized plan.
+    let old = ledger::SoftwareEpoch {
+        build: 100,
+        commit: [0x11; 20],
+    };
+    let newer = ledger::SoftwareEpoch {
+        build: 200,
+        commit: [0x22; 20],
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    authorize_at(root.path(), &Plan::default()).unwrap();
+    let mut host = Fake {
+        software_epoch: Some(old),
+        crash: Some(Stage::Spotlight),
+        ..Fake::default()
+    };
+    for _ in 0..3 {
+        launch(&mut host, root.path());
+    }
+    assert_eq!(runs(&host.calls, Stage::Spotlight), 2);
+    assert_eq!(row(root.path(), Stage::Spotlight), parked);
+    let admitted = admission_at(root.path()).unwrap().unwrap();
+    let saved = progress(root.path()).unwrap().unwrap();
+    let records = observation_at(root.path()).unwrap().records;
+    let held = std::fs::read(root.path().join(ledger::LEDGER)).unwrap();
+    host.crash = None;
+    for epoch in [
+        Some(old),
+        None,
+        Some(ledger::SoftwareEpoch { build: 99, ..newer }),
+        Some(ledger::SoftwareEpoch {
+            build: 100,
+            ..newer
+        }),
+        Some(ledger::SoftwareEpoch { build: 200, ..old }),
+    ] {
+        host.software_epoch = epoch;
+        let before = host.calls.len();
+        launch(&mut host, root.path());
+        assert!(
+            host.calls[before..].is_empty(),
+            "{epoch:?} is not newer code"
+        );
+        assert_eq!(admission_at(root.path()).unwrap(), Some(admitted.clone()));
+        assert_eq!(progress(root.path()).unwrap(), Some(saved));
+        assert_eq!(observation_at(root.path()).unwrap().records, records);
+        assert_eq!(
+            std::fs::read(root.path().join(ledger::LEDGER)).unwrap(),
+            held
+        );
+    }
+    host.software_epoch = Some(newer);
+    let before = host.calls.len();
+    launch(&mut host, root.path());
+    assert_eq!(
+        host.calls[before..],
+        [Stage::Spotlight],
+        "positively newer code resumes only the unfinished stage without Check again"
+    );
+    let after = progress(root.path()).unwrap().unwrap();
+    assert_eq!(after.revision, saved.revision);
+    assert_eq!(after.done, saved.done | Stage::Spotlight.bit());
+    assert!(after.admitted && after.completed);
+    let after = observation_at(root.path()).unwrap().records;
+    assert_eq!(after.plan, records.plan);
+    assert_eq!(after.stop_request, records.stop_request);
+    assert_eq!(after.person_access, records.person_access);
+    assert!(finished_at(root.path()).unwrap());
+
+    // A scoped Caps pass cannot consume the new code on behalf of another parked stage.
+    let root = aterm_tempfile::tempdir().unwrap();
+    let revision = authorize_at(root.path(), &Plan::default())
+        .unwrap()
+        .unwrap();
+    let mut host = Fake {
+        software_epoch: Some(old),
+        pending: Some(Stage::Workstation),
+        crash: Some(Stage::Spotlight),
+        ..Fake::default()
+    };
+    for _ in 0..2 {
+        launch(&mut host, root.path());
+    }
+    assert_eq!(runs(&host.calls, Stage::Spotlight), 2);
+    assert_eq!(row(root.path(), Stage::Spotlight), parked);
+    assert_eq!(
+        input_setup_scope_at(root.path()).unwrap(),
+        InputSetupScope::Pending(revision)
+    );
+    let before = ledger::load(root.path(), revision).ledger;
+    let mut caps = Selection::none();
+    caps.set(Setting::CapsLock, true);
+    host.software_epoch = Some(newer);
+    host.pending = None;
+    host.crash = None;
+    let start = host.calls.len();
+    {
+        let _profile = HeldLock::take(root.path()).unwrap();
+        execute_initial_for_revision_target(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+            PassTarget::Inputs(caps),
+        )
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(host.calls[start..], [Stage::Workstation]);
+    assert_eq!(host.only.last(), Some(&Some(caps)));
+    assert_eq!(
+        input_activation::revision_at(root.path()).unwrap(),
+        Some(revision)
+    );
+    let after = ledger::load(root.path(), revision).ledger;
+    assert_eq!(
+        after.attempt(Stage::Spotlight),
+        before.attempt(Stage::Spotlight)
+    );
+    assert_eq!(
+        after.record()["software"][Stage::Spotlight as usize],
+        before.record()["software"][Stage::Spotlight as usize],
+        "the scoped pass leaves the sibling's software attribution untouched"
+    );
+    assert_eq!(
+        after.crashed & Stage::Spotlight.bit(),
+        before.crashed & Stage::Spotlight.bit()
+    );
+    assert_eq!(row(root.path(), Stage::Spotlight), parked);
+    let start = host.calls.len();
+    launch(&mut host, root.path());
+    assert_eq!(runs(&host.calls[start..], Stage::Spotlight), 1);
+    assert_eq!(progress(root.path()).unwrap().unwrap().revision, revision);
+    assert!(finished_at(root.path()).unwrap());
+
+    // An unattributed legacy ledger gets one adoption, not evidence of a fictitious old build.
+    let root = aterm_tempfile::tempdir().unwrap();
+    authorize_at(root.path(), &Plan::default()).unwrap();
+    let mut host = Fake {
+        software_epoch: Some(old),
+        crash: Some(Stage::Spotlight),
+        ..Fake::default()
+    };
+    for _ in 0..3 {
+        launch(&mut host, root.path());
+    }
+    let saved = progress(root.path()).unwrap().unwrap();
+    let mut legacy: Value =
+        aterm_json::from_slice(&std::fs::read(root.path().join(ledger::LEDGER)).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("software");
+    for stage in legacy
+        .as_object_mut()
+        .unwrap()
+        .get_mut("stages")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+    {
+        stage.as_object_mut().unwrap().remove("software");
+    }
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .insert("format".into(), Value::from(1u64));
+    write_json(&root.path().join(ledger::LEDGER), &legacy).unwrap();
+    host.software_epoch = None;
+    let start = host.calls.len();
+    launch(&mut host, root.path());
+    assert!(
+        host.calls[start..].is_empty(),
+        "unknown code cannot adopt a budget"
+    );
+    host.software_epoch = Some(newer);
+    for _ in 0..3 {
+        launch(&mut host, root.path());
+    }
+    assert_eq!(
+        runs(&host.calls[start..], Stage::Spotlight),
+        2,
+        "legacy adoption is spent once"
+    );
+    assert_eq!(row(root.path(), Stage::Spotlight), parked);
+    assert_eq!(progress(root.path()).unwrap(), Some(saved));
 }
 
 /// Control: a stage recorded running while the hold that began it has profile.lock, in this
@@ -250,6 +435,69 @@ fn a_hung_stage_resumes_once_then_parks_while_the_others_run() {
     launch(&mut host, root.path());
     assert_eq!(host.calls[before..], [Stage::Repositories]);
     assert!(finished_at(root.path()).unwrap());
+
+    let old = ledger::SoftwareEpoch {
+        build: 100,
+        commit: [0x11; 20],
+    };
+    let newer = ledger::SoftwareEpoch {
+        build: 200,
+        commit: [0x22; 20],
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    authorize_at(root.path(), &Plan::default()).unwrap();
+    let mut host = Fake {
+        software_epoch: Some(old),
+        wedge: Some((Stage::Repositories, root.path().into())),
+        ..Fake::default()
+    };
+    for _ in 0..3 {
+        launch(&mut host, root.path());
+    }
+    assert_eq!(runs(&host.calls, Stage::Repositories), 2);
+    assert_eq!(row(root.path(), Stage::Repositories), parked);
+    let saved = progress(root.path()).unwrap().unwrap();
+    let admitted = admission_at(root.path()).unwrap().unwrap();
+    let records = observation_at(root.path()).unwrap().records;
+    host.wedge = None;
+    for epoch in [
+        Some(old),
+        None,
+        Some(ledger::SoftwareEpoch { build: 99, ..newer }),
+        Some(ledger::SoftwareEpoch {
+            build: 100,
+            ..newer
+        }),
+        Some(ledger::SoftwareEpoch { build: 200, ..old }),
+    ] {
+        host.software_epoch = epoch;
+        let before = host.calls.len();
+        launch(&mut host, root.path());
+        assert!(
+            host.calls[before..].is_empty(),
+            "{epoch:?} cannot clear a hang park"
+        );
+        assert_eq!(admission_at(root.path()).unwrap(), Some(admitted.clone()));
+        assert_eq!(progress(root.path()).unwrap(), Some(saved));
+        assert_eq!(observation_at(root.path()).unwrap().records, records);
+    }
+    host.software_epoch = Some(newer);
+    let before = host.calls.len();
+    launch(&mut host, root.path());
+    assert_eq!(
+        host.calls[before..],
+        [Stage::Repositories],
+        "newer code repairs only the hung unfinished stage in the existing admission"
+    );
+    let after = progress(root.path()).unwrap().unwrap();
+    assert_eq!(after.revision, saved.revision);
+    assert_eq!(after.done, saved.done | Stage::Repositories.bit());
+    assert!(after.admitted && after.completed);
+    let after = observation_at(root.path()).unwrap().records;
+    assert_eq!(after.plan, records.plan);
+    assert_eq!(after.stop_request, records.stop_request);
+    assert_eq!(after.person_access, records.person_access);
+    assert!(finished_at(root.path()).unwrap());
 }
 
 /// aterm stops once in Spotlight. More than an hour later, in the same boot, a reading of the run
@@ -299,6 +547,7 @@ fn a_stage_alive_across_a_sleep_resumes_after_a_clean_quit() {
         at,
         awake: Some(awake),
         run: Some(9),
+        software: None,
     };
     let mut ledger = ledger::Ledger::of(1);
     assert_eq!(
@@ -440,7 +689,7 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
     newer
         .as_object_mut()
         .unwrap()
-        .insert("format".into(), Value::from(2u64));
+        .insert("format".into(), Value::from(ledger::LEDGER_FORMAT + 1));
     write_json(&root.path().join(ledger::LEDGER), &newer).unwrap();
     let mut host = Fake {
         crash: Some(Stage::Spotlight),
@@ -460,7 +709,7 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
     let mut own = ledger::Ledger::of(revision).record();
     own.as_object_mut()
         .unwrap()
-        .insert("format".into(), Value::from(2u64));
+        .insert("format".into(), Value::from(ledger::LEDGER_FORMAT + 1));
     write_json(&root.path().join(ledger::LEDGER), &own).unwrap();
     let before = std::fs::read(root.path().join(ledger::LEDGER)).unwrap();
     assert!(ledger::load(root.path(), revision).frozen);
@@ -566,6 +815,7 @@ fn a_stage_wedged_in_this_process_says_it_still_runs_with_no_check_again() {
         at: ledger::now_secs(),
         awake: None,
         run: HeldLock::profile_holder(root.path()),
+        software: None,
     };
     assert_eq!(
         ledger::update(root.path(), revision, |ledger| {
@@ -626,6 +876,7 @@ fn a_read_only_reading_parks_no_hung_stage() {
         at: ledger::now_secs(),
         awake: None,
         run: HeldLock::profile_holder(root.path()),
+        software: None,
     };
     ledger::update(root.path(), revision, |ledger| {
         ledger.begin(Stage::Repositories, 0, stamp, Path::new(UNLATCHED))
@@ -676,4 +927,131 @@ fn a_setup_begins_with_its_first_record() {
     );
     authorize_at(root.path(), &Plan::default()).unwrap();
     assert!(snapshot_at(root.path(), Plan::default()).unwrap().begun);
+
+    let installed = aterm_stamp::Stamp {
+        build_number: "100",
+        git_commit_full: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ..aterm_stamp::Stamp::UNSTAMPED
+    };
+    let epoch = ledger::SoftwareEpoch {
+        build: 100,
+        commit: [0xaa; 20],
+    };
+    assert_eq!(ledger::SoftwareEpoch::from_stamp(&installed), Some(epoch));
+    for invalid in [
+        aterm_stamp::Stamp {
+            git_dirty: "true",
+            ..installed
+        },
+        aterm_stamp::Stamp {
+            git_dirty: "unknown",
+            ..installed
+        },
+        aterm_stamp::Stamp {
+            git_commit_full: "unknown",
+            ..installed
+        },
+        aterm_stamp::Stamp {
+            git_commit_full: "0000000000000000000000000000000000000000",
+            ..installed
+        },
+        aterm_stamp::Stamp {
+            build_number: "0",
+            ..installed
+        },
+        aterm_stamp::Stamp {
+            build_number: "unknown",
+            ..installed
+        },
+    ] {
+        assert_eq!(ledger::SoftwareEpoch::from_stamp(&invalid), None);
+    }
+
+    // Corrupt attribution never erases an actual parked budget or turns into legacy adoption.
+    let mut host = Fake {
+        crash: Some(Stage::Spotlight),
+        software_epoch: Some(epoch),
+        ..Fake::default()
+    };
+    launch(&mut host, root.path());
+    launch(&mut host, root.path());
+    launch(&mut host, root.path());
+    let revision = progress(root.path()).unwrap().unwrap().revision;
+    let parked = ledger::load(root.path(), revision).ledger;
+    assert_eq!(parked.parked(Stage::Spotlight), Some(ledger::Park::Crashed));
+    let next = ledger::SoftwareEpoch {
+        build: 200,
+        commit: [0xbb; 20],
+    };
+    let unread_slot = json!({ "build": 200, "commit": "unknown" });
+    let mut unread_slots = vec![Value::from("unattributed"); Stage::ALL.len()];
+    unread_slots[Stage::Spotlight as usize] = unread_slot;
+    for software in [
+        None,
+        Some(Value::Null),
+        Some(json!([])),
+        Some(json!(unread_slots)),
+    ] {
+        let mut record = parked.record();
+        let object = record.as_object_mut().unwrap();
+        match software {
+            Some(value) => {
+                object.insert("software".into(), value);
+            }
+            None => {
+                object.remove("software");
+            }
+        }
+        write_json(&root.path().join(ledger::LEDGER), &record).unwrap();
+        let loaded = ledger::load(root.path(), revision);
+        assert!(!loaded.frozen);
+        let unread = loaded.ledger;
+        assert_eq!(unread.revision, parked.revision);
+        assert_eq!(unread.attempts, parked.attempts);
+        assert_eq!(
+            (unread.running, unread.crashed, unread.hung, unread.quit),
+            (parked.running, parked.crashed, parked.hung, parked.quit)
+        );
+        assert_eq!(
+            unread.software[Stage::Spotlight as usize],
+            ledger::Software::Unread
+        );
+        assert_eq!(
+            ledger::Ledger::parse(&unread.record()).unwrap(),
+            unread,
+            "a canonical rewrite preserves unread attribution"
+        );
+        assert!(
+            !ledger::update(root.path(), revision, |ledger| ledger.software_for(
+                Stage::Spotlight,
+                0,
+                Some(next),
+                Path::new(UNLATCHED)
+            ))
+            .unwrap()
+        );
+        assert_eq!(ledger::load(root.path(), revision).ledger, unread);
+        assert!(ledger::retry_parked_at(root.path()).unwrap());
+        assert_eq!(
+            ledger::load(root.path(), revision).ledger.software[Stage::Spotlight as usize],
+            ledger::Software::Unattributed
+        );
+        assert_eq!(
+            ledger::update(root.path(), revision, |ledger| ledger.begin(
+                Stage::Spotlight,
+                0,
+                ledger::Stamp {
+                    software: Some(next),
+                    ..ledger::Stamp::default()
+                },
+                Path::new(UNLATCHED)
+            ))
+            .unwrap(),
+            ledger::Admit::Run
+        );
+        assert_eq!(
+            ledger::load(root.path(), revision).ledger.software[Stage::Spotlight as usize],
+            ledger::Software::Known(next)
+        );
+    }
 }

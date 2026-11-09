@@ -4887,6 +4887,10 @@ trait InitialHost {
     fn boot_session(&mut self) -> Option<u128> {
         ledger::boot_session()
     }
+    /// The running software, without probing the machine or changing setup's admission.
+    fn software_epoch(&mut self) -> Option<ledger::SoftwareEpoch> {
+        ledger::SoftwareEpoch::current()
+    }
     /// Now, in seconds since the epoch, which the run's ledger stamps each begin with.
     fn now_secs(&mut self) -> u64 {
         ledger::now_secs()
@@ -6651,6 +6655,7 @@ fn run_secrets_lane(
     admitted_vault: AdmittedVault,
     initial_done: u16,
     boot: Option<u128>,
+    software: Option<ledger::SoftwareEpoch>,
     password: &std::sync::Mutex<Option<SecretBytes>>,
     hooks: SetupHooks,
     reached_secrets: &std::sync::atomic::AtomicBool,
@@ -6705,6 +6710,7 @@ fn run_secrets_lane(
         at: lane.now_secs(),
         awake: ledger::awake_secs(),
         run: HeldLock::profile_holder(root),
+        software,
     };
     // Not while aterm quits ([`ledger::quitting`]): the pass's own begin ends the pass then.
     let admitted = ledger::update(root, revision, |ledger| {
@@ -7006,6 +7012,7 @@ fn execute_pass_target(
         revalidate_completed_network_stages(host, root, &plan, &mut progress)?;
     }
     let boot = host.boot_session();
+    let software = host.software_epoch();
     let mut report = Report {
         action: Action::Apply,
         rows: Vec::new(),
@@ -7063,6 +7070,7 @@ fn execute_pass_target(
                         pass_admitted_vault,
                         initial_done,
                         boot,
+                        software,
                         lane_password,
                         hooks,
                         reached_ref,
@@ -7213,6 +7221,7 @@ fn execute_pass_target(
                 at: host.now_secs(),
                 awake: ledger::awake_secs(),
                 run: HeldLock::profile_holder(root),
+                software,
             };
             let admitted = ledger::update(root, progress.revision, |ledger| {
                 ledger.begin(stage, progress.done, stamp, root)
@@ -7710,6 +7719,7 @@ mod tests {
     #[derive(Default)]
     pub(super) struct Fake {
         calls: Vec<Stage>,
+        software_epoch: Option<ledger::SoftwareEpoch>,
         pending: Option<Stage>,
         /// A stage whose row waits on a person ([`WAITING`]).
         waiting: Option<Stage>,
@@ -7830,6 +7840,9 @@ mod tests {
     }
 
     impl InitialHost for Fake {
+        fn software_epoch(&mut self) -> Option<ledger::SoftwareEpoch> {
+            self.software_epoch
+        }
         fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.workstation(root, None)
         }

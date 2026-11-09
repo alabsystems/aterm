@@ -629,20 +629,34 @@ mod tests {
     }
 
     #[test]
-    fn an_unfinished_broker_check_reaches_the_client_as_unchecked() {
-        let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
-        let words = "trustd did not answer".to_owned();
-        let frame = wire::encode(&Frame::Unchecked {
-            words: words.clone(),
-        })
-        .unwrap();
-        io::Write::write_all(&mut &server, &frame).unwrap();
-        // The broker's check took its whole minute; its answer still reaches this process.
-        let started = Instant::now() - Duration::from_secs(61);
-        assert!(matches!(
-            exchange_at(client, None, super::super::protocol(), None, started),
-            Err(LanError::Unavailable(Unavailable::Unchecked(said))) if said == words
-        ));
+    fn a_queued_broker_verdict_wins_when_the_client_hello_cannot_be_written() {
+        for refused in [false, true] {
+            let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
+            let words = "the broker's verdict".to_owned();
+            let frame = if refused {
+                Frame::Refused {
+                    words: words.clone(),
+                }
+            } else {
+                Frame::Unchecked {
+                    words: words.clone(),
+                }
+            };
+            io::Write::write_all(&mut &server, &wire::encode(&frame).unwrap()).unwrap();
+            server.shutdown(std::net::Shutdown::Write).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(io::Write::write_all(&mut &client, b"unwritable hello").is_err());
+            // The check took its whole minute. Its queued answer wins over the closed
+            // write half's error; deleting that precedence is the negative control.
+            let started = Instant::now() - Duration::from_secs(61);
+            let result = exchange_at(client, None, super::super::protocol(), None, started);
+            let expected = if refused {
+                Unavailable::Refused(words)
+            } else {
+                Unavailable::Unchecked(words)
+            };
+            assert!(matches!(result, Err(LanError::Unavailable(said)) if said == expected));
+        }
     }
 
     #[test]

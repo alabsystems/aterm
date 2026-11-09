@@ -99,7 +99,7 @@ fn world(tags: &[u8], sids: &[&'static str]) -> Vec<Seat> {
         .map(|((mac, handoff), (tag, sid))| {
             mac.broker.set_origin_keys(origins.iter().copied());
             let keys = keys_for(*tag, Some(&handoff));
-            let state = aterm_tempfile::tempdir().expect("a state dir");
+            let state = crate::test_scratch_dir("halt");
             let (lane, mut bridge, served) = bridge_on(
                 &mac,
                 sid,
@@ -518,7 +518,7 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
         let case = format!("down={down:?} control={control}");
         let mac = Mac::new(31);
         mac.broker.set_origin_keys([mac.key]);
-        let state = aterm_tempfile::tempdir().expect("a state dir");
+        let state = crate::test_scratch_dir("halt");
         let (lane, mut before) =
             FakeVerbLane::bridge_configured(&[(1, "s-a")], Some(state.path()), None);
         let old_fleet = before.cfg.fleet.clone();

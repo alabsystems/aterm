@@ -1076,10 +1076,16 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
         let (user, repo) = parse_tap_name(&format!("{user}/{repo}"))?;
         let path = tap_path(prefix, &user, &repo).ok()?;
         let tap = Tap { user, repo, path };
-        let file = formula_file(&tap, name)?;
+        let (file, shown) = match formula_file(&tap, name) {
+            Some(file) => (file, full.to_string()),
+            None => {
+                let (file, canon_name) = alias_file(&tap, name)?;
+                (file, format!("{}/{canon_name}", tap.name()))
+            }
+        };
         let canon = file.canonicalize().ok()?;
         let text = crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024).ok()?;
-        return Some(parse_rb_as_data(&text, full));
+        return Some(parse_rb_as_data(&text, &shown));
     }
     for tap in list(prefix) {
         if let Some(file) = formula_file(&tap, full)
@@ -1088,8 +1094,34 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
         {
             return Some(parse_rb_as_data(&text, &format!("{}/{full}", tap.name())));
         }
+        if let Some((file, canon_name)) = alias_file(&tap, full)
+            && let Ok(canon) = file.canonicalize()
+            && let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024)
+        {
+            return Some(parse_rb_as_data(
+                &text,
+                &format!("{}/{canon_name}", tap.name()),
+            ));
+        }
     }
     None
+}
+
+/// A tap's `Aliases/<name>` entry resolved to its formula file
+/// and canonical name (brew follows alias symlinks).
+fn alias_file(tap: &Tap, name: &str) -> Option<(PathBuf, String)> {
+    let link = tap.path.join("Aliases").join(name);
+    let meta = std::fs::symlink_metadata(&link).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let canon = link.canonicalize().ok()?;
+    let root = tap.path.canonicalize().ok()?;
+    if !canon.starts_with(&root) {
+        return None;
+    }
+    let canon_name = canon.file_stem()?.to_str()?.to_string();
+    super::valid_component(&canon_name).then_some((canon, canon_name))
 }
 
 #[cfg(test)]

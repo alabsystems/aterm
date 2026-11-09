@@ -922,6 +922,13 @@ fn process_progress_tree(root: u32) -> Option<Vec<ProcessProgressMember>> {
     Some(members)
 }
 
+fn exclude_supervisor_work(members: &mut [ProcessProgressMember], root: u32) {
+    if let Some(root) = members.iter_mut().find(|member| member.pid == root) {
+        root.cpu_ns = 0;
+        root.io_bytes = None;
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 fn process_progress_tree(_root: u32) -> Option<Vec<ProcessProgressMember>> {
     None
@@ -929,7 +936,7 @@ fn process_progress_tree(_root: u32) -> Option<Vec<ProcessProgressMember>> {
 
 /// Monotone generation of CPU or I/O progress over comparable complete descendant-tree reads.
 #[derive(Debug, Default)]
-struct ProcessProgressProbe {
+pub struct ProcessProgressProbe {
     seen: Vec<ProcessProgressMember>,
     generation: u64,
     observed: bool,
@@ -937,7 +944,21 @@ struct ProcessProgressProbe {
 
 impl ProcessProgressProbe {
     fn read(&mut self, root: u32) -> Option<u64> {
-        let now = process_progress_tree(root)?;
+        self.read_over(process_progress_tree(root))
+    }
+
+    /// Observe descendant CPU and I/O, excluding the supervisor's own polling work.
+    /// Incomplete or incomparable readings return `None`, never evidence of a stall.
+    pub fn read_descendants(&mut self, root: u32) -> Option<u64> {
+        let reading = process_progress_tree(root).map(|mut members| {
+            exclude_supervisor_work(&mut members, root);
+            members
+        });
+        self.read_over(reading)
+    }
+
+    fn read_over(&mut self, now: Option<Vec<ProcessProgressMember>>) -> Option<u64> {
+        let now = now?;
         if !self.observed {
             self.seen = now;
             self.observed = true;
@@ -2886,6 +2907,43 @@ mod tests {
                 .is_zero(),
             "progressing work is not a two-minute latency budget"
         );
+    }
+
+    #[test]
+    fn descendant_progress_excludes_polling_but_counts_worker_work() {
+        let mut probe = super::ProcessProgressProbe::default();
+        let mut reading = vec![
+            super::ProcessProgressMember {
+                pid: 1,
+                start: 1,
+                cpu_ns: 10,
+                io_bytes: Some(10),
+            },
+            super::ProcessProgressMember {
+                pid: 2,
+                start: 2,
+                cpu_ns: 20,
+                io_bytes: Some(20),
+            },
+        ];
+        let read = |probe: &mut super::ProcessProgressProbe, reading: &[_]| {
+            let mut reading = reading.to_vec();
+            super::exclude_supervisor_work(&mut reading, 1);
+            probe.read_over(Some(reading))
+        };
+        assert_eq!(read(&mut probe, &reading), Some(0));
+        reading[0].cpu_ns += 10;
+        reading[0].io_bytes = Some(30);
+        assert_eq!(
+            read(&mut probe, &reading),
+            Some(0),
+            "polling is not progress"
+        );
+        reading[1].cpu_ns += 10;
+        assert_eq!(read(&mut probe, &reading), Some(1));
+        reading[1].io_bytes = Some(30);
+        assert_eq!(read(&mut probe, &reading), Some(2));
+        assert_eq!(probe.read_over(None), None);
     }
 
     /// Negative control: a complete probe whose bytes and descendant-work generation stay flat

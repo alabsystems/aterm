@@ -21,6 +21,8 @@ mod host_carry;
 pub use host_carry::host_carry_model;
 mod entry_claim;
 pub use entry_claim::entry_claim_model;
+mod entry_frontier;
+pub use entry_frontier::entry_frontier_model;
 
 mod dispatch;
 pub use dispatch::resource_dispatch_model;

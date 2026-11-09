@@ -124,6 +124,14 @@ fn at(root: PathBuf) -> Staging {
     }
 }
 
+fn stage_scratch(live_root: Option<&Path>) -> std::io::Result<aterm_tempfile::TempDir> {
+    let builder = aterm_tempfile::Builder::new().suffix(".noindex");
+    match live_root {
+        Some(root) => builder.tempdir_in(root),
+        None => builder.tempdir(),
+    }
+}
+
 /// Verify the unchanged machine-signed canonical cut using the network updater's exact
 /// authority verifier and bundle staging path. Check-only publishes into owned scratch;
 /// explicit staging uses the existing old-host-readable atomic publisher. This tool never
@@ -142,9 +150,9 @@ pub fn stage_local(options: &LocalStageOptions) -> Result<String, String> {
     let floor = crate::manifest::Floor::read_for_gate(&live.floor())?;
     let scratch = if options.stage {
         aterm_update_core::ensure_private_dir(&live.root).map_err(|e| e.to_string())?;
-        aterm_tempfile::TempDir::new_in(&live.root)
+        stage_scratch(Some(&live.root))
     } else {
-        aterm_tempfile::TempDir::new()
+        stage_scratch(None)
     }
     .map_err(|e| e.to_string())?;
     let checked = at(scratch.path().join("checked"));
@@ -371,7 +379,7 @@ mod tests {
 
     #[test]
     fn offline_transport_keeps_the_ordinary_roster_and_manifest_authority() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let dir = crate::paths::scratch_dir("offline-auth");
         let key = fixture(dir.path(), false);
         let keys = [key.as_str()];
         let policy = RosterPolicy {
@@ -401,7 +409,28 @@ mod tests {
 
     #[test]
     fn local_transport_refuses_links_special_files_bounds_and_nonleaf_names() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let dir = crate::paths::scratch_dir("éééééééééé-local");
+        assert!(
+            dir.file_name()
+                .and_then(|os| os.to_str())
+                .is_some_and(
+                    |name| name.starts_with("aterm-upd-éééééééé-") && name.ends_with(".noindex")
+                )
+        );
+        for staged in [
+            stage_scratch(None).unwrap(),
+            stage_scratch(Some(&dir)).unwrap(),
+        ] {
+            assert!(
+                staged
+                    .path()
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .is_some_and(|name| name.ends_with(".noindex")),
+                "stage_scratch must carry .noindex: {}",
+                staged.path().display()
+            );
+        }
         std::fs::write(dir.path().join("file"), b"abc").unwrap();
         assert_eq!(read_asset(dir.path(), "file", 3).unwrap(), b"abc");
         assert!(read_asset(dir.path(), "file", 2).is_err());
@@ -413,7 +442,7 @@ mod tests {
     }
     #[test]
     fn final_publication_rechecks_installed_floor_and_existing_stage_without_losing_custody() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let dir = crate::paths::scratch_dir("final-pub");
         let live = at(dir.path().join("live"));
         std::fs::create_dir_all(live.staged_dir()).unwrap();
         let incoming = dir.path().join("incoming.app");
@@ -477,7 +506,7 @@ mod tests {
         use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes};
         use aterm_uds::spawnfd::Stdio;
 
-        let mut dir = KeptUntilRan::new(aterm_tempfile::TempDir::new().unwrap().keep());
+        let mut dir = KeptUntilRan::new(crate::paths::scratch_dir("host-binding").keep());
         let app = dir.path().join("actual.app");
         let exe = app.join("Contents/MacOS/aterm");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();

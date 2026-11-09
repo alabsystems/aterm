@@ -229,7 +229,7 @@ fn a_composition_reads_at_the_caret_of_the_pane_that_holds_it() {
     let session = app.front_terminal(WID).unwrap().session;
     let (rows, cols) = (24, 80);
     let read = |app: &App, focused| {
-        let document = app.terminal_document(WID, session, rows, cols, focused);
+        let document = app.terminal_document_for_test(WID, session, rows, cols, focused);
         document.expect("the document").snap
     };
     assert_eq!(read(&app, true).cursor, Some((0, 8)), "CONTROL");
@@ -265,7 +265,7 @@ fn a_composition_keeps_its_caret_over_a_hidden_cursor() {
     feed(&app, b"\x1b[?25l");
     let session = app.front_terminal(WID).unwrap().session;
     let caret = |app: &App| {
-        let document = app.terminal_document(WID, session, 24, 80, true);
+        let document = app.terminal_document_for_test(WID, session, 24, 80, true);
         document.expect("the document").snap.cursor
     };
     assert_eq!(caret(&app), None, "CONTROL");
@@ -290,7 +290,9 @@ fn a_view_scrolled_back_reads_no_composition() {
 
     app.on_ime_preedit(WID, "\u{65e5}".to_owned(), None);
 
-    let document = app.terminal_document(WID, session, 24, 80, true).unwrap();
+    let document = app
+        .terminal_document_for_test(WID, session, 24, 80, true)
+        .unwrap();
     assert!(
         !document.snap.value().contains('\u{65e5}'),
         "{}",
@@ -351,7 +353,9 @@ fn a_composition_in_the_find_field_reads_in_the_field() {
     assert_eq!(find.query, "a\u{65e5}\u{672c}b");
     assert_eq!(find.caret, 3, "after the composition");
     let session = app.front_terminal(WID).unwrap().session;
-    let document = app.terminal_document(WID, session, 24, 80, true).unwrap();
+    let document = app
+        .terminal_document_for_test(WID, session, 24, 80, true)
+        .unwrap();
     assert!(
         !document.snap.value().contains('\u{65e5}'),
         "and only there"

@@ -21,9 +21,10 @@ use aterm_secrets::commons::binding::Pending;
 use aterm_secrets::commons::bootstrap::{Bootstrap, Device};
 use aterm_secrets::commons::journal::Journal;
 use aterm_secrets::membership_log::{Body, Entrant, EpochAudience, Evidence, encode_records};
+use aterm_uds::stop::Stop;
 
 use super::super::{sharing_held, spawn_node_vault_pass};
-use super::{NodeMesh, NodeServeConfig, NodeStop, idle_launcher, run_node_serve_with};
+use super::{NodeMesh, NodeServeConfig, idle_launcher, run_node_serve_with};
 
 /// Far enough past any first sight for every rank's step and the settle grace.
 const PAST_EVERY_RANK: u64 = 1_000 * 60_000;
@@ -161,7 +162,7 @@ fn config_of_m2(
     lab: &Lab,
     on: bool,
     clock: &Arc<AtomicU64>,
-    stop: &Arc<NodeStop>,
+    stop: &Arc<Stop>,
 ) -> NodeServeConfig {
     let now = Arc::clone(clock);
     NodeServeConfig {
@@ -203,7 +204,7 @@ fn a_windowless_node_heals_a_gap_and_materializes_with_no_subscriber() {
     let lab = a_gap_on_m2(root.path());
     let start = aterm_time::unix_millis().unwrap();
     let clock = Arc::new(AtomicU64::new(start));
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = config_of_m2(&state, &relay, &lab, true, &clock, &stop);
     let node = std::thread::spawn(move || run_node_serve_with(cfg));
 
@@ -240,7 +241,7 @@ fn with_the_mesh_off_the_node_runs_no_pass_and_the_gap_stays() {
     let clock = Arc::new(AtomicU64::new(
         aterm_time::unix_millis().unwrap() + PAST_EVERY_RANK,
     ));
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let cfg = config_of_m2(&state, &relay, &lab, false, &clock, &stop);
     assert!(spawn_node_vault_pass(&cfg).is_none());
     assert!(!lab.healed());
@@ -261,7 +262,7 @@ fn the_nodes_switches_hold_the_pass_until_sharing_is_on() {
 
     let lab = a_gap_on_m2(root.path());
     let clock = Arc::new(AtomicU64::new(aterm_time::unix_millis().unwrap()));
-    let stop = Arc::new(NodeStop::default());
+    let stop = Arc::new(Stop::new());
     let mut cfg = config_of_m2(&state, &relay, &lab, true, &clock, &stop);
     cfg.config_path = Some(toml.clone());
     let pass = spawn_node_vault_pass(&cfg).expect("the pass starts, held");

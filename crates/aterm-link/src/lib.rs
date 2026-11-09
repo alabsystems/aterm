@@ -113,3 +113,17 @@ pub(crate) fn test_broker(
 ) -> std::io::Result<astream_broker::Broker> {
     astream_broker::Broker::open_with(log, astream_broker::Durability::Relaxed)
 }
+
+/// A `.noindex` scratch directory in `/tmp/.ubd/` short enough for Unix domain socket paths.
+///
+/// # Panics
+/// Panics if `/tmp` cannot host a fresh scratch directory.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("al-{short}-"))
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .expect("aterm-link scratch")
+}

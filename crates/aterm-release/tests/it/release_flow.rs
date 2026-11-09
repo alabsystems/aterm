@@ -96,6 +96,7 @@ fn hop_of(fix: &str) -> String {
 }
 
 struct World {
+    input_refusal: Option<Refusal>,
     fleet_refusal: Option<String>,
     fleet_selected: Option<Line>,
     existing_fleet_line: Option<Line>,
@@ -315,6 +316,7 @@ impl World {
         let mut origin_tags = BTreeMap::new();
         origin_tags.insert("v0.5.0".into(), OLD.into());
         Self {
+            input_refusal: None,
             fleet_refusal: None,
             fleet_selected: None,
             existing_fleet_line: None,
@@ -1369,6 +1371,12 @@ impl Backend for World {
     fn local_tag(&mut self, tag: &str) -> bool {
         self.origin_tags.contains_key(tag) || self.local_tags.contains(tag)
     }
+    fn input_checks(&mut self, base: &str, tip: &str, _prover: &Prover) -> Result<String, Refusal> {
+        self.calls.push(format!("input-checks {base} {tip}"));
+        self.input_refusal
+            .clone()
+            .map_or_else(|| Ok("input clean".into()), Err)
+    }
     fn ledger_versions(&mut self, _rev: &str) -> Vec<String> {
         self.ledger.clone()
     }
@@ -2219,12 +2227,14 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .position(|c| matches!(*c, "publish" | "cut --sign"))
         .expect("step 7 ran");
     order[seven..seven + 2].sort_unstable();
+    let input = format!("input-checks {OLD} {BUMP}");
     assert_eq!(
         order,
         [
             "sync",
             "bump",
             "move cccc",
+            input.as_str(),
             "sync",
             "validation-tools",
             "disk-claim 30",
@@ -2790,6 +2800,42 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
         "{:?}",
         w.calls
     );
+}
+
+/// Both entry paths judge the input before qualify; the negative control reaches its dry
+/// success summary only after that same check passes.
+#[test]
+fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
+    for dry in [true, false] {
+        let mut w = World::new();
+        w.input_refusal = Some(Refusal::new(
+            "export-scan: planted forbidden content",
+            "land the fix",
+        ));
+        let (code, last) = w.run(ReleaseOptions {
+            dry_run: dry,
+            ..bump()
+        });
+        assert_ne!(code, 0, "{last}\n{:?}", w.out);
+        assert!(
+            w.out
+                .iter()
+                .any(|line| line.contains("export-scan: planted forbidden content")),
+            "{:?}",
+            w.out
+        );
+        assert_eq!(w.count("build"), 0);
+        assert_eq!(w.count("verify --tree"), 0);
+        assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
+    }
+    let mut w = World::new();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(last.contains("would go ahead"), "{last}");
+    assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
 }
 
 #[test]

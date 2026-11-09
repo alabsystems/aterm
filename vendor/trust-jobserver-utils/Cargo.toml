@@ -17,6 +17,9 @@ jobserver = { version = "=0.1.35", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
+
 [package.metadata.aterm-origin]
 project = "Trust"
 commit = "a0c6b01024b0a63f61bff0684dcaa9751de5d637"

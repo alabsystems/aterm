@@ -763,6 +763,16 @@ static WINDOWED_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 impl Windowed {
     /// Mint the proof at a windowed launch, before its AppKit event loop is built.
     pub(crate) fn launch() -> Self {
+        let main = aterm_objc::MainThread::new().unwrap_or_else(|| {
+            crate::fatal_launch_error(
+                false,
+                crate::LaunchFatal::Display,
+                "a windowed launch must run on the main thread",
+            )
+        });
+        if let Err(why) = aterm_macos_ui::restoration::use_application_owned_restoration(main) {
+            crate::fatal_launch_error(false, crate::LaunchFatal::Display, why);
+        }
         aterm_macos_ui::appkit::load();
         WINDOWED_LAUNCH.store(true, std::sync::atomic::Ordering::Release);
         aterm_window::platform::macos::set_window_input_classifier(window_input_origin);

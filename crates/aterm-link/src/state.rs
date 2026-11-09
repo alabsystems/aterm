@@ -1474,6 +1474,7 @@ pub(crate) fn past_the_clock_tick(dir: &Path) {
     let read_the_clock = || {
         let probe = aterm_tempfile::Builder::new()
             .prefix(".tick")
+            .suffix(".noindex")
             .tempdir_in(dir)
             .expect("a probe of the volume's clock");
         let meta = std::fs::metadata(probe.path()).expect("the probe reads");
@@ -6031,10 +6032,36 @@ impl StateDir {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("atlink-state-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        p
+    #[derive(Debug)]
+    struct Scratch {
+        _dir: aterm_tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for Scratch {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        let dir = crate::test_scratch_dir(tag);
+        let path = dir.path().join("s");
+        Scratch { _dir: dir, path }
     }
 
     fn base(inc: u64) -> u64 {
@@ -6199,6 +6226,7 @@ mod tests {
         }
         let owned = aterm_tempfile::Builder::new()
             .prefix("syncdir")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let dir = owned.path();
@@ -6436,7 +6464,7 @@ mod tests {
         st.append_self_acked(None, &[3]).expect("acked, appended");
         st.raise_logfloor(11).expect("logfloor");
         let mut seen = Vec::new();
-        let mut stack = vec![dir.clone()];
+        let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).expect("a dir").flatten() {
                 let meta = e.metadata().expect("meta");
@@ -7110,6 +7138,7 @@ mod tests {
     fn the_sweep_keeps_every_whole_record_after_damage_in_the_journal() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("salvage")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -7235,6 +7264,7 @@ mod tests {
         let after = |n: u64| {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("unflushed")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let st = StateDir::open(dir.path()).expect("open");
@@ -7465,6 +7495,7 @@ mod tests {
             };
             let dir = aterm_tempfile::Builder::new()
                 .prefix("earlier-boot")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -7654,6 +7685,7 @@ mod tests {
         for refuse in [true, false] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("earlier-boot-refused")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -8020,7 +8052,7 @@ mod tests {
 
     #[test]
     fn an_acked_append_preserves_a_file_with_another_name() {
-        let scratch = aterm_tempfile::TempDir::new().expect("exclusive state scratch");
+        let scratch = crate::test_scratch_dir("acked");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
         let ordinary = StateDir::open(root.join("ordinary")).expect("ordinary state");
         ordinary
@@ -8063,7 +8095,7 @@ mod tests {
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        let scratch = aterm_tempfile::TempDir::new().expect("exclusive state scratch");
+        let scratch = crate::test_scratch_dir("acked");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
         for keeps in [false, true] {
             let st = StateDir::open(root.join(format!("keeps-{keeps}"))).expect("state");
@@ -8124,7 +8156,7 @@ mod tests {
     /// longer holds (the refused one), and opens nothing.
     #[test]
     fn a_failed_append_lets_the_held_acked_descriptor_go() {
-        let scratch = aterm_tempfile::TempDir::new().expect("exclusive state scratch");
+        let scratch = crate::test_scratch_dir("acked");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
         let mut seen = Vec::new();
         for (fails, dir) in [
@@ -8902,6 +8934,7 @@ mod tests {
         for sweep in [false, true] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("asks-damage-handed")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -9021,6 +9054,7 @@ mod tests {
         let stop_flushes = |write: &dyn Fn(&StateDir)| {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("asks-stop")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let st = StateDir::open(dir.path()).expect("open");
@@ -9162,6 +9196,7 @@ mod tests {
         for cut in [false, true] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("asks-salvage")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -10247,7 +10282,7 @@ mod tests {
 
     #[test]
     fn a_generation_clamp_preserves_uncertain_refill_evidence() {
-        let dir = aterm_tempfile::TempDir::new().expect("owned state");
+        let dir = crate::test_scratch_dir("clamp");
         let st = StateDir::open(dir.path()).expect("open");
         let sid = "s-kept";
         let topics = BTreeMap::from([("topic".to_string(), TopicCursor { next: 9 })]);
@@ -10317,6 +10352,7 @@ mod tests {
         for unclean in [true, false] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("torn")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -10522,10 +10558,12 @@ mod tests {
     fn a_planted_quarantine_link_is_refused_and_nothing_moves() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("planted")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let elsewhere = aterm_tempfile::Builder::new()
             .prefix("elsewhere")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -10564,6 +10602,7 @@ mod tests {
         for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("sweep-again-parent")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -10595,6 +10634,7 @@ mod tests {
         }
         let dir = aterm_tempfile::Builder::new()
             .prefix("sweep-again")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -10716,6 +10756,7 @@ mod tests {
         for replaced in [false, true] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("sweep-again-identity")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -10759,10 +10800,12 @@ mod tests {
             for linked in [true, false] {
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("source-parent")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let elsewhere = aterm_tempfile::Builder::new()
                     .prefix("source-target")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let st = StateDir::open(dir.path()).expect("open");
@@ -10833,6 +10876,7 @@ mod tests {
             }
             let dir = aterm_tempfile::Builder::new()
                 .prefix("run-marker")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let st = StateDir::open(dir.path()).expect("open");
@@ -10908,6 +10952,7 @@ mod tests {
             };
             let dir = aterm_tempfile::Builder::new()
                 .prefix("unclean")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let st = StateDir::open(dir.path()).expect("open");
@@ -10985,6 +11030,7 @@ mod tests {
     fn the_quarantine_counts_the_torn_files_the_owner_has_not_taken_away() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("held")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -11038,6 +11084,7 @@ mod tests {
     fn a_start_is_ordered_by_the_barrier_only_over_an_earlier_boots_record() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("start-tier")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -11095,6 +11142,7 @@ mod tests {
         st.end_run_clean().expect("a clean stop in boot 4");
         let elsewhere = aterm_tempfile::Builder::new()
             .prefix("start-tier-link")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         std::os::unix::fs::symlink(elsewhere.path(), root.join(journal::DIR))
@@ -11117,6 +11165,7 @@ mod tests {
     fn a_proof_speaks_only_for_the_file_and_the_directory_it_was_made_for() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("proof-bound")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let first = dir.path().join("first");
@@ -11248,6 +11297,7 @@ mod tests {
             for flag in ["-R", "-a"] {
                 let scratch = aterm_tempfile::Builder::new()
                     .prefix("proof-cp")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let (state, backup) = (scratch.path().join("state"), scratch.path().join("bk"));
@@ -11316,6 +11366,7 @@ mod tests {
         for inc_fails in [false, true] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("proof-inc")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11376,6 +11427,7 @@ mod tests {
             for (reopen, next_boot) in [(false, 1), (true, 1), (false, 2), (true, 2)] {
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("clean-open-error")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let st = StateDir::open(dir.path()).expect("open");
@@ -11443,6 +11495,7 @@ mod tests {
             for final_root in [false, true] {
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("clean-dir-error")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let st = StateDir::open(dir.path()).expect("open");
@@ -11490,6 +11543,7 @@ mod tests {
         for clean in [true, false] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("clean")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11577,10 +11631,12 @@ mod tests {
     fn a_flush_in_place_passes_over_what_is_gone_and_refuses_a_link() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("in-place")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let elsewhere = aterm_tempfile::Builder::new()
             .prefix("in-place-target")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let st = StateDir::open(dir.path()).expect("open");
@@ -11619,6 +11675,7 @@ mod tests {
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("retire")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11751,6 +11808,7 @@ mod tests {
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("torn-and-record")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11798,6 +11856,7 @@ mod tests {
         for in_file in [true, false] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("retire-both")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11879,6 +11938,7 @@ mod tests {
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("retire-lease")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -11935,6 +11995,7 @@ mod tests {
     fn a_cut_in_flight_entry_that_still_reads_is_set_aside_after_an_unclean_reboot() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("cut")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -11987,6 +12048,7 @@ mod tests {
     fn damage_in_a_boot_nobody_can_name_is_refused_not_set_aside() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("unnamed")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -12006,6 +12068,7 @@ mod tests {
     fn a_torn_logpin_is_left_for_the_mirror_to_refuse() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("logpin")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -12066,6 +12129,7 @@ mod tests {
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("logpin")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -12205,6 +12269,7 @@ mod tests {
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("logpin")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch");
             let root = dir.path();
@@ -12224,6 +12289,7 @@ mod tests {
 
         let dir = aterm_tempfile::Builder::new()
             .prefix("logpin")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -12307,6 +12373,7 @@ mod tests {
     fn an_ordered_pin_is_the_fence_once_its_settle_is_answered() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("logpin-ordered")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -12363,6 +12430,7 @@ mod tests {
     fn the_mirrors_copies_read_back_and_the_floor_is_only_raised() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("copies")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();

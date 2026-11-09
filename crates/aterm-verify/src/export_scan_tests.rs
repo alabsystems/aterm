@@ -224,6 +224,85 @@ fn verdict(ctx: &Ctx, scanner: Result<Scanner, String>) -> (Vec<Outcome>, Vec<St
     )
 }
 
+/// Release input scopes the real content guard to unreceipted files. The same forbidden row
+/// in a file covered by a landing receipt is the negative control: it is not scanned again.
+#[test]
+fn release_input_scans_the_unchecked_paths_only() {
+    let (_dir, mut ctx) = checkout("// quokkaword\n");
+    std::fs::write(ctx.root.join("crates/x/src/checked.rs"), "// quokkaword\n").unwrap();
+    ctx.input_paths = Some(vec!["crates/x/src/lib.rs".into()]);
+    let (_, ids, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert_eq!(ids, ["crates/x/src/lib.rs:1"]);
+    ctx.input_paths = Some(Vec::new());
+    let (_, ids, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert!(ids.is_empty());
+    ctx.input_paths = None;
+    let (_, ids, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert_eq!(
+        ids.len(),
+        2,
+        "the ordinary dev scan still judges both files"
+    );
+}
+
+/// A real hand merge is discovered and its forbidden-content row reaches the existing guard.
+/// Attaching the genuine checked-tree shape to that same merge removes it from the input.
+#[test]
+fn a_hand_merge_reaches_the_content_guard_but_a_checked_merge_does_not() {
+    use aterm_types::land_trailer::{Checked, Row, Stated};
+    let (_dir, mut ctx) = checkout("// quokkaword\n");
+    let base = crate::head_commit(&ctx.root, &ctx.path_env).unwrap();
+    git(&ctx.root, &["checkout", "-qb", "topic"]);
+    git(&ctx.root, &["add", "-A"]);
+    git(&ctx.root, &["commit", "-qm", "topic"]);
+    git(&ctx.root, &["checkout", "-q", "main"]);
+    git(
+        &ctx.root,
+        &["merge", "--no-ff", "-qm", "hand merge", "topic"],
+    );
+    ctx.input_paths = Some(
+        crate::release_input::discover(&ctx.root, &ctx.path_env, &base, "HEAD")
+            .unwrap()
+            .paths,
+    );
+    let (_, ids, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert_eq!(ids, ["crates/x/src/lib.rs:1"]);
+    let tree = crate::changed::git(&ctx.root, &ctx.path_env)
+        .args(["rev-parse", "HEAD^{tree}"])
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let receipt = Stated {
+        checked: vec![Checked {
+            tree: String::from_utf8(tree.stdout).unwrap().trim().into(),
+            base: base.clone(),
+            secs: 1,
+            rows: ["fmt", "census", "export-scan", "lint"]
+                .into_iter()
+                .map(|check| Row {
+                    check: check.into(),
+                    word: "ok".into(),
+                })
+                .collect(),
+        }],
+        ..Stated::default()
+    };
+    git(
+        &ctx.root,
+        &[
+            "commit",
+            "--amend",
+            "-qm",
+            &format!("land\n\n{}", receipt.trailers()),
+        ],
+    );
+    let input = crate::release_input::discover(&ctx.root, &ctx.path_env, &base, "HEAD").unwrap();
+    assert!(input.paths.is_empty());
+    ctx.input_paths = Some(input.paths);
+    let (_, ids, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert!(ids.is_empty());
+}
+
 /// Everything the stage shows: its rows and each finding's place and words.
 fn shown(r: &Report) -> String {
     let mut text = r.render();

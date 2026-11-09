@@ -1311,6 +1311,9 @@ mod resolver_native;
 #[path = "resource_admission_owner_tests/workload_native.rs"]
 mod workload_native;
 
+#[path = "resource_admission_owner_tests/workload_leadership.rs"]
+mod workload_leadership;
+
 #[path = "resource_admission_owner_tests/resolver_engineering.rs"]
 #[cfg(target_os = "macos")]
 mod resolver_engineering;

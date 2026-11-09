@@ -630,7 +630,7 @@ fn a_quiet_catalog_pair_reports_its_cpu() {
 /// and the [`LONG_LOG_ROTATIONS`] log.
 #[test]
 fn quiet_catalog_rounds_move_nothing_and_visit_both_tables() {
-    quiet_rounds(2, Workload::Catalog);
+    quiet_rounds(SUITE_ROUNDS, Workload::Catalog);
 }
 
 #[test]
@@ -658,7 +658,7 @@ fn a_sustained_quiet_pair_over_a_long_log_reports_its_cpu() {
 /// put's name written twice under two keys), a converged pair's rounds move nothing.
 #[test]
 fn quiet_rounds_over_a_vault_history_move_nothing() {
-    quiet_rounds(2, Workload::LongLog(41));
+    quiet_rounds(SUITE_ROUNDS, Workload::LongLog(41));
 }
 
 /// [`a_quiet_pair_over_a_long_log_reports_its_cpu`] where the second Mac was admitted after the
@@ -680,7 +680,7 @@ fn a_sustained_quiet_late_joiner_over_a_long_log_reports_its_cpu() {
 /// move nothing.
 #[test]
 fn quiet_rounds_of_a_late_joiner_move_nothing() {
-    quiet_rounds(2, Workload::LateJoiner(41));
+    quiet_rounds(SUITE_ROUNDS, Workload::LateJoiner(41));
 }
 
 #[test]
@@ -871,6 +871,19 @@ impl Workload {
     }
 }
 
+/// How many rounds the suite's own runs of [`quiet_rounds`] take. A run of more is a measurement
+/// (`verify perf commons-quiet`'s, and the retained-history diagnostic's): it waits for the
+/// fixture's files to settle before the rounds it reports on.
+const SUITE_ROUNDS: u32 = 2;
+
+/// How many rounds a measurement runs again after its wait for the fixture's files to settle,
+/// before the rounds it measures, as a live Mac's rounds run back to back. The rounds just after
+/// that idle run slowly while the CPU comes back to speed: a short pair's took 21 to 25 ms of wall
+/// time, falling over about seven rounds to the 8.6 ms back-to-back rounds take, and a reading of
+/// the process's CPU time, the same work each time, cost 5.7 to 7.9 ms just after the wait where
+/// it costs about 2 ms (2026-11-09).
+const AFTER_IDLE_WARM: u32 = 8;
+
 fn quiet_rounds(measured: u32, workload: Workload) {
     quiet_rounds_observed(measured, workload, false);
 }
@@ -922,6 +935,27 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
         assert!(left.values().all(|records| !records.is_empty()));
     }
     let mut visited = BTreeSet::new();
+    let measuring = measured > SUITE_ROUNDS;
+    let mut warmed = warm;
+    if measuring {
+        // An idle Mac's vault and journals stood unchanged long before its rounds, where this
+        // pair's setup and warm-up wrote them just now, and a journal view or a file digest of a
+        // file changed within the settled time of a read reads it again at each ask
+        // (`aterm_secrets::client::test_settled_after`).
+        // A measurement waits that time out, and a tenth of a second past it, so its rounds read
+        // what an idle Mac's read, and then warms the CPU again ([`AFTER_IDLE_WARM`]). Measured
+        // at once, the first two seconds of a sustained run's rounds, and all eight of the
+        // default lane's, read the control journal again, and over the short log the vault's
+        // files too: a sustained short run opened 588 files a round where a settled one opened
+        // 241 (2026-11-09).
+        std::thread::sleep(
+            aterm_secrets::client::test_settled_after() + Duration::from_millis(100),
+        );
+        for _ in 0..AFTER_IDLE_WARM {
+            loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        }
+        warmed += AFTER_IDLE_WARM;
+    }
     if measured > 8 {
         eprintln!(
             "\nCOMMONS-QUIET-READY {}",
@@ -980,7 +1014,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
                 "scope": "retained-history-read-cache",
                 "workload": workload.word(),
                 "tables": workload.tables(),
-                "warmup_rounds": warm,
+                "warmup_rounds": warmed,
                 "rounds": measured,
                 "moved_records": 0,
                 "counts": history_read_counts_value(reads),
@@ -999,7 +1033,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
             "history_rotations": workload.history(),
             "log_records": records.len(),
             "log_bytes": records.encode().len(),
-            "warmup_rounds": warm,
+            "warmup_rounds": warmed,
             "rounds": measured,
             "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),
             "per_round_cpu_ns": u64::try_from((spent / measured).as_nanos()).unwrap(),
@@ -1013,7 +1047,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
         spent / measured,
     );
     // A measuring run only: the witness costs below are numbers nothing here asserts on.
-    if measured < 8 {
+    if !measuring {
         return;
     }
     // What a round paid for its peer's witness when it was not held: before the cache held one

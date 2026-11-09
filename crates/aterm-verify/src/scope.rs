@@ -30,6 +30,11 @@ pub struct Changed {
     /// The packages, by name, the cone's lint leaves out
     /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `unlinted`).
     pub unlinted: Vec<String>,
+    /// The packages, by name, one edge from what the change touched
+    /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `direct_dependents`). With
+    /// [`Changed::all_targets`], they are what the cone's required-features lint compiles
+    /// ([`Scope::gated_spec_of`]).
+    pub direct_dependents: Vec<String>,
 }
 
 impl Changed {
@@ -86,6 +91,7 @@ impl Scope {
                 .filter_map(|spec| spec_name(spec).map(str::to_string))
                 .collect(),
             unlinted: Vec::new(),
+            direct_dependents: Vec::new(),
             crates,
             any_lib,
         })
@@ -117,6 +123,16 @@ impl Scope {
     pub fn with_unlinted(mut self, unlinted: Vec<String>) -> Self {
         if let Self::Changed(changed) = &mut self {
             changed.unlinted = unlinted;
+        }
+        self
+    }
+
+    /// This cone with the packages one edge from what the change touched
+    /// ([`Changed::direct_dependents`]); any other scope as it is.
+    #[must_use]
+    pub fn with_direct_dependents(mut self, direct_dependents: Vec<String>) -> Self {
+        if let Self::Changed(changed) = &mut self {
+            changed.direct_dependents = direct_dependents;
         }
         self
     }
@@ -226,6 +242,31 @@ impl Scope {
                 .iter()
                 .find(|spec| spec_name(spec) == Some(name))
                 .cloned(),
+        }
+    }
+
+    /// The `-p` spelling ([`Scope::spec_of`]) by which the lint compiles the bare package `name`'s
+    /// `required-features` targets, or `None` when it leaves them out. The workspace and `-p`
+    /// compile those of every package they select. A cone compiles those of the packages whose
+    /// every target it lints ([`Changed::all_targets`]) and those one edge from what the change
+    /// touched ([`Changed::direct_dependents`]): a feature-gated target or module names the items
+    /// of a direct dependency where no other code of its package may (`native_motion_probe`, under
+    /// aterm-gui's `bench-support`, called a method its own crate had narrowed to `cfg(test)`). GAP:
+    /// a gated target that reaches the change only through a re-export of a crate it depends on
+    /// waits for `-p` or `--all`.
+    #[must_use]
+    pub fn gated_spec_of(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Changed(changed)
+                if !changed
+                    .all_targets
+                    .iter()
+                    .chain(&changed.direct_dependents)
+                    .any(|n| n == name) =>
+            {
+                None
+            }
+            _ => self.spec_of(name),
         }
     }
 }

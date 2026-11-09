@@ -5,6 +5,17 @@ use super::*;
 use crate::harness::alab_roster::{Lab, TestSourceOverride, test_machine};
 use aterm_spec::interp::State;
 
+#[test]
+fn invalid_configuration_cannot_admit_a_fallback_source() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let config = scratch.path().join("aterm.toml");
+    std::fs::write(&config, "[fleet]\naccounts_source = 'chosen.csv'\n").unwrap();
+    let captured = AutomaticSource::capture(&config).unwrap();
+    std::fs::write(&config, "[fleet]\naccounts_source = '").unwrap();
+    assert!(captured.validate().is_err());
+    assert!(AutomaticSource::capture(&config).is_err());
+}
+
 pub(crate) fn resolve(state: &State, action: &str) -> State {
     resolve_with_origin(state, action, false)
 }

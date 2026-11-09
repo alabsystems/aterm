@@ -694,6 +694,7 @@ fn the_filesystem_rule_is_the_updaters() {
     calls.push("json:remote_filesystem|libc=null\t-\t\"/\"".into());
     let open = aterm_tempfile::Builder::new()
         .prefix("install-sh-fs.")
+        .suffix(".noindex")
         .tempdir_in(root)
         .expect("an unshielded dir");
     let open_root = open.path().canonicalize().expect("its physical path");

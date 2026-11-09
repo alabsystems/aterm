@@ -3864,12 +3864,22 @@ pub(crate) const ENV_PARENT_PID: HandoffName = HandoffName::new("ATERM_HANDOFF_P
 /// The outgoing process's kernel birth record, published beside its pid.
 #[cfg(unix)]
 pub(crate) const ENV_PARENT_BIRTH: HandoffName = HandoffName::new("ATERM_HANDOFF_PARENT_BIRTH");
-/// What the outgoing process can read of its successor's exit: a comma-separated capability list, published beside the parent's identity ([`outgoing_parent_env`], so both lanes carry it) and taken out of the snapshot by the successor before any shell exists ([`take_parent_reads_passing_exit_from`]).
+/// What the outgoing process can read of its successor's exit: a comma-separated capability list, published beside the parent's identity ([`outgoing_parent_env`], so both lanes carry it) and taken out of the snapshot by the successor before any shell exists ([`take_parent_exit_caps_from`]).
 #[cfg(unix)]
 pub(crate) const ENV_EXIT_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_EXIT_CAPS");
-/// The one capability [`ENV_EXIT_CAPS`] names: this parent files a successor's [`EXIT_SUCCESSOR_PASSING`] transient and gives its counted trial launch back (`app_native::PhysicalFailureShape::of_child_death`).
+/// This parent files a successor's [`EXIT_SUCCESSOR_PASSING`] transient and gives its counted trial launch back (`app_native::PhysicalFailureShape::of_child_death`).
 #[cfg(unix)]
 pub(crate) const EXIT_CAPS_PASSING: &str = "passing75";
+/// This parent can distinguish unfinished boot verification from other passing refusals.
+#[cfg(unix)]
+pub(crate) const EXIT_CAPS_VERIFICATION: &str = "verification76";
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParentExitCaps {
+    pub(crate) passing: bool,
+    pub(crate) verification: bool,
+}
 
 /// The kernel's own birth record for a process: the microsecond-resolution instant `fork` created it.
 #[cfg(unix)]
@@ -4087,17 +4097,28 @@ pub(crate) fn outgoing_parent_env() -> Vec<(std::ffi::OsString, std::ffi::OsStri
     if let Some(birth) = own_process_birth() {
         pairs.push(ENV_PARENT_BIRTH.pair(birth.to_wire()));
     }
-    pairs.push(ENV_EXIT_CAPS.pair(EXIT_CAPS_PASSING));
+    pairs.push(ENV_EXIT_CAPS.pair(format!("{EXIT_CAPS_PASSING},{EXIT_CAPS_VERIFICATION}")));
     pairs
 }
 
-/// Whether the outgoing process declared that it reads [`EXIT_SUCCESSOR_PASSING`] as a passing failure ([`ENV_EXIT_CAPS`] names [`EXIT_CAPS_PASSING`]) — taken out of the snapshot, so no helper or shell ever sees the name.
+/// The exit distinctions the parent declared, consumed before any helper or shell exists.
 #[cfg(unix)]
 #[must_use]
-pub(crate) fn take_parent_reads_passing_exit_from(env: &mut HandoffEnv) -> bool {
-    env.take(ENV_EXIT_CAPS)
+pub(crate) fn take_parent_exit_caps_from(env: &mut HandoffEnv) -> ParentExitCaps {
+    let mut understood = ParentExitCaps::default();
+    if let Some(caps) = env
+        .take(ENV_EXIT_CAPS)
         .and_then(|caps| caps.into_string().ok())
-        .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == EXIT_CAPS_PASSING))
+    {
+        for cap in caps.split(',').map(str::trim) {
+            match cap {
+                EXIT_CAPS_PASSING => understood.passing = true,
+                EXIT_CAPS_VERIFICATION => understood.verification = true,
+                _ => {}
+            }
+        }
+    }
+    understood
 }
 
 /// The turn-id count this successor continues from, given the manifest's `next_turn_id`: past it by one more overlap reserve (`control::TURN_ID_RESERVE`).
@@ -4531,15 +4552,19 @@ pub(crate) fn take_target_identity_from(env: &mut HandoffEnv) -> Option<HandoffT
 /// The exit status a refusing successor leaves with when what stopped it was passing: `EX_TEMPFAIL` from `sysexits.h`, "temporary failure; the user is invited to retry".
 #[cfg(unix)]
 pub(crate) const EXIT_SUCCESSOR_PASSING: i32 = 75;
+/// No boot verification verdict, emitted only when the parent advertises its interpretation.
+#[cfg(unix)]
+pub(crate) const EXIT_SUCCESSOR_VERIFICATION: i32 = 76;
 
-/// Whether a successor that refused its target leaves with [`EXIT_SUCCESSOR_PASSING`] instead of the ordinary refusal's clean `0`.
+/// A refusing target's negotiated exit: distinct unfinished verification where
+/// understood, legacy passing otherwise, or the ordinary refusal when neither is understood.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn passing_refusal_exit(
     boot_apply: &aterm_update::ApplyOutcome,
     target_names_this_build: bool,
     target_admitted: bool,
-    parent_reads_passing: bool,
+    parent: ParentExitCaps,
 ) -> Option<i32> {
     let no_verdict_on_the_stage = match boot_apply {
         aterm_update::ApplyOutcome::NoUpdate
@@ -4550,11 +4575,15 @@ pub(crate) fn passing_refusal_exit(
             false
         }
     };
-    (no_verdict_on_the_stage
-        && !target_admitted
-        && !target_names_this_build
-        && parent_reads_passing)
-        .then_some(EXIT_SUCCESSOR_PASSING)
+    if !no_verdict_on_the_stage || target_admitted || target_names_this_build {
+        None
+    } else if parent.verification {
+        Some(EXIT_SUCCESSOR_VERIFICATION)
+    } else if parent.passing {
+        Some(EXIT_SUCCESSOR_PASSING)
+    } else {
+        None
+    }
 }
 
 /// Whether this launch was offered a handoff's sessions: the descriptor list ([`ENV_FDS`]) the fork lane's parent sets and the launched lane's granted rendezvous claim installs into the snapshot.
@@ -4580,7 +4609,7 @@ pub(crate) const fn overlap_intake_exits(
     overlap_degraded && (adopted > 0 || offered)
 }
 
-/// How a successor leaves an overlap it will not take ([`overlap_intake_exits`]) once [`passing_refusal_exit`] sent no 75 for the boot swap; decided by [`refused_intake_leave`].
+/// How a successor leaves an overlap it will not take ([`overlap_intake_exits`]) once [`passing_refusal_exit`] sent no boot-swap exit; decided by [`refused_intake_leave`].
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefusedIntakeLeave {
@@ -4601,7 +4630,7 @@ impl RefusedIntakeLeave {
     }
 }
 
-/// How a successor whose overlap authority is incomplete leaves ([`RefusedIntakeLeave`]), from what it adopted, whose content a whole refusal was about ([`IncomingHandoff::refusal`]), and whether the parent declared that it reads [`EXIT_SUCCESSOR_PASSING`] ([`take_parent_reads_passing_exit_from`]).
+/// How a successor whose overlap authority is incomplete leaves ([`RefusedIntakeLeave`]), from what it adopted, whose content a whole refusal was about ([`IncomingHandoff::refusal`]), and whether the parent declared that it reads [`EXIT_SUCCESSOR_PASSING`] ([`take_parent_exit_caps_from`]).
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn refused_intake_leave(

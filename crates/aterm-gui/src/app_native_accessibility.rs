@@ -2062,6 +2062,166 @@ mod tests {
         assert_the_whole_terminal(&app, wid, "during a held frame");
     }
 
+    /// A repeated document read owns its returned text and reuses extraction storage.
+    #[test]
+    fn document_reads_allocate_only_the_returned_text_once_warm() {
+        let app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let session = app.front_terminal(wid).unwrap().session;
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        for (rows, cols) in [(24usize, 80usize), (120, 240)] {
+            {
+                let mut term = crate::term_lock(&term);
+                term.resize(rows as u16, cols as u16);
+                term.process(b"\x1b[2J\x1b[H");
+                for row in 0..rows {
+                    term.process(
+                        format!("\x1b[{};1Hrow {row} {}", row + 1, "x".repeat(cols - 10))
+                            .as_bytes(),
+                    );
+                }
+            }
+            for _ in 0..3 {
+                let _ = app
+                    .terminal_document_for_test(wid, session, rows, cols, true)
+                    .unwrap();
+            }
+            app.windows[&wid].a11y_document_frames.borrow_mut().clear();
+            let (cold, cold_allocations) = aterm_heap_count::allocations_in(|| {
+                app.terminal_document_for_test(wid, session, rows, cols, true)
+                    .unwrap()
+            });
+            let (document, allocations) = aterm_heap_count::allocations_in(|| {
+                app.terminal_document_for_test(wid, session, rows, cols, true)
+                    .unwrap()
+            });
+            assert!(document.snap.value().starts_with("row 0 "));
+            assert_eq!(
+                document.snap, cold.snap,
+                "retaining storage must preserve the document"
+            );
+            assert!(
+                cold_allocations > 1,
+                "CONTROL: discarding scratch must lose its reuse"
+            );
+            assert_eq!(
+                allocations, 1,
+                "{rows}x{cols}: only returned text needs ownership"
+            );
+            crate::term_lock(&term).process(b"\x1b[Hchanged");
+            let (changed, changed_allocations) = aterm_heap_count::allocations_in(|| {
+                app.terminal_document_for_test(wid, session, rows, cols, true)
+                    .unwrap()
+            });
+            assert!(
+                changed.snap.value().starts_with("changed"),
+                "every read must refill from terminal state"
+            );
+            assert_eq!(changed_allocations, 1);
+            println!(
+                "rows={rows} cols={cols} cold_allocations={cold_allocations} warm_allocations={allocations} changed_allocations={changed_allocations}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_client_reads_reuse_frames_for_front_and_split_documents() {
+        for split in [false, true] {
+            let mut app = crate::scripted_redraw_fixture::scripted_app();
+            let wid = WindowId(0);
+            crate::scripted_redraw_fixture::feed(&app, b"client read allocation control");
+            if split {
+                app.split_active_stub_tab(wid);
+                app.split_active_stub_tab(wid);
+            }
+            let plan = app.active_visible_leaf_plan(wid).unwrap();
+            for _ in 0..3 {
+                let _ = app.client_reads(wid, Some(&plan));
+            }
+            app.windows[&wid].a11y_document_frames.borrow_mut().clear();
+            let (cold, cold_allocations) =
+                aterm_heap_count::allocations_in(|| app.client_reads(wid, Some(&plan)));
+            let (warm, warm_allocations) =
+                aterm_heap_count::allocations_in(|| app.client_reads(wid, Some(&plan)));
+            assert_eq!(
+                cold, warm,
+                "reusing storage must preserve the complete client read"
+            );
+            assert!(
+                cold_allocations > warm_allocations,
+                "front/split={split}: extraction storage must survive a complete read pass"
+            );
+            println!(
+                "split={split} cold_allocations={cold_allocations} warm_allocations={warm_allocations}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_geometry_panes_match_independent_document_reads() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        let first = app.front_terminal(wid).unwrap().session;
+        let second = app.split_active_stub_tab(wid);
+        let third = app.split_active_stub_tab(wid);
+        for (index, session) in [first, second, third].into_iter().enumerate() {
+            let term = app.pool.get(session).unwrap().term.clone();
+            let mut term = crate::term_lock(&term);
+            term.process(format!("pane {index}> ").as_bytes());
+            if index == 0 {
+                term.text_selection_mut().start_selection(
+                    0,
+                    0,
+                    SelectionSide::Left,
+                    SelectionType::Simple,
+                );
+                term.text_selection_mut()
+                    .update_selection(0, 3, SelectionSide::Right);
+                term.text_selection_mut().complete_selection();
+            } else if index == 1 {
+                term.process(b"\x1b[?25l");
+            }
+        }
+        app.on_ime_preedit(wid, "日λ".to_owned(), None);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        assert_eq!(plan.leaves.len(), 3);
+        let mut expected = Vec::new();
+        for leaf in &plan.leaves {
+            let session = app
+                .view_store
+                .get(leaf.view)
+                .unwrap()
+                .terminal_session()
+                .unwrap();
+            let rows = (leaf.rect.size.height.round() as usize).max(1);
+            let cols = (leaf.rect.size.width.round() as usize).max(1);
+            app.windows[&wid].a11y_document_frames.borrow_mut().clear();
+            expected.push(
+                app.terminal_document_for_test(wid, session, rows, cols, leaf.focused)
+                    .unwrap(),
+            );
+        }
+        assert_ne!(
+            expected[0].snap.text, expected[1].snap.text,
+            "CONTROL: distinct terminal documents"
+        );
+        assert!(expected[0].selection.is_some());
+        assert!(expected[1].snap.cursor.is_none());
+        assert!(
+            expected[2].snap.value().contains('日'),
+            "CONTROL: focused composition was projected"
+        );
+        for _ in 0..3 {
+            let reads = app.client_reads(wid, Some(&plan));
+            assert_eq!(reads.panes.len(), expected.len());
+            for (pane, fresh) in reads.panes.iter().zip(&expected) {
+                assert_eq!(pane.snap, fresh.snap);
+                assert_eq!(pane.selection, fresh.selection);
+            }
+        }
+    }
+
     /// A terminal's document reads the rows on screen, its caret where it is drawn.
     #[test]
     fn a_document_reads_the_view_and_a_hidden_caret_is_none() {
@@ -2073,7 +2233,7 @@ mod tests {
             crate::scripted_redraw_fixture::feed(&app, format!("row {row}\r\n").as_bytes());
         }
         let read = |app: &App, focused| {
-            app.terminal_document(wid, session, rows, cols, focused)
+            app.terminal_document_for_test(wid, session, rows, cols, focused)
                 .expect("the document")
                 .snap
         };
@@ -2089,7 +2249,9 @@ mod tests {
             read(&app, true).cursor.is_some(),
             "CONTROL: it fits this view"
         );
-        let narrow = app.terminal_document(wid, session, rows, 3, true).unwrap();
+        let narrow = app
+            .terminal_document_for_test(wid, session, rows, 3, true)
+            .unwrap();
         assert_eq!(
             narrow.snap.cursor, None,
             "a caret past the view's columns is not drawn"

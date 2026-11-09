@@ -1967,7 +1967,7 @@ mod tests {
     /// reading, so a start before it saturates at 0, as the recorder's does.
     #[test]
     fn every_slow_call_is_kept_with_its_start_on_the_flush_clock() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("tally");
         let path = dir.path().join(FILE);
         let mut on = Recorder::at(&path).expect("open");
         let slow_ns = Hist::floor(SLOW_CALL_BAND, Unit::Ns);
@@ -2076,7 +2076,7 @@ mod tests {
     #[test]
     fn each_write_carries_the_processs_flushes_and_a_flush_alone_writes_nothing() {
         use std::io::Write as _;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("tally");
         let path = dir.path().join(FILE);
         let read = || std::fs::read_to_string(&path).expect("read the tally");
         let mut on = Recorder::at(&path).expect("open");
@@ -2148,7 +2148,7 @@ mod tests {
         off.idle(9, |_| panic!("an off recorder copies nothing"));
         assert_eq!(off.tally(), Tally::default());
 
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("tally");
         let path = dir.path().join(FILE);
         let mut on = Recorder::at(&path).expect("open");
         assert!(on.on());
@@ -2225,7 +2225,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_wait_tally_never_truncates_an_occupied_name_or_its_link_target() {
-        let dir = aterm_tempfile::tempdir().expect("exclusive fixture");
+        let dir = crate::test_scratch_dir("tally");
         let fresh = dir.path().join("fresh-tally");
         let mut recorder = Recorder::at(&fresh).expect("fresh recorder");
         recorder.idle(7, |_| {});

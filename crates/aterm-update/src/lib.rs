@@ -18,6 +18,67 @@
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
 
+/// An isolated `.noindex` temporary directory for `aterm-update` tests so staged `.app` bundles
+/// and test churn stay out of Spotlight and `fseventsd` across every platform cell.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScratchDir(aterm_tempfile::TempDir);
+
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl ScratchDir {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+
+    pub(crate) fn into_tempdir(self) -> aterm_tempfile::TempDir {
+        self.0
+    }
+
+    pub(crate) fn keep(self) -> std::path::PathBuf {
+        self.0.keep()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for ScratchDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+/// Create a `.noindex` temporary directory for `aterm-update` tests, truncating `label` on a
+/// UTF-8 character boundary.
+#[cfg(test)]
+pub(crate) fn scratch_dir(label: &str) -> ScratchDir {
+    let clean: String = label
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let short = &clean[..clean.floor_char_boundary(16)];
+    ScratchDir(
+        aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-upd-{short}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("create aterm-update test scratch dir"),
+    )
+}
+
 #[cfg(target_os = "macos")]
 mod bundle;
 #[cfg(any(target_os = "macos", test))]
@@ -4912,7 +4973,7 @@ mod installed_build_tests {
 
     #[test]
     fn an_unchanged_plist_is_read_once_and_a_moved_one_again() {
-        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let dir = crate::paths::scratch_dir("observed-plist");
         let app = dir.path().join("aterm.app");
         let plist = app.join("Contents/Info.plist");
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
@@ -5297,13 +5358,7 @@ mod commit_match_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ledger_reader_rejects_oversized_and_non_regular_inputs() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-update-ledger-cap-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::paths::scratch_dir("ledger-cap");
         let valid = dir.join("valid.toml");
         std::fs::write(&valid, b"enabled = true\n").unwrap();
         assert_eq!(
@@ -5320,7 +5375,6 @@ mod commit_match_tests {
         std::os::unix::fs::symlink(&valid, &link).unwrap();
         assert!(super::read_ledger_text(&link).is_none());
         assert!(super::read_ledger_text_checked(&link).is_err());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5515,11 +5569,7 @@ mod handoff_candidate_facts_tests {
 
     #[test]
     fn the_chunked_grant_is_read_off_a_bundle_on_disk() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-update-grant-chunks-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let root = crate::paths::scratch_dir("grant-chunks");
         let contents = root.join("aterm.app/Contents");
         std::fs::create_dir_all(&contents).unwrap();
         let app = root.join("aterm.app");
@@ -5552,7 +5602,6 @@ mod handoff_candidate_facts_tests {
         )
         .unwrap();
         let all = HandoffCandidateFacts::read(&app);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(grants(chunks_only), Ok((true, false, false)));
         assert_eq!(grants(both), Ok((true, true, false)));
         assert_eq!(grants(all), Ok((true, true, true)));

@@ -95,10 +95,7 @@ impl Staging {
     /// (cleaned up on drop by [`ScratchStaging`]) without mutating process env.
     #[cfg(test)]
     pub(crate) fn scratch(label: &str) -> ScratchStaging {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-update-{label}-"))
-            .tempdir()
-            .expect("scratch staging root");
+        let dir = scratch_dir(label).into_tempdir();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("download")).expect("scratch staging root");
         ScratchStaging {
@@ -115,6 +112,9 @@ impl Staging {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use crate::{ScratchDir, scratch_dir};
 
 /// [`Staging::scratch`]'s layout, which dereferences to the [`Staging`] and removes
 /// its root on drop.

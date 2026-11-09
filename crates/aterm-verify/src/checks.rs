@@ -100,9 +100,10 @@ pub const CHECKS: [Spec; 19] = [
         also: "",
         runs: "targo-tippy <selection> --all-targets -- -D warnings; a change cone has up to two \
                passes, that one over what the change touched and default targets over the rest \
-               that link it, and leaves out what it holds only by a dev edge; also \
-               -p aterm --release whenever the selection reaches aterm (under release, the \
-               required-features targets too)",
+               that link it, and leaves out what it holds only by a dev edge; then the \
+               required-features targets (--features <pkg>/<feat>,… --all-targets) of the \
+               selected packages that have them, in a cone of those it touched and those one \
+               edge from them; also -p aterm --release whenever the selection reaches aterm",
     },
     Spec {
         check: Check::Test,
@@ -861,7 +862,7 @@ mod tests {
                         .chain([name])
                         .map(String::from)
                         .collect(),
-                    dev_only: Vec::new(),
+                    ..crate::changed::Reach::default()
                 })
             };
             let sel = select(

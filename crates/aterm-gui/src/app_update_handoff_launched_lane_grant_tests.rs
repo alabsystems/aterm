@@ -164,7 +164,7 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         matches!(
             &gone,
             Err(super::PreParkRefusal::Verification { outcome, detail })
-                if *outcome == crate::UpdateHandoffOutcome::ProducerFailed
+                if *outcome == crate::UpdateHandoffOutcome::VerificationDeferred
                     && detail.contains("no longer staged")
         ),
         "{gone:?}"
@@ -325,8 +325,41 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
         "lock: could not take the apply lock within 10s ({})",
         aterm_update::PASSING_REFUSAL_KEY
     );
-    assert!(super::worker_pre_park_check(&mut job, |_| Err(moment.clone()), |_, _| None).is_err());
+    assert!(matches!(
+        super::worker_pre_park_check(&mut job, |_| Err(moment.clone()), |_, _| None),
+        Err(super::PreParkRefusal::Verification {
+            outcome: crate::UpdateHandoffOutcome::VerificationDeferred,
+            ..
+        })
+    ));
     assert!(kept().is_none(), "NEGATIVE: a moment is no verdict");
+    for matching in [false, true] {
+        job.preverified.as_ref().unwrap().publish_policy_pass(
+            &aterm_update_core::handoff_policy::PolicyRead::Absent,
+            crate::running_build_number(),
+            "the earlier read",
+        );
+        if !matching {
+            app.handoff_preverified
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .artifact = "cd".repeat(32);
+        }
+        assert!(kept().as_ref().is_some_and(|entry| entry.passed));
+        assert!(matches!(
+            super::worker_pre_park_check(&mut job, |_| Err(moment.clone()), |_, _| None),
+            Err(super::PreParkRefusal::Verification {
+                outcome: crate::UpdateHandoffOutcome::VerificationDeferred,
+                ..
+            })
+        ));
+        assert!(
+            kept().as_ref().is_some_and(|entry| entry.passed),
+            "an inconclusive read does not refute verified facts"
+        );
+    }
     let folder = format!(
         "{}: /Applications/aterm.app; this install cannot update itself",
         aterm_update::INSTALL_LOCATION_REFUSAL_KEY

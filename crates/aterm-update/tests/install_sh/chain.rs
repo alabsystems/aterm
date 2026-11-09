@@ -1587,6 +1587,7 @@ pub fn a_private_ancestor_shields_writable_children_but_not_earlier_ancestors(
     symlink(&writable, &alias);
     let shared = aterm_tempfile::Builder::new()
         .prefix("install-sh-unshielded.")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a dir under /tmp");
     let unshielded = shared.path().canonicalize().expect("its physical path");
@@ -1627,6 +1628,7 @@ pub fn what_the_installer_makes_its_verifier_admits_under_any_umask(
     use std::os::unix::fs::MetadataExt as _;
     let open = aterm_tempfile::Builder::new()
         .prefix("install-sh-umask.")
+        .suffix(".noindex")
         .tempdir_in(crate::support::scratch_root())
         .expect("an unshielded dir");
     let open_root = open.path().canonicalize().expect("its physical path");
@@ -2192,6 +2194,7 @@ pub fn the_install_path_walk_is_the_updaters_on_this_machine(scratch: &Scratch, 
     }
     let open = aterm_tempfile::Builder::new()
         .prefix("install-sh-open.")
+        .suffix(".noindex")
         .tempdir_in(crate::support::scratch_root())
         .expect("an unshielded dir");
     let open_root = open.path().canonicalize().expect("its physical path");

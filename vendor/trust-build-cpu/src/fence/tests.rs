@@ -59,8 +59,19 @@ fn probe(directory: &Path, name: &str) -> File {
 }
 
 fn assert_released(directory: &Path, name: &str) {
+    assert_released_started(directory, name, Instant::now(), || {});
+}
+
+const RELEASE_WAIT: Duration = Duration::from_secs(60);
+
+fn assert_released_started(
+    directory: &Path,
+    name: &str,
+    started: Instant,
+    mut waited: impl FnMut(),
+) {
     let file = probe(directory, name);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = started + RELEASE_WAIT;
     loop {
         if file.try_lock().is_ok() {
             return;
@@ -68,7 +79,43 @@ fn assert_released(directory: &Path, name: &str) {
         // Other test modules may fork concurrently and briefly inherit a
         // description before their exec closes it. Persistent retention fails.
         assert!(Instant::now() < deadline, "fence remained held: {name}");
+        waited();
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn required_native_fence_release_keeps_its_original_start_and_held_custody() {
+    let _serial = SERIAL.lock().unwrap();
+    for age in [6, 61] {
+        let (directory, mut files) = fixture();
+        let mut held = Some(files.remove(0));
+        drop(files);
+        assert!(probe(directory.path(), "slot-0").try_lock().is_err());
+        let mut observed_waits = 0;
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_released_started(
+                directory.path(),
+                "slot-0",
+                Instant::now() - Duration::from_secs(age),
+                || {
+                    observed_waits += 1;
+                    drop(held.take());
+                },
+            );
+        }));
+        if age >= 60 {
+            assert!(observed.is_err());
+            assert_eq!(observed_waits, 0);
+            assert!(held.is_some());
+            assert!(probe(directory.path(), "slot-0").try_lock().is_err());
+            drop(held);
+        } else {
+            observed.unwrap();
+            assert_eq!(observed_waits, 1);
+            assert!(held.is_none());
+        }
+        assert_released(directory.path(), "slot-0");
     }
 }
 

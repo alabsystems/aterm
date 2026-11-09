@@ -63,7 +63,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     );
     let claude = as_read(&engine_rows(&app, session));
     let heard = app
-        .terminal_document(wid, session, c.rows, c.cols, false)
+        .terminal_document_for_test(wid, session, c.rows, c.cols, false)
         .expect("the terminal's document")
         .snap;
     assert_eq!(heard.value(), claude, "the reader hears Claude's rows");

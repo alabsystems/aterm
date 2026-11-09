@@ -25,6 +25,10 @@ use crate::{App, Wake, WindowId};
 #[cfg(unix)]
 pub(crate) const PREVERIFY_READ_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Space inconclusive authentication reads without charging the image's launch budget.
+#[cfg(unix)]
+pub(crate) const PREVERIFY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Settings ▸ Messages is republished at most this often while the center moves.
 pub(crate) const MESSAGES_PUBLISH_MIN_GAP: std::time::Duration =
     std::time::Duration::from_millis(500);
@@ -896,6 +900,7 @@ impl PhysicalFailureShape {
             | crate::UpdateHandoffOutcome::ActivityRevoked
             | crate::UpdateHandoffOutcome::CaptureRefused
             | crate::UpdateHandoffOutcome::StageUnconfirmed
+            | crate::UpdateHandoffOutcome::VerificationDeferred
             | crate::UpdateHandoffOutcome::ProofReady => Self::Transient,
         }
     }
@@ -906,11 +911,11 @@ impl PhysicalFailureShape {
     pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
         match death {
             crate::ChildDeathEvidence::Unobserved => Self::Unexplained,
-            crate::ChildDeathEvidence::Exited { code }
-                if code == crate::seamless::EXIT_SUCCESSOR_PASSING =>
-            {
-                Self::Transient
-            }
+            crate::ChildDeathEvidence::Exited {
+                code:
+                    crate::seamless::EXIT_SUCCESSOR_PASSING
+                    | crate::seamless::EXIT_SUCCESSOR_VERIFICATION,
+            } => Self::Transient,
             crate::ChildDeathEvidence::Exited { .. } => Self::Structural,
             crate::ChildDeathEvidence::Signalled { signal } => {
                 if signal_is_the_image_faulting(signal) {
@@ -963,6 +968,8 @@ const fn signal_is_the_image_faulting(signal: i32) -> bool {
 #[cfg(any(unix, test))]
 pub(crate) enum HandoffFailureLane {
     ActivityRevoked,
+    #[cfg(unix)]
+    VerificationDeferred,
     Physical(PhysicalFailureShape),
     Manual,
     Refused,
@@ -998,6 +1005,14 @@ impl HandoffFailureLane {
         }
         if revoked_by_activity || outcome == crate::UpdateHandoffOutcome::ActivityRevoked {
             Self::ActivityRevoked
+        } else if outcome == crate::UpdateHandoffOutcome::VerificationDeferred
+            || (outcome == crate::UpdateHandoffOutcome::ChildDied
+                && death
+                    == crate::ChildDeathEvidence::Exited {
+                        code: crate::seamless::EXIT_SUCCESSOR_VERIFICATION,
+                    })
+        {
+            Self::VerificationDeferred
         } else {
             Self::Physical(PhysicalFailureShape::of_outcome(outcome, death))
         }
@@ -1009,7 +1024,7 @@ impl HandoffFailureLane {
         match self {
             Self::Manual => false,
             #[cfg(unix)]
-            Self::AwaitsRosterConfirmation { .. } => false,
+            Self::AwaitsRosterConfirmation { .. } | Self::VerificationDeferred => false,
             _ => true,
         }
     }
@@ -8524,6 +8539,33 @@ impl App {
         let activation = updater.staged.as_ref().is_some_and(|staged| {
             staged.build == attempt_build && staged.is_installed_activation()
         });
+        #[cfg(unix)]
+        let passing_retry_at = self
+            .handoff_preverify_in_flight
+            .as_ref()
+            .filter(|read| {
+                read.build == attempt_build
+                    && decode_dmg_sha256(&read.artifact) == Some(intent.dmg_sha256)
+                    && updater
+                        .staged
+                        .as_ref()
+                        .and_then(|stage| stage.commit.as_deref())
+                        == Some(read.commit.as_str())
+                    && preverify_read_needed(
+                        self.handoff_preverified
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref(),
+                        Some(read),
+                        read.build,
+                        &read.commit,
+                        &read.artifact,
+                        now,
+                    )
+            })
+            .and_then(|read| read.ended_passing_at(now))
+            .filter(|(reason, _)| !aterm_update::is_roster_confirmation_wait(reason))
+            .map(|(_, ended)| ended + PREVERIFY_RETRY_AFTER);
         if self.capture_refusal_holds(attempt_build, intent.dmg_sha256, activation, now) {
             self.note_auto_apply_hold(
                 phase,
@@ -8546,6 +8588,27 @@ impl App {
                 now,
             );
             intent.retry_at = retry_at;
+            self.auto_apply_intent = Some(intent);
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(retry_at) = passing_retry_at {
+            let started = now >= retry_at
+                && self.start_fresh_preverification(attempt_build, intent.dmg_sha256);
+            self.note_auto_apply_hold(
+                phase,
+                &mut intent,
+                crate::native_update_lane_hold::LaneHold::PreparkRead,
+                "the candidate's authentication has not reached a verdict",
+                now,
+            );
+            intent.retry_at = if now < retry_at {
+                retry_at
+            } else if started {
+                now + PREVERIFY_READ_POLL
+            } else {
+                now + PREVERIFY_RETRY_AFTER
+            };
             self.auto_apply_intent = Some(intent);
             return;
         }
@@ -10311,7 +10374,65 @@ impl App {
         {
             return self.settle_rearmed_apply_failure(attempt, message, lane, None);
         }
+        #[cfg(unix)]
+        if lane == HandoffFailureLane::VerificationDeferred {
+            return UpdateOutcome::Deferred {
+                reason: message,
+                hold: crate::native_update_lane_hold::LaneHold::StagePending,
+            };
+        }
         UpdateOutcome::Failed { message }
+    }
+
+    /// A worker's authentication read ended without a verdict. Retain its retry
+    /// cadence without erasing a verdict published since the worker finished.
+    #[cfg(unix)]
+    fn defer_worker_verification(
+        &mut self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+        reason: &str,
+    ) {
+        let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) else {
+            return;
+        };
+        let build = attempt.target_build();
+        let now = std::time::Instant::now();
+        // A concurrent read of these bytes owns its eventual answer. Otherwise
+        // publish this completed read so the automatic poll starts the next one.
+        if !self
+            .handoff_preverify_in_flight
+            .as_ref()
+            .is_some_and(|read| read.reads(attempt) && read.running_for(build, now))
+        {
+            let passing = std::sync::Arc::new(std::sync::OnceLock::new());
+            let _ = passing.set(crate::PassingPreverification {
+                reason: reason.to_string(),
+                ended: now,
+            });
+            self.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+                build,
+                commit: attempt.target_commit().to_string(),
+                artifact: attempt.target_dmg_sha256().to_string(),
+                deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+                done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                passing,
+            });
+        }
+        if !self.native_auto_apply_enabled()
+            || self.auto_apply_manual_only.is_some_and(|held| {
+                held.covers(build, dmg_sha256, attempt.is_installed_activation())
+            })
+        {
+            return;
+        }
+        self.anchor_auto_apply_ladder(build, now);
+        self.rearm_auto_apply_intent(crate::AutoApplyIntent {
+            build,
+            dmg_sha256,
+            retry_at: now + PREVERIFY_RETRY_AFTER,
+            attempts: 0,
+            held: crate::native_update_lane_hold::NamedHold::default(),
+        });
     }
 
     #[cfg(any(unix, test))]
@@ -10356,6 +10477,16 @@ impl App {
             };
         }
         if !lane.charges_the_automatic_lane() {
+            #[cfg(unix)]
+            if lane == HandoffFailureLane::VerificationDeferred {
+                self.defer_worker_verification(attempt, &message);
+                self.restate_staged_bar_posture(attempt.target_build());
+                publish(self);
+                return UpdateOutcome::Deferred {
+                    reason: message,
+                    hold: crate::native_update_lane_hold::LaneHold::PreparkRead,
+                };
+            }
             publish(self);
             return UpdateOutcome::Failed { message };
         }
@@ -10505,6 +10636,13 @@ impl App {
                 } else {
                     "the download on disk has since changed"
                 };
+                #[cfg(unix)]
+                if lane == HandoffFailureLane::VerificationDeferred {
+                    return Some(UpdateOutcome::Deferred {
+                        reason: format!("{message}; {changed}"),
+                        hold: crate::native_update_lane_hold::LaneHold::StagePending,
+                    });
+                }
                 Some(UpdateOutcome::Failed {
                     message: format!("{message}; {changed}"),
                 })

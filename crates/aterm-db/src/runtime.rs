@@ -19,6 +19,7 @@ use aterm_secrets::{
 };
 use aterm_types::MutexExt;
 use aterm_types::network_state::{MachineIdentity, Visibility};
+use aterm_uds::stop::Stop;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -228,7 +229,7 @@ impl Network {
         if let Some(retries) = &self.retries {
             retries.lock().unwrap_or_else(|p| p.into_inner()).push(wait);
         }
-        stop.wait(wait);
+        stop.sleep(wait);
     }
 
     /// Whether the runtime may open or refresh its transport on `candidates` now: on macOS once
@@ -475,27 +476,6 @@ impl Refusals {
             .min(REFUSED_MAX);
         self.streak = self.streak.saturating_add(1);
         wait
-    }
-}
-
-#[derive(Default)]
-struct Stop {
-    requested: Mutex<bool>,
-    changed: Condvar,
-}
-impl Stop {
-    fn requested(&self) -> bool {
-        *self.requested.lock().unwrap_or_else(|p| p.into_inner())
-    }
-    fn request(&self) {
-        *self.requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        self.changed.notify_all();
-    }
-    fn wait(&self, duration: Duration) {
-        let lock = self.requested.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = self
-            .changed
-            .wait_timeout_while(lock, duration, |stop| !*stop);
     }
 }
 
@@ -938,7 +918,7 @@ impl Runtime {
                 };
                 // One streak of refusals ([`Refusals`]).
                 let mut refusals = Refusals::new(background);
-                while !worker.requested() {
+                while !worker.is_set() {
                     if yields && owner::window_claimed(&observer_dir) {
                         let publication = waiting_publication(
                             &paths,
@@ -948,7 +928,7 @@ impl Runtime {
                         );
                         published.replace_publication(publication);
                         report(Status::Waiting);
-                        worker.wait(POLL);
+                        worker.sleep(POLL);
                         continue;
                     }
                     if !background && window_claim.is_none() {
@@ -969,11 +949,11 @@ impl Runtime {
                                 "Another local aterm owns network observation; its live snapshot is unavailable",
                             ));
                             report(Status::Waiting);
-                            worker.wait(if background { POLL } else { TICK * 2 });
+                            worker.sleep(if background { POLL } else { TICK * 2 });
                             continue;
                         }
                     };
-                    while !worker.requested() {
+                    while !worker.is_set() {
                         let mut serving = None;
                         let mut served = serve_mode_with_recovery(
                             (&paths, &config, recover_writer),
@@ -1077,7 +1057,7 @@ impl Runtime {
         *self.bus.lock().unwrap_or_else(|p| p.into_inner()) = Some(pred);
     }
     fn join(&mut self) {
-        self.stop.request();
+        self.stop.set();
         if let Some(task) = self.task.take() {
             let _ = task.join();
             let mut observation = self.observation.snapshot();
@@ -1225,12 +1205,12 @@ fn serve_mode_with_recovery(
         return Err(Status::Disabled);
     }
     let paths = if recover_writer {
-        crate::generation::advance_while(paths, config, &|| stop.requested())
+        crate::generation::advance_while(paths, config, &|| stop.is_set())
             .map_err(refusal("writer recovery"))?
     } else {
         paths.clone()
     };
-    if stop.requested() {
+    if stop.is_set() {
         return Ok(());
     }
     serve_selected(
@@ -1352,8 +1332,10 @@ fn serve_selected(
         let mut pushing: Option<Ask> = None;
         serve_paced(
             Instant::now,
-            || stop.requested(),
-            |rest| stop.wait(rest),
+            || stop.is_set(),
+            |rest| {
+                stop.sleep(rest);
+            },
             |now, round| {
                 if yield_to_window.is_some_and(owner::window_claimed) {
                     return Err(Status::Waiting);
@@ -1841,8 +1823,10 @@ fn serve_presence(
     report(Status::Dormant);
     serve_paced(
         Instant::now,
-        || stop.requested(),
-        |rest| stop.wait(rest),
+        || stop.is_set(),
+        |rest| {
+            stop.sleep(rest);
+        },
         |now, round| {
             if yield_to_window.is_some_and(owner::window_claimed) {
                 return Err(Status::Waiting);

@@ -230,7 +230,7 @@ fn a_hand_off_reads_back_and_follows_each_rotation_to_a_member() {
         "a cycle names no seat"
     );
 
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("fed");
     aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
     assert_eq!(Handoff::read(dir.path()).expect("none"), None);
     handoff.write(dir.path()).expect("written");
@@ -334,7 +334,7 @@ fn the_halts_go_to_every_member_but_this_mac() {
 
 #[test]
 fn the_node_key_names_the_node() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("fed");
     aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
     assert_eq!(node_of_key(dir.path()).expect("no key"), None);
     let seed = [7u8; 32];
@@ -369,7 +369,7 @@ pub(crate) struct Mac {
 
 impl Mac {
     pub(crate) fn new(tag: u8) -> Self {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("fed");
         let secret = vec![tag ^ 0x5a; 32];
         let broker = Broker::open_guarded_with(
             dir.path().join("bus.log"),
@@ -427,7 +427,7 @@ impl Mac {
             secret: self.secret.clone(),
             broker: Arc::clone(&self.broker),
             carry_down: Arc::clone(&self.carry_down),
-            dir: Arc::new(aterm_tempfile::tempdir().expect("scratch")),
+            dir: Arc::new(crate::test_scratch_dir("fed")),
         }
     }
 

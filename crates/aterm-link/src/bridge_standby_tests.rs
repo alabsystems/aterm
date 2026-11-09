@@ -119,7 +119,7 @@ fn held(st: &StateDir) -> bool {
 /// by: what aterm writes there next is all there.
 #[test]
 fn the_standby_sleeps_in_the_kernels_lock_queue_where_a_polling_take_needs_a_tick() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("standby");
     let st = StateDir::open(dir.path()).expect("open");
 
     let holder = st.lock_bridge().expect("the holder's take");
@@ -218,7 +218,7 @@ fn a_standby_told_to_stop_returns_without_the_lock() {
         ("closed", io::ErrorKind::ConnectionAborted),
         ("wrote", io::ErrorKind::InvalidData),
     ] {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("standby");
         let st = StateDir::open(dir.path()).expect("open");
         let holder = st.lock_bridge().expect("the holder's take");
         let (lane, mut aterm) = UnixStream::pair().expect("a push lane");
@@ -278,7 +278,7 @@ fn a_holder_killed_by_sigkill_is_succeeded() {
         let _ = std::io::stdin().read(&mut [0_u8; 1]);
         aterm_uds::process::kill_self_now();
     }
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("standby");
     let st = StateDir::open(dir.path()).expect("open");
     let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
     child

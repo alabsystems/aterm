@@ -64,8 +64,9 @@ impl CohortChild {
     /// the syscall, even if its leader has exited. A decoded observation, reaped
     /// leader or copied foreign-owner receipt supplies no authority.
     ///
-    /// Success means only kernel acceptance, never termination, execution or
-    /// drain. No reservation is changed. Members that escape remain outside this
+    /// Success means only kernel acceptance, or a group whose members have all
+    /// ended ([`aterm_uds::process::settle_group_signal`]), never termination,
+    /// execution or drain. No reservation is changed. Members that escape remain outside this
     /// original group's contract; no signal is sent to a newly observed group.
     /// # Errors
     /// The original owner/scope changed or is unreadable, the leader was reaped,
@@ -89,10 +90,14 @@ impl CohortChild {
         // the captured owner/host/boot/namespace are current. No arbitrary pid,
         // decoded record, live-group guess or post-reap identity is accepted.
         if unsafe { libc::kill(-group, signal.raw()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+            return Ok(());
         }
+        // A group of the ended is no refusal. A real one keeps the kernel's errno, which callers
+        // match to tell it from the custody refusals above.
+        let refused = io::Error::last_os_error();
+        let errno = refused.raw_os_error();
+        aterm_uds::process::settle_group_signal(group, refused)
+            .map_err(|settled| errno.map_or(settled, io::Error::from_raw_os_error))
     }
 
     /// Transfer the actual child receipt and bound cohort to the native controller.

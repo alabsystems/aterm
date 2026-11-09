@@ -219,6 +219,7 @@ impl Scratch {
     pub fn new() -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("install-sh.")
+            .suffix(".noindex")
             .tempdir_in(scratch_root())
             .expect("a scratch dir");
         let path = dir

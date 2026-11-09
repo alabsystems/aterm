@@ -166,7 +166,6 @@ fn remaining_words(physical: &Path) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::fs::File;
     use std::os::unix::fs::symlink;
 
     fn retire_with(
@@ -250,20 +249,15 @@ mod tests {
         let clone = aterm_tempfile::tempdir().unwrap();
         legacy(clone.path(), "target.noindex");
         let lock_path = clone.path().join("target.noindex/debug/.cargo-lock");
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        // The full release suite starts children in parallel. The fixture's lock belongs to
-        // this test alone: a child must not inherit it and keep the negative-control state alive
-        // after this image drops the guard.
-        aterm_uds::keep_out_of_children(&lock).unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the negative control deliberately holds Cargo's lock until this fixture drops its file"
-        )]
-        lock.try_lock().unwrap();
+        // The suite forks children in parallel. Closing this descriptor alone may leave a
+        // child's copy holding the lock on kernels without effective close-on-fork. The
+        // standard guard explicitly unlocks before closing, including while unwinding.
+        let lock = aterm_uds::file_lock::LockFile::take_existing(
+            &lock_path,
+            std::time::Instant::now(),
+            "the fixture's Cargo lock was unexpectedly held",
+        )
+        .unwrap();
 
         let said = retire(clone.path()).expect_err("the live build must refuse retirement");
         assert!(said.contains("could not safely retire"), "{said}");

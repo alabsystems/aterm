@@ -4,6 +4,57 @@
 use super::*;
 
 #[test]
+fn a_configured_key_excludes_default_pool_beside_named_roster() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    for key in [false, true] {
+        let bed = Bed::new("source-selection-key-pool");
+        let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
+        let config = format!(
+            "[fleet]\nmachine='m16'\n{}",
+            if key {
+                "accounts_source='unused.csv'\n"
+            } else {
+                ""
+            }
+        );
+        fs::write(bed.aterm_toml(), config).unwrap();
+        fs::write(bed.config.join(FLEET_ROSTER_FILE), "opt_in='named'\n[[account]]\nlabel='chosen'\nemail='chosen@example.test'\nmachines=['m16']\n").unwrap();
+        bed.secret(super::super::super::ai_pool::AI_POOL_FILE, "invalid pool");
+        let roster = bed.roster(Cli::Claude);
+        let origin = fleet_origin(Some(&bed.home), Some(&bed.aterm_toml()), &roster);
+        let result =
+            sync_accounts_for_init_with(&bed.home, &bed.state, &roster, NOW, || {}, &|_, _| {
+                panic!("local input is captured")
+            });
+        if key {
+            assert!(matches!(origin, FleetOrigin::Local { .. }));
+            assert_eq!(
+                result
+                    .expect("init must read the same named source as display")
+                    .rows,
+                1
+            );
+            assert_eq!(
+                Roster::load(&roster).unwrap().rows[0].email.as_deref(),
+                Some("chosen@example.test")
+            );
+            assert!(!needs_init_accounts_sync(
+                &bed.home,
+                &bed.state,
+                &roster,
+                NOW + 1
+            ));
+        } else {
+            assert!(matches!(origin, FleetOrigin::Vault(_)));
+            assert!(
+                result.is_err(),
+                "the default pool remains selected without a configured key"
+            );
+        }
+    }
+}
+
+#[test]
 fn empty_pool_checks_the_captured_source_before_publishing() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
     for changed in [false, true] {

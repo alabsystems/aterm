@@ -2285,6 +2285,7 @@ fn the_device_keeps_a_durable_write_and_may_roll_back_the_rest() {
     use crate::fx::Write;
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-dev")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let root = dir.path();
@@ -2363,6 +2364,7 @@ fn a_brokers_full_flush_settles_the_pin_its_barriers_ordered_on_its_device_only(
     use aterm_durable::Flush;
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-drain")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let root = dir.path();
@@ -2447,6 +2449,7 @@ fn a_durable_replace_flushes_its_directory_for_its_siblings() {
     use crate::fx::Write;
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-dir")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let root = dir.path();
@@ -2527,6 +2530,7 @@ fn a_flushed_append_is_on_the_media_once_its_entry_is() {
     use aterm_durable::Flush;
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-app")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let root = dir.path();
@@ -2608,6 +2612,7 @@ fn an_ordered_write_reaches_the_media_before_every_later_one() {
     use aterm_durable::Flush;
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-ord")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let root = dir.path();
@@ -2714,6 +2719,7 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
                 }
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("sim-stop")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let root = dir.path();
@@ -2815,6 +2821,7 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
                 for kill_at in 0..=5u64 {
                     let dir = aterm_tempfile::Builder::new()
                         .prefix("sim-start")
+                        .suffix(".noindex")
                         .tempdir_in("/tmp")
                         .expect("scratch");
                     let root = dir.path();
@@ -2938,6 +2945,7 @@ fn once_an_attach_is_admitted_a_power_cut_never_reads_the_clean_stop() {
                 for fault in 0..=5u64 {
                     let dir = aterm_tempfile::Builder::new()
                         .prefix("sim-admit")
+                        .suffix(".noindex")
                         .tempdir_in("/tmp")
                         .expect("scratch");
                     let root = dir.path();
@@ -3093,6 +3101,7 @@ fn a_start_its_proof_admitted_never_leaves_the_clean_stop_under_a_power_cut() {
                 for fault in 0..=5u64 {
                     let dir = aterm_tempfile::Builder::new()
                         .prefix("sim-proof-run")
+                        .suffix(".noindex")
                         .tempdir_in("/tmp")
                         .expect("scratch");
                     let root = dir.path();
@@ -3197,6 +3206,7 @@ fn a_floor_its_proof_admitted_is_never_taken_back_by_a_power_cut() {
             for fault in 0..=5u64 {
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("sim-proof-floor")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("scratch");
                 let root = dir.path();
@@ -3426,6 +3436,7 @@ fn no_copy_of_the_dir_nor_restore_over_it_proves_anything_under_a_power_cut() {
                 let scratch = |prefix: &str| {
                     aterm_tempfile::Builder::new()
                         .prefix(prefix)
+                        .suffix(".noindex")
                         .tempdir_in("/tmp")
                         .expect("scratch")
                 };
@@ -3547,6 +3558,7 @@ fn the_heads_a_clean_stop_kept_stand_through_a_power_cut() {
     let head_after = |unflushed: bool, cut: u64| -> Option<u64> {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-handed-heads")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -3641,6 +3653,7 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     };
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-s7-run")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch");
     let (core, st) = open(dir.path(), 1);
@@ -3672,6 +3685,7 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     ] {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-s7-floor-errors")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let (_core, st) = open(dir.path(), 4);
@@ -3710,6 +3724,7 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     let floor_after = |trusting: bool, cut: u64| {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-s7-floor")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();
@@ -3781,6 +3796,7 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     let pin_after = |settle: bool, cut: u64| {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-s7-pins")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let root = dir.path();

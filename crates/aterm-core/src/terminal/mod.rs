@@ -103,6 +103,7 @@ mod state;
 mod state_accessors;
 #[cfg(test)]
 mod terminal_modes_conformance;
+mod text_frame;
 mod transient_state;
 mod types;
 
@@ -198,6 +199,7 @@ pub use shell_api::InputRegionStart;
 pub use state::{
     CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
 };
+pub use text_frame::TextFrame;
 pub(crate) use types::SavedCursorState;
 pub use types::{
     ClipboardOperation, ClipboardSelection, CurrentStyle, CursorStyle,

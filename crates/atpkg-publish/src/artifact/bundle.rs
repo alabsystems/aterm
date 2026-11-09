@@ -1351,6 +1351,7 @@ fn stage_kept(e: Error, stage: &Path) -> Error {
             code,
             message: message + &note,
         },
+        committed @ Error::PublishedUnconfirmed { .. } => committed,
     }
 }
 

@@ -286,6 +286,7 @@ mod tests {
                         at: 1,
                         awake: None,
                         run: None,
+                        software: None,
                     },
                     root
                 ),

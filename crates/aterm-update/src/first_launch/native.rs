@@ -512,6 +512,7 @@ impl FirstLaunchHost for NativeHost {
         let parent = dest.parent().ok_or("installation has no parent folder")?;
         let staged = aterm_tempfile::Builder::new()
             .prefix(".aterm-first-launch-")
+            .suffix(".noindex")
             .tempdir_in(parent)
             .map_err(|error| error.to_string())?;
         let candidate = staged.path().join("aterm.app");
@@ -905,7 +906,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(stderr, "refused");
-        let scratch = aterm_tempfile::tempdir().unwrap();
+        let scratch = crate::paths::scratch_dir("first-launch-child");
         let marker = scratch.path().join("never-started");
         assert!(
             first_launch_child(
@@ -924,7 +925,7 @@ mod tests {
     fn required_first_launch_custody_waits_for_its_native_writer() {
         for age in [Duration::from_secs(11), Duration::from_secs(61)] {
             let expired = age >= aterm_spec::wait::MUST_HAPPEN;
-            let root = aterm_tempfile::tempdir().unwrap();
+            let root = crate::paths::scratch_dir("first-launch-lock");
             let path = root.path().join("apply.lock");
             let mut held = Some(aterm_update_core::FileLock::acquire(&path).unwrap());
             let busy = aterm_update_core::FileLock::acquire_within(&path, Duration::ZERO)
@@ -995,7 +996,7 @@ mod tests {
     /// preparation must preserve B and return the existing-copy relaunch disposition.
     #[test]
     fn a_newer_destination_published_after_facts_is_preserved_for_relaunch() {
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::paths::scratch_dir("first-launch-dest");
         let root_path = root.path().canonicalize().unwrap();
         let source = signed_bundle(&root_path, "AppTranslocation/source/aterm.app", 10);
         let old = signed_bundle(&root_path, "Applications/aterm.app", 9);

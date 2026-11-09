@@ -477,6 +477,7 @@ mod tests {
     fn the_rules_are_set_past_a_batch_in_flight() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-retain")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let sock = dir.path().join("b.sock");

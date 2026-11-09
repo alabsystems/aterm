@@ -239,8 +239,16 @@ mod measuring {
         support::run_classified_with_telemetry(
             "spin",
             &rows,
-            |row| support::Kind::Count {
-                windowed: row.scene.windowed(),
+            |row| {
+                // B14 excludes Windowed's matched wake shift (p=8/252), and conservatively
+                // excludes Pet after its selected-policy frames/needle shift (p=6/252).
+                if matches!(row.scene, SpinScene::Windowed | SpinScene::PetAsleep) {
+                    support::Kind::Timing
+                } else {
+                    support::Kind::Count {
+                        windowed: row.scene.windowed(),
+                    }
+                }
             },
             |row| take(&rig, row),
             Some(support::Telemetry {

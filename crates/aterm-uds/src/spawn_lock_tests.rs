@@ -139,6 +139,7 @@ fn a_blocking_tcp_accept_waits_for_a_delayed_write() {
 /// Both listener kinds return a nonblocking stream only when it is explicitly requested. On
 /// Linux the raw accepted stream is blocking, so removing the mode application is the negative
 /// control; on BSD the assertion also records the requested contract independently of inheritance.
+/// The accept waits for kernel readiness: a successful client connect alone is not its witness.
 #[cfg(unix)]
 #[test]
 fn requested_nonblocking_mode_is_explicit_for_tcp_and_unix() {
@@ -156,7 +157,7 @@ fn requested_nonblocking_mode_is_explicit_for_tcp_and_unix() {
     let _tcp_client = TcpStream::connect(tcp.local_addr().expect("TCP address")).expect("TCP dial");
     let (tcp_stream, _) = crate::accept(
         &tcp,
-        crate::AcceptWait::Ready,
+        crate::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
         crate::AcceptedMode::Nonblocking,
     )
     .expect("TCP accept");
@@ -168,7 +169,7 @@ fn requested_nonblocking_mode_is_explicit_for_tcp_and_unix() {
     let _unix_client = UnixStream::connect(&path).expect("Unix dial");
     let (unix_stream, _) = crate::accept(
         &unix,
-        crate::AcceptWait::Ready,
+        crate::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
         crate::AcceptedMode::Nonblocking,
     )
     .expect("Unix accept");
@@ -227,6 +228,7 @@ fn raw_accept_inherits_nonblocking_and_cannot_wait_for_a_write() {
     use crate::raw_accept::RawAccept as _;
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsFd as _;
     use std::sync::mpsc;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
@@ -244,7 +246,13 @@ fn raw_accept_inherits_nonblocking_and_cannot_wait_for_a_write() {
     });
     connected
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the connection is queued");
+        .expect("the client connected");
+    crate::ready::until(
+        listener.as_fd(),
+        crate::ready::Interest::Read,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("the connection reached the accept queue");
     let (mut accepted, _) = listener.accept_now().expect("raw accept");
     use std::os::fd::AsRawFd as _;
     // SAFETY: `F_GETFL` reads the flags of the live accepted test descriptor.

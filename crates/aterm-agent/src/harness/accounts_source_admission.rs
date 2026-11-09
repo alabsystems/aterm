@@ -54,7 +54,14 @@ impl AutomaticSource {
 }
 
 fn read_config(config: &Path) -> Result<Option<String>, String> {
-    aterm_types::dirs::read_aterm_config_text(config).map_err(|_| ACCOUNTS_SYNC_OFF.to_owned())
+    let text = aterm_types::dirs::read_aterm_config_text(config)
+        .map_err(|_| ACCOUNTS_SYNC_OFF.to_owned())?;
+    if let Some(text) = &text {
+        aterm_toml::from_str::<aterm_toml::Table>(text).map_err(|_| {
+            "automatic account configuration is invalid; no new sync was admitted".to_owned()
+        })?;
+    }
+    Ok(text)
 }
 
 fn same_observation(a: &SourceSnapshot, b: &SourceSnapshot) -> bool {

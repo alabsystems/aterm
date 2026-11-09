@@ -15,6 +15,15 @@ pub(super) fn tables(source: &str) -> Result<Tables, String> {
     let texts = reader.pairs()?;
     reader.declaration("ALIASES", true)?;
     let aliases = reader.pairs()?;
+    // Newer renders append a PREAMBLES table; older ones end here.
+    let checkpoint = reader.remaining;
+    let preambles = match reader.declaration("PREAMBLES", true) {
+        Ok(()) => reader.pairs()?,
+        Err(_) => {
+            reader.remaining = checkpoint;
+            BTreeMap::new()
+        }
+    };
     reader.space();
     if !reader.remaining.is_empty() {
         return Err("unrecognized syntax after the legacy tables".into());
@@ -23,6 +32,7 @@ pub(super) fn tables(source: &str) -> Result<Tables, String> {
         top,
         texts,
         aliases,
+        preambles,
     })
 }
 

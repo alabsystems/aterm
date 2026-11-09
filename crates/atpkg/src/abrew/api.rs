@@ -208,13 +208,60 @@ impl Api {
         if !super::valid_component(short) {
             return Err(format!("abrew: no such formula: {short}"));
         }
-        self.doc_checked(
+        match self.doc_checked(
             &format!("formula/{short}.json"),
             &format!("formula-{short}.json"),
             3600,
             true,
-        )
-        .map_err(|e| not_found_error(e, "formula", short))
+        ) {
+            Ok(doc) => Ok(doc),
+            Err(e) => {
+                // Brew resolves aliases and renames client-side
+                // from the index; the API has no per-alias doc.
+                if let Some(canon) = self.resolve_index_name(short, false)
+                    && canon != short
+                {
+                    return self
+                        .doc_checked(
+                            &format!("formula/{canon}.json"),
+                            &format!("formula-{canon}.json"),
+                            3600,
+                            true,
+                        )
+                        .map_err(|e2| not_found_error(e2, "formula", short));
+                }
+                Err(not_found_error(e, "formula", short))
+            }
+        }
+    }
+
+    /// The canonical index name an alias or old name refers to
+    /// (formula `aliases`/`oldnames`, cask `old_tokens`).
+    pub(super) fn resolve_index_name(&self, short: &str, casks: bool) -> Option<String> {
+        let (rel, file) = if casks {
+            ("cask.json", "cask-index.json")
+        } else {
+            ("formula.json", "formula-index.json")
+        };
+        let v = self.doc_with_freshness(rel, file, 86_400, true).ok()?;
+        for item in v.as_array()? {
+            let name = if casks {
+                item.get("token")
+            } else {
+                item.get("name")
+            }
+            .and_then(Value::as_str)?;
+            let field = if casks { "old_tokens" } else { "aliases" };
+            let hit = |key: &str| {
+                item.get(key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().any(|a| a.as_str() == Some(short)))
+            };
+            if hit(field) || (!casks && hit("oldnames")) {
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 
     fn cask_doc(&self, token: &str) -> Result<Value, String> {
@@ -223,13 +270,29 @@ impl Api {
         if !super::valid_component(short) {
             return Err(format!("abrew: no such cask: {raw_short}"));
         }
-        self.doc_checked(
+        match self.doc_checked(
             &format!("cask/{short}.json"),
             &format!("cask-{short}.json"),
             3600,
             true,
-        )
-        .map_err(|e| not_found_error(e, "cask", raw_short))
+        ) {
+            Ok(doc) => Ok(doc),
+            Err(e) => {
+                if let Some(canon) = self.resolve_index_name(short, true)
+                    && canon != short
+                {
+                    return self
+                        .doc_checked(
+                            &format!("cask/{canon}.json"),
+                            &format!("cask-{canon}.json"),
+                            3600,
+                            true,
+                        )
+                        .map_err(|e2| not_found_error(e2, "cask", raw_short));
+                }
+                Err(not_found_error(e, "cask", raw_short))
+            }
+        }
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
@@ -274,13 +337,29 @@ impl Api {
         if !super::valid_component(short) {
             return Err(format!("abrew: no such formula: {short}"));
         }
-        self.doc_bytes(
+        match self.doc_bytes(
             &format!("formula/{short}.json"),
             &format!("formula-{short}.json"),
             3600,
             true,
-        )
-        .map_err(|e| not_found_error(e, "formula", short))
+        ) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if let Some(canon) = self.resolve_index_name(short, false)
+                    && canon != short
+                {
+                    return self
+                        .doc_bytes(
+                            &format!("formula/{canon}.json"),
+                            &format!("formula-{canon}.json"),
+                            3600,
+                            true,
+                        )
+                        .map_err(|e2| not_found_error(e2, "formula", short));
+                }
+                Err(not_found_error(e, "formula", short))
+            }
+        }
     }
 
     /// [`Api::formula_value_bytes`] for a cask token.
@@ -290,13 +369,29 @@ impl Api {
         if !super::valid_component(short) {
             return Err(format!("abrew: no such cask: {raw_short}"));
         }
-        self.doc_bytes(
+        match self.doc_bytes(
             &format!("cask/{short}.json"),
             &format!("cask-{short}.json"),
             3600,
             true,
-        )
-        .map_err(|e| not_found_error(e, "cask", raw_short))
+        ) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if let Some(canon) = self.resolve_index_name(short, true)
+                    && canon != short
+                {
+                    return self
+                        .doc_bytes(
+                            &format!("cask/{canon}.json"),
+                            &format!("cask-{canon}.json"),
+                            3600,
+                            true,
+                        )
+                        .map_err(|e2| not_found_error(e2, "cask", raw_short));
+                }
+                Err(not_found_error(e, "cask", raw_short))
+            }
+        }
     }
 
     /// Index rows already in the cache, without any fetch (`None` when no cached index stands).

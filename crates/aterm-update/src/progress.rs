@@ -179,8 +179,7 @@ mod tests {
             OBSERVER.get().is_none(),
             "PRECONDITION: the session's shape"
         );
-        let dir = std::env::temp_dir().join(format!("aterm-update-beat-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch_dir("update-beat");
         let part = dir.join("aterm.zip.part");
         let generation = WATCH.register(1_000);
         assert!(WATCH.beat(generation, CheckerPhase::Checking));
@@ -202,7 +201,6 @@ mod tests {
         };
         drop(watch);
         let _ = WATCH.supersede(generation);
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             moved,
             "the bytes a session downloads must keep its checker's heartbeat fresh"
@@ -231,8 +229,7 @@ mod tests {
 
     #[test]
     fn the_probed_size_rides_every_report_once_it_lands() {
-        let dir = std::env::temp_dir().join(format!("aterm-update-size-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch_dir("update-size");
         let part = dir.join("aterm.zip.part");
         let (seen, sink) = recorder();
         let w = watch_with(&part, "0.95.0", || Some(74_000_000), sink);
@@ -260,13 +257,11 @@ mod tests {
             }
         ));
         drop(w);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_silent_or_slow_size_probe_leaves_the_total_unknown() {
-        let dir = std::env::temp_dir().join(format!("aterm-update-slow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch_dir("update-slow");
         let part = dir.join("aterm.zip.part");
         std::fs::write(&part, vec![0u8; 100]).unwrap();
         let (seen, sink) = recorder();
@@ -300,6 +295,5 @@ mod tests {
             "the download's end never waits for the probe"
         );
         let _ = release.send(());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

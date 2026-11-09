@@ -14,6 +14,7 @@ fn capture() -> Capture {
             top: "top \"# 🐈\n".into(),
             texts: BTreeMap::from([("alpha".into(), "quoted \"## text\t \n".into())]),
             aliases: BTreeMap::from([("a".into(), "alpha".into())]),
+            preambles: BTreeMap::from([("alpha".into(), "parser \"## help\n".into())]),
         },
     }
 }

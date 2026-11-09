@@ -291,6 +291,8 @@ const PROJECTION_ACTIONS: &[&str] = &[
     "MalformedReceipt",
     "LegacyState",
     "Unready",
+    "StaleSelection",
+    "ReappliedSelection",
 ];
 
 pub(crate) fn projection_transition(before: &ModelState, action: &str) -> ModelState {
@@ -302,6 +304,48 @@ fn projection_transition_with(
     action: &str,
     sequence_only: bool,
 ) -> ModelState {
+    if matches!(action, "StaleSelection" | "ReappliedSelection") {
+        let (lab, paths) =
+            super::super::log_entries_tests::stale_host_materialization(false, false);
+        let config = configured(&paths).unwrap();
+        let before_replay = load_state(&paths).unwrap();
+        let receipt = before_replay.network_materialization.as_ref().unwrap();
+        let expected = receipt.observation;
+        let historical = encoded(receipt);
+        assert_eq!(project(&paths, &config, &before_replay), Some(expected));
+        if action == "ReappliedSelection" {
+            let replay = apply_until(
+                &paths,
+                config.clone(),
+                before_replay,
+                ApplyInput::Cached,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(matches!(replay, SyncOutcome::Applied { .. }));
+        }
+        let state = load_state(&paths).unwrap();
+        assert_eq!(
+            encoded(state.network_materialization.as_ref().unwrap()),
+            historical
+        );
+        let observation = if sequence_only {
+            project(&paths, &config, &state)
+        } else {
+            match observe_materialization(&paths, &config, || Ok(())).unwrap() {
+                MaterializationObservation::Ready(held) => held.snapshot.network_materialization(),
+                MaterializationObservation::Blocked(_) => None,
+            }
+        };
+        lab.server.stop();
+        let mut next = before.clone();
+        next.insert("scenario", if action == "StaleSelection" { 19 } else { 20 });
+        next.insert("shown", i64::from(observation.is_some()));
+        next.insert("original", i64::from(observation == Some(expected)));
+        return next;
+    }
     let f = Fixture::new();
     let (mut state, _, _) = f.seeded();
     let expected = state.network_materialization.as_ref().unwrap().observation;
@@ -414,6 +458,7 @@ fn projection_conforms_and_sequence_only_or_unready_projection_is_detected() {
         "ChangedEnvelope",
         "ChangedRecords",
         "Unready",
+        "StaleSelection",
     ] {
         let unsafe_next = projection_transition_with(&initial, action, true);
         assert_eq!(unsafe_next["shown"], 1);

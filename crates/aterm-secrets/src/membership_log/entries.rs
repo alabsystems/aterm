@@ -1153,6 +1153,20 @@ struct ControlRef {
 }
 
 impl Log {
+    /// Replay the previous host-wrapper selector while priming an upgrade fixture.
+    /// Only its actual read/apply is changed; the scope restores the current selector.
+    #[cfg(test)]
+    pub(crate) fn with_host_wrapper_precedence<T>(read: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                HOST_WRAPPER_PRECEDENCE.set(self.0);
+            }
+        }
+        let _restore = Restore(HOST_WRAPPER_PRECEDENCE.replace(true));
+        read()
+    }
+
     /// Whether this log holds at least one effective [`Body::Epoch`] record.
     #[must_use]
     pub fn has_epochs(&self) -> bool {

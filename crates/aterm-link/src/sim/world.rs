@@ -1363,6 +1363,7 @@ impl World {
         });
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-sim")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let state_dir = dir.path().join("state");

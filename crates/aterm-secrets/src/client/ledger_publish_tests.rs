@@ -1552,7 +1552,10 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             admin_publish(&lab.m22, &admin, &doc).unwrap();
         }
         save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
-        assert!(files_intact(&lab.m7, &before), "old files remain intact");
+        assert!(
+            changed_files(&lab.m7, &before).is_empty() && gaps(&lab.m7, &before).is_empty(),
+            "old files remain physically intact"
+        );
         assert_ne!(
             log_entries::current_records_digest(&lab.m7, &config, &before),
             before.records_digest,
@@ -1599,6 +1602,83 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             );
             assert!(materialization_ready(&lab.m7).unwrap());
         }
+    }
+    // A changed resolver can expose local work without any changed signed heads. The old
+    // materialization was actually applied, not planted in the state or its manifest.
+    for (log_only, legacy) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (lab, reader) = log_entries_tests::stale_host_materialization(log_only, legacy);
+        let config = configured(&reader).unwrap();
+        let before = load_state(&reader).unwrap();
+        let original = network_observation::project(&reader, &config, &before);
+        assert_eq!(original.is_none(), log_only);
+        let observed = receipt(&before);
+        let catalog = std::fs::read(
+            reader
+                .home
+                .join(".secrets")
+                .join(crate::entry_class::GITHUB_REPOSITORIES),
+        )
+        .unwrap();
+        lab.server.stop();
+        let primary = StandIn::at(
+            &lab.url,
+            Duration::ZERO,
+            Some(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+        );
+        let outcome = super::super::bounded::sync_reader_with_candidates_until(
+            &reader,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        );
+        assert_eq!(
+            primary.asked(),
+            0,
+            "same-head semantic repair precedes network waits"
+        );
+        assert!(matches!(outcome.unwrap(), SyncOutcome::Applied { .. }));
+        let after = load_state(&reader).unwrap();
+        assert_eq!(
+            (after.seq, after.digest, after.records_digest),
+            (before.seq, before.digest, before.records_digest),
+            "local repair changes no authenticated source version"
+        );
+        assert_eq!(
+            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            b"current"
+        );
+        assert_eq!(
+            receipt(&after),
+            observed,
+            "the network receipt stays historical"
+        );
+        assert_eq!(
+            network_observation::project(&reader, &config, &after),
+            original
+        );
+        let captured = with_materialization_ready_for_entries(
+            &reader,
+            &config,
+            &[crate::entry_class::GITHUB_REPOSITORIES],
+            || {
+                Ok(std::fs::read(
+                    reader
+                        .home
+                        .join(".secrets")
+                        .join(crate::entry_class::GITHUB_REPOSITORIES),
+                )?)
+            },
+        )
+        .unwrap()
+        .expect("the unchanged registered repository input is ready after repair");
+        assert_eq!(captured.inputs, catalog);
+        assert!(captured.snapshot.is_current_now(&reader).unwrap());
+        let repeated =
+            apply_until(&reader, config, after, ApplyInput::Cached, None, None, true).unwrap();
+        assert!(matches!(repeated, SyncOutcome::Unchanged { .. }));
+        assert_eq!(primary.asked(), 0, "a repeated local repair is quiet");
     }
 }
 
@@ -1692,6 +1772,54 @@ fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
             server.stop();
         }
         primary.answer_with(reply);
+        // A legacy receipt-free applied state also repairs from an authenticated envelope
+        // alone: no log, endpoint or newly minted network observation is required.
+        assert!(
+            before.records_digest.is_none(),
+            "CONTROL: envelope-only state"
+        );
+        assert!(
+            log_entries::trusted_configured_log(&at.member, &config)
+                .unwrap()
+                .is_none()
+        );
+        let saved = std::fs::read_to_string(at.member.state_file()).unwrap();
+        let without: String = saved
+            .lines()
+            .filter(|line| {
+                line.split_once('=')
+                    .is_none_or(|(key, _)| key.trim() != "materialization_selection")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fsx::write_atomic(&at.member.state_file(), without.as_bytes(), 0o600).unwrap();
+        assert!(
+            !materialization_ready(&at.member).unwrap(),
+            "legacy selected meaning must be re-established"
+        );
+        let asked_before = primary.asked();
+        let replayed = super::super::bounded::sync_reader_with_candidates_until(
+            &at.member,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(replayed, SyncOutcome::Applied { .. }));
+        assert_eq!(primary.asked(), asked_before, "legacy repair is local");
+        let repaired_legacy = load_state(&at.member).unwrap();
+        assert_eq!(
+            (
+                repaired_legacy.seq,
+                repaired_legacy.digest,
+                repaired_legacy.records_digest
+            ),
+            (before.seq, before.digest, before.records_digest)
+        );
+        assert!(materialization_ready(&at.member).unwrap());
+        assert_eq!(
+            network_observation::project(&at.member, &config, &repaired_legacy),
+            observation
+        );
         let file = at.member.home.join(".secrets/shared-key");
         std::fs::remove_file(&file).unwrap();
         assert!(!materialization_ready(&at.member).unwrap());

@@ -7295,7 +7295,7 @@ mod tests {
         assert_eq!(out.status.code(), Some(7));
         assert_eq!(out.stdout, b"refused");
 
-        let scratch = aterm_tempfile::tempdir().unwrap();
+        let scratch = crate::test_scratch_dir("en");
         let marker = scratch.path().join("never-started");
         let mut expired = aterm_uds::spawnfd::command(&program);
         expired
@@ -7402,7 +7402,7 @@ mod tests {
     /// configured command as the person's off.
     #[test]
     fn an_off_record_is_written_once_and_an_on_removes_it() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = scratch_paths(dir.path());
         let mut out = Out::kept();
         off_record_step(&p, &mut out);
@@ -7437,7 +7437,7 @@ mod tests {
     /// symlinked root or config folder neither reads, writes, nor unlinks a record in its target.
     #[test]
     fn an_off_outlives_the_fabric_root_it_was_recorded_in() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let config_dir = dir.path().join("cfg/aterm");
         std::fs::create_dir_all(&config_dir).expect("aterm.toml's folder");
         #[cfg(unix)]
@@ -7528,7 +7528,7 @@ mod tests {
     #[test]
     fn a_root_with_no_node_id_that_an_earlier_on_left_reads_as_the_persons_off() {
         for kept in [MINT_SECRET, "node.cap"] {
-            let dir = aterm_tempfile::tempdir().expect("scratch");
+            let dir = crate::test_scratch_dir("en");
             let root = dir.path().join("root");
             std::fs::create_dir_all(root.join("link-state")).expect("state");
             std::fs::write(root.join("link-state/lock"), b"").expect("lock");
@@ -7566,7 +7566,7 @@ mod tests {
     #[test]
     fn a_turn_on_by_default_records_itself_until_its_steps_finish() {
         let no_command = || Ok(false);
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let done = by_default_in(&root, None, &no_command, |out| {
             assert!(root.join(DEFAULT_RECORD).exists(), "left before the steps");
@@ -7593,7 +7593,7 @@ mod tests {
         });
         assert!(matches!(left, Ok(ByDefault::Left(_))), "{left:?}");
 
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let failed = by_default_in(&root, None, &no_command, |out| {
             node_written(&root);
@@ -7622,7 +7622,7 @@ mod tests {
         let no_command = || Ok(false);
         let unrun = |_: &mut Out| -> Result<(), ExitCode> { panic!("no steps") };
 
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let p = scratch_paths(dir.path());
         let mut out = Out::kept();
@@ -7634,7 +7634,7 @@ mod tests {
         );
         assert!(root.join(OFF_RECORD).exists(), "the off's record stands");
 
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let off = switch_lock(&root, Duration::ZERO).expect("the off's lock");
         let left = by_default_in(&root, None, &no_command, unrun);
@@ -7653,7 +7653,7 @@ mod tests {
     /// A dry run says the record's step and writes nothing.
     #[test]
     fn a_dry_run_off_or_on_writes_and_removes_no_record() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = scratch_paths(dir.path());
         let mut out = Out::new(true);
         out.kept = Some(std::cell::RefCell::new(Vec::new()));
@@ -7704,7 +7704,7 @@ mod tests {
         use std::cell::Cell;
         let command = || Some(words("aterm link serve --broker /nonexistent/bus.sock"));
         let (looks, steps) = (Cell::new(0), Cell::new(0));
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         aterm_uds::private_file::ensure_private_dir(&dir.path().join("root")).expect("the root");
         let renew = |command: Option<Vec<String>>, renew: Renew, at: Found| {
             renew_with(
@@ -7801,7 +7801,7 @@ mod tests {
     fn a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none() {
         use std::cell::Cell;
         let steps = Cell::new(0);
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         aterm_uds::private_file::ensure_private_dir(&root).expect("the root");
         let renew = |renew: Renew, at: Found| {
@@ -7958,7 +7958,7 @@ mod tests {
     /// cannot hold the lock.
     #[test]
     fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let command = || Some(words("aterm link serve"));
         let replaced = |root: &Path| rooted(found(Service::Launchd, Some("/old/aterm")), root);
@@ -8043,7 +8043,7 @@ mod tests {
     /// lets an off land midway through them.
     #[test]
     fn a_persons_fabric_on_runs_its_steps_under_the_switch() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let prepared = Prepared {
             p: scratch_paths(dir.path()),
             job_durability: None,
@@ -8081,7 +8081,7 @@ mod tests {
             "let go once the steps end"
         );
 
-        let dry = aterm_tempfile::tempdir().expect("scratch");
+        let dry = crate::test_scratch_dir("en");
         let mut out = Out::new(true);
         let lock = persons_switch(&dry.path().join("root"), "on", Duration::ZERO, &mut out);
         assert!(matches!(lock, Ok(None)), "a dry run takes no lock");
@@ -8097,7 +8097,7 @@ mod tests {
     /// record keeps a job it installed from ever being renewed.
     #[test]
     fn a_broker_the_person_keeps_with_service_none_is_never_renewed() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = scratch_paths(dir.path());
         aterm_uds::private_file::ensure_private_dir(&p.root).expect("root, 0700 as `on` makes it");
         let record = p.root.join(HAND_RECORD);
@@ -8157,7 +8157,7 @@ mod tests {
     /// excuses none fails an off of a job that was not loaded.
     #[test]
     fn an_off_boots_out_a_job_print_did_not_say_of() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let plist = dir.path().join("job.plist");
 
         std::fs::write(&plist, "old").expect("plist");
@@ -8206,7 +8206,7 @@ mod tests {
     /// whose read hands the rewrite no printed arguments does too.
     #[test]
     fn a_job_loaded_from_older_arguments_is_reloaded_not_kickstarted() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = scratch_paths(dir.path());
         let current = p.plist_text();
         let argv = p.broker_argv();
@@ -9272,6 +9272,7 @@ mod tests {
     #[test]
     fn the_waits_poll_names_no_process() {
         let dir = aterm_tempfile::Builder::new()
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch folder short enough for sun_path");
         let p = paths_at(&dir.path().join("root"));
@@ -9361,8 +9362,8 @@ mod tests {
     #[test]
     fn write_atomic_never_writes_through_a_planted_name() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("atfo-plant-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("plant");
+        let dir = scratch.path();
         let shared = dir.join("shared");
         std::fs::create_dir_all(&shared).expect("scratch");
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
@@ -9416,7 +9417,6 @@ mod tests {
             .expect("linked")
             .file_type()
             .is_file());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn paths_at(root: &Path) -> Paths {
@@ -9444,7 +9444,7 @@ mod tests {
     #[test]
     fn the_root_step_makes_narrows_or_refuses_by_the_private_directory_rule() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         std::fs::create_dir(&root).expect("root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -9482,7 +9482,7 @@ mod tests {
     #[test]
     fn the_root_step_refuses_a_root_an_access_list_opens_to_others() {
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -9652,7 +9652,7 @@ mod tests {
     #[test]
     fn the_tier_is_in_the_job_and_a_bare_on_keeps_it() {
         use crate::durability::Durability;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let bare = Paths {
             home: dir.path().to_path_buf(),
             login_home: None,
@@ -9787,7 +9787,7 @@ mod tests {
     fn the_node_service_is_not_current_at_another_tier_than_the_root_records() {
         use crate::durability::Durability;
         use astream_broker::{ServedInfo, ServedReason, Tier};
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = Paths {
             durability: Some(Durability::Strict),
             ..scratch_paths(dir.path())
@@ -10054,31 +10054,30 @@ mod tests {
 
     #[test]
     fn the_launchd_failure_hint_names_what_was_written() {
-        let dir = std::env::temp_dir().join(format!("atfo-hint-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        let absent = launchd_failure_hint(&dir, "systems.alab.astream-broker.7", "501");
+        let scratch = crate::test_scratch_dir("hint");
+        let dir = scratch.path();
+        let absent = launchd_failure_hint(dir, "systems.alab.astream-broker.7", "501");
         assert!(
             absent.contains("broker.err was not written")
                 && absent.contains("launchctl print gui/501/systems.alab.astream-broker.7"),
             "{absent}"
         );
-        let absent = systemd_failure_hint(&dir, "astream-broker-7");
+        let absent = systemd_failure_hint(dir, "astream-broker-7");
         assert!(
             absent.contains("broker.err was not written")
                 && absent.contains("journalctl --user -u astream-broker-7"),
             "{absent}"
         );
         std::fs::write(dir.join("broker.err"), "").expect("empty");
-        assert!(launchd_failure_hint(&dir, "l", "501").contains("was not written"));
+        assert!(launchd_failure_hint(dir, "l", "501").contains("was not written"));
         std::fs::write(dir.join("broker.err"), " \n\n").expect("blank");
-        assert_eq!(supervisor_last_word(&dir), None, "whitespace is not a word");
+        assert_eq!(supervisor_last_word(dir), None, "whitespace is not a word");
         std::fs::write(
             dir.join("broker.err"),
             "bind: address in use\naterm link broker: open bus.log: refused\n\n",
         )
         .expect("err");
-        let written = launchd_failure_hint(&dir, "l", "501");
+        let written = launchd_failure_hint(dir, "l", "501");
         assert!(
             written.starts_with(&format!(
                 "read {} (written ",
@@ -10087,11 +10086,10 @@ mod tests {
             "{written}"
         );
         assert_eq!(
-            systemd_failure_hint(&dir, "l").split(" (written ").next(),
+            systemd_failure_hint(dir, "l").split(" (written ").next(),
             written.split(" (written ").next(),
             "a unit that writes broker.err is read the same way"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10229,7 +10227,7 @@ mod tests {
     #[test]
     fn an_edit_in_effect_whose_folder_flush_failed_is_ok_beside_a_warning() {
         use aterm_durable::seam::{FailingDirs, EIO};
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let config = dir.path().join("aterm.toml");
         std::fs::write(&config, "font_px = 12.0\n").expect("seed");
         let command = |config: &Path| {
@@ -10275,7 +10273,7 @@ mod tests {
 
     #[test]
     fn the_config_is_written_through_its_link_under_the_service_lock() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let dotfiles = dir.path().join("dotfiles");
         let cfg = dir.path().join("cfg/aterm");
         std::fs::create_dir_all(&dotfiles).expect("dotfiles");
@@ -10329,7 +10327,7 @@ mod tests {
     #[test]
     fn a_no_op_through_a_link_into_a_read_only_dir_reads_already() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let store = dir.path().join("store");
         std::fs::create_dir_all(&store).expect("store");
         let cmd = &words("aterm link serve --fleet local --broker /b.sock");
@@ -10608,7 +10606,7 @@ mod tests {
     fn an_aterm_is_named_on_path_only_where_one_runs_there() {
         use std::ffi::OsStr;
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::tempdir().expect("exclusive scratch");
+        let scratch = crate::test_scratch_dir("en");
         let dir = scratch.path();
         let (runs, plain, folder, none) = (
             dir.join("runs"),
@@ -10644,7 +10642,7 @@ mod tests {
 
     #[test]
     fn the_program_step_links_a_path_that_is_not_plain_and_replaces_no_file() {
-        let scratch = aterm_tempfile::tempdir().expect("exclusive scratch");
+        let scratch = crate::test_scratch_dir("en");
         let dir = scratch.path();
         let spaced = dir.join("a b");
         std::fs::create_dir_all(&spaced).expect("scratch");
@@ -11431,9 +11429,8 @@ mod tests {
     fn an_instance_replaced_after_the_listing_is_asked_with_its_own_token() {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("atlk-replaced-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("repl");
+        let dir = scratch.path();
         let sock = dir.join("a.sock");
         let token_file = dir.join("a.sock.token");
         std::fs::write(&token_file, "deadbeef\n").expect("token");
@@ -11478,7 +11475,6 @@ mod tests {
             asked.join().expect("server"),
             ["AUTH cafef00d\n", "sessions\n"]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The proof against a scripted instance: its `sessions` listing names `s-1`, then the proof's
@@ -11486,9 +11482,8 @@ mod tests {
     /// requests.
     fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<String>) {
         use std::io::{BufRead, BufReader, Write};
-        let dir = std::env::temp_dir().join(format!("atlk-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir(name);
+        let dir = scratch.path();
         let sock = dir.join("a.sock");
         std::fs::write(dir.join("a.sock.token"), "deadbeef\n").expect("token");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
@@ -11538,7 +11533,6 @@ mod tests {
         };
         let proved = prove(&[inst], &mut Out::kept());
         let seen = server.join().expect("server");
-        let _ = std::fs::remove_dir_all(&dir);
         (proved, seen)
     }
 
@@ -11659,9 +11653,8 @@ mod tests {
             let ring = crate::bridge::read_cap_file(&path.to_string_lossy());
             ring_is_for(ring, fleet, node, secret)
         };
-        let dir = std::env::temp_dir().join(format!("atfo-minted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = crate::test_scratch_dir("minted");
+        let dir = scratch.path();
         let node = "n-0123456789abcdef";
         let ring = node_rules("lab", node);
         let cap_under = |key: &[u8], name: &str, grants: &[String]| {
@@ -11736,7 +11729,6 @@ mod tests {
             cap_is_for(&by_hand, "work", node, &[4u8; 32]).is_err_and(|m| m.keep),
             "a ring no `on` mints is kept aside"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A RING WIDER THAN THE NODE'S CEILING IS KEPT AND NAMED; THE ONE AN EARLIER ATERM MINTED IS
@@ -11752,7 +11744,7 @@ mod tests {
     #[test]
     fn a_ring_wider_than_the_ceiling_is_kept_and_the_earlier_ring_is_minted_over() {
         let secret = [4u8; 32];
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let node = "n-0123456789abcdef";
         let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
         let cap_under = |name: &str, grants: &[String]| -> Vec<crate::bridge::Cap> {
@@ -11868,7 +11860,7 @@ mod tests {
     #[test]
     fn a_god_cap_alone_in_a_second_cap_file_is_named() {
         let secret = [4u8; 32];
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let node = "n-0123456789abcdef";
         let rules = node_rules("lab", node);
         let own = ring_in(dir.path(), &secret, "node.cap", &rules).expect("a ring");
@@ -11928,7 +11920,7 @@ mod tests {
     #[test]
     fn every_ring_doctor_names_on_keeps_aside() {
         let (root, other) = ([4u8; 32], [5u8; 32]);
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let node = "n-0123456789abcdef";
         let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
         let rules = ceiling.rules();
@@ -11997,7 +11989,7 @@ mod tests {
     #[test]
     fn a_wide_ring_under_another_secret_is_kept_aside() {
         let (root, other) = ([4u8; 32], [5u8; 32]);
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let node = "n-0123456789abcdef";
         let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
         let ring_under = |key: &[u8], name: &str, grants: &[String]| {
@@ -12103,7 +12095,7 @@ mod tests {
 
     #[test]
     fn role_of_a_root_with_the_scripts_plist_is_known_and_not_current() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("fabric");
         std::fs::create_dir_all(&root).expect("root");
         let p = Paths {
@@ -12210,7 +12202,7 @@ mod tests {
     #[test]
     fn under_the_node_service_on_installs_no_job_and_records_a_named_tier() {
         use crate::durability::Durability;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = Paths {
             durability: Some(Durability::Strict),
             ..private_root(dir.path())
@@ -12343,7 +12335,7 @@ mod tests {
     /// a `renew_under` that ignores the service renews it under the node service too.
     #[test]
     fn under_the_node_service_a_renewal_is_kept_and_steps_nothing() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let root = dir.path().join("root");
         let command = || Some(words("aterm link serve"));
         for renew in [Renew::Look, Renew::Apply] {
@@ -12391,7 +12383,7 @@ mod tests {
     #[test]
     fn retiring_a_broker_job_records_its_tier_waits_for_it_and_removes_its_plist() {
         use crate::durability::Durability;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = private_root(dir.path());
         let install = |p: &Paths, tier: Option<Durability>| {
             let job = Paths {
@@ -12493,7 +12485,7 @@ mod tests {
     /// NEGATIVE CONTROL: a retire that disables a unit with no file fails where systemd refuses.
     #[test]
     fn retiring_a_systemd_broker_stops_it_and_waits_for_its_pid() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = private_root(dir.path());
         let lc = FakeLaunchd::new(false, 0);
         lc.exiting.set(2);
@@ -12529,7 +12521,7 @@ mod tests {
     /// person turned off (no `bootout` call).
     #[test]
     fn an_off_under_the_node_service_retires_a_legacy_job() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let p = private_root(dir.path());
         std::fs::write(p.plist(), p.plist_text()).expect("the job's plist");
         let lc = FakeLaunchd::new(true, 1);
@@ -12576,7 +12568,7 @@ mod tests {
     #[test]
     fn the_node_service_hosts_bus_log_only_for_a_provisioned_fabric_that_is_on() {
         use crate::durability::Durability;
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let config_dir = dir.path().join("cfg/aterm");
         std::fs::create_dir_all(&config_dir).expect("aterm.toml's folder");
         let p = Paths {
@@ -12637,7 +12629,7 @@ mod tests {
     /// node the key names (the control).
     #[test]
     fn the_mesh_node_step_names_no_node_under_a_running_bridge() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let dir = crate::test_scratch_dir("en");
         let keys = dir.path().join("keys");
         aterm_uds::private_file::ensure_private_dir(&keys).expect("a private dir");
         let text = format!("{}\n", aterm_codec::hex::encode_lower(&[7u8; 32]));

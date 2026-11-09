@@ -214,7 +214,7 @@ pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
 
 #[cfg(unix)]
 #[test]
-fn a_target_refused_after_a_passing_deferral_exits_75() {
+fn a_target_refused_after_a_passing_deferral_uses_the_negotiated_exit() {
     use aterm_update::ApplyOutcome;
     let lock = ApplyOutcome::Deferred(format!(
         "lock: another process has held the update lock for more than 10s ({})",
@@ -225,20 +225,33 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
         aterm_update::PASSING_REFUSAL_KEY
     ));
     assert_eq!(EXIT_SUCCESSOR_PASSING, 75);
+    let legacy = ParentExitCaps {
+        passing: true,
+        verification: false,
+    };
+    let current = ParentExitCaps {
+        passing: true,
+        verification: true,
+    };
     for outcome in [
         lock,
         ApplyOutcome::NoUpdate,
         ApplyOutcome::NotApplicable,
         trial,
     ] {
-        assert_eq!(
-            passing_refusal_exit(&outcome, false, false, true),
-            Some(EXIT_SUCCESSOR_PASSING),
-            "{outcome:?}"
-        );
-        assert_eq!(passing_refusal_exit(&outcome, false, true, true), None);
-        assert_eq!(passing_refusal_exit(&outcome, true, false, true), None);
-        assert_eq!(passing_refusal_exit(&outcome, false, false, false), None);
+        for (caps, expected) in [
+            (legacy, Some(EXIT_SUCCESSOR_PASSING)),
+            (current, Some(EXIT_SUCCESSOR_VERIFICATION)),
+            (ParentExitCaps::default(), None),
+        ] {
+            assert_eq!(
+                passing_refusal_exit(&outcome, false, false, caps),
+                expected,
+                "{outcome:?}"
+            );
+            assert_eq!(passing_refusal_exit(&outcome, false, true, caps), None);
+            assert_eq!(passing_refusal_exit(&outcome, true, false, caps), None);
+        }
     }
     for outcome in [
         ApplyOutcome::Deferred("install location not writable: /Applications".to_string()),
@@ -248,11 +261,13 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
         ApplyOutcome::ReExecFailed(aterm_update::PASSING_REFUSAL_KEY.to_string()),
         ApplyOutcome::Reverted(aterm_update::PASSING_REFUSAL_KEY.to_string()),
     ] {
-        assert_eq!(
-            passing_refusal_exit(&outcome, false, false, true),
-            None,
-            "{outcome:?}"
-        );
+        for caps in [legacy, current] {
+            assert_eq!(
+                passing_refusal_exit(&outcome, false, false, caps),
+                None,
+                "{outcome:?}"
+            );
+        }
     }
 }
 
@@ -381,10 +396,6 @@ fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
 #[test]
 fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
     let published = outgoing_parent_env();
-    assert!(
-        published.contains(&ENV_EXIT_CAPS.pair(EXIT_CAPS_PASSING)),
-        "the parent declares it: {published:?}"
-    );
     assert_eq!(
         crate::app_native::PhysicalFailureShape::of_child_death(
             crate::ChildDeathEvidence::Exited {
@@ -408,22 +419,33 @@ fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
             .any(|(key, _)| key.as_os_str() == ENV_EXIT_CAPS.name()),
         "the boot apply's re-exec carries it onto the new image"
     );
-    assert!(take_parent_reads_passing_exit_from(&mut env));
+    assert_eq!(
+        take_parent_exit_caps_from(&mut env),
+        ParentExitCaps {
+            passing: true,
+            verification: true
+        }
+    );
     assert!(!env.present(ENV_EXIT_CAPS), "taken, so no shell sees it");
     assert!(
-        !take_parent_reads_passing_exit_from(&mut env),
+        take_parent_exit_caps_from(&mut env) == ParentExitCaps::default(),
         "a shipped parent never declared it"
     );
-    for (caps, reads) in [
-        ("passing75", true),
-        ("chunks1, passing75", true),
-        ("passing7", false),
-        ("", false),
+    for (caps, passing, verification) in [
+        ("passing75", true, false),
+        ("chunks1, passing75", true, false),
+        ("verification76", false, true),
+        ("passing75, verification76, future-capability", true, true),
+        ("passing7,verification7", false, false),
+        ("", false, false),
     ] {
         env.set(ENV_EXIT_CAPS, caps);
         assert_eq!(
-            take_parent_reads_passing_exit_from(&mut env),
-            reads,
+            take_parent_exit_caps_from(&mut env),
+            ParentExitCaps {
+                passing,
+                verification
+            },
             "{caps:?}"
         );
     }

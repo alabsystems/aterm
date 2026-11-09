@@ -158,8 +158,8 @@ fn a_read_that_ended_without_a_verdict_answers_the_cold_lane() {
             .expect_err("the moment the read measured answers the attempt");
         let message = error.to_string();
         assert!(
-            !error.is_refused() && !error.is_activity_deferred(),
-            "a Failed the synchronous arm books: {error:?}"
+            error.is_activity_deferred(),
+            "an inconclusive read defers without booking an image failure: {error:?}"
         );
         assert!(
             aterm_update::is_passing_refusal(&message),

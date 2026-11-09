@@ -3004,13 +3004,19 @@ mod tests {
 
     #[test]
     fn optional_head_drops_a_504_without_retry() {
+        assert_optional_head_504(std::time::Instant::now());
+    }
+
+    #[test]
+    fn required_head_fixture_keeps_its_original_start_without_a_latency_budget() {
+        assert_optional_head_504(std::time::Instant::now() - std::time::Duration::from_secs(6));
+    }
+
+    fn assert_optional_head_504(start: std::time::Instant) {
         let (fake, url) = unavailable_head_server();
-        let refused = super::head_until(
-            &url,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .unwrap_err()
-        .to_string();
+        let refused = super::head_until(&url, start + std::time::Duration::from_secs(60))
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("HTTP 504"), "{refused}");
         assert_eq!(
             fake.seen().len(),

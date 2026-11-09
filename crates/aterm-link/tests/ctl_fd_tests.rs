@@ -34,6 +34,7 @@ fn a_control_connection_is_kept_out_of_every_child() {
     );
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-dial")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a socket dir");
     let sock = dir.path().join("c.sock");

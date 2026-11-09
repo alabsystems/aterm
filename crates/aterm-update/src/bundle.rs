@@ -289,11 +289,7 @@ mod tests {
     #[test]
     fn a_leftover_probe_name_is_probed_again_under_a_fresh_one() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "aterm-update-probe-parent-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let root = crate::paths::scratch_dir("probe-parent");
         let app = root.join("aterm.app");
         std::fs::create_dir_all(&app).unwrap();
         let leftover = root.join(format!(".aterm-update-probe-{}", std::process::id()));
@@ -303,7 +299,6 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
         let refused = probe_parent_write(&app);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             matches!(refused, ParentWrite::NotWritable(_)),
             "{refused:?}"

@@ -24,7 +24,7 @@ fn node(tag: u8) -> ([u8; 32], [u8; 32]) {
 }
 
 fn private_dir() -> aterm_tempfile::TempDir {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("pkey");
     aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
     dir
 }

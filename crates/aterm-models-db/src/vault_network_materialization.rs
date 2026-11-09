@@ -49,7 +49,8 @@ pub fn vault_network_materialization_admission_model() -> Model {
 
 /// Exact stored receipt context and existing local readiness are independent of
 /// the original network admission. Reading or decoding an old receipt cannot
-/// supply a new network sample or a broader service claim.
+/// supply a new network sample or a broader service claim. Unchanged signed heads
+/// do not make an old selected meaning current; replay preserves the original sample.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vault_network_materialization_projection_model() -> Model {
@@ -75,10 +76,12 @@ pub fn vault_network_materialization_projection_model() -> Model {
             action MalformedReceipt when (scenario == 0) { scenario = 16; shown = if Buggy == 16 {1} else {0}; }
             action LegacyState when (scenario == 0) { scenario = 17; shown = if Buggy == 17 {1} else {0}; }
             action Unready when (scenario == 0) { scenario = 18; shown = if Buggy == 18 {1} else {0}; }
-            invariant QualifiedProgress: scenario == 0 || (scenario > 1 && 13 > scenario) || scenario > 14 || shown == 1;
-            invariant ExactContext: scenario == 0 || scenario == 1 || scenario == 13 || scenario == 14 || shown == 0;
+            action StaleSelection when (scenario == 0) { scenario = 19; shown = if Buggy == 21 {1} else {0}; }
+            action ReappliedSelection when (scenario == 0) { scenario = 20; shown = if Buggy == 22 {0} else {1}; original = 1; }
+            invariant QualifiedProgress: scenario == 0 || (scenario > 1 && 13 > scenario) || (scenario > 14 && 20 > scenario) || shown == 1;
+            invariant ExactContext: scenario == 0 || scenario == 1 || scenario == 13 || scenario == 14 || scenario == 20 || shown == 0;
             invariant OriginalObservation: shown == 0 || original == 1;
-            bound ScenarioRange: scenario <= 18;
+            bound ScenarioRange: scenario <= 20;
         }
     }
 }

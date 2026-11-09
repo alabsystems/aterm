@@ -127,6 +127,10 @@ impl Owner {
         mut descriptions: Vec<OwnedFd>,
     ) -> io::Result<wire::Reply> {
         request.encode()?;
+        self.fence.check_current()?;
+        if self.faulted {
+            return Err(refused("workload phase custody is faulted"));
+        }
         let job = self
             .jobs
             .get_mut(&(session.to_owned(), request.key.root_attempt))

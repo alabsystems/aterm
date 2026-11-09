@@ -1319,17 +1319,20 @@ impl App {
         wid: crate::WindowId,
         plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> crate::a11y_tree::ClientReads {
+        let Some(window) = self.windows.get(&wid) else {
+            return crate::a11y_tree::ClientReads::default();
+        };
+        let mut frames = window.a11y_document_frames.borrow_mut();
+        let mut pass = frames.pass();
         let panes = plan
-            .map(|plan| self.grid_a11y_panes(wid, plan))
+            .map(|plan| self.grid_a11y_panes_in_pass(wid, plan, &mut pass))
             .unwrap_or_default();
-        let front = self
-            .windows
-            .get(&wid)
-            .filter(|_| panes.is_empty())
-            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols)))
+        let front = panes
+            .is_empty()
+            .then_some((usize::from(window.rows), usize::from(window.cols)))
             .zip(self.front_terminal(wid).map(|front| front.session))
             .and_then(|((rows, cols), session)| {
-                self.terminal_document(wid, session, rows, cols, true)
+                self.terminal_document_in_pass(wid, session, rows, cols, true, &mut pass)
             });
         crate::a11y_tree::ClientReads {
             views: plan.map_or_else(Vec::new, |plan| {
@@ -1484,13 +1487,28 @@ impl App {
         wid: crate::WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Vec<crate::a11y_tree::GridPane> {
+        let Some(window) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut frames = window.a11y_document_frames.borrow_mut();
+        let mut pass = frames.pass();
+        self.grid_a11y_panes_in_pass(wid, plan, &mut pass)
+    }
+
+    #[cfg(a11y_tree)]
+    fn grid_a11y_panes_in_pass(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        pass: &mut crate::accessibility::DocumentFramePass<'_>,
+    ) -> Vec<crate::a11y_tree::GridPane> {
         if plan.leaves.len() < 2 || plan.zoomed {
             return Vec::new();
         }
         plan.leaves
             .iter()
             .enumerate()
-            .filter_map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
+            .filter_map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf, pass))
             .collect()
     }
 
@@ -1565,6 +1583,7 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         slot: usize,
         leaf: &crate::tab_model::VisibleLeaf,
+        pass: &mut crate::accessibility::DocumentFramePass<'_>,
     ) -> Option<crate::a11y_tree::GridPane> {
         let session = self
             .view_store
@@ -1575,7 +1594,8 @@ impl App {
         let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
         let rows = (leaf.rect.size.height.round() as usize).max(1);
         let cols = (leaf.rect.size.width.round() as usize).max(1);
-        let document = self.terminal_document(wid, session, rows, cols, leaf.focused)?;
+        let document =
+            self.terminal_document_in_pass(wid, session, rows, cols, leaf.focused, pass)?;
         let mut label = format!(
             "{} — pane {} of {}",
             crate::accessibility::LABEL,
@@ -1600,14 +1620,9 @@ impl App {
         })
     }
 
-    /// What session `session` shows a client in a view of `rows` by `cols` in window `wid`, read
-    /// from its terminal: the rows a frame of that view draws (the past screen while rewound), and
-    /// when `focused` the caret and any composition in progress there. The window's composed cells
-    /// cannot answer this, since they hold another tab's or layout's rows until a frame of this
-    /// one, a frame that proves nothing changed leaves them without their chrome rows, and they
-    /// carry what aterm paints over a program, which reaches a client as its own node.
-    #[cfg(a11y_tree)]
-    pub(crate) fn terminal_document(
+    /// Read one terminal document through a complete window frame pass for a test.
+    #[cfg(all(test, a11y_tree))]
+    pub(crate) fn terminal_document_for_test(
         &self,
         wid: crate::WindowId,
         session: u64,
@@ -1615,18 +1630,41 @@ impl App {
         cols: usize,
         focused: bool,
     ) -> Option<crate::a11y_tree::TerminalDocument> {
+        let window = self.windows.get(&wid)?;
+        let mut frames = window.a11y_document_frames.borrow_mut();
+        let mut pass = frames.pass();
+        self.terminal_document_in_pass(wid, session, rows, cols, focused, &mut pass)
+    }
+
+    /// What session `session` shows a client in a view of `rows` by `cols` in window `wid`, read
+    /// from its terminal: the rows a frame of that view draws (the past screen while rewound), and
+    /// when `focused` the caret and any composition in progress there. The window's composed cells
+    /// cannot answer this, since they hold another tab's or layout's rows until a frame of this
+    /// one, a frame that proves nothing changed leaves them without their chrome rows, and they
+    /// carry what aterm paints over a program, which reaches a client as its own node.
+    /// The pass owns refillable storage; extraction does not consume paint damage.
+    #[cfg(a11y_tree)]
+    fn terminal_document_in_pass(
+        &self,
+        wid: crate::WindowId,
+        session: u64,
+        rows: usize,
+        cols: usize,
+        focused: bool,
+        pass: &mut crate::accessibility::DocumentFramePass<'_>,
+    ) -> Option<crate::a11y_tree::TerminalDocument> {
         let (term, owner) = self.pool.shown(session)?;
-        let mut cells = aterm_core::render::RenderInput::empty();
+        let cells = pass.frame(rows, cols);
         let ambiguous_cjk = {
             let site = crate::metrics::TermWaitSite::Redraw;
             let mut term = crate::term_lock_ui(&term, &owner.ctx.ui_waiting, site);
-            term.cell_frame_into(&mut cells, rows, cols);
+            term.text_frame_into(cells, rows, cols);
             term.modes().ambiguous_width_double
         };
         let composing = self
             .windows
             .get(&wid)
-            .filter(|ws| focused && !ws.preedit.is_empty() && cells.display_offset == 0)
+            .filter(|ws| focused && !ws.preedit.is_empty() && cells.display_offset() == 0)
             .filter(|_| {
                 matches!(
                     self.preedit_owner(wid),
@@ -1635,17 +1673,15 @@ impl App {
             });
         if let Some(ws) = composing {
             cells.overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
-            cells.cursor_visible = true;
         }
-        let cursor = (focused && cells.cursor_visible && cells.cursor_col < cols)
-            .then_some((cells.cursor_row, cells.cursor_col));
+        let cursor = cells.cursor().filter(|&(_, col)| focused && col < cols);
         let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
-            &cells.cells,
+            cells.cells(),
             0..rows,
             0..cols,
             cursor,
         );
-        let selection = crate::a11y_tree::selected_span(&cells, &snap);
+        let selection = crate::a11y_tree::selected_span(cells, &snap);
         Some(crate::a11y_tree::TerminalDocument { snap, selection })
     }
 
@@ -1797,6 +1833,7 @@ impl App {
             AkWindowEvent::AccessibilityDeactivated => {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.a11y_active = false;
+                    ws.a11y_document_frames.get_mut().clear();
                 }
             }
         }

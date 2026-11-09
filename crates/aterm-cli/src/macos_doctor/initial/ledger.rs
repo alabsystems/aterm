@@ -13,7 +13,9 @@
 //! that runs past [`HANG_LIMIT`] of awake time with no end is parked the same way by the first
 //! reading of the run that sees it ([`Ledger::mark_hung`]), so a wedge, not only a crash, ends
 //! at a calm row; a stage cut off after that counts it as one stop, so it resumes once. Check
-//! again clears every park ([`Ledger::retry`]). A quit or an update's handoff in the middle of
+//! again clears every park ([`Ledger::retry`]). A valid newer build with a different exact
+//! commit gives only its owned, unfinished stage a fresh budget; a legacy unattributed budget
+//! may be adopted once ([`Ledger::software_for`]). A quit or an update's handoff in the middle of
 //! a stage is no crash ([`Ledger::interrupt`]), unless the handoff is refused
 //! ([`Ledger::refused`]); from its note until it goes or is refused, no stage begins
 //! ([`quitting`]), so it cuts off only stages its note names.
@@ -32,7 +34,7 @@ pub(super) const LEDGER: &str = "setup-ledger.json";
 const LEDGER_LOCK: &str = "setup-ledger.lock";
 
 /// The format this build writes in the ledger's `format`: a later one is a newer aterm's.
-const LEDGER_FORMAT: u64 = 1;
+pub(super) const LEDGER_FORMAT: u64 = 2;
 
 /// How long a stage may run with no end before the run's next reading parks it: twice the
 /// longest budget any one step of a stage keeps (a GitHub clone's 30 minutes), so a step that
@@ -43,6 +45,90 @@ const LEDGER_FORMAT: u64 = 1;
 pub(super) const HANG_LIMIT: u64 = 60 * 60;
 
 const STAGES: usize = Stage::ALL.len();
+
+/// The running software's ordered build and exact source identity, when both are known.
+/// Unknown or dirty builds supply no evidence that a parked stage has newer code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SoftwareEpoch {
+    pub(super) build: u64,
+    pub(super) commit: [u8; 20],
+}
+
+impl SoftwareEpoch {
+    fn valid(self) -> bool {
+        self.build > 0 && self.commit != [0; 20]
+    }
+
+    pub(super) fn current() -> Option<Self> {
+        Self::from_stamp(aterm_stamp::current())
+    }
+
+    pub(super) fn from_stamp(stamp: &aterm_stamp::Stamp) -> Option<Self> {
+        let build = stamp
+            .build_number
+            .parse::<u64>()
+            .ok()
+            .filter(|build| *build > 0)?;
+        let mut commit = [0; 20];
+        (stamp.git_dirty == "false"
+            && aterm_codec::hex::decode_into(stamp.git_commit_full.as_bytes(), &mut commit)
+            && commit != [0; 20])
+            .then_some(Self { build, commit })
+    }
+}
+
+/// Unattributed budgets may be adopted once. Unread metadata never supplies that authority:
+/// it survives a rewrite as unread until an explicit Check again gives the budget back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Software {
+    #[default]
+    Unattributed,
+    Known(SoftwareEpoch),
+    Unread,
+}
+
+impl Software {
+    fn record(self) -> Value {
+        match self {
+            Self::Unattributed => Value::from("unattributed"),
+            Self::Unread => Value::from("unread"),
+            Self::Known(epoch) => json!({
+                "build": epoch.build,
+                "commit": aterm_codec::hex::encode_lower(&epoch.commit),
+            }),
+        }
+    }
+
+    fn parse(value: &Value) -> Self {
+        match value.as_str() {
+            Some("unattributed") => return Self::Unattributed,
+            Some("unread") => return Self::Unread,
+            _ => {}
+        }
+        let Some(object) = value.as_object().filter(|object| object.len() == 2) else {
+            return Self::Unread;
+        };
+        let Some(build) = object.get("build").and_then(Value::as_u64) else {
+            return Self::Unread;
+        };
+        let Some(commit) = object.get("commit").and_then(Value::as_str) else {
+            return Self::Unread;
+        };
+        let mut decoded = [0; 20];
+        if !aterm_codec::hex::decode_into(commit.as_bytes(), &mut decoded) {
+            return Self::Unread;
+        }
+        let epoch = SoftwareEpoch {
+            build,
+            commit: decoded,
+        };
+        if epoch.valid() {
+            Self::Known(epoch)
+        } else {
+            Self::Unread
+        }
+    }
+}
 
 /// One stage's begins since it last ended.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,6 +159,8 @@ pub(super) struct Stamp {
     /// The mark of the profile.lock hold the pass runs under, where read: each hold writes a
     /// fresh one in the lock file as it takes the lock.
     pub(super) run: Option<u128>,
+    /// The software captured once by the owning pass, shared with its parallel lane.
+    pub(super) software: Option<SoftwareEpoch>,
 }
 
 /// One run revision's ledger.
@@ -89,6 +177,8 @@ pub(super) struct Ledger {
     /// The running stages a quit or an update's handoff cut off: no crash.
     pub(super) quit: u16,
     pub(super) attempts: [Attempt; STAGES],
+    /// Each stage owns its budget's attribution; a scoped pass cannot spend a sibling's epoch.
+    pub(super) software: [Software; STAGES],
 }
 
 /// Whether a stage begins ([`Ledger::begin`]).
@@ -244,6 +334,85 @@ impl Ledger {
         }
     }
 
+    /// Reconcile only an owned, unfinished stage after its interrupted begin was recovered.
+    /// A legacy unattributed budget gets one fresh adoption; it proves no earlier build.
+    /// Known budgets require both a strictly larger build and a different exact commit.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "AdoptSoftwareA",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "AdoptSoftwareB",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "NewSoftwareA",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "NewSoftwareB",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "RetainSoftwareA",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SetupLedger",
+            action = "RetainSoftwareB",
+            project = "aterm_cli::macos_doctor::initial::tests::ledger_conformance::project"
+        )
+    )]
+    pub(super) fn software_for(
+        &mut self,
+        stage: Stage,
+        done: u16,
+        current: Option<SoftwareEpoch>,
+        root: &Path,
+    ) -> bool {
+        let bit = stage.bit();
+        if quitting(root) || done & bit != 0 || self.running & bit != 0 || self.quit & bit != 0 {
+            return false;
+        }
+        let Some(current) = current.filter(|epoch| epoch.valid()) else {
+            return false;
+        };
+        let index = Self::index(stage);
+        match self.software[index] {
+            Software::Unattributed => {}
+            Software::Known(before)
+                if current.build > before.build && current.commit != before.commit => {}
+            Software::Known(_) | Software::Unread => return false,
+        }
+        self.software[index] = Software::Known(current);
+        self.attempts[index] = Attempt::default();
+        self.crashed &= !bit;
+        self.hung &= !bit;
+        true
+    }
+
     /// Begin `stage`, as `stamp` says, unless aterm is quitting `root`'s setup (the process's
     /// latch, [`quitting`], which this reads itself, under the ledger's lock), the run's progress
     /// has it `done` or it is parked: each begin counts.
@@ -269,6 +438,9 @@ impl Ledger {
         }
         if done & stage.bit() != 0 && !planted(Defect::BeginIgnoresDone) {
             return Admit::Done;
+        }
+        if stamp.software.is_some() {
+            self.software_for(stage, done, stamp.software, root);
         }
         if let Some(park) = self.parked(stage)
             && !planted(Defect::BeginIgnoresPark)
@@ -372,6 +544,11 @@ impl Ledger {
         self.hung = 0;
         for attempt in &mut self.attempts {
             attempt.began = 0;
+        }
+        for software in &mut self.software {
+            if *software == Software::Unread {
+                *software = Software::Unattributed;
+            }
         }
         *self != before
     }
@@ -558,6 +735,7 @@ impl Ledger {
             "hung": self.hung,
             "quit": self.quit,
             "stages": stages,
+            "software": self.software.iter().map(|software| software.record()).collect::<Vec<_>>(),
         })
     }
 
@@ -584,7 +762,19 @@ impl Ledger {
             hung: bits("hung")?,
             quit: bits("quit")?,
             attempts: [Attempt::default(); STAGES],
+            software: [Software::Unread; STAGES],
         };
+        if value["format"].as_u64() == Some(1) && value.get("software").is_none() {
+            ledger.software = [Software::Unattributed; STAGES];
+        } else if let Some(software) = value
+            .get("software")
+            .and_then(Value::as_array)
+            .filter(|software| software.len() == STAGES)
+        {
+            for (stored, value) in ledger.software.iter_mut().zip(software) {
+                *stored = Software::parse(value);
+            }
+        }
         for entry in value["stages"].as_array().ok_or(Unread::Damaged)? {
             let index = entry["stage"].as_u64().ok_or(Unread::Damaged)?;
             let index = usize::try_from(index).map_err(|_| Unread::Damaged)?;
@@ -669,7 +859,10 @@ pub(super) fn load(root: &Path, revision: u64) -> Loaded {
             frozen: false,
         },
         Err(Unread::Newer) => Loaded {
-            ledger: Ledger::of(revision),
+            ledger: Ledger {
+                software: [Software::Unread; STAGES],
+                ..Ledger::of(revision)
+            },
             frozen: true,
         },
     }

@@ -17,6 +17,7 @@ impl Scratch {
         Self {
             dir: aterm_tempfile::Builder::new()
                 .prefix("ar")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("scratch"),
         }

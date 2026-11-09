@@ -803,7 +803,11 @@ type KeptDigests =
 /// within its own tick as racily clean. Without it, a rewrite in place at the same length, or a
 /// new file given a freed inode, in one tick of a coarse clock would keep the stamp of the file
 /// it replaced.
-const SETTLED_NS: i128 = 2_000_000_000;
+const SETTLED_NS: i128 = SETTLED.as_nanos() as i128;
+
+/// `SETTLED_NS` as a time to wait: a measurement of quiet rounds waits it out, and a tenth of a
+/// second past it, after its fixture's last write (`client::test_settled_after`).
+pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether what `seen` shows last changed [`SETTLED_NS`] or more before `now`, so that a change
 /// made after `now` moves a stamp a later `lstat` shows, on a clock that ticks this coarsely or

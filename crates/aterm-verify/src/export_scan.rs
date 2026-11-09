@@ -319,6 +319,15 @@ fn astream_crates(root: &Path, path_env: &OsStr) -> Result<Option<Vec<String>>, 
 /// # Errors
 /// git cannot list the files, or astream's checkout is not the commit its gitlink pins.
 pub fn listed(root: &Path, path_env: &OsStr, scope: &Scope) -> Result<Listed, String> {
+    listed_input(root, path_env, scope, None)
+}
+
+fn listed_input(
+    root: &Path,
+    path_env: &OsStr,
+    scope: &Scope,
+    input: Option<&[String]>,
+) -> Result<Listed, String> {
     let links = gitlinks(root, path_env)?;
     let has_astream = match links.iter().find(|(path, _)| path == ASTREAM) {
         Some((_, pin)) => {
@@ -328,6 +337,17 @@ pub fn listed(root: &Path, path_env: &OsStr, scope: &Scope) -> Result<Listed, St
         None => false,
     };
     let (mut paths, whole, what) = match scope {
+        _ if input.is_some() => {
+            let paths = input.unwrap_or_default().to_vec();
+            match paths.iter().find(|p| widens(p)) {
+                Some(path) => (
+                    every_file(root, path_env)?,
+                    true,
+                    format!("the whole export ({path} changed)"),
+                ),
+                None => (paths, false, "unchecked release input".into()),
+            }
+        }
         Scope::Changed(changed) => {
             let paths = crate::changed::changed_since(root, path_env, &changed.base)?;
             match paths.iter().find(|p| widens(p)) {
@@ -650,7 +670,12 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
              ~/publication, or set PUBLICATION_ENGINE to a checkout whose HEAD is judged)"
         ));
     }
-    let listed = match listed(&ctx.root, &ctx.path_env, &ctx.scope) {
+    let listed = match listed_input(
+        &ctx.root,
+        &ctx.path_env,
+        &ctx.scope,
+        ctx.input_paths.as_deref(),
+    ) {
         Ok(listed) => listed,
         Err(why) => {
             r.cannot_run(format!("export-scan — {why}"));

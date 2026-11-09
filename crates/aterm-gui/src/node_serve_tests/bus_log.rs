@@ -108,7 +108,7 @@ fn with_bus(state: &Path, bus: Option<BusKeeperConfig>) -> NodeServeConfig {
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         launcher: idle_launcher(),
         updates: None,
         mesh: NodeMesh {
@@ -192,7 +192,7 @@ fn with_the_mesh_off_the_node_service_keeps_no_bus_log() {
 struct BusNode {
     addr: SocketAddr,
     table: Arc<Neighbours>,
-    stop: Arc<NodeStop>,
+    stop: Arc<Stop>,
     server: std::thread::JoinHandle<ExitCode>,
 }
 
@@ -215,7 +215,7 @@ impl BusNode {
         );
         let (told, tables) = mpsc::channel();
         let told = Mutex::new(told);
-        let stop = Arc::new(NodeStop::default());
+        let stop = Arc::new(Stop::new());
         let relay = crate::test_scratch::short_dir("bus-relay");
         let cfg = NodeServeConfig {
             relay_dir: relay.path().to_path_buf(),

@@ -13,7 +13,7 @@ use crate::federate::{
 
 /// A folder holding the node key of Mac `tag` and, where given, the node service's hand-off.
 fn keys_for(tag: u8, handoff: Option<&Handoff>) -> aterm_tempfile::TempDir {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("keys");
     aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
     let seed = format!("{}\n", aterm_codec::hex::encode_lower(&[tag; 32]));
     aterm_uds::private_file::write_private(dir.path(), NODE_KEY_FILE, seed.as_bytes())

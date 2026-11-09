@@ -148,9 +148,9 @@ mod measuring {
                     scene: RewindScene::Idle { .. },
                     ..
                 })
-                | Row::Cost(CostRow::IdleRss { .. } | CostRow::BusyRss { .. }) => {
-                    support::Kind::Count { windowed: false }
-                }
+                | Row::Cost(CostRow::BusyRss { .. }) => support::Kind::Count { windowed: false },
+                // Matched B14 confirmation shifted idle-RSS on_median_bytes (p=12/252).
+                // Its unchanged bound still passed; a value shift requires Timing.
                 _ => support::Kind::Timing,
             },
             |row| take(&rig, row),

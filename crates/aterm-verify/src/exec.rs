@@ -3709,7 +3709,7 @@ pub mod group {
         if unsafe { killpg(g, sig) } == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::last_os_error())
+            aterm_uds::process::settle_group_signal(g, std::io::Error::last_os_error())
         }
     }
 
@@ -5152,6 +5152,34 @@ mod tests {
         );
         leader.wait().expect("the leader, reaped");
         assert_eq!(group::empty(pid), Some(true), "reaped, it holds no one");
+    }
+
+    /// A group whose members have all ended takes a signal without failing: on macOS its `killpg`
+    /// answers `EPERM`, which [`aterm_uds::process::settle_group_signal`] settles from the listing,
+    /// and a timed-out run must not report it as a group the kill failed to reach. NEGATIVE CONTROL:
+    /// return `last_os_error` from `signal_group` unsettled and `kill` fails here on macOS.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_signal_to_a_group_whose_members_ended_is_not_a_failure() {
+        let mut leader = aterm_uds::spawnfd::command("/bin/sh");
+        leader
+            .args(["-c", "exit 0"])
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        let mut leader = leader.spawn().expect("a leader");
+        let pid = leader.id();
+        aterm_spec::wait::until_within(HANG_DETECTOR, "the leader's exit", || {
+            group::exited(pid, false)
+                .expect("its exit, unreaped")
+                .then_some(())
+        });
+        let live = group::Live::enter(pid);
+        live.kill().expect("a group with nothing left to signal");
+        live.term().expect("a group with nothing left to signal");
+        drop(live);
+        leader.wait().expect("the leader, reaped");
     }
 
     /// [`group::judged`] on each answer `killpg` gives: `ESRCH` is empty and `0` is not, neither

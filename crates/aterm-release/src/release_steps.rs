@@ -150,6 +150,17 @@ fn detach_process(cmd: &mut Command) {
     cmd.setsid(true).default_signals();
 }
 
+fn step_process_group(cmd: &mut Command, prefreeze: bool) {
+    if prefreeze {
+        // Preparation already leads a cancellable group. Detaching targo again would
+        // let its compiler outlive the supervisor's positive wait on the worker.
+        #[cfg(unix)]
+        cmd.setsid(false).default_signals();
+    } else {
+        detach_process(cmd);
+    }
+}
+
 fn detach(cmd: &mut Command) {
     crate::credential_wait::ask_no_one(cmd);
     detach_process(cmd);
@@ -1087,11 +1098,17 @@ impl Real {
         }
         self.finalize_spawn_environment(cmd)
             .map_err(std::io::Error::other)?;
-        detach_process(cmd);
+        let prefreeze = self.prefreeze_claim.is_some();
+        step_process_group(cmd, prefreeze);
         let child = cmd.spawn()?;
+        let group = if prefreeze {
+            std::process::id()
+        } else {
+            child.id()
+        };
         let running = match stop {
-            Some((stop, sig)) => interrupt::Running::enter_stoppable(child.id(), stop.clone(), sig),
-            None => interrupt::Running::enter(child.id()),
+            Some((stop, sig)) => interrupt::Running::enter_stoppable(group, stop.clone(), sig),
+            None => interrupt::Running::enter(group),
         };
         let note = self.note_child(step, child.id());
         Ok((
@@ -2495,21 +2512,20 @@ impl Real {
             // The new line makes the clone's old supervisor settle its compiler.
             // Join that handoff before competing for its workspace; a live
             // background owner is cancellation in progress, not a cut refusal.
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while crate::release::live_holder(&cache.join("prefreeze-running"), &mut started_of)
-                .is_some()
-            {
-                if interrupt::caught().is_some() {
-                    return Err("interrupted while settling cutter preparation".into());
-                }
-                if std::time::Instant::now() >= until {
-                    return Err(
-                        "cutter preparation did not settle after the next cut claimed its line"
-                            .into(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            let mut probe = aterm_uds::deadline::ProcessProgressProbe::default();
+            wait_prefreeze(
+                || {
+                    crate::release::live_holder(&cache.join("prefreeze-running"), &mut started_of)
+                        .map(|holder| {
+                            let progress = probe.read_descendants(holder.pid);
+                            (holder.pid, holder.started, progress)
+                        })
+                },
+                std::time::Instant::now,
+                || std::thread::sleep(std::time::Duration::from_millis(500)),
+                || interrupt::caught().is_some(),
+                |message| eprintln!("{message}"),
+            )?;
         }
         let pid = std::process::id();
         let started = started_of(pid).ok_or("cannot identify cutter workspace holder")?;
@@ -6505,6 +6521,107 @@ impl Backend for Real {
         self.git_out(&["rev-parse", "HEAD"]).unwrap_or_default()
     }
 
+    fn input_checks(&mut self, base: &str, tip: &str, prover: &Prover) -> Result<String, Refusal> {
+        let remedy = crate::release::fix_remedy(tip);
+        let unavailable = |why: String| {
+            Refusal::new(
+                format!("release input could not be judged: {why}"),
+                remedy.clone(),
+            )
+            .could_not_run()
+        };
+        // A dry run does not move the person's checkout to the fetched candidate.
+        // Only that case needs a private worktree; a real cut already runs at R.
+        let temporary = if self.off_tree(tip).is_some() {
+            let dir = aterm_tempfile::tempdir().map_err(|e| unavailable(e.to_string()))?;
+            let root = dir.path().join("input");
+            self.git()
+                .git(&[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    root.to_str()
+                        .ok_or_else(|| unavailable("non-UTF-8 scratch path".into()))?,
+                    tip,
+                ])
+                .and_then(|o| {
+                    if o.success() {
+                        Ok(o)
+                    } else {
+                        Err(crate::ledger::Error::new(o.stderr_utf8()))
+                    }
+                })
+                .map_err(|e| unavailable(e.to_string()))?;
+            Some((dir, root))
+        } else {
+            None
+        };
+        let root = temporary
+            .as_ref()
+            .map_or(self.repo.as_path(), |(_, root)| root.as_path());
+        let initialized = crate::ledger::GitCli::new(root).git(&[
+            "submodule",
+            "update",
+            "--init",
+            "vendor/astream",
+        ]);
+        let result = (|| match initialized {
+            Ok(out) if out.success() => {
+                let mut child = self.child(prover.bin.join("targo"), Some(prover));
+                if let Some(layout) = verify_layout(root).1 {
+                    child.args(["--config", &layout]);
+                }
+                child
+                    .args(["--unverified", "verify", "release-input", "--base", base])
+                    .current_dir(root);
+                let (out, record) = self
+                    .output_accounted(Step::Checks, &mut child)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                let mut log = crate::durable::open_append(&self.step_log(Step::Checks), true)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                log.write_all(&out.stdout)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                log.write_all(&out.stderr)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                writeln!(log, "{record}").map_err(|e| unavailable(e.to_string()))?;
+                let text = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if out.status.success() {
+                    Ok(text
+                        .lines()
+                        .rev()
+                        .find(|line| line.starts_with("release input:"))
+                        .unwrap_or("release input passed")
+                        .to_string())
+                } else {
+                    let refusal = Refusal::new(text, remedy.clone());
+                    Err(if out.status.code() == Some(aterm_verify::exit::FAILED) {
+                        refusal
+                    } else {
+                        refusal.could_not_run()
+                    })
+                }
+            }
+            Ok(out) => Err(unavailable(out.stderr_utf8())),
+            Err(why) => Err(unavailable(why.to_string())),
+        })();
+        if let Some((_, root)) = &temporary {
+            let removed =
+                self.git()
+                    .git(&["worktree", "remove", "--force", &root.to_string_lossy()]);
+            if !removed.is_ok_and(|out| out.success()) {
+                return Err(unavailable(format!(
+                    "cannot remove private input worktree {}",
+                    root.display()
+                )));
+            }
+        }
+        result
+    }
+
     fn branch_is_main(&mut self) -> bool {
         self.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
             .as_deref()
@@ -8381,6 +8498,55 @@ fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), S
 
 #[cfg(unix)]
 const AUTO_PREFREEZE: &str = "ATERM_RELEASE_AUTO_PREFREEZE";
+
+/// Join cancellation using worker progress, never the supervisor's polling CPU.
+#[cfg(unix)]
+fn wait_prefreeze(
+    mut holder: impl FnMut() -> Option<(u32, String, Option<u64>)>,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut tick: impl FnMut(),
+    mut interrupted: impl FnMut() -> bool,
+    mut log: impl FnMut(&str),
+) -> Result<(), String> {
+    let began = now();
+    let mut identity = None;
+    let mut evidence = None;
+    let mut last = began;
+    while let Some((pid, started, progress)) = holder() {
+        let at = now();
+        if identity.as_ref() != Some(&(pid, started.clone())) {
+            log(&format!(
+                "waiting for cutter preparation pid {pid} to yield; hang detector: 60 s without descendant CPU/I/O progress"
+            ));
+            identity = Some((pid, started));
+            evidence = None;
+            last = at;
+        }
+        if interrupted() {
+            return Err(format!(
+                "interrupted while settling cutter preparation pid {pid}"
+            ));
+        }
+        if progress.is_none() || evidence != progress {
+            last = at;
+        }
+        evidence = progress;
+        if at.saturating_duration_since(last) >= std::time::Duration::from_secs(60) {
+            return Err(format!(
+                "cutter preparation pid {pid} made no descendant CPU/I/O progress for 60 s while yielding"
+            ));
+        }
+        tick();
+    }
+    if identity.is_some() {
+        log(&format!(
+            "cutter preparation yielded after {:.3} s; continuing frozen cutter preparation",
+            now().saturating_duration_since(began).as_secs_f64()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 const PREFREEZE_WORKER: &str = "ATERM_RELEASE_PREFREEZE_WORKER";
 
@@ -8388,11 +8554,33 @@ const PREFREEZE_WORKER: &str = "ATERM_RELEASE_PREFREEZE_WORKER";
 struct PrefreezeWorker(Option<aterm_uds::spawnfd::Child>);
 
 #[cfg(unix)]
+impl PrefreezeWorker {
+    fn settle(&mut self, reason: &str) {
+        if let Some(mut child) = self.0.take() {
+            let yielding = std::time::Instant::now();
+            println!(
+                "release-event: {}",
+                aterm_json::json!({
+                    "schema":1,"event":"prefreeze-yield-requested",
+                    "worker_pid":child.id(),"reason":reason,
+                })
+            );
+            aterm_uds::deadline::settle_child(&mut child);
+            println!(
+                "release-event: {}",
+                aterm_json::json!({
+                    "schema":1,"event":"prefreeze-yielded",
+                    "settle_s":yielding.elapsed().as_secs_f64(),
+                })
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
 impl Drop for PrefreezeWorker {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            aterm_uds::deadline::settle_child(&mut child);
-        }
+        self.settle("supervisor exit");
     }
 }
 
@@ -8435,6 +8623,18 @@ fn prepare_cached_cutter(
 /// children therefore never enter the current cut's step counters.
 #[cfg(unix)]
 fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
+    let ledger = aterm_capacity::Ledger::user().ok_or("capacity ledger unavailable")?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    supervise_prefreeze_in(repo, line, &ledger, &executable)
+}
+
+#[cfg(unix)]
+fn supervise_prefreeze_in(
+    repo: &Path,
+    line: &str,
+    ledger: &aterm_capacity::Ledger,
+    executable: &Path,
+) -> Result<(), String> {
     interrupt::install();
     let cache = aterm_verify::engine::release_dir(repo).join("cutter-cache");
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
@@ -8447,7 +8647,6 @@ fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
         &mut started_of,
     )
     .map_err(|why| format!("pre-freeze supervisor unavailable: {why:?}"))?;
-    let ledger = aterm_capacity::Ledger::user().ok_or("capacity ledger unavailable")?;
     let mut worker = PrefreezeWorker(None);
     let mut worker_covered = false;
     let mut next = std::time::Instant::now();
@@ -8460,24 +8659,18 @@ fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
         if worker_covered && !covered {
             // A worker admitted beside the old line must not retain Release rank
             // between cuts. Settle it and let Background admission own the rest.
-            if let Some(mut child) = worker.0.take() {
-                aterm_uds::deadline::settle_child(&mut child);
-            }
+            worker.settle("old line ended; readmitting as Background");
             worker_covered = false;
             next = std::time::Instant::now();
         }
         let own = worker.0.as_ref().map(aterm_uds::spawnfd::Child::id);
         let state = prefreeze_traffic(&rows, line, own);
         if state != PrefreezeTraffic::Free {
-            if let Some(mut child) = worker.0.take() {
-                aterm_uds::deadline::settle_child(&mut child);
-                println!(
-                    "release-event: {}",
-                    aterm_json::json!({
-                        "schema":1,"event":"prefreeze-yielded",
-                    })
-                );
-            }
+            worker.settle(if state == PrefreezeTraffic::End {
+                "next line claimed"
+            } else {
+                "Release stage or timing claim"
+            });
             if state == PrefreezeTraffic::End {
                 return Ok(());
             }
@@ -8497,7 +8690,7 @@ fn supervise_prefreeze(repo: &Path, line: &str) -> Result<(), String> {
                 next = std::time::Instant::now() + PREFREEZE_REFRESH;
             }
         } else if prefreeze_due(std::time::Instant::now(), next) {
-            let mut cmd = command(std::env::current_exe().map_err(|e| e.to_string())?);
+            let mut cmd = command(executable);
             cmd.args(["release", "--prefreeze"])
                 .current_dir(repo)
                 .env_remove(AUTO_PREFREEZE)
@@ -9433,6 +9626,205 @@ mod tests {
         let next = now + PREFREEZE_REFRESH;
         assert!(!prefreeze_due(now, next));
         assert!(prefreeze_due(next, next));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefreeze_handoff_waits_ninety_seconds_with_progress_but_refuses_a_stall() {
+        use super::*;
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        for progressing in [true, false] {
+            let seconds = Cell::new(0_u64);
+            let began = Instant::now();
+            let mut logs = Vec::new();
+            let result = wait_prefreeze(
+                || {
+                    let elapsed = seconds.get();
+                    (!progressing || elapsed < 90).then(|| {
+                        (
+                            4321,
+                            "same birth".into(),
+                            Some(if progressing { elapsed / 30 } else { 0 }),
+                        )
+                    })
+                },
+                || began + Duration::from_secs(seconds.get()),
+                || seconds.set(seconds.get() + 1),
+                || false,
+                |message| logs.push(message.to_owned()),
+            );
+            if progressing {
+                result.unwrap();
+                assert_eq!(seconds.get(), 90);
+                assert!(logs[0].contains("pid 4321"));
+                assert!(logs[1].contains("yielded after 90.000 s"));
+            } else {
+                assert_eq!(seconds.get(), 60);
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("pid 4321 made no descendant CPU/I/O progress")
+                );
+                assert_eq!(logs.len(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefreeze_compiler_stays_in_the_workers_cancellation_group() {
+        use super::*;
+        for prefreeze in [true, false] {
+            let mut cmd = command("/bin/cat");
+            cmd.stdin(Stdio::piped()).stdout(Stdio::null());
+            step_process_group(&mut cmd, prefreeze);
+            let mut child = cmd.spawn().unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            // SAFETY: these calls only read process-group identities of this process
+            // and its owned, unreaped child.
+            let (group, parent) = unsafe { (libc::getpgid(pid), libc::getpgrp()) };
+            assert_eq!(group, if prefreeze { parent } else { pid });
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    /// Real worker and supervisor, private traffic ledger: no cut or publication.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit real prefreeze cancellation measurement"]
+    fn measure_prefreeze_yield() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        let cwd = std::env::current_dir().unwrap();
+        let source = PathBuf::from(
+            crate::ledger::git_ok(&GitCli::new(&cwd), &["rev-parse", "--show-toplevel"])
+                .unwrap()
+                .stdout_utf8()
+                .trim(),
+        );
+        let original = GitCli::new(&source);
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        crate::ledger::git_ok(
+            &original,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                source.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let git = GitCli::new(&repo);
+        let url = crate::ledger::git_ok(&original, &["remote", "get-url", "origin"])
+            .unwrap()
+            .stdout_utf8();
+        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url.trim()]).unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "submodule.vendor/astream.url",
+                source.join("vendor/astream").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "vendor/astream",
+            ],
+        )
+        .unwrap();
+        let ledger = aterm_capacity::Ledger::at(temp.path().join("traffic"));
+        let executable = aterm_tempfile::bin_exe("aterm-release");
+        std::thread::scope(|scope| {
+            let supervisor =
+                scope.spawn(|| supervise_prefreeze_in(&repo, "old-line", &ledger, &executable));
+            let mut last = Instant::now();
+            let mut probe = aterm_uds::deadline::ProcessProgressProbe::default();
+            let mut evidence = None;
+            let compiler = loop {
+                let sweep = aterm_sysprobe::processes().unwrap();
+                let mut descendants = std::collections::BTreeSet::from([std::process::id()]);
+                loop {
+                    let before = descendants.len();
+                    for process in &sweep.procs {
+                        if descendants.contains(&process.ppid) {
+                            descendants.insert(process.pid);
+                        }
+                    }
+                    if descendants.len() == before {
+                        break;
+                    }
+                }
+                if let Some(compiler) = sweep.procs.iter().find(|process| {
+                    descendants.contains(&process.pid)
+                        && process.name == "trustc"
+                        && aterm_sysprobe::kproc::argv(process.pid).is_some_and(|args| {
+                            args.iter().any(|arg| arg.starts_with(b"--emit="))
+                                && !args.iter().any(|arg| arg.starts_with(b"--print"))
+                        })
+                }) {
+                    let args = aterm_sysprobe::kproc::argv(compiler.pid).unwrap();
+                    let unit = args
+                        .windows(2)
+                        .find(|pair| pair[0] == b"--crate-name")
+                        .unwrap();
+                    println!(
+                        "prefreeze-active-compiler unit={}",
+                        String::from_utf8_lossy(&unit[1])
+                    );
+                    break Some(compiler.pid);
+                }
+                let progress = probe.read_descendants(std::process::id());
+                if progress.is_none() || progress != evidence {
+                    last = Instant::now();
+                }
+                evidence = progress;
+                if supervisor.is_finished() || last.elapsed() >= Duration::from_secs(60) {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let claimed = Instant::now();
+            let _line = aterm_capacity::admit_with(
+                &ledger,
+                &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4)),
+                aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
+                aterm_capacity::Admit::Wait,
+                aterm_capacity::Pace::default(),
+                &mut |_| {},
+            )
+            .unwrap();
+            supervisor.join().unwrap().unwrap();
+            let compiler =
+                compiler.expect("no compiler appeared before preparation stopped progressing");
+            println!(
+                "prefreeze-yield-measure compiler_pid={compiler} claim_to_holder_removed_s={:.6}",
+                claimed.elapsed().as_secs_f64()
+            );
+            assert!(
+                !repo
+                    .join(".git/aterm-release/cutter-cache/prefreeze-running")
+                    .exists()
+            );
+            let remaining = aterm_sysprobe::kproc::record_read(compiler).unwrap();
+            println!("prefreeze-yield-compiler-terminal {remaining:?}");
+            assert!(
+                remaining.is_none_or(|record| record.zombie),
+                "a live compiler retained its build lock after yield"
+            );
+        });
     }
 
     /// Small real Cargo graph, no release, credential, service or product execution.

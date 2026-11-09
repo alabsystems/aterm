@@ -27,8 +27,15 @@ struct Faulty {
     /// `release(tag)` answers this instead (a racing read, an unreadable state).
     release_answer: Option<(String, HostError)>,
     /// The download host lags: it answers 404 for this tag's first `n` probes once the
-    /// fake serves it (`usize::MAX`: never serves it).
+    /// fake serves it (`usize::MAX`: HEAD never reports it present).
     unserved: Option<(String, Mutex<usize>)>,
+    /// A real anonymous payload failure, separate from an inconclusive HEAD.
+    public_fetch: Option<(String, String, FetchFault)>,
+}
+
+enum FetchFault {
+    Absent,
+    Corrupt,
 }
 
 impl Faulty {
@@ -37,6 +44,7 @@ impl Faulty {
             inner,
             release_answer: None,
             unserved: Some((tag, Mutex::new(probes))),
+            public_fetch: None,
         }
     }
 }
@@ -99,7 +107,23 @@ impl ReleaseHost for Faulty {
         answer
     }
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
-        self.inner.fetch_public(slug, tag, asset, dest, cap)
+        if let Some((bad_tag, bad_asset, FetchFault::Absent)) = &self.public_fetch
+            && tag == bad_tag
+            && asset == bad_asset
+        {
+            return Probe::Absent;
+        }
+        let answer = self.inner.fetch_public(slug, tag, asset, dest, cap);
+        if let Some((bad_tag, bad_asset, FetchFault::Corrupt)) = &self.public_fetch
+            && tag == bad_tag
+            && asset == bad_asset
+            && answer == Probe::Present
+        {
+            let mut bytes = std::fs::read(dest).expect("fetched public bytes");
+            bytes[0] ^= 1;
+            std::fs::write(dest, bytes).expect("corrupt public test response");
+        }
+        answer
     }
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> std::result::Result<(), HostError> {
         self.inner.clone_repo(slug, dest)
@@ -308,12 +332,14 @@ fn a_fresh_publish_mirrors_first_then_creates_one_prerelease_on_the_public_repo(
             "index.toml.sig"
         ]
     );
-    assert!(
-        calls
-            .iter()
-            .any(|c| c == "probe alabsystems/aterm atpkg-index-22 index.toml"),
-        "confirmed on the download host: {calls:?}"
-    );
+    for name in QUAD_FILES {
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("fetch alabsystems/aterm atpkg-index-22 {name}")),
+            "confirmed every public file: {calls:?}"
+        );
+    }
 }
 
 #[test]
@@ -327,12 +353,69 @@ fn packs_that_are_not_public_publish_no_index() {
 }
 
 #[test]
-fn an_index_the_download_host_does_not_serve_after_its_create_fails_the_run() {
+fn a_false_negative_head_does_not_override_the_public_signed_quad() {
     let mut rig = live("idx-unserved");
     let host = rig.host.clone();
     rig.route(Arc::new(Faulty::unserved(host, index_tag(22), usize::MAX)));
-    let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
-    assert!(e.to_string().contains("is the repo public?"), "{e}");
+    let (result, log) = publish(&rig, &request(&rig, "out", true, Delta::default()));
+    assert!(
+        result
+            .expect("anonymous bytes confirm the publication")
+            .published
+            .uploaded
+    );
+    assert!(log.contains("all four anonymous public files match"));
+}
+
+#[test]
+fn a_missing_public_quad_file_preserves_the_committed_publication_state() {
+    for name in QUAD_FILES {
+        let mut rig = live("idx-missing-public-file");
+        rig.route(Arc::new(Faulty {
+            inner: rig.host.clone(),
+            release_answer: None,
+            unserved: None,
+            public_fetch: Some((index_tag(22), name.into(), FetchFault::Absent)),
+        }));
+        let (error, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
+        assert!(
+            matches!(&error, Error::PublishedUnconfirmed { index_build: 22, directory, .. } if directory == &rig.path("out"))
+        );
+        assert_eq!(error.exit_code(), 3);
+        assert!(error.to_string().contains("do not create another index"));
+        assert!(
+            rig.index_release(22).is_some(),
+            "the write already committed"
+        );
+        assert!(rig.index_release(23).is_none());
+    }
+}
+
+#[test]
+fn corrupt_public_quad_bytes_refuse_without_losing_the_commit_state() {
+    let mut rig = live("idx-corrupt-public-file");
+    rig.route(Arc::new(Faulty {
+        inner: rig.host.clone(),
+        release_answer: None,
+        unserved: None,
+        public_fetch: Some((index_tag(22), "index.toml".into(), FetchFault::Corrupt)),
+    }));
+    let (error, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
+    assert!(matches!(
+        &error,
+        Error::PublishedUnconfirmed {
+            index_build: 22,
+            ..
+        }
+    ));
+    assert_eq!(error.exit_code(), 1);
+    assert!(
+        error
+            .to_string()
+            .contains("differs from the committed signed quad")
+    );
+    assert!(rig.index_release(22).is_some());
+    assert!(rig.index_release(23).is_none());
 }
 
 fn own_then(label: &str, shape: impl Fn(&Rig, &Path)) -> Rig {
@@ -445,6 +528,7 @@ fn a_create_that_loses_a_race_never_falls_back_to_an_upload() {
         inner: host,
         release_answer: Some((index_tag(22), HostError::NotFound)),
         unserved: None,
+        public_fetch: None,
     }));
     let before = writes(&rig.host).len();
     let (e, _) = refused(&rig, &rerun(&rig, "again"));
@@ -503,6 +587,7 @@ fn a_release_whose_state_cannot_be_read_is_refused() {
         inner: host,
         release_answer: Some((index_tag(22), HostError::Unreachable("HTTP 500".into()))),
         unserved: None,
+        public_fetch: None,
     }));
     let before = writes(&rig.host).len();
     let (e, _) = refused(&rig, &rerun(&rig, "again"));

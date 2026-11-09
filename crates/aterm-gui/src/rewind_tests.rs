@@ -2008,7 +2008,7 @@ fn a_rewound_pane_reads_its_past_screen_to_a_client() {
     let _ = slice(&app, b"\x1b[2J\x1b[Hthe live screen now");
     let (rows, cols) = grid(&app);
     let read = |app: &App| {
-        let document = app.terminal_document(WID, 0, rows, cols, false);
+        let document = app.terminal_document_for_test(WID, 0, rows, cols, false);
         document.expect("a document").snap.value().to_string()
     };
     assert!(read(&app).starts_with("the live screen now"), "CONTROL");

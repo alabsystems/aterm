@@ -6661,6 +6661,16 @@ done
 exec /usr/bin/tar -c -f - "$@""#,
     );
     let archive = g.vm.exec_complete(&files, STEP);
+    let debug_successor = scenario == Scenario::DebugSuccessor;
+    let ctl = if debug_successor {
+        format!(
+            "{} ctl --sock {}",
+            crate::util::shell_quote(&g.aterm),
+            crate::util::shell_quote(debug_successor::SOCKET)
+        )
+    } else {
+        format!("{} ctl", crate::util::shell_quote(&g.aterm))
+    };
     let census = g.vm.exec_complete(
         &format!(
             r#"collector_uid=$(/usr/bin/id -u)
@@ -6675,16 +6685,22 @@ printf '%s\n' '--- root broker log ---'
 printf '%s\n' '--- broker protocol ---'
 {aterm} lan status || collector_status=1
 printf '%s\n' '--- GUI control ---'
-{aterm} ctl ls || collector_status=1
+if [ {debug_successor} = 1 ] && [ ! -S {private_socket} ]; then
+  printf '%s\n' 'private successor control socket is absent after the row'
+else
+{ctl} ls || collector_status=1
 for f in "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
   [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] || continue
   collector_sid=$(/usr/bin/sed -n '2p' "$f")
   printf '%s\n' "$collector_sid" | /usr/bin/grep -Eq '^s-[0-9a-f]{{1,62}}$' || continue
-  {aterm} ctl "@$collector_sid" status || collector_status=1
-  {aterm} ctl "@$collector_sid" sys procs --json || collector_status=1
+  {ctl} "@$collector_sid" status || collector_status=1
+  {ctl} "@$collector_sid" sys procs --json || collector_status=1
 done
+fi
 exit "$collector_status""#,
             aterm = crate::util::shell_quote(&g.aterm),
+            debug_successor = u8::from(debug_successor),
+            private_socket = crate::util::shell_quote(debug_successor::SOCKET),
             broker_print = g.as_root(&format!(
                 "/bin/launchctl print system/{}",
                 aterm_uds::lan::LABEL

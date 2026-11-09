@@ -96,6 +96,9 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     CURRENT_CMD.with(|cell| {
         *cell.borrow_mut() = args.first().cloned().unwrap_or_default();
     });
+    CURRENT_ARGS.with(|cell| {
+        *cell.borrow_mut() = args.to_vec();
+    });
     PREAMBLE_DONE.with(|cell| cell.set(false));
     #[cfg(all(unix, not(test)))]
     {
@@ -416,6 +419,8 @@ thread_local! {
     static VIA_REROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command being run, for brew's usage-error help preamble.
     static CURRENT_CMD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The full argv, for picking a subcommand's preamble.
+    static CURRENT_ARGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Whether the usage preamble already printed this run.
     static PREAMBLE_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -503,6 +508,60 @@ fn brew_help_text(cmd: &str) -> &'static str {
         .map_or(help_texts::TOP, |(_, text)| text)
 }
 
+/// The help brew prints ahead of a usage error: subcommand
+/// parents (bundle, services) print their full parser help,
+/// which differs from the topic help; a subcommand-scope
+/// error prints that subcommand's help, and an unknown
+/// subcommand prints the topic help.
+fn brew_preamble_text(cmd: &str, message: &str) -> &'static str {
+    let cmd = canonical_help_command(cmd);
+    if message.contains("unknown subcommand:") {
+        return brew_help_text(cmd);
+    }
+    // Subcommand-parser errors (scope and depends_on forms)
+    // print the resolved subcommand's help; token-level
+    // errors print the parent's.
+    let sub_named = message
+        .strip_prefix("Error: Invalid usage: The `")
+        .and_then(|rest| rest.split('`').next());
+    let sub_from_argv = if message.starts_with("Error: Invalid usage: `--") {
+        CURRENT_ARGS.with(|cell| {
+            let argv = cell.borrow();
+            let mut it = argv.iter().skip(1).take_while(|a| a.as_str() != "--");
+            let mut found = None;
+            while let Some(arg) = it.next() {
+                if arg == "--file" {
+                    it.next();
+                } else if !arg.starts_with('-') {
+                    found = Some(match arg.as_str() {
+                        "upgrade" => "install".to_string(),
+                        "ls" => "list".to_string(),
+                        "i" => "info".to_string(),
+                        other => other.to_string(),
+                    });
+                    break;
+                }
+            }
+            found
+        })
+    } else {
+        None
+    };
+    if let Some(sub) = sub_named.map(str::to_string).or(sub_from_argv) {
+        let dotted = format!("{cmd}.{sub}");
+        if let Some((_, text)) = help_texts::PREAMBLES
+            .iter()
+            .find(|(name, _)| *name == dotted)
+        {
+            return text;
+        }
+    }
+    help_texts::PREAMBLES
+        .iter()
+        .find(|(name, _)| *name == cmd)
+        .map_or_else(|| brew_help_text(cmd), |(_, text)| text)
+}
+
 /// Brew prints the command's help before a usage-class error
 /// under the reroute: `Invalid usage:` errors get a blank line
 /// after the help, OptionParser invalid/ambiguous-option
@@ -522,7 +581,7 @@ pub(super) fn usage_preamble_for(cmd: &str, message: &str) {
         return;
     };
     PREAMBLE_DONE.with(|cell| cell.set(true));
-    eprint!("{}", brew_help_text(cmd));
+    eprint!("{}", brew_preamble_text(cmd, message));
     if blank {
         eprintln!();
     }
@@ -761,6 +820,19 @@ fn native_args(
     // Brew's disabled switches (`odisabled` in each command's
     // parser): usage errors in brew's exact wording, before any
     // command work. `--ask` is one (ask mode is the default).
+    // Direct-dialect commands brew does not have are unknown
+    // commands under the reroute.
+    if via_reroute() && matches!(cmd, "zap" | "switch") {
+        let dictionary: Vec<String> = command_names(true)
+            .iter()
+            .filter(|name| !matches!(**name, "zap" | "switch"))
+            .map(|s| (*s).to_string())
+            .collect();
+        return Err(InstallError::Failed(format!(
+            "Error: Invalid usage: Unknown command: brew {cmd}{}",
+            commands::command_suggestion(cmd, &dictionary)
+        )));
+    }
     let disabled_cmd = match cmd {
         "ls" => "list",
         "-S" => "search",
@@ -926,6 +998,10 @@ fn native_args(
             ("--cask", &["--casks"]),
             ("--command", &["--commands"]),
         ]],
+        "info" => &[
+            &[m("--sizes"), m("--installed")],
+            &[m("--sizes"), m("--eval-all")],
+        ],
         "desc" => &[&[
             ("--search", &["-s"]),
             ("--name", &["-n"]),
@@ -1210,6 +1286,138 @@ fn native_args(
         }
     }
     if cmd == "bundle" {
+        // Token-level OptionParser errors first: a switch brew's
+        // bundle parser never declared is invalid (or ambiguous
+        // as a prefix), ahead of conflicts and scope checks.
+        {
+            const BUNDLE_LONGS: &[&str] = &[
+                "all",
+                "brews",
+                "cask",
+                "casks",
+                "check",
+                "cleanup",
+                "deny-network",
+                "describe",
+                "file",
+                "force",
+                "force-cleanup",
+                "formula",
+                "formulae",
+                "global",
+                "help",
+                "install",
+                "jobs",
+                "no-brews",
+                "no-cask",
+                "no-casks",
+                "no-cleanup-brew",
+                "no-cleanup-cask",
+                "no-cleanup-tap",
+                "no-describe",
+                "no-dump-brew",
+                "no-dump-cask",
+                "no-dump-tap",
+                "no-formula",
+                "no-formulae",
+                "no-restart",
+                "no-secrets",
+                "no-tap",
+                "no-taps",
+                "no-upgrade",
+                "quiet",
+                "sandbox",
+                "services",
+                "tap",
+                "taps",
+                "upgrade",
+                "upgrade-formula",
+                "upgrade-formulae",
+                "verbose",
+                "debug",
+                "zap",
+            ];
+            const BUNDLE_EXTS: &[&str] = &[
+                "mas", "vscode", "go", "cargo", "uv", "flatpak", "winget", "krew", "npm",
+            ];
+            let known_long = |name: &str| -> Option<bool> {
+                // Some(true): known; Some(false): ambiguous prefix; None: unknown.
+                let mut generated: Vec<String> = Vec::new();
+                for ext in BUNDLE_EXTS {
+                    generated.push((*ext).to_string());
+                    generated.push(format!("no-{ext}"));
+                    generated.push(format!("no-cleanup-{ext}"));
+                    generated.push(format!("no-dump-{ext}"));
+                }
+                let all = BUNDLE_LONGS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .chain(generated);
+                let mut prefix_matches = 0usize;
+                for known in all {
+                    if known == name {
+                        return Some(true);
+                    }
+                    if known.starts_with(name) {
+                        prefix_matches += 1;
+                    }
+                }
+                match prefix_matches {
+                    0 => None,
+                    1 => Some(true),
+                    _ => Some(false),
+                }
+            };
+            let mut seen_sub = false;
+            let mut exec_command_seen = false;
+            let mut args = rest.iter().take_while(|a| a.as_str() != "--").peekable();
+            let mut subcommand: Option<&str> = None;
+            while let Some(arg) = args.next() {
+                if exec_command_seen {
+                    break;
+                }
+                if !arg.starts_with('-') || arg.as_str() == "-" {
+                    if !seen_sub {
+                        seen_sub = true;
+                        subcommand = Some(arg.as_str());
+                    } else if subcommand == Some("exec") {
+                        exec_command_seen = true;
+                    }
+                    continue;
+                }
+                if matches!(
+                    arg.as_str(),
+                    "--file" | "--jobs" | "--upgrade-formulae" | "--upgrade-formula"
+                ) {
+                    args.next();
+                    continue;
+                }
+                if let Some(long) = arg.strip_prefix("--") {
+                    let name = long.split('=').next().unwrap_or(long);
+                    match known_long(name) {
+                        Some(true) => {}
+                        Some(false) => {
+                            return Err(InstallError::Failed(format!(
+                                "Error: ambiguous option: --{name}"
+                            )));
+                        }
+                        None => {
+                            return Err(InstallError::Failed(format!(
+                                "Error: invalid option: {arg}"
+                            )));
+                        }
+                    }
+                } else if arg.len() > 1
+                    && !arg[1..]
+                        .chars()
+                        .all(|c| matches!(c, 'f' | 'g' | 'v' | 'q' | 'd' | 'h'))
+                {
+                    return Err(InstallError::Failed(format!(
+                        "Error: invalid option: {arg}"
+                    )));
+                }
+            }
+        }
         // Brew's bundle type toggles: each enabled spelling
         // conflicts with the disabled, no-cleanup and no-dump
         // forms, registered in type order (extensions in
@@ -1400,7 +1608,7 @@ fn native_args(
         ];
         const SUBCOMMANDS: &[&str] = &[
             "add", "check", "cleanup", "dump", "edit", "env", "exec", "install", "list", "remove",
-            "sh",
+            "sh", "upgrade",
         ];
         // The first positional names the subcommand; --file's
         // separate value is not positional.
@@ -1426,7 +1634,11 @@ fn native_args(
                 "Error: Invalid usage: unknown subcommand: `{named}`"
             )));
         }
-        let subcommand = first_positional.unwrap_or("install");
+        // `bundle upgrade` is shorthand for `bundle install --upgrade`.
+        let subcommand = match first_positional {
+            Some("upgrade") | None => "install",
+            Some(other) => other,
+        };
         if SUBCOMMANDS.contains(&subcommand) {
             let mut seen_subcommand = false;
             for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
@@ -1482,6 +1694,16 @@ fn native_args(
                     }
                 }
             }
+        }
+        if subcommand == "install"
+            && has_flag_eq(rest, "--zap")
+            && !has_flag_eq(rest, "--force-cleanup")
+            && !env_set("HOMEBREW_BUNDLE_INSTALL_CLEANUP")
+        {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: `--zap` cannot be passed without `--force-cleanup` or `$HOMEBREW_BUNDLE_INSTALL_CLEANUP`."
+                    .to_string(),
+            ));
         }
         return bundle_args(rest).map(|prepared| (prepared, rest.to_vec()));
     }
@@ -1562,6 +1784,7 @@ fn native_args(
                 "--analytics",
                 "--days",
                 "--category",
+                "--sizes",
                 "--github",
                 "--verbose",
                 "-v",
@@ -1652,6 +1875,7 @@ fn native_args(
             true,
         ),
         "zap" => (&["--force", "-f", "--cask", "--casks"], 1, usize::MAX, true),
+        "postinstall" => (&[], 1, usize::MAX, false),
         "which-formula" => (&["--explain"], 0, usize::MAX, true),
         "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
         "autoremove" => (&["--dry-run", "-n"], 0, 0, true),
@@ -2688,7 +2912,7 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
             Some(sel) if !sel.extensions_enabled => Ok(None),
             _ => Err(unsupported()),
         },
-        Some("install") | None => brewfile_args(rest.get(1..).unwrap_or(&[]), false),
+        Some("install" | "upgrade") | None => brewfile_args(rest.get(1..).unwrap_or(&[]), false),
         Some("check") => brewfile_args(rest.get(1..).unwrap_or(&[]), true),
         Some("list") => bundle_list_args(rest.get(1..).unwrap_or(&[])),
         Some("cleanup") => {
@@ -2700,6 +2924,7 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
                 _ => Err(unsupported()),
             }
         }
+        Some("edit") => Ok(None),
         Some(flag) if flag.starts_with("--file") => brewfile_args(rest, false),
         _ => Err(unsupported()),
     }
@@ -2852,6 +3077,32 @@ fn brewfile_args(
             )
         {
             // `bundle check` display switches.
+        } else if !check
+            && (matches!(
+                arg.as_str(),
+                "--verbose"
+                    | "-v"
+                    | "--quiet"
+                    | "-q"
+                    | "--debug"
+                    | "-d"
+                    | "--no-upgrade"
+                    | "--upgrade"
+                    | "--force"
+                    | "-f"
+            ) || arg.starts_with("--upgrade-formulae=")
+                || arg.starts_with("--upgrade-formula=")
+                || arg.starts_with("--jobs="))
+        {
+            // `bundle install` upgrade/display switches.
+        } else if !check
+            && matches!(
+                arg.as_str(),
+                "--upgrade-formulae" | "--upgrade-formula" | "--jobs"
+            )
+        {
+            // Space-form values ride along untouched.
+            let _ = it.next();
         } else {
             return Err(unsupported());
         }
@@ -3151,6 +3402,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         }
         "command-not-found-init" => return commands::cmd_command_not_found_init(),
         "services" => return services::cmd_services(prefix, rest),
+        "postinstall" => {
+            let api0 = api::Api::new(prefix.clone());
+            return commands::cmd_postinstall(prefix, &api0, rest);
+        }
         "unpack" => {
             let api0 = api::Api::new(prefix.clone());
             return commands::cmd_unpack(prefix, &api0, args, rest);
@@ -3356,8 +3611,16 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             let want_cask = has_flag(rest, "--cask", "");
             let want_formula = has_flag(rest, "--formula", "");
             each_name(rest, |n| {
-                let short = Formula::short_name(n);
-                let token = api::canonical_cask_token(short);
+                let short_owned =
+                    commands::canonical_installed_name(prefix, &api, Formula::short_name(n), false);
+                let short = short_owned.as_str();
+                let token_owned = commands::canonical_installed_name(
+                    prefix,
+                    &api,
+                    api::canonical_cask_token(short),
+                    true,
+                );
+                let token = token_owned.as_str();
                 if !want_cask && prefix.installed_one(prefix::Kind::Formula, short).is_some() {
                     if prefix.pinned_version(short).is_some() {
                         tty::opoo!("Warning: {short} already pinned");
@@ -4115,7 +4378,6 @@ mod admission_tests {
             ),
             ("link", vec!["--HEAD", "wget"]),
             ("services", vec!["start", "wget"]),
-            ("postinstall", vec!["wget"]),
             ("--cache", vec!["-s", "wget"]),
             ("--cache", vec!["--HEAD", "wget"]),
             ("desc", vec!["-s", "/(?=http)client/"]),

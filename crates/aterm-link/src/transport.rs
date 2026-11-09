@@ -333,7 +333,7 @@ mod tests {
             decode_request, encode_response, read_frame, write_frame, NonceExt, Request, Response,
         };
         use std::os::unix::net::UnixListener;
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::test_scratch_dir("sched");
         let path = root.path().join("broker.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let started = Instant::now() - Duration::from_secs(6);
@@ -379,10 +379,8 @@ mod tests {
     #[test]
     fn a_connects_deadline_ends_a_hello_nobody_answers_and_a_publish_nobody_reads() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("atlink-deadline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
-        let sock = dir.join("s.sock");
-        let _ = std::fs::remove_file(&sock);
+        let dir = crate::test_scratch_dir("deadline");
+        let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let path = sock.to_str().expect("utf8").to_string();
         let deadline = Duration::from_millis(50);
@@ -416,7 +414,6 @@ mod tests {
             );
             drop(peer);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A broker that sent a subscription its mail and hung up BEFORE the subscriber
@@ -431,6 +428,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let dir = aterm_tempfile::Builder::new()
             .prefix("atlink-hungup")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let sock = dir.path().join("s.sock");
@@ -505,6 +503,7 @@ mod tests {
     fn a_fetch_below_the_retained_floor_reads_on_from_it() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atlink-kept")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let sock = dir.path().join("b.sock");
@@ -546,7 +545,7 @@ mod tests {
     #[test]
     fn a_mint_secret_is_owner_only_long_enough_and_read_byte_for_byte() {
         use std::os::unix::fs::PermissionsExt;
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let scratch = crate::test_scratch_dir("secret");
         let dir = scratch.path().join("root");
         std::fs::create_dir(&dir).expect("root");
         let mode = |path: &std::path::Path, mode| {
@@ -664,7 +663,7 @@ mod tests {
     #[test]
     fn a_mint_secret_is_refused_for_an_access_list_allow_entry_not_a_deny_entry() {
         use std::os::unix::fs::PermissionsExt;
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let scratch = crate::test_scratch_dir("secret");
         let dir = scratch.path().join("root");
         std::fs::create_dir(&dir).expect("root");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -740,7 +739,7 @@ mod tests {
             println!("\nbare-name=read");
             return;
         }
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let scratch = crate::test_scratch_dir("secret");
         let here = scratch.path().join("here");
         std::fs::create_dir(&here).expect("here");
         let secret = here.join("mint.secret");

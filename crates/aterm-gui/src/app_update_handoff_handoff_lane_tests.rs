@@ -1223,17 +1223,14 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
         app.sessionless_waited.automatic, lane_read,
         "the lane's entry is its own"
     );
-    // The automatic lane: one read, then its failure, which it does try again; then it reads
+    // The automatic lane: one read, then a deferral, which it does try again; then it reads
     // afresh.
     app.sessionless_waited.automatic = deadline(&app);
     let own = waited_read_ended(&mut app, ApplyMode::Automatic);
     let failed = app
         .sessionless_preverify_wait(ApplyMode::Automatic, &ticket)
         .expect("the read answered the attempt");
-    assert!(
-        !failed.is_activity_deferred() && !failed.is_refused(),
-        "{failed:?}"
-    );
+    assert!(failed.is_activity_deferred(), "{failed:?}");
     assert!(failed.to_string().contains("tried again later"), "{failed}");
     assert_eq!(deadline(&app), Some(own), "no read started");
     assert_eq!(
@@ -1244,7 +1241,7 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
     let deferred = reads_again(&mut app, ApplyMode::Automatic);
     assert!(deferred.is_activity_deferred(), "{deferred:?}");
     // A person's press on an image a relaunch replaces goes on to the cold lane instead, which
-    // relaunches and verifies again; the automatic lane fails there too.
+    // relaunches and verifies again; the automatic lane remains deferred.
     app.launch_image_kept = false;
     app.sessionless_waited.person = deadline(&app);
     waited_read_ended(&mut app, ApplyMode::Immediate);
@@ -1260,8 +1257,8 @@ fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop(
     );
     assert!(
         app.sessionless_preverify_wait(ApplyMode::Automatic, &ticket)
-            .is_some_and(|failed| !failed.is_activity_deferred() && !failed.is_refused()),
-        "CONTROL: the automatic lane's failure stands"
+            .is_some_and(|failed| failed.is_activity_deferred()),
+        "CONTROL: the automatic lane's deferral stands"
     );
     // A `--hold` pane, which the admission refuses to relaunch over, keeps the press's failure.
     let ids: Vec<u64> = app.pool.iter().map(|session| session.id).collect();

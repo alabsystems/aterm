@@ -43,8 +43,8 @@ impl Reader {
             .name("commons-vault-reader".into())
             .spawn(move || {
                 loop {
-                    worker.wait(INTERVAL);
-                    if worker.requested() {
+                    worker.sleep(INTERVAL);
+                    if worker.is_set() {
                         break;
                     }
                     if !enabled(&config).unwrap_or(false)
@@ -58,7 +58,7 @@ impl Reader {
                     if generation::guard_until(&paths, false, deadline).is_err() {
                         continue;
                     }
-                    if worker.requested() {
+                    if worker.is_set() {
                         break;
                     }
                     // This member-only pass shares one bound across discovery,
@@ -76,7 +76,7 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.stop.request();
+        self.stop.set();
         if let Some(task) = self.task.take() {
             let _ = task.join();
         }

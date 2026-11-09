@@ -12,8 +12,9 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 
 const HELPER_REAP: Duration = Duration::from_millis(250);
 
-/// The AGGREGATE ceiling on one apply's verification work — see [`ApplyBudget`].
-pub const APPLY_BUDGET: Duration = Duration::from_secs(8);
+/// The aggregate apply window matches the ordinary native-helper window.
+/// In-session authentication runs before readers park, so it has no shorter UI latency cap.
+pub const APPLY_BUDGET: Duration = HELPER_TIMEOUT;
 
 thread_local! {
     static APPLY_DEADLINE: std::cell::Cell<Option<Instant>> =
@@ -26,7 +27,11 @@ pub struct ApplyBudget(Option<Instant>);
 impl ApplyBudget {
     /// Start a budget of `limit`, replacing any budget already in force.
     pub fn start(limit: Duration) -> Self {
-        Self(APPLY_DEADLINE.with(|d| d.replace(Some(crate::instant_after(Instant::now(), limit)))))
+        Self::start_at(limit, Instant::now())
+    }
+
+    fn start_at(limit: Duration, started: Instant) -> Self {
+        Self(APPLY_DEADLINE.with(|d| d.replace(Some(crate::instant_after(started, limit)))))
     }
 
     /// Push the deadline out by `elapsed`.
@@ -951,10 +956,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_required_update_helper_waits_for_its_native_completion() {
-        for (age, refuses) in [(31, false), (61, false), (31, true)] {
+        for (age, refuses, applying) in [
+            (31, false, false),
+            (61, false, false),
+            (31, true, false),
+            (31, false, true),
+            (61, false, true),
+            (31, true, true),
+        ] {
             let age = Duration::from_secs(age);
             let expired = age >= aterm_spec::wait::MUST_HAPPEN;
-            let root = aterm_tempfile::tempdir().unwrap();
+            let started = Instant::now() - age;
+            let _budget = applying.then(|| ApplyBudget::start_at(APPLY_BUDGET, started));
+            let root = crate::paths::scratch_dir("verify-helper");
             let ready = root.path().join("native-ready");
             let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
             child
@@ -968,19 +982,20 @@ mod tests {
             if refuses {
                 child.env("ATERM_TEST_UPDATE_HELPER_REFUSES", "1");
             }
-            let result =
-                output_bounded_started(&mut child, "owned required helper", Instant::now() - age);
+            let result = output_bounded_started(&mut child, "owned required helper", started);
             if expired {
                 let refusal = result.expect_err("an expired hang detector admits no new helper");
                 assert!(crate::is_passing_refusal(&refusal));
                 assert!(!ready.exists());
                 continue;
             }
+            let output = result.unwrap_or_else(|why| {
+                panic!("native helper rejected at age {age:?}, applying={applying}: {why}")
+            });
             assert_eq!(
                 std::fs::read(&ready).unwrap(),
                 b"the actual updater helper ran\n"
             );
-            let output = result.expect("a scheduled native verification helper is not a rejection");
             if refuses {
                 assert_eq!(
                     output.status.code(),
@@ -995,7 +1010,7 @@ mod tests {
                 );
             }
         }
-        let root = aterm_tempfile::tempdir().unwrap();
+        let root = crate::paths::scratch_dir("verify-helper");
         let ready = root.path().join("outside-apply-budget");
         let _budget = ApplyBudget::start(Duration::ZERO);
         let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
@@ -1473,6 +1488,7 @@ mod tests {
         let exited = std::process::ExitStatus::from_raw(1 << 8);
         let bundle = aterm_tempfile::Builder::new()
             .prefix("aterm-quoted-key-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let app = bundle.path().join("aterm.app");
@@ -1548,6 +1564,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
         let bundle = aterm_tempfile::Builder::new()
             .prefix("aterm-probe-signal-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let app = bundle.path().join("aterm.app");
@@ -1587,6 +1604,7 @@ mod tests {
         aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-codesign-tamper-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let unsigned = |name: &str| unsigned_app(root.path(), name);
@@ -1691,6 +1709,7 @@ mod tests {
         aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-codesign-fifo-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let fifo = |at: &Path| {
@@ -1809,6 +1828,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-team-id-moment-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let exe = root.path().join("aterm.app/Contents/MacOS/aterm");
@@ -1867,6 +1887,7 @@ mod tests {
         aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-check-bundle-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let app = ad_hoc_bundle(
@@ -1926,6 +1947,7 @@ mod tests {
         aterm_uds::deadline::require_trust_service();
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-check-bundles-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let plist = |build: u32| {
@@ -1978,6 +2000,7 @@ mod tests {
     fn a_bundle_check_helper_that_never_answers_is_a_passing_refusal_at_the_budget() {
         let root = aterm_tempfile::Builder::new()
             .prefix("aterm-check-bundle-fifo-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let app = root.path().join("aterm.app");

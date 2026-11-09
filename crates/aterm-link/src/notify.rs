@@ -751,6 +751,7 @@ impl Store {
         std::fs::create_dir_all(&logs)?;
         let scratch = aterm_tempfile::Builder::new()
             .prefix(".carry-")
+            .suffix(".noindex")
             .tempdir_in(&logs)?;
         let built = Store {
             root: scratch.path().to_path_buf(),
@@ -3202,14 +3203,52 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Scratch {
+        _dir: std::sync::Arc<aterm_tempfile::TempDir>,
+        path: String,
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = str;
+
+        fn deref(&self) -> &str {
+            &self.path
+        }
+    }
+
+    impl AsRef<str> for Scratch {
+        fn as_ref(&self) -> &str {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            Path::new(&self.path)
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for Scratch {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            std::ffi::OsStr::new(&self.path)
+        }
+    }
+
+    impl std::fmt::Display for Scratch {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.path.fmt(f)
+        }
+    }
+
     /// A fresh scratch dir for `tag`. Its prefix is short because a broker socket a test binds in
     /// it must fit `sun_path` ([`crate::enable::SUN_PATH_MAX`] bytes, its NUL included). Under the
     /// build shim's `$TMPDIR/.ubd/` with a five-digit pid, the old `atlink-notify-` prefix made
     /// `need-derived-late-false/b.sock` a path of 104 or 105 bytes, past the 103 that fit.
-    fn scratch(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("atn-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        p.to_string_lossy().into_owned()
+    fn scratch(tag: &str) -> Scratch {
+        let dir = std::sync::Arc::new(crate::test_scratch_dir(tag));
+        let path = dir.path().join("s").to_string_lossy().into_owned();
+        Scratch { _dir: dir, path }
     }
 
     fn cfg(dir: &str) -> Config {
@@ -3500,7 +3539,8 @@ mod tests {
         for bad in ["invalid-utf8", "malformed", "dangling"] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("notify-owner")
-                .tempdir()
+                .suffix(".noindex")
+                .tempdir_in("/tmp")
                 .unwrap();
             let store = Store::open(dir.path().to_str().unwrap()).unwrap();
             store.set_cursor("attention", 900).unwrap();
@@ -3548,7 +3588,8 @@ mod tests {
         };
         let dir = aterm_tempfile::Builder::new()
             .prefix("notify-prune")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .unwrap();
         let store = Store::open(dir.path().to_str().unwrap()).unwrap();
         store
@@ -7966,7 +8007,7 @@ mod tests {
 
     #[test]
     fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
-        let dir = aterm_tempfile::TempDir::new().expect("owned notifier");
+        let dir = crate::test_scratch_dir("carry-ref");
         let from = Store {
             root: dir.path().join("from"),
         };
@@ -8035,7 +8076,7 @@ mod tests {
 
     #[test]
     fn a_carry_retires_only_its_exclusively_owned_stage() {
-        let dir = aterm_tempfile::TempDir::new().expect("owned carry parent");
+        let dir = crate::test_scratch_dir("carry-own");
         let from = Store {
             root: dir.path().join("from"),
         };

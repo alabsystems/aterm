@@ -432,10 +432,13 @@ fn install_inner(
                 cask.token
             )));
         } else {
-            super::tty::opoo!(
-                "Warning: Not upgrading {}, the latest version is already installed",
-                cask.token
-            );
+            // Brew's dry run says nothing for an up-to-date cask.
+            if !dry_run {
+                super::tty::opoo!(
+                    "Warning: Not upgrading {}, the latest version is already installed",
+                    cask.token
+                );
+            }
             return Ok(inst.version);
         }
     }

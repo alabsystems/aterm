@@ -2519,37 +2519,37 @@ impl App {
         wid: WindowId,
         hit: Option<(crate::tab_model::ViewId, crate::native_ui::UiKey)>,
     ) {
-        let mut visible_native_views = Vec::new();
+        let mut hover_changed = Vec::new();
         if let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) {
-            let mut push_if_native = |view: &crate::tab_model::ViewId| {
-                if matches!(
-                    self.view_store.get(*view),
+            let view_store = &self.view_store;
+            let native_runtime = &mut self.native_runtime;
+            let mut update_if_native = |view: &crate::tab_model::ViewId| {
+                let target = *view;
+                if !matches!(
+                    view_store.get(target),
                     Some(crate::tab_model::View::Native(_))
                 ) {
-                    visible_native_views.push(*view);
+                    return;
+                }
+                let desired = hit
+                    .as_ref()
+                    .filter(|(hit_view, _)| *hit_view == target)
+                    .map(|(_, key)| key.clone());
+                if native_runtime.change_view_state(target, |state| {
+                    let common = state.common_mut();
+                    let moved = common.hovered != desired;
+                    if moved {
+                        common.hovered = desired;
+                    }
+                    moved
+                }) {
+                    hover_changed.push(target);
                 }
             };
             if (tab.zoomed && tab.root.contains(tab.focus)) || tab.root.len() == 1 {
-                push_if_native(&tab.focus);
+                update_if_native(&tab.focus);
             } else {
-                tab.root.visit(&mut push_if_native);
-            }
-        }
-        let mut hover_changed = Vec::new();
-        for target in visible_native_views {
-            let desired = hit
-                .as_ref()
-                .filter(|(hit_view, _)| *hit_view == target)
-                .map(|(_, key)| key.clone());
-            if self.native_runtime.change_view_state(target, |state| {
-                let common = state.common_mut();
-                let moved = common.hovered != desired;
-                if moved {
-                    common.hovered = desired;
-                }
-                moved
-            }) {
-                hover_changed.push(target);
+                tab.root.visit(&mut update_if_native);
             }
         }
         for target in hover_changed {
@@ -12243,6 +12243,28 @@ mod tests {
             visible_leaf_plan_builds(),
             0,
             "palette_live, publish_menu_live, overlay_coordinate_transform, and dispatch_ime_event need no VisibleLeafPlan"
+        );
+
+        // 6. Single-pane/zoomed focus_pane_would_move and single-pane shared_target_geometry build 0 plans.
+        let mut single_native_app = App::headless_for_test();
+        assert!(
+            single_native_app
+                .open_settings_tab(crate::native_settings::SettingsRoute::CursorStyles)
+        );
+        reset_visible_leaf_plan_builds();
+        for dir in [
+            crate::pane::FocusDir::Left,
+            crate::pane::FocusDir::Right,
+            crate::pane::FocusDir::Up,
+            crate::pane::FocusDir::Down,
+        ] {
+            assert!(!single_native_app.focus_pane_would_move(wid, dir));
+        }
+        let _ = single_native_app.shared_target_geometry(0);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "single-pane native focus_pane_would_move and shared_target_geometry need no VisibleLeafPlan"
         );
 
         #[cfg(a11y_tree)]

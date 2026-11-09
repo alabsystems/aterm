@@ -2315,8 +2315,8 @@ impl NodePassDue {
 pub struct NodePassHost<'a> {
     /// This Mac's vault.
     pub paths: &'a Paths,
-    /// Ends the loop.
-    pub stop: &'a std::sync::atomic::AtomicBool,
+    /// Ends the loop, and wakes it from its wait between looks.
+    pub stop: &'a aterm_uds::stop::Stop,
     /// Whether the node's switches hold sharing off now (`[swarm] enabled = false`, this Mac left
     /// the fleet): no pass runs while one does.
     pub held: &'a dyn Fn() -> bool,
@@ -2353,7 +2353,7 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
     let mut unfinished = 0_u32;
     let mut converge = NodeConverge::default();
     let mut inputs = None;
-    while !host.stop.load(std::sync::atomic::Ordering::Acquire) {
+    while !host.stop.is_set() {
         if !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home) {
             let inputs = inputs.get_or_insert_with(host.make_inputs);
             let stamp = records_stamp(host.paths);
@@ -2382,7 +2382,7 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
         } else {
             converge.due.paused();
         }
-        std::thread::sleep(host.pace.look);
+        host.stop.sleep(host.pace.look);
     }
 }
 

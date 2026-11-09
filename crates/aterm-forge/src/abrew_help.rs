@@ -42,6 +42,7 @@ struct Tables {
     top: String,
     texts: BTreeMap<String, String>,
     aliases: BTreeMap<String, String>,
+    preambles: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +134,7 @@ impl Capture {
                 "top",
                 "canonical",
                 "aliases",
+                "preambles",
             ],
         )?;
         if value.get("schema").and_then(Value::as_u64) != Some(1)
@@ -144,6 +146,7 @@ impl Capture {
             top: string(&value, "top")?,
             texts: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            preambles: BTreeMap::new(),
         };
         for row in records(&value, "canonical")? {
             object_fields(row, &["name", "stdout"])?;
@@ -169,6 +172,19 @@ impl Capture {
             }
             if tables.aliases.insert(name.clone(), target).is_some() {
                 return Err(format!("duplicate alias {name:?}"));
+            }
+        }
+        if value.get("preambles").is_some() {
+            for row in records(&value, "preambles")? {
+                object_fields(row, &["name", "stdout"])?;
+                let name = string(row, "name")?;
+                if tables
+                    .preambles
+                    .insert(name.clone(), string(row, "stdout")?)
+                    .is_some()
+                {
+                    return Err(format!("duplicate preamble name {name:?}"));
+                }
             }
         }
         let capture = Self {
@@ -221,6 +237,20 @@ impl Capture {
                 return Err(format!("invalid canonical help {name:?}"));
             }
         }
+        for (name, text) in &self.tables.preambles {
+            // A preamble names a canonical command, or one of its
+            // subcommands as `<command>.<subcommand>`.
+            let parent = name.split('.').next().unwrap_or(name);
+            if !command_name(name)
+                || text.is_empty()
+                || !self.tables.texts.contains_key(parent)
+                || name.matches('.').count() > 1
+            {
+                return Err(format!(
+                    "preamble {name:?} has no canonical help or is empty"
+                ));
+            }
+        }
         for (alias, target) in &self.tables.aliases {
             if !command_name(alias)
                 || self.tables.texts.contains_key(alias)
@@ -233,6 +263,7 @@ impl Capture {
         }
         for text in std::iter::once(&self.tables.top)
             .chain(self.tables.texts.values())
+            .chain(self.tables.preambles.values())
             .chain([&self.reference, &self.provenance])
         {
             if foreign_user_path(text) {
@@ -255,9 +286,15 @@ impl Capture {
             .iter()
             .map(|(name, target)| json!({"name": name, "target": target}))
             .collect();
+        let preambles: Vec<Value> = self
+            .tables
+            .preambles
+            .iter()
+            .map(|(name, stdout)| json!({"name": name, "stdout": stdout}))
+            .collect();
         let value = json!({"schema": 1, "reference": self.reference, "mode": "piped", "columns": self.columns,
             "provenance": self.provenance, "source_sha256": self.source_sha256, "source_commit": self.source_commit, "top": self.tables.top,
-            "canonical": canonical, "aliases": aliases});
+            "canonical": canonical, "aliases": aliases, "preambles": preambles});
         let mut encoded = aterm_json::to_vec(&value).map_err(|e| e.to_string())?;
         encoded.push(b'\n');
         Ok(encoded)
@@ -321,6 +358,10 @@ fn render(capture: &Capture, generator: &str, input_hash: &str) -> String {
     out.push_str("];\n\npub(super) const ALIASES: &[(&str, &str)] = &[\n");
     for (alias, target) in &capture.tables.aliases {
         out.push_str(&format!("    ({alias:?}, {target:?}),\n"));
+    }
+    out.push_str("];\n\n/// Parser help for subcommand parents, printed ahead of usage\n/// errors where it differs from the topic help above.\npub(super) const PREAMBLES: &[(&str, &str)] = &[\n");
+    for (name, text) in &capture.tables.preambles {
+        out.push_str(&format!("    ({name:?}, {}),\n", literal(text)));
     }
     out.push_str("];\n");
     out

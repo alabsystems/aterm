@@ -1607,7 +1607,8 @@ pub(crate) mod tests {
             let changed_version = secrets(&paths, first.observed_at_ms);
             assert_eq!(changed_version.network_materialization, None, "{key}");
             if key == "records_digest" {
-                assert_eq!(changed_version.availability, ServiceAvailability::Cached);
+                // An asserted applied log with no authenticated records cannot prove local use.
+                assert_eq!(changed_version.availability, ServiceAvailability::Unknown);
             }
             fsx::write_atomic(&state_path, state.as_bytes(), 0o600).unwrap();
             assert_eq!(

@@ -15650,19 +15650,13 @@ mod tests {
     fn a_refused_status_batch_never_fans_out() {
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::net::UnixListener;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         for batch_reply in [
             "ERR main thread did not answer within the placement deadline\n",
             "ERR usage: sessions\n",
         ] {
-            let scratch = std::env::temp_dir().join(format!(
-                "al-status-batch-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&scratch).unwrap();
+            let dir = crate::test_scratch_dir("batch");
+            let scratch = dir.path();
             let socket = scratch.join("ctl.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             let responder = std::thread::spawn(move || {
@@ -15762,7 +15756,6 @@ mod tests {
                 "{batch_reply:?}: no session's status, and the meta of only a session the round \
                  publishes for whose slot no row sampled"
             );
-            std::fs::remove_dir_all(scratch).unwrap();
         }
     }
 
@@ -15912,7 +15905,8 @@ mod tests {
     fn bridge_deadlines_restore_then_move_the_shipping_arm_from_far_to_near() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-dl")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("the fixture dir");
         let state_path = dir.path().join("state");
         StateDir::open(&state_path)
@@ -16457,6 +16451,7 @@ mod tests {
         };
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-silent")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("the fixture dir");
         let sock = dir.path().join("b.sock");
@@ -17296,6 +17291,7 @@ mod tests {
             let lease = FixtureLease::take();
             let dir = aterm_tempfile::Builder::new()
                 .prefix("al-v")
+                .suffix(".noindex")
                 .tempdir_in("/tmp")
                 .expect("the fixture dir");
             let sock = dir.path().join("v.sock");
@@ -35421,18 +35417,16 @@ mod tests {
             })
             .collect();
         let at = |tag: &str, node: Option<&str>| {
-            let dir =
-                std::env::temp_dir().join(format!("atlink-node-for-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            let state = StateDir::open(&dir).expect("state dir");
+            let dir = crate::test_scratch_dir(tag);
+            let state = StateDir::open(dir.path()).expect("state dir");
             if let Some(n) = node {
-                std::fs::write(dir.join("node"), format!("{n}\n")).expect("seed node");
+                std::fs::write(dir.path().join("node"), format!("{n}\n")).expect("seed node");
             }
             (dir, state)
         };
         let (s, n) = ("n-00000000000000bb", "n-00000000000000aa");
 
-        let (dir, state) = at("same", Some(s));
+        let (_dir, state) = at("same", Some(s));
         assert_eq!(node_for(&state, &ring(s)).unwrap(), s);
         let mut both = ring(s);
         both.extend(person.clone());
@@ -35444,21 +35438,18 @@ mod tests {
             "{e}"
         );
         assert_eq!(state.node().as_deref(), Some(s));
-        let _ = std::fs::remove_dir_all(&dir);
 
-        let (dir, state) = at("empty", None);
+        let (_dir, state) = at("empty", None);
         let e = node_for(&state, &ring(n)).unwrap_err();
         assert!(e.to_string().contains(n), "{e}");
         assert_eq!(state.node(), None, "a refused start writes no node id");
         let minted = node_for(&state, &person).unwrap();
         assert!(crate::enable::is_node_id(&minted), "{minted}");
         assert_eq!(node_for(&state, &[]).unwrap(), minted);
-        let _ = std::fs::remove_dir_all(&dir);
 
-        let (dir, state) = at("person", Some("h-x"));
+        let (_dir, state) = at("person", Some("h-x"));
         assert!(node_for(&state, &[]).is_err());
         assert!(node_for(&state, &person).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -36309,7 +36300,8 @@ mod tests {
     fn a_cap_file_others_can_read_is_refused_naming_the_file_and_the_chmod() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-wide")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         for mode in [0o644, 0o640, 0o604, 0o660] {
             let path = a_ring_at(dir.path(), "wide.cap", mode);
@@ -36330,7 +36322,8 @@ mod tests {
     fn a_fifo_for_a_cap_file_is_refused_without_waiting_for_a_writer() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-fifo")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let fifo = dir.path().join("fifo.cap");
         let made = aterm_uds::spawnfd::command("mkfifo")
@@ -36361,7 +36354,8 @@ mod tests {
     fn a_symlink_for_a_cap_file_is_refused_without_following_it() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-link")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let real = a_ring_at(dir.path(), "real.cap", 0o600);
         let link = dir.path().join("link.cap");
@@ -36387,7 +36381,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-kept")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
             .expect("a directory others can list");
@@ -36438,7 +36433,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-start")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let real = a_ring_at(dir.path(), "node.cap", 0o600);
         let bytes = std::fs::read(&real).unwrap();
@@ -36512,7 +36508,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-cap-held")
-            .tempdir()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .expect("scratch");
         let path = a_ring_at(dir.path(), "node.cap", 0o600);
         let files = vec![path.clone()];

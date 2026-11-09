@@ -305,16 +305,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod survey {
         use super::super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-        fn temp_root() -> PathBuf {
-            let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root =
-                std::env::temp_dir().join(format!("aterm-which-copy-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&root).unwrap();
-            root
+        fn temp_root() -> crate::paths::ScratchDir {
+            crate::paths::scratch_dir("which-copy")
         }
 
         fn make_bundle(app: &Path, plist_body: Option<&str>) -> PathBuf {

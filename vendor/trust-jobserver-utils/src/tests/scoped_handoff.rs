@@ -4,6 +4,30 @@ use super::*;
 
 const MODE: &str = "TRUST_SCOPED_HANDOFF_TEST";
 const TEST: &str = "handoff::scoped_tests::scoped_member_transport";
+const NAMED: &str = "TRUST_SCOPED_NAMED_TEST";
+const EXACT: &str = "handoff::scoped_tests::scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement";
+const SCOPED_READY_HANG: Duration = Duration::from_secs(60);
+
+fn readiness_deadline(started: Instant) -> Instant {
+    started + SCOPED_READY_HANG
+}
+
+struct OwnedMember(std::process::Child);
+impl std::ops::Deref for OwnedMember {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl std::ops::DerefMut for OwnedMember {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+impl Drop for OwnedMember {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 fn child(mode: &str, endpoint: &ScopedHandoff) -> Command {
     let mut child = Command::new(std::env::current_exe().unwrap());
@@ -79,6 +103,15 @@ fn scoped_member_transport() {
         }
         return;
     }
+    scoped_members_with_age(Duration::ZERO);
+}
+
+#[test]
+fn required_scoped_members_keep_their_original_start_without_a_latency_budget() {
+    scoped_members_with_age(Duration::from_secs(6));
+}
+
+fn scoped_members_with_age(age: Duration) {
     for mode in ["member", "gnu", "parent", "exec-cpu", "exec-gnu"] {
         let path =
             std::env::temp_dir().join(format!("scoped-test-{}", hex(&random().unwrap()[..8])));
@@ -102,8 +135,9 @@ fn scoped_member_transport() {
         if let Some(identity) = cpu_identity {
             command.env("TRUST_SCOPED_CPU_ID", identity);
         }
-        let mut member = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut member = OwnedMember(command.spawn().unwrap());
+        let deadline = readiness_deadline(Instant::now() - age);
+        assert!(Instant::now() < deadline, "member readiness hang detector expired");
         while !path.exists() {
             assert!(Instant::now() < deadline, "member did not report unarmed refusal");
             std::thread::sleep(Duration::from_millis(5));
@@ -158,8 +192,6 @@ fn exited_member_cannot_authorize_another_process() {
 
 #[test]
 fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
-    const NAMED: &str = "TRUST_SCOPED_NAMED_TEST";
-    const EXACT: &str = "handoff::scoped_tests::scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement";
     if std::env::var_os(NAMED).is_some() {
         let ad = std::env::var_os(ENV).unwrap();
         assert!(recover_named_fifo_resources(&ad).is_err(), "unbound member must refuse");
@@ -196,6 +228,15 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
         assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
         return;
     }
+    named_fifo_with_age(Duration::ZERO);
+}
+
+#[test]
+fn required_scoped_fifo_keeps_its_original_start_without_a_latency_budget() {
+    named_fifo_with_age(Duration::from_secs(6));
+}
+
+fn named_fifo_with_age(age: Duration) {
     use std::os::unix::fs::OpenOptionsExt;
     let world = tempfile::tempdir().unwrap();
     let path = world.path().join("pool");
@@ -220,9 +261,10 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
         .env("CARGO_MAKEFLAGS", format!("--jobserver-auth=fifo:{}", path.display()))
         .stdin(Stdio::piped());
     endpoint.configure(&mut command);
-    let mut member = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut member = OwnedMember(command.spawn().unwrap());
+    let deadline = readiness_deadline(Instant::now() - age);
     for marker in [&ready, &consumed] {
+        assert!(Instant::now() < deadline, "FIFO completion hang detector expired");
         while !marker.exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));

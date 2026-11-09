@@ -26,7 +26,7 @@ fn mesh_on(state: &Path) -> NodeServeConfig {
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
-        stop: Arc::new(NodeStop::default()),
+        stop: Arc::new(Stop::new()),
         launcher: idle_launcher(),
         updates: None,
         mesh: NodeMesh {

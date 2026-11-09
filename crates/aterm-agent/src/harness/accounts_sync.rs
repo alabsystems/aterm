@@ -30,6 +30,10 @@ mod returned;
 mod source_admission;
 use source_admission::{AutomaticSource, SourceRequest};
 
+#[path = "accounts_source_selection.rs"]
+mod source_selection;
+use source_selection::{Scope as SourceScope, Selection as SelectedSource};
+
 /// Changes outside one source admission are supplied by the environment.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
@@ -47,6 +51,41 @@ use source_admission::{AutomaticSource, SourceRequest};
     machine = "AccountSourceCapture",
     action = "Config",
     reason = "An external writer may change the admitted configuration."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Automatic",
+    reason = "The caller chooses automatic init or a source-less manual sync."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Key",
+    reason = "Configuration can name an explicit source key."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Named",
+    reason = "The beside file can record a source opt-in."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Beside",
+    reason = "An unannotated beside file can be present."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Pool",
+    reason = "The default pool entry can be present."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Vault",
+    reason = "A vault fleet entry can be present."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceSelection",
+    action = "Sheet",
+    reason = "An accounting sheet entry can be present."
 )]
 pub fn source_capture_inputs() {}
 
@@ -3146,78 +3185,7 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
         Err(why) => return FleetOrigin::AlabPending(why),
         Ok(None) => {}
     }
-    let beside = fleet_file_beside(roster).filter(|fleet| source_entry_present(fleet));
-    let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
-    let beside_opts_in = beside_opt_in.is_some_and(OptIn::opts_in_by_file);
-    if !beside_opts_in && let Some(source) = config.and_then(source_key) {
-        return FleetOrigin::Key(source);
-    }
-    let secrets = home.map(|home| home.join(".secrets"));
-    if config.and_then(source_key).is_none()
-        && let Some(pool) = secrets
-            .as_ref()
-            .map(|s| s.join(super::ai_pool::AI_POOL_FILE))
-            .filter(|p| pool_entry_present(p))
-    {
-        return FleetOrigin::Vault(pool);
-    }
-    let sheet = secrets
-        .as_ref()
-        .map(|secrets| secrets.join(ACCOUNTS_CSV_FILE))
-        .filter(|sheet| sheet_read_here() && source_entry_present(sheet));
-    if let Some((home, vault)) = home
-        .zip(
-            secrets
-                .as_ref()
-                .map(|secrets| secrets.join(FLEET_ROSTER_FILE))
-                .filter(|vault| source_entry_present(vault)),
-        )
-        .filter(|(home, vault)| {
-            !beside
-                .as_deref()
-                .is_some_and(|beside| superseded_secrets_copy(home, vault, beside))
-        })
-    {
-        let own = beside
-            .as_deref()
-            .is_some_and(|beside| own_secrets_copy(home, &vault, beside));
-        // The sheet outranks aterm's own copy where it gives this machine rows, as a sync from
-        // init reads them.
-        if own
-            && let Some(sheet) = sheet
-            && sheet_names_this_machine(config, &sheet)
-        {
-            return FleetOrigin::Vault(sheet);
-        }
-        let read = read_local_source_text(&vault).ok().and_then(|text| {
-            let fleet = FleetRoster::from_toml(&text, &vault.display().to_string()).ok()?;
-            Some((opt_in_of(&text), fleet))
-        });
-        return match read {
-            Some((opt_in, fleet)) if own || fleet_of_this_machine(opt_in, &fleet) => {
-                let files: Vec<PathBuf> = beside.into_iter().chain([vault]).collect();
-                FleetOrigin::Local {
-                    opt_in: if beside_opts_in {
-                        beside_opt_in
-                    } else {
-                        opt_in
-                    },
-                    files,
-                }
-            }
-            _ => FleetOrigin::Vault(vault),
-        };
-    }
-    if let Some(sheet) = sheet {
-        return FleetOrigin::Vault(sheet);
-    }
-    match beside {
-        Some(fleet) => FleetOrigin::Local {
-            files: vec![fleet],
-            opt_in: beside_opt_in,
-        },
-        None => FleetOrigin::Roster,
-    }
+    source_selection::select(home, config, Some(roster), SourceScope::Init).origin()
 }
 
 /// Whether a fleet roster entry stands beside `roster` without a readable opt-in
@@ -3519,7 +3487,28 @@ pub enum InitAccountsAssignment {
 /// # Errors
 /// The selected local vault source cannot be read or parsed, or the machine id is unknown.
 pub fn init_accounts_assignment(env: &Env) -> Result<InitAccountsAssignment, String> {
-    let (Some(home), Some(roster)) = (env.home.as_deref(), env.accounts_roster()) else {
+    let Some(roster) = env.accounts_roster() else {
+        return Ok(InitAccountsAssignment::Required);
+    };
+    if super::alab_roster::chosen(Cli::Claude, Some(&roster), None, env.config.as_deref())?
+        .is_some()
+    {
+        return Ok(InitAccountsAssignment::Required);
+    }
+    let selected = source_selection::select(
+        env.home.as_deref(),
+        env.config.as_deref(),
+        Some(&roster),
+        SourceScope::Init,
+    );
+    init_accounts_assignment_from(env, &selected.origin())
+}
+
+fn init_accounts_assignment_from(
+    env: &Env,
+    origin: &FleetOrigin,
+) -> Result<InitAccountsAssignment, String> {
+    let (Some(_), Some(roster)) = (env.home.as_deref(), env.accounts_roster()) else {
         return Ok(InitAccountsAssignment::Required);
     };
     match fs::symlink_metadata(&roster) {
@@ -3530,12 +3519,11 @@ pub fn init_accounts_assignment(env: &Env) -> Result<InitAccountsAssignment, Str
     if read_default_profile_email(env).is_some() {
         return Ok(InitAccountsAssignment::Required);
     }
-    let FleetOrigin::Vault(source) = fleet_origin(Some(home), env.config.as_deref(), &roster)
-    else {
+    let FleetOrigin::Vault(source) = origin else {
         return Ok(InitAccountsAssignment::Required);
     };
     let raw =
-        read_local_source_text(&source).map_err(|why| format!("{}: {why}", source.display()))?;
+        read_local_source_text(source).map_err(|why| format!("{}: {why}", source.display()))?;
     let source = source.to_string_lossy();
     // A valid shared sheet can serve other pools without a Claude membership column.
     // Parse a column it does name, so malformed input is still an error rather than absence.
@@ -3615,25 +3603,16 @@ fn load_selected_fleet_source(
     let (chosen, opt_in) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), OptIn::Named),
         None => {
-            let has_key = env.config.as_deref().and_then(source_key).is_some();
-            let secrets_pool = env
-                .home
-                .as_ref()
-                .map(|h| h.join(".secrets").join(super::ai_pool::AI_POOL_FILE))
-                .filter(|p| !has_key && pool_entry_present(p));
-            if let Some(pool_path) = secrets_pool {
-                (pool_path.to_string_lossy().into_owned(), OptIn::Named)
-            } else {
-                configured_source(env.config.as_deref(), env.accounts_roster().as_deref())
-                    .map(|configured| {
-                        let opt_in = match configured {
-                            FleetSource::File(_) => OptIn::Named,
-                            FleetSource::Key(_) => OptIn::Key,
-                        };
-                        (configured.source(), opt_in)
-                    })
-                    .ok_or_else(|| NO_SOURCE.to_owned())?
-            }
+            let selected = source_selection::select(
+                env.home.as_deref(),
+                env.config.as_deref(),
+                env.accounts_roster().as_deref(),
+                SourceScope::Configured,
+            );
+            (
+                selected.source().ok_or_else(|| NO_SOURCE.to_owned())?,
+                selected.opt_in(),
+            )
         }
     };
     let configured = (opt_in == OptIn::Key)
@@ -9035,6 +9014,13 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
         );
         return hash.finalize();
     }
+    let selected = source_selection::select(
+        Some(home),
+        Some(&config),
+        Some(roster_path),
+        SourceScope::Init,
+    );
+    field(selected.source().as_deref().map(str::as_bytes));
     let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
     let sheet = sheet_read_here().then(|| secrets.join(ACCOUNTS_CSV_FILE));
     for path in [
@@ -9054,7 +9040,7 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
                 .map(str::as_bytes),
         );
     }
-    if pool_entry_present(&secrets_pool) {
+    if matches!(selected, SelectedSource::Pool(_)) {
         let id_bytes = super::ai_pool::resolve_local_pool_identity(Some(home), Some(&config), None)
             .map(|id| id.map(|id| format!("{}:{}", id.primary, id.aliases.join(",")).into_bytes()))
             .unwrap_or_else(|why| Some(why.into_bytes()));
@@ -9207,9 +9193,9 @@ fn sync_if_missing(
     if roster_path.exists() {
         return true;
     }
-    let Ok(automatic) = AutomaticSource::capture(config) else {
+    if AutomaticSource::capture(config).is_err() {
         return false;
-    };
+    }
     let _cooldown = {
         let mut guard = fx
             .sync_cooldown
@@ -9228,48 +9214,9 @@ fn sync_if_missing(
             own,
         }
     };
-    let env = Env {
-        state: state_dir.to_path_buf(),
-        aterm_state: state_dir
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf),
-        cwd: home.to_path_buf(),
-        home: Some(home.to_path_buf()),
-        claude_dir: Some(home.join(".claude")),
-        claude_config_unusable: None,
-        claude_profile: Some(home.join(".claude.json")),
-        claude_custom_oauth: false,
-        claude_session: None,
-        claude_pid: None,
-        codex_thread: None,
-        agy_conversation: None,
-        codex_home: None,
-        codex_login: None,
-        now,
-        tz_s: 0,
-        sid: String::new(),
-        sock: None,
-        config: Some(config.to_path_buf()),
-        claude_tmp: None,
-        claude_running: None,
-    };
-    let how = SyncHow {
-        fetch: fx.fetch,
-        ladder: &accounts::LOCK_LADDER,
-        fleet_snapshots: &[],
-        heal: None,
-        allow_empty_pool: false,
-    };
-    let _ = sync_accounts_request(
-        &env,
-        SourceRequest::Automatic {
-            candidate: None,
-            admission: &automatic,
-        },
-        None,
-        &how,
-    );
+    // Missing-roster upkeep uses the same automatic capture and source selection as init.
+    // A source-less manual request deliberately has a narrower set of inputs.
+    let _ = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
     roster_path.exists()
 }
 
@@ -9286,26 +9233,34 @@ pub fn has_init_accounts_source(
         .parent()
         .map(|p| p.join("aterm.toml"))
         .unwrap_or_else(|| PathBuf::from("aterm.toml"));
-    if configured_source(Some(&config_path), Some(roster_path)).is_some()
-        || lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true)
-    {
+    if lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true) {
+        return true;
+    }
+    let selected = source_selection::select(
+        Some(home),
+        Some(&config_path),
+        Some(roster_path),
+        SourceScope::Init,
+    );
+    let configured = match selected {
+        SelectedSource::Absent => false,
+        SelectedSource::Beside { opt_in, .. } if !opt_in.is_some_and(OptIn::opts_in_by_file) => {
+            // An explicit init can read this file. Presence alone does not opt a fresh
+            // roster into upkeep; an existing roster can still be upgraded from it.
+            Roster::load(roster_path).is_ok_and(|roster| !roster.rows.is_empty())
+        }
+        _ => true,
+    };
+    if configured {
         return true;
     }
     let secrets = home.join(".secrets");
-    if has_fleet_source(&secrets)
-        || [
-            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-            super::headless_oauth::MAILBOX_TOML_FILE,
-        ]
-        .into_iter()
-        .any(|name| secrets.join(name).is_file())
-    {
-        return true;
-    }
-    if Roster::load(roster_path).is_ok_and(|r| !r.rows.is_empty())
-        && roster_path
-            .parent()
-            .is_some_and(|p| source_entry_present(&p.join(FLEET_ROSTER_FILE)))
+    if [
+        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+        super::headless_oauth::MAILBOX_TOML_FILE,
+    ]
+    .into_iter()
+    .any(|name| secrets.join(name).is_file())
     {
         return true;
     }
@@ -9382,28 +9337,31 @@ fn init_sync_needed(
         );
     }
     let secrets = home.join(".secrets");
+    let config_path = config_beside(roster_path);
+    let selected = source_selection::select(
+        Some(home),
+        Some(&config_path),
+        Some(roster_path),
+        SourceScope::Init,
+    );
+    if matches!(selected, SelectedSource::Key(_) | SelectedSource::Absent) {
+        // Configured inputs have their own change detector; no source permits no discovery here.
+        return false;
+    }
     let Some(fb) = fleet_file_beside(roster_path) else {
         return false;
     };
     if !fleet_file_opt_in(&fb).is_some_and(OptIn::opts_in_by_file) {
-        return false;
+        return !matches!(selected, SelectedSource::Beside { .. });
     }
-    let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
-    let secrets_fleet = secrets.join(FLEET_ROSTER_FILE);
-    let secrets_csv = secrets.join(ACCOUNTS_CSV_FILE);
-    let has_secrets_pool = pool_entry_present(&secrets_pool);
-    let has_secrets_fleet =
-        source_entry_present(&secrets_fleet) && !superseded_secrets_copy(home, &secrets_fleet, &fb);
-    let has_secrets_csv = sheet_read_here() && source_entry_present(&secrets_csv);
-    let config_path = config_beside(roster_path);
-    if has_secrets_pool && source_key(&config_path).is_none() {
+    if let SelectedSource::Pool(secrets_pool) = &selected {
         let Ok(existing_text) = read_local_source_text(&fb) else {
             return true;
         };
         let Ok(existing_fleet) = FleetRoster::from_toml(&existing_text, FLEET_ROSTER_FILE) else {
             return true;
         };
-        let Ok(raw) = read_local_source_text(&secrets_pool) else {
+        let Ok(raw) = read_local_source_text(secrets_pool) else {
             return true;
         };
         let Ok(pool) = super::ai_pool::Pool::from_toml(&raw, super::ai_pool::AI_POOL_FILE) else {
@@ -9452,20 +9410,26 @@ fn init_sync_needed(
             })
             .unwrap_or(true);
     }
-    if has_secrets_fleet {
-        if own_secrets_copy(home, &secrets_fleet, &fb) {
-            // aterm's own copy holds the fleet file's accounts, so a sync reads nothing new from
-            // it; beside a sheet that gives this machine rows, a sync reads the sheet and
-            // removes the copy.
-            if has_secrets_csv && sheet_names_this_machine(Some(&config_path), &secrets_csv) {
-                return true;
-            }
-        } else if !matches!(
-            (read_local_source_text(&secrets_fleet), read_local_source_text(&fb)),
+    if let SelectedSource::VaultFleet {
+        path,
+        own_copy: false,
+        ..
+    } = &selected
+        && !matches!(
+            (read_local_source_text(path), read_local_source_text(&fb)),
             (Ok(source), Ok(kept)) if source == kept
-        ) {
-            return true;
+        )
+    {
+        return true;
+    }
+    if matches!(
+        &selected,
+        SelectedSource::Sheet {
+            displaced_copy: Some(_),
+            ..
         }
+    ) {
+        return true;
     }
     let Ok(existing_text) = read_local_source_text(&fb) else {
         return true;
@@ -9476,8 +9440,8 @@ fn init_sync_needed(
     let opt_in = opt_in_of(&existing_text);
     // A sync from the sheet writes its accounts as they are: any edit (a row added, removed, or
     // moved to another machine) is one the fleet file does not hold yet.
-    if !has_secrets_fleet && has_secrets_csv {
-        let Ok(csv_text) = read_local_source_text(&secrets_csv) else {
+    if let SelectedSource::Sheet { path, .. } = &selected {
+        let Ok(csv_text) = read_local_source_text(path) else {
             return true;
         };
         let Ok(csv_fleet) = parse_accounting_csv(&csv_text, ACCOUNTS_CSV_FILE) else {
@@ -9706,10 +9670,25 @@ fn sync_accounts_for_init_with(
         claude_tmp: None,
         claude_running: None,
     };
+    let native = SourceRequest::Automatic {
+        candidate: None,
+        admission: &automatic,
+    }
+    .chosen(Cli::Claude, roster_path, env.config.as_deref())?;
+    let selected = if native.is_none() {
+        source_selection::select(
+            Some(home),
+            env.config.as_deref(),
+            Some(roster_path),
+            SourceScope::Init,
+        )
+    } else {
+        SelectedSource::Absent
+    };
     if let InitAccountsAssignment::Unassigned {
         machine,
         fleet_accounts,
-    } = init_accounts_assignment(&env)?
+    } = init_accounts_assignment_from(&env, &selected.origin())?
     {
         before_sync();
         automatic.validate()?;
@@ -9723,7 +9702,7 @@ fn sync_accounts_for_init_with(
         });
     }
     // Where the lab is the source nothing in `~/.secrets` is captured or read.
-    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path))? {
+    if native.is_some() {
         before_sync();
         let report = sync_accounts_request(
             &env,
@@ -9750,66 +9729,37 @@ fn sync_accounts_for_init_with(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(FLEET_ROSTER_FILE);
-    let has_named_fleet = fleet_file_opt_in(&fleet_path).is_some_and(OptIn::opts_in_by_file);
-    let has_key = env.config.as_deref().and_then(source_key).is_some();
     let secrets_dir = home.join(".secrets");
-    let secrets_pool = secrets_dir.join(super::ai_pool::AI_POOL_FILE);
     let secrets_fleet = secrets_dir.join(FLEET_ROSTER_FILE);
-    let secrets_sheet = secrets_dir.join(ACCOUNTS_CSV_FILE);
-    // The sheet outranks the copy aterm keeps there of the fleet file beside the roster where it
-    // gives this machine rows, and the sync that reads the sheet removes that copy, so a sheet
-    // edited later reaches the roster. Where it gives none, the copy stays this Mac's own list.
-    let own_copy = source_entry_present(&secrets_fleet)
-        && sheet_read_here()
-        && source_entry_present(&secrets_sheet)
-        && own_secrets_copy(home, &secrets_fleet, &fleet_path)
-        && sheet_names_this_machine(env.config.as_deref(), &secrets_sheet);
-    let superseded = superseded_secrets_copy(home, &secrets_fleet, &fleet_path);
-    let secrets_source = pool_entry_present(&secrets_pool)
-        .then_some(&secrets_pool)
-        .or_else(|| {
-            [&secrets_fleet, &secrets_sheet]
-                .into_iter()
-                .filter(|path| !((own_copy || superseded) && *path == &secrets_fleet))
-                .filter(|path| sheet_read_here() || *path != &secrets_sheet)
-                .find(|path| source_entry_present(path))
-        })
-        .map(|path| path.to_string_lossy().into_owned());
     let mut captured_fleet = None;
     let mut fleet_snapshots = Vec::new();
-    let init_source = if has_key && !has_named_fleet {
+    let init_source = if matches!(selected, SelectedSource::Key(_)) {
         None
-    } else if let Some(src) = secrets_source {
-        let (text, snapshot) = capture_init_fleet(
-            &env,
-            Path::new(&src),
-            src.ends_with(FLEET_ROSTER_FILE),
-            true,
-        )?;
-        captured_fleet = Some((src.clone(), text));
+    } else if let Some(source) = selected.source() {
+        let merge = matches!(&selected, SelectedSource::VaultFleet { .. })
+            || matches!(&selected, SelectedSource::Beside { opt_in: Some(opt_in), .. } if opt_in.opts_in_by_file());
+        let publish = matches!(
+            &selected,
+            SelectedSource::Pool(_)
+                | SelectedSource::VaultFleet { .. }
+                | SelectedSource::Sheet { .. }
+        );
+        let (text, snapshot) = capture_init_fleet(&env, Path::new(&source), merge, publish)?;
+        captured_fleet = Some((source.clone(), text));
         fleet_snapshots.push(snapshot);
-        if own_copy && src == secrets_sheet.to_string_lossy() {
-            let copy = read_local_source_text(&secrets_fleet)
-                .map_err(|why| format!("{}: {why}", secrets_fleet.display()))?;
+        if let SelectedSource::Sheet {
+            displaced_copy: Some(path),
+            ..
+        } = &selected
+        {
+            let copy =
+                read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))?;
             fleet_snapshots.push(FleetSnapshot {
-                path: secrets_fleet.clone(),
+                path: path.clone(),
                 bytes: Some(copy.into_bytes()),
                 publish: Publish::Remove,
             });
         }
-        Some(src)
-    } else if configured_source(env.config.as_deref(), Some(roster_path)).is_some() {
-        if has_named_fleet {
-            let (text, snapshot) = capture_init_fleet(&env, &fleet_path, true, false)?;
-            captured_fleet = Some((fleet_path.to_string_lossy().into_owned(), text));
-            fleet_snapshots.push(snapshot);
-        }
-        None
-    } else if source_entry_present(&fleet_path) {
-        let source = fleet_path.to_string_lossy().into_owned();
-        let (text, snapshot) = capture_init_fleet(&env, &fleet_path, false, false)?;
-        captured_fleet = Some((source.clone(), text));
-        fleet_snapshots.push(snapshot);
         Some(source)
     } else {
         let min_accounts = if [
@@ -9948,8 +9898,17 @@ fn has_claude_resync_source(home: &Path, state_dir: &Path, roster_path: &Path, n
 /// intentionally leaves `roster_path` absent in that state).
 fn empty_claude_pool_settled(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> bool {
     let config_path = config_beside(roster_path);
-    let secrets_pool = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
-    if !pool_entry_present(&secrets_pool) || source_key(&config_path).is_some() {
+    if lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true)
+        || !matches!(
+            source_selection::select(
+                Some(home),
+                Some(&config_path),
+                Some(roster_path),
+                SourceScope::Init
+            ),
+            SelectedSource::Pool(_)
+        )
+    {
         return false;
     }
     let Some(fb) = fleet_file_beside(roster_path) else {
@@ -15422,18 +15381,19 @@ fn assigning_source(cli: Cli, env: &Env) -> Assigning {
             Ok(Some(_)) => return Assigning::Free,
             Err(_) => return Assigning::Unread(UnreadWhy::Source),
         }
-        let source = match fleet_origin(env.home.as_deref(), env.config.as_deref(), &roster) {
-            FleetOrigin::Alab => return Assigning::Free,
-            FleetOrigin::AlabPending(_) => return Assigning::Unread(UnreadWhy::Source),
-            FleetOrigin::Roster | FleetOrigin::Local { .. } if env.home.is_none() => {
+        let selected = source_selection::select(
+            env.home.as_deref(),
+            env.config.as_deref(),
+            Some(&roster),
+            SourceScope::Init,
+        );
+        let source = match &selected {
+            SelectedSource::Absent | SelectedSource::Beside { .. } if env.home.is_none() => {
                 return Assigning::Unread(UnreadWhy::Source);
             }
-            FleetOrigin::Roster => return Assigning::Free,
-            FleetOrigin::Local { files, .. } => {
-                files.first().map(|file| file.display().to_string())
-            }
-            FleetOrigin::Key(_) => None,
-            FleetOrigin::Vault(path) => Some(path.display().to_string()),
+            SelectedSource::Absent => return Assigning::Free,
+            SelectedSource::Key(_) => None,
+            _ => selected.source(),
         };
         load_fleet_source_for_machine(env, source.as_deref(), None, &local_only).map(
             |(fleet, _, pool)| {

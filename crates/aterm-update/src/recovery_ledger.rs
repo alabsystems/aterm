@@ -1312,14 +1312,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-recovery-ledger-{tag}-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch(tag: &str) -> crate::ScratchDir {
+        crate::scratch_dir(&format!("ledger-{tag}"))
     }
 
     #[cfg(unix)]

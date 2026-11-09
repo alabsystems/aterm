@@ -1832,8 +1832,8 @@ fn stranger_orphan(shell_orphan: bool) {
     std::fs::write(&release, b"go").expect("let the early parent exit");
     owned
         .child
-        .as_mut()
-        .unwrap()
+        .take()
+        .expect("the stranger's launcher")
         .wait()
         .expect("reap stranger's launcher");
     let expected_image = if shell_orphan {
@@ -3221,12 +3221,13 @@ impl OwnedEscapeFixture {
             }
         }
         if let Some(child) = self.child.as_mut() {
-            // SAFETY: `child` is unreaped and still owns its process group.
-            if unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    errors.push(format!("kill the owned group: {error}"));
-                }
+            // Only an unreaped leader pins its group's id. A test that reaped its launcher left
+            // only the daemon, ended above by its birth; the id it held is no longer the fixture's.
+            if !child.is_reaped()
+                && let Err(error) = aterm_uds::process::kill_group_until_empty(child.id() as i32)
+                && error.raw_os_error() != Some(libc::ESRCH)
+            {
+                errors.push(format!("kill the owned group: {error}"));
             }
             if let Err(error) = child.kill()
                 && error.raw_os_error() != Some(libc::ESRCH)

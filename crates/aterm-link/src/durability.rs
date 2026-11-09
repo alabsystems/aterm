@@ -626,6 +626,7 @@ mod tests {
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()
             .prefix("dur")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch")
     }

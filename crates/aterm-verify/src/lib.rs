@@ -69,6 +69,7 @@ pub mod perf;
 pub mod plan;
 #[cfg(unix)]
 pub mod provision;
+pub mod release_input;
 pub mod report;
 mod run_log;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
@@ -606,6 +607,8 @@ pub struct Ctx {
     /// ([`cells::pulled_cells`]).
     pub cells_pulled: bool,
     pub scope: Scope,
+    /// Explicit committed paths for a release's unchecked input; ordinary runs use their diff.
+    pub input_paths: Option<Vec<String>>,
     pub tools: Toolchain,
     /// PATH for every child.
     pub path_env: OsString,
@@ -813,6 +816,7 @@ impl Ctx {
             cells: Vec::new(),
             cells_pulled: false,
             scope,
+            input_paths: None,
             tools,
             path_env,
             scratch,
@@ -2849,6 +2853,9 @@ fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
+    if args.first().is_some_and(|arg| arg == "release-input") {
+        return release_input::run_cli(&args[1..], cwd);
+    }
     if args.first().is_some_and(|arg| arg == "status") {
         return status::run(&args[1..], cwd);
     }

@@ -288,8 +288,10 @@ pub fn tippy_args(scope: &Scope) -> Vec<String> {
 /// edge is in neither ([`crate::scope::Changed::unlinted`]), since its library and binaries link
 /// nothing that changed; a root manifest row, a lock row other than a touched member's own entry,
 /// or a fork keeps it in the first pass with the whole cone. `test` compiles the test targets of
-/// all of those, so an error in one still stops the run. GAP: the benches and examples of unchanged
-/// dependents (at most the workspace's 104 targets, 19 of them with macOS arms, on 2026-11-04) have
+/// all of those, so an error in one still stops the run. The `required-features` targets of what
+/// the change touched and of what depends on it directly have a pass of their own
+/// ([`lint_invocations`]). GAP: the other benches and examples of unchanged dependents (at most the
+/// workspace's 104 targets, 19 of them with macOS arms, on 2026-11-04) have
 /// no compile for this machine in this run, only a pulled cell's type-check on another OS, and a
 /// lint that fires only in one of them or in such a crate's test target waits for `verify lint -p`
 /// or `--all`, though a rustc warning there (a `#[must_use]` newly discarded) reds a pulled cell
@@ -342,7 +344,8 @@ pub fn tippy_passes(scope: &Scope) -> Vec<TippyPass> {
     passes
 }
 
-/// One [`tippy_passes`] invocation: its arguments and how the report names its selection.
+/// One lint invocation ([`tippy_passes`], [`lint_invocations`]): its arguments and how the report
+/// names its selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TippyPass {
     pub label: String,
@@ -400,13 +403,13 @@ pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
     found
 }
 
-/// `<tippy> -p <pkg>… --features <pkg/feat>,… <LINT_TAIL>`: the second pass, over the targets [`tippy_args`] cannot reach (`gated`, [`gated_lint_features`]).
+/// `<tippy> -p <pkg>… --features <pkg/feat>,… <LINT_TAIL>`: the pass over the targets [`tippy_args`] cannot reach (`gated`, [`gated_lint_features`]), of the packages whose gated targets the selection compiles ([`Scope::gated_spec_of`]). `None` when it holds none.
 #[must_use]
 pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec<String>> {
     let mut packages: Vec<String> = Vec::new();
     let mut features: Vec<String> = Vec::new();
     for (pkg, feat) in gated {
-        let Some(spec) = scope.spec_of(pkg) else {
+        let Some(spec) = scope.gated_spec_of(pkg) else {
             continue;
         };
         if !packages.contains(&spec) {
@@ -425,6 +428,36 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
     a.push(features.join(","));
     a.extend(LINT_TAIL.map(String::from));
     Some(a)
+}
+
+/// Every lint invocation `scope` runs, in order, each with its row's words: the ordinary passes
+/// ([`tippy_passes`]); the required-features targets of the packages whose gated targets it
+/// compiles ([`tippy_gated_args`] over `gated`, [`gated_lint_features`]), under the same feature
+/// unification ([`lint_unified`]), so it compiles again only what a feature changes; and the
+/// shipped build's ([`tippy_release_args`]).
+#[must_use]
+pub fn lint_invocations(scope: &Scope, gated: &[(String, String)]) -> Vec<TippyPass> {
+    let mut runs: Vec<TippyPass> = tippy_passes(scope)
+        .into_iter()
+        .map(|pass| TippyPass {
+            label: pass.label,
+            args: lint_unified(pass.args),
+        })
+        .collect();
+    if let Some(args) = tippy_gated_args(scope, gated) {
+        let sep = args.iter().position(|a| a == "--features").unwrap_or(0);
+        runs.push(TippyPass {
+            label: format!("required-features targets {}", args[..sep].join(" ")),
+            args: lint_unified(args),
+        });
+    }
+    if let Some(args) = tippy_release_args(scope) {
+        runs.push(TippyPass {
+            label: format!("-p {SHIPPED} --release"),
+            args,
+        });
+    }
+    runs
 }
 
 /// The package of the one shipped executable, which `ship` builds `--release`.
@@ -2026,12 +2059,12 @@ fn tippy_scope(
         return true;
     }
     let mut passed = true;
-    for pass in tippy_passes(scope) {
+    for pass in lint_invocations(scope, &gated_lint_features(&ctx.root)) {
         if !compile_labeled(
             ctx,
             r,
             &format!("tippy {} -D warnings{borrowed}", pass.label),
-            &tippy_cmd(ctx, bin, lint_unified(pass.args)),
+            &tippy_cmd(ctx, bin, pass.args),
         ) {
             passed = false;
             crate::red_now(ctx, crate::checks::Check::Lint, r);
@@ -2039,32 +2072,6 @@ fn tippy_scope(
                 return false;
             }
         }
-    }
-    if ctx.release
-        && let Some(args) = tippy_gated_args(scope, &gated_lint_features(&ctx.root))
-        && !compile_labeled(
-            ctx,
-            r,
-            &format!("tippy required-features targets -D warnings{borrowed}"),
-            &tippy_cmd(ctx, bin, lint_unified(args)),
-        )
-    {
-        passed = false;
-        crate::red_now(ctx, crate::checks::Check::Lint, r);
-        if ctx.halted().is_some() {
-            return false;
-        }
-    }
-    if let Some(args) = tippy_release_args(scope)
-        && !compile_labeled(
-            ctx,
-            r,
-            &format!("tippy -p {SHIPPED} --release -D warnings{borrowed}"),
-            &tippy_cmd(ctx, bin, args),
-        )
-    {
-        passed = false;
-        crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
     passed
 }
@@ -2074,20 +2081,9 @@ fn exact_package_tippy_commands(
     bin: &std::path::Path,
     spec: &str,
 ) -> Result<Vec<Cmd>, String> {
-    let scope = Scope::crate_only(spec);
-    let mut arguments: Vec<Vec<String>> = tippy_passes(&scope)
+    lint_invocations(&Scope::crate_only(spec), &gated_lint_features(&ctx.root))
         .into_iter()
-        .map(|pass| lint_unified(pass.args))
-        .collect();
-    if let Some(args) = tippy_gated_args(&scope, &gated_lint_features(&ctx.root)) {
-        arguments.push(lint_unified(args));
-    }
-    if let Some(args) = tippy_release_args(&scope) {
-        arguments.push(args);
-    }
-    arguments
-        .into_iter()
-        .map(|args| {
+        .map(|TippyPass { args, .. }| {
             let mut command =
                 crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
             // Content-keyed lint commands use one stable process shape. Utility-QoS wrapping and
@@ -4359,6 +4355,15 @@ mod tests {
     }
 
     fn fixture_gated() -> Vec<(String, String)> {
+        let root = gated_fixture_root();
+        let gated = gated_lint_features(&root);
+        std::fs::remove_dir_all(&root).ok();
+        gated
+    }
+
+    /// A checkout whose `crates/*/Cargo.toml` give aterm-gui and aterm-scrollback
+    /// `required-features` targets and aterm-core none.
+    fn gated_fixture_root() -> PathBuf {
         let root = crate::mktemp_dir("atv-gated").expect("mktemp");
         for (dir, manifest) in [
             (
@@ -4380,9 +4385,158 @@ mod tests {
                 .expect("write");
         }
         std::fs::create_dir_all(root.join("crates/no-manifest")).expect("mkdir");
-        let gated = gated_lint_features(&root);
+        root
+    }
+
+    /// A cone of `crates`, of which the change touched `touched` and `direct` depend on one directly.
+    fn gated_cone(crates: &[&str], touched: &[&str], direct: &[&str]) -> Scope {
+        let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        Scope::changed("main", owned(crates), true)
+            .with_seeds(owned(touched))
+            .with_all_targets(owned(touched))
+            .with_direct_dependents(owned(direct))
+    }
+
+    /// The `-p` packages and the `--features` of the required-features pass among `runs`, or
+    /// `None` when none is.
+    fn gated_pass(runs: &[TippyPass]) -> Option<(Vec<String>, String)> {
+        let pass = runs
+            .iter()
+            .find(|run| run.label.starts_with("required-features targets"))?;
+        let at = pass.args.iter().position(|a| a == "--features")?;
+        let packages = pass.args[..at]
+            .windows(2)
+            .filter(|w| w[0] == "-p")
+            .map(|w| w[1].clone())
+            .collect();
+        Some((packages, pass.args[at + 1].clone()))
+    }
+
+    /// A change cone lints the `required-features` targets of the packages it touched and of those
+    /// one edge from them, under the ordinary passes' feature unification, after them and before
+    /// the shipped build's: 1bda125b88 narrowed a method of aterm-gui's to `cfg(test)` that its
+    /// `bench-support` module still called, the cone's lint never compiled that module, and the
+    /// release's lint was the first that did (0.189.0, E0599). The workspace and `-p` lint those of
+    /// every package they select. CONTROLS: a package with gated targets the cone holds only further
+    /// away, and a cone holding no package with gated targets, get no such pass.
+    #[test]
+    fn a_cone_lints_the_gated_targets_of_what_it_touched_and_what_names_it() {
+        let gated = fixture_gated();
+        let gui = (
+            vec!["aterm-gui".to_string()],
+            "aterm-gui/bench-support,aterm-gui/control-conformance".to_string(),
+        );
+        let touched = gated_cone(&["aterm", "aterm-gui"], &["aterm-gui"], &["aterm"]);
+        let runs = lint_invocations(&touched, &gated);
+        assert_eq!(gated_pass(&runs), Some(gui.clone()), "{runs:?}");
+        let at = runs
+            .iter()
+            .position(|run| run.label.starts_with("required-features"))
+            .expect("the gated pass");
+        assert!(
+            at == tippy_passes(&touched).len() && runs[at + 1].label == "-p aterm --release",
+            "after the ordinary passes, before the shipped build's: {runs:?}"
+        );
+        assert_eq!(
+            runs[at].args,
+            lint_unified(tippy_gated_args(&touched, &gated).expect("gated")),
+            "the ordinary passes' feature unification, so it shares their dependency units"
+        );
+        assert!(runs[at].args.ends_with(&LINT_TAIL.map(String::from)));
+        let named = gated_cone(
+            &["aterm-core", "aterm-gui", "aterm-scrollback"],
+            &["aterm-core"],
+            &["aterm-gui"],
+        );
+        assert_eq!(
+            gated_pass(&lint_invocations(&named, &gated)),
+            Some(gui),
+            "a direct dependent's gated targets, not those of one further away"
+        );
+        let further = gated_cone(&["aterm-core", "aterm-scrollback"], &["aterm-core"], &[]);
+        assert_eq!(gated_pass(&lint_invocations(&further, &gated)), None);
+        let none = gated_cone(
+            &["aterm-core", "aterm-verify"],
+            &["aterm-core"],
+            &["aterm-verify"],
+        );
+        let runs = lint_invocations(&none, &gated);
+        assert_eq!(gated_pass(&runs), None);
+        assert!(
+            runs.iter()
+                .all(|run| !run.args.iter().any(|a| a == "--features")),
+            "{runs:?}"
+        );
+        assert_eq!(
+            gated_pass(&lint_invocations(&Scope::workspace(), &gated)),
+            Some((
+                vec!["aterm-gui".to_string(), "aterm-scrollback".to_string()],
+                "aterm-gui/bench-support,aterm-gui/control-conformance,aterm-scrollback/disk-tier"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            gated_pass(&lint_invocations(
+                &Scope::crate_only("aterm-scrollback"),
+                &gated
+            )),
+            Some((
+                vec!["aterm-scrollback".to_string()],
+                "aterm-scrollback/disk-tier".to_string()
+            ))
+        );
+    }
+
+    /// The lint stage of a dev run, not a release, runs a cone's gated pass: a recording
+    /// `targo-tippy` stand-in, over the fixture's manifests, sees `--features aterm-gui/…` for a
+    /// cone that touched aterm-gui. CONTROL: for a cone holding no package with gated targets it
+    /// sees no `--features`, and as many runs as that cone has ordinary passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_lint_stage_runs_the_cones_gated_pass() {
+        let root = gated_fixture_root();
+        std::fs::create_dir_all(root.join("scratch")).expect("the run's scratch");
+        let argv = |scope: Scope| -> Vec<String> {
+            let log = root.join(format!("tippy-{}.log", scope.label().replace(' ', "_")));
+            let bin = root.join("bin/targo-tippy");
+            crate::standin_body(
+                &bin,
+                &format!("printf '%s\\n' \"$*\" >> '{}'", log.display()),
+            );
+            let mut ctx = Ctx::new(
+                root.clone(),
+                scope,
+                EnvSnapshot::default(),
+                root.join("scratch"),
+            );
+            assert!(!ctx.release, "a dev run");
+            ctx.tools.tippy = Some(bin);
+            let mut r = Report::new("lint".to_string());
+            tippy(&ctx, &mut r);
+            assert!(
+                r.outcomes().all(|(o, _)| o == Outcome::Ok),
+                "{}",
+                r.render()
+            );
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let touched = argv(gated_cone(&["aterm-gui"], &["aterm-gui"], &[]));
+        let none = argv(gated_cone(&["aterm-core"], &["aterm-core"], &[]));
         std::fs::remove_dir_all(&root).ok();
-        gated
+        assert_eq!(touched.len(), 2, "{touched:?}");
+        assert!(
+            touched[1].contains(
+                "-p aterm-gui --features aterm-gui/bench-support,aterm-gui/control-conformance \
+                 --all-targets --keep-going"
+            ) && touched[1].ends_with(" -- -D warnings"),
+            "{touched:?}"
+        );
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(!none[0].contains("--features"), "{none:?}");
     }
 
     #[test]

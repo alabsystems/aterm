@@ -421,6 +421,7 @@ fn spec_xref_closure() {
         "DbEntryProvenance",
         "DbHostCarry",
         "DbEntryClaim",
+        "DbEntryFrontier",
         "AccountSharedRecovery",
         "AccountSharedProgress",
         "AccountSharedAdoptionProgress",
@@ -430,6 +431,7 @@ fn spec_xref_closure() {
         "LabPreferenceIdentity",
         "LabSourceAvailability",
         "AccountSourceCapture",
+        "AccountSourceSelection",
         "AccountFleetCommit",
         "AccountProviderCommit",
     ] {

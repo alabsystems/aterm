@@ -23,6 +23,8 @@ mod models_lab_source_availability;
 pub use models_lab_source_availability::lab_source_availability_model;
 mod models_account_source_capture;
 pub use models_account_source_capture::account_source_capture_model;
+mod models_account_source_selection;
+pub use models_account_source_selection::account_source_selection_model;
 mod models_account_fleet_commit;
 pub use models_account_fleet_commit::account_fleet_commit_model;
 mod models_account_provider_commit;

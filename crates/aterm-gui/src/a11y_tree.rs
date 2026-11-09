@@ -90,7 +90,7 @@ pub(crate) struct ClientReads {
 
 /// The span of `snap`, read from `cells`, that is selected, kept to the text of each row.
 pub(crate) fn selected_span(
-    cells: &aterm_core::render::RenderInput,
+    cells: &aterm_core::terminal::TextFrame,
     snap: &crate::accessibility::AccessibleSnapshot,
 ) -> Option<GridSpan> {
     if !cells.any_selection() {
@@ -1403,9 +1403,10 @@ mod tests {
                     format!("\x1b[{};1H{}", row + 1, "x".repeat(cols as usize - 1)).as_bytes(),
                 );
             }
-            let cells = term.cell_frame(rows as usize, cols as usize);
+            let mut cells = aterm_core::terminal::TextFrame::default();
+            term.text_frame_into(&mut cells, rows as usize, cols as usize);
             let snap = crate::accessibility::AccessibleSnapshot::from_cells(
-                &cells.cells,
+                cells.cells(),
                 cols as usize,
                 None,
             );

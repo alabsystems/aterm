@@ -1591,14 +1591,14 @@ pub(crate) mod ffi {
 
 /// Clear `errno`, so that a libproc call's failure reads as its own.
 #[cfg(target_vendor = "apple")]
-fn clear_errno() {
+pub(crate) fn clear_errno() {
     // SAFETY: `__error` returns this thread's live `errno` slot.
     unsafe { *ffi::__error() = 0 };
 }
 
 /// This thread's `errno`.
 #[cfg(target_vendor = "apple")]
-fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 

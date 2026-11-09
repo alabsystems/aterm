@@ -435,7 +435,7 @@ pub(super) fn cached_log_progress(
     let (log, digest) = log_entries::trusted_seeded_log(paths, config, &envelope)
         .ok()
         .flatten()?;
-    if state.records_digest == Some(digest) {
+    if state.records_digest == Some(digest) && materialization_selection_current(paths, state) {
         return None;
     }
     let identity = read_identity(paths).ok().flatten()?;

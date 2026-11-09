@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Acceptance measurement runner with an explicit concurrent count-row experiment.
+//! Acceptance measurements with concurrent count rows and isolated timing rows.
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -124,21 +124,12 @@ pub fn run_classified_with_telemetry<R: Sync>(
     take: impl Fn(&R) -> Outcome + Sync,
     telemetry: Option<Telemetry>,
 ) -> ExitCode {
-    let together = match std::env::var("ATERM_MEASURE_COUNT_MODE").as_deref() {
-        Ok("sequential") | Err(std::env::VarError::NotPresent) => false,
-        Ok("together") => true,
-        _ => {
-            eprintln!("measure {target}: ATERM_MEASURE_COUNT_MODE takes sequential or together");
-            return ExitCode::from(2);
-        }
-    };
     run_selected(target, rows, |selected, out| {
         run_scheduled_into(
             target,
             selected,
             |row| kind(*row),
             |row| take(*row),
-            together,
             telemetry,
             out,
         )
@@ -156,16 +147,14 @@ fn run_scheduled_into<R: Sync>(
     rows: &[(&str, R)],
     kind: impl Fn(&R) -> Kind + Sync,
     take: impl Fn(&R) -> Outcome + Sync,
-    together: bool,
     telemetry: Option<Telemetry>,
     out: &mut dyn Write,
 ) -> io::Result<Counts> {
-    if !together {
-        return run_into(target, rows, take, telemetry, out);
-    }
     let (mut headless, mut windows, mut timing) = (Vec::new(), Vec::new(), Vec::new());
-    for (i, (_, row)) in rows.iter().enumerate() {
-        match kind(row) {
+    for (i, (name, row)) in rows.iter().enumerate() {
+        let kind = kind(row);
+        writeln!(out, "measure kind: {target}::{name} {kind:?}")?;
+        match kind {
             Kind::Count { windowed: false } => headless.push((i, row)),
             Kind::Count { windowed: true } => windows.push((i, row)),
             Kind::Timing => timing.push((i, row)),
@@ -415,7 +404,7 @@ mod tests {
                 Ok(())
             }
         }
-        for together in [false, true] {
+        for concurrent_counts in [false, true] {
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let (release, wait) = mpsc::channel();
             let wait = Mutex::new(wait);
@@ -429,7 +418,7 @@ mod tests {
                 "fixture",
                 &rows,
                 |row| {
-                    if *row == 2 {
+                    if *row == 2 || !concurrent_counts {
                         Kind::Timing
                     } else {
                         Kind::Count {
@@ -459,7 +448,6 @@ mod tests {
                     }
                     _ => unreachable!(),
                 },
-                together,
                 None,
                 &mut tape,
             )
@@ -541,7 +529,6 @@ mod tests {
                 }
                 Outcome::Pass(row.to_string())
             },
-            true,
             None,
             &mut output,
         )
@@ -551,31 +538,9 @@ mod tests {
         for (name, i) in rows {
             assert!(output.contains(&format!("fixture::{name} PASS\n{i}\n")));
         }
-        let seen = Mutex::new(Vec::new());
-        let mut output = Vec::new();
-        let counts = run_scheduled_into(
-            "fixture",
-            &rows,
-            |_| Kind::Count { windowed: false },
-            |row| {
-                seen.lock().unwrap().push(*row);
-                if *row == 1 {
-                    panic!("negative control");
-                }
-                Outcome::Pass(row.to_string())
-            },
-            false,
-            None,
-            &mut output,
-        )
-        .unwrap();
-        assert_eq!(*seen.lock().unwrap(), [0, 1, 2, 3, 4]);
-        assert_eq!(counts.failed, 1);
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("negative control")
-        );
+        assert!(output.contains("measure kind: fixture::headless-a Count { windowed: false }"));
+        assert!(output.contains("measure kind: fixture::window-a Count { windowed: true }"));
+        assert!(output.contains("measure kind: fixture::timing Timing"));
     }
 
     #[test]

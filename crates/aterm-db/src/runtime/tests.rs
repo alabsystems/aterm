@@ -929,7 +929,7 @@ fn running_generation_withdraws_after_same_envelope_rebinds_to_another_source() 
             finished.send(result).unwrap();
         });
         let result = completion.recv_timeout(Duration::from_secs(60));
-        stop.request();
+        stop.set();
         worker.join().unwrap();
         assert_eq!(
             result.expect("the old source generation must withdraw"),
