@@ -494,13 +494,20 @@ release_asset_url() { # <tag> <name>
 # github.com answers 302 today; a 301 or a 307 from the same host names the
 # same release, so the code alone must never strand a fresh install on a
 # channel every installed copy still follows. The Location decides.
+# Each mutable pointer lookup has its own cache key; request no-cache headers
+# alone did not prevent a cached redirect from naming the previous release.
 HEAD_TAG=""
 HEAD_WHY=""
 channel_head() {
 	local url="$RELEASE_HOST/$REPO_SLUG/releases/latest/download/aterm-appcast.toml"
-	local answer code location rest tag rc=0
+	local answer code location rest tag nonce rc=0
 	HEAD_TAG=""
 	HEAD_WHY=""
+	if ! nonce="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || [[ ! "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+		HEAD_WHY="could not make a fresh release lookup"
+		return 1
+	fi
+	url="$url?aterm_lookup=$nonce"
 	answer="$(web_curl -sS -I -o /dev/null --max-time 30 -w '%{http_code} %{redirect_url}' "$url" 2>/dev/null)" || rc=$?
 	if [[ "$rc" -ne 0 ]]; then
 		HEAD_WHY="could not reach $url (curl exit $rc: the network, DNS or TLS)"
