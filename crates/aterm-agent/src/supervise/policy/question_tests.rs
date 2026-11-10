@@ -97,6 +97,28 @@ fn decide_rows(rows: &[String]) -> Decision {
 }
 
 #[test]
+fn a_kimi_question_selects_its_recommended_option_without_moving_focus() {
+    let rows = screen(aterm_phase::kimi::fixtures::QUESTION_240);
+    let prompt = aterm_phase::kimi::prompt(&rows).expect("Kimi question");
+    let decision = recommended_answer(&prompt, &rows);
+    let Decision::Approve {
+        rule_id,
+        choice: Choice::Digit(1),
+        guard,
+        subject,
+        unproven: Some(unproven),
+        ..
+    } = decision
+    else {
+        panic!("not answered by Kimi's numbered option: {decision:?}");
+    };
+    assert_eq!(rule_id, RULE_ANSWER_RECOMMENDED);
+    assert_eq!(guard, row_guard(&rows[15]));
+    assert!(subject.contains("Red (Recommended)"), "{subject}");
+    assert!(unproven.contains("recommended option"), "{unproven}");
+}
+
+#[test]
 fn the_incident_question_is_answered_with_its_recommended_option() {
     let (rows, d) = decided(f::QUESTION_TABS_INCIDENT);
     let (steps, target, guard, subject, _) = answer(&d);

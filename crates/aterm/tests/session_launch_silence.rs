@@ -29,15 +29,10 @@ const MACHINE: &str = "[machine]\nuniversal_control = \"leave\"\n";
 const UPDATE: &str = "[update]\nenabled = false\nauto_apply = false\n";
 
 /// Creates an isolated root with `packages` as the `[packages]` table.
-fn fixture(label: &str, packages: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-session-launch-silence-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    launch_isolation::prepare(&root).expect("prepare private session state");
+fn fixture(label: &str, packages: &str) -> aterm_tempfile::TempDir {
+    let root = launch_isolation::scratch_root(&format!("sls-{label}"));
     std::fs::write(
-        root.join("cfg/aterm/aterm.toml"),
+        root.path().join("cfg/aterm/aterm.toml"),
         format!("agents_auto_prime = false\n{UPDATE}{packages}{MACHINE}"),
     )
     .expect("write the fixture config");
@@ -171,25 +166,23 @@ fn assert_silent(what: &str, stderr: &str, screen: &str) {
 #[test]
 fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_stderr() {
     let root = fixture("never-checked", "[packages]\nenabled = true\n");
-    hold_the_pass(&root);
-    let status = prefix(&root).join("status.toml");
+    hold_the_pass(root.path());
+    let status = prefix(root.path()).join("status.toml");
     assert!(
         !status.exists(),
         "precondition: no pass has written a status record in this HOME"
     );
-    let (stderr, screen) = launch(&root, false);
+    let (stderr, screen) = launch(root.path(), false);
     assert_silent("a never-checked store", &stderr, &screen);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A malformed `[packages]` table is logged rather than printed into the new shell.
 #[test]
 fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
     let root = fixture("malformed", "[packages]\nenabled = \"yes\"\n");
-    hold_the_pass(&root);
-    let (stderr, screen) = launch(&root, false);
+    hold_the_pass(root.path());
+    let (stderr, screen) = launch(root.path(), false);
     assert_silent("a malformed [packages] table", &stderr, &screen);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// An engaged reroute over an uncreatable `reroute/` directory and an unwritable prefix logs without printing to the shell.
@@ -206,16 +199,16 @@ fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing(
         "reroute",
         &format!("[packages]\nenabled = true\n{foreign_prefix}"),
     );
-    let prefix = make_prefix(&root);
-    hold_the_pass(&root);
+    let prefix = make_prefix(root.path());
+    hold_the_pass(root.path());
     std::fs::write(prefix.join(atpkg::reroute::DIR_NAME), "not a directory\n")
         .expect("block reroute/");
-    let (stderr, screen) = launch(&root, true);
+    let (stderr, screen) = launch(root.path(), true);
     assert_silent("an unlaid reroute", &stderr, &screen);
     assert!(
         prefix.join(atpkg::reroute::DIR_NAME).is_file(),
         "precondition held: nothing could lay the reroute"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    drop(root);
     aterm_uds::host::could_not_run_as_root("a root-owned prefix this user cannot write");
 }

@@ -214,6 +214,7 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
     }
     let Ok(dir) = aterm_tempfile::Builder::new()
         .prefix("aterm-verify-activate-")
+        .suffix(".noindex")
         .tempdir()
     else {
         return false;

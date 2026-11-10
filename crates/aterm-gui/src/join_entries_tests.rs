@@ -59,6 +59,22 @@ fn an_asking_mac_is_an_info_entry_with_its_allow_and_a_cleaned_name() {
     );
 }
 
+#[test]
+fn a_join_codes_letters_cannot_turn_its_entry_into_forbidden_prose() {
+    for word in 0..4 {
+        let mut words = ["aaaa"; 4];
+        words[word] = "soon";
+        let code = words.join("-");
+        let made = entries(desk_askers(&[row(7, "m20", &code)], true));
+        assert_eq!(made.len(), 1);
+        let message = made[0].message().expect("the join code is data");
+        assert_eq!(made[0].key(), format!("members.join.{code}.asking"));
+        assert_eq!(message.actions, [Intent::AllowJoin { request: 7 }]);
+        assert!(message.detail.iter().any(|line| line.contains(&code)));
+        assert!(matches!(message.need(), Need::Later(_)));
+    }
+}
+
 /// A few asking Macs show one entry each; from [`MANY_AT`] on, one entry stands for them all,
 /// with no Allow (which needs a name). One join code asked through the desk and the approver is
 /// one entry.

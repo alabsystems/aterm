@@ -557,10 +557,13 @@ fn actual_rejected_code_response_waits_for_exact_owned_scope_retirement() {
             let home = auth.parent().unwrap();
             hour_login(home, env.now, Some("previous-refresh"));
             let before = std::fs::read(auth).unwrap();
+            // Historical issuer is prepared before admission. This actual HTTP
+            // retirement control does not authorize new global code issuance.
+            let capture = owner::prepare(env, request, auth, &"d".repeat(64)).unwrap();
             let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
             store
                 .transact_logins(env.now, &mut None, |_, logins| {
-                    logins.enrollment.admit_native(request)?;
+                    logins.enrollment.admit_historical_native_fixture(request)?;
                     Ok(Vec::new())
                 })
                 .unwrap();
@@ -574,7 +577,6 @@ fn actual_rejected_code_response_waits_for_exact_owned_scope_retirement() {
                 token_url: format!("http://127.0.0.1:{port}/oauth/token"),
                 callback_ports: vec![],
             };
-            let capture = owner::prepare(env, request, auth, &"d".repeat(64)).unwrap();
             let (email, output) = CodeExchange {
                 native_scope: None,
                 publication: None,
@@ -730,7 +732,6 @@ fn native_owner_exchange(storage_failure: bool) {
     )
     .unwrap();
     let env = admission::tests::environment(root.path(), &machine, "native-state");
-    let scope = admission::tests::reservation(&env, "native", "a");
     let request = crate::harness::codex_enrollment::Request {
         id: "a".repeat(32),
         caller: "d".repeat(64),
@@ -741,6 +742,10 @@ fn native_owner_exchange(storage_failure: bool) {
     let now = 1_790_000_000;
     hour_login(&stage, now, Some("previous-native-test-refresh"));
     let before = std::fs::read(stage.join(AUTH_FILE)).unwrap();
+    // Preserve the historical native phase/HTTP test independently of global
+    // row admission: it does not claim a catalogue or source-coverage permit.
+    let prepared = owner::prepare(&env, &request, &stage.join(AUTH_FILE), &"f".repeat(64)).unwrap();
+    let scope = admission::tests::historical_reservation(&env, "native", "a");
     let mut wrong_request = request.clone();
     wrong_request.id = "b".repeat(32);
     assert!(
@@ -769,8 +774,7 @@ fn native_owner_exchange(storage_failure: bool) {
         .is_err(),
         "equal operation metadata cannot cross account stores"
     );
-    let prepared = owner::prepare(&env, &request, &stage.join(AUTH_FILE), &"f".repeat(64))
-        .unwrap()
+    let prepared = prepared
         .with_native_scope(&env, Some(Arc::clone(&scope)))
         .unwrap();
     let directory = env
@@ -877,4 +881,89 @@ fn actual_native_code_exchange_holds_gates_and_settles_before_releasing_them() {
 #[test]
 fn actual_native_response_io_failure_keeps_gates_in_owned_carrier_until_exact_retry() {
     native_owner_exchange(true);
+}
+
+#[test]
+fn actual_global_row_code_response_keeps_unsupported_realm_quarantined() {
+    use crate::harness::{
+        account_work, accounts, codex_enrollment, codex_grant_owner as owner,
+        native_enrollment_admission as admission,
+    };
+    let _callback_turn = admission::tests::callback_test_turn();
+    owner::with_global_code_fixture(|env, request, auth, turn, prepared, _artifact| {
+        let lifetime = account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let (work, _control) = codex_enrollment::owned_work(request.clone(), scope.clone());
+        let server_env = env.clone();
+        let server_request = request.clone();
+        let token = make_chatgpt_jwt(Some("global-code@example.test"), "pro", env.now + 3600);
+        let (port, server) = provider(move |_, _| {
+            assert!(admission::RefreshExchangeLease::for_env(&server_env).is_err());
+            let store = server_env.accounts_store_for(accounts::Cli::Codex).unwrap();
+            let (logins, warning) = store.load_logins(server_env.now).unwrap();
+            assert!(warning.is_none());
+            assert_eq!(
+                logins
+                    .enrollment
+                    .catalogue_witness(&server_request)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                codex_enrollment::CataloguePhase::Attempted
+            );
+            (
+                "200 OK",
+                json!({"id_token":token,"access_token":token,
+                "refresh_token":"actual-http-global-fixture-response"}),
+            )
+        });
+        let endpoints = Endpoints {
+            issuer: format!("http://127.0.0.1:{port}"),
+            token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+            callback_ports: vec![],
+        };
+        let (_, outcome) = CodeExchange {
+            native_scope: Some(&turn),
+            enrollment: None,
+            publication: None,
+            home: auth.parent().unwrap(),
+            endpoints: &endpoints,
+            redirect_uri: "http://127.0.0.1/callback",
+            code: "single-global-code-fixture",
+            code_verifier: "verifier",
+            deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+            work: Some(&scope),
+            now: env.now,
+        }
+        .persist_capturing(Some("actual-global-fixture-owner"), Some(prepared));
+        assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+        let owner::CaptureOutcome::Verified(retained) = outcome.unwrap() else {
+            panic!("completed verified identity must retain its exact global issuer occurrence");
+        };
+        let recovered = owner::recover_pending(env, request).unwrap();
+        assert_eq!(retained.reference(), recovered.reference());
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let (logins, warning) = store.load_logins(env.now).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(
+            logins
+                .enrollment
+                .catalogue_witness(request)
+                .unwrap()
+                .unwrap()
+                .phase,
+            codex_enrollment::CataloguePhase::Quarantined
+        );
+        assert!(logins.enrollment.checkpoint_reference(request).is_err());
+        assert!(admission::RefreshExchangeLease::for_env(env).is_ok());
+        // Local HTTP proves the actual sender/custody path, never the pinned
+        // provider realm or an independent grant. No canonical C1 is installed.
+        drop(recovered);
+        drop(retained);
+        drop(turn);
+        scope.cancellation().cancel();
+        drop(work);
+        drop(scope);
+        assert!(lifetime.pause().unwrap().try_wait().is_ok());
+    });
 }

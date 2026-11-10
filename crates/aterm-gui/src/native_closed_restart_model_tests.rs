@@ -73,6 +73,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
             facts.processes.lock().unwrap().insert(live.pid, live);
         }
         op.children[0] = Some(LaunchChild {
+            source_constructor: None,
             death: Arc::new(SharedDeath {
                 watch: if state["child_dead"] == 0 && state["child_group"] == 1 {
                     DeathWatch::Unknown
@@ -308,6 +309,7 @@ fn attached_ungranted_helper_keeps_the_no_exec_classification() {
     let operation = lookup(&handle.ctx, &binding).unwrap();
     let mut op = operation.lock().unwrap();
     op.children[1] = Some(LaunchChild {
+        source_constructor: None,
         process: child.clone(),
         death: Arc::new(SharedDeath {
             watch: DeathWatch::Unknown,

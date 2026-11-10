@@ -678,6 +678,7 @@ fn the_node_log_reads_back_what_a_pass_published_on_it() {
     // Short and in /tmp, as the mesh's own tests make it: its brokers' socket paths live there.
     let state = aterm_tempfile::Builder::new()
         .prefix("amq")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a scratch state dir");
     aterm_uds::private_file::ensure_private_dir(state.path()).expect("a private state dir");

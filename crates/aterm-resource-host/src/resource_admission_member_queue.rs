@@ -85,6 +85,16 @@ pub(super) struct Slot {
     state: State,
 }
 impl Slot {
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn close_linker_lifeline(&mut self) -> bool {
+        match &mut self.state {
+            State::Active(active) => active
+                .attempt
+                .test_resources_mut()
+                .is_some_and(metadata::Resources::close_linker_lifeline),
+            _ => false,
+        }
+    }
     pub(super) fn produced(binding: Binding, member: workload::ProducedMember) -> Self {
         Self {
             binding,
@@ -618,14 +628,15 @@ impl Owner {
                                 let input: io::Result<metadata::Preparation> = (|| {
                                     let deadline = native_inputs::deadline(Instant::now());
                                     if let Some(request) = &pending.linker {
-                                        let held = job
-                                            .metadata_sdk
-                                            .as_ref()
-                                            .ok_or_else(|| refused("original linker SDK missing"))?
-                                            .workload_linker(deadline)?;
+                                        let sdk = job.metadata_sdk.as_ref().ok_or_else(|| {
+                                            refused("original linker SDK missing")
+                                        })?;
+                                        let held = sdk.workload_linker(deadline)?;
+                                        let descriptor = aterm_uds::kept_out(|| sdk.descriptor())?;
                                         return Ok(metadata::Preparation::Linker {
                                             request: request.clone(),
                                             held,
+                                            sdk: descriptor,
                                         });
                                     }
                                     let original = if job.workload.is_some() {
@@ -777,29 +788,29 @@ impl Owner {
                 mut events,
                 mut settled,
             } => {
-                let returned = job.workload.as_mut().map_or(Ok(()), |workload| {
-                    if job.reaped {
-                        workload.host_closed_after_root_exit(slot.binding.attempt);
-                        Ok(())
-                    } else {
-                        workload.return_member(
-                            slot.binding.attempt,
-                            job.timeout
-                                .map(|timeout| job.started + timeout)
-                                .unwrap_or_else(Instant::now),
-                        )
-                    }
-                });
-                if returned
-                    .as_ref()
-                    .is_err_and(|error| error.kind() != io::ErrorKind::WouldBlock)
-                {
+                let returned = job.workload.as_mut().map_or(
+                    Ok(member::ReturnProgress::Returned),
+                    |workload| {
+                        if job.reaped {
+                            workload.host_closed_after_root_exit(slot.binding.attempt);
+                            Ok(member::ReturnProgress::Returned)
+                        } else {
+                            workload.return_member(
+                                slot.binding.attempt,
+                                job.timeout
+                                    .map(|timeout| job.started + timeout)
+                                    .unwrap_or_else(Instant::now),
+                            )
+                        }
+                    },
+                );
+                if returned.is_err() {
                     self.journal
                         .fault(&mut self.faulted, "member-return", &returned);
                     job.cause = CompletionCause::HostFault;
                     job.cleanup_at.get_or_insert_with(Instant::now);
                 }
-                if !settled && returned.is_ok() {
+                if !settled && matches!(returned, Ok(member::ReturnProgress::Returned)) {
                     settled = self.journal.settle(&slot.binding).is_ok();
                 }
                 if settled && events.drained() {
@@ -854,8 +865,9 @@ impl Owner {
         if let Some(arg0) = &pending.arg0 {
             command.arg0(std::ffi::OsStr::from_bytes(arg0));
         }
-        // Linker is a nondelegating target: CPU5 is its sole guard. The Host
-        // retains original SDK ownership; no SDK/root/control locator leaks.
+        // Linker is a nondelegating target: original CPU5 and Host-selected
+        // read-only lifeline6 and close-only original SDK7 cross final exec.
+        // The sole writer stays with Host; no SDK/root/control locator leaks.
         let sdk = match if pending.linker.is_some() {
             Ok(None)
         } else {

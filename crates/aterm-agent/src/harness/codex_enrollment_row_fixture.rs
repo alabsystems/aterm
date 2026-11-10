@@ -10,18 +10,61 @@ use super::*;
 pub struct NativeRowRecoveryFixture {
     _world: aterm_tempfile::TempDir,
     env: cli::Env,
-    requests: [Request; 2],
+    requests: Vec<Request>,
     lifetime: account_work::Lifetime,
 }
 
 impl NativeRowRecoveryFixture {
+    pub(super) fn source_host() -> Result<Self, String> {
+        let caller = aterm_uds::rand::hex_token::<32>().map_err(|_| "fixture nonce unavailable")?;
+        let (world, env, requests) =
+            super::super::codex_grant_owner::native_source_host_fixture(&caller);
+        Ok(Self {
+            _world: world,
+            env,
+            requests: Vec::from(requests),
+            lifetime: account_work::Lifetime::default(),
+        })
+    }
+
+    pub(super) fn directory(&self) -> &std::path::Path {
+        self._world.path()
+    }
+    pub(super) fn keep(self) -> std::path::PathBuf {
+        self._world.keep()
+    }
+
+    pub(super) fn publish_source_rows(&self) -> Result<(), String> {
+        self.retire_originals()?;
+        for request in &self.requests {
+            let scope = self.lifetime.enter().ok_or("fixture admission closed")?;
+            let (work, _) = owned_work(request.clone(), scope);
+            if self.run_recovery(work)?.phase != Phase::Applied {
+                return Err("source fixture publication did not settle".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(caller: &str) -> Self {
         let (world, env, requests) =
             super::super::codex_grant_owner::native_recovery_row_fixture(caller);
         Self {
             _world: world,
             env,
-            requests,
+            requests: Vec::from(requests),
+            lifetime: account_work::Lifetime::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::harness) fn five(caller: &str) -> Self {
+        let (world, env, requests) =
+            super::super::codex_grant_owner::native_recovery_five_fixture(caller);
+        Self {
+            _world: world,
+            env,
+            requests: Vec::from(requests),
             lifetime: account_work::Lifetime::default(),
         }
     }
@@ -30,7 +73,7 @@ impl NativeRowRecoveryFixture {
         &self.env
     }
 
-    pub fn requests(&self) -> &[Request; 2] {
+    pub fn requests(&self) -> &[Request] {
         &self.requests
     }
 

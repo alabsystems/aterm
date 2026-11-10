@@ -292,6 +292,19 @@ fn a_relaunched_agents_limit_holds_the_hosts_carry_on_to_its_reset() {
 }
 
 #[test]
+fn an_ordinary_kimi_turn_end_continues_under_cruise_and_land() {
+    let ended = screen(aterm_phase::kimi::fixtures::END_OF_TURN_240);
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let said = run_points(
+            &format!("ordinary-kimi-{autopilot:?}"),
+            autopilot,
+            &[p(&ended, Some("kimi"), 0, Some(240))],
+        );
+        assert!(said[0].act.starts_with("act "), "{autopilot:?}: {said:?}");
+    }
+}
+
+#[test]
 fn cruise_waits_out_each_harness_wall_and_goes_on_after_it() {
     use aterm_phase::agy::fixtures::lab as agy;
     use aterm_phase::muse::fixtures as muse;
@@ -328,14 +341,22 @@ fn cruise_waits_out_each_harness_wall_and_goes_on_after_it() {
             screen(agy::END_OF_TURN),
             4000,
         ),
+        (
+            "kimi",
+            Some("kimi"),
+            screen(aterm_phase::kimi::fixtures::LIMIT_429_FINAL_240),
+            screen(aterm_phase::kimi::fixtures::END_OF_TURN_240),
+            6 * 3600,
+        ),
     ];
     for (name, program, wall, ended, past) in cases {
         let tag = format!("cruise-{name}");
+        let first = p(&wall, program, 0, Some(60));
         let said = run_points(
             &tag,
             Autopilot::Cruise,
             &[
-                p(&wall, program, 0, Some(60)),
+                first,
                 p(&wall, program, 600, None),
                 p(&wall, program, past, None),
                 p(&ended, program, past + 300, Some(240)),

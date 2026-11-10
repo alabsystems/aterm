@@ -31,6 +31,10 @@ struct Shared {
 #[path = "account_work_release.rs"]
 mod release_operation;
 pub(super) use release_operation::{ReleaseMonitor, ReleaseOperation};
+#[path = "account_work_maintenance.rs"]
+mod maintenance;
+pub use maintenance::AdmissionOwner;
+pub(in crate::harness) use maintenance::{MaintenanceEpoch, MaintenanceOwner};
 
 /// Admission owner for automatic account work.
 #[derive(Clone)]
@@ -49,21 +53,27 @@ impl Default for Lifetime {
     }
 }
 
+// Both normal App work and a genuine weak same-App maintenance locator use
+// this single current-epoch admission gate. No namespace is created here.
+fn counted_enter(shared: &Arc<Shared>) -> Option<Scope> {
+    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.sealed || state.epoch.cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    state.operations = state.operations.checked_add(1)?;
+    Some(Scope(Arc::new(Operation {
+        shared: shared.clone(),
+        epoch: state.epoch.clone(),
+        status: Arc::new(Status::default()),
+        #[cfg(test)]
+        dropping: None,
+    })))
+}
+
 impl Lifetime {
     /// Counts a new operation unless admissions are closed.
     pub fn enter(&self) -> Option<Scope> {
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.epoch.cancelled.load(Ordering::Acquire) {
-            return None;
-        }
-        state.operations = state.operations.checked_add(1)?;
-        Some(Scope(Arc::new(Operation {
-            shared: self.0.clone(),
-            epoch: state.epoch.clone(),
-            status: Arc::new(Status::default()),
-            #[cfg(test)]
-            dropping: None,
-        })))
+        counted_enter(&self.0)
     }
 
     /// A distinct counted release turn may settle retained cleanup while

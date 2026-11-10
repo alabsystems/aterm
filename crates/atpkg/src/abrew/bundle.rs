@@ -1552,7 +1552,7 @@ pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
     if path == Some(Path::new("-")) {
         return read_stdin_brewfile();
     }
-    let p = path.map_or_else(|| std::path::PathBuf::from("Brewfile"), Path::to_path_buf);
+    let p = path.map_or_else(|| deps_brewfile_path(None), Path::to_path_buf);
     read_brewfile_file(&p).map_err(|e| {
         // brew's `Brewfile.read` maps any ENOENT here.
         if e.kind() == std::io::ErrorKind::NotFound {

@@ -131,6 +131,48 @@ impl PendingCustodyFixture {
             }
             Ok(Vec::new())
         })?;
+        let held = store
+            .acquire_bounded()
+            .map_err(|_| "fixture writer unavailable")?
+            .ok_or("fixture writer busy")?;
+        store.transact_pool_logins_held(&held, &roster, env.now, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, &request.label)?;
+            Ok(Vec::new())
+        })?;
+        let snapshot = store.native_row_snapshot_held(&held, &roster, env.now)?;
+        let image = snapshot.account_image();
+        let parent = accounts::RenewalParent::capture(&image.logins, &request.label);
+        let workflow = accounts::current_workflow(
+            image
+                .raw_roster
+                .row(&request.label)
+                .ok_or("fixture row unavailable")?,
+            &image.logins,
+        )
+        .ok_or("fixture workflow unavailable")?
+        .value();
+        let occurrence =
+            super::super::codex_native_row::NativeRowOccurrence::capture(snapshot, &request)?;
+        let staging = Staging {
+            native_row: Some(occurrence.fence().clone()),
+            request: request.clone(),
+            store: std::fs::canonicalize(&store.dir).map_err(|_| "fixture store unavailable")?,
+            directory: std::fs::canonicalize(&stage).map_err(|_| "fixture stage unavailable")?,
+            store_identity: Some(DirectoryIdentity::capture(&store.dir)?),
+            directory_identity: Some(DirectoryIdentity::capture(&stage)?),
+            parent,
+            workflow,
+            policy: occurrence.policy().to_owned(),
+            selection: None,
+        };
+        let admission = occurrence.finish(staging)?;
+        store.transact_roster_logins_held(&held, &roster, env.now, &mut None, |_, _, logins| {
+            logins
+                .enrollment
+                .bind_staging(admission.staging().clone())?;
+            Ok(Vec::new())
+        })?;
+        drop(held);
         let turn =
             super::super::native_enrollment_admission::NativeBrowserTurn::acquire_isolated_fixture(
                 &store, &request, &row, env.now,
@@ -155,7 +197,19 @@ impl PendingCustodyFixture {
             &stage.join("auth.json"),
             scope,
             turn,
+            admission,
         )?;
+        let (admitted, warning) = store.load_logins(env.now)?;
+        if warning.is_some()
+            || !admitted.enrollment.requires_global_catalogue(&request)?
+            || admitted
+                .enrollment
+                .catalogue_staging(&request)?
+                .native_row
+                .is_none()
+        {
+            return Err("fixture lost its actual native row admission".into());
+        }
         let _ = work.native.capture(outcome, &work.scope);
         if !control.has_pending_custody() {
             return Err("fixture lost pending custody".into());

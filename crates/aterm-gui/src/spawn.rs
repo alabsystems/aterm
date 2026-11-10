@@ -9161,6 +9161,9 @@ impl crate::App {
             drop(registry);
         });
         crate::proxy::publish_session(&session.ctx.self_id, &session.ctx.nonce);
+        if session.handoff_local_id.is_some() {
+            let _ = crate::program_worker::resume(store, session);
+        }
     }
 }
 

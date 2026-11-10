@@ -480,28 +480,55 @@ pub(crate) fn project(slot: Option<&FleetSlot>, obs: &NetworkObservation, now_ms
                 )
             })
             .count();
-        if let Some(tally) = mac.activity {
-            *tallies.busy.get_or_insert(0) += usize::from(tally.busy);
-            tallies.waiting += usize::from(tally.waiting);
-            // A session the tally does not count waiting (a shell; or an agent an older node
-            // still counts by its word alone) whose need a person decides waits too, as its
-            // seat's diamond says; counted only where the read listed every agent, so no agent is
-            // counted twice.
-            if mac.sessions_more == 0 {
-                tallies.waiting += mac
-                    .needs
-                    .iter()
-                    .filter(|need| need.word.severity() == aterm_types::needs::Severity::Decide)
-                    .filter(|need| {
-                        !mac.agent_sessions
-                            .iter()
-                            .any(|s| s.sid == need.sid && s.agent == AgentWord::Waiting)
-                    })
-                    .count();
+        // Each session whose need a person decides waits, as its seat's diamond says, once.
+        let mut decided: Vec<&str> = Vec::new();
+        for need in &mac.needs {
+            if need.word.severity() == aterm_types::needs::Severity::Decide
+                && !decided.contains(&need.sid.as_str())
+            {
+                decided.push(&need.sid);
             }
-            tallies.walled += usize::from(tally.walled);
-            tallies.walled_macs += usize::from(tally.walled > 0);
         }
+        let Some(tally) = mac.activity else {
+            // No tally read: its needs are what is known to wait.
+            tallies.waiting += decided.len();
+            continue;
+        };
+        let (mut busy, mut waiting, mut walled) = (
+            usize::from(tally.busy),
+            usize::from(tally.waiting),
+            usize::from(tally.walled),
+        );
+        // A session the tally does not count waiting (a shell; an agent an older node counts by
+        // its word alone; one the needs row reads as asking before the next activity count)
+        // whose need a person decides waits too, and leaves the bucket its word put it in, so no
+        // session is counted twice; counted only where the read listed every agent, since one
+        // that left agents out cannot tell a shell's need from an unlisted agent's.
+        if mac.sessions_more == 0 {
+            for sid in decided {
+                match mac
+                    .agent_sessions
+                    .iter()
+                    .find(|s| s.sid == sid)
+                    .map(|s| &s.agent)
+                {
+                    Some(AgentWord::Waiting) => {}
+                    Some(AgentWord::Busy) => {
+                        busy = busy.saturating_sub(1);
+                        waiting += 1;
+                    }
+                    Some(AgentWord::Walled(_)) => {
+                        walled = walled.saturating_sub(1);
+                        waiting += 1;
+                    }
+                    Some(AgentWord::Idle | AgentWord::Unknown) | None => waiting += 1,
+                }
+            }
+        }
+        *tallies.busy.get_or_insert(0) += busy;
+        tallies.waiting += waiting;
+        tallies.walled += walled;
+        tallies.walled_macs += usize::from(walled > 0);
     }
     #[cfg(unix)]
     {
@@ -790,11 +817,13 @@ fn observer_words(
     if let Some(caption) = caption {
         // Place does not establish observer or history health: keep their status first.
         if super::place_only(status, caption) {
-            text = if fits(&caption.long) {
-                caption.long.clone()
-            } else {
-                caption.short.clone()
-            };
+            // The layout reserved only the status's short form: a caption that does not fit
+            // leaves the status.
+            if fits(&caption.long) {
+                text = caption.long.clone();
+            } else if fits(&caption.short) {
+                text = caption.short.clone();
+            }
             extras.clear();
         } else {
             extras.push(caption.short.clone());
@@ -1207,19 +1236,21 @@ pub(crate) fn paint(
 }
 
 /// The targets ↑/↓ visit on the field as `layout` draws it, in strip order: the Fleet words,
-/// then the seats that need attention, or a tally's drawn groups (every observed seat in
-/// observer fallback). A stale read has none.
+/// then the seats that need attention, or a tally's drawn groups (in observer fallback, every
+/// observed seat, or its tally's groups, with no Fleet words). A stale read has none.
 pub(crate) fn targets(field: &Field, layout: &Layout) -> Vec<Target> {
     let seats = field
         .seats
         .iter()
         .filter(|seat| seat.attention)
         .map(|seat| Target::Seat(seat.key));
+    let groups = layout.groups.iter().map(|group| Target::Group(group.class));
     match field.source {
+        Source::Observer if layout.tier == Tier::C => groups.collect(),
         Source::Observer => seats.collect(),
-        Source::Fleet if layout.tier == Tier::C => std::iter::once(Target::Fleet)
-            .chain(layout.groups.iter().map(|group| Target::Group(group.class)))
-            .collect(),
+        Source::Fleet if layout.tier == Tier::C => {
+            std::iter::once(Target::Fleet).chain(groups).collect()
+        }
         Source::Fleet => std::iter::once(Target::Fleet).chain(seats).collect(),
         Source::Stale { .. } | Source::Reading | Source::NotRead => vec![Target::Fleet],
     }

@@ -491,11 +491,11 @@ pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
 }
 
 fn read_started(paths: &Paths, now: u64, caps: Caps, started: Instant) -> Result<Read> {
-    let selected = crate::generation::selected(paths)?;
-    let paths = &selected;
     let deadline = crate::admission::deadline_at(started);
+    let selected = crate::generation::observed_generation_until(paths, deadline)?;
+    let paths = &selected;
     let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
-    let session = Session::observe(&bootstrap)?;
+    let session = Session::observe_named_until(&bootstrap, deadline)?;
     let directory = Directory::new(paths, bootstrap.trust());
     let state = directory.ring_view(&session, &CLAIMS);
     let mut logs = ring_logs(&session, &directory, &state, now)?;

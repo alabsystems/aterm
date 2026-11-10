@@ -863,12 +863,7 @@ mod tests {
     /// removed after the listing is held by nobody rather than failing the watch.
     #[test]
     fn the_watch_names_each_held_slot_file_with_its_holder() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("lab-slot-holders-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestScratch::new("slots");
         for n in 0..3 {
             std::fs::write(dir.join(format!("slot-{n}")), b"").unwrap();
         }
@@ -882,7 +877,6 @@ mod tests {
         let scan = slot_holders(&files);
         let _ = holder.kill();
         let _ = holder.wait();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(files.len(), 3, "the listing");
         let scan = scan.expect("the scan");
         assert_eq!(scan.held, [(dir.join("slot-0"), holder.id())]);

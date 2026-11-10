@@ -137,8 +137,10 @@ pub fn world(tag: &str) -> World {
 /// A new world ([`world`]) whose config says `keeper` about the keeper, and nothing when it is
 /// empty: what a new Mac's config says.
 pub fn world_saying(tag: &str, keeper: &str) -> World {
+    let short = &tag[..tag.floor_char_boundary(8)];
     let made = aterm_tempfile::Builder::new()
-        .prefix(&format!("atkr-{tag}-"))
+        .prefix(&format!("atkr-{short}-"))
+        .suffix(".noindex")
         .tempdir_in("/tmp");
     let world = match made {
         Ok(dir) => World(dir.keep()),

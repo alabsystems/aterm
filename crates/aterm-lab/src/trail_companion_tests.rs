@@ -5,8 +5,6 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 /// The gallery's grid: 14x26 cells under a 12 px pad and a 2 px top pad.
 const GRID: Grid = Grid {
     ox: 12,
@@ -93,15 +91,8 @@ fn a_graze_counts_raw_but_not_shaved_and_an_icon_counts() {
     assert!(m.over());
 }
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
-
-fn scratch(tag: &str) -> PathBuf {
-    let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "lab-trail-companion-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch(tag: &str) -> crate::TestScratch {
+    let dir = crate::TestScratch::new(tag);
     std::fs::create_dir_all(dir.join("solarized-dark")).expect("scratch dir");
     dir
 }
@@ -207,7 +198,6 @@ fn a_gallery_tree_is_read_end_to_end() {
         Some(1),
         "two frames over --max 1 fail"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn report_of(path: &Path, max: Option<i64>) -> Result<J, String> {
@@ -248,7 +238,6 @@ fn a_path_with_no_frame_is_an_error_not_a_pass() {
         out.get("failures").and_then(J::as_arr).map(<[J]>::len),
         Some(0)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -259,9 +248,7 @@ fn a_frame_not_read_is_never_counted_clean() {
         let dir = scratch(tag);
         write_frame(&dir, stem, "t0", "250,320,88,132", Some("none"));
         unread(&dir);
-        let out = report_of(&dir, Some(0)).expect("a report");
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        report_of(&dir, Some(0)).expect("a report")
     };
     let int = |out: &J, k: &str| out.get(k).and_then(J::as_i64);
     let failed = |out: &J| {
@@ -382,7 +369,6 @@ fn the_flying_head_is_read_as_the_pet_is() {
         "{}",
         render(&over)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -444,5 +430,4 @@ fn a_settings_cards_own_grid_places_its_letters() {
         "on the window's grid row 11 holds no text: {:?}",
         read.meets
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

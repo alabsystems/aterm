@@ -1011,6 +1011,7 @@ mod tests {
     fn only_a_run_that_passed_is_kept_for_this_machines_other_checkouts() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("verify-disk-machine-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         let record = dir.path().join("state").join(MACHINE_FOOTPRINT);
@@ -1227,6 +1228,7 @@ mod tests {
     fn a_covered_run_walks_nothing_and_keeps_nothing() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("verify-disk-covered-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         let covered = dir.path().join("covered");
@@ -1347,6 +1349,7 @@ mod tests {
     fn a_passing_release_run_keeps_the_units_it_used() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("verify-disk-used-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         let leaf = dir.path().join("cache/w/.cargo-build");

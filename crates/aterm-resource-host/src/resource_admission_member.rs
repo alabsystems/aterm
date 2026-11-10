@@ -58,14 +58,23 @@ pub(super) trait MemberCustody {
     fn return_producer(
         &mut self,
         original: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
+    ) -> Result<ProducerReturn, (io::Error, Box<ProducerRetirement>)> {
         Err((io::ErrorKind::Unsupported.into(), original))
     }
     /// Called only after lexical NoLaunch, authenticated NoChild cancellation,
     /// or successful actual scope retirement. Retry bookkeeping without
     /// repeating or reconstructing the consumed native closure proof.
-    fn return_unit(&mut self, receipt: ReturnReceipt) -> io::Result<()>;
+    fn return_unit(&mut self, receipt: ReturnReceipt) -> io::Result<ReturnProgress>;
     fn validate(&mut self) -> io::Result<()>;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReturnProgress {
+    Pending,
+    Returned,
+}
+pub(super) enum ProducerReturn {
+    Pending(Box<ProducerRetirement>),
+    Returned(Box<ReturnedProducer>),
 }
 /// Constructed only at this owned attempt's lexical no-ARM boundary or after
 /// its native cancellation/retirement receipt. No wire value creates one.
@@ -260,6 +269,10 @@ impl<D: MemberResources> OwnedAttempt<D> {
     pub fn binding(&self) -> &Binding {
         &self.binding
     }
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn test_resources_mut(&mut self) -> Option<&mut D> {
+        self.resources.as_mut()
+    }
     pub(super) fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
     }
@@ -453,7 +466,10 @@ impl<D: MemberResources> OwnedAttempt<D> {
         }
         if let State::Bound(bound) = &mut self.state {
             let failure = poll_bound(bound, &mut self.events, self.timeout, cause);
-            self.uncertain = failure.is_some();
+            // A healthy later native wait is not a durable return receipt.
+            // Retain earlier custody uncertainty through typed bank Pending;
+            // only positive finish_return may resolve it and drop resources.
+            self.uncertain |= failure.is_some();
             if let Some(failure) = failure {
                 self.failure = Some(failure);
             }
@@ -517,7 +533,14 @@ impl<D: MemberResources> OwnedAttempt<D> {
         };
         if let Some(retirement) = self.producer_retirement.take() {
             match custody.return_producer(retirement) {
-                Ok(returned) => self.producer_returned = Some(returned),
+                Ok(ProducerReturn::Returned(returned)) => self.producer_returned = Some(returned),
+                Ok(ProducerReturn::Pending(original)) => {
+                    // The SAME accepted original-bank request is outstanding.
+                    // Preserve closure/resources without fabricating a fault or
+                    // replaying retirement while its durable reply is pending.
+                    self.producer_retirement = Some(original);
+                    return;
+                }
                 Err((error, original)) => {
                     self.failure = Some(format!("return producer: {error:?}"));
                     self.producer_retirement = Some(original);
@@ -525,7 +548,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
                     return;
                 }
             }
-        } else if custody.return_unit(receipt).is_err() {
+        } else if !matches!(custody.return_unit(receipt), Ok(ReturnProgress::Returned)) {
             return;
         }
         // Consume once, only after the SAME original custody has durably

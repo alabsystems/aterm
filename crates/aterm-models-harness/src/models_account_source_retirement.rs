@@ -13,7 +13,7 @@ pub fn account_source_retirement_model() -> Model {
             const Buggy = 0;
             var mode = 0; var cut = 0; var conflict = 0; var done = 0;
             var retired = 0; var fenced = 1; var preserved = 1; var loss_refused = 1; var stable = 1;
-            action Mode when (done == 0 && 3 > mode) { mode = mode + 1; }
+            action Mode when (done == 0 && 5 > mode) { mode = mode + 1; }
             action Cut when (done == 0 && 7 > cut) { cut = cut + 1; }
             action Conflict when (done == 0 && conflict == 0) { conflict = 1; }
             action Commit when (done == 0) {
@@ -29,7 +29,7 @@ pub fn account_source_retirement_model() -> Model {
             invariant ConflictPreservesEveryImage: preserved == 1;
             invariant LostPolicyIsNotInitial: loss_refused == 1;
             invariant RepeatedRetirementIsStable: stable == 1;
-            bound ModeDomain: 0 <= mode && mode <= 3;
+            bound ModeDomain: 0 <= mode && mode <= 5;
             bound CutDomain: 0 <= cut && cut <= 7;
         }
     }

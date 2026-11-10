@@ -65,6 +65,7 @@ pub mod libtest;
 pub mod libtest_json;
 pub mod lint_content;
 pub mod memory;
+pub mod own_tests;
 pub mod perf;
 pub mod plan;
 #[cfg(unix)]
@@ -3299,6 +3300,7 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
     if !cfg!(unix) {
         return Ok(aterm_tempfile::Builder::new()
             .prefix(&format!("{tag}."))
+            .suffix(".noindex")
             .tempdir()?
             .keep());
     }

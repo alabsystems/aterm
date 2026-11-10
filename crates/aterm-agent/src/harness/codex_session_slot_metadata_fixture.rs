@@ -19,6 +19,7 @@ pub(in crate::harness) fn source(
     generation: u64,
 ) -> SourceHandle {
     SourceHandle {
+        policy: None,
         binding: std::sync::Arc::new(binding),
         slot: "1".repeat(64),
         path,
@@ -42,6 +43,20 @@ pub(in crate::harness) fn with_authority(
     authority: codex_assignment::SourceAuthority,
 ) -> SourceHandle {
     source.source_authority = authority;
+    source
+}
+
+/// Synthetic positive assignment correlation for ledger tests. This provides
+/// no signed Book, installed role, supported image, or publication authority.
+pub(in crate::harness) fn with_assignment(
+    mut source: SourceHandle,
+    generation: u64,
+    operation: &str,
+) -> SourceHandle {
+    source.assignment_generation = generation;
+    source.source_authority = codex_assignment::SourceAuthority::Assignment {
+        operation: operation.into(),
+    };
     source
 }
 

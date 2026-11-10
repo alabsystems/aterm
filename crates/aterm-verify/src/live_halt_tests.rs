@@ -181,6 +181,7 @@ fn run_arm(dir: &Path, arm: &str, during: impl FnOnce(&dyn Fn() -> String)) -> R
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("atv-live-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir")
 }

@@ -21,6 +21,11 @@ use crate::task_record::{TaskMark, TaskRecord, TaskState};
 #[cfg(unix)]
 #[path = "task_launch_codex_source.rs"]
 mod codex_source;
+#[cfg(all(unix, debug_assertions))]
+#[path = "task_launch_source_proof.rs"]
+mod source_proof;
+#[cfg(all(unix, debug_assertions))]
+pub(crate) use source_proof::spawn as spawn_source_proof;
 
 /// Actual constructor permission/count fixture for the App drain tests only.
 /// Advertised-layout bytes are synthetic and never executed; no source grant.

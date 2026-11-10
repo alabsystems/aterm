@@ -16,9 +16,10 @@
 //! survey's screen reads are ([`crate::survey::redact`]) and cut to [`TAIL_BYTES`], written where
 //! `result` reads it ([`aterm_agent::harness::result::snapshot_output`]).
 //!
-//! The launcher watches its own worker to that end ([`watch`]). A worker whose launcher is not this
-//! process's, one a seamless update carried or a restore brought back, is concluded by the
-//! reaper's look instead ([`crate::App::reap_workers`], [`unwatched_end`]).
+//! The launcher watches its own worker to that end ([`watch`]). A seamless update starts that
+//! watch again for an adopted worker ([`resume`]). The reaper's look remains a fallback for
+//! a worker whose watch could not start or a cold restore ([`crate::App::reap_workers`],
+//! [`unwatched_end`]).
 
 use std::time::Duration;
 
@@ -342,7 +343,6 @@ pub(crate) fn conclude(
 /// task is no longer the one it typed for, still [`awaits_its_end`] with its typed block noted: whatever
 /// moved it said how it ended.
 pub(crate) fn watch(work: &crate::task_launch::Launch) {
-    let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
     let started = work
         .ctx
         .timeline
@@ -350,12 +350,69 @@ pub(crate) fn watch(work: &crate::task_launch::Launch) {
         .unwrap_or_else(|p| p.into_inner())
         .task()
         .map(|task| task.started);
-    loop {
-        if !crate::task_launch::session_alive(work) {
-            return;
+    watch_registered(&work.ctx, &work.term, work.local, started, || {
+        crate::task_launch::session_alive(work)
+            .then(|| shell_pid(&work.store, work.local).unwrap_or(0))
+    });
+}
+
+/// Resume an adopted program's exit watch after its live handle is registered. The carried
+/// block and task start identify the same program; a later task or reused local id is not it.
+pub(crate) fn resume(
+    store: &crate::session_store::Store,
+    session: &crate::Session,
+) -> Option<std::thread::JoinHandle<()>> {
+    let started = session
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .task()
+        .filter(|record| awaits_its_end(record) && record.program_block.is_some())
+        .map(|record| record.started)?;
+    let (ctx, term, store, local) = (
+        session.ctx.clone(),
+        session.term.clone(),
+        std::sync::Arc::downgrade(store),
+        session.id,
+    );
+    match std::thread::Builder::new()
+        .name(format!("aterm-program-{local}"))
+        .spawn(move || {
+            watch_registered(&ctx, &term, local, Some(started), || {
+                store
+                    .upgrade()?
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .by_local(local)
+                    .filter(|handle| {
+                        handle.nonce == ctx.nonce
+                            && handle.state != crate::session_store::SessionState::Exited
+                    })
+                    .map(|handle| handle.shell_identity.pid)
+            });
+        }) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            aterm_log::warn!("worker session {local}: could not resume its program watch: {error}");
+            None
         }
-        let read = work
-            .ctx
+    }
+}
+
+fn watch_registered(
+    ctx: &SessionCtx,
+    term: &std::sync::Mutex<Terminal>,
+    local: u64,
+    started: Option<std::time::Instant>,
+    live_shell: impl Fn() -> Option<i32>,
+) {
+    let sub = crate::session_watch::Subscription::single(&ctx.watchers);
+    loop {
+        let Some(shell) = live_shell() else {
+            return;
+        };
+        let read = ctx
             .timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -367,20 +424,12 @@ pub(crate) fn watch(work: &crate::task_launch::Launch) {
         else {
             return;
         };
-        let shell = shell_pid(work);
-        let end = ended(&crate::term_lock(&work.term), typed, || {
-            shell.is_some_and(holds_stopped_job)
+        let end = ended(&crate::term_lock(term), typed, || {
+            shell > 0 && holds_stopped_job(shell)
         });
         if let Some(end) = end {
-            let sid = work.ctx.self_id.as_str().to_string();
-            match conclude(
-                &work.ctx,
-                work.local,
-                &sid,
-                &read,
-                &end,
-                work.ctx.fabric.fence_wait(),
-            ) {
+            let sid = ctx.self_id.as_str().to_string();
+            match conclude(ctx, local, &sid, &read, &end, ctx.fabric.fence_wait()) {
                 Ok(Some(_)) => return,
                 // Moved since the read: the next turn reads what moved it.
                 Ok(None) => continue,
@@ -391,12 +440,12 @@ pub(crate) fn watch(work: &crate::task_launch::Launch) {
     }
 }
 
-/// The pid of the shell holding `work`'s session, `None` once it is gone.
-fn shell_pid(work: &crate::task_launch::Launch) -> Option<i32> {
-    work.store
+/// The pid of the shell holding `local`'s session, `None` once it is gone.
+fn shell_pid(store: &crate::session_store::Store, local: u64) -> Option<i32> {
+    store
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .by_local(work.local)
+        .by_local(local)
         .map(|h| h.shell_identity.pid)
         .filter(|pid| *pid > 0)
 }

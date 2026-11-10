@@ -187,18 +187,158 @@ pub fn cmd(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let handoffs = handoff_count(&mut args)?;
     let streaming = instance::take_flag(&mut args, "--stream");
+    let programs = instance::take_flag(&mut args, "--program-workers");
     let aterm = instance::resolve_aterm(instance::take_value(&mut args, "--aterm")?)?;
     let out = instance::take_value(&mut args, "--out")?
         .map(PathBuf::from)
         .ok_or_else(|| Fail::usage("installer-handoff needs --out ABS"))?;
     if !args.is_empty() || !out.is_absolute() {
         return Err(Fail::usage(
-            "installer-handoff takes --aterm PATH --out ABS [--stream]",
+            "installer-handoff takes --aterm PATH --out ABS [--stream] [--program-workers]",
         ));
     }
     execute(&aterm, &out, |aterm, out| {
-        run(aterm, out, handoffs, streaming)
+        run(aterm, out, handoffs, streaming, programs)
     })
+}
+
+/// Private program worker: wait for the controller's release, then report the requested exit.
+pub(crate) fn program_fixture_main(args: &[String]) -> i32 {
+    let [release, status] = args else { return 2 };
+    let status = match status.as_str() {
+        "0" => 0,
+        "3" => 3,
+        _ => return 2,
+    };
+    println!("PROGRAM_HANDOFF_READY");
+    if std::io::stdout().flush().is_err()
+        || wait("program worker release", || {
+            Path::new(release).is_file().then_some(())
+        })
+        .is_err()
+    {
+        return 1;
+    }
+    println!("PROGRAM_HANDOFF_DONE {status}");
+    status
+}
+
+struct ProgramWorker {
+    sid: String,
+    release: PathBuf,
+    exit: i32,
+}
+
+fn programs_started(
+    instance: &Instance,
+    manager: &str,
+    out: &Path,
+) -> Result<Vec<ProgramWorker>, String> {
+    let program = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut workers = Vec::new();
+    for exit in [0, 3] {
+        let release = out.join(format!("program-{exit}.release"));
+        let spawned = instance.ctl_stdin(
+            &[
+                &format!("@{manager}"),
+                "spawn",
+                &format!(
+                    "program={}",
+                    aterm_codec::pct::encode(&program.to_string_lossy())
+                ),
+                "arg=__handoff-program",
+                &format!(
+                    "arg={}",
+                    aterm_codec::pct::encode(&release.to_string_lossy())
+                ),
+                &format!("arg={exit}"),
+                "raise=false",
+                "-",
+            ],
+            b"program handoff fixture\n",
+        );
+        if spawned.code != 0 {
+            return Err(format!("program worker did not spawn: {}", spawned.first()));
+        }
+        let sid = crate::stub::first_sid(&spawned.stdout)
+            .ok_or_else(|| format!("spawn did not name its program worker: {}", spawned.first()))?
+            .to_owned();
+        let ready = instance.ctl(&[
+            &format!("@{sid}"),
+            "await",
+            "match",
+            "^PROGRAM_HANDOFF_READY$",
+            "timeout=60000",
+        ]);
+        if ready.code != 0 {
+            return Err(format!("program worker did not start: {}", ready.first()));
+        }
+        workers.push(ProgramWorker { sid, release, exit });
+    }
+    programs_working(instance, &workers)?;
+    Ok(workers)
+}
+
+fn programs_working(instance: &Instance, workers: &[ProgramWorker]) -> Result<(), String> {
+    for worker in workers {
+        let task = instance.ctl(&[&format!("@{}", worker.sid), "task"]);
+        if task.code != 0 || crate::workers::kv(&task.stdout, "state") != Some("working") {
+            return Err(format!(
+                "program task did not stay working: {}",
+                task.first()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn program_finished(task: &str, exit: i32) -> bool {
+    crate::workers::kv(task, "state") == Some(if exit == 0 { "done" } else { "failed" })
+        && crate::workers::kv(task, "why") == Some("exit-status")
+        && crate::workers::kv(task, "exit").and_then(|word| word.parse::<i32>().ok()) == Some(exit)
+}
+
+fn programs_finish(
+    instance: &Instance,
+    workers: &[ProgramWorker],
+) -> Result<Vec<aterm_json::Value>, String> {
+    let mut reports = Vec::new();
+    for worker in workers {
+        crate::util::create_new_regular_file(&worker.release, 0o600).map_err(|e| e.to_string())?;
+    }
+    for worker in workers {
+        let ended = instance.ctl(&[
+            &format!("@{}", worker.sid),
+            "await",
+            "task",
+            "since=0",
+            "timeout=60000",
+        ]);
+        let task = instance.ctl(&[&format!("@{}", worker.sid), "task"]);
+        if ended.code != 0 || task.code != 0 || !program_finished(&task.stdout, worker.exit) {
+            return Err(format!(
+                "adopted program did not conclude: {}; {}",
+                ended.first(),
+                task.first()
+            ));
+        }
+        let result = instance.ctl(&[&format!("@{}", worker.sid), "result"]);
+        let want = format!(
+            "PROGRAM_HANDOFF_READY\nPROGRAM_HANDOFF_DONE {}\n",
+            worker.exit
+        );
+        if result.code != 0 || result.stdout != want {
+            return Err(format!(
+                "adopted program result changed: {}",
+                result.first()
+            ));
+        }
+        reports.push(aterm_json::json!({
+            "sid": worker.sid, "exit": worker.exit,
+            "task": task.stdout, "result": result.stdout,
+        }));
+    }
+    Ok(reports)
 }
 
 const STREAM_LIMIT: usize = 10_000;
@@ -628,15 +768,33 @@ fn run_cold(aterm: &Path, out: &Path, handoffs: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(), String> {
+fn run(
+    aterm: &Path,
+    out: &Path,
+    handoffs: usize,
+    streaming: bool,
+    programs: bool,
+) -> Result<(), String> {
     let image = ProbeImage::read(aterm)?;
     image.record(out)?;
-    let mut world = World::new(instance::CONFIG_OFF)?;
+    let config = if programs {
+        instance::config_after(
+            &format!("tab_status = false\n{}", instance::CONFIG_OFF),
+            true,
+            &[],
+        )
+    } else {
+        instance::CONFIG_OFF.to_owned()
+    };
+    let mut world = World::new(&config)?;
     world.keep();
     let mut evidence = EvidenceLog::new(out);
     let mut env = world.env();
     env.push(("ATERM_DEBUG_SEAMLESS_REEXEC".into(), "1".into()));
     env.push(("ATERM_DEBUG_INSTALLER_CUSTODY".into(), "1".into()));
+    if programs {
+        env.push(("SHELL".into(), "/bin/zsh".into()));
+    }
     let mut args: Vec<String> = ["--columns", "100", "--lines", "30", "-e"]
         .map(str::to_owned)
         .to_vec();
@@ -671,6 +829,11 @@ fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(),
     let before = wait("the installer fixture's custody record", || {
         record(&instance.log_tail(200), "seeded", parent)
     })?;
+    let workers = if programs {
+        programs_started(&instance, &before.sid, out)?
+    } else {
+        Vec::new()
+    };
     echo(&instance, &before.sid, "installer_before", true)?;
     if streaming {
         echo(&instance, &before.sid, "stream_start", false)?;
@@ -699,6 +862,7 @@ fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(),
             ));
         }
         echo(&instance, &after.sid, &marker, !streaming)?;
+        programs_working(&instance, &workers)?;
         wait("the outgoing GUI to exit", || {
             (!crate::sys::alive(outgoing)).then_some(())
         })?;
@@ -709,6 +873,7 @@ fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(),
     } else {
         None
     };
+    let program_records = programs_finish(&instance, &workers)?;
     window.stop()?;
     instance.stop()?;
     evidence.capture()?;
@@ -723,6 +888,8 @@ fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(),
         "image_path": image.path.to_string_lossy().into_owned(), "image_sha256": image.sha256,
         "initial_identity": parent_identity, "successor_identities": identities,
         "stream_records": stream_records,
+        "program_workers": program_records,
+        "tab_status_disabled": programs,
     });
     write_new_report(&out.join("passed.json"), &report).map_err(|e| e.to_string())?;
     world.release();
@@ -736,6 +903,23 @@ fn run(aterm: &Path, out: &Path, handoffs: usize, streaming: bool) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_completion_requires_the_requested_exit_status() {
+        assert!(program_finished("OK state=done why=exit-status exit=0", 0));
+        assert!(program_finished(
+            "OK state=failed why=exit-status exit=3",
+            3
+        ));
+        for wrong in [
+            "OK state=working why=exit-status exit=0",
+            "OK state=done why=no-exit-status",
+            "OK state=done why=exit-status exit=3",
+            "OK state=failed why=exit-status exit=0",
+        ] {
+            assert!(!program_finished(wrong, 0));
+        }
+    }
 
     #[test]
     fn stream_line_reads_the_single_line_cli_reply() {

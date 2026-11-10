@@ -194,7 +194,7 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
 /// label before it reads the fleet, keeping the row's login directory and its records, and
 /// signs nobody out; with the lab unsettled the row keeps its label. The `held_by` an old
 /// `ai-pool.toml` left on the row is cleared by the first sync from the lab.
-/// NEGATIVE CONTROL: with `sync_cli_with_replan`'s `migrate_before_sync` call removed, the
+/// NEGATIVE CONTROL: with the provider source's held migration call removed, the
 /// settled sync leaves `kimi-m16` (`renamed before the fleet is read`); with its `alab` arm that
 /// clears `held_by` removed, the hold stays (`left: Some("m3") right: None`).
 #[test]
@@ -264,6 +264,7 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
                 cli,
                 (&home, &state_dir, &toml),
                 (None, None),
+                false,
                 NOW,
                 (&fetch, &[]),
                 || {},
@@ -367,6 +368,7 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
             cli,
             (&home, &state_dir, &toml),
             (Some(alab_roster::SOURCE), None),
+            false,
             NOW,
             (&fetch, &[]),
             || {},
@@ -959,7 +961,11 @@ fn a_synced_antigravity_row_is_told_only_renew() {
         let code = run_cli_accounts_sync_with(
             cli,
             (&env, None),
-            (Some("accounts.toml"), Some("m16"), false),
+            (
+                Some("https://example.invalid/accounts.toml"),
+                Some("m16"),
+                false,
+            ),
             (&mut out, &mut err),
             &fetch,
         );

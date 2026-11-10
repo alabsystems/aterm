@@ -525,12 +525,87 @@ fn a_lapsed_answer_never_drops_a_private_restart_an_unsupported_ask_history_or_a
         Err("native-unknown")
     );
     assert_eq!(st, before);
-    // A retired-unissued record stays held whatever a later epoch answers.
-    let mut st = cold_baseline(false);
+    // Private restart debt stays held whatever a later epoch answers.
+    let mut st = baseline(false);
     reply(&mut st, Retirement::NotGranted);
     let held = st.clone();
     assert_eq!(lapsed_reply(&mut st), Ok(Recovery::Held));
     assert_eq!(st, held);
+}
+
+pub(super) fn cold_transition(state: &State, action: &str) -> State {
+    let mut cold = state["cold"] == 1;
+    let mut candidate = state["candidate"] == 1;
+    if action == "Cold" {
+        cold = true;
+    }
+    if action == "Account" {
+        candidate = true;
+    }
+    let mut st = if cold {
+        cold_baseline(true)
+    } else {
+        baseline(true)
+    };
+    if candidate {
+        st.native_account_candidate = Some(super::super::native_account_handoff::Pending::read(
+            &aterm_json::Value::Null,
+        ));
+    }
+    if state["held"] == 1 || action == "PriorRetirement" {
+        reply(&mut st, Retirement::NotGranted);
+    }
+    match action {
+        "Cold" | "Account" | "PriorRetirement" => {}
+        "Unknown" => {
+            let before = st.clone();
+            let _ = recover_reply(&mut st, Reply::Decision(Decision::Unknown));
+            assert_eq!(st, before);
+        }
+        "NoGrant" => {
+            let got = recover_reply(
+                &mut st,
+                Reply::Decision(Decision::Retired(Retirement::NotGranted)),
+            );
+            assert_eq!(
+                got,
+                Ok(if cold && !candidate {
+                    Recovery::Lapsed
+                } else {
+                    Recovery::Held
+                })
+            );
+        }
+        _ => unreachable!("unmapped cold-retirement action"),
+    }
+    let mut next = state.clone();
+    next.insert("cold", i64::from(cold));
+    next.insert("candidate", i64::from(candidate));
+    next.insert("held", i64::from(st.native_retired_unissued));
+    next.insert("proof", i64::from(action == "NoGrant"));
+    next.insert(
+        "closed",
+        i64::from(st.native_prepare.is_empty() && st.native.is_none()),
+    );
+    next
+}
+
+#[test]
+fn cold_retirement_recovery_refines_its_model() {
+    let model = aterm_models_harness::cold_retirement_recovery_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = cold_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
 }
 
 #[test]

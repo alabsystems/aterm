@@ -135,3 +135,60 @@ fn wide_append_rejections_preserve_capacity_for_a_complete_edit() {
     assert_eq!(replicated.last().unwrap().header().id, receipt.id);
     assert_eq!(replicated.last().unwrap().payload(), b"edit");
 }
+
+/// A fence of an observed store stands under a later session where the store's own check would
+/// pass, and falls where it refuses: unchanged it stands, an append moves the claim, and a
+/// membership change moves the access the store was read under. A writer's store has none.
+/// NEGATIVE CONTROL: the custody judgment the fence shares with the check (`Custody::admits`)
+/// without its access-observation comparison stands after the membership change.
+#[test]
+fn a_fence_stands_where_its_stores_check_passes() {
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+    let dir = lab._home.path().join("fenced");
+    let scope = {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::create(&session, &dir).unwrap();
+        store.commit_catalog(&session, b"row").unwrap();
+        assert!(store.fence().is_none(), "a writer's store has no fence");
+        store.scope()
+    };
+    let observed = || {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let store = Store::observe(&session, &dir, scope).unwrap();
+        let fence = store.fence().expect("an observed store has a fence");
+        assert!(fence.stands(&session).unwrap());
+        (store, fence)
+    };
+    let stands = |store: &Store, fence: &Fence| {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let stands = fence.stands(&session).unwrap();
+        assert_eq!(
+            stands,
+            store.check(&session).is_ok(),
+            "a fence stands as its store's check"
+        );
+        stands
+    };
+
+    let (store, fence) = observed();
+    assert!(stands(&store, &fence), "an unchanged store's fence stands");
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &dir, scope)
+            .unwrap()
+            .commit_catalog(&session, b"another row")
+            .unwrap();
+    }
+    assert!(!stands(&store, &fence), "an append moves the claim");
+
+    let (store, fence) = observed();
+    lab.rotate(&[Role::Writer, Role::Reader]);
+    assert!(
+        !stands(&store, &fence),
+        "a membership change moves the access the store was read under"
+    );
+}

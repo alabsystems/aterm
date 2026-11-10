@@ -385,7 +385,7 @@ fn desk_reads_only_stamped_files(paths: &Paths, member: bool) {
         "a member's desk"
     );
     offers.expect("its removals read");
-    let inputs = vault_memo::stamped_files(paths, vault_memo::desk_files).expect("the inputs");
+    let inputs = vault_memo::desk_stamped_files(paths).expect("the inputs");
     let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
     assert!(
@@ -848,5 +848,265 @@ fn the_lan_presence_reads_the_vault_again_only_when_a_file_moved() {
         None,
         "m7's denial at the next call"
     );
+    lab.server.stop();
+}
+
+/// The configuration the node's watch reads for its fleet tenure at each tick and each handshake
+/// ([`config_now`], aterm-agent's `fleet_vault::tenure`) is the fresh read's, and read again with
+/// no file moved it opens none, where each ask read the whole envelope a signer's chain is taken
+/// from. A rewritten `source.toml`, and a moved envelope, are read at the next call; a writer
+/// holding the vault meets a fresh read; and a read whose envelope cannot be read is answered as
+/// [`config`] answers it (no chain) and is not kept: the next call reads again.
+///
+/// NEGATIVE CONTROLS (2026-11-09): with `config_inputs` stamping no file (`Some(vec![])`), the
+/// rewritten `source.toml` is not read (`left: Some("m7"), right: Some("renamed")`); with the memo
+/// not quiet (`Memo::unrecorded(config_inputs, false)`), the writer is given the kept answer (`a
+/// writer holding the vault meets a fresh read`); with the memo reading `config` (which takes a
+/// failed envelope read as no chain) in place of `config_whole`, that answer is kept past the
+/// fault (`a failed read is not kept`).
+#[test]
+fn the_configuration_is_read_again_only_when_its_files_move() {
+    let _answering = ServersAnswering::set();
+    let lab = log_entries_tests::two_macs(&[]);
+    let m7 = &lab.m7;
+    // A signer reached through a handoff, with `source.toml` naming no `followed`: the chain is
+    // the held envelope's.
+    let opened = admin_open(&lab.m22).unwrap();
+    admin_rotate(&lab.m22, &opened, &opened.doc.clone()).unwrap();
+    save_records(m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
+    sync(m7, None).unwrap();
+    let mut configured = config(m7).unwrap().expect("m7's vault");
+    let chain = std::mem::take(&mut configured.followed);
+    assert!(
+        !chain.is_empty(),
+        "the rotated signer was reached by a handoff"
+    );
+    save_config(m7, &configured).unwrap();
+    let followed = |config: crate::Result<Option<Config>>| config.unwrap().map(|c| c.followed);
+    let fresh = config(m7).unwrap();
+    assert_eq!(fresh.as_ref().map(|c| &c.followed), Some(&chain));
+
+    assert!(config_now(m7).unwrap() == fresh, "the fresh read's");
+    let (again, read) = reads_during(m7, || config_now(m7));
+    assert!(again.unwrap() == fresh, "the kept configuration");
+    let read: Vec<_> = read.into_iter().collect();
+    assert_eq!(read, vec![], "a configuration of unchanged files");
+
+    let mut renamed = configured.clone();
+    renamed.host = "renamed".to_owned();
+    save_config(m7, &renamed).unwrap();
+    assert_eq!(
+        config_now(m7).unwrap().map(|c| c.host),
+        Some("renamed".to_owned())
+    );
+
+    let envelope = std::fs::read(m7.cache_file()).unwrap();
+    fsx::write_atomic(&m7.cache_file(), b"not an envelope", 0o600).unwrap();
+    assert_eq!(followed(config_now(m7)), Some(vec![]), "a moved envelope");
+    fsx::write_atomic(&m7.cache_file(), &envelope, 0o600).unwrap();
+    assert_eq!(followed(config_now(m7)), Some(chain.clone()));
+
+    {
+        let _writer = test_hold_state_lock(m7).unwrap();
+        let (under, read) = reads_during(m7, || config_now(m7));
+        assert_eq!(followed(under), Some(chain.clone()));
+        assert!(
+            read.contains_key(&m7.source_file()),
+            "a writer holding the vault meets a fresh read"
+        );
+    }
+
+    // Moved, so the next call reads; its read of the envelope fails, and so does `config`'s.
+    fsx::write_atomic(&m7.cache_file(), &envelope, 0o600).unwrap();
+    fsx::fail_reads(&m7.cache_file(), 2);
+    let failed = config_now(m7);
+    fsx::fail_reads(&m7.cache_file(), 0);
+    assert_eq!(followed(failed), Some(vec![]), "as `config` answers it");
+    assert_eq!(
+        followed(config_now(m7)),
+        Some(chain),
+        "a failed read is not kept"
+    );
+    lab.server.stop();
+}
+
+/// The members desk's inputs ([`desk_inputs`], which a window's desk lane and the node's automatic
+/// admission keep a member by) stand over a round of the vault's subscriber that brings nothing
+/// new, which rewrites `state.toml` with its receipt and, a minute apart at most, the time the
+/// vault last heard this Mac: about every 25 s on a member, and each one read the desk again. A
+/// change of what the state holds moves them at once.
+///
+/// NEGATIVE CONTROLS (2026-11-09): with `desk_files` keeping `state.toml` among the files stamped
+/// by their metadata, the round moves them (`a round moves none of the desk's inputs`); with
+/// `desk_inputs` stamping no file and no state, the membership change moves none (`a change of
+/// the state moves them`).
+#[test]
+fn the_desk_inputs_stand_over_a_round_and_move_with_the_state() {
+    use std::os::unix::fs::MetadataExt as _;
+    let _answering = ServersAnswering::set();
+    let lab = log_entries_tests::two_macs(&[]);
+    let m7 = &lab.m7;
+    let before = desk_inputs(m7).expect("the desk's inputs stamp");
+    let written = || {
+        let meta = std::fs::symlink_metadata(m7.state_file()).unwrap();
+        (meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    let was = written();
+    sync(m7, None).expect("a round that finds nothing new");
+    let mut state = load_state(m7).unwrap();
+    state.heard += 60;
+    save_state(m7, &state).unwrap();
+    assert_ne!(written(), was, "the round rewrote state.toml");
+    assert!(
+        desk_inputs(m7).as_ref() == Some(&before),
+        "a round moves none of the desk's inputs"
+    );
+    state.membership = Stored::Revoked;
+    save_state(m7, &state).unwrap();
+    assert!(
+        desk_inputs(m7).as_ref() != Some(&before),
+        "a change of the state moves them"
+    );
+    lab.server.stop();
+}
+
+/// Every read [`Local::of`](crate::members::desk::Local::of) makes of `paths`, failed in turn
+/// alone and with the next read of the same file (a fallback that reads a file again after a
+/// failure, as the genesis's and the configuration's do, meets the fault again): the member each
+/// gives, where it gives one, is whole only where it reads as the one read with no fault. How
+/// many faults left a member marked, and how many left none.
+fn fault_sweep(paths: &Paths, shape: &str) -> (usize, usize) {
+    use crate::members::desk::Local;
+    let (fresh, read) = reads_during(paths, || Local::of(paths));
+    let fresh = fresh.unwrap().expect("a member");
+    assert!(
+        fresh.whole(),
+        "{shape}: a member read with no fault is whole"
+    );
+    let (mut partial, mut failed) = (0, 0);
+    for run in 1..=2 {
+        for (path, &count) in &read {
+            for at in 0..count {
+                let before = fsx::reads_of(path);
+                fsx::fail_reads_after(path, at, run);
+                let local = Local::of(paths);
+                fsx::fail_reads(path, 0);
+                if fsx::reads_of(path) - before <= at {
+                    continue;
+                }
+                match local {
+                    Ok(Some(local)) if local.whole() => assert!(
+                        local.reads_as(&fresh),
+                        "{shape}: a whole member a fault shaped, at {} read {at} ({run} failed)",
+                        path.display()
+                    ),
+                    Ok(Some(_)) => partial += 1,
+                    Ok(None) | Err(_) => failed += 1,
+                }
+            }
+        }
+    }
+    (partial, failed)
+}
+
+/// A member [`Local::of`](crate::members::desk::Local::of) reads through a fault at any of its
+/// reads, where it gives a member at all, is whole ([`Local::whole`]) only where it is the member
+/// read with no fault: each read whose failure it takes as a default (no writer bound, no seat,
+/// no admitted seat, no signer's chain, no removal, no kept seat, the genesis judged by the vault
+/// config, no lab home) marks it, so a reader that keeps a whole member never keeps one a fault
+/// shaped. Swept ([`fault_sweep`]) on a member none of whose defaults is what it reads: its signer
+/// one a handoff reached, so the held envelope's chain decides what verifies; a Mac its log seats
+/// with a node key (a kept seat) and one it removed; its vault read as a lab's that names the
+/// home LAN its route is on; and that vault read as the ALab vault by the chain alone, on a
+/// genesis not the live one, which the vault config takes it for.
+///
+/// The log seat's mark is not swept: `Local::of` reads the seat only where the Commons access
+/// answers none, and both m7 and a Mac its log admitted read an access.
+///
+/// NEGATIVE CONTROLS (2026-11-09), each mark removed alone from `Local::of`, then each seen
+/// failing: the Commons access's (`a lab's: a whole member a fault shaped, at …/source.toml read
+/// 1 (1 failed)`); `log_admitted_actors_read`'s (`a lab's: … at …/identity read 8 (1 failed)`);
+/// the signer's chain's, with `config` read in place of `config_whole` (`ALab's by its chain: …
+/// at …/vault read 8 (1 failed)`), and with `config_whole`'s failure not marked (`… (2
+/// failed)`); the genesis's (`ALab's by its chain: … at …/records.frontiers read 4 (2
+/// failed)`); the lab home's (`a lab's: … at …/identity read 9 (1 failed)`); the removals' and
+/// kept seats' (`a lab's: … at …/records read 3 (1 failed)`).
+///
+/// [`Local::whole`]: crate::members::desk::Local::whole
+#[test]
+fn a_member_read_through_a_fault_is_whole_only_as_read() {
+    let _answering = ServersAnswering::set();
+    let lab = log_entries_tests::two_macs(&[]);
+    let m7 = &lab.m7;
+    let opened = admin_open(&lab.m22).unwrap();
+    admin_rotate(&lab.m22, &opened, &opened.doc.clone()).unwrap();
+    save_records(m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
+    sync(m7, None).unwrap();
+    let mut seated = Vec::new();
+    for name in ["m40", "m41"] {
+        let (_, request, allowed) = log_entries_tests::newcomer(lab.root.path(), m7, name);
+        let (_, logged) = log_entries_tests::hand(m7, &request, &allowed, true);
+        assert!(logged, "PRECONDITION: m7 seats {name} by its log");
+        seated.push(request.binding().actor());
+    }
+    let label = load_records(m7)
+        .unwrap()
+        .log()
+        .unwrap()
+        .membership()
+        .get(&seated[1])
+        .unwrap()
+        .label
+        .clone();
+    remove_member(m7, &label, false).expect("m7 removes m41");
+    assert!(
+        !removed_notes(m7).unwrap().by_recipient.is_empty(),
+        "PRECONDITION: a Mac removed"
+    );
+    assert!(
+        !kept_seats(m7).unwrap().is_empty(),
+        "PRECONDITION: a kept seat"
+    );
+    let mut configured = config(m7).unwrap().expect("m7's vault");
+    let chain = std::mem::take(&mut configured.followed);
+    assert!(
+        !chain.is_empty(),
+        "PRECONDITION: the rotated signer was reached by a handoff"
+    );
+    save_config(m7, &configured).unwrap();
+    let home = crate::members::lab_lan::Cidr::parse("192.168.1.0/24").unwrap();
+    crate::members::lab_lan::write(m7, &home).unwrap();
+    let route = aterm_netplace::facts::parse_script(
+        "route en0 192.168.1.20/24 via 192.168.1.1 hw aa:bb:cc:dd:ee:01\npath usable wifi\n",
+    );
+    let (mut partial, mut failed) = aterm_netplace::facts::script_here(route, || {
+        assert!(
+            crate::members::lab_lan::home(m7, Some(&configured), false)
+                .unwrap()
+                .is_some(),
+            "PRECONDITION: the lab's home holds its route"
+        );
+        fault_sweep(m7, "a lab's")
+    });
+    let previous = envelope::TEST_RETIRED.with(|cell| {
+        cell.replace(Some(envelope::Retired {
+            keys: Vec::new(),
+            current: Some(chain[0]),
+        }))
+    });
+    assert!(
+        alab_vault(&config(m7).unwrap().expect("m7's vault")),
+        "PRECONDITION: the ALab vault by its chain"
+    );
+    assert!(
+        !live_genesis_read(m7).unwrap(),
+        "PRECONDITION: on a genesis not the live one"
+    );
+    let alab = fault_sweep(m7, "ALab's by its chain");
+    envelope::TEST_RETIRED.with(|cell| cell.replace(previous));
+    partial += alab.0;
+    failed += alab.1;
+    assert!(partial > 0, "some faults leave a member, marked");
+    assert!(failed > 0, "some faults leave none");
     lab.server.stop();
 }

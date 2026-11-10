@@ -692,11 +692,7 @@ mod tests {
     /// once its binder is not of the run, stay out.
     #[test]
     fn the_witness_reads_a_members_open_file_and_bound_listener() {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("lab-rt-held-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::TestScratch::new("rt-held");
         std::fs::create_dir_all(root.join("sessions")).unwrap();
         let (session, theirs, idle) = (
             root.join("sessions/01a1.json"),
@@ -727,7 +723,6 @@ mod tests {
             let _ = child.wait();
         }
         drop(listener);
-        let _ = std::fs::remove_dir_all(&root);
         got.sort();
         let session = (pid, session.to_string_lossy().into_owned());
         let mut want = vec![session.clone(), (me, socket.to_string_lossy().into_owned())];

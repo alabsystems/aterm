@@ -8,6 +8,10 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+#[path = "accounts_publication.rs"]
+mod publication;
+use publication::PreparedPublication;
+
 type NativePublicationResult =
     Result<Option<super::super::codex_grant_owner::OwnerWitnessTransition>, String>;
 type NoNativePublication = for<'a> fn(ActualPublicationPermit<'a>) -> NativePublicationResult;
@@ -98,7 +102,7 @@ struct FleetImage {
 enum StateTarget<'a> {
     Fleet(&'a Path, &'a str),
     RetiringFleet(&'a Path, &'a str),
-    Roster(SyncTarget<'a>),
+    Roster(SyncTarget<'a>, bool),
 }
 
 struct PreparedStateTarget {
@@ -166,6 +170,15 @@ struct Receipt {
 struct StoredReceipt {
     receipt: Receipt,
     digest: String,
+}
+
+/// Bytes produced by the bounded receipt encoder, never caller-supplied text.
+struct EncodedReceipt(String);
+
+impl EncodedReceipt {
+    fn new(receipt: &Receipt) -> Result<Self, String> {
+        encode_stored_receipt(receipt).map(Self)
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -416,6 +429,20 @@ impl Plan {
             .chain(self.source_policy.iter())
     }
 
+    /// Fresh intent admission requires its captured before-images. Recovery may
+    /// also see after-images, but that does not admit a new transaction.
+    fn check_before(&self, store: &Store, scope: Scope<'_>) -> Result<(), String> {
+        for (role, path) in self.paths(store, scope)? {
+            if read(&path, role.limit())? != self.image(role)?.before {
+                return Err(format!(
+                    "{} changed before account publication; no new sync was admitted",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn image(&self, role: ImageRole) -> Result<&Image, String> {
         match role {
             ImageRole::State => Ok(&self.state),
@@ -663,13 +690,13 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         target: SyncTarget<'_>,
-        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
+        (retire, edit): (bool, impl FnOnce(&mut State) -> Result<Vec<Event>, String>),
     ) -> Result<bool, String> {
         self.transact_state_images_held(
             held,
             now,
             note,
-            Some(StateTarget::Roster(target)),
+            Some(StateTarget::Roster(target, retire)),
             Some(edit),
         )
         .map(|(_, changed)| changed)
@@ -683,12 +710,13 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         target: SyncTarget<'_>,
+        retire: bool,
     ) -> Result<bool, String> {
         self.transact_state_images_held(
             held,
             now,
             note,
-            Some(StateTarget::Roster(target)),
+            Some(StateTarget::Roster(target, retire)),
             None::<fn(&mut State) -> Result<Vec<Event>, String>>,
         )
         .map(|(_, changed)| changed)
@@ -702,7 +730,13 @@ impl Store {
         target: Option<StateTarget<'_>>,
         edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, String>>,
     ) -> Result<(Vec<Event>, bool), String> {
-        let retire_legacy = matches!(&target, Some(StateTarget::RetiringFleet(..)));
+        let retire_legacy = matches!(
+            &target,
+            Some(StateTarget::RetiringFleet(..) | StateTarget::Roster(_, true))
+        );
+        if retire_legacy && !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
         // A scoped caller planned outside this lock. A newly pending commit invalidates that
         // plan; it must recover and plan again, not silently continue from stale inputs.
         if target.is_some() {
@@ -727,7 +761,7 @@ impl Store {
                             Some(fleet),
                         )
                     }
-                    StateTarget::Roster(target) => {
+                    StateTarget::Roster(target, _) => {
                         if target.fleet.is_some() {
                             return Err(
                                 "provider roster-state publication cannot carry a fleet target"
@@ -1233,11 +1267,18 @@ impl Store {
     }
 
     fn save_receipt(&self, receipt: &Receipt) -> Result<(), String> {
-        let text = encode_stored_receipt(receipt)?;
+        self.save_encoded_receipt(&EncodedReceipt::new(receipt)?)
+    }
+
+    fn save_encoded_receipt(&self, encoded: &EncodedReceipt) -> Result<(), String> {
         self.ensure().map_err(|why| why.to_string())?;
-        super::super::upgrade_models::write_atomic_mode(&self.dir.join(RECEIPT), &text, Some(0o600))
-            .and_then(|()| aterm_durable::durable_dir(&self.dir))
-            .map_err(|why| format!("account sync receipt: {why}"))
+        super::super::upgrade_models::write_atomic_mode(
+            &self.dir.join(RECEIPT),
+            &encoded.0,
+            Some(0o600),
+        )
+        .and_then(|()| aterm_durable::durable_dir(&self.dir))
+        .map_err(|why| format!("account sync receipt: {why}"))
     }
 
     /// Resume state-only images at fixed store paths, never a receipt-supplied path.
@@ -1756,74 +1797,14 @@ impl Store {
         events: &[Event],
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        if plan.source_policy.is_some() && !self.native_writer_matches(held) {
-            return Err("source retirement requires this account store's writer".into());
-        }
-        plan.validate(self, scope)?;
-        let changed = plan.images().any(|image| image.before != image.after);
-        // Entropy and serialization failures are also admission failures, not partial commits.
-        let receipt = Receipt {
-            schema: 1,
-            id: aterm_uds::rand::hex_token::<16>().map_err(|why| why.to_string())?,
-            plan: Some(plan),
-        };
-        encode_stored_receipt(&receipt)?;
+        let prepared = PreparedPublication::new(self, held, scope, plan, !events.is_empty())?;
+        // Neither phase object owns a callback. In particular, persisting an
+        // intent cannot replay this auxiliary work while a source guard is held.
         auxiliary()?;
-        if receipt
-            .plan
-            .as_ref()
-            .is_some_and(|plan| plan.source_policy.is_some())
-            && !self.native_writer_matches(held)
-        {
-            return Err("source retirement writer changed before publication".into());
+        if let Some(pending) = prepared.persist()? {
+            pending.replay()?;
         }
-        #[cfg(test)]
-        if EARLY_ROSTER.with(std::cell::Cell::take)
-            && let Some(path) = scope.roster
-            && let Some(plan) = &receipt.plan
-            && let Some(text) = plan.roster.after.as_deref()
-        {
-            // The conformance test's production mutant publishes the real candidate
-            // before its receipt. Its no-early-image law must reject this ordering.
-            super::super::upgrade_models::write_atomic_mode(path, text, plan.roster_mode)
-                .map_err(|why| why.to_string())?;
-        }
-        // A bounded ledger can retain identical bytes after appending an identical event.
-        // That event still needs its receipt and notification, even without a changed image.
-        if !changed && events.is_empty() {
-            return Ok(());
-        }
-        // A durable clean receipt precedes the first retained witness: a crash between the
-        // witness and pending intent still has a valid clean receipt and no changed authority.
-        if self.receipt()?.is_none() {
-            let clean = Receipt {
-                schema: 1,
-                id: "0".repeat(32),
-                plan: None,
-            };
-            self.save_receipt(&clean)?;
-        }
-        durable_ancestry(
-            std::iter::once(self.dir.as_path())
-                .chain(scope.roster.map(publication_parent))
-                .chain(scope.fleet.map(publication_parent)),
-        )?;
-        self.retain_witness(&self.dir.join(WITNESS))
-            .map_err(|why| why.to_string())?;
-        self.save_receipt(&receipt)?;
-        #[cfg(test)]
-        let cut = CUT.with(std::cell::Cell::take);
-        #[cfg(not(test))]
-        let cut: Option<usize> = None;
-        // The plan was validated above and is the receipt just saved, under the lock nothing else
-        // replaces a receipt without, so it is neither read back nor validated again.
-        self.replay(held, receipt, scope, &mut |step| {
-            if cut == Some(step) {
-                Err("injected interruption".to_owned())
-            } else {
-                Ok(())
-            }
-        })
+        Ok(())
     }
 }
 

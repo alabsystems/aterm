@@ -5,8 +5,10 @@
 //! it found: the swarm deny list (a fleet listener, which checks each proved dialer against it,
 //! its node job's watch, which checks every live connection each tick, and the node's Commons
 //! peer checks and census), the Commons observation (the Commons runtime's presence poll,
-//! the members desk) and this Mac's standing as an ALab member (the node's LAN responder and
-//! advert). [`swarm_denied_nodes`](super::swarm_denied_nodes) and
+//! the members desk), this Mac's standing as an ALab member (the node's LAN responder and
+//! advert), the vault's configuration (the vault the node's fleet state is of, at each tick and
+//! handshake) and the stamps of what the members desk reads (a window's desk lane and the node's
+//! automatic admission). [`swarm_denied_nodes`](super::swarm_denied_nodes) and
 //! [`observe_commons`](super::observe_commons) read, decrypt and evaluate the vault and its
 //! membership log at every call, tens of milliseconds of CPU on a busy Mac, so each keeps its
 //! last settled answer and reads again when one of the files it reads, or the vault directory's
@@ -165,6 +167,36 @@ pub fn swarm_member_heard_now(paths: &Paths) -> crate::Result<Option<u64>> {
         &super::steward::alab_standing_for_tests(paths),
         super::steward::swarm_member_heard,
     )
+}
+
+/// [`config`](super::config), read again only when `source.toml` or the held envelope it takes
+/// the signer's chain from ([`config_inputs`]) was added, removed or changed, or the vault
+/// directory's identity or access metadata changed. The node asks it for the vault this Mac's
+/// fleet state is of (aterm-agent's `fleet_vault::tenure`) at each watch tick and as fleet
+/// connections under drive grants are offered and served, and for the vault configured
+/// (`fleet_vault::Vault::configured`) at each heartbeat, and each ask read the whole envelope
+/// again where `source.toml` names no `followed`: 1.25 MB every 2 s on the watch's thread alone
+/// on a Linux arm64 member whose envelope is 1.18 MB, and 0.68 ms of CPU an ask on a fixture's
+/// 1.2 MB one, where an answer kept takes 5 µs and reads nothing (2026-11-09).
+///
+/// Quiet, as [`local_swarm_roster_for_log_now`]: while a writer holds the vault's state lock (a
+/// join writing `source.toml`) the read is fresh, as before. Each answer is what `config` gives
+/// for the same files: a read whose envelope cannot be read (which `config` takes as no chain)
+/// is never kept, and is answered by `config` itself, so a fault is that call's alone. It keeps
+/// no answer that depends on the time.
+///
+/// # Errors
+/// As [`config`](super::config).
+pub fn config_now(paths: &Paths) -> crate::Result<Option<super::Config>> {
+    static MEMO: Memo<Option<super::Config>> = Memo::unrecorded(config_inputs, true);
+    MEMO.read_keyed(paths, &(), super::config_whole)
+        .or_else(|_| super::config(paths))
+}
+
+/// The files [`config`](super::config) reads: `source.toml`, and the held envelope (`vault`) whose
+/// handoff chain is the keys its signer was reached from where it names no `followed`.
+fn config_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
+    Some(vec![paths.source_file(), paths.cache_file()])
 }
 
 /// [`local_swarm_roster_for_log`](super::local_swarm_roster_for_log), read again only when one
@@ -484,30 +516,64 @@ pub(super) fn observation_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
 }
 
 /// The files the members desk reads this Mac's membership from ([`desk_files`]), stamped as the
-/// memo stamps its inputs: a desk lane that read them to a settled answer ([`Local::of`]'s member
-/// or a Mac that left, [`undo_offers`]'s rows) need not read them again while they stand as they
-/// were. Equal only to the stamps of the same files unchanged.
+/// memo stamps its inputs, and `state.toml` by what it holds but for the telemetry of the vault's
+/// rounds ([`state_standing`](super::state_standing)): a desk lane, or the node's automatic
+/// admission, that read them to a settled answer ([`Local::of`]'s member or a Mac that left,
+/// [`undo_offers`]'s rows) need not read them again while they stand as they were. Equal only to
+/// the stamps of the same files unchanged, and the same state but for when the vault last heard
+/// this Mac and the receipts of its last rounds, which no part of the desk's answer is read from:
+/// a round of the vault's subscriber rewrites `state.toml` about every 25 s (Linux arm64,
+/// 2026-11-09), and each rewrite read the desk again: 26 MB on that member's automatic admission,
+/// 14.4 MB and 10 ms of CPU on a fixture member whose envelope is 1.2 MB, where taking these
+/// stamps reads 1.3 KB in 30 µs.
 ///
 /// [`Local::of`]: crate::members::desk::Local::of
 /// [`undo_offers`]: super::undo_offers
 #[derive(PartialEq, Eq)]
-pub struct DeskInputs(InputStamps);
+pub struct DeskInputs {
+    stamps: InputStamps,
+    state: Option<[u8; 32]>,
+}
 
 /// The stamps of the files the members desk reads this Mac's membership from, now; `None` where a
-/// file's metadata or the vault folder cannot be read safely (read again).
+/// file's metadata, the vault folder or `state.toml` cannot be read safely (read again).
 #[must_use]
 pub fn desk_inputs(paths: &Paths) -> Option<DeskInputs> {
-    stamp_inputs(paths, desk_files).map(DeskInputs)
+    Some(DeskInputs {
+        stamps: stamp_inputs(paths, desk_files)?,
+        state: super::state_standing(paths).ok()?,
+    })
+}
+
+/// [`desk_inputs`] for a reader about to give what it read under them, taken as a quiet memo
+/// takes its stamps ([`local_swarm_roster_for_log_now`]): under a shared observation of the
+/// vault's state lock, so `None` while a writer holds it (mid-apply, its files not yet renamed
+/// in) or where it cannot be observed, and that reader reads afresh and meets the writer, as
+/// before.
+#[must_use]
+pub fn desk_inputs_quiet(paths: &Paths) -> Option<DeskInputs> {
+    match StateLock::observe_classified(paths) {
+        Ok(StateObservation::Held(lock)) => {
+            let inputs = desk_inputs(paths);
+            drop(lock);
+            inputs
+        }
+        Ok(StateObservation::Absent) => desk_inputs(paths),
+        Ok(StateObservation::Busy) | Err(_) => None,
+    }
 }
 
 /// The files [`Local::of`](crate::members::desk::Local::of) and
-/// [`undo_offers`](super::undo_offers) take their answer from: [`observation_inputs`], the vault
-/// slot's creation claim, the Commons custody that seats this Mac (the retained claim, the custody
-/// locks, the pinned anchor), in a debug build a lab vault's home LAN file, and the control
-/// journal, by its directory (an entry came or went) and each entry in it and in the folders it
-/// holds (an append). `None` where the journal cannot be listed.
+/// [`undo_offers`](super::undo_offers) take their answer from, but `state.toml`, which
+/// [`desk_inputs`] stamps by what it holds: [`observation_inputs`], the vault slot's creation
+/// claim, the Commons custody that seats this Mac (the retained claim, the custody locks, the
+/// pinned anchor), in a debug build a lab vault's home LAN file, and the control journal, by its
+/// directory (an entry came or went) and each entry in it and in the folders it holds (an
+/// append). `None` where the journal cannot be listed.
 pub(super) fn desk_files(paths: &Paths) -> Option<Vec<PathBuf>> {
     let mut files = observation_inputs(paths)?;
+    let state = paths.state_file();
+    files.retain(|file| *file != state);
     let commons = paths.dir.join("commons");
     let control = commons.join("control");
     files.extend([
@@ -584,8 +650,9 @@ pub(super) struct FileStamps {
 pub(super) struct InputStamps {
     stamps: FileStamps,
     /// Every file the selection of the membership records' data is judged by, which each read
-    /// these stamps stand for reads ([`inputs`] and the sets that extend it).
-    records: crate::records_storage::Standing,
+    /// these stamps stand for reads ([`inputs`] and the sets that extend it); `None` for a read
+    /// that opens no record ([`config_now`], [`Memo::unrecorded`]).
+    records: Option<crate::records_storage::Standing>,
 }
 
 /// Source inputs and the record limits of a stage-owned materialization selection.
@@ -614,6 +681,15 @@ pub(super) fn stamped_files(
     Some(files)
 }
 
+/// Every file [`desk_inputs`] stands for: [`stamped_files`] of [`desk_files`], and `state.toml`,
+/// which it stamps by what it holds.
+#[cfg(test)]
+pub(super) fn desk_stamped_files(paths: &Paths) -> Option<Vec<PathBuf>> {
+    let mut files = stamped_files(paths, desk_files)?;
+    files.push(paths.state_file());
+    Some(files)
+}
+
 /// [`stamp_files`] of `inputs`, with the membership records' selection as it stands
 /// ([`records_storage::standing`](crate::records_storage::standing)). Records the selection
 /// refuses require a fresh read.
@@ -621,19 +697,28 @@ pub(super) fn stamp_inputs(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
 ) -> Option<InputStamps> {
-    stamp_inputs_in(paths, inputs, None)
+    stamp_inputs_in(paths, inputs, true, None)
 }
 
-/// [`stamp_inputs`], each `lstat` `glance`'s where the caller looks through one ([`fsx::Glance`]):
-/// the stamps of a check that asks several memos of the same files.
+/// [`stamp_inputs`], with the records' selection where `records` (a read that opens none stamps
+/// none), and each `lstat` `glance`'s where the caller looks through one ([`fsx::Glance`]): the
+/// stamps of a check that asks several memos of the same files.
 fn stamp_inputs_in(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    records: bool,
     glance: Option<&fsx::Glance>,
 ) -> Option<InputStamps> {
     Some(InputStamps {
         stamps: stamp_files_in(paths, inputs, glance)?,
-        records: crate::records_storage::standing(&paths.records_file(), glance)?,
+        records: if records {
+            Some(crate::records_storage::standing(
+                &paths.records_file(),
+                glance,
+            )?)
+        } else {
+            None
+        },
     })
 }
 
@@ -709,6 +794,9 @@ fn record_bounds() -> RecordBounds {
 struct Memo<T, K = ()> {
     /// The files the read takes its answer from.
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+    /// Whether the read opens the membership records, whose selection is stamped beside
+    /// `inputs` ([`stamp_inputs`]): every memo's but [`config_now`]'s.
+    records: bool,
     /// Whether a kept answer is given only while no writer holds the vault's state lock: one
     /// that a peer check takes, whose rule is that a busy writer never yields a permissive
     /// verdict, so a writer mid-apply (its files not yet renamed in) reads as busy as before.
@@ -740,14 +828,34 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
     /// A memo of a read whose answer depends on `inputs` and on a key its caller names (the
     /// membership log a roster is read for); `quiet` as [`Memo::quiet`] says.
     const fn keyed(inputs: fn(&Paths) -> Option<Vec<PathBuf>>, quiet: bool) -> Self {
+        Self::reading(inputs, true, quiet)
+    }
+
+    /// [`Memo::keyed`] for a read that opens no membership record, so its records' selection is
+    /// not stamped: a record that arrives reads nothing again.
+    const fn unrecorded(inputs: fn(&Paths) -> Option<Vec<PathBuf>>, quiet: bool) -> Self {
+        Self::reading(inputs, false, quiet)
+    }
+
+    const fn reading(
+        inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+        records: bool,
+        quiet: bool,
+    ) -> Self {
         Self {
             inputs,
+            records,
             quiet,
             held: Mutex::new(Vec::new()),
             refresh: Mutex::new(()),
             #[cfg(test)]
             waiting: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The stamps of this memo's inputs now ([`stamp_inputs_in`]).
+    fn stamps(&self, paths: &Paths, glance: Option<&fsx::Glance>) -> Option<InputStamps> {
+        stamp_inputs_in(paths, self.inputs, self.records, glance)
     }
 
     /// The answer kept for `paths` and `key` under exactly `stamps`, read under this thread's
@@ -784,7 +892,7 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
         read: impl FnOnce(&Paths) -> crate::Result<T>,
     ) -> crate::Result<T> {
         if lock.observes(paths)
-            && let Some(stamps) = stamp_inputs_in(paths, self.inputs, Some(glance))
+            && let Some(stamps) = self.stamps(paths, Some(glance))
             && let Some(answer) = self.kept(paths, key, &stamps)
         {
             return Ok(answer);
@@ -811,7 +919,7 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
             None
         };
         // Taken before the read: a write after this moves the next stamps, so it is read again.
-        let Some(stamps) = stamp_inputs(paths, self.inputs) else {
+        let Some(stamps) = self.stamps(paths, None) else {
             return read(paths);
         };
         if let Some(answer) = self.kept(paths, key, &stamps) {
@@ -827,7 +935,7 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another caller may have read these same files while this one waited (a quiet memo
         // looks under the observation below).
-        let Some(stamps) = stamp_inputs(paths, self.inputs) else {
+        let Some(stamps) = self.stamps(paths, None) else {
             return read(paths);
         };
         if !self.quiet
@@ -840,7 +948,7 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
         // lock's change time, so its stamps are taken again, still before the read.
         let narrowed = StateLock::narrow_owned(paths);
         let stamps = match narrowed {
-            Ok(true) => match stamp_inputs(paths, self.inputs) {
+            Ok(true) => match self.stamps(paths, None) {
                 Some(stamps) => stamps,
                 None => return read(paths),
             },

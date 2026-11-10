@@ -21,6 +21,7 @@ pub(super) struct Store {
     max: usize,
     retired: AtomicBool,
     _claim: super::browser_window::ProfileLock,
+    physical: PhysicalIdentity,
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -70,9 +71,11 @@ impl Store {
     pub(super) fn physical_identity(&self) -> Result<PhysicalIdentity, &'static str> {
         self.unchanged()?;
         let directory = self.path.parent().ok_or(UNAVAILABLE)?;
-        let observed = PhysicalIdentity::capture(directory, &self._claim)?;
+        if !self._claim.current(directory) || !self.physical.current() {
+            return Err(UNAVAILABLE);
+        }
         self.unchanged()?;
-        Ok(observed)
+        Ok(self.physical.clone())
     }
 
     pub(super) fn sealed_digest(&self) -> Option<[u8; 32]> {
@@ -122,6 +125,7 @@ impl Store {
         }
         let claim = super::browser_window::ProfileLock::claim(directory)
             .map_err(|_| "Native completion is held or unavailable")?;
+        let physical = PhysicalIdentity::capture(directory, &claim)?;
         let ciphertext = aterm_secrets::fsx::read_private(&path, max).map_err(|_| UNAVAILABLE)?;
         if !prepare && ciphertext.is_none() {
             return Ok(None);
@@ -145,6 +149,9 @@ impl Store {
                     .map_err(|_| "Protected native completion failed decryption")
             })
             .transpose()?;
+        if !physical.current() || !claim.current(directory) {
+            return Err(UNAVAILABLE);
+        }
         Ok(Some((
             Self {
                 expected: ciphertext.as_ref().map(|bytes| digest(bytes.as_slice())),
@@ -153,21 +160,31 @@ impl Store {
                 max,
                 retired: AtomicBool::new(false),
                 _claim: claim,
+                physical,
             },
             plaintext,
         )))
+    }
+
+    fn namespace_current(&self) -> Result<(), &'static str> {
+        let directory = self.path.parent().ok_or(UNAVAILABLE)?;
+        if !self.physical.current() || !self._claim.current(directory) {
+            return Err(UNAVAILABLE);
+        }
+        Ok(())
     }
 
     pub(super) fn unchanged(&self) -> Result<(), &'static str> {
         if self.retired.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.namespace_current()?;
         let bytes =
             aterm_secrets::fsx::read_private(&self.path, self.max).map_err(|_| UNAVAILABLE)?;
         if bytes.as_ref().map(|bytes| digest(bytes.as_slice())) != self.expected {
             return Err("Native completion changed during recovery");
         }
-        Ok(())
+        self.namespace_current()
     }
 
     pub(super) fn save(&mut self, plaintext: &[u8]) -> Result<(), &'static str> {
@@ -185,7 +202,16 @@ impl Store {
         self.unchanged()?;
         aterm_secrets::fsx::write_atomic(&self.path, &ciphertext, 0o600)
             .map_err(|_| UNAVAILABLE)?;
+        self.namespace_current()?;
+        let previous = self.expected;
         self.expected = Some(digest(&ciphertext));
+        if let Err(error) = self.unchanged() {
+            // An unacknowledged rename must not erase the original CAS base.
+            // Exact recovery can adopt the completed bytes after restoration;
+            // an unrelated replacement still cannot be overwritten.
+            self.expected = previous;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -204,6 +230,7 @@ impl Store {
         {
             return Err(UNAVAILABLE);
         }
+        self.namespace_current()?;
         let parent = self.path.parent().ok_or(UNAVAILABLE)?;
         let name = self
             .path
@@ -246,7 +273,13 @@ impl Store {
         {
             return Err(UNAVAILABLE);
         }
+        self.namespace_current()?;
+        let previous = self.expected;
         self.expected = Some(expected);
+        if let Err(error) = self.unchanged() {
+            self.expected = previous;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -367,5 +400,61 @@ mod tests {
             PhysicalIdentity::capture(&directory, &store._claim).is_err(),
             "different actual held fd cannot adopt a replacement path"
         );
+    }
+    #[test]
+    fn held_namespace_cannot_be_relabelled_by_a_byte_identical_directory_copy() {
+        let (root, identity, mut store) = fixture();
+        store.save(b"owned-response").unwrap();
+        let expected = store.expected;
+        let directory = store.path.parent().unwrap().to_path_buf();
+        let displaced = root.path().join("original-held");
+        std::fs::rename(&directory, &displaced).unwrap();
+        aterm_secrets::fsx::ensure_private_dir(&directory).unwrap();
+        std::fs::copy(displaced.join("candidate.age"), &store.path).unwrap();
+        let replacement = super::super::browser_window::ProfileLock::claim(&directory).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        assert!(store.unchanged().is_err());
+        assert!(store.save(b"must-not-overwrite").is_err());
+        assert!(
+            store
+                .recover_exact_write(&identity, b"owned-response")
+                .is_err()
+        );
+        assert!(store.retire().is_err());
+        assert_eq!(store.expected, expected);
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        drop(replacement);
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::rename(displaced, &directory).unwrap();
+        assert!(store.unchanged().is_ok());
+        assert!(
+            store
+                .recover_exact_write(&identity, b"owned-response")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn identical_ciphertext_cannot_adopt_a_replaced_profile_claim() {
+        let (_root, identity, mut store) = fixture();
+        store.save(b"owned-response").unwrap();
+        let directory = store.path.parent().unwrap().to_path_buf();
+        let lock = directory.join(super::super::browser_window::PROFILE_LOCK_FILE);
+        let displaced = directory.join("held-original.lock");
+        std::fs::rename(&lock, &displaced).unwrap();
+        let replacement = super::super::browser_window::ProfileLock::claim(&directory).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        assert!(store.unchanged().is_err());
+        assert!(store.save(b"must-not-overwrite").is_err());
+        assert!(
+            store
+                .recover_exact_write(&identity, b"owned-response")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        drop(replacement);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::rename(displaced, &lock).unwrap();
+        store.unchanged().unwrap();
     }
 }

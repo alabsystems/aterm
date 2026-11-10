@@ -1181,20 +1181,10 @@ mod tests {
     #[test]
     fn archived_scratch_files_keep_times_but_refuse_other_names() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        use std::path::PathBuf;
 
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let d = Scratch(
-            std::fs::canonicalize(crate::sys::make_temp_dir("/tmp/lab-archive.XXXXXX").unwrap())
-                .unwrap(),
-        );
-        let input = d.0.join("scratch");
-        let output = d.0.join("archive");
+        let d = crate::TestScratch::new("archive");
+        let input = d.join("scratch");
+        let output = d.join("archive");
         std::fs::create_dir_all(input.join("nested")).unwrap();
         let normal = input.join("nested/normal");
         std::fs::write(&normal, "keep this log").unwrap();
@@ -1206,7 +1196,7 @@ mod tests {
             .unwrap()
             .set_modified(modified)
             .unwrap();
-        let outside = d.0.join("outside");
+        let outside = d.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("private"), "do not archive").unwrap();
         std::fs::hard_link(outside.join("private"), input.join("hard")).unwrap();
@@ -1340,10 +1330,7 @@ mod tests {
     /// program limit is refused before a byte is read.
     #[test]
     fn read_program_takes_what_the_ordinary_limit_refuses() {
-        let dir = std::fs::canonicalize(
-            crate::sys::make_temp_dir("/tmp/lab-program-read.XXXXXX").unwrap(),
-        )
-        .unwrap();
+        let dir = crate::TestScratch::new("prog");
         let file = dir.join("program");
         let sparse = |len| {
             std::fs::File::create(&file).unwrap().set_len(len).unwrap();
@@ -1356,15 +1343,11 @@ mod tests {
         );
         sparse(MAX_LAB_PROGRAM_BYTES + 1);
         assert!(read_program(&file).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn read_regular_file_and_text_refuse_non_regular_entries() {
-        let dir = std::fs::canonicalize(
-            crate::sys::make_temp_dir("/tmp/lab-regular-read.XXXXXX").unwrap(),
-        )
-        .unwrap();
+        let dir = crate::TestScratch::new("regread");
         let file = dir.join("ok.txt");
         std::fs::write(&file, "hello\n").unwrap();
         assert_eq!(read_regular_text(&file).unwrap(), "hello\n");
@@ -1386,16 +1369,12 @@ mod tests {
         );
         let err = read_regular_file(&fifo).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn line_tail_cursor_reads_deltas_holds_partial_lines_and_resets_on_replace() {
         use std::io::Write as _;
-        let dir = std::fs::canonicalize(
-            crate::sys::make_temp_dir("/tmp/lab-tail-cursor.XXXXXX").unwrap(),
-        )
-        .unwrap();
+        let dir = crate::TestScratch::new("tail");
         let file = dir.join("journal.jsonl");
         let mut cursor = LineTailCursor::default();
         assert_eq!(
@@ -1436,6 +1415,5 @@ mod tests {
             cursor.poll_scratch_text(&file).unwrap(),
             (true, "replaced-1\n".to_string())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -13183,6 +13183,7 @@ fn versions_reads_the_harness_claims_off_the_roster() {
             ),
             ("s-bbb", "codex-alab@5150", true, None, None),
             ("s-ccc", "grok-alab@4343", false, None, None),
+            ("s-eee", "kimi-alab@77", false, None, None),
         ]
     );
     assert!(live_claims_of("").is_empty());
@@ -13246,10 +13247,11 @@ fn versions_lists_installed_packages_and_live_claims() {
         "  @s-aaa grok-alab 0.3.0+gabc (grok 1.0.70)\n",
         "  @s-bbb codex-alab unknown (self-claim)\n",
         "  @s-ccc grok-alab unknown (grok unknown)  unproven\n",
+        "  @s-eee kimi-alab unknown (kimi unknown)  unproven\n",
     ] {
         assert!(text.contains(line), "{line:?} in:\n{text}");
     }
-    for skipped in ["s-ddd", "s-eee", "s-fff", "@9"] {
+    for skipped in ["s-ddd", "s-fff", "@9"] {
         assert!(!text.contains(skipped), "{skipped} in:\n{text}");
     }
     let (ok, json, err) = go(&Cmd::Versions { json: true }, &env);

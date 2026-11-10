@@ -59,6 +59,7 @@ fn a_wait_that_runs_out_on_a_held_child_ends_could_not_run_and_any_other_silence
 fn the_fixture_config_declines_installs() {
     let root = aterm_tempfile::Builder::new()
         .prefix("atl-consent-")
+        .suffix(".noindex")
         .tempdir()
         .expect("scratch root");
     crate::harness::prepare_fixture_config(root.path());
@@ -85,6 +86,7 @@ fn an_own_image_goes_only_with_its_folder() {
     let mut dir = aterm_uds::deadline::KeptUntilRan::new(
         aterm_tempfile::Builder::new()
             .prefix("atl-own-image-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch root")
             .keep(),

@@ -1586,3 +1586,35 @@ fn a_member_that_forks_and_goes_while_its_group_is_read_leaves_the_group_live() 
         "the member's sleep is still in its group"
     );
 }
+
+/// WITNESS RENEWAL, ON A SIMULATED CLOCK (2026-11-06, m14): an idle agent's witness refreshed
+/// only when its snapshot moved lapsed 30 minutes after the last move, so its death 34 minutes
+/// in proved nothing and its relaunch was refused for good. Refreshed every
+/// [`crate::harness_host::WITNESS_RENEW`] while the vendor lives, as the host's renewals do, the
+/// witness proves its death 35 minutes in. Negative control: the same agent with no renewal
+/// proves nothing.
+#[test]
+fn a_witness_renewed_on_the_hosts_timer_proves_a_death_past_its_lifetime_and_one_left_lapses() {
+    let renew_us = u64::try_from(crate::harness_host::WITNESS_RENEW.as_micros()).unwrap();
+    let died_at = 35 * 60 * 1_000_000;
+    assert!(died_at > LIFETIME_US, "the death comes past one lifetime");
+    for renewed in [true, false] {
+        let (registration, context, facts) = setup();
+        let mut store = Store::default();
+        let binding = register(&mut store, &registration, &context, &facts, 10);
+        let mut now = 10;
+        while now + renew_us < died_at {
+            now += renew_us;
+            if renewed {
+                assert_eq!(
+                    store.refresh_with(&binding, &context, 9, now, &facts),
+                    Reply::Registered(binding.clone()),
+                    "a renewal at {now} us"
+                );
+            }
+        }
+        facts.crash(&registration);
+        let proof = store.prove_with(&binding, &context, 9, died_at, &facts);
+        assert_eq!(proof.is_some(), renewed, "renewed {renewed}");
+    }
+}

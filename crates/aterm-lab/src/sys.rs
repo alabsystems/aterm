@@ -3180,21 +3180,10 @@ pub fn peek_fd(fd: RawFd, kind: FdKind, buf: &mut [u8]) -> usize {
 mod tests {
     use super::*;
 
-    struct Dir(std::path::PathBuf);
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct Dir(crate::TestScratch);
 
     fn dir(name: &str) -> Dir {
-        let d = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-sys-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        Dir(d)
+        Dir(crate::TestScratch::new(name))
     }
 
     #[test]
@@ -3218,6 +3207,7 @@ mod tests {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
         let scratch = aterm_tempfile::Builder::new()
             .prefix("lab-put-owned-")
+            .suffix(".noindex")
             .tempdir()
             .expect("exclusive scratch");
         let root = scratch.path().canonicalize().expect("physical scratch");

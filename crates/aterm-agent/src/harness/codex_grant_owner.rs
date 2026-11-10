@@ -49,10 +49,13 @@ pub(super) fn pending_custody_fixture(
     stage: &Path,
     original: &super::account_work::Scope,
     turn: std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>,
+    admission: super::codex_native_row::NativeRowAdmission,
 ) -> Result<(CaptureOutcome, PendingFixtureRestore), String> {
     let deadline = super::wake_deadline::WakeDeadline::after(super::login_drive::HANG);
-    let mut pending = prepare(env, request, stage, &"d".repeat(64))?
-        .with_native_scope(env, Some(turn.clone()))?;
+    let policy = admission.staging().policy.clone();
+    let mut pending = prepare(env, request, stage, &policy)?
+        .with_native_scope(env, Some(turn.clone()))?
+        .with_row_admission(admission)?;
     turn.enter_exchange(deadline, Some(original))?;
     drop(turn);
     pending.begin_exchange()?;
@@ -62,8 +65,10 @@ pub(super) fn pending_custody_fixture(
     platform::ensure_private_dir(&directory).map_err(|_| "fixture replacement failed")?;
     pending.capture_response(
         br#"{"tokens":{"access_token":"isolated-fixture-only"}}"#,
-        Some(Identity::from_native("fixture-account", "fixture-user")),
-        Some("fixture-code-owner".into()),
+        // Deliberately unsupported body: storage/lifetime custody is real,
+        // but no verified Code grant or publication authority is fabricated.
+        None,
+        None,
     );
     let outcome = pending.settle_response();
     if !matches!(&outcome, CaptureOutcome::Pending(_)) {
@@ -72,14 +77,29 @@ pub(super) fn pending_custody_fixture(
     Ok((outcome, PendingFixtureRestore { directory, held }))
 }
 
+#[path = "codex_grant_catalogue.rs"]
+mod catalogue;
+pub(super) use catalogue::CatalogueTransition;
+
+#[path = "codex_grant_published_source.rs"]
+mod published_source;
+
 #[path = "codex_grant_refresh.rs"]
 mod refresh;
+pub(in crate::harness) use refresh::NativeUsageGrant;
 #[cfg(all(test, unix))]
 pub(super) use refresh::initialize_revision;
+pub use refresh::{
+    NativeUsageContinuation, NativeUsageDeferred, NativeUsageDiscoveryCursor, NativeUsageOutcome,
+    NativeUsageRequest, NativeUsageRetention, NativeUsageSettlement, NativeUsageSourceLease,
+    discover_native_usage_deferred, read_native_usage, read_native_usage_observed,
+};
 pub(super) use refresh::{
     OwnedRefreshRetention, OwnerRefreshContinuation, OwnerRefreshError, OwnerWitnessTransition,
-    with_refreshed_owner,
+    with_refreshed_owner, with_refreshed_owner_in_namespace,
 };
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) use refresh::{advance_source_proof, reconcile_source_proof};
 
 /// A baseline initializer's borrowed fresh-publication authority. There is no
 /// constructor from an Applied record, copied document or retained reference.
@@ -117,6 +137,7 @@ fn initialize_fresh_revision(
     identity: &Identity,
     document: &[u8],
 ) -> Result<OwnerWitnessTransition, String> {
+    catalogue::require_publication(env, binding, identity, document)?;
     refresh::initialize_revision(
         env,
         &FreshActivationGuard {
@@ -338,6 +359,8 @@ struct RejectionEvidence {
 #[serde(deny_unknown_fields)]
 struct Record {
     schema: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalogue_scope: Option<catalogue::CatalogueScope>,
     request: codex_enrollment::Request,
     stage: PathBuf,
     stage_device: u64,
@@ -360,11 +383,16 @@ impl Drop for Record {
 
 impl Record {
     fn valid(&self) -> bool {
-        (self.schema == 6
-            || self
-                .response
-                .as_ref()
-                .is_none_or(|response| response.native_row.is_none()))
+        self.catalogue_scope
+            .as_ref()
+            .is_none_or(catalogue::CatalogueScope::valid)
+            && (self.schema != 7 || self.catalogue_scope.is_some())
+            && (self.schema == 6
+                || self.schema == 7
+                || self
+                    .response
+                    .as_ref()
+                    .is_none_or(|response| response.native_row.is_none()))
             && ((self.schema == 1
                 && !matches!(self.phase, Phase::NotDispatched | Phase::RejectedResponse)
                 && self.no_dispatch_seal.is_none()
@@ -382,7 +410,7 @@ impl Record {
                         .as_ref()
                         .and_then(|response| response.predecessor.as_ref())
                         .is_some_and(StagePredecessor::valid))
-                || (self.schema == 6
+                || (matches!(self.schema, 6 | 7)
                     && self.phase == Phase::VerifiedResponse
                     && self.no_dispatch_seal.is_none()
                     && self.rejection.is_none()
@@ -396,6 +424,17 @@ impl Record {
                                     && staging.request == self.request
                                     && staging.directory.join("auth.json") == self.stage
                             })
+                    }))
+                || (self.schema == 7
+                    && self.phase == Phase::VerifiedResponse
+                    && self.catalogue_scope.is_some()
+                    && self.no_dispatch_seal.is_none()
+                    && self.rejection.is_none()
+                    && self.response.as_ref().is_some_and(|response| {
+                        response
+                            .predecessor
+                            .as_ref()
+                            .is_some_and(StagePredecessor::valid)
                     }))
                 || (self.schema == 2
                     && self.phase == Phase::NotDispatched
@@ -510,6 +549,7 @@ fn stage_shape(path: &Path) -> bool {
 }
 
 struct Store {
+    catalogue_scope: Option<catalogue::CatalogueScope>,
     journal: platform::Store,
     directory: PathBuf,
     home: PathBuf,
@@ -517,7 +557,7 @@ struct Store {
 }
 
 impl Store {
-    fn location(env: &Env, id: &str) -> Result<(PathBuf, PathBuf), String> {
+    fn historical_location(env: &Env, id: &str) -> Result<(PathBuf, PathBuf), String> {
         if !valid_hex(id, 32) {
             return Err("invalid grant operation".into());
         }
@@ -530,8 +570,19 @@ impl Store {
         Ok((root.join(id), home.into()))
     }
 
+    fn location(env: &Env, id: &str) -> Result<(PathBuf, PathBuf), String> {
+        match catalogue::existing_scope(env, id)? {
+            Some(scope) => Ok((
+                catalogue::location(env, &scope)?,
+                env.home.clone().ok_or("catalogue home unavailable")?,
+            )),
+            None => Self::historical_location(env, id),
+        }
+    }
+
     fn open(env: &Env, id: &str, prepare: bool) -> Result<Option<(Self, Option<Record>)>, String> {
         platform::require_available()?;
+        let scope = catalogue::existing_scope(env, id)?;
         let (directory, home) = Self::location(env, id)?;
         let identity = platform::machine_identity(&home)
             .map_err(|_| "grant owner identity unavailable")?
@@ -555,7 +606,7 @@ impl Store {
             .map(|bytes| {
                 let record: Record = aterm_json::from_slice(bytes.as_slice())
                     .map_err(|_| "grant custody record is invalid")?;
-                if !record.valid() || record.request.id != id {
+                if !record.valid() || record.request.id != id || record.catalogue_scope != scope {
                     return Err("grant custody record is invalid");
                 }
                 Ok(record)
@@ -563,6 +614,7 @@ impl Store {
             .transpose()?;
         Ok(Some((
             Self {
+                catalogue_scope: scope,
                 journal,
                 directory,
                 home,
@@ -612,6 +664,29 @@ impl Store {
     }
 
     fn no_dispatch_mac(&self, record: &Record) -> Result<String, String> {
+        if let Some(scope) = &record.catalogue_scope {
+            if self.catalogue_scope.as_ref() != Some(scope) {
+                return Err("global no-send scope changed".into());
+            }
+            let message = SecretBytes::new(
+                aterm_json::to_vec(&(
+                    "aterm/codex-code-not-dispatched/v2",
+                    &record.request,
+                    &record.stage,
+                    record.stage_device,
+                    record.stage_inode,
+                    &record.source_fence,
+                    &record.capability,
+                    scope,
+                ))
+                .map_err(|_| "global no-send evidence unavailable")?,
+            );
+            return machine_mac(
+                &self.identity,
+                b"aterm/codex-code-not-dispatched/key/v2\0",
+                message.as_slice(),
+            );
+        }
         let message = SecretBytes::new(
             aterm_json::to_vec(&(
                 "aterm/codex-code-not-dispatched/v1",
@@ -768,42 +843,11 @@ impl Store {
     }
 
     fn proof(&self, record: &Record, digest: &str) -> Result<String, String> {
-        let identity = record
-            .response
-            .as_ref()
-            .and_then(|response| response.identity.as_ref())
-            .ok_or("unverified response has no producer receipt")?;
-        let message = SecretBytes::new(
-            aterm_json::to_vec(&(
-                "aterm/codex-fresh-code-issuance/v1",
-                &record.request,
-                &record.stage,
-                &record.source_fence,
-                record.stage_device,
-                record.stage_inode,
-                &record.capability,
-                identity,
-                digest,
-            ))
-            .map_err(|_| "grant issuance cannot be encoded")?,
-        );
-        let salt = ring::hkdf::Salt::new(
-            ring::hkdf::HKDF_SHA256,
-            b"aterm/codex-grant-receipt-key/v1\0",
-        );
-        let derived = salt.extract(self.identity.secret_bytes());
-        let info: &[&[u8]] = &[b"fresh-code-producer"];
-        let key = derived
-            .expand(info, ring::hkdf::HKDF_SHA256)
-            .map_err(|_| "grant issuance key unavailable")?;
-        let mut bytes = [0u8; 32];
-        key.fill(&mut bytes)
-            .map_err(|_| "grant issuance key unavailable")?;
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes);
-        bytes.zeroize();
-        Ok(aterm_codec::hex::encode_lower(
-            ring::hmac::sign(&key, message.as_slice()).as_ref(),
-        ))
+        IssuerCryptography {
+            identity: &self.identity,
+            catalogue_scope: self.catalogue_scope.as_ref(),
+        }
+        .proof(record, digest)
     }
 
     fn issuance(&self, record: &Record) -> Result<GrantReference, String> {
@@ -823,80 +867,11 @@ impl Store {
         })
     }
     fn origin_seal(&self, record: &Record) -> Result<String, String> {
-        let response = record.response.as_ref().ok_or("grant response absent")?;
-        let identity = response
-            .identity
-            .as_ref()
-            .ok_or("unverified grant response")?;
-        let owner = response
-            .login_owner
-            .as_deref()
-            .ok_or("unverified grant response")?;
-        let legacy = (
-            &record.request,
-            &record.stage,
-            record.stage_device,
-            record.stage_inode,
-            &record.source_fence,
-            &record.capability,
-            identity,
-            owner,
-            &response.document,
-        );
-        if let Some(staging) = &response.native_row {
-            if record.schema != 6 || !super::codex_native_row::staging_shape(staging) {
-                return Err("native row issuer evidence unavailable".into());
-            }
-            let predecessor = response
-                .predecessor
-                .as_ref()
-                .ok_or("native row predecessor unavailable")?;
-            let body = SecretBytes::new(
-                aterm_json::to_vec(&(
-                    "aterm/codex-code-response-origin/v3",
-                    legacy,
-                    predecessor,
-                    staging,
-                ))
-                .map_err(|_| "native row origin cannot be encoded")?,
-            );
-            machine_mac(
-                &self.identity,
-                b"aterm/codex-code-response-origin/key/v3\0",
-                body.as_slice(),
-            )
-        } else if let Some(predecessor) = &response.predecessor {
-            let body = SecretBytes::new(
-                aterm_json::to_vec(&("aterm/codex-code-response-origin/v2", legacy, predecessor))
-                    .map_err(|_| "grant origin cannot be encoded")?,
-            );
-            machine_mac(
-                &self.identity,
-                b"aterm/codex-code-response-origin/key/v2\0",
-                body.as_slice(),
-            )
-        } else {
-            let body = SecretBytes::new(
-                aterm_json::to_vec(&(
-                    "aterm/codex-code-response-origin/v1",
-                    &record.request,
-                    &record.stage,
-                    record.stage_device,
-                    record.stage_inode,
-                    &record.source_fence,
-                    &record.capability,
-                    identity,
-                    owner,
-                    &response.document,
-                ))
-                .map_err(|_| "grant origin cannot be encoded")?,
-            );
-            machine_mac(
-                &self.identity,
-                b"aterm/codex-code-response-origin/key/v1\0",
-                body.as_slice(),
-            )
+        IssuerCryptography {
+            identity: &self.identity,
+            catalogue_scope: self.catalogue_scope.as_ref(),
         }
+        .origin_seal(record)
     }
 
     fn verify_origin(&self, record: &Record) -> Result<(), String> {
@@ -1005,9 +980,157 @@ impl PreparedStore {
     }
 }
 
+// Only private issuer code computes producer MACs. Read-only observations can
+// verify an existing occurrence, never mint a public proof from decoded data.
+struct IssuerCryptography<'a> {
+    identity: &'a age::Identity,
+    catalogue_scope: Option<&'a catalogue::CatalogueScope>,
+}
+impl IssuerCryptography<'_> {
+    fn proof(&self, record: &Record, digest: &str) -> Result<String, String> {
+        let identity = record
+            .response
+            .as_ref()
+            .and_then(|response| response.identity.as_ref())
+            .ok_or("unverified response has no producer receipt")?;
+        let message = SecretBytes::new(
+            aterm_json::to_vec(&(
+                "aterm/codex-fresh-code-issuance/v1",
+                &record.request,
+                &record.stage,
+                &record.source_fence,
+                record.stage_device,
+                record.stage_inode,
+                &record.capability,
+                identity,
+                digest,
+            ))
+            .map_err(|_| "grant issuance cannot be encoded")?,
+        );
+        let salt = ring::hkdf::Salt::new(
+            ring::hkdf::HKDF_SHA256,
+            b"aterm/codex-grant-receipt-key/v1\0",
+        );
+        let derived = salt.extract(self.identity.secret_bytes());
+        let info: &[&[u8]] = &[b"fresh-code-producer"];
+        let key = derived
+            .expand(info, ring::hkdf::HKDF_SHA256)
+            .map_err(|_| "grant issuance key unavailable")?;
+        let mut bytes = [0u8; 32];
+        key.fill(&mut bytes)
+            .map_err(|_| "grant issuance key unavailable")?;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes);
+        bytes.zeroize();
+        Ok(aterm_codec::hex::encode_lower(
+            ring::hmac::sign(&key, message.as_slice()).as_ref(),
+        ))
+    }
+
+    fn origin_seal(&self, record: &Record) -> Result<String, String> {
+        let response = record.response.as_ref().ok_or("grant response absent")?;
+        let identity = response
+            .identity
+            .as_ref()
+            .ok_or("unverified grant response")?;
+        let owner = response
+            .login_owner
+            .as_deref()
+            .ok_or("unverified grant response")?;
+        let legacy = (
+            &record.request,
+            &record.stage,
+            record.stage_device,
+            record.stage_inode,
+            &record.source_fence,
+            &record.capability,
+            identity,
+            owner,
+            &response.document,
+        );
+        if let Some(scope) = &record.catalogue_scope {
+            if record.schema != 7 || self.catalogue_scope != Some(scope) || !scope.valid() {
+                return Err("global issuer scope changed".into());
+            }
+            let body = SecretBytes::new(
+                aterm_json::to_vec(&(
+                    "aterm/codex-code-response-origin/v4",
+                    legacy,
+                    &response.predecessor,
+                    &response.native_row,
+                    scope,
+                ))
+                .map_err(|_| "global origin cannot be encoded")?,
+            );
+            return machine_mac(
+                self.identity,
+                b"aterm/codex-code-response-origin/key/v4\0",
+                body.as_slice(),
+            );
+        }
+        if let Some(staging) = &response.native_row {
+            if record.schema != 6 || !super::codex_native_row::staging_shape(staging) {
+                return Err("native row issuer evidence unavailable".into());
+            }
+            let predecessor = response
+                .predecessor
+                .as_ref()
+                .ok_or("native row predecessor unavailable")?;
+            let body = SecretBytes::new(
+                aterm_json::to_vec(&(
+                    "aterm/codex-code-response-origin/v3",
+                    legacy,
+                    predecessor,
+                    staging,
+                ))
+                .map_err(|_| "native row origin cannot be encoded")?,
+            );
+            machine_mac(
+                self.identity,
+                b"aterm/codex-code-response-origin/key/v3\0",
+                body.as_slice(),
+            )
+        } else if let Some(predecessor) = &response.predecessor {
+            let body = SecretBytes::new(
+                aterm_json::to_vec(&("aterm/codex-code-response-origin/v2", legacy, predecessor))
+                    .map_err(|_| "grant origin cannot be encoded")?,
+            );
+            machine_mac(
+                self.identity,
+                b"aterm/codex-code-response-origin/key/v2\0",
+                body.as_slice(),
+            )
+        } else {
+            let body = SecretBytes::new(
+                aterm_json::to_vec(&(
+                    "aterm/codex-code-response-origin/v1",
+                    &record.request,
+                    &record.stage,
+                    record.stage_device,
+                    record.stage_inode,
+                    &record.source_fence,
+                    &record.capability,
+                    identity,
+                    owner,
+                    &response.document,
+                ))
+                .map_err(|_| "grant origin cannot be encoded")?,
+            );
+            machine_mac(
+                self.identity,
+                b"aterm/codex-code-response-origin/key/v1\0",
+                body.as_slice(),
+            )
+        }
+    }
+}
+
+#[path = "codex_grant_issuer_observation.rs"]
+mod issuer_observation;
+
 /// One staged exchange's durable custody, prepared before the authorization code
 /// can be spent. Different enrollments hold different locks.
 pub(super) struct PreparedGrant {
+    env: Env,
     store: PreparedStore,
     record: Record,
     stage_witness: codex_app_login::StagedWitness,
@@ -1037,6 +1160,7 @@ pub(super) fn prepare(
     let stage = stage_path(stage)?;
     let stage_witness = codex_app_login::StagedWitness::open(&stage)?;
     let (_, stage_device, stage_inode) = stage_witness.coordinates()?;
+    let catalogue_scope = catalogue::prepare(env, request, &stage)?;
     let (directory, _) = Store::location(env, &request.id)?;
     let root = directory
         .parent()
@@ -1068,6 +1192,7 @@ pub(super) fn prepare(
         capability.zeroize();
         let record = Record {
             schema: 1,
+            catalogue_scope: catalogue_scope.clone(),
             request: request.clone(),
             stage,
             stage_device,
@@ -1083,6 +1208,7 @@ pub(super) fn prepare(
         record
     };
     Ok(PreparedGrant {
+        env: env.clone(),
         store: PreparedStore {
             active: Some(store),
             parked: None,
@@ -1135,6 +1261,10 @@ fn response_resource_identity(
             b"aterm native publication account v1\0",
             identity.account.as_bytes(),
         ),
+        resource(
+            b"aterm native publication user v1\0",
+            identity.user.as_bytes(),
+        ),
         resource(b"aterm native publication refresh v1\0", refresh.as_bytes()),
     ];
     resources.sort();
@@ -1175,7 +1305,8 @@ fn retirement_identity(
         .response
         .as_ref()
         .ok_or("native retirement response unavailable")?;
-    if record.schema != 6 || response.native_row.as_ref() != Some(candidate.staging()) {
+    if !matches!(record.schema, 6 | 7) || response.native_row.as_ref() != Some(candidate.staging())
+    {
         return Err("native retirement issuer stage changed".into());
     }
     let identity = response
@@ -1385,6 +1516,17 @@ impl PreparedGrant {
         self.native_scope.clone()
     }
 
+    fn catalogue_response_durable(&self) -> Result<(), String> {
+        if let Some(scope) = &self.record.catalogue_scope {
+            let store = self
+                .store
+                .active
+                .as_ref()
+                .ok_or("catalogue issuer custody unavailable")?;
+            catalogue::received(&self.env, scope, store, &self.record)?;
+        }
+        Ok(())
+    }
     fn release_settled_exchange(&self) {
         if let Some(scope) = &self.native_scope {
             scope.response_durable(&DurableExchangeSettlement {
@@ -1416,6 +1558,9 @@ impl PreparedGrant {
         {
             return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
         }
+        if self.catalogue_response_durable().is_err() {
+            return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
+        }
         self.release_settled_exchange();
         CaptureOutcome::NotDispatched(NotDispatched {
             request: self.record.request.clone(),
@@ -1426,6 +1571,9 @@ impl PreparedGrant {
         self.store.resume(&self.record.request.id)?;
         if self.record.phase != Phase::Prepared {
             return Err("grant exchange is already attempted".into());
+        }
+        if let Some(scope) = &self.record.catalogue_scope {
+            catalogue::attempted(&self.env, scope)?;
         }
         self.record.phase = Phase::Attempted;
         self.store.write(&self.record)
@@ -1536,6 +1684,9 @@ impl PreparedGrant {
     }
 
     fn settle_response(mut self) -> CaptureOutcome {
+        if self.record.phase == Phase::VerifiedResponse && self.record.catalogue_scope.is_some() {
+            self.record.schema = 7;
+        }
         if self.record.phase == Phase::RejectedResponse
             && self
                 .record
@@ -1576,6 +1727,9 @@ impl PreparedGrant {
                 .producer_seal = Some(seal);
         }
         if self.store.write(&self.record).is_err() {
+            return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
+        }
+        if self.catalogue_response_durable().is_err() {
             return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
         }
         if self.record.phase == Phase::RejectedResponse {
@@ -1993,6 +2147,13 @@ impl PublicationResponse<'_> {
         let binding = permit.binding(&self.issuer.record.request, fresh)?;
         let transition =
             initialize_fresh_revision(env, &binding, &self.identity, self.document.as_slice())?;
+        catalogue::mark_owner(
+            env,
+            &binding,
+            &self.witness,
+            &self.auth,
+            self.document.as_slice(),
+        )?;
         self.current()?;
         if !codex_app_login::retained_document_current(
             &self.witness,
@@ -2254,7 +2415,7 @@ pub(super) fn row_publication_issuer(
         return Err("native publication request differs".into());
     }
     let (owner, record) = open_authenticated(env, request, &fresh.reference)?;
-    if record.schema != 6
+    if !matches!(record.schema, 6 | 7)
         || record
             .response
             .as_ref()
@@ -2342,6 +2503,7 @@ impl FreshPublicationResponse<'_> {
         let binding = permit.binding(self.request, self.grant)?;
         let transition =
             initialize_fresh_revision(self.env, &binding, self.identity, self.document)?;
+        catalogue::mark_owner(self.env, &binding, self.witness, self.auth, self.document)?;
         if !codex_app_login::retained_document_current(self.witness, self.auth, self.document) {
             return Err("native publication document changed".into());
         }
@@ -2477,6 +2639,7 @@ pub(super) fn with_current_published_grant<R>(
         env,
         binding,
         |grant| {
+            catalogue::require_participant(env, grant.binding, grant.identity)?;
             lineage_consumers_capable(env, grant.canonical_auth, grant.identity)?;
             if Process::observe(caller.pid).as_ref() != Some(&process) {
                 return Err("credential consumer changed".into());
@@ -2538,6 +2701,11 @@ pub(super) fn with_selected_target<R>(
         .authenticates_published_grant(source)
     {
         return Err("assignment source publication changed".into());
+    }
+    let source_scope = catalogue::existing_scope(env, &source.request.id)?
+        .ok_or("historical assignment source requires authenticated migration")?;
+    if source_scope.request() != &source.request {
+        return Err("assignment source catalogue scope changed".into());
     }
     let source_row = records
         .roster
@@ -2612,6 +2780,7 @@ pub(super) fn with_selected_target<R>(
             records: &records,
         },
         |grant| {
+            catalogue::require_participant(env, grant.binding, grant.identity)?;
             lineage_consumers_capable(env, grant.canonical_auth, grant.identity)?;
             if Process::observe(caller.pid).as_ref() != Some(&process) {
                 return Err("credential consumer changed".into());
@@ -2733,7 +2902,23 @@ fn with_canonical_owner_held<R>(
     {
         return Err("account source changed".into());
     }
+    let home = env.home.as_deref().ok_or("account home unavailable")?;
+    let canonical_auth = row
+        .dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
+        .join("auth.json");
+    let publication = published_source::PublishedSource::authenticate(
+        env,
+        binding,
+        &records.logins,
+        &canonical_auth,
+    )?;
     let (owner, issuance) = open_authenticated(env, &binding.request, &binding.reference)?;
+    if issuance.catalogue_scope.is_some() && publication.is_none() {
+        return Err("global owner has no authenticated canonical publication".into());
+    }
     let anchor = codex_enrollment::OwnerAnchorWriter::new(store, writer, binding, env.now);
     let witness = anchor
         .read()?
@@ -2754,13 +2939,6 @@ fn with_canonical_owner_held<R>(
     {
         return Err("owned grant revision changed".into());
     }
-    let home = env.home.as_deref().ok_or("account home unavailable")?;
-    let canonical_auth = row
-        .dir
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex"))
-        .join("auth.json");
     let _auth = codex_app_login::AuthLock::try_take(&canonical_auth)
         .map_err(|_| "native auth custody unavailable")?
         .ok_or("native auth custody busy")?;
@@ -2794,6 +2972,9 @@ fn with_canonical_owner_held<R>(
     let after = store
         .peek_account_records(roster_path, env.now)
         .map_err(|_| "account publication unavailable")?;
+    if let Some(publication) = &publication {
+        publication.at(&after.logins, &canonical_auth)?;
+    }
     if after.raw_roster != records.raw_roster
         || !after
             .logins
@@ -2894,6 +3075,10 @@ fn lineage_consumers_capable(
 mod row_fixture;
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub(super) use row_fixture::create as native_recovery_row_fixture;
+#[cfg(all(test, unix))]
+pub(super) use row_fixture::create_five as native_recovery_five_fixture;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) use row_fixture::create_source_host as native_source_host_fixture;
 
 #[cfg(all(test, unix))]
 #[path = "codex_grant_owner_tests.rs"]
@@ -2902,6 +3087,32 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "codex_grant_maintenance_tests.rs"]
 mod maintenance_tests;
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn with_global_code_fixture(
+    test: impl FnOnce(
+        &Env,
+        &codex_enrollment::Request,
+        &Path,
+        std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>,
+        PreparedGrant,
+        codex_enrollment::Artifact,
+    ),
+) {
+    row_fixture::with_global_code_fixture(test);
+}
+
+/// Exact authenticated fixture occurrence locator; never owner adoption from a path.
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn fixture_owner_cipher(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    grant: &RetainedGrant,
+) -> Result<PathBuf, String> {
+    let (owner, _) = open_authenticated(env, request, &grant.reference())?;
+    owner.current()?;
+    Ok(owner.directory.join("candidate.age"))
+}
 
 #[cfg(all(test, unix))]
 pub(in crate::harness) fn with_code_rejection_fixture(

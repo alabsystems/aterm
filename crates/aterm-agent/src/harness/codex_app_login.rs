@@ -49,6 +49,8 @@ pub(in crate::harness) use code_rejection::{
 pub(in crate::harness) use grant_completion::NoGrantCapture;
 pub(in crate::harness) use grant_completion::{CapturedLogin, CodeGrantCapture};
 pub use grant_completion::{FreshCodeGrant, StagedWitness};
+#[cfg(all(test, unix))]
+pub(in crate::harness) use refresh_transport::with_refresh_fixture_endpoint;
 pub(in crate::harness) use refresh_transport::{
     ReceivedRefresh, RefreshExchange, exchange_owned_refresh, merge_owned_refresh,
     owned_refresh_token_digest,
@@ -3846,8 +3848,17 @@ impl CodeExchange<'_> {
             }
             // From this point any transport error may have reached the provider.
             dispatched = true;
-            let resp = http_client(token_url, wait)
-                .request(Method::Post, token_url)
+            // Test transport is selected only after declared endpoint,
+            // native exchange, owner claim, stage/Auth and send-budget checks.
+            // Provenance below continues to use the original token_url.
+            #[cfg(test)]
+            let fixture_contact = tests::code_contact_url(token_url, native_scope, enrollment);
+            #[cfg(test)]
+            let contact_url = &fixture_contact;
+            #[cfg(not(test))]
+            let contact_url = token_url;
+            let resp = http_client(contact_url, wait)
+                .request(Method::Post, contact_url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .header("Accept", "application/json")
                 .header("User-Agent", "codex-cli")
@@ -4430,6 +4441,12 @@ pub fn login_in_home(
         deadline,
     )
 }
+
+#[path = "codex_native_usage_http.rs"]
+mod native_usage_http;
+pub(in crate::harness) use native_usage_http::{
+    LegacyUsageRead, native_legacy_observation, native_usage_probe, native_usage_route,
+};
 
 #[cfg(test)]
 #[path = "codex_app_login_tests.rs"]

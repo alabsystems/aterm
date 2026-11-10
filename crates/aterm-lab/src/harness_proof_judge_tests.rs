@@ -90,6 +90,12 @@ fn the_stand_ins_frame_is_read_off_the_screen() {
     );
     let empty = screen.replace("❯ a draft, not sent", "❯ ");
     assert_eq!(frame_of(&empty).map(|f| f.composer), Some(String::new()));
+    let kimi = screen.replace("❯ a draft, not sent", "│ > a draft, not sent │");
+    assert_eq!(
+        frame_of(&kimi).map(|frame| frame.composer),
+        Some("a draft, not sent".to_string()),
+        "Kimi's composer is read too"
+    );
     assert_eq!(frame_of("$ muse-alab\nmuse-alab: not installed\n$ "), None);
     assert_eq!(
         frame_of(&format!(
@@ -593,10 +599,11 @@ fn the_reexec_judge_wants_the_same_pid_on_the_new_image_and_the_child_kept() {
     );
 }
 
-/// THE NEGATIVE CONTROL: where no contract 3 is served, the vendor in the harness's place
-/// (program and leader the stand-in's), unclaimed, passes; a harness that stays (its own name,
-/// its own pid leading) or claims anyway fails. The built-in lanes then take the session: their
-/// resume line and the vendor back on its session pass; no line, or a new session, fails.
+/// THE NEGATIVE CONTROL: where no contract 3 is served, the vendor in the harness's place (the
+/// vendor's program name or its mapped alias, and the stand-in's leader), unclaimed, passes; an
+/// unrecognized program name, the harness's own pid leading, or a claim anyway fails. The built-in
+/// lanes then take the session: their resume line and the vendor back on its session pass; no
+/// line, or a new session, fails.
 #[test]
 fn the_negative_control_wants_a_pass_through_the_built_in_lanes_take() {
     let standin = frame(V1, 700, S1, 1);
@@ -615,13 +622,19 @@ fn the_negative_control_wants_a_pass_through_the_built_in_lanes_take() {
     };
     let good = passed_through("muse", &hosted, Some(700), Some(&standin), HOST);
     assert!(passed(&good), "{good:?}");
+    let alias = ClaimSeen {
+        program: Some("kimi-alab".to_string()),
+        ..through.clone()
+    };
+    let good = passed_through("kimi", &alias, Some(700), Some(&standin), HOST);
+    assert!(passed(&good), "the vendor's mapped harness alias: {good:?}");
 
-    let stayed = ClaimSeen {
-        program: Some("muse-alab".to_string()),
+    let wrong_name = ClaimSeen {
+        program: Some("other-alab".to_string()),
         ..ClaimSeen::default()
     };
     fails_on(
-        &passed_through("muse", &stayed, Some(500), Some(&standin), HOST),
+        &passed_through("muse", &wrong_name, Some(500), Some(&standin), HOST),
         "program muse",
     );
     fails_on(

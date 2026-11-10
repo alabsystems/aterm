@@ -2323,7 +2323,7 @@ fn snapshot_of_joins_seat_rows() {
         book_peer(3, "mac-4.local"),
         book_peer(4, "studio.local"),
     ];
-    let snap = snapshot_of(&view, &fleet, &book, NOW);
+    let snap = snapshot_of(&view, &fleet, &book, None, NOW);
     assert_eq!(
         snap.seats.as_ref(),
         Some(&seats),
@@ -2405,6 +2405,44 @@ fn snapshot_of_joins_seat_rows() {
             ),
         ]
     );
+
+    // A log seat that bound no node key and names this Mac, or a Mac the view already stands
+    // for, is that seat: no phantom never-up Mac.
+    let mut unbound = fleet.clone();
+    unbound.rows.push(seat_row("here", None, None));
+    unbound.rows.push(SeatRow {
+        name: "studio.local".to_owned(),
+        ..seat_row("m7", None, None)
+    });
+    unbound.rows.push(SeatRow {
+        name: "studio.office.local".to_owned(),
+        ..seat_row("m10", None, None)
+    });
+    let snap = snapshot_of(&view, &unbound, &book, Some("here"), NOW);
+    let distinct = snap
+        .unanswered
+        .iter()
+        .find(|row| row.dial == "studio.office.local")
+        .expect("a different full host is still its own unbound seat");
+    assert_eq!(distinct.label.as_deref(), Some("m10"));
+    assert_eq!(distinct.reason, Reach::NeverUp);
+    let never: Vec<&str> = snap
+        .unanswered
+        .iter()
+        .filter(|u| u.reason == Reach::NeverUp)
+        .map(|u| u.name.as_str())
+        .collect();
+    assert_eq!(never, ["m9", "studio"]);
+    // Only a bare LAN label has the .local alias: a multi-label host is a full host.
+    let snap = snapshot_of(&view, &unbound, &book, Some("studio.office"), NOW);
+    assert!(snap.unanswered.iter().any(|row| {
+        row.dial == "studio.office.local"
+            && row.label.as_deref() == Some("m10")
+            && row.reason == Reach::NeverUp
+    }));
+    // Control: another Mac's host is a Mac never seen up.
+    let snap = snapshot_of(&view, &unbound, &book, Some("elsewhere.local"), NOW);
+    assert!(snap.unanswered.iter().any(|u| u.name == "here"));
 }
 
 /// THE GLANCE'S GENERATION IS READ WITHOUT A COPY (Fleet Field §12): the band's service turn
@@ -2687,7 +2725,7 @@ fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
         rows: Vec::new(),
         unserved: None,
     };
-    let mut snapshot = snapshot_of(&view, &fleet, &[], NOW);
+    let mut snapshot = snapshot_of(&view, &fleet, &[], None, NOW);
     let mac = |snapshot: &FleetSnapshot, n: u8| {
         snapshot
             .macs
@@ -2743,7 +2781,7 @@ fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
         ..view.clone()
     };
     assert_eq!(
-        mac(&snapshot_of(&unread, &fleet, &[], NOW), 2).activity_absent,
+        mac(&snapshot_of(&unread, &fleet, &[], None, NOW), 2).activity_absent,
         Some(ActivityAbsent::Unread)
     );
 

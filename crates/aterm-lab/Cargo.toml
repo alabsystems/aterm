@@ -52,6 +52,7 @@ aterm-pty = { workspace = true }
 aterm-phase = { workspace = true }
 # The workspace's JSON parser: request bodies, settings, tool scripts, records.
 aterm-json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 # The workspace's TOML parser: a `harness` value is written as typed only when
 # it is a TOML value, so the scratch `aterm.toml` stays one aterm can read.
 aterm-toml = { workspace = true }

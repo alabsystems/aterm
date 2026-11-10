@@ -25,8 +25,10 @@ struct Scratch {
 
 impl Scratch {
     fn new(tag: &str) -> Self {
+        let short = &tag[..tag.floor_char_boundary(8)];
         let held = aterm_tempfile::Builder::new()
-            .prefix(&format!("atfo-{tag}-"))
+            .prefix(&format!("atfo-{short}-"))
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch dir");
         let dir = held.path().to_path_buf();

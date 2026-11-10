@@ -43,8 +43,10 @@ struct Scratch {
 
 impl Scratch {
     fn new(tag: &str) -> Self {
+        let short = &tag[..tag.floor_char_boundary(8)];
         let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("atf-{tag}-"))
+            .prefix(&format!("atf-{short}-"))
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch dir");
         for sub in ["cfg/aterm", "run/aterm", "link", "home"] {

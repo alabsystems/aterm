@@ -315,6 +315,40 @@ fn its_footer_claims_no_other_programs_screen() {
     assert!(others > 1000, "{others} other programs' frames");
 }
 
+#[test]
+fn turn_end_reads_the_reply_launch_and_tool_evidence() {
+    let ended = screen(super::fixtures::END_OF_TURN_240);
+    assert_eq!(
+        said_tail(&ended).as_deref(),
+        Some("lab held reply, sent after 30 s")
+    );
+    assert!(said_whole(&ended));
+    assert_eq!(turn_messages_before(&ended), None);
+    assert_eq!(turn_said_before(&ended), None);
+    assert!(!turn_ran_tools(&ended));
+    assert!(turn_opens_above(&ended));
+    assert_eq!(turn_opened_by(&ended).as_deref(), Some("lab draft one"));
+    assert!(!interrupted(&ended));
+    assert!(!fresh(&ended));
+    assert!(opening(&ended));
+    assert!(message_drawn(&ended));
+    let without_launch: Vec<String> = ended
+        .iter()
+        .filter(|row| !row.contains("Welcome to Kimi Code!"))
+        .cloned()
+        .collect();
+    assert!(!opening(&without_launch), "CONTROL: no launch card");
+
+    let launch = screen(IDLE);
+    assert!(fresh(&launch));
+    assert!(!opening(&launch));
+    assert!(!message_drawn(&launch));
+    let tools = screen(BOX_SHELL_240);
+    assert!(turn_ran_tools(&tools));
+    let interrupted_screen = frame("2.4.0-interrupted-esc");
+    assert!(interrupted(&interrupted_screen));
+}
+
 /// Every Kimi Code fixture by name (`kimi-<version>-<name>.txt`), with the phase its rows decide
 /// and whether they decide it (`phase`). A new fixture needs its row here.
 const PHASES: &[(&str, Phase, bool)] = &[
@@ -415,9 +449,9 @@ fn frame(name: &str) -> Vec<String> {
 /// composer's top border; every frame a turn ended on (a reply, an interrupt, an error, a
 /// resume's notice, a plan mode switched on, a slash menu or the exit hint over the idle
 /// composer) is idle by the blank row there. A command's approval, a file's, a plan's, a question
-/// (its review step too) and the trust prompt drawn in the composer's place are prompts, each read as
-/// its box, and no other frame reads a box; the session picker, the person's own, and the frames
-/// of an exit decide nothing. Display only: neither program is supervised.
+/// (its review step too) and the trust prompt drawn in the composer's place are prompts, each read
+/// as its box, and no other frame reads a box; the session picker, the person's own, and the frames
+/// of an exit decide nothing.
 #[test]
 fn every_kimi_frame_reads_the_phase_its_own_rows_decide() {
     let names: std::collections::BTreeSet<String> = crate::text::fixture_files()
@@ -461,7 +495,7 @@ fn every_kimi_frame_reads_the_phase_its_own_rows_decide() {
         (Phase::Idle, false),
         "no screen decides nothing"
     );
-    assert!(!Program::Kimi.supervisable(), "display only");
+    assert!(Program::Kimi.supervisable());
 }
 
 /// THE EXIT HINT A FIRST CTRL-C ARMS STANDS AT THE FOOTER'S LEFT AND HIDES NO COMPOSER: the
@@ -667,10 +701,31 @@ fn each_box_in_the_composers_place_reads_as_the_box_it_draws() {
         Some("↑↓ navigate · Enter select · Esc exit")
     );
 
-    for p in [&shell, &plan, &question, &review, &write, &edit, &trust] {
+    for (p, roles) in [
+        (
+            &shell,
+            vec![Role::Once, Role::Session, Role::Deny, Role::Deny],
+        ),
+        (
+            &plan,
+            vec![Role::Other, Role::Other, Role::Deny, Role::Other],
+        ),
+        (&question, vec![Role::Answer, Role::Answer, Role::Other]),
+        (&review, vec![Role::Answer, Role::Other]),
+        (
+            &write,
+            vec![Role::Once, Role::Session, Role::Deny, Role::Deny],
+        ),
+        (
+            &edit,
+            vec![Role::Once, Role::Session, Role::Deny, Role::Deny],
+        ),
+        (&trust, vec![Role::Trust, Role::Exit]),
+    ] {
         assert_eq!(p.cancel, None, "{:?}", p.kind);
-        assert!(
-            p.options.iter().all(|o| o.role == Role::Other),
+        assert_eq!(
+            p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+            roles,
             "{:?}",
             p.kind
         );

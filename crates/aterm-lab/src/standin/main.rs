@@ -14,14 +14,14 @@
 //! `terminal` records, and `session.end` with `exit_reason: clean` on a clean end), under
 //! `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<uuid>/` (else `$HOME/.local/share`); `resume <uuid>`
 //! reopens that session. It draws Muse Code's frame (aterm-phase's Muse reader: the `Muse Code
-//! <version>` banner, a rule, the `❯` composer, a rule and a footer two spaces in), whose footer
-//! says what aterm's screen read judges a leg by: `standin · <version> · pid <pid> · session <uuid>
+//! <version>` banner, a vendor-shaped composer and a footer two spaces in), whose footer says
+//! what aterm's screen read judges a leg by: `standin · <version> · pid <pid> · session <uuid>
 //! · start <n>`, `<n>` counting the session's starts.
 //!
 //! Input is read raw, only when `poll` says the terminal is readable. Enter submits the composer:
-//! `/crash` kills the process with `SIGKILL` and no end record,
-//! `/exit <n>` records a clean end and exits `<n>`, and any other text is one turn that ends at
-//! once. `SIGTERM` is a clean end (143); `SIGHUP` ends it by `SIGHUP`; `SIGINT` is said on the
+//! `/crash` kills the process with `SIGKILL` and no end record, `/quota` ends a Kimi turn on its
+//! measured quota wall, `/exit <n>` records a clean end and exits `<n>`, and any other text is one
+//! turn that ends at once. `SIGTERM` is a clean end (143); `SIGHUP` ends it by `SIGHUP`; `SIGINT` is said on the
 //! screen and nothing more. `--help` and `--version` print and exit 0 (a harness's build probe).
 //! Every start, probe, signal and end is one line in `$ATERM_LAB_STANDIN_LOG`, when set.
 
@@ -39,12 +39,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 enum Dialect {
     /// Muse Code (`muse`).
     Muse,
+    /// Kimi Code (`kimi`).
+    Kimi,
 }
 
 impl Dialect {
     fn of(argv0: &OsString) -> Option<Dialect> {
         match Path::new(argv0).file_name()?.to_str()? {
             "muse" => Some(Dialect::Muse),
+            "kimi" => Some(Dialect::Kimi),
             _ => None,
         }
     }
@@ -53,6 +56,7 @@ impl Dialect {
     const fn banner(self) -> &'static str {
         match self {
             Dialect::Muse => "Muse Code",
+            Dialect::Kimi => "Kimi Code",
         }
     }
 
@@ -60,6 +64,15 @@ impl Dialect {
     const fn data_dir(self) -> &'static str {
         match self {
             Dialect::Muse => "muse",
+            Dialect::Kimi => "kimi-code",
+        }
+    }
+
+    /// The flag a session resumes by.
+    const fn resume_flag(self) -> &'static [u8] {
+        match self {
+            Dialect::Muse => b"resume",
+            Dialect::Kimi => b"--session",
         }
     }
 }
@@ -210,8 +223,21 @@ fn civil(secs: u64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+fn kimi_home() -> Option<PathBuf> {
+    let home = std::env::var_os("KIMI_CODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".kimi-code")
+        });
+    home.is_absolute().then_some(home)
+}
+
 /// The vendor's sessions root under the data home (`$XDG_DATA_HOME`, else `$HOME/.local/share`).
 fn sessions_root(dialect: Dialect) -> Option<PathBuf> {
+    if dialect == Dialect::Kimi {
+        return Some(kimi_home()?.join("sessions"));
+    }
     let data = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(x) if Path::new(&x).is_absolute() => PathBuf::from(x),
         Some(_) => return None,
@@ -222,7 +248,10 @@ fn sessions_root(dialect: Dialect) -> Option<PathBuf> {
 
 /// The directory of `session` under `root` (`YYYY/MM/DD/<session>`): the one that exists, else
 /// today's.
-fn session_dir(root: &Path, session: &str) -> PathBuf {
+fn session_dir(dialect: Dialect, root: &Path, session: &str) -> PathBuf {
+    if dialect == Dialect::Kimi {
+        return root.join(session);
+    }
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
             .into_iter()
@@ -327,11 +356,15 @@ struct Session {
     escape: Option<Vec<u8>>,
 }
 
+fn hostname() -> String {
+    aterm_uds::process::kernel_host_name().unwrap_or_else(|| "unknown".to_string())
+}
+
 impl Session {
     fn open(dialect: Dialect, version: String, resume: Option<String>, cwd: &str) -> Session {
         let id = resume.filter(|r| is_uuid(r)).unwrap_or_else(new_uuid);
         let pid = std::process::id();
-        let dir = sessions_root(dialect).map(|root| session_dir(&root, &id));
+        let dir = sessions_root(dialect).map(|root| session_dir(dialect, &root, &id));
         let mut lock = None;
         let mut log = None;
         let mut start = 1;
@@ -343,17 +376,37 @@ impl Session {
                 .matches("\"payload_type\":\"session.started\"")
                 .count();
             use std::os::unix::fs::OpenOptionsExt as _;
+            let lock_path = if dialect == Dialect::Kimi {
+                kimi_home()
+                    .expect("Kimi's home")
+                    .join("locks/sessions")
+                    .join(format!("{id}.lock"))
+            } else {
+                dir.join(".session.lock")
+            };
+            let _ = lock_path.parent().map(std::fs::create_dir_all);
             lock = OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(dir.join(".session.lock"))
+                .open(lock_path)
                 .ok()
                 .filter(|f| f.metadata().is_ok_and(|m| m.is_file()));
             if let Some(f) = lock.as_mut() {
-                let _ = f.write_all(format!("pid={pid}\n").as_bytes());
+                if dialect == Dialect::Kimi {
+                    let _ = f.write_all(
+                        format!(
+                            "{{\"version\":1,\"token\":\"standin-{pid}\",\"pid\":{pid},\"hostname\":\"{}\",\"startedAt\":{},\"clientIdentity\":\"kimi_code_cli\"}}",
+                            hostname(),
+                            now_us()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    let _ = f.write_all(format!("pid={pid}\n").as_bytes());
+                }
             }
             log = OpenOptions::new()
                 .create(true)
@@ -465,15 +518,24 @@ impl Session {
             out.push_str(&fit(line));
             out.push_str("\r\n");
         }
-        out.push_str(&rule);
-        out.push_str("\r\n");
-        out.push_str(&fit(&format!(
-            "❯ {}",
-            String::from_utf8_lossy(&self.composer)
-        )));
-        out.push_str("\r\n");
-        out.push_str(&rule);
-        out.push_str("\r\n");
+        if self.dialect == Dialect::Kimi {
+            out.push_str("╭────────╮\r\n");
+            out.push_str(&fit(&format!(
+                "│ > {} │",
+                String::from_utf8_lossy(&self.composer)
+            )));
+            out.push_str("\r\n╰────────╯\r\ncontext: 0%\r\n");
+        } else {
+            out.push_str(&rule);
+            out.push_str("\r\n");
+            out.push_str(&fit(&format!(
+                "❯ {}",
+                String::from_utf8_lossy(&self.composer)
+            )));
+            out.push_str("\r\n");
+            out.push_str(&rule);
+            out.push_str("\r\n");
+        }
         out.push_str(&fit(&self.footer()));
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(out.as_bytes());
@@ -535,6 +597,12 @@ impl Session {
             return Some(code);
         }
         self.turn(text);
+        if self.dialect == Dialect::Kimi && text == "/quota" {
+            self.transcript.push(
+                "  Error: [provider.rate_limit] 429 You exceeded your current quota, please check your plan and billing details.".to_string(),
+            );
+            self.transcript.push(String::new());
+        }
         None
     }
 }
@@ -544,7 +612,7 @@ fn main() -> ExitCode {
     let argv0 = argv.first().cloned().unwrap_or_default();
     let Some(dialect) = Dialect::of(&argv0) else {
         eprintln!(
-            "aterm-lab-standin: run as a vendor's command (muse), not {}",
+            "aterm-lab-standin: run as a vendor's command (muse or kimi), not {}",
             Path::new(&argv0).display()
         );
         return ExitCode::from(2);
@@ -559,8 +627,13 @@ fn main() -> ExitCode {
             word(exe.as_os_str().as_bytes())
         ));
         println!(
-            "{} {version} (aterm-lab stand-in)\n\nusage: muse [resume <session>]",
-            dialect.banner()
+            "{} {version} (aterm-lab stand-in)\n\nusage: {} [{} <session>]",
+            dialect.banner(),
+            Path::new(&argv0)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            String::from_utf8_lossy(dialect.resume_flag())
         );
         return ExitCode::SUCCESS;
     }
@@ -570,7 +643,7 @@ fn main() -> ExitCode {
     }
     let resume = args
         .windows(2)
-        .find(|w| w[0] == b"resume")
+        .find(|w| w[0] == dialect.resume_flag())
         .map(|w| String::from_utf8_lossy(w[1]).into_owned());
     let cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
@@ -579,8 +652,13 @@ fn main() -> ExitCode {
     let mut session = Session::open(dialect, version.clone(), resume, &cwd);
     // SAFETY: getppid and getpgrp take no arguments and cannot fail.
     let (ppid, pgid) = unsafe { (libc::getppid(), libc::getpgrp()) };
+    let home = if dialect == Dialect::Kimi {
+        kimi_home().map_or_else(|| "-".to_string(), |home| word(home.as_os_str().as_bytes()))
+    } else {
+        "-".to_string()
+    };
     log(&format!(
-        "start pid={pid} ppid={ppid} pgid={pgid} exe={} version={version} session={} start={} argv={}",
+        "start pid={pid} ppid={ppid} pgid={pgid} exe={} version={version} session={} start={} home={home} argv={}",
         word(exe.as_os_str().as_bytes()),
         session.id,
         session.start,

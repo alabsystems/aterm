@@ -18,6 +18,14 @@ struct Held {
     path: PathBuf,
 }
 
+// A captured identity may inspect or lock only its existing private inode.
+// open_private_rw creates a missing file, so it belongs only to initial creation.
+fn existing_gate_file(directory: &Path) -> Result<File, &'static str> {
+    platform::open_private(directory, "gate")
+        .map(|(file, _)| file)
+        .map_err(|_| UNAVAILABLE)
+}
+
 #[cfg(unix)]
 fn private_directory(path: &Path) -> Result<(), &'static str> {
     match std::fs::symlink_metadata(path) {
@@ -59,7 +67,7 @@ fn open_gate(directory: &Path) -> Result<Held, &'static str> {
                 |_| Ok(()),
             )
             .map_err(|_| UNAVAILABLE)?;
-            platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?
+            existing_gate_file(directory)?
         }
         Err(_) => return Err(UNAVAILABLE),
     };
@@ -83,7 +91,7 @@ impl Held {
         }
         let parent = self.path.parent().ok_or(UNAVAILABLE)?;
         platform::check_private_dir(parent).map_err(|_| UNAVAILABLE)?;
-        let checked = platform::open_private_rw(parent, "gate").map_err(|_| UNAVAILABLE)?;
+        let checked = existing_gate_file(parent)?;
         if !astream_sys::file_matches_path(&checked, &self.path).map_err(|_| UNAVAILABLE)? {
             return Err(UNAVAILABLE);
         }
@@ -162,7 +170,7 @@ impl SourceGateIdentity {
             let directory = self.path.parent().ok_or(UNAVAILABLE)?;
             platform::check_private_dir(directory).map_err(|_| UNAVAILABLE)?;
             let held = Held {
-                file: platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?,
+                file: existing_gate_file(directory)?,
                 path: self.path.clone(),
             };
             held.identity()
@@ -176,7 +184,7 @@ impl SourceGateIdentity {
         // An identity is a reference to an existing gate, never permission to
         // recreate a missing/replaced namespace during a read acquisition.
         let held = Held {
-            file: platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?,
+            file: existing_gate_file(directory)?,
             path: self.path.clone(),
         };
         if held.identity()? != *self {
@@ -231,7 +239,7 @@ fn existing_identity_for_home(home: &Path) -> Result<SourceGateIdentity, &'stati
     let directory = profile.join("codex-source-custody");
     platform::check_private_dir(&directory).map_err(|_| UNAVAILABLE)?;
     let held = Held {
-        file: platform::open_private_rw(&directory, "gate").map_err(|_| UNAVAILABLE)?,
+        file: existing_gate_file(&directory)?,
         path: directory.join("gate"),
     };
     held.identity()
@@ -248,6 +256,18 @@ impl std::fmt::Debug for SourceWorkLease {
 }
 
 impl SourceWorkLease {
+    /// Cold maintenance may join an existing gate, never recreate a lost one.
+    pub(super) fn for_existing_home(home: &Path) -> Result<Self, &'static str> {
+        existing_identity_for_home(home)?.shared()
+    }
+
+    /// Join this actual held gate to the selected machine profile without
+    /// creating or reacquiring source custody.
+    pub(super) fn matches_home(&self, home: &Path) -> bool {
+        self.0
+            .identity()
+            .is_ok_and(|identity| identity.matches_home(home))
+    }
     pub(super) fn namespace(&self) -> Result<SourceNamespace, &'static str> {
         Ok(SourceNamespace(self.0.identity()?))
     }
@@ -321,12 +341,59 @@ impl PublicationLock {
 
 #[path = "codex_source_gate_family.rs"]
 mod family;
-pub(in crate::harness) use family::ReservationFamilyExclusive;
 pub use family::{FamilyExclusive, FamilySource, FamilyWork, SourceBorrow};
+pub(in crate::harness) use family::{ReservationFamilyExclusive, TargetFamilyLease};
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_gate_probes_never_create_a_missing_inode() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let work = SourceWorkLease::for_home(home.path()).unwrap();
+        let identity = work.identity().unwrap();
+        let namespace = work.namespace().unwrap();
+        let gate = identity.path.clone();
+        let displaced = gate.with_extension("held-original");
+        std::fs::rename(&gate, &displaced).unwrap();
+
+        assert!(!identity.current());
+        assert!(!gate.exists(), "identity inspection must not create a gate");
+        assert!(!identity.matches_home(home.path()));
+        assert!(
+            !gate.exists(),
+            "namespace comparison must not create a gate"
+        );
+        assert!(existing_namespace_for_home(home.path()).is_err());
+        assert!(!gate.exists(), "namespace lookup must not create a gate");
+        assert!(SourceWorkLease::for_existing_home(home.path()).is_err());
+        assert!(
+            !gate.exists(),
+            "maintenance admission must not create a gate"
+        );
+        assert!(identity.shared().is_err());
+        assert!(
+            !gate.exists(),
+            "captured shared acquisition must not create a gate"
+        );
+        assert!(work.current().is_err());
+        assert!(namespace.directory().is_err());
+        assert!(!gate.exists(), "held read probes must not create a gate");
+
+        std::fs::rename(&displaced, &gate).unwrap();
+        assert!(identity.current());
+        let existing = SourceWorkLease::for_existing_home(home.path()).unwrap();
+        drop(work);
+        assert!(
+            PublicationLock::try_for_home(home.path())
+                .unwrap()
+                .is_none()
+        );
+        drop(existing);
+        let publication = PublicationLock::for_home(home.path()).unwrap();
+        assert!(publication.current().is_ok());
+    }
 
     #[test]
     fn publication_excludes_real_live_source_work_and_replaced_gate_is_refused() {

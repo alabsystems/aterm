@@ -308,13 +308,13 @@ fn the_watch_ends_past_the_sixth_or_at_what_decides_the_run() {
     assert!(watched(&held, T0 + 465_000, T0));
 }
 
-/// A scratch folder of its own for `name`, empty.
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("forever-angles-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    let _ = std::fs::remove_dir_all(other_worktree(&d));
+/// A scratch folder of its own for `name`, empty, inside an RAII parent that also holds
+/// [`other_worktree`].
+fn scratch(name: &str) -> (crate::TestScratch, PathBuf) {
+    let outer = crate::TestScratch::new(name);
+    let d = outer.join("repo");
     std::fs::create_dir_all(&d).expect("the scratch folder");
-    d
+    (outer, d)
 }
 
 /// Another session's work laid beside a committed `main` stands as laid, and each piece of it
@@ -323,7 +323,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn another_sessions_work_stands_as_laid_and_each_piece_gone_is_named() {
     for gone in ["", "stash", "branch", "worktree"] {
-        let dir = scratch(if gone.is_empty() { "laid" } else { gone });
+        let (_outer, dir) = scratch(if gone.is_empty() { "laid" } else { gone });
         let home = dir.join("home");
         std::fs::create_dir_all(&home).expect("home");
         let g = |args: &[&str]| git(&home, &dir, args).expect("git");
@@ -346,8 +346,6 @@ fn another_sessions_work_stands_as_laid_and_each_piece_gone_is_named() {
             _ => {}
         }
         let left = others_left(&home, &dir);
-        let _ = std::fs::remove_dir_all(other_worktree(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
         if gone.is_empty() {
             assert!(left.is_empty(), "{left:?}");
         } else {

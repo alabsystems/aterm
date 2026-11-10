@@ -14,8 +14,37 @@ pub(super) enum Phase {
         attempt: Arc<Attempt>,
         kernel: Arc<ReservationFamilyExclusive>,
     },
+    // Keep every prior guard while durable cancellation is unknown. Only an
+    // authenticated no-effect cancellation can take these into retirement.
+    Cancelling(Box<Phase>),
+    Terminal,
 }
 impl Phase {
+    /// Existing A work keeps its own admitted use while cancellation settles.
+    /// This never admits a new Begin, constructor, or destination role.
+    pub(super) fn owes_origin(&self) -> bool {
+        matches!(self, Self::Draining)
+            || matches!(self, Self::Cancelling(prior) if matches!(prior.as_ref(), Self::Draining))
+    }
+
+    pub(super) fn normalized_source(
+        &self,
+    ) -> Option<&Arc<target::normalize::handoff::FamilyHandoff>> {
+        match self {
+            Self::Sealing(attempt) | Self::Sealed { attempt, .. } => attempt.normalized.as_ref(),
+            Self::Cancelling(prior) => prior.normalized_source(),
+            Self::Draining | Self::Terminal => None,
+        }
+    }
+    pub(super) fn sealing_worker_active(&self) -> bool {
+        match self {
+            Self::Sealing(attempt) | Self::Sealed { attempt, .. } => {
+                attempt.worker.load(Ordering::Acquire)
+            }
+            Self::Cancelling(prior) => prior.sealing_worker_active(),
+            Self::Draining | Self::Terminal => false,
+        }
+    }
     pub(super) fn admits(&self) -> bool {
         matches!(self, Self::Draining)
     }
@@ -23,6 +52,7 @@ impl Phase {
         let attempt = match self {
             Self::Draining => return true,
             Self::Sealing(attempt) | Self::Sealed { attempt, .. } => attempt,
+            Self::Cancelling(_) | Self::Terminal => return false,
         };
         let Some(expected) = attempt.independent.get(member) else {
             return false;
@@ -34,7 +64,7 @@ impl Phase {
     }
     fn matches(&self, expected: &Arc<Attempt>) -> bool {
         match self {
-            Self::Draining => false,
+            Self::Draining | Self::Cancelling(_) | Self::Terminal => false,
             Self::Sealing(actual)
             | Self::Sealed {
                 attempt: actual, ..
@@ -45,15 +75,19 @@ impl Phase {
 pub(super) struct Attempt {
     worker: AtomicBool,
     independent: BTreeMap<String, Arc<slot::SourceHandle>>,
+    normalized: Option<Arc<target::normalize::handoff::FamilyHandoff>>,
 }
-struct Worker(Arc<Attempt>);
+struct Worker(Arc<Attempt>, crate::harness::account_work::Scope);
 impl Worker {
-    fn acquire(attempt: Arc<Attempt>) -> Result<Self, Error> {
+    fn acquire(
+        attempt: Arc<Attempt>,
+        scope: crate::harness::account_work::Scope,
+    ) -> Result<Self, Error> {
         attempt
             .worker
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Busy)?;
-        Ok(Self(attempt))
+        Ok(Self(attempt, scope))
     }
 }
 impl Drop for Worker {
@@ -79,6 +113,69 @@ impl SealingSource {
     }
     pub(in crate::harness) fn source(&self) -> &slot::SourceHandle {
         self.origin.source()
+    }
+    pub(in crate::harness) fn matches_target(
+        &self,
+        target: &crate::harness::codex_assignment::prepare::TargetIntent,
+    ) -> bool {
+        let (Some(state), Some(cell), Some(attempt)) = (
+            self.state.upgrade(),
+            self.cell.upgrade(),
+            self.attempt.upgrade(),
+        ) else {
+            return false;
+        };
+        let Ok(state) = lock(&state) else {
+            return false;
+        };
+        if same_cell(&state, &cell, self.origin.caller()).is_err() {
+            return false;
+        }
+        lock(&cell).is_ok_and(|cell| {
+            cell.phase.matches(&attempt)
+                && cell.target.matches_intent(target)
+                && cell._scope.as_ref().is_some_and(|scope| !scope.cancelled())
+        })
+    }
+    pub(in crate::harness) fn matches_applied(
+        &self,
+        commit: &crate::harness::codex_assignment::AssignmentCommit,
+    ) -> bool {
+        let (Some(state), Some(cell), Some(attempt)) = (
+            self.state.upgrade(),
+            self.cell.upgrade(),
+            self.attempt.upgrade(),
+        ) else {
+            return false;
+        };
+        let Ok(state) = lock(&state) else {
+            return false;
+        };
+        if same_cell(&state, &cell, self.origin.caller()).is_err() {
+            return false;
+        }
+        lock(&cell).is_ok_and(|cell| {
+            cell.phase.matches(&attempt)
+                && commit.caller() == self.origin.caller()
+                && cell.target.intent().operation() == commit.operation()
+                && cell.target.intent().target_binding() == Some(commit.binding())
+                && cell.target.intent().assignment_generation() == Some(commit.generation())
+        })
+    }
+    pub(in crate::harness) fn retained_scope(
+        &self,
+    ) -> Result<crate::harness::account_work::Scope, Error> {
+        let state = self.state.upgrade().ok_or(Error::Stale)?;
+        let cell = self.cell.upgrade().ok_or(Error::Stale)?;
+        let attempt = self.attempt.upgrade().ok_or(Error::Stale)?;
+        let state = lock(&state)?;
+        same_cell(&state, &cell, self.origin.caller())?;
+        let cell = lock(&cell)?;
+        if !cell.phase.matches(&attempt) {
+            return Err(Error::Stale);
+        }
+        reservation_cell_scope(&state, &cell)?;
+        Ok(cell.scope()?.clone())
     }
     pub(in crate::harness) fn current(&self) -> bool {
         if !self.origin.current() {
@@ -107,6 +204,10 @@ pub struct SourceSeal {
     kernel: Weak<ReservationFamilyExclusive>,
 }
 impl SourceSeal {
+    pub(super) fn retained_kernel(&self) -> Option<Arc<ReservationFamilyExclusive>> {
+        self.kernel.upgrade()
+    }
+
     pub fn current(&self) -> bool {
         self.kernel
             .upgrade()
@@ -137,6 +238,7 @@ struct Snapshot {
     issued: BTreeMap<String, String>,
     loaded: Vec<(String, LoadedMember)>,
     retired: Vec<String>,
+    revoked: Vec<(String, target::normalize::handoff::RevokedMember)>,
     uses: Vec<CapturedUse>,
 }
 impl Snapshot {
@@ -164,6 +266,7 @@ impl Snapshot {
             issued: cell.issued.clone(),
             loaded: Vec::new(),
             retired: Vec::new(),
+            revoked: Vec::new(),
             uses: Vec::new(),
         };
         for (id, operation) in &cell.issued {
@@ -178,6 +281,17 @@ impl Snapshot {
             // Unrelated-role constructor evidence will join through its own
             // retained source allocation proof. A role enum alone is not that proof.
             let member = state.members.get(&key).ok_or(Error::Busy)?;
+            if let Some(revoked) = target::normalize::handoff::RevokedMember::capture(
+                state,
+                cell.target.caller(),
+                member,
+            )? {
+                if has_active_uses(state, &key) {
+                    return Err(Error::Busy);
+                }
+                result.revoked.push((id.clone(), revoked));
+                continue;
+            }
             let loaded = LoadedMember::capture(member)?;
             let namespace = loaded.source.namespaces().ok_or(Error::Unavailable)?;
             if loaded.source.binding() == cell.origin.source().binding()
@@ -269,6 +383,9 @@ impl Snapshot {
         if !self.origin.current() || self.loaded.iter().any(|(_, member)| !member.observed()) {
             return Err(Error::Stale);
         }
+        for (_, revoked) in &self.revoked {
+            revoked.probe(self.origin.source())?;
+        }
         for (source, gate) in std::iter::once((self.origin.source().as_ref(), self.origin.gate()))
             .chain(
                 self.loaded
@@ -302,6 +419,19 @@ impl Snapshot {
             || actor.issued.keys().any(|id| !cell.issued.contains_key(id))
             || self.retired.iter().any(|id| actor.issued.contains_key(id))
         {
+            return false;
+        }
+        if self.revoked.iter().any(|(id, revoked)| {
+            if !actor.issued.contains_key(id) {
+                return false;
+            }
+            member_key(cell.target.caller(), id)
+                .ok()
+                .and_then(|key| state.members.get(&key).map(|member| (key, member)))
+                .is_none_or(|(key, member)| {
+                    !revoked.matches(member) || has_active_uses(state, &key)
+                })
+        }) {
             return false;
         }
         if self.loaded.iter().any(|(id, loaded)| {
@@ -357,46 +487,54 @@ impl Reservation {
             return Err(Error::Stale);
         }
         let state = self.state.upgrade().ok_or(Error::Stale)?;
-        let (snapshot, attempt, existing) = {
+        let (snapshot, attempt, existing, scope) = {
             let state = lock(&state)?;
             same_cell(&state, &self.cell, &peer.caller)?;
             let cell = lock(&self.cell)?;
             if cell.process != peer.process || cell.target.caller() != &peer.caller {
                 return Err(Error::Stale);
             }
-            if !matches!(cell.phase, Phase::Sealed { .. }) {
-                reservation_scope(&state, &cell._scope)?;
+            if let Phase::Sealed { kernel, .. } = &cell.phase {
+                // Existing custody survives legitimate old-member retirement
+                // and installed-B rebind. It is not a fresh census or grant.
+                (None, None, Some(kernel.clone()), cell.scope()?.clone())
+            } else {
+                reservation_cell_scope(&state, &cell)?;
+                let snapshot = Snapshot::capture(&state, &cell)?;
+                let source_namespace = snapshot
+                    .origin
+                    .source()
+                    .namespaces()
+                    .ok_or(Error::Unavailable)?;
+                let independent = snapshot
+                    .loaded
+                    .iter()
+                    .filter(|(_, loaded)| {
+                        loaded.source.binding() != snapshot.origin.source().binding()
+                            && loaded.source.namespaces().is_some_and(|namespace| {
+                                !namespace.shares_storage(source_namespace)
+                            })
+                    })
+                    .map(|(id, loaded)| (id.clone(), loaded.source.clone()))
+                    .collect();
+                let attempt = match &cell.phase {
+                    Phase::Draining => Arc::new(Attempt {
+                        worker: false.into(),
+                        independent,
+                        normalized: target::normalize::handoff::capture_family(
+                            &state,
+                            cell.target.caller(),
+                            cell.origin.source(),
+                            cell.origin.gate(),
+                        )?,
+                    }),
+                    Phase::Sealing(attempt) => attempt.clone(),
+                    Phase::Sealed { .. } | Phase::Cancelling(_) | Phase::Terminal => {
+                        return Err(Error::Stale);
+                    }
+                };
+                (Some(snapshot), Some(attempt), None, cell.scope()?.clone())
             }
-            let snapshot = Snapshot::capture(&state, &cell)?;
-            let source_namespace = snapshot
-                .origin
-                .source()
-                .namespaces()
-                .ok_or(Error::Unavailable)?;
-            let independent = snapshot
-                .loaded
-                .iter()
-                .filter(|(_, loaded)| {
-                    loaded.source.binding() != snapshot.origin.source().binding()
-                        && loaded
-                            .source
-                            .namespaces()
-                            .is_some_and(|namespace| !namespace.shares_storage(source_namespace))
-                })
-                .map(|(id, loaded)| (id.clone(), loaded.source.clone()))
-                .collect();
-            let existing = match &cell.phase {
-                Phase::Sealed { kernel, .. } => Some(kernel.clone()),
-                _ => None,
-            };
-            let attempt = match &cell.phase {
-                Phase::Draining => Arc::new(Attempt {
-                    worker: false.into(),
-                    independent,
-                }),
-                Phase::Sealing(attempt) | Phase::Sealed { attempt, .. } => attempt.clone(),
-            };
-            (snapshot, attempt, existing)
         };
         if let Some(kernel) = existing {
             kernel.current().map_err(|_| Error::Stale)?;
@@ -404,7 +542,9 @@ impl Reservation {
                 kernel: Arc::downgrade(&kernel),
             });
         }
-        let _worker = Worker::acquire(attempt.clone())?;
+        let snapshot = snapshot.ok_or(Error::Stale)?;
+        let attempt = attempt.ok_or(Error::Stale)?;
+        let worker = Worker::acquire(attempt.clone(), scope)?;
         if !snapshot
             .origin
             .gate()
@@ -415,6 +555,9 @@ impl Reservation {
         slot::authenticate_source_scope(env, &peer.caller, snapshot.origin.source())
             .map_err(|_| Error::Stale)?;
         snapshot.probe()?;
+        if worker.1.cancelled() {
+            return Err(Error::Stale);
+        }
         {
             let state = lock(&state)?;
             same_cell(&state, &self.cell, &peer.caller)?;
@@ -435,7 +578,14 @@ impl Reservation {
             origin: snapshot.origin.clone(),
         };
         let kernel = Arc::new(
-            ReservationFamilyExclusive::acquire(source).map_err(|error| {
+            match &attempt.normalized {
+                Some(retained) if retained.matches(snapshot.origin.source()) => {
+                    ReservationFamilyExclusive::reclaim(source, retained.resource())
+                }
+                Some(_) => return Err(Error::Stale),
+                None => ReservationFamilyExclusive::acquire(source),
+            }
+            .map_err(|error| {
                 if error.contains("busy") {
                     Error::Busy
                 } else {
@@ -470,6 +620,7 @@ pub(super) fn kernel_fixture(reservation: &Reservation) -> SourceSeal {
     let attempt = Arc::new(Attempt {
         worker: false.into(),
         independent: BTreeMap::new(),
+        normalized: None,
     });
     let origin = {
         let mut cell = reservation.cell.lock().unwrap();
@@ -511,5 +662,6 @@ pub(super) fn independent_phase_fixture(
     reservation.cell.lock().unwrap().phase = Phase::Sealing(Arc::new(Attempt {
         worker: false.into(),
         independent: BTreeMap::from([(member.into(), source)]),
+        normalized: None,
     }));
 }

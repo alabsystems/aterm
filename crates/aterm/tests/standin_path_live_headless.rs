@@ -42,6 +42,7 @@ const SYSTEM: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 fn marks() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("atsp-marks-")
+        .suffix(".noindex")
         .tempdir()
         .expect("the records' folder")
 }
@@ -279,6 +280,7 @@ fn a_stand_in_outlives_another_fixture_of_its_text_going() {
     let fixture = || {
         aterm_tempfile::Builder::new()
             .prefix("atsp-fixture-")
+            .suffix(".noindex")
             .tempdir()
             .expect("a fixture")
     };

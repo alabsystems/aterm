@@ -9,6 +9,100 @@ use std::path::Path;
 use crate::ledger::GitRunner;
 use aterm_uds::spawnfd::Command;
 
+/// Maintain the release's exclusively claimed, stable preflight checkout. An existing path
+/// must be registered to this repository and clean; no user work is discarded or adopted.
+pub fn checkout(git: &dyn GitRunner, root: &Path, tip: &str) -> Result<(), String> {
+    let name = root.to_str().ok_or("non-UTF-8 input checkout path")?;
+    let run = |git: &dyn GitRunner, args: &[&str]| {
+        let out = git.git(args).map_err(|e| e.to_string())?;
+        if out.success() {
+            Ok(out.stdout_utf8())
+        } else {
+            Err(out.stderr_utf8())
+        }
+    };
+    if root.try_exists().map_err(|e| e.to_string())? {
+        if root
+            .symlink_metadata()
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("input checkout is a symlink".into());
+        }
+        let listed = run(git, &["worktree", "list", "--porcelain", "-z"])?;
+        let physical = root.canonicalize().map_err(|e| e.to_string())?;
+        if !listed
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| {
+                Path::new(path)
+                    .canonicalize()
+                    .is_ok_and(|path| path == physical)
+            })
+        {
+            return Err("existing input checkout is not owned by this repository".into());
+        }
+        let own = crate::ledger::GitCli::new(root);
+        if !run(&own, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+            return Err("input checkout has tracked edits; no work was discarded".into());
+        }
+        run(&own, &["checkout", "--detach", tip])?;
+    } else {
+        run(git, &["worktree", "add", "--detach", name, tip])?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Attempt {
+    tree: String,
+    seal: String,
+}
+
+/// The immediately preceding input attempt for this release base. Its A19 package rows are
+/// only candidates; a failed or unfinished attempt cannot resurrect an older success.
+pub fn previous_lint(
+    records: &Path,
+    base: &str,
+) -> Result<aterm_verify::lint_content::Passed, String> {
+    let at = records.join(format!(
+        "previous-{}.json",
+        crate::check_record::seal_dir(base)
+    ));
+    let text = match std::fs::read_to_string(&at) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let previous: Attempt = aterm_json::from_str(&text).map_err(|e| e.to_string())?;
+    if !aterm_codec::hex::is_lower(&previous.tree, 40)
+        && !aterm_codec::hex::is_lower(&previous.tree, 64)
+    {
+        return Err("previous input judgment has an invalid tree".into());
+    }
+    crate::check_record::input_lint_candidates(records, &previous.tree, &previous.seal)
+}
+
+/// Remember the current attempt before dispatch, so an interrupted or failed run also replaces
+/// the predecessor. A19 retains its begun/FAIL record independently of this pointer.
+pub fn attempted(records: &Path, base: &str, tree: &str, seal: &str) -> Result<(), String> {
+    let text = aterm_json::to_string(&Attempt {
+        tree: tree.into(),
+        seal: seal.into(),
+    })
+    .map_err(|e| e.to_string())?;
+    crate::durable::write_atomic_durable(
+        &records.join(format!(
+            "previous-{}.json",
+            crate::check_record::seal_dir(base)
+        )),
+        text.as_bytes(),
+        0o600,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Claim one existing record directory without waiting. A concurrent dry or real run must
 /// not overwrite its writer's begun record. The guard unlocks explicitly before closing.
 pub fn claim(directory: &Path) -> Result<aterm_uds::file_lock::LockFile, String> {
@@ -212,6 +306,47 @@ mod tests {
         drop(held);
         let resumed = claim(dir.path()).unwrap();
         drop((independent, resumed));
+    }
+
+    #[test]
+    fn stable_checkout_moves_clean_tips_but_preserves_unexpected_work() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("input"), "first").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "first"]);
+        let first = git(&source, &["rev-parse", "HEAD"]);
+        let owned = dir.path().join("owned");
+        let runner = crate::ledger::GitCli::new(&source);
+        checkout(&runner, &owned, &first).unwrap();
+        std::fs::write(source.join("input"), "second").unwrap();
+        git(&source, &["commit", "-qam", "second"]);
+        let second = git(&source, &["rev-parse", "HEAD"]);
+        checkout(&runner, &owned, &second).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(owned.join("input")).unwrap(),
+            "second"
+        );
+        std::fs::write(owned.join("input"), "unexpected work").unwrap();
+        assert!(checkout(&runner, &owned, &first).is_err());
+        assert_eq!(
+            std::fs::read_to_string(owned.join("input")).unwrap(),
+            "unexpected work"
+        );
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        assert!(checkout(&runner, &foreign, &first).is_err());
+        git(
+            &source,
+            &["worktree", "remove", "--force", owned.to_str().unwrap()],
+        );
     }
 
     #[test]

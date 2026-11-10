@@ -21,9 +21,10 @@
 //!    version alone moved ([`version::independent_lock`]). The four immutable trees retain
 //!    every other lock byte and the source-proven binary-leaf identity boundary. That
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
-//!    ([`COMPOSES`] in a row at most). Where the rule fails, merge M2 and judge only the delta it
-//!    brought (`verify --base <the judged commit>`); after [`REJUDGES`] re-judges it stops, the
-//!    branch merged and judged, and says so. Semantic breaks across disjoint files are B8's.
+//!    ([`COMPOSES`] in a row at most). Where the rule fails, merge M2 and judge the branch's
+//!    delta from M2 against its new dependencies (`verify --base M2`); after [`REJUDGES`]
+//!    re-judges it stops with the branch merged and judged, and says so. Semantic breaks
+//!    across disjoint files are B8's.
 //! 5. The landing merge states what ran ([`aterm_types::land_trailer`]). A branch whose head
 //!    already merges the main it lands on is that merge, restated with the trailers.
 //!
@@ -295,15 +296,7 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         },
     );
     let mut stated = Stated::default();
-    if let Some(code) = judge(
-        git,
-        seams,
-        &judged_at,
-        &merged,
-        &merged,
-        &branch,
-        &mut stated,
-    )? {
+    if let Some(code) = judge(git, seams, &judged_at, &merged, &branch, &mut stated)? {
         return Ok(code);
     }
     let mut onto = merged.clone();
@@ -360,14 +353,12 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             }
             None => Vec::new(),
         };
-        let product_version = tree.as_ref().and_then(|tree| {
-            if overlap.len() == 1 && overlap[0].as_slice() == b"Cargo.lock" {
-                version::independent_lock(git, &merged, &tip, &judged_at, tree)
-            } else {
-                None
-            }
-        });
-        if let (Some(tree), true) = (&tree, overlap.is_empty() || product_version.is_some()) {
+        let composition = tree
+            .as_ref()
+            .map(|tree| git.independent_changes(&merged, &tip, &judged_at, tree))
+            .transpose()?
+            .flatten();
+        if let (Some(tree), Some(why)) = (&tree, composition) {
             if composes == COMPOSES {
                 say(
                     seams,
@@ -380,19 +371,6 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
                 return Ok(STOPPED);
             }
             composes += 1;
-            let why = product_version.map_or_else(
-                || {
-                    "the merge is clean and its new commits touch none of the branch's files"
-                        .to_owned()
-                },
-                |(old, new)| {
-                    format!(
-                        "the merge is clean and its only shared file is Cargo.lock, where the \
-                         isolated product version moved from {old} to {new}; every other lock \
-                         byte is preserved"
-                    )
-                },
-            );
             say(seams, format!("verify land: composing onto {tip}: {why}"));
             composed_tree = Some(tree.clone());
             onto = tip;
@@ -434,21 +412,16 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             Merge::Conflict(paths) => return Ok(conflicted(seams, &tip, &paths)),
             Merge::Clean => {
                 rehome_changelog(git, seams, &tip, Some(&subject))?;
-                let previous = std::mem::replace(&mut judged_at, git.head()?);
+                judged_at = git.head()?;
                 rejudges += 1;
                 composes = 0;
                 composed_tree = None;
                 merged = tip.clone();
                 onto = tip;
-                if let Some(code) = judge(
-                    git,
-                    seams,
-                    &judged_at,
-                    &previous,
-                    &merged,
-                    &branch,
-                    &mut stated,
-                )? {
+                // Main's intervening edits are already in `merged`. Only the branch's delta
+                // from that tip can change its outcomes, including in the branch's dependents.
+                // The merged checkout still compiles and tests against main's new dependencies.
+                if let Some(code) = judge(git, seams, &judged_at, &merged, &branch, &mut stated)? {
                     return Ok(code);
                 }
                 push_until = Instant::now() + NETWORK;
@@ -457,7 +430,7 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
     }
 }
 
-/// Judge `at` (HEAD) over the cone since `base`, inheriting the reds main's lane names at `main`
+/// Judge `at` (HEAD) over the cone since merged main `base`, inheriting its lane's reds
 /// once the run ends, outside `branch`'s crates: `None` when it passed (its judgment added to `stated`),
 /// else the exit to stop with.
 fn judge(
@@ -465,7 +438,6 @@ fn judge(
     seams: &mut Seams<'_>,
     at: &str,
     base: &str,
-    main: &str,
     branch: &Branch,
     stated: &mut Stated,
 ) -> Result<Option<i32>, String> {
@@ -480,21 +452,21 @@ fn judge(
         ));
         return Ok(Some(exit::COULD_NOT_RUN));
     }
-    // Read once the run ends: the lane judges main on its own schedule, so a verdict on `main`
+    // Read once the run ends: the lane judges main on its own schedule, so a verdict on `base`
     // that came while this ran counts, and none can depend on the branch.
-    let lane = (seams.lane)(git.root, main);
+    let lane = (seams.lane)(git.root, base);
     (seams.say)(&match &lane {
         Lane::Red(items) => format!(
-            "verify land: main's lane judged {main} red ({} items)",
+            "verify land: main's lane judged {base} red ({} items)",
             items.len()
         ),
-        Lane::Pass => format!("verify land: main's lane judged {main} green"),
-        Lane::Unjudged(why) => format!("verify land: main's lane has not judged {main}: {why}"),
+        Lane::Pass => format!("verify land: main's lane judged {base} green"),
+        Lane::Unjudged(why) => format!("verify land: main's lane has not judged {base}: {why}"),
     });
     let decision = decide(&judged, &lane, branch);
     for id in &decision.inherited {
         (seams.say)(&format!(
-            "verify land: INHERITED {id} (main's lane named it red at {main}, outside the branch's crates)"
+            "verify land: INHERITED {id} (main's lane named it red at {base}, outside the branch's crates)"
         ));
     }
     if !decision.counted.is_empty() {
@@ -743,6 +715,43 @@ fn display_git_path(path: &[u8]) -> String {
     format!("\"{shown}\"")
 }
 
+/// Validate a historical composition with the same file rule as the landing writer.
+/// A re-judgment's `base` can be an earlier checked branch commit; composition instead
+/// compares the two parents from their common main ancestor.
+pub(crate) fn receipt_composition(
+    root: &Path,
+    path: &std::ffi::OsStr,
+    checked: &str,
+    main: &str,
+    tree: &str,
+) -> Result<bool, String> {
+    let make = |root: &Path| {
+        let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        command
+            .current_dir(root)
+            .env("PATH", path)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "");
+        for key in crate::changed::GIT_REDIRECTS {
+            command.env_remove(key);
+        }
+        command
+    };
+    let git = Git { root, make: &make };
+    let base = git.local(&["merge-base", "--all", checked, main])?;
+    if base.split_whitespace().count() != 1 {
+        return Ok(false);
+    }
+    let base = base.trim();
+    if git.merge_tree(checked, main)?.as_deref() != Some(tree) {
+        return Ok(false);
+    }
+    Ok(git
+        .independent_changes(base, main, checked, tree)?
+        .is_some())
+}
+
 /// The checkout's git.
 struct Git<'a> {
     root: &'a Path,
@@ -756,6 +765,33 @@ struct GitStatus {
 }
 
 impl Git<'_> {
+    /// The writer and historical reader apply one composition rule, including the
+    /// isolated product-version exception. The returned reason is the writer's report.
+    fn independent_changes(
+        &self,
+        base: &str,
+        main: &str,
+        checked: &str,
+        tree: &str,
+    ) -> Result<Option<String>, String> {
+        let theirs = self.files(base, main)?;
+        let ours = self.files(base, checked)?;
+        let overlap: Vec<_> = theirs.intersection(&ours).collect();
+        if overlap.is_empty() {
+            return Ok(Some(
+                "the merge is clean and its new commits touch none of the branch's files".into(),
+            ));
+        }
+        if overlap.len() == 1
+            && overlap[0].as_slice() == b"Cargo.lock"
+            && let Some((old, new)) = version::independent_lock(self, base, main, checked, tree)
+        {
+            return Ok(Some(format!(
+                "the merge is clean and its only shared file is Cargo.lock, where the isolated product version moved from {old} to {new}; every other lock byte is preserved"
+            )));
+        }
+        Ok(None)
+    }
     fn status(&self, args: &[&str], within: Duration) -> Result<GitStatus, String> {
         let mut cmd = (self.make)(self.root);
         cmd.args(args);
@@ -1073,7 +1109,7 @@ pub fn usage() -> String {
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
          it (a clean merge and disjoint files, except a sole shared Cargo.lock whose isolated\n\
          local product version alone moved) or merge it and\n\
-         judge the new delta, at most {REJUDGES} times. A red main's lane already named at the\n\
+         judge the branch's delta from that main tip, at most {REJUDGES} times. A red main's lane already named at the\n\
          main commit merged (M1, or the moved main a re-judge merged), in a crate outside the\n\
          branch's own, is INHERITED: named, not counted. The landing merge carries\n\
          Aterm-Checked, Aterm-Composed-Onto and Aterm-Inherited trailers.\n\n\

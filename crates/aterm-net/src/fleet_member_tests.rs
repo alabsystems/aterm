@@ -1424,6 +1424,22 @@ fn a_registration_never_takes_a_persons_entry_by_the_name_it_gives() {
         Ok(Recorded::New),
         "lab-mini.lan is another machine than lab-mini.local"
     );
+
+    let bare = manual("studio", 7100);
+    let office = Peer {
+        via: Via::Issuer,
+        ..joined(4, "studio.office.local", [10, 0, 0, 10], 7100)
+    };
+    let mut separate = vec![bare.clone()];
+    assert_eq!(record(&mut separate, office.clone()), Ok(Recorded::New));
+    assert_eq!(
+        separate,
+        vec![bare.clone(), office.clone()],
+        "an unrelated full host must not replace the person's bare target"
+    );
+    let mut separate = vec![office.clone()];
+    assert_eq!(record(&mut separate, bare.clone()), Ok(Recorded::New));
+    assert_eq!(separate, vec![office, bare]);
 }
 
 #[test]
@@ -7750,6 +7766,44 @@ fn host_resolution_order_ranks_tiers_resolves_m22_and_lists_ties() {
         find(&[m22.clone(), m22_dup], "m22"),
         Err(err),
         "find and named must agree on ambiguity refusal"
+    );
+
+    // An explicit short lookup remains useful, but does not bind an unresolved roster name
+    // to every full host with the same first label.
+    let studio = joined(0x10, "studio.local", [10, 0, 2, 1], 7100);
+    let office = joined(0x11, "studio.office.local", [10, 0, 2, 2], 7100);
+    let unresolved = vec![PeerIdentity {
+        node: None,
+        host: Some("studio".to_owned()),
+        label: Some("m110".to_owned()),
+        aliases: vec!["m111".to_owned()],
+        vault_name: Some("studio".to_owned()),
+    }];
+    assert_eq!(
+        named_with(std::slice::from_ref(&studio), &[], &unresolved, "m110"),
+        Ok(Some(&studio))
+    );
+    assert_eq!(
+        named(std::slice::from_ref(&office), &[], "studio"),
+        Ok(Some(&office))
+    );
+    assert!(named(&[studio.clone(), office.clone()], &[], "studio").is_err());
+    assert_eq!(
+        named_with(std::slice::from_ref(&office), &[], &unresolved, "m110"),
+        Ok(None),
+        "a bare roster host must not label an unrelated full host"
+    );
+    assert_eq!(
+        named_with(std::slice::from_ref(&office), &[], &unresolved, "m111"),
+        Ok(None)
+    );
+    let exact = vec![PeerIdentity {
+        host: Some(office.host.clone()),
+        ..unresolved[0].clone()
+    }];
+    assert_eq!(
+        named_with(std::slice::from_ref(&office), &[], &exact, "m110"),
+        Ok(Some(&office))
     );
 
     // remove never deletes a lower-tier NodeId peer in `book` when `others` holds the higher-tier match.

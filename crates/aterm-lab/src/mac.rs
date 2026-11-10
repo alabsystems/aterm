@@ -159,6 +159,7 @@ pub fn cmd_mac(args: &[String]) -> Res {
         Some("runtime") => crate::mac_runtime::run(&args[1..]),
         Some("count-ranks") => crate::mac_runtime::count_ranks(&args[1..]),
         Some("settle-ranks") => crate::mac_runtime::settle_ranks(&args[1..]),
+        Some("wait-ranks") => crate::mac_runtime::wait_ranks(&args[1..]),
         Some("clean") => cmd_clean(&args[1..]),
         None | Some("help" | "-h" | "--help") => {
             print!(
@@ -264,6 +265,7 @@ fn fetch_tart(cache: &Path) -> Result<String, Fail> {
         }
         let unpacked = aterm_tempfile::Builder::new()
             .prefix(".tart-")
+            .suffix(".noindex")
             .tempdir_in(cache)
             .map_err(|e| format!("{}: {e}", cache.display()))?;
         let tar = crate::windows::run(
@@ -1313,6 +1315,7 @@ pub fn cmd_dmg(args: &[String]) -> Res {
     std::fs::create_dir_all(&runs).map_err(|e| format!("{}: {e}", runs.display()))?;
     let run_guard = aterm_tempfile::Builder::new()
         .prefix("run-")
+        .suffix(".noindex")
         .tempdir_in(&runs)
         .map_err(|e| format!("{}: {e}", runs.display()))?;
     let run = run_guard.path();

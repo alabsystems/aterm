@@ -123,14 +123,14 @@ impl Drop for Group {
     }
 }
 
-/// A fresh private directory `<base>/<prefix><pid>.<n>`, registered for removal on interrupt.
+/// A fresh private directory `<base>/<prefix><pid>.<n>.noindex`, registered for removal on interrupt.
 pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt as _;
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let mut live = live();
     loop {
         let dir = base.join(format!(
-            "{prefix}{}.{}",
+            "{prefix}{}.{}.noindex",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
@@ -352,7 +352,11 @@ mod tests {
     fn an_interrupted_arena_run_retires_its_terminal_and_its_scratch() {
         use aterm_spec::wait::{MUST_HAPPEN, until_within};
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            let root = aterm_tempfile::tempdir().unwrap();
+            let root = aterm_tempfile::Builder::new()
+                .prefix("atvl-")
+                .suffix(".noindex")
+                .tempdir_in("/tmp")
+                .unwrap();
             let log = root.path().join("fixture.log");
             let mut fixture = FixtureChild {
                 child: command(std::env::current_exe().unwrap())

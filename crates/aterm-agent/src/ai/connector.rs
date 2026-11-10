@@ -1040,8 +1040,10 @@ pub const KIMI_ACCOUNTS: Accounts = Accounts {
     web_session_key: Some("access_token"),
     measured: true,
     measured_on: Some("kimi 2.3.1"),
-    // No signed-in session reached a wall, so a running session is not moved yet.
-    walls_measured_on: None,
+    // Real Kimi 2.4.0 runs reached the 429 quota and 401 authentication walls against the local
+    // OpenAI-compatible stub (docs/measured/kimi-forever-2026-10-29.md §"The usage-limit wall
+    // and the auth failure").
+    walls_measured_on: Some("kimi 2.4.0's measured 429 quota and 401 authentication walls"),
     signin: Some(KIMI_SIGNIN),
 };
 

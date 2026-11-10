@@ -5,8 +5,6 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 const PAGE: Rgb = [0xf6, 0xf7, 0xf9];
 const INK: Rgb = [0x2b, 0x2d, 0x33];
 /// A clean glass colour (L .838, C .132): 8.72:1 under the ink.
@@ -718,14 +716,8 @@ fn encode_rgb(img: &Canvas) -> Vec<u8> {
     out
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("lab-trail-census-{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(tag: &str) -> crate::TestScratch {
+    crate::TestScratch::new(tag)
 }
 
 /// `frame` and `clean` written as a gallery frame with its dims and cursor sidecars.
@@ -823,7 +815,6 @@ fn the_report_reads_the_sidecars_writes_the_pixels_and_judges_its_thresholds() {
             .unwrap_err()
             .starts_with("no clean twin")
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A glass frame: the typed line under a glass band on row 1 whose last two cells (6 and 7) fade to the page through
@@ -919,7 +910,6 @@ fn a_glass_frame_judges_its_band_by_the_glass_rule_and_its_lip_by_both() {
         failures,
         vec![format!("rail_lip core: {lip} px of mud_spec over 0")]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

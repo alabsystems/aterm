@@ -533,21 +533,17 @@ mod tests {
     const FR: &str = "com.apple.keylayout.French";
     const PALETTE: &str = "com.apple.CharacterPaletteIM";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-lab-input-sources-{}-{name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir.join("record")
+    fn scratch(name: &str) -> (crate::TestScratch, PathBuf) {
+        let dir = crate::TestScratch::new(name);
+        let record = dir.join("record");
+        (dir, record)
     }
 
     /// A run puts back the selection and disables what it enabled, and nothing
     /// else: a source enabled before the run (the palette) stays, in its place.
     #[test]
     fn a_run_puts_back_the_selection_and_disables_only_what_it_enabled() {
-        let path = scratch("put-back");
+        let (_dir, path) = scratch("put-back");
         let hit = Fake::new(US, &[US, PALETTE]);
         {
             let mut run = Switch::begin(&hit, &path).expect("begin");
@@ -585,7 +581,7 @@ mod tests {
     /// puts the desk back.
     #[test]
     fn dropping_the_switch_puts_the_desk_back() {
-        let path = scratch("drop");
+        let (_dir, path) = scratch("drop");
         let hit = Fake::new(US, &[US, PALETTE]);
         let run = || -> Result<(), String> {
             let mut s = Switch::begin(&hit, &path)?;
@@ -602,7 +598,7 @@ mod tests {
     /// the two still leaves a record that disables it.
     #[test]
     fn a_source_is_recorded_before_it_is_enabled() {
-        let path = scratch("before");
+        let (_dir, path) = scratch("before");
         let hit = Fake {
             watch: Some(path.clone()),
             ..Fake::new(US, &[US])
@@ -623,7 +619,7 @@ mod tests {
     /// desk back before it starts, and says so.
     #[test]
     fn a_dead_runs_record_is_put_back_by_the_next_run() {
-        let path = scratch("recover");
+        let (_dir, path) = scratch("recover");
         let hit = Fake::new(DE, &[US, PALETTE, DE, FR]);
         let dead = Record {
             pid: i32::MAX,
@@ -647,7 +643,7 @@ mod tests {
     /// A live run's record is not touched: that run puts its own desk back.
     #[test]
     fn a_live_runs_record_is_left_to_it() {
-        let path = scratch("live");
+        let (_dir, path) = scratch("live");
         let hit = Fake::new(DE, &[US, DE]);
         let live = Record::mine(US.into(), Vec::new());
         write(
@@ -675,7 +671,7 @@ mod tests {
     /// tries again; it is never dropped as done.
     #[test]
     fn a_refused_restore_keeps_the_record() {
-        let path = scratch("refused");
+        let (_dir, path) = scratch("refused");
         let hit = Fake::new(US, &[US]);
         let mut run = Switch::begin(&hit, &path).expect("begin");
         run.select(DE).expect("German");
@@ -748,7 +744,7 @@ mod tests {
     /// for the desk again.
     #[test]
     fn each_layout_is_put_back_before_the_lane_waits_again() {
-        let path = scratch("in-turn");
+        let (_dir, path) = scratch("in-turn");
         let hit = Fake::new(US, &[US, PALETTE]);
         let mut desk = Desk::new(&hit);
         in_turn(&hit, &path, &ids(&[US, DE, FR]), &mut desk).expect("not interrupted");
@@ -786,7 +782,7 @@ mod tests {
     /// after it are skipped, never selected.
     #[test]
     fn a_busy_desk_between_layouts_finds_the_persons_own_layout() {
-        let path = scratch("busy");
+        let (_dir, path) = scratch("busy");
         let hit = Fake::new(US, &[US]);
         let mut desk = Desk::new(&hit);
         desk.idle = [Ok(()), Ok(()), Err("a person typed".to_string())].into();
@@ -813,7 +809,7 @@ mod tests {
     /// no later layout is selected.
     #[test]
     fn a_touch_puts_the_persons_layout_back_and_ends_the_layouts() {
-        let path = scratch("touch");
+        let (_dir, path) = scratch("touch");
         let hit = Fake::new(US, &[US]);
         let mut desk = Desk::new(&hit);
         desk.touched_in = Some(DE);
@@ -843,7 +839,7 @@ mod tests {
     /// nothing over, switches nothing and leaves that record as it was.
     #[test]
     fn a_second_run_cannot_take_over_the_record() {
-        let path = scratch("second");
+        let (_dir, path) = scratch("second");
         let hit = Fake::new(DE, &[US, DE]);
         let first = Record {
             enabled: vec![DE.into()],

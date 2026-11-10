@@ -159,9 +159,11 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
 /// it.
 #[track_caller]
 pub fn scratch_root(prefix: &str) -> PathBuf {
+    let short = &prefix[..prefix.floor_char_boundary(10)];
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
         let Ok(root) = aterm_tempfile::Builder::new()
-            .prefix(&format!("{prefix}-"))
+            .prefix(&format!("{short}-"))
+            .suffix(".noindex")
             .tempdir_in(base)
         else {
             continue;
@@ -335,11 +337,13 @@ fn boot_under(
 
 #[test]
 fn setup_errors_keep_the_partial_world_and_success_transfers_its_cleanup() {
-    let failed = aterm_tempfile::Builder::new()
-        .prefix("headless-setup-failed-")
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("headless-guard-")
+        .suffix(".noindex")
         .tempdir()
-        .expect("failed setup world")
-        .keep();
+        .expect("guard scratch");
+    let failed = scratch.path().join("failed");
+    std::fs::create_dir(&failed).expect("failed setup world");
     let setup = || -> std::io::Result<()> {
         let world = WorldGuard::new(failed.clone());
         std::fs::write(world.path().join("evidence"), b"partial setup")?;
@@ -351,11 +355,8 @@ fn setup_errors_keep_the_partial_world_and_success_transfers_its_cleanup() {
         b"partial setup"
     );
 
-    let completed = aterm_tempfile::Builder::new()
-        .prefix("headless-setup-complete-")
-        .tempdir()
-        .expect("completed world")
-        .keep();
+    let completed = scratch.path().join("completed");
+    std::fs::create_dir(&completed).expect("completed world");
     let mut world = WorldGuard::new(completed.clone());
     std::fs::write(world.path().join("evidence"), b"completed").expect("completed evidence");
     let root = world.into_path();
@@ -371,11 +372,13 @@ fn setup_errors_keep_the_partial_world_and_success_transfers_its_cleanup() {
 
 #[test]
 fn a_ready_world_is_retained_when_its_test_unwinds() {
-    let failed = aterm_tempfile::Builder::new()
-        .prefix("headless-test-failed-")
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("headless-unwind-")
+        .suffix(".noindex")
         .tempdir()
-        .expect("test failure world")
-        .keep();
+        .expect("unwind scratch");
+    let failed = scratch.path().join("failed");
+    std::fs::create_dir(&failed).expect("test failure world");
     let outcome = std::panic::catch_unwind(|| {
         let mut world = WorldGuard::new(failed.clone());
         std::fs::write(world.path().join("evidence"), b"ready before unwind")

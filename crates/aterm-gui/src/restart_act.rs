@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
 
-#[cfg(any(unix, test))]
 use aterm_agent::harness::restart_stamp::Cause;
 use aterm_agent::harness::restart_stamp::{self, Stamp};
 
@@ -122,6 +121,74 @@ pub(crate) fn stalled_for(tl: &crate::session_timeline::SessionTimeline, pgrp: i
     })
 }
 
+/// The timeline event sent instead of signalling a scoped harness's own process.
+pub(crate) const RESTART_EVENT: &str = "restart";
+
+fn scoped_relaunch(ctx: &SessionCtx, pgrp: i32) -> bool {
+    scoped_relaunch_pid(ctx, crate::metrics::now_us()).and_then(|pid| i32::try_from(pid).ok())
+        == Some(pgrp)
+}
+
+fn scoped_relaunch_pid(ctx: &SessionCtx, now_us: u64) -> Option<u32> {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_scoped(now_us)
+        .filter(|scoped| {
+            scoped
+                .claim
+                .scopes
+                .contains(aterm_agent::harness::contract::Scope::Relaunch)
+        })
+        .map(|scoped| scoped.proven.pid)
+}
+
+fn record_restart(ctx: &SessionCtx, cause: Cause) {
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_row(RESTART_EVENT, format!("cause={}", cause.word()));
+}
+
+/// Publish an account-pool selection to a proven relaunch claimant. No credential value crosses
+/// this boundary: only the row label and the home its sessions already share with the default.
+pub(crate) fn record_scoped_account(
+    ctx: &SessionCtx,
+    cause: &str,
+    env: &aterm_agent::harness::accounts_pool::LoginEnv,
+) -> bool {
+    if !matches!(cause, "account" | "account-ahead")
+        || env.var != "KIMI_CODE_HOME"
+        || !aterm_agent::harness::accounts::admissible_label(&env.label)
+        || env
+            .value
+            .as_deref()
+            .is_some_and(|home| !std::path::Path::new(home).is_absolute())
+    {
+        return false;
+    }
+    let Some(pid) =
+        scoped_relaunch_pid(ctx, crate::metrics::now_us()).and_then(|pid| i32::try_from(pid).ok())
+    else {
+        return false;
+    };
+    if !scoped_relaunch(ctx, pid) {
+        return false;
+    }
+    let home = env
+        .value
+        .as_deref()
+        .map_or_else(|| "-".to_string(), crate::control::pct_encode);
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_row(
+            RESTART_EVENT,
+            format!("cause={cause} to={} home={home}", env.label),
+        );
+    true
+}
+
 /// Why the act cannot run for `pgrp` at `start` ([`crate::input_stall::host_hand_refusal`]).
 pub(crate) fn unavailable(
     ctx: &SessionCtx,
@@ -146,6 +213,9 @@ fn unavailable_for(
     now_us: u64,
     home: Option<&std::path::Path>,
 ) -> Option<&'static str> {
+    if scoped_relaunch(ctx, pgrp) {
+        return None;
+    }
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())
         .filter(|snap| i32::try_from(snap.pid).ok() == Some(pgrp) && snap.start == start);
     let Some(snap) = snap else {
@@ -241,6 +311,18 @@ fn offered_unless(
     now_us: u64,
     waived: Option<&str>,
 ) -> Option<Offer> {
+    let pid = leader
+        .or_else(|| scoped_relaunch_pid(ctx, now_us).and_then(|pid| i32::try_from(pid).ok()))
+        .or_else(|| {
+            crate::harness_host::published_snapshot(ctx.self_id.as_str())
+                .and_then(|snap| i32::try_from(snap.pid).ok())
+        });
+    if let Some(pid) = pid.filter(|pid| scoped_relaunch(ctx, *pid)) {
+        return Some(Offer {
+            pid: u32::try_from(pid).ok()?,
+            promised: true,
+        });
+    }
     let snap = crate::harness_host::published_snapshot(ctx.self_id.as_str())?;
     let pid = i32::try_from(snap.pid).ok()?;
     let agent = snap.agent().program();
@@ -436,6 +518,14 @@ impl Stamped<'_> {
         } = self;
         let sid = ctx.self_id.as_str();
         let cause = stamp.cause;
+        if scoped_relaunch(ctx, pgrp) {
+            record_restart(ctx, cause);
+            aterm_log::info!(
+                "restart @{sid}: pid {pgrp} is a scoped harness; sent restart event (cause={})",
+                cause.word()
+            );
+            return format!("OK restarting pid {pgrp} cause={}\n", cause.word());
+        }
         let asker = crate::session_log::EndAsker {
             timeline: &ctx.timeline,
             by,
@@ -1157,6 +1247,63 @@ mod tests {
         );
         crate::harness_host::publish_snapshot_for_test(sid, None);
         crate::self_claim::forget(sid);
+    }
+
+    #[test]
+    fn a_scoped_relaunch_claim_gets_a_restart_event_not_a_signal() {
+        let ctx = crate::session_store::test_handle_on(4242, -1).ctx;
+        crate::session_timeline::scoped_input_tests::install(
+            &ctx,
+            71,
+            &[aterm_agent::harness::contract::Scope::Relaunch],
+        );
+        assert!(scoped_relaunch(&ctx, 4242));
+        assert!(!scoped_relaunch(&ctx, 4243));
+        assert_eq!(
+            offered(&ctx, None, crate::metrics::now_us()),
+            Some(Offer {
+                pid: 4242,
+                promised: true,
+            }),
+            "an automatic restart needs no built-in vendor snapshot"
+        );
+        record_restart(&ctx, Cause::Asked);
+        let events = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
+        let event = events.last().expect("the restart event");
+        assert_eq!(event.kind, RESTART_EVENT);
+        assert_eq!(event.payload.as_ref(), "cause=asked");
+    }
+
+    #[test]
+    fn a_scoped_account_event_carries_only_the_row_and_its_home() {
+        let ctx = crate::session_store::test_handle_on(4242, -1).ctx;
+        crate::session_timeline::scoped_input_tests::install(
+            &ctx,
+            71,
+            &[aterm_agent::harness::contract::Scope::Relaunch],
+        );
+        let env = aterm_agent::harness::accounts_pool::LoginEnv {
+            label: "work".to_string(),
+            var: "KIMI_CODE_HOME",
+            value: Some("/tmp/account home".to_string()),
+        };
+        assert!(record_scoped_account(&ctx, "account", &env));
+        let events = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
+        let event = events.last().expect("the account event");
+        assert_eq!(event.kind, RESTART_EVENT);
+        assert_eq!(
+            event.payload.as_ref(),
+            "cause=account to=work home=/tmp/account%20home"
+        );
+        assert!(!record_scoped_account(&ctx, "asked", &env));
+        assert!(!record_scoped_account(
+            &ctx,
+            "account",
+            &aterm_agent::harness::accounts_pool::LoginEnv {
+                value: Some("relative".to_string()),
+                ..env
+            }
+        ));
     }
 
     #[test]

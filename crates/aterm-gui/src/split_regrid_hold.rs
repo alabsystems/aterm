@@ -147,21 +147,23 @@ impl App {
         let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) else {
             return Vec::new();
         };
-        tab.root
-            .leaves()
-            .into_iter()
-            .filter_map(|view| {
-                self.view_store
-                    .get(view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-            })
-            .filter_map(|session| {
-                let s = self.pool.get(session)?;
-                let term = crate::term_lock(&s.term);
-                Some((session, (term.rows(), term.cols())))
-            })
-            .collect()
+        let mut grids = Vec::new();
+        tab.root.visit(&mut |&view| {
+            let Some(session) = self
+                .view_store
+                .get(view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            else {
+                return;
+            };
+            let Some(s) = self.pool.get(session) else {
+                return;
+            };
+            let term = crate::term_lock(&s.term);
+            grids.push((session, (term.rows(), term.cols())));
+        });
+        grids
     }
 
     /// Arms a take-back hold on every pane in `before` (except `newborn`) whose grid changed.

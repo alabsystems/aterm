@@ -76,6 +76,7 @@ fn report_of(tsv: &str) -> Result<Vec<(&'static str, f64)>, String> {
 pub(crate) fn gate_deck(record: bool) -> LaneRun {
     let scratch = match aterm_tempfile::Builder::new()
         .prefix("aterm-deck-")
+        .suffix(".noindex")
         .tempdir()
     {
         Ok(dir) => dir,

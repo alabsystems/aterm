@@ -191,6 +191,7 @@ const VERDICT: &str =
 fn the_first_red_ends_a_fail_fast_run_and_its_napping_child() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-halt-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let mut run = start(dir.path(), false);
@@ -225,6 +226,7 @@ fn an_interrupt_after_the_halt_reports_before_the_run_dies() {
     use std::os::unix::process::ExitStatusExt as _;
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-halt-int-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let mut run = start(dir.path(), true);

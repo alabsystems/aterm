@@ -50,6 +50,7 @@ fn admission(work: &Work) -> Admission<'_> {
 fn native_fenced_owner_only_recovery_publishes_both_rows_without_exchange() {
     codex_grant_owner::with_two_native_rows_fixture(|env, store, roster, rows| {
         let lifetime = account_work::Lifetime::default();
+        let mut rotated = std::collections::BTreeSet::new();
         for (request, staging, fresh, _) in rows {
             assert!(!staging.directory.join("auth.json").exists());
             retire_original(env, &request, &lifetime);
@@ -119,6 +120,13 @@ fn native_fenced_owner_only_recovery_publishes_both_rows_without_exchange() {
             assert_eq!(
                 aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&c2_document)),
                 c2.revision.digest
+            );
+            assert!(
+                rotated.insert(
+                    super::super::codex_app_login::owned_refresh_token_digest(&c2_document)
+                        .unwrap()
+                ),
+                "independent fixture bundles must not manufacture a shared refresh token"
             );
             let before_replay = advanced.logins.to_json();
             let replay = cli::enroll_codex_operation_custody(
@@ -1109,5 +1117,192 @@ fn pre_attachment_native_cancel_uses_actual_claim_reference_without_materializin
             fresh.reference()
         );
         assert!(pause.try_wait().is_ok());
+    });
+}
+
+#[test]
+fn current_global_code_owner_recovers_actual_sender_response_across_publication_cuts() {
+    use super::super::{codex_app_login, native_enrollment_admission};
+    for (cut, predecessor) in [
+        (codex_app_login::EnrollmentCut::BeforeSeal, false),
+        (codex_app_login::EnrollmentCut::BeforeSeal, true),
+        (codex_app_login::EnrollmentCut::AfterSeal, false),
+        (codex_app_login::EnrollmentCut::AfterSeal, true),
+        (codex_app_login::EnrollmentCut::AfterAuthWrite, true),
+    ] {
+        codex_grant_owner::with_global_code_fixture(
+            |env, request, auth, turn, prepared, artifact| {
+                let lifetime = account_work::Lifetime::default();
+                let scope = lifetime.enter().unwrap();
+                let (work, control) = owned_work(request.clone(), scope.clone());
+                let outcome = codex_app_login::tests::current_global_code_fixture(
+                    &artifact,
+                    prepared,
+                    &scope,
+                    Some(cut),
+                    true,
+                    predecessor,
+                    env,
+                );
+                let codex_grant_owner::CaptureOutcome::Verified(retained) = &outcome else {
+                    panic!("actual supported-bundle response must retain a verified issuer");
+                };
+                let original_reference = retained.reference();
+                work.fixture_capture_after_native_admission(env, outcome);
+                let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+                let (captured, warning) = store.load_logins(env.now).unwrap();
+                assert!(warning.is_none());
+                assert!(
+                    captured
+                        .enrollment
+                        .requires_global_catalogue(request)
+                        .unwrap()
+                );
+                assert_eq!(
+                    captured
+                        .enrollment
+                        .catalogue_witness(request)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    CataloguePhase::Received
+                );
+                assert!(
+                    captured
+                        .enrollment
+                        .catalogue_staging(request)
+                        .unwrap()
+                        .native_row
+                        .is_some()
+                );
+                // Provider response is durable before the real exchange exclusion
+                // releases. No artefact bytes or historical admission bit grant it.
+                assert!(native_enrollment_admission::RefreshExchangeLease::for_env(env).is_ok());
+                drop(turn);
+                drop(work);
+                drop(scope);
+                control.settle_custody(env).unwrap();
+                control.retired().unwrap().finish(env).unwrap();
+                let (recovery, _) = owned_work(request.clone(), lifetime.enter().unwrap());
+                let retirement = std::sync::Mutex::new(None);
+                let context = NativeContext {
+                    env,
+                    runtime: &recovery.native,
+                    scope: &recovery.scope,
+                    retirement: &retirement,
+                };
+                let status = cli::enroll_codex_operation_custody(
+                    env,
+                    &LocalOnly(env.now),
+                    request,
+                    Some(&admission(&recovery)),
+                    Some(&context),
+                )
+                .unwrap();
+                assert_eq!(status.phase, Phase::Applied);
+                let (after, warning) = store.load_logins(env.now).unwrap();
+                assert!(warning.is_none());
+                let binding = after
+                    .enrollment
+                    .published_grant(&request.label, status.generation.unwrap())
+                    .unwrap();
+                assert_eq!(binding.reference, original_reference);
+                let current = after.enrollment.owner_witness(&binding).unwrap().unwrap();
+                assert_eq!(current.revision.generation, 1);
+                assert!(current.pending.is_none());
+                assert_eq!(
+                    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(
+                        std::fs::read(auth).unwrap()
+                    )),
+                    current.revision.digest
+                );
+                assert_eq!(
+                    codex_grant_owner::recover_pending(env, request)
+                        .unwrap()
+                        .reference(),
+                    original_reference
+                );
+                let before_replay = after.to_json();
+                let replay = cli::enroll_codex_operation_custody(
+                    env,
+                    &LocalOnly(env.now),
+                    request,
+                    Some(&admission(&recovery)),
+                    Some(&context),
+                )
+                .unwrap();
+                assert_eq!(replay, status);
+                assert_eq!(
+                    store.load_logins(env.now).unwrap().0.to_json(),
+                    before_replay
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn current_global_code_sender_override_does_not_reclassify_unsupported_realm() {
+    use super::super::codex_app_login;
+    codex_grant_owner::with_global_code_fixture(|env, request, _auth, turn, prepared, artifact| {
+        let lifetime = account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let (work, control) = owned_work(request.clone(), scope.clone());
+        let outcome = codex_app_login::tests::current_global_code_fixture(
+            &artifact,
+            prepared,
+            &scope,
+            Some(codex_app_login::EnrollmentCut::BeforeSeal),
+            false,
+            false,
+            env,
+        );
+        assert!(matches!(
+            &outcome,
+            codex_grant_owner::CaptureOutcome::Verified(_)
+        ));
+        work.fixture_capture_after_native_admission(env, outcome);
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let (captured, warning) = store.load_logins(env.now).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(
+            captured
+                .enrollment
+                .catalogue_witness(request)
+                .unwrap()
+                .unwrap()
+                .phase,
+            CataloguePhase::Quarantined
+        );
+        drop(turn);
+        drop(work);
+        drop(scope);
+        control.settle_custody(env).unwrap();
+        control.retired().unwrap().finish(env).unwrap();
+        let before = store.load_logins(env.now).unwrap().0;
+        let (recovery, _) = owned_work(request.clone(), lifetime.enter().unwrap());
+        let retirement = std::sync::Mutex::new(None);
+        let context = NativeContext {
+            env,
+            runtime: &recovery.native,
+            scope: &recovery.scope,
+            retirement: &retirement,
+        };
+        let _ = cli::enroll_codex_operation_custody(
+            env,
+            &LocalOnly(env.now),
+            request,
+            Some(&admission(&recovery)),
+            Some(&context),
+        );
+        let after = store.load_logins(env.now).unwrap().0;
+        assert_eq!(after.generation_clock, before.generation_clock);
+        assert!(
+            after
+                .enrollment
+                .published_grant(&request.label, after.generation_clock)
+                .is_none()
+        );
+        assert!(codex_grant_owner::recover_pending(env, request).is_ok());
     });
 }

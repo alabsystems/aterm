@@ -799,6 +799,12 @@ fn tls_inventory_evidence_precedes_positive_repair_and_distinguishes_equal_count
     }
 }
 
+/// A round's final matching-inventory read withdraws the observation where the inventory or the
+/// control changed since its operation inventory, and stands on that inventory read's fence where
+/// the store did not move: an unchanged store's final read opens no store
+/// (`Round::fenced_observation`), and one that moved is read again.
+/// NEGATIVE CONTROL: a fence that stands whatever claim it reads keeps the observation after the
+/// concurrent operation.
 #[test]
 fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes() {
     let p = Pair::new(false, 0);
@@ -806,12 +812,18 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
     let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
     let id = p.scope.digest();
     let make_report = |round: &Round<'_>| {
-        let before = round
+        let inventory = round
             .inventory(peer, id, &mut None, &mut None)
             .unwrap()
-            .unwrap()
-            .observation;
-        round.inventory_observation.set(Some(before));
+            .unwrap();
+        let before = inventory.observation;
+        assert!(
+            inventory.fence.is_some(),
+            "an observed store leaves a fence"
+        );
+        round
+            .inventory_read
+            .replace(Some((before, inventory.fence)));
         round.active_table.set(Some(id));
         Report {
             table: Some(id),
@@ -821,9 +833,16 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
             ..Report::default()
         }
     };
+    let opens = || crate::table::store::test_opens_and_checks().0;
     let round = replica.round(peer).unwrap();
     let report = make_report(&round);
+    let opened = opens();
     assert!(round.matching_inventory(peer, id, &report).is_some());
+    assert_eq!(
+        opens(),
+        opened,
+        "an unchanged store's final read opens no store"
+    );
 
     let source = p.lab.bootstrap(0);
     let session = Session::open(&source).unwrap();
@@ -833,10 +852,12 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
         .unwrap();
     drop(session);
     drop(source);
+    let opened = opens();
     assert!(
         round.matching_inventory(peer, id, &report).is_none(),
         "a final inventory change withdraws the observation"
     );
+    assert_eq!(opens(), opened + 1, "a store that moved is read again");
 
     let round = replica.round(peer).unwrap();
     let report = make_report(&round);

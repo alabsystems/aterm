@@ -104,6 +104,8 @@ mod codex_proof;
 #[cfg(target_os = "macos")]
 mod codex_rig;
 #[cfg(target_os = "macos")]
+mod codex_source_proof;
+#[cfg(target_os = "macos")]
 mod commons_lan;
 #[cfg(target_os = "macos")]
 mod commons_startup;
@@ -945,9 +947,10 @@ Outside any lab (no jail, no stub):
                                  actual GUI retains its original lane/memory after keeper and owner crash; debug lab
   window-handoff-app --aterm ABS --out ABS [--cut-keeper]
                                  authenticated launchd handoff and normal Quit or keeper-lifeline closure; debug lab
-  installer-handoff --aterm ABS --out ABS [--handoffs N] [--stream]
+  installer-handoff --aterm ABS --out ABS [--handoffs N] [--stream] [--program-workers]
                                  live same-image handoff with an inert receipt-bound installer terminal; debug lab
                                  --stream checks every numbered output record across the handoffs while output stays active
+                                 --program-workers checks successful and failed task completion after adoption, tab status off
   cold-handoff --aterm ABS --out ABS [--handoffs N]
                                  verify repeated in-place updates of a private native window with no terminal sessions
                                  both default to 2 handoffs; N is 1..32, with one-minute progress hang detectors
@@ -1049,6 +1052,8 @@ Outside any lab (no jail, no stub):
                                  through, the built-in lanes take the session); its worlds are always kept
   codex-accounts-proof --package DIR --aterm PATH [--keep]
                                  Read-only /accounts in a private native host, real package and fake loopback model.
+  codex-source-proof --package DIR --aterm NATIVE_HOST_FIXTURE [--keep]
+                                 Debug-only isolated Source candidate against the real native control host; no vendor access.
   codex-measure [--package DIR] [--keep]
                                  measure a codex-alab build for the rollout tap, in a clean checkout (~25 min): the proof
                                  in process expecting it partial, its six legs' rollouts reduced to a fixed point the
@@ -1356,6 +1361,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
         "codex-accounts-proof" => codex_alab_proof::cmd_codex_accounts_proof(args),
+        "codex-source-proof" => codex_source_proof::cmd(args),
         "codex-boxes" => codex_alab_proof::cmd_codex_boxes(args),
         "harness-proof" => harness_proof::cmd_harness_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
@@ -1466,6 +1472,8 @@ fn main() -> std::process::ExitCode {
             match cmd.as_str() {
                 #[cfg(debug_assertions)]
                 "__handoff-stream" => installer_handoff::stream_fixture_main(rest),
+                #[cfg(debug_assertions)]
+                "__handoff-program" => installer_handoff::program_fixture_main(rest),
                 "stub" => stub::main(rest),
                 "sampler" => sampler::main(rest),
                 "ctty" => relay::ctty(rest),
@@ -1578,6 +1586,57 @@ fn main() -> std::process::ExitCode {
     }
     eprintln!("aterm-lab: macOS only (sandbox-exec is the lab's jail)");
     std::process::ExitCode::from(3)
+}
+
+/// Create a short `.noindex` temporary directory for unit tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("alb-{short}-"))
+        .suffix(".noindex");
+    #[cfg(unix)]
+    let made = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let made = builder.tempdir();
+    made.expect("test scratch dir")
+}
+
+/// A canonicalized `.noindex` test scratch directory that dereferences to [`std::path::Path`] and
+/// removes itself on drop.
+#[cfg(test)]
+pub(crate) struct TestScratch {
+    _dir: aterm_tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl TestScratch {
+    pub(crate) fn new(tag: &str) -> Self {
+        let dir = test_scratch_dir(tag);
+        let path = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        Self { _dir: dir, path }
+    }
+
+    pub(crate) fn as_path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestScratch {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestScratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 #[cfg(test)]

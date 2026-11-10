@@ -171,6 +171,7 @@ impl std::error::Error for SlotError {}
 
 #[path = "codex_session_slot_use_guard.rs"]
 mod use_guard;
+pub(in crate::harness) use use_guard::source_for_preload;
 pub use use_guard::{refresh_for_use, source_for_use};
 
 /// Descriptive identities captured under actual MAC-authenticated Book and
@@ -221,6 +222,7 @@ pub struct SourceHandle {
     assignment_generation: u64,
     source_authority: codex_assignment::SourceAuthority,
     namespaces: Option<std::sync::Arc<SourceNamespaces>>,
+    policy: Option<Box<codex_assignment::ProviderPolicy>>,
 }
 
 impl std::fmt::Debug for SourceHandle {
@@ -230,6 +232,11 @@ impl std::fmt::Debug for SourceHandle {
 }
 
 impl SourceHandle {
+    /// Descriptive policy from the same admitted document used by Slot readback.
+    /// Absence cannot authorize a policy preview or a provider request.
+    pub fn provider_policy(&self) -> Option<&codex_assignment::ProviderPolicy> {
+        self.policy.as_deref()
+    }
     pub(super) fn namespaces(&self) -> Option<&SourceNamespaces> {
         self.namespaces.as_deref()
     }
@@ -523,6 +530,9 @@ impl Opened {
             return Err("slot credential unavailable".into());
         }
         Ok(SourceHandle {
+            policy: codex_assignment::ProviderPolicy::capture(grant)
+                .ok()
+                .map(Box::new),
             binding: std::sync::Arc::new(grant.binding().clone()),
             slot: self.key.clone(),
             path,
@@ -724,58 +734,139 @@ fn validate_expected_namespaces(
     .map_err(|_| SlotError::Unavailable)
 }
 
+fn validate_expected_in_namespace(
+    env: &Env,
+    caller: &Caller,
+    expected: &SourceHandle,
+    namespace: &RefreshNamespace,
+) -> Result<(), SlotError> {
+    validate_expected_in_read_namespace(
+        env,
+        caller,
+        expected,
+        SourceReadNamespace::RefreshingUse(namespace),
+    )
+}
+
+fn validate_expected_in_read_namespace(
+    env: &Env,
+    caller: &Caller,
+    expected: &SourceHandle,
+    namespace: SourceReadNamespace<'_>,
+) -> Result<(), SlotError> {
+    namespace
+        .with_namespace(
+            env,
+            caller,
+            expected.binding(),
+            expected.assignment_generation(),
+            expected.source_authority(),
+            |actual| {
+                if expected
+                    .namespaces()
+                    .is_some_and(|captured| !captured.current() || captured.book() != actual)
+                {
+                    return Err("source physical namespace changed".into());
+                }
+                Ok(())
+            },
+        )
+        .map_err(|_| SlotError::Unavailable)
+}
+
 fn source_inner(
     env: &Env,
     caller: &Caller,
     operation: &str,
     expected: Option<&SourceHandle>,
 ) -> Result<SourceProgress, SlotError> {
+    source_inner_using_namespace(env, caller, operation, expected, None)
+}
+
+fn source_inner_using_namespace(
+    env: &Env,
+    caller: &Caller,
+    operation: &str,
+    expected: Option<&SourceHandle>,
+    namespace: Option<SourceReadNamespace<'_>>,
+) -> Result<SourceProgress, SlotError> {
+    if namespace.is_some() && expected.is_none() {
+        return Err(SlotError::InvalidRequest);
+    }
     if !caller.valid() || !hex(operation, 32) {
         return Err(SlotError::InvalidRequest);
     }
     let before = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
     if let Some(expected) = expected {
         use_guard::check_record(env, caller, &before, expected)?;
-        validate_expected_namespaces(env, caller, expected)?;
-    }
-    #[cfg(test)]
-    use_guard::note_owner_entry();
-    let result = owner::with_current_published_grant(env, &before.binding, caller, |grant| {
-        codex_assignment::with_current_assignment_namespace(
+        if let Some(namespace) = namespace {
+            validate_expected_in_read_namespace(env, caller, expected, namespace)?;
+        } else {
+            validate_expected_namespaces(env, caller, expected)?;
+        }
+    } else {
+        // Legacy/uncontextual Source may never enter a pending B owner. The
+        // claimed signed assignment is checked and released before accounts.
+        codex_assignment::with_current_assignment(
             env,
             caller,
             &before.binding,
             before.assignment_generation,
             &before.source_authority,
-            |book_namespace| {
-                let auth = auth_lock(env, caller, &before.binding)?;
-                let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
-                if opened.record.as_ref() != Some(&before) {
-                    return Err("session assignment changed".into());
-                }
-                if before.revision == *grant.revision() {
-                    return opened
-                        .readback(&grant, &before, book_namespace)
-                        .map(SourceProgress::Ready);
-                }
-                if grant.revision().generation <= before.revision.generation {
-                    return Err("slot credential revision did not advance".into());
-                }
-                // Another consumer can refresh this same grant between install
-                // and source lookup. Reconcile its already durable revision;
-                // never exchange a token or change assignment during discovery.
-                let mut record = before.clone();
-                record.revision = grant.revision().clone();
-                if opened.read_materialized(&before).is_err() {
-                    // A prior reconciliation may have renamed the current
-                    // document before its metadata write completed. Accept
-                    // only the exact authenticated destination revision.
-                    opened.read_materialized(&record)?;
-                }
-                let (source, _receipt) = materialize(opened, auth, &grant, record, book_namespace)?;
-                Ok(SourceProgress::Ready(source))
-            },
+            || Ok(()),
         )
+        .map_err(|_| SlotError::Unavailable)?;
+    }
+    #[cfg(test)]
+    use_guard::note_owner_entry();
+    let result = owner::with_current_published_grant(env, &before.binding, caller, |grant| {
+        let inspect = |book_namespace: &codex_assignment::BookNamespace| {
+            let auth = auth_lock(env, caller, &before.binding)?;
+            let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
+            if opened.record.as_ref() != Some(&before) {
+                return Err("session assignment changed".into());
+            }
+            if before.revision == *grant.revision() {
+                return opened
+                    .readback(&grant, &before, book_namespace)
+                    .map(SourceProgress::Ready);
+            }
+            if grant.revision().generation <= before.revision.generation {
+                return Err("slot credential revision did not advance".into());
+            }
+            // Another consumer can refresh this same grant between install
+            // and source lookup. Reconcile its already durable revision;
+            // never exchange a token or change assignment during discovery.
+            let mut record = before.clone();
+            record.revision = grant.revision().clone();
+            if opened.read_materialized(&before).is_err() {
+                // A prior reconciliation may have renamed the current
+                // document before its metadata write completed. Accept
+                // only the exact authenticated destination revision.
+                opened.read_materialized(&record)?;
+            }
+            let (source, _receipt) = materialize(opened, auth, &grant, record, book_namespace)?;
+            Ok(SourceProgress::Ready(source))
+        };
+        if let Some(namespace) = namespace {
+            namespace.with_namespace(
+                env,
+                caller,
+                &before.binding,
+                before.assignment_generation,
+                &before.source_authority,
+                inspect,
+            )
+        } else {
+            codex_assignment::with_current_assignment_namespace(
+                env,
+                caller,
+                &before.binding,
+                before.assignment_generation,
+                &before.source_authority,
+                inspect,
+            )
+        }
     })
     .map_err(|_| SlotError::Unavailable)?;
     if let Some(expected) = expected {
@@ -803,6 +894,47 @@ fn prepare_materialization(
     let auth = auth_lock(env, caller, binding)?;
     let opened = Opened::open(env, caller, true)?.ok_or("slot unavailable")?;
     Ok((opened, auth))
+}
+
+/// Publish only after a real native assignment commit has acknowledged the
+/// process-wide boundary. The receipt holds custody through the owner's ACK.
+pub(super) fn install(
+    env: &Env,
+    grant: &owner::AdmittedGrant<'_>,
+    assignment: &codex_assignment::AssignmentCommit,
+) -> Result<(SourceHandle, MaterializationReceipt), String> {
+    let caller = assignment.caller();
+    if !caller.valid()
+        || assignment.binding() != grant.binding()
+        || assignment.generation() == 0
+        || !hex(assignment.operation(), 32)
+        || !grant.revision().valid()
+        || grant.document().is_empty()
+        || grant.document().len() > MAX_DOCUMENT
+    {
+        return Err("invalid slot assignment".into());
+    }
+    assignment.with_namespace(|book_namespace| {
+        let (opened, auth) = prepare_materialization(env, caller, grant.binding())?;
+        let record = Record {
+            schema: 2,
+            caller: caller.clone(),
+            binding: grant.binding().clone(),
+            assignment_generation: assignment.generation(),
+            source_authority: codex_assignment::SourceAuthority::Assignment {
+                operation: assignment.operation().into(),
+            },
+            revision: grant.revision().clone(),
+        };
+        if !installation_allowed(
+            opened.record.as_ref(),
+            &record,
+            assignment.previous_assignment_generation(),
+        ) {
+            return Err("session assignment changed".into());
+        }
+        materialize(opened, auth, grant, record, book_namespace)
+    })
 }
 
 /// Retains the signed startup book and exact Slot claims through the native
@@ -867,6 +999,27 @@ fn startup_installation_allowed(current: Option<&Record>, destination: &Record) 
     })
 }
 
+fn installation_allowed(current: Option<&Record>, destination: &Record, previous: u64) -> bool {
+    if !destination.valid() || previous >= destination.assignment_generation {
+        return false;
+    }
+    let Some(current) = current else {
+        return previous == 0 && destination.assignment_generation > 0;
+    };
+    if current.caller != destination.caller {
+        return false;
+    }
+    if current.assignment_generation == destination.assignment_generation {
+        // A lost ACK or interrupted multi-file publication reconciles this exact
+        // native assignment. The Slot record cannot mint the required proof.
+        return current.binding == destination.binding
+            && current.source_authority == destination.source_authority
+            && (current.revision == destination.revision
+                || destination.revision.generation > current.revision.generation);
+    }
+    current.assignment_generation == previous && destination.assignment_generation > previous
+}
+
 fn materialize(
     mut opened: Opened,
     auth: super::codex_app_login::AuthLock,
@@ -904,15 +1057,28 @@ pub fn refresh(
     env: &Env,
     caller: &Caller,
     request: &RefreshRequest,
+    scope: &super::account_work::Scope,
 ) -> Result<RefreshProgress, SlotError> {
-    refresh_inner(env, caller, request, None)
+    refresh_inner(env, caller, request, scope, None)
 }
 
 fn refresh_inner(
     env: &Env,
     caller: &Caller,
     request: &RefreshRequest,
+    scope: &super::account_work::Scope,
     expected: Option<&SourceHandle>,
+) -> Result<RefreshProgress, SlotError> {
+    refresh_inner_using_namespace(env, caller, request, scope, expected, None)
+}
+
+fn refresh_inner_using_namespace(
+    env: &Env,
+    caller: &Caller,
+    request: &RefreshRequest,
+    scope: &super::account_work::Scope,
+    expected: Option<&SourceHandle>,
+    namespace: Option<&RefreshNamespace>,
 ) -> Result<RefreshProgress, SlotError> {
     if !caller.valid() || !hex(&request.operation, 32) || !hex(&request.expected_digest, 64) {
         return Err(SlotError::InvalidRequest);
@@ -920,7 +1086,21 @@ fn refresh_inner(
     let before = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
     if let Some(expected) = expected {
         use_guard::check_record(env, caller, &before, expected)?;
-        validate_expected_namespaces(env, caller, expected)?;
+        if let Some(namespace) = namespace {
+            validate_expected_in_namespace(env, caller, expected, namespace)?;
+        } else {
+            validate_expected_namespaces(env, caller, expected)?;
+        }
+    } else {
+        codex_assignment::with_current_assignment(
+            env,
+            caller,
+            &before.binding,
+            before.assignment_generation,
+            &before.source_authority,
+            || Ok(()),
+        )
+        .map_err(|_| SlotError::Unavailable)?;
     }
     if slot_key(caller, &before.binding).map_err(|_| SlotError::InvalidRequest)? != request.slot {
         return Err(SlotError::InvalidRequest);
@@ -938,26 +1118,56 @@ fn refresh_inner(
     });
     #[cfg(test)]
     use_guard::note_owner_entry();
-    let result =
-        owner::with_refreshed_owner(env, &before.binding, caller, &admitted_request, |grant| {
+    let materialize_current = |grant: owner::AdmittedGrant<'_>| {
+        let materialize_in = |book_namespace: &codex_assignment::BookNamespace| {
+            let auth = auth_lock(env, caller, &before.binding)?;
+            let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
+            if opened.record.as_ref() != Some(&before) {
+                return Err("session assignment changed".into());
+            }
+            let mut record = before.clone();
+            record.revision = grant.revision().clone();
+            materialize(opened, auth, &grant, record, book_namespace)
+        };
+        if let Some(namespace) = namespace {
+            namespace.with_namespace(
+                env,
+                caller,
+                &before.binding,
+                before.assignment_generation,
+                &before.source_authority,
+                materialize_in,
+            )
+        } else {
             codex_assignment::with_current_assignment_namespace(
                 env,
                 caller,
                 &before.binding,
                 before.assignment_generation,
                 &before.source_authority,
-                |book_namespace| {
-                    let auth = auth_lock(env, caller, &before.binding)?;
-                    let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
-                    if opened.record.as_ref() != Some(&before) {
-                        return Err("session assignment changed".into());
-                    }
-                    let mut record = before.clone();
-                    record.revision = grant.revision().clone();
-                    materialize(opened, auth, &grant, record, book_namespace)
-                },
+                materialize_in,
             )
-        });
+        }
+    };
+    let result = if let Some(namespace) = namespace {
+        owner::with_refreshed_owner_in_namespace(
+            env,
+            &before.binding,
+            caller,
+            &admitted_request,
+            namespace,
+            materialize_current,
+        )
+    } else {
+        owner::with_refreshed_owner(
+            env,
+            &before.binding,
+            caller,
+            &admitted_request,
+            scope,
+            materialize_current,
+        )
+    };
     match result {
         Ok((_, revision)) => {
             if let Some(expected) = expected {
@@ -976,6 +1186,19 @@ fn refresh_inner(
 #[cfg(all(test, unix))]
 #[path = "codex_session_slot_metadata_fixture.rs"]
 pub(in crate::harness) mod metadata_fixture;
+
+#[path = "codex_session_slot_target.rs"]
+mod target;
+pub(super) use target::{
+    preload_installed, preload_normalized, validate_installed, validate_normalized,
+    validate_target_ack, validate_target_snapshot,
+};
+#[path = "codex_session_slot_namespace.rs"]
+mod namespace;
+pub(in crate::harness) use namespace::RefreshNamespace;
+#[path = "codex_session_slot_read_namespace.rs"]
+mod read_namespace;
+use read_namespace::SourceReadNamespace;
 
 #[cfg(test)]
 mod tests {
@@ -1152,6 +1375,59 @@ mod tests {
             read_document(&second_path).unwrap().as_slice(),
             b"second-grant-revision-1"
         );
+    }
+
+    #[test]
+    fn installed_target_credential_advance_uses_actual_assignment_predecessor() {
+        let mut current = record(caller());
+        current.binding.generation = 41;
+        current.assignment_generation = 8;
+        current.source_authority = codex_assignment::SourceAuthority::Assignment {
+            operation: "a".repeat(32),
+        };
+        current.revision.generation = 13;
+        current.revision.digest = "d".repeat(64);
+        let mut next = current.clone();
+        next.revision.generation = 14;
+        next.revision.digest = "e".repeat(64);
+        assert!(installation_allowed(Some(&current), &next, 7));
+        assert!(!installation_allowed(Some(&current), &next, 8));
+        assert_eq!(next.assignment_generation, 8);
+        assert_eq!(next.binding.generation, 41);
+    }
+
+    #[test]
+    fn lost_ack_reconciles_only_the_exact_assignment_without_revision_rollback() {
+        let current = record(caller());
+        assert!(installation_allowed(None, &current, 0));
+        assert!(installation_allowed(Some(&current), &current, 0));
+        assert!(!installation_allowed(Some(&current), &current, 1));
+        let mut destination = current.clone();
+        destination.revision.generation += 1;
+        destination.revision.digest = "4".repeat(64);
+        assert!(installation_allowed(Some(&current), &destination, 0));
+        assert!(!installation_allowed(Some(&destination), &current, 0));
+        destination = current.clone();
+        destination.revision.digest = "4".repeat(64);
+        assert!(!installation_allowed(Some(&current), &destination, 0));
+        destination = current.clone();
+        destination.source_authority = codex_assignment::SourceAuthority::Assignment {
+            operation: "5".repeat(32),
+        };
+        assert!(!installation_allowed(Some(&current), &destination, 0));
+        destination = current.clone();
+        destination.binding.generation += 1;
+        assert!(!installation_allowed(Some(&current), &destination, 0));
+        destination = current.clone();
+        destination.caller.birth += 1;
+        assert!(!installation_allowed(Some(&current), &destination, 0));
+        destination = current.clone();
+        destination.assignment_generation += 1;
+        destination.source_authority = codex_assignment::SourceAuthority::Assignment {
+            operation: "6".repeat(32),
+        };
+        assert!(installation_allowed(Some(&current), &destination, 1));
+        assert!(!installation_allowed(Some(&current), &destination, 0));
     }
 
     #[cfg(unix)]

@@ -399,7 +399,7 @@ impl member::MemberCustody for Borrowed<'_> {
     fn return_producer(
         &mut self,
         retirement: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
+    ) -> Result<member::ProducerReturn, (io::Error, Box<ProducerRetirement>)> {
         let returned = (|| {
             self.validate()?;
             self.check_producer(&retirement.original)?;
@@ -407,7 +407,8 @@ impl member::MemberCustody for Borrowed<'_> {
             self.return_unit(member::ReturnReceipt::ScopeClosed)
         })();
         match returned {
-            Ok(()) => {
+            Ok(member::ReturnProgress::Pending) => Ok(member::ProducerReturn::Pending(retirement)),
+            Ok(member::ReturnProgress::Returned) => {
                 let retirement: std::sync::Arc<ProducerRetirement> =
                     std::sync::Arc::from(retirement);
                 if retirement.inputs.operation.is_some() {
@@ -415,7 +416,9 @@ impl member::MemberCustody for Borrowed<'_> {
                         .contained_retirements
                         .insert(self.member, std::sync::Arc::clone(&retirement));
                 }
-                Ok(Box::new(ReturnedProducer { retirement }))
+                Ok(member::ProducerReturn::Returned(Box::new(
+                    ReturnedProducer { retirement },
+                )))
             }
             Err(error) => Err((error, retirement)),
         }
@@ -506,7 +509,10 @@ impl member::MemberCustody for Borrowed<'_> {
         job::inspection(self.fence, self.debt, self.job)?;
         Ok(())
     }
-    fn return_unit(&mut self, receipt: member::ReturnReceipt) -> io::Result<()> {
+    fn return_unit(
+        &mut self,
+        receipt: member::ReturnReceipt,
+    ) -> io::Result<member::ReturnProgress> {
         if parent_loan::outgoing(self.job, self.member).is_some() {
             return Err(refused("member still owns an outgoing CPU continuation"));
         }
@@ -518,7 +524,7 @@ impl member::MemberCustody for Borrowed<'_> {
                 // This private registered member consumed the already parked
                 // phase, not a compiler-bank loan. The actual scope receipt
                 // above returns no fresh CPU or GNU unit.
-                return Ok(());
+                return Ok(member::ReturnProgress::Returned);
             }
             // The owning state machine supplies this only after no ARM or
             // positive native scope closure. A nonblocking reply keeps the
@@ -526,16 +532,16 @@ impl member::MemberCustody for Borrowed<'_> {
             if self.job.reaped {
                 workload.host_closed_after_root_exit(self.member);
             } else {
-                workload.return_member(
+                return workload.return_member(
                     self.member,
                     self.job
                         .timeout
                         .map(|timeout| self.job.started + timeout)
                         .unwrap_or_else(Instant::now),
-                )?;
+                );
             }
         }
-        Ok(())
+        Ok(member::ReturnProgress::Returned)
     }
 }
 

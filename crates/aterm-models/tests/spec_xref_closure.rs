@@ -431,8 +431,11 @@ fn spec_xref_closure() {
         "LabPreferenceIdentity",
         "LabSourceAvailability",
         "AccountSourceCapture",
+        "AccountProviderCapture",
         "AccountSourceSelection",
         "AccountSourceRetirement",
+        "AccountPublicationPhases",
+        "AccountSyncCleanup",
         "AccountFleetCommit",
         "AccountProviderCommit",
     ] {

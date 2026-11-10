@@ -281,3 +281,132 @@ fn recovery_obeys_disabled_and_excluded_policy_without_replacing_either_catalog(
     );
     assert_eq!(std::fs::read(recovered_log).unwrap(), retained);
 }
+
+/// A Commons table's fence stands only for the store `Round::store` opens, which is an existing
+/// recovery store first (`Round::opens_fenced`). While the primary stands alone, the matching
+/// inventory's final read opens no store beyond its admission's (whose table policy reads the
+/// catalog). Once a recovery store is enrolled after the operation inventory read the primary,
+/// the final read reads the recovery store `Round::store` now opens, whose inventory differs,
+/// and withdraws the observation. A recovery store's own fence then stands with no probe, until
+/// the recovery store receives a row.
+/// NEGATIVE CONTROL: `opens_fenced` without its recovery probe keeps the first observation, and one
+/// that declines every recovery store's fence opens a store for the last but one.
+#[test]
+fn a_commons_tables_fence_stands_only_for_the_store_round_store_opens() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "fenced-recovery", "rows", 1)
+        .unwrap();
+    let mut primary = directory.open_store(&session, scope).unwrap();
+    let row = primary.commit_catalog(&session, b"row").unwrap();
+    let wire = primary.wire(&session, &row.id).unwrap().unwrap().to_vec();
+    drop(primary);
+    let tables = directory
+        .existing_subscriptions(&session, &crate::catalog::policy::Policy::default())
+        .unwrap()
+        .unwrap();
+    drop(session);
+    let peer = lab.bootstrap(1).request().unwrap().binding().actor();
+    let replica = Replica::commons(lab.paths[0].clone(), lab.paths[0].home.join("config")).unwrap();
+    let mut round = replica.round(peer).unwrap();
+    round.tables = tables;
+    let id = scope.digest();
+    round.active_table.set(Some(id));
+    let inventory = round
+        .inventory(peer, id, &mut None, &mut None)
+        .unwrap()
+        .unwrap();
+    let before = inventory.observation;
+    assert!(
+        inventory
+            .fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_recovery()),
+        "the operation inventory read the primary store"
+    );
+    round
+        .inventory_read
+        .replace(Some((before, inventory.fence)));
+    let report = Report {
+        table: Some(id),
+        local_known: Some(before.inventory),
+        peer_known: Some(before.inventory),
+        local_offered: Some(before.inventory),
+        ..Report::default()
+    };
+    let opens = || crate::table::store::test_opens_and_checks().0;
+    let opened = opens();
+    round.local(peer, |_| Ok(())).unwrap();
+    let admission = opens() - opened;
+    let opened = opens();
+    assert!(round.matching_inventory(peer, id, &report).is_some());
+    assert_eq!(
+        opens() - opened,
+        admission,
+        "the primary's fence stands while it stands alone"
+    );
+
+    let session = Session::open(&bootstrap).unwrap();
+    directory.recovery().enroll(&session, scope).unwrap();
+    drop(session);
+    let opened = opens();
+    assert!(
+        round.matching_inventory(peer, id, &report).is_none(),
+        "the recovery store Round::store now opens holds another inventory"
+    );
+    assert!(
+        opens() - opened > admission,
+        "the final read opens the store Round::store chooses"
+    );
+
+    let inventory = round
+        .inventory(peer, id, &mut None, &mut None)
+        .unwrap()
+        .unwrap();
+    let before = inventory.observation;
+    assert!(
+        inventory
+            .fence
+            .as_ref()
+            .is_some_and(|fence| fence.is_recovery()),
+        "the operation inventory read the recovery store"
+    );
+    round
+        .inventory_read
+        .replace(Some((before, inventory.fence)));
+    let report = Report {
+        table: Some(id),
+        local_known: Some(before.inventory),
+        peer_known: Some(before.inventory),
+        local_offered: Some(before.inventory),
+        ..Report::default()
+    };
+    let opened = opens();
+    assert!(round.matching_inventory(peer, id, &report).is_some());
+    assert_eq!(
+        opens() - opened,
+        admission,
+        "a recovery store's fence stands with no probe"
+    );
+
+    let session = Session::open(&bootstrap).unwrap();
+    directory
+        .recovery()
+        .open_store(&session, scope)
+        .unwrap()
+        .ingest(&session, &wire)
+        .unwrap();
+    drop(session);
+    let opened = opens();
+    assert!(
+        round.matching_inventory(peer, id, &report).is_none(),
+        "the row the recovery store received moved its claim and its inventory"
+    );
+    assert!(
+        opens() - opened > admission,
+        "a moved recovery store is read again"
+    );
+}

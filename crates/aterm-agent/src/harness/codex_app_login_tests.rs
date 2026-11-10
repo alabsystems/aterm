@@ -13,6 +13,166 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+thread_local! {
+    static CODE_CONTACT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn with_code_contact<R>(contact: &str, run: impl FnOnce() -> R) -> R {
+    assert!(is_loopback_endpoint(contact));
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CODE_CONTACT.with(|value| *value.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CODE_CONTACT.with(|value| value.replace(Some(contact.to_owned()))));
+    run()
+}
+
+pub(super) fn code_contact_url(
+    declared: &str,
+    native: Option<&crate::harness::native_enrollment_admission::NativeBrowserTurn>,
+    enrollment: Option<&crate::harness::codex_enrollment::Artifact>,
+) -> String {
+    if declared == format!("{DEFAULT_ISSUER}/oauth/token")
+        && native.is_some_and(|scope| {
+            scope.check_exchange().is_ok()
+                && enrollment.is_some_and(|artifact| {
+                    scope.matches_request(&artifact.staging().request)
+                        && crate::harness::codex_native_row::staging_shape(artifact.staging())
+                        && artifact.staging().directories_current()
+                })
+        })
+    {
+        CODE_CONTACT
+            .with(|value| value.borrow().clone())
+            .unwrap_or_else(|| declared.to_owned())
+    } else {
+        declared.to_owned()
+    }
+}
+
+#[test]
+fn code_contact_override_cannot_supply_native_admission_or_a_declared_realm() {
+    let declared = format!("{DEFAULT_ISSUER}/oauth/token");
+    with_code_contact("http://127.0.0.1:1/oauth/token", || {
+        assert_eq!(code_contact_url(&declared, None, None), declared);
+        let unsupported = "http://127.0.0.1:2/oauth/token";
+        assert_eq!(code_contact_url(unsupported, None, None), unsupported);
+    });
+    assert!(CODE_CONTACT.with(|value| value.borrow().is_none()));
+}
+
+/// Real sender/typed capture with a loopback transport only at the final send.
+/// No provider/TLS or independent-account qualification is supplied here.
+#[cfg(unix)]
+pub(in crate::harness) fn current_global_code_fixture(
+    artifact: &crate::harness::codex_enrollment::Artifact,
+    prepared: crate::harness::codex_grant_owner::PreparedGrant,
+    scope: &crate::harness::account_work::Scope,
+    cut: Option<EnrollmentCut>,
+    supported: bool,
+    predecessor: bool,
+    env: &crate::harness::cli::Env,
+) -> crate::harness::codex_grant_owner::CaptureOutcome {
+    let now = env.now;
+    let turn = prepared
+        .native_scope()
+        .expect("actual native browser reservation");
+    let auth = artifact.staging().directory.join(AUTH_FILE);
+    if predecessor {
+        hour_login(
+            auth.parent().unwrap(),
+            now,
+            Some("actual-stage-predecessor-fixture"),
+        );
+    }
+    let server_auth = auth.clone();
+    let server_env = env.clone();
+    let server_request = artifact.staging().request.clone();
+    let server_turn = turn.clone();
+    let token = make_chatgpt_jwt(Some("global-code@example.test"), "pro", now + 3600);
+    let (port, server) = provider_by_request(move |request| {
+        let form = parse_query_params(&request.body);
+        assert_eq!(
+            form.iter()
+                .filter(|(key, _)| key == "client_id")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            [CLIENT_ID]
+        );
+        assert_eq!(
+            form.iter()
+                .filter(|(key, _)| key == "grant_type")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            ["authorization_code"]
+        );
+        assert!(AuthLock::try_take(&server_auth).unwrap().is_none());
+        assert!(server_turn.check_exchange().is_ok());
+        assert!(
+            crate::harness::native_enrollment_admission::RefreshExchangeLease::for_env(&server_env)
+                .is_err()
+        );
+        let store = server_env
+            .accounts_store_for(crate::harness::accounts::Cli::Codex)
+            .unwrap();
+        let (logins, warning) = store.load_logins(now).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(
+            logins
+                .enrollment
+                .catalogue_witness(&server_request)
+                .unwrap()
+                .unwrap()
+                .phase,
+            crate::harness::codex_enrollment::CataloguePhase::Attempted
+        );
+        (
+            "200 OK",
+            json!({"id_token":token,"access_token":token,
+            "refresh_token":"actual-current-global-code-response"}),
+        )
+    });
+    let contact = format!("http://127.0.0.1:{port}/oauth/token");
+    let endpoints = Endpoints {
+        issuer: if supported {
+            DEFAULT_ISSUER.into()
+        } else {
+            format!("http://127.0.0.1:{port}")
+        },
+        token_url: if supported {
+            format!("{DEFAULT_ISSUER}/oauth/token")
+        } else {
+            contact.clone()
+        },
+        callback_ports: vec![],
+    };
+    let exchange = CodeExchange {
+        native_scope: Some(&turn),
+        publication: None,
+        enrollment: Some(artifact),
+        home: auth.parent().unwrap(),
+        endpoints: &endpoints,
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "single-current-code-fixture",
+        code_verifier: "verifier",
+        deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        work: Some(scope),
+        now,
+    };
+    let (_, outcome) = with_code_contact(&contact, || {
+        exchange.persist_capturing_inner(
+            Some("actual-current-code-fixture-owner"),
+            Some(prepared),
+            |home, deadline| AuthLock::within(home, deadline.instant()),
+            cut,
+        )
+    });
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    outcome.expect("actual sender retains the response")
+}
+
 // Synthetic journal metadata for low-level credential guards only. This does not
 // claim Store admission; end-to-end tests obtain Artifact from the actual writer.
 fn native_receipt_fixture(home: &Path, now: i64) -> RefreshJournal {
@@ -181,34 +341,6 @@ pub(in crate::harness) fn native_ordinary_exchange_fixture(
         now,
         Some(work),
         email,
-    )
-}
-
-#[cfg(unix)]
-pub(in crate::harness) fn native_enrollment_owner_fixture(
-    artifact: &crate::harness::codex_enrollment::Artifact,
-    cut: Option<EnrollmentCut>,
-    now: i64,
-    prepared: crate::harness::codex_grant_owner::PreparedGrant,
-) -> (
-    crate::harness::login_drive::Drove,
-    crate::harness::codex_grant_owner::CaptureOutcome,
-) {
-    let (drove, captured) = native_exchange_capturing(
-        &artifact.staging().directory,
-        NativeDestination {
-            enrollment: Some(artifact),
-            publication: None,
-        },
-        cut,
-        now,
-        None,
-        "main@example.test",
-        Some(prepared),
-    );
-    (
-        drove,
-        captured.expect("actual code exchange retains its outcome"),
     )
 }
 

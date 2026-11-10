@@ -490,7 +490,7 @@ pub fn reorder_cells_with_classes(
 ) -> Vec<usize> {
     let mut scratch = Scratch::default();
     let mut out = Vec::new();
-    reorder_cells_with_classes_into(
+    reorder_cells_into::<false>(
         cell_classes,
         cell_brackets,
         is_wide_continuation,
@@ -508,6 +508,7 @@ pub struct Scratch {
     logical_brackets: Vec<Bracket>,
     lead_cell: Vec<usize>,
     has_cont: Vec<bool>,
+    // Character indices during resolution; cell indices after the public `_into` returns.
     levels: Vec<u8>,
     char_order: Vec<usize>,
     resolve: Resolve,
@@ -516,19 +517,9 @@ pub struct Scratch {
 impl Scratch {
     /// Whether CELL `cell` of the row last passed to [`reorder_cells_with_classes_into`] with this scratch resolved to an odd (right-to-left) level: the cells UAX #9 L4 draws mirrored.
     #[must_use]
+    #[inline]
     pub fn cell_is_rtl(&self, cell: usize) -> bool {
-        let at = self.lead_cell.partition_point(|&lead| lead <= cell);
-        let Some(c) = at.checked_sub(1) else {
-            return false;
-        };
-        let owns = match self.lead_cell.get(c) {
-            Some(&lead) if lead == cell => true,
-            Some(&lead) => {
-                lead.checked_add(1) == Some(cell) && self.has_cont.get(c).copied().unwrap_or(false)
-            }
-            None => false,
-        };
-        owns && self.levels.get(c).is_some_and(|level| level % 2 == 1)
+        self.levels.get(cell).is_some_and(|level| level % 2 == 1)
     }
 }
 
@@ -541,17 +532,79 @@ pub fn reorder_cells_with_classes_into(
     scratch: &mut Scratch,
     out: &mut Vec<usize>,
 ) {
+    reorder_cells_into::<true>(
+        cell_classes,
+        cell_brackets,
+        is_wide_continuation,
+        base,
+        scratch,
+        out,
+    );
+}
+
+/// Only a caller retaining scratch can query cell directions after reordering.
+fn reorder_cells_into<const CELL_LEVELS: bool>(
+    cell_classes: &[BidiClass],
+    cell_brackets: &[Bracket],
+    is_wide_continuation: &[bool],
+    base: BaseDirection,
+    scratch: &mut Scratch,
+    out: &mut Vec<usize>,
+) {
     let s = scratch;
+    if !is_wide_continuation
+        .iter()
+        .take(cell_classes.len())
+        .any(|&cont| cont)
+    {
+        // With one cell per character, the caller's inputs and final output
+        // already have the resolver's index space. No folding buffers are needed.
+        resolve_into(
+            cell_classes,
+            cell_brackets,
+            base,
+            &mut s.resolve,
+            &mut s.levels,
+        );
+        reorder_paragraphs_into(cell_classes, &s.levels, out);
+        return;
+    }
     fold_cells_and_resolve(cell_classes, cell_brackets, is_wide_continuation, base, s);
     reorder_paragraphs_into(&s.logical, &s.levels, &mut s.char_order);
 
     out.clear();
+    // Folding consumes one cell per lead and one per continuation, and expansion
+    // emits both again. Reserve that known total once, including on cold callers.
+    out.reserve(cell_classes.len());
     for &c in &s.char_order {
         if let Some(&lead) = s.lead_cell.get(c) {
             out.push(lead);
             if s.has_cont.get(c).copied().unwrap_or(false) {
                 out.push(lead.saturating_add(1));
             }
+        }
+    }
+    if CELL_LEVELS {
+        expand_scratch_levels_to_cells(s, cell_classes.len());
+    }
+}
+
+/// Normalize character levels after L2 so every public scratch query indexes cells.
+fn expand_scratch_levels_to_cells(s: &mut Scratch, cells: usize) {
+    if s.levels.len() == cells {
+        return;
+    }
+    s.levels.resize(cells, 0);
+    // lead[c] >= c: backwards expansion cannot overwrite an unread character level.
+    for (c, &lead) in s.lead_cell.iter().enumerate().rev() {
+        let level = s.levels.get(c).copied().unwrap_or(0);
+        if let Some(slot) = s.levels.get_mut(lead) {
+            *slot = level;
+        }
+        if s.has_cont.get(c).copied().unwrap_or(false)
+            && let Some(slot) = s.levels.get_mut(lead.saturating_add(1))
+        {
+            *slot = level;
         }
     }
 }
@@ -587,10 +640,9 @@ pub fn cell_levels(
     out
 }
 
-/// Steps 1 and 2 of the cell reorder, shared by
-/// [`reorder_cells_with_classes_into`] and [`cell_levels`] so the two cannot
-/// fold a row differently: fold the cells into logical characters, then
-/// resolve each character's level into `s.levels`.
+/// Fold wide cell pairs into logical characters and resolve their levels.
+/// Reordering uses this for wide rows; `cell_levels` also uses it before its
+/// separate forward expansion into an owned cell-level array.
 fn fold_cells_and_resolve(
     cell_classes: &[BidiClass],
     cell_brackets: &[Bracket],
@@ -1569,6 +1621,80 @@ mod tests {
             &mut order,
         );
         assert!(scratch.cell_is_rtl(1) && scratch.cell_is_rtl(2));
+    }
+
+    #[test]
+    fn reused_scratch_matches_folded_maps_and_forward_expanded_levels() {
+        let mut scratch = Scratch::default();
+        let mut out = Vec::new();
+        for text in [
+            "",
+            "a(אב)12",
+            "א中 12ב",
+            "a\u{2067}אב\u{2069}(1)",
+            "א\nb(ג)1",
+        ] {
+            let chars: Vec<_> = text.chars().collect();
+            let (classes, mut brackets) = classes_and_brackets(&chars);
+            let n = classes.len();
+            brackets.extend([bracket_of('('), bracket_of(')')]);
+            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
+                for mask in 0..(1usize << (n + 1)) {
+                    // Includes malformed leading markers and a marker past the last cell.
+                    let wide: Vec<_> = (0..=n).map(|i| mask & (1 << i) != 0).collect();
+                    for bracket_len in [0, n / 2, n, n + 2] {
+                        let brackets = &brackets[..bracket_len];
+                        let mut folded = Scratch::default();
+                        fold_cells_and_resolve(&classes, brackets, &wide, base, &mut folded);
+                        let mut char_order = Vec::new();
+                        reorder_paragraphs_into(&folded.logical, &folded.levels, &mut char_order);
+                        let expected: Vec<_> = char_order
+                            .iter()
+                            .flat_map(|&c| {
+                                let lead = folded.lead_cell[c];
+                                lead..lead + 1 + usize::from(folded.has_cont[c])
+                            })
+                            .collect();
+                        let levels = cell_levels(&classes, brackets, &wide, base);
+                        reorder_cells_with_classes_into(
+                            &classes,
+                            brackets,
+                            &wide,
+                            base,
+                            &mut scratch,
+                            &mut out,
+                        );
+                        assert_eq!(
+                            out, expected,
+                            "{text:?} {base:?} mask={mask} brackets={bracket_len}"
+                        );
+                        for cell in 0..n + 2 {
+                            assert_eq!(
+                                scratch.cell_is_rtl(cell),
+                                levels.get(cell).is_some_and(|l| l % 2 == 1),
+                                "{text:?} {base:?} mask={mask} brackets={bracket_len} cell={cell}"
+                            );
+                        }
+                        // Reuse a previously folded scratch on a direct row immediately.
+                        reorder_cells_with_classes_into(
+                            &classes,
+                            brackets,
+                            &[],
+                            base,
+                            &mut scratch,
+                            &mut out,
+                        );
+                        let direct = cell_levels(&classes, brackets, &[], base);
+                        for (cell, level) in direct.iter().enumerate() {
+                            assert_eq!(scratch.cell_is_rtl(cell), level % 2 == 1);
+                        }
+                    }
+                }
+            }
+        }
+        reorder_cells_with_classes_into(&[], &[], &[], BaseDirection::Auto, &mut scratch, &mut out);
+        assert!(out.is_empty());
+        assert!(!scratch.cell_is_rtl(0));
     }
 }
 

@@ -191,6 +191,126 @@ impl Outbox {
         }
     }
 
+    /// Return sanitized correlation only from a real production reply.
+    #[cfg(all(unix, debug_assertions))]
+    pub(super) fn fixture_source_outcome(&self, request: &str) -> Option<aterm_json::Value> {
+        let Segment::Bytes(bytes) = self.segments.front()? else {
+            return None;
+        };
+        let line = std::str::from_utf8(bytes).ok()?;
+        let (action, body) = line.strip_prefix("OK codex-auth ")?.split_once(' ')?;
+        if !matches!(
+            action,
+            "member-retire"
+                | "member-retire-owned"
+                | "member-work-rebind"
+                | "member-ready"
+                | "member-reader-ready"
+                | "member-rebound-ready"
+        ) || !request.split_ascii_whitespace().any(|word| word == action)
+        {
+            return None;
+        }
+        let value: aterm_json::Value = aterm_json::from_str(body.trim()).ok()?;
+        if value["schema"].as_u64() != Some(1) {
+            return None;
+        }
+        for name in ["request", "operation", "member"] {
+            let mut values = request
+                .split_ascii_whitespace()
+                .filter_map(|word| word.split_once('='))
+                .filter(|(key, _)| *key == name)
+                .map(|(_, value)| value);
+            let expected = values.next()?;
+            if values.next().is_some() || value[name].as_str() != Some(expected) {
+                return None;
+            }
+        }
+        let mut event = aterm_json::json!({"action":action,"request":value["request"],
+            "operation":value["operation"],"member":value["member"]});
+        if matches!(
+            action,
+            "member-ready" | "member-reader-ready" | "member-rebound-ready"
+        ) {
+            let field = |name| {
+                let mut values = request
+                    .split_ascii_whitespace()
+                    .filter_map(|word| word.split_once('='))
+                    .filter(|(key, _)| *key == name)
+                    .map(|(_, value)| value);
+                let result = values.next()?;
+                values.next().is_none().then_some(result)
+            };
+            let registration = field("registration")?;
+            let sequence = field("preload_sequence")?;
+            if value["registration"].as_str() != Some(registration)
+                || value["preload_sequence"].as_str() != Some(sequence)
+            {
+                return None;
+            }
+            let generation: u64 = field("credential_generation")?.parse().ok()?;
+            let mut report = Vec::new();
+            for name in [
+                "auth_generation",
+                "owner_generation",
+                "source_generation",
+                "login_generation",
+            ] {
+                if action != "member-reader-ready" {
+                    report.push(field(name)?.parse::<u64>().ok()?);
+                }
+            }
+            // Complete semantic Ready-body correlation without exporting its
+            // credential digest/principal fields. RPC nonce and action alias
+            // differ on replay/rebound; the owned report itself must not.
+            let mut body = aterm_digest::Sha256::new();
+            body.update(b"aterm/source-proof/ready-body/v1\0");
+            for name in [
+                "operation",
+                "member",
+                "preload_sequence",
+                "registration",
+                "credential_generation",
+                "digest",
+                "account",
+                "user",
+                "auth_generation",
+                "owner_generation",
+                "source_generation",
+                "login_generation",
+            ] {
+                if action == "member-reader-ready"
+                    && matches!(
+                        name,
+                        "auth_generation"
+                            | "owner_generation"
+                            | "source_generation"
+                            | "login_generation"
+                    )
+                {
+                    continue;
+                }
+                let value = field(name)?;
+                body.update(name.as_bytes());
+                body.update(u32::try_from(value.len()).ok()?.to_be_bytes());
+                body.update(value.as_bytes());
+            }
+            let object = event.as_object_mut()?;
+            object.insert("registration".into(), aterm_json::json!(registration));
+            object.insert("preload_sequence".into(), aterm_json::json!(sequence));
+            object.insert(
+                "credential_generation".into(),
+                aterm_json::json!(generation),
+            );
+            object.insert("report".into(), aterm_json::json!(report));
+            object.insert(
+                "body_digest".into(),
+                aterm_json::json!(aterm_codec::hex::encode_lower(&body.finalize())),
+            );
+        }
+        Some(event)
+    }
+
     /// The explicit host fixture pauses only a completed account preparation,
     /// never a waiting/error response or an execution grant.
     #[cfg(all(unix, debug_assertions))]
@@ -2785,6 +2905,76 @@ mod startup_tests {
 mod outbox_spill_tests {
     use super::{CtlStream, Outbox, SPILL_FROM, Segment};
     use std::io::Read as _;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn source_fixture_requires_actual_exact_cleanup_reply() {
+        let request = "@self native-act codex-auth member-retire-owned schema=1 request=req operation=op member=member";
+        let mut out = Outbox::default();
+        assert!(out.fixture_source_outcome(request).is_none());
+        out.push_owned(b"WAIT codex-auth member-retire-owned\n".to_vec());
+        assert!(out.fixture_source_outcome(request).is_none());
+        out.segments.clear();
+        out.push_owned(b"OK codex-auth member-retire-owned {\"schema\":1,\"request\":\"req\",\"operation\":\"op\",\"member\":\"member\"}\n".to_vec());
+        assert!(out.fixture_source_outcome(request).is_some());
+        assert!(
+            out.fixture_source_outcome(&request.replace("request=req", "request=foreign"))
+                .is_none()
+        );
+        assert!(
+            out.fixture_source_outcome(&request.replace("member=member", "member=foreign"))
+                .is_none()
+        );
+        out.segments.clear();
+        let ready = format!(
+            "member-rebound-ready schema=1 request=req operation=op member=member registration=reg preload_sequence=seq credential_generation=4 digest={} account={} user={} auth_generation=1 owner_generation=2 source_generation=3 login_generation=4",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64)
+        );
+        out.push_owned(b"OK codex-auth member-rebound-ready {\"schema\":1,\"request\":\"req\",\"operation\":\"op\",\"member\":\"member\",\"registration\":\"reg\",\"preload_sequence\":\"seq\"}\n".to_vec());
+        let event = out.fixture_source_outcome(&ready).unwrap();
+        assert_eq!(event["credential_generation"].as_u64(), Some(4));
+        assert_eq!(event["report"], aterm_json::json!([1, 2, 3, 4]));
+        for (field, original) in [
+            ("digest", "a".repeat(64)),
+            ("account", "b".repeat(64)),
+            ("user", "c".repeat(64)),
+            ("auth_generation", "1".into()),
+        ] {
+            let changed = ready.replace(
+                &format!("{field}={original}"),
+                &format!(
+                    "{field}={}",
+                    if field == "auth_generation" {
+                        "9".into()
+                    } else {
+                        "d".repeat(64)
+                    }
+                ),
+            );
+            let other = out.fixture_source_outcome(&changed).unwrap();
+            assert_ne!(
+                event["body_digest"], other["body_digest"],
+                "changed {field} cannot replay the same semantic Ready body"
+            );
+        }
+        assert!(
+            out.fixture_source_outcome(&format!("{ready} digest={}", "d".repeat(64)))
+                .is_none()
+        );
+
+        assert!(
+            out.fixture_source_outcome(&ready.replace("registration=reg", "registration=foreign"))
+                .is_none()
+        );
+        assert!(
+            out.fixture_source_outcome(
+                &ready.replace("preload_sequence=seq", "preload_sequence=foreign")
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn a_large_unsent_answer_leaves_the_heap_and_arrives_whole() {

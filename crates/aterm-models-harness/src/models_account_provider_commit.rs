@@ -14,7 +14,7 @@ pub fn account_provider_commit_model() -> Model {
             var completed = 0; var early = 0; var fenced = 1;
             var exact = 1; var preserved = 1; var once = 1;
             action Provider when (phase == 0 && 3 > provider) { provider = provider + 1; }
-            action Cut when (phase == 0 && 5 > cut) { cut = cut + 1; }
+            action Cut when (phase == 0 && 6 > cut) { cut = cut + 1; }
             action Fault when (phase == 0 && 2 > fault) { fault = fault + 1; }
             action Recover when (phase == 0) {
                 phase = 1;
@@ -32,7 +32,7 @@ pub fn account_provider_commit_model() -> Model {
             invariant RejectedRecoveryPreserves: preserved == 1;
             invariant ReplayIdempotent: once == 1;
             bound ProviderDomain: 0 <= provider && provider <= 3;
-            bound CutDomain: 0 <= cut && cut <= 5;
+            bound CutDomain: 0 <= cut && cut <= 6;
             bound FaultDomain: 0 <= fault && fault <= 2;
         }
     }

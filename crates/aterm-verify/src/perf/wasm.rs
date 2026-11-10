@@ -333,6 +333,7 @@ fn build_modules(
     // STOCK EXCEPTION: Trust lacks a wasm32 std.
     let neutral = aterm_tempfile::Builder::new()
         .prefix("aterm-wasm-bench-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("could not create neutral build directory: {e}"))?;
     eprintln!(

@@ -3535,7 +3535,6 @@ fn run_checker(
                 args.send_health(title, body);
             }
             speak_health(&mut announcer);
-            watch.set_max_interval(generation, schedule.max_wait().as_secs());
             if !stamp(CheckerPhase::Waiting) {
                 return Cycle::Superseded(last.get());
             }

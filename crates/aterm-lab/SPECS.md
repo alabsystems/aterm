@@ -1212,3 +1212,13 @@ file	test	primary	also
 src/outlook_captures.rs	scene_js_card_is_case_cs_its_marks_beside_its_ticks	outlook-card-scene-j	outlook-glass-seeds
 src/outlook_captures.rs	a_card_is_shown_once_its_observer_has_read	outlook-card-scene-j	
 ```
+
+## 33. Added 2026-11-09: program outcomes across native handoffs
+
+The installer-handoff lab can keep two program workers running through its native
+replacements, then require the exact success and failure outcomes through the control API.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+handoff-program-outcome	contract	installer_handoff::program_finished	For expected exit e, a task is accepted iff state is done when e = 0 or failed otherwise, why is exit-status, and the parsed exit equals e. A missing status, wrong state, or different exit is refused.	src/installer_handoff.rs::tests::program_completion_requires_the_requested_exit_status	field parsing, integer comparison	0,1,3
+```

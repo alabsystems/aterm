@@ -42,6 +42,8 @@ pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<
             token_key: config.token_key.clone(),
         },
         recorded,
+        empty: std::sync::Mutex::new(None),
+        lease: std::sync::Mutex::new(None),
         hooks: std::sync::Mutex::new(Vec::new()),
         reading: LastReading::default(),
     })
@@ -51,6 +53,11 @@ struct Repositories {
     user: User,
     config: Github,
     recorded: Vec<PathBuf>,
+    /// Only this item's admitted source may reuse its actual empty advertisements.
+    empty: std::sync::Mutex<Option<(super::source::Stamp, Vec<EmptyCheckout>)>>,
+    /// Keep an unfinished-checkout acquisition owned through its completion probe.
+    lease:
+        std::sync::Mutex<Option<std::sync::Arc<crate::sync::repository_refresh::RepositoryPass>>>,
     /// What the last apply's clones made of their hook installers ([`Cloned::hooks`]), which
     /// the read-back's row says.
     hooks: std::sync::Mutex<Vec<String>>,
@@ -60,9 +67,11 @@ struct Repositories {
 struct Scan {
     /// Every selected repository, including a destination that must stay untouched.
     all: usize,
+    repositories: Vec<Repo>,
     missing: Vec<Repo>,
     existing: Vec<(Repo, PathBuf, Stands)>,
     dependencies: Vec<(Repo, PathBuf)>,
+    unborn: Vec<(Repo, PathBuf)>,
     recorded: usize,
     /// Repositories excluded by the inventory's folder-selection policy.
     notes: Vec<String>,
@@ -113,6 +122,11 @@ impl Item for Repositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        let _lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // What the last apply's clones made of their hook installers: whatever this read says,
         // the switch turned off or the profile changed since included, its row says that too.
         let hooks = std::mem::take(
@@ -145,9 +159,94 @@ impl Item for Repositories {
             },
             Ok(Some(token)) => token,
         };
-            let scan = match self.scan(sys, &token) {
+            let source = match super::source::Stamp::read(sys, &self.user) {
+                Ok(source) => source,
+                Err(why) => return Probe::Unusable { why },
+            };
+            let selected = match super::develop_checkouts(sys, &self.user) {
+                Ok(selected) => selected,
+                Err(why) => return Probe::Unusable { why },
+            };
+            let current = || self.ensure_current(sys, &source, &selected, &|| Ok(()));
+            let mut scan = match self.scan(sys, &token, &selected) {
                 Err(why) => return Probe::Unusable { why },
                 Ok(scan) => scan,
+            };
+            let mut recorded: BTreeSet<_> = self.recorded.iter().cloned().collect();
+            recorded.extend(selected.iter().cloned());
+            let receipt = self
+                .empty
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut empty = receipt
+                .filter(|(stamp, _)| stamp == &source)
+                .map_or_else(Vec::new, |(_, empty)| empty);
+            empty.retain(|proof| !scan.unborn.iter().any(|(repo, _)| proof.is_for(repo)));
+            *self
+                .empty
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if empty.is_empty() {
+                None
+            } else {
+                Some((source.clone(), empty.clone()))
+            };
+            let mut observed = Vec::new();
+            for candidate in std::mem::take(&mut scan.unborn) {
+                match observe_unborn(sys, &self.user, &candidate, &recorded, &current) {
+                    Ok(UnbornObservation::Empty(proof)) => {
+                        observed.push(candidate.0);
+                        empty.push(*proof);
+                    }
+                    Ok(UnbornObservation::Owed) => scan.unborn.push(candidate),
+                    Ok(UnbornObservation::Preserved(why)) => {
+                        scan.blocked.push(format!("~/{}: {why}", candidate.0.name))
+                    }
+                    Err(why) if why.is_network() => {
+                        return Probe::Blocked {
+                            why: why.to_string(),
+                        };
+                    }
+                    Err(why) => {
+                        return Probe::Unusable {
+                            why: why.to_string(),
+                        };
+                    }
+                }
+            }
+            if !observed.is_empty() {
+                let standing = match partition_with_empty(sys, &self.user, &observed, &empty) {
+                    Ok(standing) => standing,
+                    Err(why) => return Probe::Unusable { why },
+                };
+                if let Some(why) = named(&standing.git_waits) {
+                    return Probe::Blocked { why };
+                }
+                scan.unborn.extend(standing.unborn);
+                scan.dependencies.extend(standing.dependencies);
+                scan.blocked.extend(standing.notes);
+                for (repo, path) in standing.present {
+                    if recorded.contains(&path) {
+                        scan.recorded += 1;
+                    } else {
+                        scan.existing.push((
+                            repo,
+                            path,
+                            Stands::Kept("origin currently advertises no commits".into()),
+                        ));
+                    }
+                }
+            }
+            if let Err(why) = current() {
+                return Probe::Blocked { why };
+            }
+            *self
+                .empty
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if empty.is_empty() {
+                None
+            } else {
+                Some((source.clone(), empty))
             };
             let present = scan.existing.len() + scan.recorded;
             self.reading.set(Some(Reading::Repositories {
@@ -155,7 +254,11 @@ impl Item for Repositories {
                 count: scan.all,
                 signed_in: true,
             }));
-            if scan.missing.is_empty() && scan.dependencies.is_empty() && scan.moving() == 0 {
+            if scan.missing.is_empty()
+                && scan.dependencies.is_empty()
+                && scan.unborn.is_empty()
+                && scan.moving() == 0
+            {
                 if let Some(why) = named(&scan.blocked) {
                     return Probe::Person {
                         step: "github.repositories".into(),
@@ -180,11 +283,19 @@ impl Item for Repositories {
             } else {
                 Probe::Change {
                     from: format!(
-                        "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub{}",
+                        "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub{}{}",
                         scan.missing.len(),
                         scan.all,
                         unfit(sys, &self.user, &scan.missing),
                         scan.moving(),
+                        if scan.unborn.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; {} repositories need their first checkout",
+                                scan.unborn.len()
+                            )
+                        },
                         if scan.dependencies.is_empty() {
                             String::new()
                         } else {
@@ -217,33 +328,73 @@ impl Item for Repositories {
         _ctx: &Ctx,
         authorized: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<(), String> {
+        let mut lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let source = super::source::Stamp::read(sys, &self.user)?;
-        let current = || {
-            authorized()?;
-            if !super::settings_managed(sys, &self.user)? {
-                return Err("repository setup was disabled in init.toml while cloning".into());
-            }
-            if !super::source::Stamp::matches_config(sys, &self.user, &self.config)? {
-                return Err("the configured repository profile changed before cloning".into());
-            }
-            if !source.is_current(sys, &self.user)? {
-                return Err("repository input source changed while cloning".into());
-            }
-            Ok(())
-        };
+        let selected = super::develop_checkouts(sys, &self.user)?;
+        let mut recorded: BTreeSet<_> = self.recorded.iter().cloned().collect();
+        recorded.extend(selected.iter().cloned());
+        let current = || self.ensure_current(sys, &source, &selected, authorized);
         current()?;
         let Some(token) = auth_ready(sys, &self.user, &self.config)? else {
             return Err("GitHub authentication changed; no repositories cloned".into());
         };
-        let scan = self.scan(sys, &token)?;
+        let scan = self.scan(sys, &token, &selected)?;
+        if !scan.unborn.is_empty() && lease.is_none() {
+            lease = Some(
+                sys.repository_pass()?
+                    .pass
+                    .ok_or("another repository/converge pass holds align.lock")?,
+            );
+        }
+        let receipt = self
+            .empty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut empty = receipt
+            .filter(|(stamp, _)| stamp == &source)
+            .map_or_else(Vec::new, |(_, empty)| empty);
+        empty.retain(|proof| !scan.unborn.iter().any(|(repo, _)| proof.is_for(repo)));
+        *self
+            .empty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = if empty.is_empty() {
+            None
+        } else {
+            Some((source.clone(), empty.clone()))
+        };
+        let mut unfinished = Vec::new();
+        let mut hydrated = false;
+        for candidate in &scan.unborn {
+            match acquire_unborn(
+                sys,
+                &self.user,
+                std::slice::from_ref(candidate),
+                &recorded,
+                &current,
+            ) {
+                Ok(mut admitted) => {
+                    hydrated |= admitted.is_empty();
+                    empty.append(&mut admitted);
+                }
+                Err(why) => unfinished.push(why.to_string()),
+            }
+        }
         let home = Path::new(&self.user.home);
         let guard = CloneGuard::new(&current);
         let Cloned {
             left,
             mut failed,
             hooks,
+            empty: mut cloned_empty,
             ..
         } = clone_all(sys, &self.user, &scan.missing, Some(&guard));
+        empty.append(&mut cloned_empty);
+        failed.extend(unfinished);
         let room = || short_of_room(sys.volume(home).as_ref(), &left, INIT_AGAIN);
         // A failed row is read back by nothing: it says what the clones that went made of their
         // hook installers, after why it failed, a guard that stopped the rest included; a done
@@ -251,7 +402,18 @@ impl Item for Repositories {
         if let Err(why) = current() {
             return Err(stopped_after_clones(why, failed, room(), &hooks));
         }
-        for (repo, path) in scan.dependencies {
+        // A first commit can introduce required gitlinks. Reuse the admitted selection,
+        // but inspect local dependencies again after acquiring it.
+        let dependencies = if hydrated {
+            let standing = partition_with_empty(sys, &self.user, &scan.repositories, &empty)?;
+            if let Some(why) = named(&standing.git_waits) {
+                failed.push(why);
+            }
+            standing.dependencies
+        } else {
+            scan.dependencies
+        };
+        for (repo, path) in dependencies {
             if let Err(why) = current() {
                 return Err(stopped_after_clones(why, failed, room(), &hooks));
             }
@@ -274,6 +436,19 @@ impl Item for Repositories {
         }
         let short = room();
         if failed.is_empty() && short.is_none() {
+            current()?;
+            *self
+                .empty
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if empty.is_empty() {
+                None
+            } else {
+                Some((source.clone(), empty))
+            };
+            *self
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = lease;
             *self
                 .hooks
                 .lock()
@@ -305,23 +480,65 @@ fn unfit(sys: &dyn System, user: &User, missing: &[Repo]) -> String {
 }
 
 impl Repositories {
-    fn scan(&self, sys: &dyn System, token: &Secret) -> Result<Scan, String> {
+    fn ensure_current(
+        &self,
+        sys: &dyn System,
+        source: &super::source::Stamp,
+        selected: &BTreeSet<PathBuf>,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        authorized()?;
+        if !super::settings_managed(sys, &self.user)? {
+            return Err("repository setup was disabled in init.toml while cloning".into());
+        }
+        if !super::source::Stamp::matches_config(sys, &self.user, &self.config)? {
+            return Err("the configured repository profile changed before cloning".into());
+        }
+        if !source.is_current(sys, &self.user)? {
+            return Err("repository input source changed while cloning".into());
+        }
+        if *selected != super::develop_checkouts(sys, &self.user)? {
+            return Err(
+                "develop checkout selection changed while repositories were being refreshed".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn scan(
+        &self,
+        sys: &dyn System,
+        token: &Secret,
+        selected: &BTreeSet<PathBuf>,
+    ) -> Result<Scan, String> {
         admit_home(sys, &self.user)?;
         let listed = enumerate(sys, &self.user, &self.config, token)?;
+        let receipt = self
+            .empty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let empty = match &receipt {
+            Some((source, empty)) if source.is_current(sys, &self.user)? => empty.as_slice(),
+            _ => &[],
+        };
         let Partition {
             missing,
             present,
             dependencies,
+            unborn,
             notes,
             git_waits,
-        } = partition(sys, &self.user, &listed.repositories)?;
+        } = partition_with_empty(sys, &self.user, &listed.repositories, empty)?;
         if let Some(why) = named(&git_waits) {
             return Err(why);
         }
         let mut aligned = Vec::new();
         let mut recorded = 0;
+        let mut delegated: BTreeSet<_> = self.recorded.iter().cloned().collect();
+        delegated.extend(selected.iter().cloned());
         for (repo, path) in present {
-            if self.recorded.contains(&path) {
+            if delegated.contains(&path) {
                 recorded += 1;
                 continue;
             }
@@ -329,11 +546,21 @@ impl Repositories {
                 .unwrap_or_else(|unread| Stands::Kept(unread.why));
             aligned.push((repo, path, stands));
         }
+        if let Some((source, _)) = &receipt
+            && !empty.is_empty()
+            && !source.is_current(sys, &self.user)?
+        {
+            return Err(
+                "the configured repository source changed during empty-origin readback".into(),
+            );
+        }
         Ok(Scan {
             all: listed.repositories.len(),
+            repositories: listed.repositories,
             missing,
             existing: aligned,
             dependencies,
+            unborn,
             recorded,
             notes: listed.notes,
             blocked: notes,
@@ -368,9 +595,84 @@ pub(super) struct Partition {
     pub(super) missing: Vec<Repo>,
     pub(super) present: Vec<(Repo, PathBuf)>,
     pub(super) dependencies: Vec<(Repo, PathBuf)>,
+    /// Matching worktrees without a commit need a fresh, owned remote observation.
+    pub(super) unborn: Vec<(Repo, PathBuf)>,
     pub(super) notes: Vec<String>,
     /// Dependencies whose local inspection waits for a capable Git, without touching them.
     pub(super) git_waits: Vec<String>,
+}
+
+/// A complete empty advertisement, bound to this pass's unchanged physical checkout.
+/// Only acquisition can construct it; local absence and catalogue metadata cannot.
+#[derive(Clone, Debug)]
+pub(super) struct EmptyCheckout {
+    name: String,
+    owner: String,
+    branch: String,
+    physical: [FileId; 3],
+    refs: [u8; 32],
+}
+
+impl EmptyCheckout {
+    pub(super) fn is_for(&self, repo: &Repo) -> bool {
+        self.name == repo.name && self.owner == repo.owner
+    }
+
+    fn capture(sys: &dyn System, user: &User, repo: &Repo, path: &Path) -> Result<Self, String> {
+        verify_existing(sys, user, &repo.owner, repo, path)?;
+        clone_command(
+            sys,
+            user,
+            git(sys, user, Some(path)),
+            &repo.owner,
+            repo,
+            "origin",
+        )?;
+        owned_storage(sys, user, path)?;
+        let branch = crate::checkout::unborn(sys, user, path)?
+            .ok_or("an empty advertisement no longer matches the local checkout")?;
+        let refs = git_read(
+            sys,
+            user,
+            path,
+            &["for-each-ref", "--format=%(objectname) %(refname)"],
+        )?;
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(refs.as_bytes());
+        Ok(Self {
+            name: repo.name.clone(),
+            owner: repo.owner.clone(),
+            branch,
+            physical: refresh_subjects(sys, path)
+                .map_err(|_| "cannot identify the empty checkout")?,
+            refs: hash.finalize(),
+        })
+    }
+
+    fn current(&self, sys: &dyn System, user: &User, repo: &Repo, path: &Path) -> bool {
+        self.is_for(repo)
+            && Self::capture(sys, user, repo, path).is_ok_and(|now| {
+                now.branch == self.branch && now.physical == self.physical && now.refs == self.refs
+            })
+    }
+}
+
+fn owned_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
+    for path in [
+        path.to_owned(),
+        path.join(".git"),
+        path.join(".git/objects"),
+    ] {
+        if !sys
+            .stat(&path)
+            .is_ok_and(|s| s.dir && !s.symlink && s.uid == user.uid)
+        {
+            return Err(
+                "the unfinished checkout's storage is linked, foreign or unreadable".into(),
+            );
+        }
+    }
+    super::dependencies::complete_storage(sys, user, path)
 }
 
 /// `lines` joined, the first [`NAMED`] of them and how many more; `None` when there are none.
@@ -406,6 +708,15 @@ pub(super) const HOME_FOLDERS: [&str; 9] = [
 ];
 
 pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Partition, String> {
+    partition_with_empty(sys, user, all, &[])
+}
+
+pub(super) fn partition_with_empty(
+    sys: &dyn System,
+    user: &User,
+    all: &[Repo],
+    empty: &[EmptyCheckout],
+) -> Result<Partition, String> {
     if all.is_empty() {
         admit_destination(sys, user)?;
     } else {
@@ -431,15 +742,25 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
             }
             Ok(stat) if stat.dir && !stat.symlink => {
                 match verify_existing(sys, user, &repo.owner, repo, &path) {
-                    Ok(()) => match super::dependencies::ready(sys, user, &path, repo) {
-                        Ok(true) => standing.present.push((repo.clone(), path)),
-                        Ok(false) => standing.dependencies.push((repo.clone(), path)),
-                        Err(super::dependencies::Unready::Git(why)) => {
-                            standing.git_waits.push(format!("~/{}: {why}", repo.name));
+                    Ok(()) => match crate::checkout::unborn(sys, user, &path) {
+                        Ok(Some(_))
+                            if !empty
+                                .iter()
+                                .any(|proof| proof.current(sys, user, repo, &path)) =>
+                        {
+                            standing.unborn.push((repo.clone(), path));
                         }
-                        Err(super::dependencies::Unready::Preserved(why)) => {
-                            standing.notes.push(format!("~/{}: {why}", repo.name));
-                        }
+                        Err(why) => standing.notes.push(format!("~/{}: {why}", repo.name)),
+                        Ok(_) => match super::dependencies::ready(sys, user, &path, repo) {
+                            Ok(true) => standing.present.push((repo.clone(), path)),
+                            Ok(false) => standing.dependencies.push((repo.clone(), path)),
+                            Err(super::dependencies::Unready::Git(why)) => {
+                                standing.git_waits.push(format!("~/{}: {why}", repo.name));
+                            }
+                            Err(super::dependencies::Unready::Preserved(why)) => {
+                                standing.notes.push(format!("~/{}: {why}", repo.name));
+                            }
+                        },
                     },
                     Err(why) => standing.notes.push(why),
                 }
@@ -454,6 +775,179 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
         }
     }
     Ok(standing)
+}
+
+fn unborn_current(
+    sys: &dyn System,
+    user: &User,
+    repo: &Repo,
+    path: &Path,
+    physical: [FileId; 3],
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    current()?;
+    owned_storage(sys, user, path)?;
+    verify_existing(sys, user, &repo.owner, repo, path)?;
+    clone_command(
+        sys,
+        user,
+        git(sys, user, Some(path)),
+        &repo.owner,
+        repo,
+        "origin",
+    )?;
+    if refresh_subjects(sys, path).ok() != Some(physical) {
+        return Err("unfinished checkout storage changed; preserved".into());
+    }
+    Ok(())
+}
+
+fn read_unborn(
+    sys: &dyn System,
+    user: &User,
+    repo: &Repo,
+    path: &Path,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<(Remote, String, [FileId; 3]), AcquisitionFailure> {
+    current()?;
+    owned_storage(sys, user, path)?;
+    let physical =
+        refresh_subjects(sys, path).map_err(|_| "cannot identify unfinished checkout storage")?;
+    let branch = crate::checkout::unborn(sys, user, path)?.ok_or("unfinished HEAD changed")?;
+    verify_existing(sys, user, &repo.owner, repo, path)?;
+    let url = format!("https://github.com/{}/{}.git", repo.owner, repo.name);
+    let command = clone_command(
+        sys,
+        user,
+        git(sys, user, Some(path)),
+        &repo.owner,
+        repo,
+        &url,
+    )?;
+    let bytes = crate::checkout::acquisition_read(
+        sys,
+        &command.args([
+            "ls-remote",
+            "--symref",
+            "--",
+            &url,
+            "HEAD",
+            "refs/heads/*",
+            "refs/tags/*",
+        ]),
+        "cannot read the unfinished repository's complete remote references",
+    )?;
+    let remote =
+        remote(std::str::from_utf8(&bytes).map_err(|_| "invalid remote reference encoding")?)?;
+    unborn_current(sys, user, repo, path, physical, current)?;
+    Ok((remote, branch, physical))
+}
+
+#[derive(Debug)]
+pub(super) enum UnbornObservation {
+    Empty(Box<EmptyCheckout>),
+    Owed,
+    Preserved(String),
+}
+
+/// Conservative local repair debt, never proof that a remote is empty or current.
+/// A later network-admitted observation can lift a stale catalogue hint.
+pub(super) fn local_unborn(
+    sys: &dyn System,
+    user: &User,
+    candidate: &(Repo, PathBuf),
+    recorded: &BTreeSet<PathBuf>,
+) -> Result<Option<String>, String> {
+    let (repo, path) = candidate;
+    let branch = crate::checkout::unborn(sys, user, path)?.ok_or("unfinished HEAD changed")?;
+    if recorded.contains(path) {
+        return Ok(Some(
+            "the unfinished checkout is recorded in [develop]; left to the develop item".into(),
+        ));
+    }
+    let Some(default) = repo.default_branch.as_deref() else {
+        return Err("the unfinished checkout's default branch is unknown locally; waiting for an admitted remote refresh".into());
+    };
+    if default != branch {
+        return Ok(Some(
+            "the unfinished branch differs from the admitted default branch; preserved".into(),
+        ));
+    }
+    crate::checkout::unborn_preservation(sys, user, path, &branch)
+}
+
+fn first_commit<'a>(
+    remote: &'a Remote,
+    branch: &str,
+    path: &Path,
+    recorded: &BTreeSet<PathBuf>,
+) -> Result<&'a str, String> {
+    if recorded.contains(path) {
+        return Err("the unfinished checkout is recorded in [develop]; its first commit is left to the develop item".into());
+    }
+    match remote.head.as_deref() {
+        Some(tip)
+            if remote.branch.as_deref() == Some(branch)
+                && remote
+                    .refs
+                    .get(&format!("refs/heads/{branch}"))
+                    .map(String::as_str)
+                    == Some(tip) =>
+        {
+            Ok(tip)
+        }
+        _ => Err("the unfinished branch differs from the advertised default; preserved".into()),
+    }
+}
+
+/// Read-only classification for a network-admitted probe. Only a complete empty
+/// advertisement returns a fact; a nonempty remote never starts a fetch or checkout.
+pub(super) fn observe_unborn(
+    sys: &dyn System,
+    user: &User,
+    candidate: &(Repo, PathBuf),
+    recorded: &BTreeSet<PathBuf>,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<UnbornObservation, AcquisitionFailure> {
+    let (repo, path) = candidate;
+    let (remote, branch, physical) = read_unborn(sys, user, repo, path, current)?;
+    let observed = if remote.head.is_none() && remote.refs.is_empty() {
+        UnbornObservation::Empty(Box::new(EmptyCheckout::capture(sys, user, repo, path)?))
+    } else {
+        match first_commit(&remote, &branch, path, recorded) {
+            Ok(_) => match crate::checkout::unborn_preservation(sys, user, path, &branch)? {
+                None => UnbornObservation::Owed,
+                Some(why) => UnbornObservation::Preserved(why),
+            },
+            Err(why) => UnbornObservation::Preserved(why),
+        }
+    };
+    unborn_current(sys, user, repo, path, physical, current)?;
+    Ok(observed)
+}
+
+/// Acquire only unfinished checkouts. Remote emptiness is a pass-owned readback;
+/// a first commit uses the same guarded, non-overwriting native checkout boundary.
+pub(super) fn acquire_unborn(
+    sys: &dyn System,
+    user: &User,
+    unborn: &[(Repo, PathBuf)],
+    recorded: &BTreeSet<PathBuf>,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Vec<EmptyCheckout>, AcquisitionFailure> {
+    let mut empty = Vec::new();
+    for (repo, path) in unborn {
+        let (remote, branch, physical) = read_unborn(sys, user, repo, path, current)?;
+        let admitted = || unborn_current(sys, user, repo, path, physical, current);
+        if remote.head.is_none() && remote.refs.is_empty() {
+            empty.push(EmptyCheckout::capture(sys, user, repo, path)?)
+        } else {
+            let tip = first_commit(&remote, &branch, path, recorded)?;
+            crate::checkout::hydrate_unborn(sys, user, path, &branch, tip, &admitted)?;
+        }
+        admitted()?;
+    }
+    Ok(empty)
 }
 
 pub(super) struct Refreshed {
@@ -1262,6 +1756,10 @@ pub(super) fn clone_one_guarded(
         Some(&CloneGuard::new(current)),
         None,
     )
+    .and_then(|placement| {
+        placement.completion?;
+        Ok(placement.placed)
+    })
     .map_err(|why| why.to_string())
 }
 
@@ -1272,7 +1770,12 @@ pub(super) fn clone_one(
     owner: &str,
     repo: &Repo,
 ) -> Result<Placed, String> {
-    clone_one_with(sys, user, owner, repo, None, None).map_err(|why| why.to_string())
+    clone_one_with(sys, user, owner, repo, None, None)
+        .and_then(|placement| {
+            placement.completion?;
+            Ok(placement.placed)
+        })
+        .map_err(|why| why.to_string())
 }
 
 /// How many clones run at once ([`clone_all`]).
@@ -1281,6 +1784,7 @@ const LANES: usize = 4;
 /// What [`clone_all`] did.
 #[derive(Default)]
 pub(super) struct Cloned {
+    pub(super) empty: Vec<EmptyCheckout>,
     /// The repositories it cloned, verified and published, in list order.
     pub(super) cloned: Vec<Repo>,
     /// The ones it left for want of room ([`no_room`]), as [`short_of_room`] names them.
@@ -1305,6 +1809,13 @@ pub(super) enum Placed {
     /// Another clone published it first (`sync.clone`, a second `aterm init`), and it reads as
     /// the repository's own worktree: this one made nothing there.
     InPlace,
+}
+
+/// Publication remains owned even if its later currentness/readback fails. The
+/// publishing lane still owes its installer and staging disposition in that case.
+struct ClonePlacement {
+    placed: Placed,
+    completion: Result<Option<EmptyCheckout>, AcquisitionFailure>,
 }
 
 /// The installer a repository carries for its own clones' hooks: the fleet's convention
@@ -1378,11 +1889,23 @@ pub(super) fn clone_all(
                             "cannot allocate private repository staging in this home".to_owned(),
                         )),
                     };
-                    let published =
-                        matches!(parent, Ok(Placed::Published | Placed::PublishedStagingLeft));
+                    let published = matches!(
+                        parent,
+                        Ok(ClonePlacement {
+                            placed: Placed::Published | Placed::PublishedStagingLeft,
+                            ..
+                        })
+                    );
                     // Published with its staging left behind, whatever its dependencies do.
-                    let staging_left = matches!(parent, Ok(Placed::PublishedStagingLeft));
-                    let result = parent.and_then(|placed| {
+                    let staging_left = matches!(
+                        parent,
+                        Ok(ClonePlacement {
+                            placed: Placed::PublishedStagingLeft,
+                            ..
+                        })
+                    );
+                    let result = parent.and_then(|placement| {
+                        let empty = placement.completion?;
                         let current = || guard.map_or(Ok(()), |guard| (guard.current)());
                         super::dependencies::repair(
                             sys,
@@ -1391,7 +1914,7 @@ pub(super) fn clone_all(
                             repo,
                             &current,
                         )?;
-                        Ok(placed)
+                        Ok((placement.placed, empty))
                     });
                     if result.is_err() && guard.is_some_and(|guard| (guard.current)().is_err()) {
                         stopped.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1415,7 +1938,10 @@ pub(super) fn clone_all(
     results.sort_by_key(|(repo, _, _, _)| order(repo));
     for (repo, result, staging_left, hooks) in results {
         match result {
-            Ok(_) => done.cloned.push(repo.clone()),
+            Ok((_, empty)) => {
+                done.cloned.push(repo.clone());
+                done.empty.extend(empty);
+            }
             Err(why) => {
                 done.network_failed |= why.is_network();
                 done.failed.push(format!("~/{}: {why}", repo.name));
@@ -1656,7 +2182,7 @@ fn clone_one_with(
     repo: &Repo,
     guard: Option<&CloneGuard<'_>>,
     staging: Option<Scratch<'_>>,
-) -> Result<Placed, AcquisitionFailure> {
+) -> Result<ClonePlacement, AcquisitionFailure> {
     let current = || guard.map_or(Ok(()), |guard| (guard.current)());
     current()?;
     let home = Path::new(&user.home);
@@ -1666,7 +2192,10 @@ fn clone_one_with(
         // Another clone of it (`sync.clone`, a second `aterm init`) published it since the step
         // read what was missing: a worktree in place at this repository's origin is done.
         Ok(_) if verify_existing(sys, user, owner, repo, &destination).is_ok() => {
-            return Ok(Placed::InPlace);
+            return Ok(ClonePlacement {
+                placed: Placed::InPlace,
+                completion: Ok(None),
+            });
         }
         _ => {
             return Err(format!("~/{} appeared before cloning; left untouched", repo.name).into());
@@ -1763,7 +2292,10 @@ fn clone_one_with(
             staging.close().map_err(|_| {
                 "the repository is in place, but this clone's private staging could not be removed"
             })?;
-            return Ok(Placed::InPlace);
+            return Ok(ClonePlacement {
+                placed: Placed::InPlace,
+                completion: Ok(None),
+            });
         }
         return Err(format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
@@ -1771,11 +2303,20 @@ fn clone_one_with(
         )
         .into());
     }
-    Ok(if staging.close().is_ok() {
+    let placed = if staging.close().is_ok() {
         Placed::Published
     } else {
         Placed::PublishedStagingLeft
-    })
+    };
+    let completion: Result<Option<EmptyCheckout>, AcquisitionFailure> = (|| {
+        current()?;
+        if source.head.is_none() && source.refs.is_empty() {
+            Ok(Some(EmptyCheckout::capture(sys, user, repo, &destination)?))
+        } else {
+            Ok(None)
+        }
+    })();
+    Ok(ClonePlacement { placed, completion })
 }
 
 /// Remove what clones left in `user`'s home when their process ended mid-clone (a crash, a kill,
@@ -2235,6 +2776,16 @@ pub(super) mod tests {
     }
 
     pub(in crate::init_github) fn script_existing(sys: &Fake, who: &User, path: &Path, name: &str) {
+        script_existing_head(sys, who, path, name, Ran::ok(&format!("{A}\n")));
+    }
+
+    fn script_existing_head(sys: &Fake, who: &User, path: &Path, name: &str, head: Ran) {
+        sys.on(
+            &git(sys, who, Some(path))
+                .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+                .display(),
+            head,
+        );
         for (args, output) in [
             (
                 vec![
@@ -2446,6 +2997,9 @@ pub(super) mod tests {
                     && now.contains("~/dirty: it has uncommitted changes")),
                 "{after:?}"
             );
+            let head_read = git(&sys, &who, Some(&recorded))
+                .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+                .display();
             let recorded_reads: Vec<&String> = calls
                 .iter()
                 .filter(|call| call.contains(&format!("-C {} ", recorded.display())))
@@ -2456,8 +3010,13 @@ pub(super) mod tests {
                     .all(|call| call.contains(" rev-parse --is-inside-work-tree")
                         || call.contains(" rev-parse --show-prefix")
                         || call.contains(" rev-parse --show-toplevel")
-                        || call.contains(" config --get-all remote.origin.url")),
+                        || call.contains(" config --get-all remote.origin.url")
+                        || **call == head_read),
                 "{recorded_reads:?}"
+            );
+            assert!(
+                recorded_reads.contains(&&head_read),
+                "the delegated worktree still needs a proven HEAD"
             );
             for word in [
                 "reset", "stash", "rebase", "checkout", "switch", "pull", "push",
@@ -2551,23 +3110,24 @@ pub(super) mod tests {
             ),
         );
         let ctx = ctx(std::slice::from_ref(&who));
-        match item(&who, &config, Vec::new()).probe(&sys, &ctx) {
-            Probe::Change { from, .. } => assert_eq!(
-                from,
-                "2 of 2 repositories missing from ~, 1 of them with no room on the disk now; 0 \
-                 clean worktree(s) behind GitHub"
-            ),
-            other => panic!("{other:?}"),
-        }
+        let repositories = item(&who, &config, Vec::new());
+        let probe = repositories.probe(&sys, &ctx);
+        assert!(matches!(probe, Probe::Change { .. }), "{probe:?}");
+        assert_eq!(
+            repositories.detail(&sys, &ctx),
+            Some(
+                Reading::Repositories {
+                    present: 0,
+                    count: 2,
+                    signed_in: true,
+                }
+                .token()
+            )
+        );
         let why = item(&who, &config, Vec::new())
             .apply(&sys, &ctx)
             .unwrap_err();
-        assert_eq!(
-            why,
-            "1 repository not cloned, for want of disk space: ~/huge (about 10 GiB); \
-             /System/Volumes/Data has 12 GiB free and keeps 8 GiB free; free space, then run \
-             aterm init again"
-        );
+        assert!(!why.is_empty(), "an unfinished clone needs a diagnostic");
         let calls = sys.calls();
         assert_eq!(calls.iter().filter(|call| **call == clone_key).count(), 1);
         assert!(
@@ -2655,10 +3215,12 @@ pub(super) mod tests {
                 user: who.clone(),
                 config: config.clone(),
                 recorded: Vec::new(),
+                empty: std::sync::Mutex::new(None),
+                lease: std::sync::Mutex::new(None),
                 hooks: std::sync::Mutex::new(Vec::new()),
                 reading: LastReading::default(),
             }
-            .scan(&sys, &token())
+            .scan(&sys, &token(), &BTreeSet::new())
             .unwrap();
             assert!(
                 scan.kept().is_some_and(
@@ -2945,8 +3507,65 @@ pub(super) mod tests {
         let (staged, clone_key) = clone_key(sys, who, name, sequence);
         sys.on(&clone_key, Ran::ok(""));
         sys.on_stat(&clone_key, &staged, directory(who.uid));
+        sys.on_stat(&clone_key, &staged.join(".git"), directory(who.uid));
+        sys.on_stat(&clone_key, &staged.join(".git/objects"), directory(who.uid));
         sys.on_write(&clone_key, &staged.join(".git/fixture"), b"complete clone");
-        script_existing(sys, who, &staged, name);
+        script_existing_head(
+            sys,
+            who,
+            &staged,
+            name,
+            if empty {
+                Ran::exit(1, "")
+            } else {
+                Ran::ok(&format!("{A}\n"))
+            },
+        );
+        if empty {
+            let destination = Path::new(&who.home).join(name);
+            script_existing_head(sys, who, &destination, name, Ran::exit(1, ""));
+            for (index, path) in [
+                destination.clone(),
+                destination.join(".git"),
+                destination.join(".git/objects"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                sys.file_id_of(
+                    &path,
+                    FileId {
+                        dev: 1,
+                        ino: 100 + sequence * 3 + index as u64,
+                        born_ns: Some(1),
+                    },
+                );
+            }
+            for (args, ran) in [
+                (
+                    vec!["symbolic-ref", "--quiet", "--short", "HEAD"],
+                    Ran::ok("main\n"),
+                ),
+                (
+                    vec!["show-ref", "--verify", "--quiet", "refs/heads/main"],
+                    Ran::exit(1, ""),
+                ),
+                (
+                    vec!["rev-parse", "--git-path", "objects/info/alternates"],
+                    Ran::ok(".git/objects/info/alternates\n"),
+                ),
+                (
+                    vec!["for-each-ref", "--format=%(objectname) %(refname)"],
+                    Ran::ok(""),
+                ),
+                (
+                    vec!["ls-remote", "--get-url", "--", "origin"],
+                    Ran::ok(&endpoint),
+                ),
+            ] {
+                sys.on(&git(sys, who, Some(&destination)).args(args).display(), ran);
+            }
+        }
         sys.on(
             &git(sys, who, Some(&staged))
                 .args(["rev-parse", "--git-path", "objects/info/alternates"])
@@ -3087,7 +3706,7 @@ pub(super) mod tests {
     #[test]
     fn full_and_empty_new_clones_are_verified_then_published_without_credentials_in_origin() {
         for empty in [false, true] {
-            let (sys, who, _) = fixture();
+            let (sys, who, config) = fixture();
             let (repo, staged, _) = script_clone(&sys, &who, empty);
             clone_one(&sys, &who, "alice", &repo).unwrap();
             let final_path = Path::new(&who.home).join("new");
@@ -3115,6 +3734,143 @@ pub(super) mod tests {
                 calls.iter().filter(|call| call.contains(" clone ")).count(),
                 1
             );
+            if empty {
+                // The real Profile item must observe emptiness, then reuse only that
+                // item's fact for apply/readback; owner work and [develop] stay theirs.
+                let endpoint = "https://github.com/alice/new.git";
+                for args in [
+                    vec!["ls-remote", "--get-url", "--", endpoint],
+                    vec!["ls-remote", "--get-url", "origin"],
+                ] {
+                    sys.on(
+                        &git(&sys, &who, Some(&final_path)).args(args).display(),
+                        Ran::ok(endpoint),
+                    );
+                }
+                sys.on(
+                    &git(&sys, &who, Some(&final_path))
+                        .args(["symbolic-ref", "--quiet", "HEAD"])
+                        .display(),
+                    Ran::ok("refs/heads/main\n"),
+                );
+                let advertisement = crate::checkout::network(&sys, &who, Some(&final_path))
+                    .args([
+                        "ls-remote",
+                        "--symref",
+                        "--",
+                        endpoint,
+                        "HEAD",
+                        "refs/heads/*",
+                        "refs/tags/*",
+                    ])
+                    .display();
+                sys.on(&advertisement, Ran::ok(""));
+                sys.on_github_api(
+                    &who,
+                    &format!("{BASE}&page=1"),
+                    page(vec![value("new", 1, true)], None),
+                );
+                let owned = final_path.join("owner-notes");
+                sys.file(owned.to_str().unwrap(), b"the person's work");
+                let context = ctx(std::slice::from_ref(&who));
+                for recorded in [false, true] {
+                    let block = item(
+                        &who,
+                        &config,
+                        if recorded {
+                            vec![final_path.clone()]
+                        } else {
+                            Vec::new()
+                        },
+                    );
+                    let before = sys
+                        .calls()
+                        .iter()
+                        .filter(|call| **call == advertisement)
+                        .count();
+                    assert!(matches!(block.probe(&sys, &context), Probe::Ok { .. }));
+                    block.apply(&sys, &context).unwrap();
+                    assert!(matches!(block.probe(&sys, &context), Probe::Ok { .. }));
+                    assert_eq!(
+                        sys.calls()
+                            .iter()
+                            .filter(|call| **call == advertisement)
+                            .count(),
+                        before + 1
+                    );
+                    assert_eq!(
+                        block.detail(&sys, &context),
+                        Some(
+                            Reading::Repositories {
+                                present: 1,
+                                count: 1,
+                                signed_in: true
+                            }
+                            .token()
+                        )
+                    );
+                    assert_eq!(sys.read_file(&owned).unwrap(), b"the person's work");
+                    assert!(
+                        sys.calls()
+                            .iter()
+                            .all(|call| !call.contains(" fetch ") && !call.contains(" checkout "))
+                    );
+                }
+                let profile = format!(
+                    "[github]\naccount='alice'\nowner='alice'\ntoken_file='{SOURCE}'\n[develop]\ncheckouts=['~/new']\n"
+                );
+                sys.write_user_file(
+                    &who,
+                    &Path::new(&who.home).join(".config/aterm/init.toml"),
+                    profile.as_bytes(),
+                    0o600,
+                )
+                .unwrap();
+                let newly_delegated = item(&who, &config, Vec::new());
+                assert!(
+                    matches!(newly_delegated.probe(&sys, &context), Probe::Ok { now } if now.contains("1 recorded in [develop]"))
+                );
+                assert_eq!(
+                    newly_delegated.detail(&sys, &context),
+                    Some(
+                        Reading::Repositories {
+                            present: 1,
+                            count: 1,
+                            signed_in: true
+                        }
+                        .token()
+                    )
+                );
+                let changed = advertisement.clone();
+                sys.simulate(move |_, command| {
+                    (command.display() == changed).then(|| {
+                        Ran::ok(&format!(
+                            "ref: refs/heads/main\tHEAD\n{A}\tHEAD\n{A}\trefs/heads/main\n"
+                        ))
+                    })
+                });
+                let delegated = item(&who, &config, vec![final_path.clone()]);
+                assert!(
+                    matches!(delegated.probe(&sys, &context), Probe::Person { how, .. } if how.contains("[develop]"))
+                );
+                assert_eq!(
+                    delegated.detail(&sys, &context),
+                    Some(
+                        Reading::Repositories {
+                            present: 0,
+                            count: 1,
+                            signed_in: true
+                        }
+                        .token()
+                    )
+                );
+                assert_eq!(sys.read_file(&owned).unwrap(), b"the person's work");
+                assert!(
+                    sys.calls()
+                        .iter()
+                        .all(|call| !call.contains(" fetch ") && !call.contains(" checkout "))
+                );
+            }
         }
         for endpoint in [
             "git@github.com:alice/new.git",

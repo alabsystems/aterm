@@ -16,8 +16,8 @@ mod view;
 mod words;
 
 pub use model::{
-    AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Level, Link, MailFacts, MailLast,
-    NeedFact, NeedSeverity, Slot, StopCause, StoryVerb, TurnFact, WallAnswer,
+    AgentPhase, AgentReading, ChipLevel, ComposerState, Facts, Hand, HoldFact, Level, Link,
+    MailFacts, MailLast, NeedFact, NeedSeverity, Slot, StopCause, StoryVerb, TurnFact, WallAnswer,
 };
 pub use view::{View, chip_of_attention};
 pub use words::{

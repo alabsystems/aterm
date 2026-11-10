@@ -503,12 +503,10 @@ impl App {
     /// view.
     pub(crate) fn window_holds_private(&self, window: WindowId) -> bool {
         self.windows.get(&window).is_some_and(|ws| {
-            ws.tab_set.tabs().iter().any(|tab| {
-                tab.root
-                    .leaves()
-                    .into_iter()
-                    .any(|view| self.view_is_private(view))
-            })
+            ws.tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.any_leaf(&mut |&view| self.view_is_private(view)))
         })
     }
 
@@ -1369,8 +1367,7 @@ fn subtree_rect(
     tree: &SplitTree<ViewId>,
     leaves: &[crate::tab_model::LayoutLeaf<ViewId>],
 ) -> LogicalRect {
-    let ids = tree.leaves();
-    let mut matching = leaves.iter().filter(|leaf| ids.contains(&leaf.value));
+    let mut matching = leaves.iter().filter(|leaf| tree.contains(leaf.value));
     let Some(first) = matching.next() else {
         return LogicalRect::default();
     };

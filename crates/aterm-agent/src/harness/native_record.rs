@@ -65,6 +65,7 @@ impl State {
 #[derive(Default)]
 pub(super) struct Baseline {
     expected_native_state: Mutex<Memory>,
+    cold_retirement: Mutex<Option<(State, State)>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -83,6 +84,7 @@ struct Memory {
 impl Clone for Baseline {
     fn clone(&self) -> Self {
         Self {
+            cold_retirement: Mutex::new(None),
             expected_native_state: Mutex::new(Memory {
                 acknowledged: self
                     .expected_native_state
@@ -114,6 +116,10 @@ impl std::fmt::Debug for Baseline {
 }
 
 pub(super) fn acknowledge(st: &St, written: &St) {
+    *st.native_record
+        .cold_retirement
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
     let written = Stamp {
         generation: generation(written),
         write_id: write_id(written),
@@ -126,6 +132,26 @@ pub(super) fn acknowledge(st: &St, written: &St) {
         acknowledged: Some(written),
         attempted: None,
     };
+}
+
+/// A fresh host reply authorizes only this exact journal transition. It is neither
+/// serialized nor inherited by a clone; ordinary status writers cannot clear a hold.
+pub(super) fn authorize_cold_retirement(before: &St, after: &St) {
+    *after
+        .native_record
+        .cold_retirement
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((State::of(before), State::of(after)));
+}
+
+pub(super) fn permits_cold_retirement(caller: &St, previous: &St, next: &St) -> bool {
+    caller
+        .native_record
+        .cold_retirement
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|(before, after)| *before == State::of(previous) && *after == State::of(next))
 }
 
 pub(super) fn generation(st: &St) -> u64 {

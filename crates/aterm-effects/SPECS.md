@@ -3,6 +3,28 @@
 
 # aterm-effects: spec recovery from unit tests
 
+> 2026-11-09, the pet traced across a change of display scale (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+> §7 step 2): new row `regrid-keeps-rest`, and `no-teleport-law`'s give reads the art's width. New
+> cells under a caret that keeps its cell re-measure, through the art's width (`art_cols`: 5.61
+> columns on 7x14 px cells, 5.23 on 15x28), every station that reads it, and a resting body glided
+> the shift over about 120 frames, asleep or awake: a wall-side station's 0.374 columns, the seat
+> under Claude Code's composer 0.187. `PetBrain::keep_place_on_restation` moves a body on its station
+> with it on the tick that measures the new cells, in a hold too (a purr, a hide), and re-aims a
+> flight coming down on it. It measures against the tick before only, so a body off glass across the
+> change is placed by its first sighting on the new station. *Revised 2026-11-09 after review:* the
+> first version measured against the station of the last tick that reached the walk, however old,
+> and only at the walk: a body seen again after an unseen change came back a whole width change past
+> its station and glided back, and a body in a hold jumped the change in one frame when the hold
+> let go, outside `no-teleport-law`'s bound at 120 Hz or for a larger change of aspect; it also
+> refused a change of the grid's columns, which a window dragged between displays makes, since it
+> keeps its size in points (100 columns of 15 px cells become 107 of 7; the headless gui's drag,
+> aterm-gui's `pet_display_drag_tests`). A re-grid of unchanged cells lands a body resting under a
+> pixel off its station on it (0.03 columns, 0.2 px on 7 px cells), as before. Still the
+> locomotion's: a re-grid that changes the columns can change the side the wall's law stands a body
+> on (100 to 120 columns under a caret on column 96 sends a sleeping cat across the caret, 7.6
+> columns; 100 to 93 under one on column 88, the drag to a 2x display, too), and a flight that has
+> flown more than `REAIM_MAX_U` of its way at the change comes down on the old station and glides
+> the rest. The rows' tests ran with their negative controls (see the commit).
 > 2026-11-07, the glass's words (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` S8): `glass-inks`
 > said the gui's meter law calls `day_vivid_floor`; the weekly meter left the glass in S5, and the
 > laws that hold Day vivid now are the gui's `footer-outlook-inks` (line D's `⎆`, the card's levels
@@ -449,7 +471,8 @@ flow-latch	contract	PetBrain::{note_flow,tick}; FLOW_LATCH_TTL	note_flow adds no
 time-translation-determinism	equivalence	PetBrain::tick; PetFrame::fp	For every script and offset d the frames of the script and of the script shifted by d are identical: tick reads time only through differences and stored instants.	0,1,2,5,7,13	3
 empty-ink-identity	equivalence	PetBrain::{sense_ink,tick}	Feeding an empty ink map first gives fp-identical frames to never feeding one.	0,1,2,7	1
 viewport-clamp	invariant	PetBrain::{emit,tick}	Every frame has 0 <= col <= max(cols - w, 0) and 0 <= row <= rows - 1, and an airborne bound's sprite top stays at or below the viewport top (the apex gives up height).	0,2,3,7	2
-no-teleport-law	invariant	PetBrain::{tick,emit,begin_arc,begin_big_arc,launch_big,leave_ground,retime,content_ride,carry_with_regrid}; re-aim	After the seeding frame every step moves col by at most max(MAX_SPEED, the flight rates before and after) times dt plus a resize give, and rows change only in flight or when content_ride carries a resting cat down with the shifted rows round it (carry_with_regrid); every launch has span/dur <= HOP_SPEED_MAX (pounce) or quiet_speed_max(cols) (bound); a re-aim keeps the remaining rate within the cap, draws out a row change via retime up to ROW_REAIM_MAX_U (column re-aims up to REAIM_MAX_U) without regressing Flight::stage, rebases so the drawn body does not move, never turns a flight back in the air (taking only the caret's row and keeping its column when a row change puts the station behind, where that stand fits), and refuses any landing that does not fit; every caret-driven launch spends the jump latch. So an hour between ticks moves the body under 5 cols and a one-frame hide never moves a visible body a cell.	0,1,2,3,4,5,7,11	8
+no-teleport-law	invariant	PetBrain::{tick,emit,begin_arc,begin_big_arc,launch_big,leave_ground,retime,content_ride,carry_with_regrid,keep_place_on_restation}; re-aim	After the seeding frame every step moves col by at most max(MAX_SPEED, the flight rates before and after) times dt plus a re-grid's give (the larger of the move of the edge a station clamps at, the columns less the art's width, and the change of the art's width, art_cols, which moves every station that reads it), and rows change only in flight or when content_ride carries a resting cat down with the shifted rows round it (carry_with_regrid); every launch has span/dur <= HOP_SPEED_MAX (pounce) or quiet_speed_max(cols) (bound); a re-aim keeps the remaining rate within the cap, draws out a row change via retime up to ROW_REAIM_MAX_U (column re-aims up to REAIM_MAX_U) without regressing Flight::stage, rebases so the drawn body does not move, never turns a flight back in the air (taking only the caret's row and keeping its column when a row change puts the station behind, where that stand fits), and refuses any landing that does not fit; every caret-driven launch spends the jump latch. So an hour between ticks moves the body under 5 cols and a one-frame hide never moves a visible body a cell.	0,1,2,3,4,5,7,11	8
+regrid-keeps-rest	invariant	PetBrain::{tick,keep_place_on_restation,carry_resting_body,rebase_geometry}; CompanionOwner::rebase_geometry	On a tick whose cells give the art another width (art_cols) than the tick before had, for the caret's cell that tick had, where the station the tick measures (its aim) moved from the one the tick before measured by no more than that width's change and on its row (a change of display scale, the grid's rows and columns kept or changed with the cells; a font step): a body within ARRIVED of the old station, at rest (no flight, speed or brake, not walking, running or landing) and not yet moved on the tick, moves with the station, whatever it does there (asleep, purring, hiding); its pose, alpha, row and lift stay frame for frame those of the same brain given no re-grid, the station's anchor (a wall-side body's right edge, a caret-side body's left edge, a console seat's centre) stays within a pixel of the new cells, and from that tick on the body is as still as that brain, within the pixel it lands its rest on. A flight coming down within ARRIVED of the old station comes down on the new one, rebased so the drawn body does not move, while it has flown no more than REAIM_MAX_U of its way and the rest fits flight_cap. Only the tick before is measured against: a body off glass across the change is placed by its first sighting on the new station. A station that moved further (the wall's law's other side, a clamp at a moved grid edge), a moved caret or another row leaves the body to the locomotion.	0,1,2,3,5,7	4
 flight-wall-time	contract	PetBrain::{tick,flight_shape,big_shape}	A flight's clock advances by each tick's clamped dt, so it lands by the first tick at or after t0 + dur with at most one tick of overshoot; pounces last at most FLIGHT_MAX and bounds BIG_FLIGHT_MAX plus a tick; a wrap from a long line ends on the new row.	0,2,3,7	3
 first-sighting	contract	PetBrain::{tick,tick_static_capture,needs_frames}	An off-glass pet seen at caret (r,c) is placed exactly at (station(c), r); a fade-in's seeding tick has alpha 0 and owes frames; tick_static_capture of a fresh brain returns alpha 255 at the station; a caret that hides until dark and returns elsewhere is a new sighting, never a Startle.	0,1,2,3	4
 fade-and-appearance	contract	PetBrain::{tick,sync_look,colors_for_appearance,appearance_colors,invalidate_colors,is_active}; PetFrame::fp	With the caret hidden alpha reaches 0 within FADE_OUT plus a tick, then fp = 0 and not active. One appearance wears one look and palette: a visible re-sync parks and lands at alpha 0, a hidden one applies at once, an agreeing one is a no-op; colors_for_appearance returns the first sample until invalidated or the pet goes dark.	0,1,2,3,10	4
@@ -1655,6 +1678,7 @@ src/kitty_pet.rs	a_bell_inside_a_commanded_sit_ends_the_seat	bell-stimulus
 src/kitty_pet.rs	a_bell_wakes_the_sleeper	bell-stimulus	
 src/kitty_pet.rs	a_big_retreat_still_bottles	retreat-reactions	
 src/kitty_pet.rs	a_bored_cat_hides_behind_a_word_and_comes_back	pointer-play	
+src/kitty_pet.rs	a_body_off_glass_through_a_scale_change_is_seen_on_its_new_station	regrid-keeps-rest	first-sighting
 src/kitty_pet.rs	a_build_log_under_the_cat_is_not_chased_across_the_pane	stream-watch	
 src/kitty_pet.rs	a_burst_of_new_lines_comes_home_quietly	show-door	
 src/kitty_pet.rs	a_caret_jump_interrupts_the_watch	stream-watch	
@@ -1682,6 +1706,7 @@ src/kitty_pet.rs	a_far_peek_is_ignored	peek-latch-ranges
 src/kitty_pet.rs	a_fast_command_only_nudges	verdict-choreography	
 src/kitty_pet.rs	a_first_sighting_materialises_at_the_station_not_at_the_origin	first-sighting	
 src/kitty_pet.rs	a_flight_lands_on_wall_time_through_synchronized_output_holds	flight-wall-time	
+src/kitty_pet.rs	a_flight_through_a_scale_change_comes_down_on_its_new_station	regrid-keeps-rest	no-teleport-law
 src/kitty_pet.rs	a_flinch_under_a_hiding_cat_ends_the_hide	pet-idle-to-zero	
 src/kitty_pet.rs	a_gentle_body_stroke_earns_a_visible_finite_affection_beat	petting-affection	
 src/kitty_pet.rs	a_ghost_reaches_its_door_on_a_wide_pane	breed-handoff	
@@ -1729,6 +1754,7 @@ src/kitty_pet.rs	a_revoked_trick_leaves_the_frames_byte_identical	trick-latch-al
 src/kitty_pet.rs	a_roll_interrupted_by_an_enter_jump_releases_the_lane_and_never_replays	pet-idle-to-zero	
 src/kitty_pet.rs	a_round_trip_flip_never_walks	breed-handoff	
 src/kitty_pet.rs	a_running_job_keeps_the_cat_awake_with_you	vigil	
+src/kitty_pet.rs	a_scale_change_keeps_a_resting_body_on_its_station	regrid-keeps-rest	no-teleport-law
 src/kitty_pet.rs	a_scrolled_wrap_is_a_wrap	new-line-law	
 src/kitty_pet.rs	a_seam_crossing_never_bets_past_the_station	keep-ahead-lead	
 src/kitty_pet.rs	a_seat_commanded_off_its_mark_is_taken_after_the_walk_home	trick-performance	
@@ -1863,6 +1889,7 @@ src/kitty_pet/console_life.rs	a_late_wake_read_still_offers_the_unconsumed_expir
 src/kitty_pet/console_life.rs	a_look_swap_landing_under_a_hidden_caret_resident_keeps_both_halves_of_the_crossfade	console-ghost-rules	
 src/kitty_pet/console_life.rs	a_look_swaps_arrival_ramp_runs_while_the_console_resident_owns_the_tick	console-ghost-rules	
 src/kitty_pet/console_life.rs	a_roll_plays_through_an_executing_block	console-trick-interplay	
+src/kitty_pet/console_life.rs	a_scale_change_keeps_the_cat_on_its_console_seat	regrid-keeps-rest	
 src/kitty_pet/console_life.rs	a_seat_typed_through_a_repair_is_taken_and_held	console-trick-interplay	
 src/kitty_pet/console_life.rs	a_spent_content_perch_hands_the_pet_back_its_own_life	console-attention	
 src/kitty_pet/console_life.rs	a_trick_typed_through_a_repair_is_still_performed	console-trick-interplay	

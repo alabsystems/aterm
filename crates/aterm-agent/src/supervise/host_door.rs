@@ -238,6 +238,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = wake;
         None
     }
+    /// Whether `why` is an account event for the session's proven scoped harness, not a built-in
+    /// process restart. The observer gate admits only this host-certified action.
+    fn scoped_restart(&self, why: &super::super::policy::turn_end::Restart) -> bool {
+        let _ = why;
+        false
+    }
     /// The restart in place `why`, asked as `ask` ([`super::super::policy::turn_end::RestartAsk`]:
     /// the same at every ask of one restart), and the host's answer
     /// ([`super::super::policy::turn_end::RestartAnswer`]): its word for what it did, and what it

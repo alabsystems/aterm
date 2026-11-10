@@ -163,15 +163,25 @@ pub fn write(paths: &Paths, cidr: &Cidr) -> Result<()> {
 /// profile at `paths` follows, `live_genesis` whether its records pin the live ALab genesis. Read
 /// on the desk's lane or a connection thread, never a window's main thread: this Mac's route comes
 /// from [`aterm_netplace::facts::here_now`], which reads the path.
-#[must_use]
-pub fn home(paths: &Paths, config: Option<&Config>, live_genesis: bool) -> Option<HomeNet> {
-    let config = config?;
+///
+/// # Errors
+/// [`FILE`] or the profile's identity cannot be read, or [`FILE`] holds no CIDR [`Cidr::parse`]
+/// takes: no home either, but one a reader that keeps what it read must not keep
+/// (`desk::Local::whole`).
+pub fn home(paths: &Paths, config: Option<&Config>, live_genesis: bool) -> Result<Option<HomeNet>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
     if live_genesis || client::alab_vault(config) || !matches!(config.source, Source::Url(_)) {
-        return None;
+        return Ok(None);
     }
-    let cidr = read(paths).ok()??;
-    client::lab_mark(paths).ok()??;
-    home_in(&cidr, &aterm_netplace::facts::here_now())
+    let Some(cidr) = read(paths)? else {
+        return Ok(None);
+    };
+    if client::lab_mark(paths)?.is_none() {
+        return Ok(None);
+    }
+    Ok(home_in(&cidr, &aterm_netplace::facts::here_now()))
 }
 
 /// This Mac's home under `cidr` where `here` puts its default route ([`route_in`]).

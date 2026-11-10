@@ -134,6 +134,12 @@ enum Message {
         binding: Binding,
         reply: SyncSender<bool>,
     },
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    TestCloseLinkerLifeline {
+        binding: Binding,
+        attempt: [u8; 16],
+        reply: SyncSender<bool>,
+    },
     AuthorizeWorkloadProduced {
         peer: Peer,
         request: Box<trust_resource_controller::workload::host::produced::ProducedRequest>,
@@ -282,6 +288,16 @@ fn stop_test() -> io::Result<bool> {
 pub(super) fn control_eof_before_reap_test(binding: Binding) -> io::Result<bool> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::TestControlEofBeforeReap { binding, reply })?;
+    receive_reply(read).map_err(|_| unavailable())
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn close_linker_lifeline_test(binding: Binding, attempt: [u8; 16]) -> io::Result<bool> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::TestCloseLinkerLifeline {
+        binding,
+        attempt,
+        reply,
+    })?;
     receive_reply(read).map_err(|_| unavailable())
 }
 fn actor() -> io::Result<&'static Handle> {
@@ -970,6 +986,14 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
                 Message::TestControlEofBeforeReap { binding, reply } => {
                     let _ = reply.try_send(owner.control_eof_before_reap_test(&binding));
+                }
+                #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+                Message::TestCloseLinkerLifeline {
+                    binding,
+                    attempt,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.close_linker_lifeline_test(&binding, attempt));
                 }
                 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
                 Message::TestStop(reply) => {

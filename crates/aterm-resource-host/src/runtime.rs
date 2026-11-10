@@ -54,12 +54,31 @@ pub(crate) fn test_endpoint() -> io::Result<()> {
 }
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn test_endpoint_with_store(path: &std::path::Path) -> io::Result<()> {
+    test_store_endpoint(path, false)
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn test_endpoint_with_native_store(path: &std::path::Path) -> io::Result<()> {
+    test_store_endpoint(path, true)
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn test_store_endpoint(path: &std::path::Path, with_native: bool) -> io::Result<()> {
     let store = open_store_description(path)?;
     let program = std::env::current_exe()?.canonicalize()?;
+    let native = if with_native {
+        let native = trust_resource_provenance::Store::open_at(path)?
+            .pin_program(&program, control_deadline(Instant::now()))?;
+        native.validate_cached_process(
+            trust_resource_provenance::process::read_identity(std::process::id())?,
+            control_deadline(Instant::now()),
+        )?;
+        Some(Arc::new(native))
+    } else {
+        None
+    };
     ENDPOINT
         .set(Endpoint {
             program,
-            native: None,
+            native,
             telemetry: None,
             store: Some(store),
         })

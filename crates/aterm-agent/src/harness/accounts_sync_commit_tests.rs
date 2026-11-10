@@ -153,6 +153,96 @@ fn oversized_stored_receipt_refuses_before_auxiliary_effects() {
 }
 
 #[test]
+fn stale_before_images_never_publish_a_new_pending_receipt() {
+    for (during_auxiliary, matches_after) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        for role in [
+            ImageRole::State,
+            ImageRole::Logins,
+            ImageRole::Ledger,
+            ImageRole::Roster,
+            ImageRole::Fleet,
+            ImageRole::SourcePolicy,
+        ] {
+            let bed = Bed::new();
+            let fleet = bed.root.path().join("fleet.toml");
+            std::fs::write(&fleet, "# original\n").unwrap();
+            let mut plan = bed.receipt.plan.clone().unwrap();
+            plan.fleet = Some(FleetImage {
+                path: fleet.to_str().unwrap().to_owned(),
+                mode: Some(0o600),
+                image: Image {
+                    before: Some("# original\n".to_owned()),
+                    after: Some("# updated\n".to_owned()),
+                },
+            });
+            let (before, after) = bed.store.retirement_image(NOW).unwrap();
+            plan.source_policy = Some(Image {
+                before,
+                after: Some(after),
+            });
+            let scope = Scope {
+                roster: Some(&bed.path),
+                fleet: Some(&fleet),
+            };
+            let paths = plan.paths(&bed.store, scope).unwrap();
+            let target = paths.iter().find(|(kind, _)| *kind == role).unwrap();
+            let before: Vec<_> = paths
+                .iter()
+                .map(|(kind, path)| read(path, kind.limit()).unwrap())
+                .collect();
+            let receipt_before = read(&bed.store.dir.join(RECEIPT), MAX_RECEIPT).unwrap();
+            let held = bed.store.acquire().unwrap();
+            let conflicting = if matches_after {
+                plan.image(role).unwrap().after.clone().unwrap()
+            } else if role == ImageRole::SourcePolicy {
+                bed.store.retirement_image(NOW - 1).unwrap().1
+            } else {
+                "outside edit\n".to_owned()
+            };
+            let edit = || {
+                if role == ImageRole::SourcePolicy {
+                    bed.store
+                        .retain_witness(&bed.store.source_policy_witness())
+                        .unwrap();
+                }
+                std::fs::write(&target.1, &conflicting).unwrap();
+            };
+            if !during_auxiliary {
+                edit();
+            }
+            let called = std::cell::Cell::new(false);
+            let result = bed.store.publish_plan_scoped(&held, scope, plan, &[], || {
+                called.set(true);
+                if during_auxiliary {
+                    edit();
+                }
+                Ok(())
+            });
+            assert!(
+                result.is_err(),
+                "{role:?}, auxiliary={during_auxiliary}, matches_after={matches_after}"
+            );
+            assert_eq!(called.get(), during_auxiliary);
+            assert_eq!(
+                read(&bed.store.dir.join(RECEIPT), MAX_RECEIPT).unwrap(),
+                receipt_before,
+                "a stale {role:?} image must not leave a newly pending receipt"
+            );
+            for ((kind, path), original) in paths.iter().zip(before) {
+                let expected = if *kind == role {
+                    Some(conflicting.clone())
+                } else {
+                    original
+                };
+                assert_eq!(read(path, kind.limit()).unwrap(), expected, "{kind:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn scoped_state_publications_refuse_missing_witnessed_images() {
     for missing_state in [false, true] {
         for operation in 0..3 {
@@ -187,10 +277,14 @@ fn scoped_state_publications_refuse_missing_witnessed_images() {
             let result = match operation {
                 0 => bed
                     .store
-                    .transact_roster_held(&held, NOW, &mut None, target()),
-                1 => bed
-                    .store
-                    .transact_roster_state_held(&held, NOW, &mut None, target(), edit),
+                    .transact_roster_held(&held, NOW, &mut None, target(), false),
+                1 => bed.store.transact_roster_state_held(
+                    &held,
+                    NOW,
+                    &mut None,
+                    target(),
+                    (false, edit),
+                ),
                 2 => bed.store.transact_fleet_state_policy_held(
                     &held,
                     NOW,

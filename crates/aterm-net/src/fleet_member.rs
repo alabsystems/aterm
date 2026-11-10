@@ -1690,9 +1690,9 @@ fn same_host(a: &str, b: &str) -> bool {
     }
     let bare_of = |bare: &str, dotted: &str| {
         !bare.contains('.')
-            && dotted
-                .split_once('.')
-                .is_some_and(|(label, _)| label.eq_ignore_ascii_case(bare))
+            && dotted.split_once('.').is_some_and(|(label, domain)| {
+                domain.eq_ignore_ascii_case("local") && label.eq_ignore_ascii_case(bare)
+            })
     };
     bare_of(a, b) || bare_of(b, a)
 }

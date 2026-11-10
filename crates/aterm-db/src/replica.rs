@@ -14,7 +14,7 @@ use crate::{
     table::{
         Scope, Session,
         conflict::ProofKey,
-        store::{Receipt, Store, Via},
+        store::{Fence, Receipt, Store, Via},
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -167,6 +167,9 @@ pub(crate) struct InventoryObservation {
 
 /// Historical evidence that an authenticated peer reported the same retained operation IDs.
 /// This establishes neither projection equality, decryptability, nor current/global currency.
+/// Its final read, under a fresh admission, stands on the store's unchanged enrollment claim where
+/// the store has not moved (`Round::fenced_observation`): it reads neither the table's journal nor
+/// its records again, so damage to them under an unchanged claim is the next open's to find.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchingInventory {
     observed: InventoryObservation,
@@ -185,7 +188,8 @@ impl MatchingInventory {
     pub const fn peer_actor(self) -> Actor {
         self.observed.peer_actor
     }
-    /// Exact local control head and basis admitted during both inventory reads.
+    /// Exact local control head and basis admitted at both the operation inventory's read and the
+    /// final read.
     pub const fn control_observation(self) -> [u8; 64] {
         self.observed.control_observation
     }
@@ -859,7 +863,7 @@ impl Replica {
             tables: self.tables.clone(),
             commons: self.commons.clone(),
             active_table: std::cell::Cell::new(None),
-            inventory_observation: std::cell::Cell::new(None),
+            inventory_read: std::cell::RefCell::new(None),
         })
     }
 
@@ -1111,7 +1115,7 @@ impl Replica {
             return Ok(None);
         };
         round.local(None, |session| match round.store(session, table) {
-            Ok(store) => Ok(Some(store.inventory(session)?.copied().collect())),
+            Ok(store) => Ok(Some(store.inventory_unchecked().copied().collect())),
             Err(error) if error.is_busy() => Err(error),
             Err(_) => Ok(None),
         })
@@ -1130,7 +1134,7 @@ impl Replica {
             let store = round.store(session, table)?;
             let mut wires = Vec::new();
             for id in ids {
-                if let Some(wire) = store.wire(session, id)? {
+                if let Some(wire) = store.wire_unchecked(id) {
                     wires.push(wire.to_vec());
                 }
             }
@@ -1148,7 +1152,7 @@ impl Replica {
             return Ok(None);
         };
         round.local(None, |session| match round.store(session, table) {
-            Ok(store) => store.proof_inventory(session).map(Some),
+            Ok(store) => Ok(Some(store.proof_inventory_unchecked())),
             Err(error) if error.is_busy() => Err(error),
             Err(_) => Ok(None),
         })
@@ -1167,7 +1171,7 @@ impl Replica {
             let store = round.store(session, table)?;
             let mut wires = Vec::new();
             for key in keys {
-                if let Some(wire) = store.proof_wire(session, key)? {
+                if let Some(wire) = store.proof_wire_unchecked(session, key)? {
                     wires.push(wire);
                 }
             }
@@ -1237,8 +1241,8 @@ impl Replica {
                 round.active_table.set(Some(table));
                 match round.store(session, table) {
                     Ok(store) => {
-                        let ids = store.inventory(session)?.copied().collect();
-                        let proofs = store.proof_inventory(session)?;
+                        let ids = store.inventory_unchecked().copied().collect();
+                        let proofs = store.proof_inventory_unchecked();
                         out.push((table, ids, proofs));
                     }
                     Err(error) if error.is_busy() => return Err(error),
@@ -1309,6 +1313,9 @@ struct Inventory {
     known: BTreeSet<Digest>,
     offered: BTreeSet<Digest>,
     observation: InventoryObservation,
+    /// The store's custody as this read found it, which the round's matching inventory stands
+    /// on where it holds ([`Round::fenced_observation`]).
+    fence: Option<Fence>,
 }
 
 struct Round<'a> {
@@ -1325,7 +1332,8 @@ struct Round<'a> {
     /// Locally selected storage; switching to recovery never changes membership or the actor.
     commons: Option<(crate::catalog::Directory, PathBuf)>,
     active_table: std::cell::Cell<Option<Digest>>,
-    inventory_observation: std::cell::Cell<Option<InventoryObservation>>,
+    /// The table's operation inventory as the round read it, with that read's fence.
+    inventory_read: std::cell::RefCell<Option<(InventoryObservation, Option<Fence>)>>,
 }
 impl std::ops::Deref for Round<'_> {
     type Target = Replica;
@@ -1345,6 +1353,13 @@ impl Round<'_> {
         self.exchange_with_policy(stream, peer, side, repair, ProbePolicy::Projection)
     }
 
+    /// Table `id`'s store, opened in `session`. In a read session (each [`Self::local`]'s), every
+    /// path ends in an open whose last step checks the store (`Store::check`: the session's
+    /// currency and the enrollment claim), so the reads that follow it in the same closure stand on
+    /// that check and take the store's unchecked accessors: a checked one would check the store
+    /// again for nothing, once more for each store a quiet table round opens (2026-11-09). A
+    /// control writer's `Store::open` seals its pending writes after that check, so this holds of
+    /// read sessions only.
     fn store(&self, session: &Session<'_>, id: Digest) -> Result<Store> {
         let (scope, path) = &self.tables[&id];
         if let Some((directory, _)) = &self.commons
@@ -2119,7 +2134,7 @@ impl Round<'_> {
                     return Ok(None);
                 }
             };
-            let known = store.inventory(session)?.copied().collect();
+            let known = store.inventory_unchecked().copied().collect();
             Ok(Some(Inventory {
                 observation: InventoryObservation {
                     scope: store.scope(),
@@ -2132,6 +2147,7 @@ impl Round<'_> {
                 },
                 known,
                 offered: store.replication_inventory_unchecked().copied().collect(),
+                fence: store.fence(),
             }))
         });
         Self::table_read(read, refusal, cause)
@@ -2179,7 +2195,7 @@ impl Round<'_> {
                     } else {
                         self.store(session, *id)?
                     };
-                    let known = store.inventory(session)?;
+                    let known = store.inventory_unchecked();
                     Ok(Some(
                         InventorySummary::of_sorted(known.len(), known).fingerprint,
                     ))
@@ -2196,15 +2212,80 @@ impl Round<'_> {
         id: Digest,
         report: &Report,
     ) -> Option<MatchingInventory> {
-        let before = self.inventory_observation.get()?;
+        let read = self.inventory_read.borrow();
+        let (before, fence) = read.as_ref()?;
         if report.local_known != report.peer_known || report.deferred != 0 {
             return None;
         }
-        let after = self
-            .inventory(peer, id, &mut None, &mut None)
-            .ok()??
-            .observation;
-        MatchingInventory::from_observations(report, before, after)
+        let after = match fence
+            .as_ref()
+            .and_then(|fence| self.fenced_observation(peer, id, before, fence))
+        {
+            Some(after) => after,
+            None => {
+                self.inventory(peer, id, &mut None, &mut None)
+                    .ok()??
+                    .observation
+            }
+        };
+        MatchingInventory::from_observations(report, *before, after)
+    }
+
+    /// `before`'s inventory observed again under a fresh read admission without reading the store
+    /// again, where [`Self::store`] would open the store `fence` was taken of and it stands as
+    /// that read found it ([`Self::opens_fenced`]): its records, and so its inventory, are the
+    /// same claim's witnessed prefix. A store that moved, another store, or any error is `None`,
+    /// and the caller reads the inventory again.
+    fn fenced_observation(
+        &self,
+        peer: Actor,
+        id: Digest,
+        before: &InventoryObservation,
+        fence: &Fence,
+    ) -> Option<InventoryObservation> {
+        self.local(peer, |session| {
+            let sampled_at = Instant::now();
+            let observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
+            if !self.opens_fenced(session, id, fence)? {
+                return Ok(None);
+            }
+            Ok(Some(InventoryObservation {
+                scope: fence.scope(),
+                local_actor: session.actor(),
+                peer_actor: peer,
+                control_observation: session.observation()?,
+                inventory: before.inventory,
+                observed_at_ms,
+                sampled_at,
+            }))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Whether [`Self::store`] would open, in this read `session`, the store `fence` was taken of
+    /// with its custody unchanged ([`Fence::stands`]). Its choice among a Commons application
+    /// table's stores is this one: an existing recovery store first, so a primary's fence holds
+    /// only while no recovery store exists. A directory in recovery, whose choice reads the
+    /// primary too, declines.
+    fn opens_fenced(&self, session: &Session<'_>, id: Digest, fence: &Fence) -> Result<bool> {
+        let (scope, _) = &self.tables[&id];
+        if let Some((directory, _)) = &self.commons
+            && *scope != directory.catalog_scope()
+        {
+            if directory.is_recovery() {
+                return Ok(false);
+            }
+            if !fence.is_recovery()
+                && directory
+                    .recovery()
+                    .observe_store_if_exists(session, *scope)?
+                    .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        fence.stands(session)
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -2245,7 +2326,7 @@ impl Round<'_> {
                 }
             };
             report.recovery |= store.is_recovery();
-            store.proof_inventory(session).map(Some)
+            Ok(Some(store.proof_inventory_unchecked()))
         });
         let local = Self::table_read(local, &mut local_error, &mut local_cause)?;
         let remote = exchange_inventory(stream, side, local.as_ref(), MAX_PROOFS, || {
@@ -2378,7 +2459,8 @@ impl Round<'_> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .observe(id, &local.known, &remote);
-        self.inventory_observation.set(Some(local.observation));
+        self.inventory_read
+            .replace(Some((local.observation, local.fence)));
         let mut ids: Vec<_> = cycle(&local.offered, repair.records.get(&id).copied())
             .filter(|v| !remote.contains(*v))
             .take(BATCH + 1)

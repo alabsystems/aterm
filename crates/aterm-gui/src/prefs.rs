@@ -376,6 +376,8 @@ pub(crate) const EDIT_HARNESS_QUESTION_PRIORITY: &str = "harness.question_priori
 pub(crate) const EDIT_HARNESS_CLAUDE_ENABLED: &str = "harness.claude.enabled";
 /// Compatibility policy key allowing codex-alab's native Autopilot.
 pub(crate) const EDIT_HARNESS_CODEX_ENABLED: &str = "harness.codex.enabled";
+/// `[harness.kimi] enabled`.
+pub(crate) const EDIT_HARNESS_KIMI_ENABLED: &str = "harness.kimi.enabled";
 
 /// The label of Codex's own switch ([`EDIT_HARNESS_CODEX_ENABLED`]).
 pub(crate) const CODEX_SWITCH_LABEL: &str = "Enable codex-alab Autopilot";
@@ -655,6 +657,11 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: EDIT_HARNESS_MUSE_ENABLED,
         label: "Supervise Muse Code sessions",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: EDIT_HARNESS_KIMI_ENABLED,
+        label: "Supervise Kimi Code sessions",
         kind: EditKind::Bool,
     },
     NestedLeaf {

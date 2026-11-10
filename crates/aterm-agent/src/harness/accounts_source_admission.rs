@@ -138,6 +138,22 @@ impl AutomaticSource {
             .as_ref()
             .is_some_and(accounts::source_policy::Snapshot::retired)
     }
+
+    pub(super) fn chosen(
+        &self,
+        cli: Cli,
+        roster: &Path,
+        named: Option<&str>,
+    ) -> Result<Option<FleetRoster>, String> {
+        self.validate()?;
+        super::super::alab_roster::chosen_from(
+            &self.observation,
+            cli,
+            Some(roster),
+            named,
+            Some(&self.config),
+        )
+    }
 }
 
 fn read_config(config: &Path) -> Result<Option<String>, String> {

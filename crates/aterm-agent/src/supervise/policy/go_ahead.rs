@@ -1455,15 +1455,22 @@ const RESTARTED: &[&str] = &[
 /// in it or `before`), or pending own work in a semicolon-joined prior clause ([`prior_clause_works`]).
 fn works(unit: &Unit, before: Option<&Unit>, stop_note: bool) -> bool {
     let names = |u: &Unit, bases: &[&str]| u.words.iter().any(|(_, w)| inflects_any(w, bases));
-    let worked = (0..unit.len()).any(|i| {
+    // What a condition names is what the go-ahead waits for, not the agent's work: `the test
+    // iPhone` in `once the test iPhone is connected` is no test the agent runs.
+    let condition = in_condition(unit);
+    let own = |i: usize| !condition[i];
+    let worked = (0..unit.len()).filter(|&i| own(i)).any(|i| {
         let w = unit.word(i);
         inflects_any(w, WORK) && (!inflects_any(w, GENERIC_WORK) || generic_own(unit, i))
     });
-    if worked || unit.any(WORK_IRREGULAR) || !own_cleanup(unit).is_empty() {
+    if worked
+        || (0..unit.len()).any(|i| own(i) && WORK_IRREGULAR.contains(&unit.word(i)))
+        || own_cleanup(unit).into_iter().any(own)
+    {
         return true;
     }
     let mains = unit.any(&["main", "branch"]);
-    if (0..unit.len()).any(|i| {
+    if (0..unit.len()).filter(|&i| own(i)).any(|i| {
         let w = unit.word(i);
         (inflects(w, "merge") && mains)
             || (inflects(w, "rebase") && unit.any(&["main"]))
@@ -1474,6 +1481,34 @@ fn works(unit: &Unit, before: Option<&Unit>, stop_note: bool) -> bool {
     (restarts(unit)
         && (stop_note || names(unit, RESTARTED) || before.is_some_and(|b| names(b, RESTARTED))))
         || before.is_some_and(|b| prior_clause_works(unit, b))
+}
+
+/// Which words of `unit` stand in a condition the go-ahead waits on: from `once`, `when` or
+/// `after` to the clause's end (a comma, semicolon or colon, `so` or `then`, or the sentence's
+/// end),
+/// as in `Waiting on your go-ahead once the test iPhone is connected.` or `… once you connect the
+/// test iPhone.`
+fn in_condition(unit: &Unit) -> Vec<bool> {
+    // Not `until`: `until you tell me to rebuild` is the go-ahead itself, its act the agent's.
+    const OPENS: &[&str] = &["once", "when", "after"];
+    // `when you're back so I can rebuild`: what follows is the agent's again.
+    const CLOSES: &[&str] = &["so", "then"];
+    let mut open = false;
+    let mut end = 0;
+    unit.words
+        .iter()
+        .map(|(at, w)| {
+            if open
+                && (unit.lower[end.min(*at)..*at].contains([',', ';', ':'])
+                    || CLOSES.contains(&w.as_str()))
+            {
+                open = false;
+            }
+            end = at + w.len();
+            open |= OPENS.contains(&w.as_str());
+            open
+        })
+        .collect()
 }
 
 /// Whether `b`, joined to `unit` by a semicolon in the same paragraph (`Ready to commit and

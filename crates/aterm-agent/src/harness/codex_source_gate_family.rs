@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::harness::{codex_session_slot::Caller, codex_source_registry};
+use std::sync::Arc;
 
 pub enum FamilySource<'a> {
     Manager(&'a codex_source_registry::ReadySourceProof),
@@ -186,11 +187,100 @@ impl SourceBorrow<'_, '_> {
 
 /// Owned only by a registry phase. Its source proof survives legitimate member
 /// retirement without claiming an old Ready observation is still current.
+const FAMILY_EXCLUSIVE: u8 = 1;
+const FAMILY_SHARED: u8 = 2;
+const FAMILY_RETIRING: u8 = 3;
+const FAMILY_RELEASED: u8 = 4;
+struct OwnedFamily {
+    held: Held,
+    mode: std::sync::atomic::AtomicU8,
+}
+impl OwnedFamily {
+    fn exclusive(&self) -> Result<(), &'static str> {
+        if self.mode.load(std::sync::atomic::Ordering::Acquire) != FAMILY_EXCLUSIVE {
+            return Err(UNAVAILABLE);
+        }
+        self.held.current()
+    }
+    // Private kernel transition; the public target path checks its actual
+    // durable Applied receipt before entering here.
+    fn share_after_admission(&self) -> Result<(), &'static str> {
+        if matches!(
+            self.mode.load(std::sync::atomic::Ordering::Acquire),
+            FAMILY_RETIRING | FAMILY_RELEASED
+        ) {
+            return Err(UNAVAILABLE);
+        }
+        if self.mode.load(std::sync::atomic::Ordering::Acquire) == FAMILY_SHARED {
+            return self.held.current();
+        }
+        self.mode.store(0, std::sync::atomic::Ordering::Release);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "actual Applied receipt authorizes retained same-family lock handoff"
+        )]
+        self.held
+            .file
+            .try_lock_shared()
+            .map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => BUSY,
+                std::fs::TryLockError::Error(_) => UNAVAILABLE,
+            })?;
+        self.held.current()?;
+        self.mode
+            .store(FAMILY_SHARED, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn exclusive_after_census(&self) -> Result<(), &'static str> {
+        match self.mode.load(std::sync::atomic::Ordering::Acquire) {
+            FAMILY_EXCLUSIVE => return self.held.current(),
+            FAMILY_RETIRING | FAMILY_RELEASED => return Err(UNAVAILABLE),
+            _ => (),
+        }
+        // Conversion may release SH before failing. Mode zero owns uncertainty
+        // and must not reopen a borrower until a real lock acknowledgement.
+        self.mode.store(0, std::sync::atomic::Ordering::Release);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "actual sealed census transfers the existing family FD"
+        )]
+        self.held.file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => BUSY,
+            std::fs::TryLockError::Error(_) => UNAVAILABLE,
+        })?;
+        self.held.current()?;
+        self.mode
+            .store(FAMILY_EXCLUSIVE, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn release_after_effect(&self) -> Result<(), &'static str> {
+        if self.mode.load(std::sync::atomic::Ordering::Acquire) == FAMILY_RELEASED {
+            return Ok(());
+        }
+        self.mode
+            .store(FAMILY_RETIRING, std::sync::atomic::Ordering::Release);
+        self.held.file.unlock().map_err(|_| UNAVAILABLE)?;
+        self.mode
+            .store(FAMILY_RELEASED, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn borrowed(&self) -> Result<(), &'static str> {
+        if !matches!(
+            self.mode.load(std::sync::atomic::Ordering::Acquire),
+            FAMILY_EXCLUSIVE | FAMILY_SHARED
+        ) {
+            return Err(UNAVAILABLE);
+        }
+        self.held.current()
+    }
+}
+
 pub(in crate::harness) struct ReservationFamilyExclusive {
     source: codex_source_registry::SealingSource,
     identity: Identity,
-    global: SourceWorkLease,
-    held: Held,
+    global: Arc<SourceWorkLease>,
+    held: Arc<OwnedFamily>,
+    _scope: crate::harness::account_work::Scope,
 }
 impl ReservationFamilyExclusive {
     pub(in crate::harness) fn acquire(
@@ -199,13 +289,14 @@ impl ReservationFamilyExclusive {
         if !source.current() {
             return Err(UNAVAILABLE);
         }
+        let scope = source.retained_scope().map_err(|_| UNAVAILABLE)?;
         let identity = Identity {
             caller: source.caller().clone(),
             version: 0, // phase identity is retained by source, never a Ready version
             family: family_key(source.caller(), source.source().binding())?,
             gate: source.gate().clone(),
         };
-        let global = identity.gate.shared()?;
+        let global = Arc::new(identity.gate.shared()?);
         let held = family_gate(&identity)?;
         #[expect(
             clippy::disallowed_methods,
@@ -219,19 +310,212 @@ impl ReservationFamilyExclusive {
             source,
             identity,
             global,
-            held,
+            held: Arc::new(OwnedFamily {
+                held,
+                mode: std::sync::atomic::AtomicU8::new(FAMILY_EXCLUSIVE),
+            }),
+            _scope: scope,
         };
         guard.current()?;
         Ok(guard)
+    }
+    /// Reuse only the actual normalized source claim selected by the native
+    /// census phase. No new global share is acquired behind a queued writer.
+    pub(in crate::harness) fn reclaim(
+        source: codex_source_registry::SealingSource,
+        retained: &TargetFamilyLease,
+    ) -> Result<Self, &'static str> {
+        if !source.current()
+            || source.caller() != &retained.identity.caller
+            || source.gate() != &retained.identity.gate
+            || family_key(source.caller(), source.source().binding())? != retained.identity.family
+        {
+            return Err(UNAVAILABLE);
+        }
+        let scope = source.retained_scope().map_err(|_| UNAVAILABLE)?;
+        retained.global.current()?;
+        if retained.global.identity()? != retained.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        let held = retained.held.owned().clone();
+        held.exclusive_after_census()?;
+        let guard = Self {
+            source,
+            identity: retained.identity.clone(),
+            global: retained.global.clone(),
+            held,
+            _scope: scope,
+        };
+        guard.current()?;
+        Ok(guard)
+    }
+
+    pub(in crate::harness) fn release_source_after_applied(
+        &self,
+        receipt: &crate::harness::codex_assignment::target_ack::AppliedReceipt,
+        commit: &crate::harness::codex_assignment::AssignmentCommit,
+    ) -> Result<(), &'static str> {
+        if !receipt.matches(commit) || !self.source.matches_applied(commit) {
+            return Err(UNAVAILABLE);
+        }
+        self.global.current()?;
+        if self.global.identity()? != self.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        if family_key(commit.caller(), commit.binding())? == self.identity.family {
+            self.held.share_after_admission()
+        } else {
+            self.held.release_after_effect()
+        }
+    }
+
+    /// Acquire only physical target-family custody under the SAME actual global
+    /// shared lease. This is not a credential, installation or factory grant.
+    pub(in crate::harness) fn target_resource(
+        &self,
+        target: &crate::harness::codex_assignment::prepare::TargetIntent,
+    ) -> Result<TargetFamilyLease, &'static str> {
+        self.current()?;
+        if !self.source.matches_target(target) || target.caller() != &self.identity.caller {
+            return Err(UNAVAILABLE);
+        }
+        let binding = target.target_binding().ok_or(UNAVAILABLE)?;
+        let identity = Identity {
+            caller: target.caller().clone(),
+            version: 0,
+            family: family_key(target.caller(), binding)?,
+            gate: self.identity.gate.clone(),
+        };
+        let held = if identity.family == self.identity.family {
+            // The actual held same-family exclusion is borrowed, not relocked.
+            TargetHeld::Same(self.held.clone())
+        } else {
+            let held = family_gate(&identity)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "target resource owns its actual shared family lock"
+            )]
+            held.file.try_lock_shared().map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => BUSY,
+                std::fs::TryLockError::Error(_) => UNAVAILABLE,
+            })?;
+            TargetHeld::Shared(Arc::new(OwnedFamily {
+                held,
+                mode: std::sync::atomic::AtomicU8::new(FAMILY_SHARED),
+            }))
+        };
+        let resource = TargetFamilyLease {
+            identity,
+            global: self.global.clone(),
+            held,
+        };
+        resource.current()?;
+        self.current()?;
+        Ok(resource)
     }
     pub(in crate::harness) fn current(&self) -> Result<(), &'static str> {
         if !self.source.current() || self.source.gate() != &self.identity.gate {
             return Err(UNAVAILABLE);
         }
         self.global.current()?;
-        self.held.current()
+        self.held.exclusive()
     }
 }
+/// Separately retained physical global share + B family. It contains no A
+/// exclusive guard or source/target admission authority. New B work must also
+/// prove its actual installed assignment and counted member/use admission.
+enum TargetHeld {
+    Shared(Arc<OwnedFamily>),
+    Same(Arc<OwnedFamily>),
+}
+impl TargetHeld {
+    fn owned(&self) -> &Arc<OwnedFamily> {
+        match self {
+            Self::Shared(held) | Self::Same(held) => held,
+        }
+    }
+    fn current(&self) -> Result<(), &'static str> {
+        self.owned().borrowed()
+    }
+}
+pub(in crate::harness) struct TargetFamilyLease {
+    identity: Identity,
+    global: Arc<SourceWorkLease>,
+    held: TargetHeld,
+}
+impl TargetFamilyLease {
+    /// Retain the actual claim without probing under a registry mutex. The
+    /// caller must validate current() outside that mutex before using it.
+    pub(in crate::harness) fn retained_source_lease(&self) -> Arc<SourceWorkLease> {
+        self.global.clone()
+    }
+    pub(in crate::harness) fn current(&self) -> Result<(), &'static str> {
+        self.global.current()?;
+        if self.global.identity()? != self.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        self.held.current()
+    }
+    pub(in crate::harness) fn restore_after_cancel(
+        &self,
+        permit: &crate::harness::codex_assignment::prepare::cancel::CancelledSource<'_>,
+        source: &crate::harness::codex_session_slot::SourceHandle,
+    ) -> Result<(), &'static str> {
+        if permit.caller() != &self.identity.caller
+            || !permit.matches_source(source)
+            || family_key(&self.identity.caller, source.binding())? != self.identity.family
+        {
+            return Err(UNAVAILABLE);
+        }
+        self.global.current()?;
+        if self.global.identity()? != self.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        self.held.owned().share_after_admission()
+    }
+
+    /// Only the actual durable ACK receipt may turn same-family exclusion into
+    /// an ordinary B resource. Conversion is not assumed atomic: mode zero
+    /// denies every borrower until the shared kernel claim is acknowledged.
+    pub(in crate::harness) fn normalize_after_applied(
+        &self,
+        receipt: &crate::harness::codex_assignment::target_ack::AppliedReceipt,
+        assignment: &crate::harness::codex_assignment::AssignmentCommit,
+    ) -> Result<(), &'static str> {
+        if !receipt.matches(assignment)
+            || self.identity.caller != *assignment.caller()
+            || family_key(assignment.caller(), assignment.binding())? != self.identity.family
+        {
+            return Err(UNAVAILABLE);
+        }
+        self.global.current()?;
+        if self.global.identity()? != self.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        match &self.held {
+            TargetHeld::Shared(held) => held.borrowed(),
+            TargetHeld::Same(held) => held.share_after_admission(),
+        }
+    }
+    pub(in crate::harness) fn matches_target(
+        &self,
+        target: &crate::harness::codex_assignment::prepare::TargetIntent,
+    ) -> bool {
+        target.caller() == &self.identity.caller
+            && target.target_binding().is_some_and(|binding| {
+                family_key(target.caller(), binding).is_ok_and(|key| key == self.identity.family)
+            })
+    }
+    pub(in crate::harness) fn gate_identity(&self) -> &SourceGateIdentity {
+        &self.identity.gate
+    }
+}
+impl std::fmt::Debug for TargetFamilyLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TargetFamilyLease(redacted)")
+    }
+}
+
 impl std::fmt::Debug for ReservationFamilyExclusive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ReservationFamilyExclusive(redacted)")
@@ -302,6 +586,177 @@ mod tests {
         independent.current().unwrap();
         assert!(PublicationLock::for_home(home.path()).is_err());
     }
+    #[test]
+    fn same_family_handoff_retains_shared_kernel_custody() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let source = fixture(home.path(), "grant-a", 1);
+        let exclusive = FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+        let FamilyExclusive {
+            global: _global,
+            held,
+            ..
+        } = exclusive;
+        let held = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        assert!(FamilyWork::acquire(FamilySource::Fixture(&source)).is_err());
+        held.share_after_admission().unwrap();
+        held.share_after_admission().unwrap();
+        assert!(held.exclusive().is_err());
+        held.borrowed().unwrap();
+        let work = FamilyWork::acquire(FamilySource::Fixture(&source)).unwrap();
+        assert!(FamilyExclusive::acquire(FamilySource::Fixture(&source)).is_err());
+        drop(work);
+        assert!(FamilyExclusive::acquire(FamilySource::Fixture(&source)).is_err());
+        drop(held);
+        FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+    }
+
+    #[test]
+    fn replaced_family_gate_during_handoff_never_reenables_borrowers() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let source = fixture(home.path(), "grant-a", 1);
+        let exclusive = FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+        let FamilyExclusive {
+            global: _global,
+            held,
+            ..
+        } = exclusive;
+        let held = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        std::fs::rename(&held.held.path, held.held.path.with_extension("old")).unwrap();
+        private_file::write_private_new(
+            held.held.path.parent().unwrap(),
+            "gate",
+            b"replacement",
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(held.share_after_admission().is_err());
+        assert!(held.borrowed().is_err());
+        assert!(held.exclusive().is_err());
+        assert_eq!(held.mode.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn replaced_source_family_cannot_restore_after_failed_upgrade() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let source = fixture(home.path(), "grant-b", 1);
+        let original = FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+        let FamilyExclusive {
+            global: _global,
+            held,
+            ..
+        } = original;
+        let held = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        held.share_after_admission().unwrap();
+        std::fs::rename(&held.held.path, held.held.path.with_extension("old")).unwrap();
+        private_file::write_private_new(
+            held.held.path.parent().unwrap(),
+            "gate",
+            b"replacement",
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(held.exclusive_after_census().is_err());
+        assert_eq!(held.mode.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(held.share_after_admission().is_err());
+        assert!(held.borrowed().is_err());
+        assert_eq!(held.mode.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn competing_fd_blocks_upgrade_and_only_real_shared_reacquisition_restores_borrow() {
+        // Physical lock-state controls only; no fabricated census/cancel/ACK.
+        let home = aterm_tempfile::tempdir().unwrap();
+        let source = fixture(home.path(), "grant-b", 1);
+        let exclusive = FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+        let FamilyExclusive {
+            global: _global,
+            held,
+            ..
+        } = exclusive;
+        let held = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        held.share_after_admission().unwrap();
+        let competing = FamilyWork::acquire(FamilySource::Fixture(&source)).unwrap();
+        assert_eq!(held.exclusive_after_census(), Err(BUSY));
+        assert_eq!(held.mode.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(held.borrowed().is_err());
+        // An OS failure is never interpreted as still owning the old SH.
+        held.share_after_admission().unwrap();
+        held.borrowed().unwrap();
+        assert!(FamilyExclusive::acquire(FamilySource::Fixture(&source)).is_err());
+        // Parallel process controls can briefly inherit this open description
+        // between fork and exec. Acknowledge actual competitor retirement,
+        // rather than assuming the parent's last FD drop released every copy.
+        competing.held.file.unlock().unwrap();
+        drop(competing);
+        held.exclusive_after_census().unwrap();
+        assert!(FamilyWork::acquire(FamilySource::Fixture(&source)).is_err());
+    }
+
+    #[test]
+    fn repeated_family_epochs_do_not_keep_old_exclusive_or_revive_old_handles() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let b = fixture(home.path(), "grant-b", 1);
+        let c = fixture(home.path(), "grant-c", 1);
+        let first = FamilyExclusive::acquire(FamilySource::Fixture(&b)).unwrap();
+        let FamilyExclusive {
+            global: _global_b,
+            held,
+            ..
+        } = first;
+        let old_b = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        old_b.share_after_admission().unwrap();
+        old_b.exclusive_after_census().unwrap();
+        let next = FamilyExclusive::acquire(FamilySource::Fixture(&c)).unwrap();
+        let FamilyExclusive {
+            global: _global_c,
+            held,
+            ..
+        } = next;
+        let old_c = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        old_c.share_after_admission().unwrap();
+        old_b.release_after_effect().unwrap();
+        assert!(old_b.borrowed().is_err());
+        assert!(old_b.share_after_admission().is_err());
+        assert!(old_b.exclusive_after_census().is_err());
+        old_c.exclusive_after_census().unwrap();
+        let final_b = FamilyExclusive::acquire(FamilySource::Fixture(&b)).unwrap();
+        let FamilyExclusive {
+            global: _global_b2,
+            held,
+            ..
+        } = final_b;
+        let current_b = OwnedFamily {
+            held,
+            mode: FAMILY_EXCLUSIVE.into(),
+        };
+        current_b.share_after_admission().unwrap();
+        old_c.release_after_effect().unwrap();
+        // Exact historical release cannot unlock the new epoch's distinct FD.
+        old_b.release_after_effect().unwrap();
+        assert!(FamilyExclusive::acquire(FamilySource::Fixture(&b)).is_err());
+        current_b.borrowed().unwrap();
+        drop(current_b);
+        FamilyExclusive::acquire(FamilySource::Fixture(&b)).unwrap();
+    }
+
     #[test]
     fn root_version_liveness_and_replaced_gate_cannot_inherit_a_borrow() {
         let home = aterm_tempfile::tempdir().unwrap();

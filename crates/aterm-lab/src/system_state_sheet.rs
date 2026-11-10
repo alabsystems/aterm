@@ -438,6 +438,7 @@ mod tests {
         assert_eq!(shrink(368), 1);
         let dir = aterm_tempfile::Builder::new()
             .prefix("sheet")
+            .suffix(".noindex")
             .tempdir()
             .expect("a scratch folder");
         let path = dir.path().join("sheet.png");

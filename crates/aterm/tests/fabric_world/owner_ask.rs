@@ -46,6 +46,7 @@ impl Owner {
     fn boot_at_rest(at_rest: bool) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("oa-")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("exclusive world scratch");
         let tmp = scratch.path().to_path_buf();

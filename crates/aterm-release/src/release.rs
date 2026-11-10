@@ -55,7 +55,42 @@ pub const JOURNAL_FILE: &str = "release.toml";
 pub const LINE_SOURCE: &str = "crates/aterm-release/src/line.rs";
 const PENDING_LINE: &str = "locally-carried-line";
 const SUPERSEDED_LINE: &str = "supersession-completed";
-const SELECTION_FILE: &str = "candidate.toml";
+pub(crate) const SELECTION_FILE: &str = "candidate.toml";
+
+/// One explicit line replacement, kept only in `candidate.toml` until its source
+/// compare-and-swap is decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SupersedeTxn {
+    /// The checkout HEAD before selecting the replacement.
+    pub head: String,
+    /// The authoritative `release.toml` line, or its authoritative absence.
+    pub release_line: Option<crate::line::Line>,
+    /// The exact fleet line the replacement retires.
+    pub previous: crate::line::Line,
+    /// The one replacement identity preflighted, journaled, and written.
+    pub replacement: crate::line::Line,
+    /// The source writer was entered, so only an authoritative exact reread may decide it.
+    #[serde(default)]
+    pub cas_unknown: bool,
+}
+
+/// The source compare-and-swap's structured answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupersedeResult {
+    /// The exact requested supersession is durable.
+    Committed(String),
+    /// The write is authoritatively absent or was not attempted.
+    Refused {
+        /// Why the write did not become durable.
+        why: String,
+        /// An ambiguous earlier call was authoritatively absent and may be retried now.
+        retry: bool,
+        /// The authoritative replacement when a different writer won.
+        winner: Option<crate::line::Line>,
+    },
+    /// The write may be durable, but an exact reread was unavailable.
+    Unknown(String),
+}
 
 /// The live run's claim, beside the journal.
 pub const RUNNING_FILE: &str = "running";
@@ -405,6 +440,9 @@ pub struct Journal {
     /// written before lines has none; [`Journal::line`] reads it as a line at R with no hops.
     #[serde(default)]
     pub line: Option<crate::line::Line>,
+    /// Present only in `candidate.toml` while an explicit supersession is undecided.
+    #[serde(default)]
+    pub(crate) supersede: Option<SupersedeTxn>,
 }
 
 /// A PREPARED release, as `--prepare` left it.
@@ -1332,8 +1370,33 @@ pub trait Backend {
     ) -> Result<Option<crate::line::Supersession>, Refusal> {
         Ok(None)
     }
-    fn supersede_line(&mut self, _line: &crate::line::Line) -> Result<String, String> {
-        Err("supersession is unavailable".into())
+    /// Read every public surface before a replacement changes local selection.
+    fn preflight_supersede(
+        &mut self,
+        line: &crate::line::Line,
+        _expected_previous: Option<&crate::line::Line>,
+    ) -> Result<crate::line::Line, Refusal> {
+        Ok(line.clone())
+    }
+    /// Classify a candidate retained after an ambiguous source write.
+    fn classify_supersede(
+        &mut self,
+        _previous: &crate::line::Line,
+        _line: &crate::line::Line,
+    ) -> SupersedeResult {
+        SupersedeResult::Unknown("supersession recovery is unavailable".into())
+    }
+    fn supersede_line(
+        &mut self,
+        _previous: &crate::line::Line,
+        _line: &crate::line::Line,
+    ) -> SupersedeResult {
+        SupersedeResult::Unknown("supersession is unavailable".into())
+    }
+    /// Durably update the candidate after an authoritative source-write result. Tests inject
+    /// only the write result; production uses the journal's ordinary durable writer.
+    fn save_supersede_journal(&mut self, journal: &Journal, path: &Path) -> Result<(), String> {
+        journal.save(path)
     }
     fn supersession_completed(&mut self) {}
     /// Record a step boundary and detect an adopted lease before starting more work.
@@ -1627,6 +1690,9 @@ struct Run<'b> {
     dry_audit: Option<Vec<Finding>>,
     last: String,
     early_sign: Option<Box<dyn PendingSign>>,
+    /// The candidate-only explicit supersession transaction, if one is being selected or
+    /// recovered.
+    supersede: Option<SupersedeTxn>,
 }
 
 /// Run a release with `b`.
@@ -1671,6 +1737,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         dry_audit: None,
         last: String::new(),
         early_sign: None,
+        supersede: None,
     };
     let went = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.go()));
     let code = match went {
@@ -1701,6 +1768,77 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
 }
 
 impl Run<'_> {
+    /// Dry supersession judgment precedes step 1's broad source/engine fetch, just as the real
+    /// launcher's judgment precedes any local selection write.
+    fn preflight_dry_supersede(&mut self) -> Flow {
+        if !self.opts.supersede {
+            return Ok(());
+        }
+        if let Some(txn) = self
+            .supersede
+            .clone()
+            .filter(|transaction| transaction.cas_unknown)
+        {
+            match self.b.classify_supersede(&txn.previous, &txn.replacement) {
+                SupersedeResult::Committed(note) => {
+                    self.say(&note);
+                    self.supersede = None;
+                    if let Some(journal) = self.journal.as_mut() {
+                        journal.supersede = None;
+                        journal.add(SUPERSEDED_LINE);
+                    }
+                    self.opts.supersede = false;
+                    return Ok(());
+                }
+                SupersedeResult::Refused {
+                    why,
+                    winner: Some(winner),
+                    ..
+                } => {
+                    return self.refuse_hard(Refusal::new(
+                        why,
+                        format!(
+                            "run the same command without --dry-run to adopt the authoritative \
+                             line at {}",
+                            short(winner.head())
+                        ),
+                    ));
+                }
+                SupersedeResult::Refused {
+                    retry: true,
+                    winner: None,
+                    ..
+                } => {}
+                SupersedeResult::Refused { why, .. } => {
+                    return self.refuse_hard(Refusal::new(why, "resume the authoritative line"));
+                }
+                SupersedeResult::Unknown(why) => {
+                    let message = format!(
+                        "COULD NOT RUN: the supersession write is still unknown: {why}; \
+                         candidate.toml retains {} for an exact retry",
+                        short(txn.replacement.head())
+                    );
+                    self.say(&message);
+                    self.last = message;
+                    return Err(Halt::Said(3));
+                }
+            }
+        }
+        self.choose_candidate(true)?;
+        let line = self.supersede.as_ref().map_or_else(
+            || crate::line::Line::start(&self.version(), &self.commit_r(), self.t_start),
+            |txn| txn.replacement.clone(),
+        );
+        let expected = match &self.supersede {
+            Some(txn) => txn.release_line.clone(),
+            None => self.saved_release_line()?,
+        };
+        self.b
+            .preflight_supersede(&line, expected.as_ref())
+            .map(|_| ())
+            .map_err(|refusal| self.halted(refusal))
+    }
+
     fn go(&mut self) -> Flow {
         if self.opts.forget {
             return self.forget();
@@ -1718,6 +1856,30 @@ impl Run<'_> {
                 ));
             }
         };
+        self.supersede = self
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.supersede.clone());
+        if let Some(txn) = &self.supersede {
+            let requested = self
+                .opts
+                .commit
+                .as_deref()
+                .and_then(|commit| self.b.rev(&format!("{commit}^{{commit}}")));
+            if !self.opts.supersede || requested.as_deref() != Some(txn.replacement.head()) {
+                let replacement = txn.replacement.head();
+                return self.refuse_hard(
+                    Refusal::new(
+                        "candidate.toml retains an undecided supersession transaction",
+                        format!(
+                            "decide that exact transaction first: {RELEASE_COMMAND} --commit \
+                             {replacement} --supersede"
+                        ),
+                    )
+                    .could_not_run(),
+                );
+            }
+        }
         self.t_start = self.b.now();
         self.cur_t0 = self.t_start;
         self.b.observe_operational();
@@ -1725,6 +1887,7 @@ impl Run<'_> {
             self.say(
                 "release: DRY RUN — nothing is changed; each step says what a real run would do",
             );
+            self.preflight_dry_supersede()?;
         }
 
         if !self.dry {
@@ -2307,10 +2470,34 @@ impl Run<'_> {
             return Err(Halt::Said(1));
         }
         let selected = self.b.release_dir().join(SELECTION_FILE);
-        let asks = Journal::load(&selected)
-            .and_then(|pending| {
-                pending.map_or_else(|| Journal::load(&self.journal_path), |j| Ok(Some(j)))
-            })
+        let pending = match Journal::load(&selected) {
+            Ok(pending) => pending,
+            Err(why) => {
+                self.last = format!(
+                    "COULD NOT RUN: {why}; candidate.toml may retain an undecided source write \
+                     and was left byte-for-byte unchanged"
+                );
+                let last = self.last.clone();
+                self.say(&last);
+                return Err(Halt::Said(3));
+            }
+        };
+        if let Some(txn) = pending
+            .as_ref()
+            .and_then(|journal| journal.supersede.as_ref())
+            .filter(|txn| txn.cas_unknown)
+        {
+            self.last = format!(
+                "COULD NOT RUN: candidate.toml retains a supersession whose source write is \
+                 unknown; classify it first: {RELEASE_COMMAND} --commit {} --supersede",
+                txn.replacement.head()
+            );
+            let last = self.last.clone();
+            self.say(&last);
+            return Err(Halt::Said(3));
+        }
+        let asks = pending
+            .map_or_else(|| Journal::load(&self.journal_path), |j| Ok(Some(j)))
             .ok()
             .flatten()
             .map(|j| j.asks)
@@ -3102,54 +3289,424 @@ impl Run<'_> {
         };
     }
 
-    /// Select locally, freeze, and only then let the candidate's cutter judge the release.
-    /// Selection is independent of the launching cutter's engine and publication roster
-    /// readers. An old local origin/main is a pinned candidate, not a claim about the current
-    /// remote tip; `--fix` refreshes source refs before admission, and step 1 refreshes and
-    /// proves the candidate's ancestry before a product build or staging begins.
+    fn saved_release_journal(&mut self) -> Result<Option<Journal>, Halt> {
+        let path = self.b.release_dir().join(JOURNAL_FILE);
+        Journal::load(&path).map_err(|why| {
+            self.halted(Refusal::new(
+                why,
+                "restore release.toml before selecting a replacement line",
+            ))
+        })
+    }
+
+    fn saved_release_line(&mut self) -> Result<Option<crate::line::Line>, Halt> {
+        self.saved_release_journal()
+            .map(|journal| journal.as_ref().map(Journal::line))
+    }
+
+    /// A line journal with no candidate-only or release-result facts. It keeps only the local
+    /// prover declaration, Linux choice, and unresolved asks that remain meaningful on a
+    /// different authoritative line.
+    fn clean_line_journal(&self, line: &crate::line::Line) -> Journal {
+        let current = self.journal.as_ref();
+        Journal {
+            version: line.version.clone(),
+            commit: line.head().to_string(),
+            prover: current.map_or_else(String::new, |journal| journal.prover.clone()),
+            trustc: current.map_or_else(String::new, |journal| journal.trustc.clone()),
+            started: line.started,
+            linux: current.map_or_else(LinuxDecl::default, |journal| journal.linux.clone()),
+            asks: current.map_or_else(Vec::new, |journal| journal.asks.clone()),
+            line: Some(line.clone()),
+            ..Journal::default()
+        }
+    }
+
+    /// Restore the exact local state recorded in candidate.toml. HEAD moves first; if candidate
+    /// removal fails, overwriting it with release.toml makes both preferred journals name the
+    /// authoritative old line.
+    fn restore_supersede_selection(&mut self) -> Result<(), Refusal> {
+        let txn = self.supersede.clone().ok_or_else(|| {
+            Refusal::new(
+                "candidate.toml has no supersession transaction to restore",
+                "keep the candidate and retry the exact --commit ... --supersede request",
+            )
+            .could_not_run()
+        })?;
+        let release_dir = self.b.release_dir();
+        let release_path = release_dir.join(JOURNAL_FILE);
+        let saved = Journal::load(&release_path).map_err(|why| {
+            Refusal::new(
+                why,
+                "restore release.toml before rolling back the replacement",
+            )
+            .could_not_run()
+        })?;
+        if saved.as_ref().map(Journal::line) != txn.release_line {
+            return Err(Refusal::new(
+                "release.toml changed after the replacement transaction began",
+                "keep candidate.toml and reconcile the two release journals",
+            )
+            .could_not_run());
+        }
+        if self.b.head() != txn.head {
+            self.b.move_to(&txn.head)?;
+        }
+        let selection = release_dir.join(SELECTION_FILE);
+        let mut restored = saved.clone();
+        match std::fs::remove_file(&selection) {
+            Ok(()) => crate::durable::sync_dir(&release_dir).map_err(|error| {
+                Refusal::new(
+                    format!("cannot make candidate.toml removal durable: {error}"),
+                    "retry after the release state directory is writable",
+                )
+                .could_not_run()
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let fallback = saved
+                    .clone()
+                    .unwrap_or_else(|| self.clean_line_journal(&txn.previous));
+                fallback.save(&selection).map_err(|why| {
+                    Refusal::new(
+                        format!("{why}; candidate.toml removal also failed: {error}"),
+                        "make both release journals writable and retry",
+                    )
+                    .could_not_run()
+                })?;
+                restored = Some(fallback);
+            }
+        }
+        self.journal = restored;
+        self.journal_path = release_path;
+        self.supersede = None;
+        Ok(())
+    }
+
+    /// Converge this clone on a different authoritative winner. The preferred candidate is
+    /// replaced first, then release.toml; a failure to write release.toml restores the exact
+    /// transaction so its recovery identity is not lost.
+    fn adopt_supersede_winner(
+        &mut self,
+        winner: &crate::line::Line,
+    ) -> Result<Option<String>, Refusal> {
+        let original = self.journal.clone().ok_or_else(|| {
+            Refusal::new(
+                "candidate.toml has no journal to replace with the authoritative winner",
+                "keep the candidate and retry the exact --commit ... --supersede request",
+            )
+            .could_not_run()
+        })?;
+        let release_dir = self.b.release_dir();
+        let selection = release_dir.join(SELECTION_FILE);
+        let release_path = release_dir.join(JOURNAL_FILE);
+        let adopted = self.clean_line_journal(winner);
+        adopted.save(&selection).map_err(|why| {
+            Refusal::new(
+                why,
+                "keep candidate.toml and retry adopting the authoritative fleet line",
+            )
+            .could_not_run()
+        })?;
+        if let Err(why) = adopted.save(&release_path) {
+            let restored = original.save(&selection);
+            let detail = restored
+                .err()
+                .map(|restore| format!("; restoring candidate.toml also failed: {restore}"))
+                .unwrap_or_default();
+            return Err(Refusal::new(
+                format!("{why}{detail}"),
+                "restore the release state directory, then retry the exact supersession request",
+            )
+            .could_not_run());
+        }
+        self.journal = Some(adopted);
+        self.journal_path = release_path;
+        self.supersede = None;
+        if self.b.head() != winner.head() {
+            self.b.move_to(winner.head()).map_err(|refusal| {
+                refusal.detail([format!(
+                    "both journals already name authoritative line {}",
+                    short(winner.head())
+                )])
+            })?;
+        }
+        let retained = match std::fs::remove_file(&selection) {
+            Ok(()) => crate::durable::sync_dir(&release_dir)
+                .err()
+                .map(|error| format!("candidate removal sync will retry: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "candidate.toml remains as an equal authoritative journal: {error}"
+            )),
+        };
+        Ok(retained)
+    }
+
+    fn refuse_supersede(&mut self, refusal: Refusal) -> Flow {
+        if let Err(restore) = self.restore_supersede_selection() {
+            return self.refuse_hard(
+                restore.detail([format!("the triggering refusal was: {}", refusal.why)]),
+            );
+        }
+        self.refuse_hard(refusal)
+    }
+
+    fn stop_supersede(&mut self, why: String) -> Flow {
+        if let Err(restore) = self.restore_supersede_selection() {
+            return self.refuse_hard(restore.detail([why]));
+        }
+        let code = if why.starts_with("CUTTING ELSEWHERE:") {
+            4
+        } else {
+            2
+        };
+        self.say(&why);
+        self.last = why;
+        Err(Halt::Said(code))
+    }
+
+    fn stop_supersede_at_winner(&mut self, why: String, winner: crate::line::Line) -> Flow {
+        let retained = match self.adopt_supersede_winner(&winner) {
+            Ok(retained) => retained,
+            Err(refusal) => {
+                return self
+                    .refuse_hard(refusal.detail([format!("the triggering refusal was: {why}")]));
+            }
+        };
+        let retained = retained.map(|note| format!("; {note}")).unwrap_or_default();
+        let message = format!(
+            "{why}; adopted authoritative line {} in HEAD and both journals{retained}",
+            short(winner.head())
+        );
+        self.say(&message);
+        self.last = message;
+        Err(Halt::Said(2))
+    }
+
+    fn halt_supersede(&mut self, halt: Halt) -> Flow {
+        if matches!(&halt, Halt::Said(0)) {
+            return Err(halt);
+        }
+        if let Err(restore) = self.restore_supersede_selection() {
+            return self.refuse_hard(restore);
+        }
+        Err(halt)
+    }
+
+    /// Record a source-confirmed supersession. Until this final candidate write succeeds, the
+    /// on-disk `cas_unknown` transaction remains the exact recovery request.
+    fn finish_supersede_commit(&mut self, txn: SupersedeTxn, note: String) -> Flow {
+        self.say(&note);
+        let Some(journal) = self.journal.as_mut() else {
+            return self.refuse_hard(
+                Refusal::new(
+                    "the committed supersession has no candidate journal",
+                    format!(
+                        "retry its exact recovery: {RELEASE_COMMAND} --commit {} --supersede",
+                        txn.replacement.head()
+                    ),
+                )
+                .could_not_run(),
+            );
+        };
+        journal.add(SUPERSEDED_LINE);
+        journal.supersede = None;
+        self.supersede = None;
+        if let Err(why) = self.b.save_supersede_journal(journal, &self.journal_path) {
+            journal.done.retain(|fact| fact != SUPERSEDED_LINE);
+            journal.supersede = Some(txn.clone());
+            self.supersede = Some(txn.clone());
+            let message = format!(
+                "COULD NOT RUN: the exact supersession is durable, but its final candidate \
+                 write failed ({why}); candidate.toml retains the exact recovery: \
+                 {RELEASE_COMMAND} --commit {} --supersede",
+                txn.replacement.head()
+            );
+            self.say(&message);
+            self.last = message;
+            return Err(Halt::Said(3));
+        }
+        self.opts.supersede = false;
+        self.b.supersession_completed();
+        Ok(())
+    }
+
+    /// Resolve an entered source write before any local gate can roll its transaction back.
+    /// Until this authoritative reread answers, candidate.toml is the sole exact recovery key.
+    fn recover_unknown_supersession(&mut self) -> Flow {
+        let pending = self.opts.supersede
+            && !self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.has(SUPERSEDED_LINE));
+        if !pending || !self.supersede.as_ref().is_some_and(|txn| txn.cas_unknown) {
+            return Ok(());
+        }
+        let txn = self.supersede.clone().ok_or(Halt::Said(1))?;
+        match self.b.classify_supersede(&txn.previous, &txn.replacement) {
+            SupersedeResult::Committed(note) => self.finish_supersede_commit(txn, note),
+            SupersedeResult::Refused {
+                why,
+                winner: Some(winner),
+                ..
+            } => self.stop_supersede_at_winner(why, winner),
+            SupersedeResult::Refused {
+                retry: true,
+                winner: None,
+                ..
+            } => {
+                if let Some(txn) = self.supersede.as_mut() {
+                    txn.cas_unknown = false;
+                }
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.supersede = self.supersede.clone();
+                }
+                self.save_journal()
+            }
+            SupersedeResult::Refused { why, .. } => self.stop_supersede(why),
+            SupersedeResult::Unknown(why) => {
+                let message = format!(
+                    "COULD NOT RUN: the supersession write is still unknown: {why}; \
+                     candidate.toml retains {} for an exact retry",
+                    short(txn.replacement.head())
+                );
+                self.say(&message);
+                self.last = message;
+                Err(Halt::Said(3))
+            }
+        }
+    }
+
+    /// Preflight an explicit replacement while selection is unchanged, then journal that one
+    /// transaction in candidate.toml before dispatching to the candidate's cutter. An old local
+    /// origin/main is a pinned candidate, not a claim about the current remote tip; `--fix`
+    /// refreshes source refs before admission, and step 1 proves ancestry before a product build
+    /// or staging begins.
     fn prepare_candidate(&mut self) -> Flow {
         let _timing =
             crate::cut_timing::Timer::start(&self.b.log_path(Step::Checks), "launch-prelude");
         if let Some(refusal) = self.claim_refused.take() {
             return self.refuse_hard(refusal);
         }
+        self.recover_unknown_supersession()?;
         if !self.b.branch_is_main() {
-            return self.refuse_hard(Refusal::new(
+            let refusal = Refusal::new(
                 "this clone is not on main",
                 "release from a clean clone on main (git switch main)",
-            ));
+            );
+            return if self.supersede.is_some() {
+                self.refuse_supersede(refusal)
+            } else {
+                self.refuse_hard(refusal)
+            };
         }
         if let Err(refusal) = self.b.prepare_clone() {
-            return self.refuse_hard(refusal);
+            return if self.supersede.is_some() {
+                self.refuse_supersede(refusal)
+            } else {
+                self.refuse_hard(refusal)
+            };
         }
-        self.tip = self.b.rev("origin/main^{commit}").ok_or_else(|| {
-            self.halted(Refusal::new(
-                "this clone has no local origin/main candidate",
-                "git fetch origin, then run the release again",
-            ))
-        })?;
+        self.tip = match self.b.rev("origin/main^{commit}") {
+            Some(tip) => tip,
+            None => {
+                let refusal = Refusal::new(
+                    "this clone has no local origin/main candidate",
+                    "git fetch origin, then run the release again",
+                );
+                return if self.supersede.is_some() {
+                    self.refuse_supersede(refusal)
+                } else {
+                    self.refuse_hard(refusal)
+                };
+            }
+        };
         self.choose_candidate(true)?;
         let r = self.commit_r();
-        if self.b.head() != r
-            && let Err(refusal) = self.b.move_to(&r)
-        {
-            return self.refuse_hard(refusal);
-        }
         let journaled = self
             .journal
             .as_ref()
             .filter(|j| !j.finished())
             .map(|j| j.prover.clone());
-        let prover = self.b.prover(journaled.as_deref()).map_err(|why| {
-            self.halted(Refusal::new(
-                format!("no Trust prover: {why}"),
-                "restore the locked Trust toolchain and retry",
-            ))
-        })?;
+        let prover = match self.b.prover(journaled.as_deref()) {
+            Ok(prover) => prover,
+            Err(why) => {
+                let refusal = Refusal::new(
+                    format!("no Trust prover: {why}"),
+                    "restore the locked Trust toolchain and retry",
+                );
+                return if self.supersede.is_some() {
+                    self.refuse_supersede(refusal)
+                } else {
+                    self.refuse_hard(refusal)
+                };
+            }
+        };
         if let Err(why) = self.b.lease(&prover) {
-            return self.refuse_hard(Refusal::new(why, "restore the toolchain lease and retry"));
+            let refusal = Refusal::new(why, "restore the toolchain lease and retry");
+            return if self.supersede.is_some() {
+                self.refuse_supersede(refusal)
+            } else {
+                self.refuse_hard(refusal)
+            };
         }
         self.prover = Some(prover);
+
+        if self.opts.supersede
+            && !self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.has(SUPERSEDED_LINE))
+        {
+            let replacement = self.supersede.as_ref().map_or_else(
+                || crate::line::Line::start(&self.version(), &r, self.t_start),
+                |txn| txn.replacement.clone(),
+            );
+            let release_line = match &self.supersede {
+                Some(txn) => txn.release_line.clone(),
+                None => self.saved_release_line()?,
+            };
+            let previous = match self
+                .b
+                .preflight_supersede(&replacement, release_line.as_ref())
+            {
+                Ok(previous) => previous,
+                Err(refusal) if self.supersede.is_some() => {
+                    return self.refuse_supersede(refusal);
+                }
+                Err(refusal) => return self.refuse_hard(refusal),
+            };
+            if let Some(txn) = &self.supersede {
+                if txn.previous != previous || txn.replacement != replacement {
+                    return self.refuse_supersede(
+                        Refusal::new(
+                            "the replacement transaction changed between cutter images",
+                            "retry the exact --commit ... --supersede request",
+                        )
+                        .could_not_run(),
+                    );
+                }
+            } else {
+                self.supersede = Some(SupersedeTxn {
+                    head: self.b.head(),
+                    release_line,
+                    previous,
+                    replacement,
+                    cas_unknown: false,
+                });
+            }
+        }
+        if self.supersede.is_none()
+            && self.b.head() != r
+            && let Err(refusal) = self.b.move_to(&r)
+        {
+            return if self.supersede.is_some() {
+                self.refuse_supersede(refusal)
+            } else {
+                self.refuse_hard(refusal)
+            };
+        }
         // A bump needs the publication engine. Dispatch to its base's content-proved cutter
         // first, so no previous line's engine discovery can hold the next line hostage.
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_some()) {
@@ -3158,47 +3715,72 @@ impl Run<'_> {
                 return self.refuse_hard(refusal);
             }
         }
-        self.commit(true)?;
-        self.own_cutter()?;
-        if self.opts.supersede {
-            if !self
+        if let Err(halt) = self.commit(true) {
+            return if self.supersede.is_some() {
+                self.halt_supersede(halt)
+            } else {
+                Err(halt)
+            };
+        }
+        if self.supersede.is_some()
+            && self.b.head() != r
+            && let Err(refusal) = self.b.move_to(&r)
+        {
+            return self.refuse_supersede(refusal);
+        }
+        if let Err(halt) = self.own_cutter() {
+            return if self.supersede.is_some() {
+                self.halt_supersede(halt)
+            } else {
+                Err(halt)
+            };
+        }
+        if self.opts.supersede
+            && !self
                 .journal
                 .as_ref()
                 .is_some_and(|j| j.has(SUPERSEDED_LINE))
-            {
-                let version = self.version();
-                if self.version_used(&version, &self.tip.clone()) {
-                    return self.refuse_hard(Refusal::new(
-                        format!("v{version} has public release state and cannot be superseded"),
-                        "finish the existing release",
-                    ));
-                }
-                if let Some(previous) = Journal::load(&self.b.release_dir().join(JOURNAL_FILE))
-                    .ok()
-                    .flatten()
-                    .filter(|j| !j.finished())
-                {
-                    self.refuse_published(&previous, "--supersede")?;
-                }
-                let line = crate::line::Line::start(&version, &self.commit_r(), self.t_start);
-                match self.b.supersede_line(&line) {
-                    Ok(note) => self.say(&note),
-                    Err(why) => {
-                        let code = if why.starts_with("CUTTING ELSEWHERE:") {
-                            4
-                        } else {
-                            2
-                        };
-                        self.say(&why);
-                        self.last = why;
-                        return Err(Halt::Said(code));
-                    }
-                }
-                if let Some(journal) = self.journal.as_mut() {
-                    journal.add(SUPERSEDED_LINE);
-                }
-                self.save_journal()?;
+        {
+            let mut txn = self.supersede.clone().ok_or(Halt::Said(1))?;
+            txn.cas_unknown = true;
+            self.supersede = Some(txn.clone());
+            if let Some(journal) = self.journal.as_mut() {
+                journal.supersede = Some(txn.clone());
             }
+            if let Err(halt) = self.save_journal() {
+                return self.halt_supersede(halt);
+            }
+            let note = match self.b.supersede_line(&txn.previous, &txn.replacement) {
+                SupersedeResult::Committed(note) => note,
+                SupersedeResult::Refused {
+                    why,
+                    winner: Some(winner),
+                    ..
+                } => {
+                    return self.stop_supersede_at_winner(why, winner);
+                }
+                SupersedeResult::Refused { why, .. } => {
+                    return self.stop_supersede(why);
+                }
+                SupersedeResult::Unknown(why) => {
+                    let message = format!(
+                        "COULD NOT RUN: the supersession write's result is unknown: {why}; \
+                         candidate.toml retains {} for an exact retry",
+                        short(txn.replacement.head())
+                    );
+                    self.say(&message);
+                    self.last = message;
+                    return Err(Halt::Said(3));
+                }
+            };
+            self.finish_supersede_commit(txn, note)?;
+        }
+        if self.opts.supersede
+            && self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.has(SUPERSEDED_LINE))
+        {
             self.opts.supersede = false;
             self.b.supersession_completed();
         }
@@ -3868,7 +4450,8 @@ impl Run<'_> {
                 Err(r) => self.refuse(r)?,
             }
         }
-        if self.b.head() != cand.commit
+        if !(selecting && self.supersede.is_some())
+            && self.b.head() != cand.commit
             && let Err(r) = self.b.move_to(&cand.commit)
         {
             self.refuse(r)?;
@@ -3880,6 +4463,12 @@ impl Run<'_> {
         if !same {
             let now = self.b.now();
             let line = carried
+                .or_else(|| {
+                    self.supersede
+                        .as_ref()
+                        .filter(|txn| txn.replacement.head() == cand.commit)
+                        .map(|txn| txn.replacement.clone())
+                })
                 .unwrap_or_else(|| crate::line::Line::start(&cand.version, &cand.commit, now));
             let asks = self
                 .journal
@@ -3904,6 +4493,7 @@ impl Run<'_> {
                 artifact: None,
                 prepared: None,
                 line: Some(line),
+                supersede: selecting.then(|| self.supersede.clone()).flatten(),
             });
         } else if !self.claimed()
             && let Some(j) = self.journal.as_mut()
@@ -3912,6 +4502,9 @@ impl Run<'_> {
             j.trustc = prover.commit.clone();
             if self.linux.declared() {
                 j.linux = self.linux.clone();
+            }
+            if selecting {
+                j.supersede = self.supersede.clone();
             }
         }
         if !self.early_asks.is_empty()

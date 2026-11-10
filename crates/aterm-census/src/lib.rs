@@ -10,6 +10,7 @@ pub mod export;
 pub mod export_scan;
 mod guards;
 mod held_guard;
+pub mod items;
 mod lazy_init;
 mod lex;
 mod lock_order;

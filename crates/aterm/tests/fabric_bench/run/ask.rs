@@ -2651,6 +2651,7 @@ mod tests {
         assert_eq!(crate::spec::ASKED_PREFILL_MAX, ASKED_KEEP);
         let dir = aterm_tempfile::Builder::new()
             .prefix("fb-prefill")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("scratch");
         let rows = |n: u64| -> String {

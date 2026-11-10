@@ -1106,3 +1106,80 @@ fn a_semicolon_joined_pending_work_clause_parks_and_past_or_split_controls_do_no
         );
     }
 }
+
+/// What a person must give, with the agent's own reversible work in the sentence before: a
+/// hostile review (2026-11-09) of joining that sentence as a prior clause (285c967d99, reverted)
+/// found each of these read as a park there; none parks, so the split form of KI-1020-2 stays a
+/// miss until a join reads the whole paragraph against the person-only exclusions.
+#[test]
+fn a_person_s_decision_after_a_sentence_of_own_work_never_parks() {
+    for reply in [
+        "This checkout is the public mirror. Ready to commit and push. Waiting on your sign-off.",
+        "This change touches prod billing. Ready to commit and push. Waiting on your sign-off.",
+        "Ready to commit and push, then submit the build to the App Store. Waiting for your go-ahead.",
+        "Ready to commit and push, then mail the changelog to everyone on the list. Waiting on your sign-off.",
+        "Ready to land this and run the schema change against the live database. Waiting on your sign-off.",
+        "Ready to commit and push, then message Alice about the outage. Waiting on your go-ahead.",
+        "Ready to commit and push, then flip the feature flag on for all users. Waiting on your sign-off.",
+        "Ready to commit and push, then refund the three duplicate orders. Waiting on your sign-off.",
+        "Ready to commit and push, then clear the shared cache volume on the build server. Waiting on your sign-off.",
+        "The branch is ready to merge into main once the reviewer is happy with it. Waiting on their approval.",
+        "Priya's fix is ready to merge into main. Waiting on your go-ahead.",
+        "The fix from Priya is ready to merge into main. Waiting on your go-ahead.",
+        "My teammate will rebase it onto main. Waiting on your go-ahead.",
+        "I won't merge this into main, because I think the approach is wrong. Waiting on your go-ahead.",
+        "I'd rather not push this to main until Sam has finished reviewing it. Waiting on your go-ahead.",
+        "If the API change is acceptable to the other teams, I can push to main. Waiting on your go-ahead.",
+        "You'll need to merge the branch into main yourself. Waiting on your go-ahead.",
+        "Dana's review is still pending, though the tests pass. Waiting on your go-ahead.",
+        "The new plan limits change what every customer is charged next month, and their invoices go out on the 1st. I'll commit the config and push it to main. Waiting on your go-ahead on the pricing.",
+        "The GitHub token on the CI runner expired overnight, so the checks there are red. I can rerun them and push once it's replaced. Waiting on your go-ahead.",
+        "You said not to touch the payments module until Thursday. I've got the fix ready to commit and push to main. Waiting on your go-ahead.",
+        "My fix rewrites every row of the shared staging database in place, and there is no snapshot to go back to. I can commit it and run it as soon as it's pushed. Waiting on your go-ahead.",
+        "I'm ready to commit and push. Waiting for your go-ahead once you've unlocked 1Password.",
+        "I can rerun the full benchmark matrix on the rented GPU boxes. Waiting on your go-ahead, since each run bills about forty dollars an hour.",
+        "The branch is ready to merge into main. Waiting on your go-ahead. Maya asked to review the diff before anything lands. Do you want me to hold it for her?",
+    ] {
+        for columns in DRAWN {
+            let text = drawn(reply, columns);
+            assert_eq!(
+                parked("", &text),
+                None,
+                "must not park at {columns:?}: {reply}"
+            );
+        }
+    }
+}
+
+/// A CONDITION NAMES WHAT THE GO-AHEAD WAITS FOR, NOT THE AGENT'S WORK (2026-11-09 review): `the
+/// test iPhone` in `once the test iPhone is connected` is no test the agent runs, and `once you
+/// connect it` is a person's act; work outside the condition, before it or after its `so`, still
+/// parks.
+#[test]
+fn a_condition_s_nouns_are_not_the_agent_s_work() {
+    for person in [
+        "I'll rebuild the app and rerun the device tests. Waiting on your go-ahead once the test \
+         iPhone is connected.",
+        "Waiting on your go-ahead once the test iPhone is connected.",
+        "Waiting on your go-ahead once you connect the test iPhone.",
+        "Waiting on your go-ahead when the build machine is connected.",
+        "Waiting on your go-ahead after the test runner is back.",
+    ] {
+        for columns in DRAWN {
+            let text = drawn(person, columns);
+            assert_eq!(
+                parked("", &text),
+                None,
+                "must not park at {columns:?}: {person}"
+            );
+        }
+    }
+    for park in [
+        "The build is waiting for your go-ahead.",
+        "Waiting on your go-ahead to rebuild and push my branch once memory frees up.",
+        "Say \"go\" when you're back so I can rebuild and push my branch to main.",
+        "Nothing more until you tell me to rebuild.",
+    ] {
+        assert!(parked("", park).is_some(), "must park: {park}");
+    }
+}

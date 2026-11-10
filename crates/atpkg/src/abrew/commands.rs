@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 use std::cmp::Ordering;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::api::Api;
@@ -150,6 +152,28 @@ pub(super) fn foreign_formula(prefix: &Prefix, name: &str) -> Option<Formula> {
         2 => super::tap::lookup(prefix, &format!("{}/{}/{}", parts[0], parts[0], parts[1])),
         _ => None,
     }
+}
+
+/// Whether the named foreign tap holds a cask file for the
+/// leaf (brew's factory would resolve the reference as that
+/// cask; abrew then delegates rather than errors).
+pub(super) fn foreign_cask_exists(prefix: &Prefix, name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    let (user, repo, leaf) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        2 => (parts[0], parts[0], parts[1]),
+        _ => return false,
+    };
+    let casks = prefix
+        .taps_dir()
+        .join(user)
+        .join(format!("homebrew-{repo}"))
+        .join("Casks");
+    casks.join(format!("{leaf}.rb")).is_file()
+        || casks
+            .join(leaf.chars().next().map_or(String::new(), |c| c.to_string()))
+            .join(format!("{leaf}.rb"))
+            .is_file()
 }
 
 /// Brew's factory failure for an unresolvable foreign-qualified
@@ -5370,6 +5394,37 @@ pub(super) fn cmd_cat(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
 
 fn cat_one(prefix: &Prefix, api: &Api, rest: &[String], name: &str) -> ExitCode {
     let name = name.to_string();
+    // Brew's to_paths: a two-segment name is a tap reference;
+    // its path is the tap directory itself.
+    {
+        let parts: Vec<&str> = name.split('/').collect();
+        if parts.len() == 2
+            && parts.iter().all(|p| super::valid_component(p))
+            && !(parts[0] == "homebrew" && matches!(parts[1], "core" | "cask"))
+        {
+            let tap_dir = prefix
+                .taps_dir()
+                .join(parts[0])
+                .join(format!("homebrew-{}", parts[1]));
+            if !tap_dir.is_dir() {
+                let shown = if has_flag(rest, "--cask", "") {
+                    format!("homebrew-{}", parts[1])
+                } else {
+                    tap_dir.display().to_string()
+                };
+                let treat = if has_flag(rest, "--cask", "") {
+                    "--cask "
+                } else if has_flag(rest, "--formula", "") {
+                    "--formula "
+                } else {
+                    ""
+                };
+                return failed(&format!(
+                    "Error: {shown}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github {treat}{name}"
+                ));
+            }
+        }
+    }
     if has_flag(rest, "--cask", "") {
         let short = super::api::canonical_cask_token(Formula::short_name(&name));
         let parts: Vec<&str> = name.split('/').collect();
@@ -5401,7 +5456,9 @@ fn cat_one(prefix: &Prefix, api: &Api, rest: &[String], name: &str) -> ExitCode 
                     }
                 }
             }
-            return failed(&format!("abrew: no cask file for {name} in the local tap"));
+            return failed(&format!(
+                "Error: {short}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github --cask {name}"
+            ));
         }
         // A tapped cask tap's file wins, as in brew.
         for t in tap::list(prefix) {
@@ -5425,7 +5482,7 @@ fn cat_one(prefix: &Prefix, api: &Api, rest: &[String], name: &str) -> ExitCode 
         }
         if api.cask(short).is_err() || super::via_reroute() {
             return failed(&format!(
-                "Error: {short}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github --cask {short}"
+                "Error: {short}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github --cask {name}"
             ));
         }
         let url = format!(
@@ -5465,8 +5522,25 @@ fn cat_one(prefix: &Prefix, api: &Api, rest: &[String], name: &str) -> ExitCode 
                 Err(e) => failed(&format!("abrew: {e}")),
             };
         }
+        if has_flag(rest, "--formula", "") {
+            // Formulary.path constructs the tap file path blindly.
+            let shown = t.path.join("Formula").join(format!("{n}.rb"));
+            return failed(&format!(
+                "Error: {}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github --formula {name}",
+                shown.display()
+            ));
+        }
     }
     let short = Formula::short_name(&name);
+    // A foreign three-segment reference that missed its tap
+    // file takes brew's raw-path error; the leaf must not
+    // resolve against another tap by short name.
+    if foreign_qualified(&name) && parts.len() == 3 {
+        return failed(&format!(
+            "Error: {}/{name}'s source doesn't exist on disk.\nThe name may be wrong, or the tap hasn't been tapped. Instead try:\n  brew info --github {name}",
+            prefix.root.display()
+        ));
+    }
     // A tapped tap's formula file wins verbatim (bottle block
     // included), as in brew; the API source is the fallback.
     for t in tap::list(prefix) {
@@ -5616,11 +5690,20 @@ pub(super) fn cmd_cache_query(
     let mut paths = Vec::new();
     for name in operands_without_flag_values(rest, &["--os", "--arch", "--bottle-tag"]) {
         let short = Formula::short_name(&name);
+        if foreign_qualified(&name) && foreign_formula(prefix, &name).is_none() {
+            return failed(&format!(
+                "Error: {}",
+                foreign_unavailable(prefix, api, &name, want_cask, false)
+            ));
+        }
         if !want_cask {
-            let resolved = api
-                .formula(&name)
-                .ok()
-                .or_else(|| tap::lookup(prefix, &name));
+            let resolved = if foreign_qualified(&name) {
+                foreign_formula(prefix, &name)
+            } else {
+                api.formula(&name)
+                    .ok()
+                    .or_else(|| tap::lookup(prefix, &name))
+            };
             match resolved {
                 Some(f) => {
                     if let Some(tags) = &cross_tags {
@@ -6382,6 +6465,72 @@ fn indented(items: &[String]) -> String {
 
 /// `brew generate-cask-token`: propose a token for an app
 /// name or bundle, warning like brew (a duplicate fails).
+/// Whether a formula's log directory holds any file (brew's
+/// `load_logs` emptiness, recursively).
+fn has_log_files(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if has_log_files(&path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// brew `gist-logs`: without logs on disk the answer is brew's
+/// own error; uploading a gist is never native.
+pub(super) fn cmd_gist_logs(
+    prefix: &Prefix,
+    api: &Api,
+    args: &[String],
+    rest: &[String],
+) -> ExitCode {
+    let Some(name) = operands(rest).into_iter().next() else {
+        return usage("gist-logs needs a formula");
+    };
+    let formula = if foreign_qualified(&name) {
+        match foreign_formula(prefix, &name) {
+            Some(f) => f,
+            None => {
+                return failed(&format!(
+                    "Error: {}",
+                    foreign_unavailable(prefix, api, &name, false, true)
+                ));
+            }
+        }
+    } else {
+        match api
+            .formula(&name)
+            .ok()
+            .or_else(|| super::tap::lookup(prefix, &name))
+        {
+            Some(f) => f,
+            None => {
+                return failed(&format!("Error: {}", formula_unavailable(api, &name)));
+            }
+        }
+    };
+    let logs_root = std::env::var_os("HOMEBREW_LOGS").map_or_else(
+        || {
+            std::env::home_dir()
+                .unwrap_or_default()
+                .join("Library/Logs/Homebrew")
+        },
+        std::path::PathBuf::from,
+    );
+    if !has_log_files(&logs_root.join(&formula.name)) {
+        return failed("Error: No logs.");
+    }
+    not_native(prefix, args, "gist-logs (uploading a gist)")
+}
+
 pub(super) fn cmd_generate_cask_token(api: &Api, rest: &[String]) -> ExitCode {
     let app = operands(rest).into_iter().next().unwrap_or_default();
     let app_name = super::token_generator::simplified_app_name(&app);
@@ -7046,7 +7195,14 @@ fn deprecated_disabled_finding(
 /// an actual recipe is not native.
 pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let mut names: Vec<String> = Vec::new();
+    let mut foreign: Vec<String> = Vec::new();
     for name in operands(rest) {
+        if foreign_qualified(&name) {
+            if !foreign.contains(&name) {
+                foreign.push(name);
+            }
+            continue;
+        }
         let short = Formula::short_name(&name).to_string();
         if !names.contains(&short) {
             names.push(short);
@@ -7054,6 +7210,41 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
     }
     // Resolve and classify everything before printing.
     let mut plan: Vec<(String, bool)> = Vec::new();
+    // Foreign references resolve in their tap only; the leaf
+    // must not be classified against other taps by short name.
+    for name in &foreign {
+        match foreign_formula(prefix, name) {
+            Some(f) => {
+                let parts: Vec<&str> = name.split('/').collect();
+                let (user, repo, leaf) = if parts.len() == 3 {
+                    (parts[0], parts[1], parts[2])
+                } else {
+                    (parts[0], parts[0], parts[1])
+                };
+                let tap = tap::Tap {
+                    path: prefix
+                        .taps_dir()
+                        .join(user)
+                        .join(format!("homebrew-{repo}")),
+                    user: user.to_string(),
+                    repo: repo.to_string(),
+                };
+                let defined = tap::formula_file(&tap, leaf)
+                    .and_then(|file| std::fs::read_to_string(file).ok())
+                    .map(|text| text.contains("def post_install"));
+                match defined {
+                    Some(false) => plan.push((f.name.clone(), false)),
+                    _ => return super::unsupported("'postinstall' is not native"),
+                }
+            }
+            None => {
+                return failed(&format!(
+                    "Error: {}",
+                    foreign_unavailable(prefix, api, name, false, true)
+                ));
+            }
+        }
+    }
     for name in &names {
         let defined = match api.formula_value(name) {
             Ok(v) => v.get("post_install_defined").and_then(|b| b.as_bool()),
@@ -7630,6 +7821,27 @@ pub(super) fn cmd_install(
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
     for name in &names {
+        if foreign_qualified(name) {
+            // Resolvable foreign names still delegate; brew's
+            // rescue searches by leaf name for the two-segment
+            // shorthand, and abrew never auto-taps for the rest.
+            if foreign_formula(prefix, name).is_some() || foreign_cask_exists(prefix, name) {
+                return not_native(prefix, args, "install (tap-qualified name)");
+            }
+            if name.matches('/').count() == 1 {
+                return install_unknown_name(
+                    prefix,
+                    api,
+                    Formula::short_name(name),
+                    want_cask,
+                    want_formula,
+                );
+            }
+            return failed(&format!(
+                "Error: {}",
+                foreign_unavailable(prefix, api, name, want_cask, false)
+            ));
+        }
         if want_cask {
             if let Err(e) = api.cask(name) {
                 if e.contains("no such") {
@@ -13067,8 +13279,7 @@ pub(super) fn cmd_tab(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     } else if has_flag(rest, "--no-installed-on-request", "") {
         false
     } else {
-        super::tty::onoe!("Error: Invalid usage: No marking option specified.");
-        return ExitCode::from(1);
+        return super::usage_failed("tab", "Error: Invalid usage: No marking option specified.");
     };
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
@@ -13078,6 +13289,20 @@ pub(super) fn cmd_tab(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut not_installed: Vec<String> = Vec::new();
     for name in operands(rest) {
+        if foreign_qualified(&name)
+            && foreign_formula(prefix, &name).is_none()
+            && !foreign_cask_exists(prefix, &name)
+        {
+            return failed(&format!(
+                "Error: {}",
+                if want_cask {
+                    // Tab's cask resolution shorts first.
+                    cask_unavailable(Formula::short_name(&name))
+                } else {
+                    foreign_unavailable(prefix, api, &name, false, false)
+                }
+            ));
+        }
         let short = Formula::short_name(&name);
         let token = super::api::canonical_cask_token(short);
         if !want_cask && let Some(inst) = prefix.installed_one(Kind::Formula, short) {
@@ -13958,6 +14183,25 @@ fn mode_string(meta: &std::fs::Metadata) -> String {
 }
 
 fn list_json(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    // Brew's Bash fast path shells out to jq and errors when it
+    // is nowhere to be found (PATH, $HOMEBREW_PATH, the prefix's
+    // opt or bin jq); abrew mirrors the gate for parity even
+    // though it renders the JSON natively.
+    let jq_on = |path_var: Option<std::ffi::OsString>| {
+        path_var.is_some_and(|p| {
+            std::env::split_paths(&p).any(|d| {
+                let f = d.join("jq");
+                f.is_file() && is_executable(&f)
+            })
+        })
+    };
+    let jq_found = jq_on(std::env::var_os("PATH"))
+        || jq_on(std::env::var_os("HOMEBREW_PATH"))
+        || prefix.root.join("opt/jq/bin/jq").exists()
+        || prefix.root.join("bin/jq").exists();
+    if !jq_found {
+        return failed("Error: jq is required for brew list --versions --json.");
+    }
     let opt_str = |v: Option<String>| v.map_or(JVal::Val(aterm_json::Value::Null), jstr);
     let version_values = |i: &Installed| {
         let mut vs = i.versions.clone();
@@ -16253,6 +16497,15 @@ pub(super) fn cmd_options(
     } else {
         let mut rows = Vec::new();
         for name in &names {
+            if foreign_qualified(name) {
+                if foreign_formula(prefix, name).is_some() {
+                    return tapped();
+                }
+                return failed(&format!(
+                    "Error: {}",
+                    foreign_unavailable(prefix, api, name, false, true)
+                ));
+            }
             match api.formula_value(name) {
                 Ok(v) => {
                     let (options, head) = super::api::parse_options_record(&v);
@@ -16838,45 +17091,85 @@ pub(super) fn cmd_log(prefix: &Prefix, _api: &Api, rest: &[String]) -> ExitCode 
             // Brew's log resolves without the API: it constructs
             // the tap file path blindly and cds to its directory,
             // which fails when that tap is not installed.
-            let (user, repo, subdir, tap_name) = if parts.len() >= 3 {
-                let subdir = if want_cask { "Casks" } else { "Formula" };
+            // Brew's to_paths: a two-segment name is the tap
+            // directory itself; an unflagged three-segment name
+            // that resolves nowhere stays a working-directory
+            // relative path; flagged and bare names construct
+            // the tap file path.
+            if parts.len() == 2 {
+                let tap_dir = prefix
+                    .taps_dir()
+                    .join(parts[0].to_lowercase())
+                    .join(format!("homebrew-{}", parts[1].to_lowercase()));
+                let cd_dir = tap_dir
+                    .parent()
+                    .map_or(tap_dir.clone(), std::path::Path::to_path_buf);
+                if !cd_dir.is_dir() {
+                    return failed(&format!(
+                        "Error: No such file or directory @ dir_chdir0 - {}",
+                        cd_dir.display()
+                    ));
+                }
+                let tap_name = format!("{}/{}", parts[0], parts[1]).to_lowercase();
+                (tap_name, tap_dir)
+            } else if parts.len() >= 3 && !want_cask && !want_formula {
+                let constructed = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(name.as_str());
+                let cd_dir = constructed
+                    .parent()
+                    .map_or(constructed.clone(), std::path::Path::to_path_buf);
+                if !cd_dir.is_dir() {
+                    return failed(&format!(
+                        "Error: No such file or directory @ dir_chdir0 - {}",
+                        cd_dir.display()
+                    ));
+                }
                 (
-                    parts[0].to_lowercase(),
-                    parts[1].to_lowercase(),
-                    subdir,
                     format!("{}/{}", parts[0], parts[1]).to_lowercase(),
-                )
-            } else if want_cask {
-                (
-                    "homebrew".to_string(),
-                    "cask".to_string(),
-                    "Casks",
-                    "homebrew/cask".to_string(),
+                    constructed,
                 )
             } else {
-                (
-                    "homebrew".to_string(),
-                    "core".to_string(),
-                    "Formula",
-                    "homebrew/core".to_string(),
-                )
-            };
-            let constructed = prefix
-                .taps_dir()
-                .join(&user)
-                .join(format!("homebrew-{repo}"))
-                .join(subdir)
-                .join(format!("{leaf}.rb"));
-            let cd_dir = constructed
-                .parent()
-                .map_or(constructed.clone(), |d| d.to_path_buf());
-            if !cd_dir.is_dir() {
-                return failed(&format!(
-                    "Error: No such file or directory @ dir_chdir0 - {}",
-                    cd_dir.display()
-                ));
+                let (user, repo, subdir, tap_name) = if parts.len() >= 3 {
+                    let subdir = if want_cask { "Casks" } else { "Formula" };
+                    (
+                        parts[0].to_lowercase(),
+                        parts[1].to_lowercase(),
+                        subdir,
+                        format!("{}/{}", parts[0], parts[1]).to_lowercase(),
+                    )
+                } else if want_cask {
+                    (
+                        "homebrew".to_string(),
+                        "cask".to_string(),
+                        "Casks",
+                        "homebrew/cask".to_string(),
+                    )
+                } else {
+                    (
+                        "homebrew".to_string(),
+                        "core".to_string(),
+                        "Formula",
+                        "homebrew/core".to_string(),
+                    )
+                };
+                let constructed = prefix
+                    .taps_dir()
+                    .join(&user)
+                    .join(format!("homebrew-{repo}"))
+                    .join(subdir)
+                    .join(format!("{leaf}.rb"));
+                let cd_dir = constructed
+                    .parent()
+                    .map_or(constructed.clone(), |d| d.to_path_buf());
+                if !cd_dir.is_dir() {
+                    return failed(&format!(
+                        "Error: No such file or directory @ dir_chdir0 - {}",
+                        cd_dir.display()
+                    ));
+                }
+                (tap_name, constructed)
             }
-            (tap_name, constructed)
         }
     };
     git_log_in(
@@ -16942,6 +17235,159 @@ pub(super) fn cmd_analytics() -> ExitCode {
     println!("InfluxDB analytics are disabled.");
     println!("Google Analytics were destroyed.");
     ExitCode::SUCCESS
+}
+
+/// One `brew <tool>env-sync` run, ported from brew's
+/// nodenv-sync/pyenv-sync/rbenv-sync: symlink every installed
+/// keg version (and, unless HOMEBREW_ENV_SYNC_STRICT, every
+/// lower patch — and for node, lower minor) into
+/// `<root>/versions`, never clobbering a real directory, then
+/// prune broken symlinks. pyenv also links unversioned
+/// `python3` & friends inside each keg's `bin`.
+pub(super) fn cmd_env_sync(prefix: &Prefix, tool: &str) -> ExitCode {
+    let (env_root, lang) = match tool {
+        "nodenv" => ("HOMEBREW_NODENV_ROOT", "node"),
+        "pyenv" => ("HOMEBREW_PYENV_ROOT", "python"),
+        _ => ("HOMEBREW_RBENV_ROOT", "ruby"),
+    };
+    let root = std::env::var_os(env_root).map_or_else(
+        || {
+            std::env::home_dir()
+                .unwrap_or_default()
+                .join(format!(".{tool}"))
+        },
+        PathBuf::from,
+    );
+    let running = root.join(format!(".{tool}_sync_running"));
+    if running.exists() {
+        return ExitCode::SUCCESS;
+    }
+    let versions = root.join("versions");
+    let result = env_sync_run(prefix, tool, lang, &running, &versions);
+    let _ = fs::remove_file(&running);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => failed(&format!("Error: {e}")),
+    }
+}
+
+fn env_sync_run(
+    prefix: &Prefix,
+    tool: &str,
+    lang: &str,
+    running: &Path,
+    versions: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(versions).map_err(|e| e.to_string())?;
+    fs::write(running, b"").map_err(|e| e.to_string())?;
+    let strict = super::env_set("HOMEBREW_ENV_SYNC_STRICT");
+    let cellar = prefix.cellar();
+    let mut keg_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&cellar) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == lang || name.starts_with(&format!("{lang}@")) {
+                keg_roots.push(entry.path());
+            }
+        }
+    }
+    keg_roots.sort();
+    for keg_root in keg_roots {
+        let Ok(entries) = fs::read_dir(&keg_root) else {
+            continue;
+        };
+        let mut kegs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        kegs.sort();
+        for keg in kegs {
+            env_sync_link(tool, &keg, versions, strict)?;
+        }
+    }
+    if let Ok(entries) = fs::read_dir(versions) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_symlink() && !path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn env_sync_link(tool: &str, keg: &Path, versions: &Path, strict: bool) -> Result<(), String> {
+    fs::create_dir_all(versions).map_err(|e| e.to_string())?;
+    let name = keg
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let core = name.split('_').next().unwrap_or(&name);
+    let mut parts = core.split('.').map(|p| {
+        p.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    let minors: Vec<u64> = if tool != "nodenv" || strict {
+        vec![minor]
+    } else {
+        (0..=minor).collect()
+    };
+    let patches: Vec<u64> = if strict {
+        vec![patch]
+    } else {
+        (0..=patch).collect()
+    };
+    for m in &minors {
+        for p in &patches {
+            let link = versions.join(format!("{major}.{m}.{p}"));
+            if link.exists() && !link.is_symlink() {
+                continue;
+            }
+            let _ = fs::remove_file(&link);
+            symlink(keg, &link).map_err(|e| e.to_string())?;
+            if tool == "pyenv" {
+                for exe in ["python3", "pip3", "wheel3", "idle3", "pydoc3"] {
+                    let major_link = link.join("bin").join(exe);
+                    if major_link.exists() && !major_link.is_symlink() {
+                        continue;
+                    }
+                    let exe_path = link.join("bin").join(format!("{exe}.{minor}"));
+                    let _ = fs::remove_file(&major_link);
+                    if let Err(e) = symlink(&exe_path, &major_link) {
+                        eprintln!(
+                            "{}",
+                            super::tty::warning_line(&format!(
+                                "Failed to link {} to {}: {e}",
+                                exe_path.display(),
+                                major_link.display()
+                            ))
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(not(unix))]
+fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks require unix",
+    ))
 }
 
 /// `brew developer [state|on|off]`: brew's developer-mode
@@ -18528,7 +18974,7 @@ fn bundle_edit(rest: &[String], sub: &str) -> BundleEdit {
 
 fn bundle_edit_path(file: Option<&std::path::Path>) -> std::path::PathBuf {
     file.map_or_else(
-        || std::path::PathBuf::from("Brewfile"),
+        || bundle::deps_brewfile_path(None),
         std::path::Path::to_path_buf,
     )
 }
@@ -19047,6 +19493,38 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn env_sync_links_ranges_and_never_clobbers_dirs() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let keg = tmp.path().join("Cellar/node/26.2.1");
+        std::fs::create_dir_all(&keg).unwrap();
+        let versions = tmp.path().join("versions");
+        std::fs::create_dir_all(versions.join("26.1.0")).unwrap();
+        env_sync_link("nodenv", &keg, &versions, false).unwrap();
+        for v in ["26.0.0", "26.0.1", "26.1.1", "26.2.0", "26.2.1"] {
+            assert_eq!(std::fs::read_link(versions.join(v)).unwrap(), keg, "{v}");
+        }
+        assert!(versions.join("26.1.0").is_dir());
+        assert!(!versions.join("26.1.0").is_symlink());
+        // Strict mode links only the exact version.
+        let strict = tmp.path().join("strict-versions");
+        env_sync_link("rbenv", &keg, &strict, true).unwrap();
+        assert!(strict.join("26.2.1").is_symlink());
+        assert!(!strict.join("26.2.0").exists());
+    }
+
+    #[test]
+    fn gist_logs_presence_is_recursive() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().join("logs/widget");
+        assert!(!has_log_files(&root));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(!has_log_files(&root));
+        std::fs::write(root.join("sub/00.config.out"), b"x").unwrap();
+        assert!(has_log_files(&root));
+    }
 
     #[test]
     fn foreign_qualified_resolution_and_errors() {

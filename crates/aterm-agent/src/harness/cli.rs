@@ -9952,8 +9952,8 @@ struct AccountsNext {
     /// ([`claude_worker_words`]): `to` there is the row a rotation moves a session to, which a
     /// launch need not take.
     worker: Option<String>,
-    /// For Codex, each row a session can run on and the row its weekly limit moves such a session
-    /// to ([`wall_moves`]), which is not `to`: `to` is a new launch's.
+    /// For Codex or Kimi, each row a session can run on and the row its weekly limit moves such a
+    /// session to ([`wall_moves`]), which is not `to`: `to` is a new launch's.
     wall_moves: Vec<(String, String)>,
     /// The row on the default login that names no address, the row of the address that login names
     /// ([`accounts::default_login_twin`]), and that address: one account listed twice.
@@ -10231,8 +10231,8 @@ fn active_header_line(roster: &Roster, state: &accounts::State) -> String {
 /// start nothing here ([`Launch::uninstalled`]: the doctor's `not installed`), no row is next in
 /// any mode, and the reason is the doctor's, with its fix; the rows are then judged as on no
 /// known program, so none is not next for what the build it names would run (no `this Codex
-/// build:` line either). A live Codex session moves past its row at its weekly limit, which
-/// `next:` does not say: [`wall_moves`] does. A known identity contradiction in Codex's
+/// build:` line either). A live Codex or scoped Kimi session moves past its row at its weekly
+/// limit, which `next:` does not say: [`wall_moves`] does. A known identity contradiction in Codex's
 /// selected file-backed login withholds a launch on that login. For Claude Code, whose `next:` is
 /// no launch's, it also says what a worker aterm starts takes ([`claude_worker_words`]).
 fn accounts_next(
@@ -10322,9 +10322,17 @@ fn walls_move_sessions(
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> bool {
-    handoff_can_run((cli, launch), rotation)
-        && super::accounts_pool::default_only_now(cli, roster, state, enrolled, launch.program, now)
-            .is_none()
+    (cli == Cli::Kimi && rotation.mode != accounts::Mode::Off)
+        || (handoff_can_run((cli, launch), rotation)
+            && super::accounts_pool::default_only_now(
+                cli,
+                roster,
+                state,
+                enrolled,
+                launch.program,
+                now,
+            )
+            .is_none())
 }
 
 /// Where [`walls_move_sessions`] says one can move: each row a session can run on (one with a login

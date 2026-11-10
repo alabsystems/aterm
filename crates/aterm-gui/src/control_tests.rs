@@ -18886,7 +18886,7 @@ fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
             .map(|c| c.holder.clone())
     };
     let rostered = "set supervisor grok-alab@4242 contract=3 scope=relaunch,upgrade";
-    let foreign = "set supervisor kimi-alab@4242 contract=3 scope=relaunch,upgrade";
+    let foreign = "set supervisor other-alab@4242 contract=3 scope=relaunch,upgrade";
     for line in [rostered, foreign] {
         let refused = sup(false, 7, line);
         assert!(
@@ -18904,7 +18904,7 @@ fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
         "OK\n",
         "a foreign v3 claim, unproven"
     );
-    assert_eq!(holder().as_deref(), Some("kimi-alab@4242"));
+    assert_eq!(holder().as_deref(), Some("other-alab@4242"));
     release_connection_claims_of(&h, 7);
     assert_eq!(holder(), None);
     assert_eq!(sup(false, 8, "set supervisor sup-a"), "OK\n", "a v2 claim");

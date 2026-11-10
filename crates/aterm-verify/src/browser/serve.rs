@@ -581,6 +581,7 @@ mod tests {
     fn the_server_answers_files_and_refuses_the_rest() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-serve-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         std::fs::write(dir.path().join("lane.mjs"), "export {}\n").expect("write");
@@ -690,6 +691,7 @@ mod tests {
     fn a_beat_moves_the_clock_and_is_not_a_request_served() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-beat-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         let server = Server::start(dir.path()).expect("start");

@@ -29,7 +29,7 @@ mod selection;
 mod source;
 pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
-pub use native::InitialRepositoryInputs;
+pub use native::{InitialRepositoryInputs, RepositoryReadback, RepositoryRun};
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
 pub use selection::{RepositoryCredentialWithdrawal, RepositorySelection};
 pub use source::{
@@ -161,7 +161,7 @@ pub fn run_initial_repositories_captured(
     work: aterm_secrets::converge::RepositoryWork,
     inputs: InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
-) -> Result<Vec<crate::model::ItemReport>, String> {
+) -> Result<RepositoryRun, String> {
     native::run_captured(sys, ctx, mode, work, inputs, Box::new(current))
 }
 
@@ -173,7 +173,7 @@ pub fn run_initial_repositories(
     sys: &dyn System,
     ctx: &Ctx,
     mode: crate::model::Mode,
-) -> Result<Vec<crate::model::ItemReport>, String> {
+) -> Result<RepositoryRun, String> {
     native::run(sys, ctx, mode)
 }
 
@@ -876,6 +876,7 @@ fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {
 /// What other modules' tests script of the GitHub stage.
 #[cfg(test)]
 pub(crate) mod scripted {
+    pub(crate) use super::native::tests::{metadata, owned_source, repository};
     /// `user`'s account on `sys` with one repository of hers, `name`, already a worktree in
     /// `~`: the stage init runs with no init.toml, converged.
     pub(crate) fn converged(sys: &crate::port::Fake, user: &crate::model::User, name: &str) {

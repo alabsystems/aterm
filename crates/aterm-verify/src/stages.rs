@@ -2039,7 +2039,7 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
-    if ctx.release {
+    if ctx.release || (ctx.input_paths.is_some() && ctx.carry_context.is_some()) {
         tippy_release_content(ctx, r, &bin, &borrowed);
     } else {
         let scope = ctx.scope.clone();
@@ -2081,18 +2081,41 @@ fn exact_package_tippy_commands(
     bin: &std::path::Path,
     spec: &str,
 ) -> Result<Vec<Cmd>, String> {
-    lint_invocations(&Scope::crate_only(spec), &gated_lint_features(&ctx.root))
-        .into_iter()
-        .map(|TippyPass { args, .. }| {
-            let mut command =
-                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
-            // Content-keyed lint commands use one stable process shape. Utility-QoS wrapping and
-            // per-spawn wait-marker paths are scheduling behavior, not compiler inputs.
-            command.demoted = false;
-            command.waits_count = true;
-            exec::materialize_exact_command(command, ctx.exec_env())
-        })
-        .collect()
+    lint_invocations(
+        &lint_package_scope(ctx, &[spec.to_owned()]),
+        &gated_lint_features(&ctx.root),
+    )
+    .into_iter()
+    .map(|TippyPass { mut args, .. }| {
+        args.insert(0, "--unverified".into());
+        let mut command = crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
+        // Content-keyed lint commands use one stable process shape. Utility-QoS wrapping and
+        // per-spawn wait-marker paths are scheduling behavior, not compiler inputs.
+        command.demoted = false;
+        command.waits_count = true;
+        let mut command = exec::materialize_exact_command(command, ctx.exec_env())?;
+        // Each outer Targo invocation creates a different authority endpoint. This child
+        // names its own lane, so remove that capability from its actual environment as well
+        // as its proof. Keeping it would defeat reuse across separate preflight processes.
+        command.envs.retain(|(name, _)| {
+            !name
+                .to_str()
+                .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
+        });
+        exec::finalize_exact_command(command, ctx.exec_env())
+    })
+    .collect()
+}
+
+fn lint_package_scope(ctx: &Ctx, specs: &[String]) -> Scope {
+    if ctx.input_paths.is_some()
+        && let Scope::Changed(mut changed) = ctx.scope.clone()
+    {
+        changed.crates.retain(|spec| specs.contains(spec));
+        Scope::Changed(changed)
+    } else {
+        Scope::packages(specs)
+    }
 }
 
 fn unbounded_lint_evidence(reason: impl Into<String>) -> crate::lint_content::Evidence {
@@ -2352,7 +2375,7 @@ impl LintScheduleOps for RealLintScheduleOps<'_> {
             .iter()
             .map(|package| package.spec.clone())
             .collect();
-        let scope = Scope::packages(&specs);
+        let scope = lint_package_scope(self.ctx, &specs);
         let began = std::time::Instant::now();
         let passed = tippy_scope(self.ctx, self.report, self.bin, &scope, self.borrowed);
         let execution_s = began.elapsed().as_secs_f64() / packages.len() as f64;
@@ -5677,6 +5700,34 @@ mod tests {
         let cmd = tippy_cmd(&c, &own, tippy_args(&c.scope));
         assert_eq!(env_of(&cmd, "TRUST_STAGE2_BIN"), None);
         assert_eq!(crate::fmt::borrowed_suffix(&c, TIPPY), "");
+    }
+
+    #[test]
+    fn exact_lint_commands_remove_outer_authority_but_keep_real_inputs() {
+        let mut c = ctx(Scope::crate_only("a"));
+        c.child_env_add.push((
+            "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT".into(),
+            "first".into(),
+        ));
+        let first = exact_package_tippy_commands(&c, std::path::Path::new("tippy"), "a").unwrap();
+        assert!(
+            first
+                .iter()
+                .all(|command| command.args.iter().any(|arg| arg == "--unverified"))
+        );
+        assert!(first.iter().all(|command| {
+            command
+                .envs
+                .iter()
+                .all(|(name, _)| !name.to_string_lossy().starts_with("TRUST_TARGO_"))
+        }));
+        c.child_env_add.last_mut().unwrap().1 = "second".into();
+        let second = exact_package_tippy_commands(&c, std::path::Path::new("tippy"), "a").unwrap();
+        assert_eq!(first[0].envs, second[0].envs);
+        c.child_env_add
+            .push(("INPUT_CONTROL".into(), "changed".into()));
+        let changed = exact_package_tippy_commands(&c, std::path::Path::new("tippy"), "a").unwrap();
+        assert_ne!(first[0].envs, changed[0].envs);
     }
 
     #[test]

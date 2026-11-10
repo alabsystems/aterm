@@ -6,7 +6,8 @@
 //! grammar of a v3 claim's words after its holder.
 //!
 //! A v3 claim is `meta set supervisor <id>@<pid> contract=3 scope=<word>[,<word>…]
-//! [version=<MAJOR.MINOR.0[+meta]>] [vendor=<version>]`. It is proven like codex-alab's v2
+//! [version=<MAJOR.MINOR.0[+meta]>] [vendor=<version>] [login=<account>]`. It is proven like
+//! codex-alab's v2
 //! self-claim (the kernel's peer pid is `<pid>`, which leads the session's foreground group),
 //! with the image rule taken from the row: the claimant runs from this user's atpkg store build of
 //! the row's program, or from its dev link (`crates/aterm-gui/src/harness_claim.rs`). codex-alab's
@@ -121,6 +122,13 @@ pub const ROSTER: &[Row] = &[
         program: Program::Muse,
         package: "muse-alab",
         vendor: "muse",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+    },
+    Row {
+        id: "kimi-alab",
+        program: Program::Kimi,
+        package: "kimi-alab",
+        vendor: "kimi",
         allows: &[Scope::Relaunch, Scope::Upgrade],
     },
 ];
@@ -267,6 +275,8 @@ pub struct Claim {
     pub version: Option<ClaimVersion>,
     /// The vendor build its child runs (`vendor=`), when it named one.
     pub vendor: Option<String>,
+    /// The managed account row its child last started on (`login=`), when it named one.
+    pub login: Option<String>,
 }
 
 impl Claim {
@@ -302,7 +312,7 @@ pub enum Words<'a> {
 ///
 /// Without `contract=` they are the v2 grammar, except that a rostered holder never claims
 /// under it (its proof is the v3 image rule, its duties are its scope). With `contract=` the
-/// words are `contract=3`, `scope=` and optionally `version=` and `vendor=`, each once; `ttl=`
+/// words are `contract=3`, `scope=` and optionally `version=`, `vendor=` and `login=`, each once; `ttl=`
 /// and any other word refuse. A rostered holder's scope must be non-empty, every word known
 /// and allowed by its row, none twice.
 #[must_use]
@@ -322,7 +332,8 @@ pub fn read_in<'a>(rows: &'static [Row], holder: &str, words: &'a [&'a str]) -> 
             Words::V2(words)
         };
     }
-    let (mut contract, mut scope, mut version, mut vendor) = (None, None, None, None);
+    let (mut contract, mut scope, mut version, mut vendor, mut login) =
+        (None, None, None, None, None);
     for word in words {
         let Some((key, value)) = word.split_once('=') else {
             return Words::Refused("a claim word is key=value");
@@ -332,7 +343,10 @@ pub fn read_in<'a>(rows: &'static [Row], holder: &str, words: &'a [&'a str]) -> 
             "scope" => &mut scope,
             "version" => &mut version,
             "vendor" => &mut vendor,
-            _ => return Words::Refused("a v3 claim takes contract= scope= version= vendor="),
+            "login" => &mut login,
+            _ => {
+                return Words::Refused("a v3 claim takes contract= scope= version= vendor= login=");
+            }
         };
         if slot.replace(value).is_some() {
             return Words::Refused("a claim word is named twice");
@@ -364,6 +378,9 @@ pub fn read_in<'a>(rows: &'static [Row], holder: &str, words: &'a [&'a str]) -> 
     if vendor.is_some_and(|v| !vendor_ok(v)) {
         return Words::Refused("vendor= is a version word");
     }
+    if login.is_some_and(|label| !crate::harness::accounts::admissible_label(label)) {
+        return Words::Refused("login= is an account label");
+    }
     let Some((row, pid)) = rostered else {
         return Words::Foreign;
     };
@@ -377,6 +394,7 @@ pub fn read_in<'a>(rows: &'static [Row], holder: &str, words: &'a [&'a str]) -> 
         scopes: Scopes(scopes),
         version,
         vendor: vendor.map(str::to_string),
+        login: login.map(str::to_string),
     })
 }
 
@@ -402,11 +420,10 @@ mod tests {
         assert!(SERVED.contains(&SCOPED));
     }
 
-    /// grok-alab and muse-alab are on the roster, for Grok Build and Muse Code, each allowed
-    /// exactly relaunch and upgrade; nothing else is a rostered holder, codex-alab included (its
-    /// v2 rule stays its own).
+    /// grok-alab, muse-alab and kimi-alab may relaunch and upgrade. Nothing else is a rostered
+    /// holder, codex-alab included (its v2 rule stays its own).
     #[test]
-    fn the_roster_names_grok_alab_and_muse_alab_for_relaunch_and_upgrade() {
+    fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
         let (row, pid) = holder("grok-alab@4242").expect("rostered");
         assert_eq!(
             (row.id, row.program, row.package, pid),
@@ -423,6 +440,14 @@ mod tests {
         assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
         assert_eq!(row_for(Program::Muse).map(|r| r.id), Some("muse-alab"));
         assert_eq!(row_named("MUSE-ALAB").map(|r| r.id), Some("muse-alab"));
+        let (row, pid) = holder("kimi-alab@4244").expect("rostered");
+        assert_eq!(
+            (row.id, row.program, row.package, row.vendor, pid),
+            ("kimi-alab", Program::Kimi, "kimi-alab", "kimi", 4244)
+        );
+        assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
+        assert_eq!(row_for(Program::Kimi).map(|r| r.id), Some("kimi-alab"));
+        assert_eq!(row_named("Kimi-Alab").map(|r| r.id), Some("kimi-alab"));
         // Every row's id reads as its vendor (§8.1 item 5), so presence keeps the vendor's reader.
         for row in ROSTER {
             assert_eq!(
@@ -442,7 +467,9 @@ mod tests {
             "grok-alab",
             "codex-alab@4242",
             "claude-code-alab@4242",
-            "kimi-alab@4242",
+            "kimi-alab@",
+            "kimi-alab@1",
+            "kimi-alab@04242",
             "agy-alab@4242",
             "muse-alab@1",
             "muse@4242",
@@ -455,7 +482,6 @@ mod tests {
             Program::Claude,
             Program::Codex,
             Program::Agy,
-            Program::Kimi,
             Program::Generic,
         ] {
             assert_eq!(row_for(p), None, "{p:?}");
@@ -472,10 +498,12 @@ mod tests {
                 "scope=upgrade,relaunch",
                 "version=0.1.0",
                 "vendor=1.0.70",
+                "login=work",
             ],
         )
         .expect("a claim");
         assert_eq!(c.pid, 500);
+        assert_eq!(c.login.as_deref(), Some("work"));
         assert_eq!(c.scopes.words(), "relaunch,upgrade");
         assert!(c.scopes.contains(Scope::Upgrade) && !c.scopes.contains(Scope::Walls));
         assert_eq!(c.versions(), "grok-alab 0.1.0 (grok 1.0.70)");
@@ -512,6 +540,8 @@ mod tests {
             &["contract=3", "scope=relaunch", "version=0.1.0+"],
             &["contract=3", "scope=relaunch", "vendor="],
             &["contract=3", "scope=relaunch", "vendor=1.0.70;rm"],
+            &["contract=3", "scope=relaunch", "login=bad/slash"],
+            &["contract=3", "scope=relaunch", "login=a", "login=b"],
             &[],
             &["ttl=5000"],
         ] {
@@ -519,7 +549,9 @@ mod tests {
         }
         assert_eq!(read("watcher@9", &["ttl=5000"]), Words::V2(&["ttl=5000"]));
         assert_eq!(read("codex-alab@9", &[]), Words::V2(&[]));
-        assert_eq!(read("kimi-alab@9", &ok), Words::Foreign);
+        assert_eq!(read("agy-alab@9", &ok), Words::Foreign);
+        assert!(scoped("kimi-alab@9", &["contract=3", "scope=relaunch,upgrade"]).is_ok());
+        assert!(refused("kimi-alab@9", &["contract=3", "scope=turn-end"]));
         assert!(refused("kimi-alab@9", &["contract=3", "scope=bogus"]));
     }
 

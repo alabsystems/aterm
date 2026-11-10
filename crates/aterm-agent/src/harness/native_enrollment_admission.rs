@@ -17,6 +17,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[path = "native_enrollment_refresh_resources.rs"]
+mod refresh_resources;
+pub(super) use refresh_resources::RefreshResourceTurn;
+
 const EXCHANGE: &str = "native-code-exchange.lock";
 
 /// Managed refresh enters before account/owner/AuthLock custody, and retains
@@ -664,6 +668,22 @@ pub(super) mod tests {
         label: &str,
         operation: &str,
     ) -> Arc<NativeBrowserTurn> {
+        reservation_using(env, label, operation, false)
+    }
+    /// Explicit historical phase fixture: no global catalogue authority.
+    pub(in crate::harness) fn historical_reservation(
+        env: &super::super::cli::Env,
+        label: &str,
+        operation: &str,
+    ) -> Arc<NativeBrowserTurn> {
+        reservation_using(env, label, operation, true)
+    }
+    fn reservation_using(
+        env: &super::super::cli::Env,
+        label: &str,
+        operation: &str,
+        historical: bool,
+    ) -> Arc<NativeBrowserTurn> {
         let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
         let request = codex_enrollment::Request {
             id: operation.repeat(32),
@@ -673,7 +693,13 @@ pub(super) mod tests {
         };
         store
             .transact_logins(env.now, &mut None, |_, logins| {
-                logins.enrollment.admit_native(&request)?;
+                if historical {
+                    logins
+                        .enrollment
+                        .admit_historical_native_fixture(&request)?;
+                } else {
+                    logins.enrollment.admit_native(&request)?;
+                }
                 Ok(Vec::new())
             })
             .unwrap();
@@ -685,7 +711,9 @@ pub(super) mod tests {
             ),
         )
         .unwrap();
-        let turn = NativeBrowserTurn::acquire(&store, &request, &roster.rows[0], env.now).unwrap();
+        let turn =
+            NativeBrowserTurn::acquire_isolated_fixture(&store, &request, &roster.rows[0], env.now)
+                .unwrap();
         turn.bind_source_home(env.home.as_deref().unwrap()).unwrap();
         turn
     }

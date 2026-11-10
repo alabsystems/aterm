@@ -792,15 +792,14 @@ impl App {
         wid: WindowId,
         tab_id: crate::tab_model::TabId,
     ) -> Option<crate::tab_model::TabPresentation> {
-        let (focus, leaves) = self.windows.get(&wid).and_then(|window| {
-            let tab = window.tab_set.get(tab_id)?;
-            Some((tab.focus, tab.root.leaves()))
-        })?;
-        let presentations = leaves
-            .into_iter()
-            .filter_map(|view| self.live_view_presentation(view).map(|value| (view, value)))
-            .collect::<Vec<_>>();
-        crate::tab_model::aggregate_presentations(focus, presentations)
+        let tab = self.windows.get(&wid)?.tab_set.get(tab_id)?;
+        let mut presentations = Vec::with_capacity(tab.root.len());
+        tab.root.visit(&mut |&view| {
+            if let Some(value) = self.live_view_presentation(view) {
+                presentations.push((view, value));
+            }
+        });
+        crate::tab_model::aggregate_presentations(tab.focus, presentations)
     }
 
     pub(crate) fn refresh_aggregate_tab_presentation(
@@ -941,39 +940,36 @@ impl App {
         wid: WindowId,
         tab_id: crate::tab_model::TabId,
     ) {
-        let Some((root, focus, zoomed, canonical_index)) =
-            self.windows.get(&wid).and_then(|window| {
-                let canonical_index = window
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .position(|tab| tab.id == tab_id)?;
-                let tab = window.tab_set.get(tab_id)?;
-                is_terminal_tab(tab, &self.view_store)
-                    .then(|| (tab.root.clone(), tab.focus, tab.zoomed, canonical_index))
-            })
-        else {
-            return;
-        };
-        let Some(layout) = self.restored_terminal_pane_layout(&root, focus) else {
-            return;
-        };
-        let sessions = root
-            .leaves()
-            .into_iter()
-            .filter_map(|view| {
-                self.view_store
+        let Some((tree, canonical_index)) = self.windows.get(&wid).and_then(|window| {
+            let canonical_index = window
+                .tab_set
+                .tabs()
+                .iter()
+                .position(|tab| tab.id == tab_id)?;
+            let tab = window.tab_set.get(tab_id)?;
+            if !is_terminal_tab(tab, &self.view_store) {
+                return None;
+            }
+            let layout = self.restored_terminal_pane_layout(&tab.root, tab.focus)?;
+            let mut sessions = Vec::with_capacity(tab.root.len());
+            tab.root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
                     .get(view)
                     .copied()
                     .and_then(crate::tab_model::View::terminal_session)
-            })
-            .collect::<Vec<_>>();
-        let Some(mut tree) = pane::PaneTree::rebuild(&layout, &sessions) else {
+                {
+                    sessions.push(session);
+                }
+            });
+            let mut tree = pane::PaneTree::rebuild(&layout, &sessions)?;
+            if tab.zoomed {
+                tree.toggle_zoom();
+            }
+            Some((tree, canonical_index))
+        }) else {
             return;
         };
-        if zoomed {
-            tree.toggle_zoom();
-        }
         let Some(window) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1338,41 +1334,43 @@ impl App {
 
     /// Re-project one terminal compatibility tree into its stable generic tab.
     pub(crate) fn sync_tab_model_from_layout(&mut self, wid: WindowId, index: usize) -> bool {
-        let Some((layout, tab_id, old_views)) = self.windows.get(&wid).and_then(|ws| {
+        let mut by_session = std::collections::HashMap::new();
+        let mut used = std::collections::HashSet::new();
+        let Some((layout, tab_id)) = self.windows.get(&wid).and_then(|ws| {
             let tab_id = terminal_tab_id_at(&ws.tab_set, &self.view_store, index)?;
-            Some((
-                ws.layouts.get(index)?.clone(),
-                tab_id,
-                ws.tab_set.get(tab_id)?.root.leaves(),
-            ))
+            let layout = ws.layouts.get(index)?.clone();
+            ws.tab_set.get(tab_id)?.root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                {
+                    by_session.insert(session, view);
+                    used.insert(view);
+                }
+            });
+            Some((layout, tab_id))
         }) else {
             return false;
         };
 
-        let mut by_session = std::collections::HashMap::new();
-        let mut used = std::collections::HashSet::new();
-        for view in old_views {
-            if let Some(session) = self
-                .view_store
-                .get(view)
-                .copied()
-                .and_then(crate::tab_model::View::terminal_session)
-            {
-                by_session.insert(session, view);
-                used.insert(view);
-            }
-        }
-        for session in layout.sessions() {
-            if by_session.contains_key(&session) {
-                continue;
+        let mut missing = false;
+        layout.visit_sessions(&mut |session| {
+            if missing || by_session.contains_key(&session) {
+                return;
             }
             let Some(view) = self.view_store.iter().find_map(|(id, view)| {
                 (!used.contains(&id) && view.terminal_session() == Some(session)).then_some(id)
             }) else {
-                return false;
+                missing = true;
+                return;
             };
             by_session.insert(session, view);
             used.insert(view);
+        });
+        if missing {
+            return false;
         }
         let root = layout.map_sessions(|session| by_session[&session]);
         let Some(focus) = by_session.get(&layout.focus()).copied() else {
@@ -1443,9 +1441,9 @@ impl App {
     }
 
     pub(crate) fn remove_tab_views(&mut self, tab: &crate::tab_model::Tab) {
-        for view in tab.root.leaves() {
+        tab.root.visit(&mut |&view| {
             self.remove_view_link(view);
-        }
+        });
     }
 
     /// Whether the visible tab strip is enabled (`tab_strip_rows > 0`), for every window.
@@ -3882,19 +3880,27 @@ impl App {
         let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.tab_at(i)) else {
             return false;
         };
-        let sessions: Vec<u64> = tab
-            .root
-            .leaves()
-            .into_iter()
-            .filter_map(|view| {
-                self.view_store
-                    .get(view)
+        tab.root.any_leaf(&mut |&view| {
+            let Some(session) = self
+                .view_store
+                .get(view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            else {
+                return false;
+            };
+            let mut here = 0u32;
+            tab.root.visit(&mut |&other| {
+                if self
+                    .view_store
+                    .get(other)
                     .copied()
                     .and_then(crate::tab_model::View::terminal_session)
-            })
-            .collect();
-        sessions.iter().any(|&session| {
-            let here = sessions.iter().filter(|&&s| s == session).count() as u32;
+                    == Some(session)
+                {
+                    here += 1;
+                }
+            });
             self.pool.views(session).is_some_and(|views| views <= here)
                 && self.session_foreground_busy(session)
         })
@@ -5191,9 +5197,9 @@ impl App {
                 .unlist_window(wid);
         }
         self.retiring_edit_leaves_in(wid, |app| {
-            for view in tab.root.leaves() {
+            tab.root.visit(&mut |&view| {
                 app.remove_view_link_for_close(view, crate::native_app::CloseScope::Tab);
-            }
+            });
         });
         for session in terminal_sessions {
             self.teardown_session(session);
@@ -5396,18 +5402,32 @@ impl App {
         let Some(projection) = prior_projection else {
             return;
         };
-        let Some((root, focus, zoomed, terminal)) = self.windows.get(&wid).and_then(|window| {
+        let Some(rebuilt) = self.windows.get(&wid).and_then(|window| {
             let tab = window.tab_set.get(tab_id)?;
-            Some((
-                tab.root.clone(),
-                tab.focus,
-                tab.zoomed,
-                is_terminal_tab(tab, &self.view_store),
-            ))
+            if !is_terminal_tab(tab, &self.view_store) {
+                return Some(None);
+            }
+            let layout = self.restored_terminal_pane_layout(&tab.root, tab.focus)?;
+            let mut sessions = Vec::with_capacity(tab.root.len());
+            tab.root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                {
+                    sessions.push(session);
+                }
+            });
+            let mut tree = pane::PaneTree::rebuild(&layout, &sessions)?;
+            if tab.zoomed {
+                tree.toggle_zoom();
+            }
+            Some(Some(tree))
         }) else {
             return;
         };
-        if !terminal {
+        let Some(tree) = rebuilt else {
             if let Some(window) = self.windows.get_mut(&wid)
                 && projection < window.layouts.len()
             {
@@ -5415,26 +5435,7 @@ impl App {
                 remove_terminal_projection(window, projection);
             }
             return;
-        }
-        let Some(layout) = self.restored_terminal_pane_layout(&root, focus) else {
-            return;
         };
-        let sessions = root
-            .leaves()
-            .into_iter()
-            .filter_map(|view| {
-                self.view_store
-                    .get(view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-            })
-            .collect::<Vec<_>>();
-        let Some(mut tree) = pane::PaneTree::rebuild(&layout, &sessions) else {
-            return;
-        };
-        if zoomed {
-            tree.toggle_zoom();
-        }
         if let Some(slot) = self
             .windows
             .get_mut(&wid)
@@ -6217,17 +6218,16 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        let closing = ws.layouts[projection_index].sessions();
-        ws.layouts.remove(projection_index);
+        let closing = ws.layouts.remove(projection_index);
         remove_terminal_projection(ws, projection_index);
         let stable_tab = ws.tab_set.remove(tab_id).expect("stable tab mirror exists");
         align_terminal_projection_to_active(ws, &self.view_store);
         self.remove_tab_views(&stable_tab);
-        for sid in closing {
+        closing.visit_sessions(&mut |sid| {
             if self.detach_session_view(sid) {
                 self.retire_session_registration(sid);
             }
-        }
+        });
         if let Some(tab) = recovery {
             self.retain_closed_tab(wid, i, tab);
         }
@@ -6518,24 +6518,21 @@ impl App {
                 if canonical_last {
                     return true;
                 }
-                let drained: Vec<u64> = self
-                    .windows
-                    .get(&wid)
-                    .map(|ws| ws.layouts[tab].sessions())
-                    .unwrap_or_default();
-                let stable_tab = self.windows.get_mut(&wid).and_then(|ws| {
-                    ws.layouts.remove(tab);
+                let Some((closing, stable_tab)) = self.windows.get_mut(&wid).map(|ws| {
+                    let closing = ws.layouts.remove(tab);
                     remove_terminal_projection(ws, tab);
                     let removed = ws.tab_set.remove(stable_id);
                     align_terminal_projection_to_active(ws, &self.view_store);
-                    removed
-                });
+                    (closing, removed)
+                }) else {
+                    return false;
+                };
                 if let Some(stable_tab) = stable_tab {
                     self.remove_tab_views(&stable_tab);
                 }
-                for sid in drained {
+                closing.visit_sessions(&mut |sid| {
                     self.teardown_session(sid);
-                }
+                });
                 self.resync_active_or_window(wid);
                 false
             }

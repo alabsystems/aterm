@@ -167,6 +167,7 @@ impl Cadence {
     }
 
     /// Upper bound on a single [`wait`] call including jitter and post-wake settle.
+    /// Depends only on the fixed base, so schedule transitions leave it unchanged.
     pub(crate) fn max_wait(&self) -> Duration {
         let cap = u64::try_from(self.cap().as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(cap.saturating_mul(100 + JITTER_PCT) / 100) + WAKE_SETTLE
@@ -371,11 +372,12 @@ mod tests {
     /// the shipped interval and a fast test base, every failure depth, the offline
     /// and in-flight ladders, a hold past the ceiling, a deferral held to its own
     /// window (`Cadence::deferred`) and every jitter byte, no delay (plus the wake
-    /// settle) exceeds it.
+    /// settle) exceeds it, and every state retains the base's same ceiling.
     #[test]
     fn max_wait_bounds_every_delay_the_schedule_can_take() {
         let now = Instant::now();
         for base in [BASE, Duration::from_secs(INTERVAL_SECS)] {
+            let ceiling = Cadence::new(base).max_wait();
             let mut schedules = Vec::new();
             let mut c = Cadence::new(base);
             for _ in 0..24 {
@@ -403,6 +405,11 @@ mod tests {
                 }
             }
             for s in schedules {
+                assert_eq!(
+                    s.max_wait(),
+                    ceiling,
+                    "the cadence ceiling depends only on its base"
+                );
                 for entropy in 0..=u8::MAX {
                     assert!(
                         s.delay_at(now, entropy) + WAKE_SETTLE <= s.max_wait(),

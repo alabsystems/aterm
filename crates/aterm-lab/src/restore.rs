@@ -1293,9 +1293,8 @@ mod tests {
 
     #[test]
     fn the_agent_is_the_sessions_record_whose_pid_is_in_the_tree() {
-        let dir = fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-sessions-{}", std::process::id()));
+        let outer = crate::TestScratch::new("sessions");
+        let dir = outer.join("sessions");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("100.json"), r#"{"pid":100,"sessionId":"conv-a"}"#).unwrap();
         fs::write(dir.join("200.json"), r#"{"pid":200,"sessionId":"conv-b"}"#).unwrap();
@@ -1305,12 +1304,9 @@ mod tests {
             vec![(200, "conv-b".to_string())]
         );
         assert!(agents_of(&dir, &[1]).is_empty());
-        let link = dir.with_extension("link");
-        let _ = fs::remove_file(&link);
+        let link = outer.join("sessions.link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(agents_of(&link, &[200]).is_empty());
-        let _ = fs::remove_file(&link);
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(since(1000, 3350), "2.4 s");
     }
 

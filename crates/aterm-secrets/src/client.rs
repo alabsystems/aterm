@@ -85,7 +85,10 @@ pub use admit::{
     log_admitted_actors, member_by_log, post_records_to_servers, readmit_from_log_bundle,
     write_from_log_bundle,
 };
-pub(crate) use admit::{readmit_from_log_bundle_admitted, seated_member, with_proof_admission};
+pub(crate) use admit::{
+    log_admitted_actors_read, log_seated, readmit_from_log_bundle_admitted, seated_member,
+    with_proof_admission,
+};
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
 #[cfg(any(test, debug_assertions))]
 pub use commons_excluded::{CommonsExcluded, test_commons_excluded};
@@ -212,9 +215,10 @@ pub use steward::{
 };
 pub use subscriber::mend_subscriber;
 pub use vault_memo::{
-    DeskInputs, VaultLook, acknowledged_commons_log_now, desk_inputs,
-    local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now, swarm_denied_nodes_now,
-    swarm_member_heard_now, swarm_roster_now_until, trusted_commons_log_now,
+    DeskInputs, VaultLook, acknowledged_commons_log_now, config_now, desk_inputs,
+    desk_inputs_quiet, local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now,
+    swarm_denied_nodes_now, swarm_member_heard_now, swarm_roster_now_until,
+    trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
     local_recipient_denied_under, observe_commons_now, observe_commons_quiet,
@@ -2229,22 +2233,46 @@ pub(crate) fn live_genesis_store(store: &crate::membership_log::Store) -> bool {
 /// vault config names a lab's vault: a read that fails lets no lab identity in.
 #[must_use]
 pub fn on_live_genesis(paths: &Paths) -> bool {
-    match records_store(paths) {
-        Ok((_, store)) => live_genesis_store(&store),
-        Err(_) => !matches!(config(paths), Ok(Some(config)) if !alab_vault(&config)),
-    }
+    live_genesis_read(paths)
+        .unwrap_or_else(|_| !matches!(config(paths), Ok(Some(config)) if !alab_vault(&config)))
+}
+
+/// [`on_live_genesis`] by the record store alone, or why it cannot be read, which
+/// `on_live_genesis` answers by the vault config: for a reader that keeps what it read only where
+/// nothing failed (`members::desk::Local::whole`).
+///
+/// # Errors
+/// The record store cannot be read.
+pub(crate) fn live_genesis_read(paths: &Paths) -> crate::Result<bool> {
+    Ok(live_genesis_store(&records_store(paths)?.1))
 }
 
 /// The configured source, if any.
 pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
-    config_with(paths, |pin| cached_chain(paths, pin))
+    config_with(paths, |pin| Ok(cached_chain(paths, pin)))
+}
+
+/// [`config`] for a read that is kept ([`config_now`], the members desk's
+/// [`Local::of`](crate::members::desk::Local::of)): where `source.toml` names no `followed`, a
+/// held envelope that cannot be read is this read's error, never the empty chain [`config`]
+/// takes it as, so a failed read is never kept.
+///
+/// # Errors
+/// As [`config`], or the held envelope cannot be read.
+pub(crate) fn config_whole(paths: &Paths) -> crate::Result<Option<Config>> {
+    config_with(paths, |pin| {
+        Ok(
+            fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
+                .map_or_else(Vec::new, |bytes| chain_cache::parsed(bytes).chain(pin)),
+        )
+    })
 }
 
 /// `source.toml`, with `chain` answering the keys its signer was reached from where it names no
 /// `followed`.
 fn config_with(
     paths: &Paths,
-    chain: impl FnOnce(&[u8; 32]) -> Vec<[u8; 32]>,
+    chain: impl FnOnce(&[u8; 32]) -> crate::Result<Vec<[u8; 32]>>,
 ) -> crate::Result<Option<Config>> {
     let Some(table) = read_toml(&paths.source_file(), "source.toml", 4 << 20)? else {
         return Ok(None);
@@ -2277,7 +2305,7 @@ fn config_with(
             );
         }
     } else if let Some(pin) = &signer {
-        followed = chain(pin);
+        followed = chain(pin)?;
     }
     let host = get("host").unwrap_or("machine").to_string();
     // A mirror carries no authority, so no entry of `mirrors` fails the read: one this build
@@ -2434,8 +2462,13 @@ pub(crate) fn service_health_version(paths: &Paths) -> crate::Result<[u8; 32]> {
 }
 
 fn load_state(paths: &Paths) -> crate::Result<State> {
+    Ok(read_state(paths)?.unwrap_or_default())
+}
+
+/// `state.toml`, `None` where there is none.
+fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
     let Some(table) = read_toml(&paths.state_file(), "state.toml", MAX_STATE)? else {
-        return Ok(State::default());
+        return Ok(None);
     };
     let int = |key: &str| {
         table
@@ -2465,7 +2498,7 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
     let manifest = Manifest {
         files: digests("manifest"),
     };
-    Ok(State {
+    Ok(Some(State {
         seq: int("seq"),
         digest: digest("digest"),
         records_digest: digest("records_digest"),
@@ -2518,11 +2551,60 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
                     .map(str::to_string)
                     .collect()
             }),
-    })
+    }))
+}
+
+/// What `state.toml` holds but for when the vault last heard this Mac and the receipts of the
+/// last rounds (`heard`, the network materialization, `204` and refresh receipts), digested:
+/// what a round of the vault's subscriber rewrites (about every 25 s on a Linux arm64 member,
+/// 2026-11-09) while nothing else in the file moves. `None` where there is no `state.toml`. A
+/// reader that keeps what it read while this stands takes none of its answer from those fields
+/// ([`vault_memo::desk_inputs`], aterm-agent's `fleet_log::LocalLog`): of the file's readers,
+/// only [`status`] answers with `heard`, and only the receipts' own projections with a receipt.
+///
+/// # Errors
+/// `state.toml` cannot be read.
+pub fn state_standing(paths: &Paths) -> crate::Result<Option<[u8; 32]>> {
+    Ok(read_state(paths)?.map(|state| sha256(ordinary_state(&state, false).as_bytes())))
 }
 
 fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     fsx::ensure_private_dir(&paths.dir)?;
+    let mut text = ordinary_state(state, true);
+    if text.len() > MAX_STATE {
+        return Err(Error::new(format!(
+            "{}: would be larger than {MAX_STATE} bytes: the vault holds more entries than this machine can track",
+            paths.state_file().display()
+        )));
+    }
+    if let Some(receipt) = &state.network_materialization {
+        let ordinary_size = text.len();
+        receipt.write(&mut text);
+        // Optional visibility must not make a previously writable ordinary state too large.
+        if text.len() > MAX_STATE {
+            text.truncate(ordinary_size);
+        }
+    }
+    if let Some(receipt) = &state.http204_response {
+        let previous_size = text.len();
+        receipt.write(&mut text);
+        if text.len() > MAX_STATE {
+            text.truncate(previous_size);
+        }
+    }
+    if let Some(receipt) = &state.network_refresh {
+        let previous_size = text.len();
+        receipt.write(&mut text);
+        if text.len() > MAX_STATE {
+            text.truncate(previous_size);
+        }
+    }
+    fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600)
+}
+
+/// The text of `state` that [`save_state`] writes before the receipts of the last rounds, with
+/// `heard` or without it ([`state_standing`]).
+fn ordinary_state(state: &State, heard: bool) -> String {
     let mut text = String::from(
         "# aterm secrets: what this machine holds. Written by aterm; names and digests only.\n",
     );
@@ -2552,10 +2634,12 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     if let Some(identity) = &state.source_identity {
         text.push_str(&format!("source_identity = {}\n", toml_str(&hex(identity))));
     }
-    text.push_str(&format!(
-        "heard = {}\n",
-        i64::try_from(state.heard).unwrap_or(i64::MAX)
-    ));
+    if heard {
+        text.push_str(&format!(
+            "heard = {}\n",
+            i64::try_from(state.heard).unwrap_or(i64::MAX)
+        ));
+    }
     text.push_str(&format!(
         "requested = {}\n",
         i64::try_from(state.requested).unwrap_or(i64::MAX)
@@ -2587,35 +2671,7 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
             text.push_str(&format!("{} = {}\n", toml_str(name), toml_str(digest)));
         }
     }
-    if text.len() > MAX_STATE {
-        return Err(Error::new(format!(
-            "{}: would be larger than {MAX_STATE} bytes: the vault holds more entries than this machine can track",
-            paths.state_file().display()
-        )));
-    }
-    if let Some(receipt) = &state.network_materialization {
-        let ordinary_size = text.len();
-        receipt.write(&mut text);
-        // Optional visibility must not make a previously writable ordinary state too large.
-        if text.len() > MAX_STATE {
-            text.truncate(ordinary_size);
-        }
-    }
-    if let Some(receipt) = &state.http204_response {
-        let previous_size = text.len();
-        receipt.write(&mut text);
-        if text.len() > MAX_STATE {
-            text.truncate(previous_size);
-        }
-    }
-    if let Some(receipt) = &state.network_refresh {
-        let previous_size = text.len();
-        receipt.write(&mut text);
-        if text.len() > MAX_STATE {
-            text.truncate(previous_size);
-        }
-    }
-    fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600)
+    text
 }
 
 fn source_identity(config: &Config) -> [u8; 32] {

@@ -439,24 +439,18 @@ mod tests {
     }
 
     /// A scratch directory under the test's temp dir, removed when dropped.
-    struct Scratch(PathBuf);
+    struct Scratch(aterm_tempfile::TempDir);
 
     impl Scratch {
         fn new(tag: &str) -> Scratch {
-            let dir = std::env::temp_dir().join(format!(
-                "aterm-lab-guest-{tag}-{}.noindex",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("seed")).unwrap();
-            std::fs::create_dir_all(dir.join("joiner")).unwrap();
+            let dir = aterm_tempfile::Builder::new()
+                .prefix(&format!("guest-{tag}-"))
+                .suffix(".noindex")
+                .tempdir()
+                .expect("scratch dir");
+            std::fs::create_dir_all(dir.path().join("seed")).unwrap();
+            std::fs::create_dir_all(dir.path().join("joiner")).unwrap();
             Scratch(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -465,7 +459,7 @@ mod tests {
     #[test]
     fn arrivals_say_when_each_file_landed_and_whether_it_is_the_seeds() {
         let s = Scratch::new("arrivals");
-        let (seed, joiner) = (s.0.join("seed"), s.0.join("joiner"));
+        let (seed, joiner) = (s.0.path().join("seed"), s.0.path().join("joiner"));
         std::fs::write(seed.join("gh_access_token"), "nux-synthetic-github-1").unwrap();
         std::fs::write(joiner.join("gh_access_token"), "nux-synthetic-github-1").unwrap();
         std::fs::write(seed.join("ai-accounts.csv"), "claude,a@example.invalid\n").unwrap();

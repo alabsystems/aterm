@@ -791,7 +791,11 @@ pub trait Ports: Sync {
     ///
     /// # Errors
     /// Its record, this login's context or its init.toml cannot be read.
-    fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
+    fn owed_clone(
+        &self,
+        _readback: Option<&crate::init_github::RepositoryReadback>,
+        _work: aterm_secrets::converge::RepositoryWork,
+    ) -> Result<crate::init::OwedClone, String> {
         Ok(crate::init::OwedClone::Nothing(
             "aterm init owes no clone".into(),
         ))
@@ -805,7 +809,7 @@ pub trait Ports: Sync {
         &self,
         _work: aterm_secrets::converge::RepositoryWork,
         _execution: Option<repository_refresh::Execution>,
-    ) -> Result<String, String> {
+    ) -> Result<crate::init::CloneOwedOutcome, String> {
         Err("this build runs no clone aterm init owes".into())
     }
     /// Forget the clone an `aterm init` owes ([`crate::init::forget_owed_clone`]): its step was
@@ -953,6 +957,8 @@ struct Synced<'a> {
     /// A repair wake does not requery remote heads of already acquired worktrees.
     repository_work: aterm_secrets::converge::RepositoryWork,
     repository_execution: Option<repository_refresh::Execution>,
+    /// Only this item can use its actual native empty-origin readback; it dies with the pass.
+    repository_readback: Mutex<Option<std::sync::Arc<crate::init_github::RepositoryReadback>>>,
     /// Why System State holds the vault out, read as the row starts ([`Ports::vault_held`]): a
     /// Stop pressed while an earlier row ran holds this one.
     held: std::sync::OnceLock<Option<String>>,
@@ -981,6 +987,7 @@ impl<'a> Synced<'a> {
             mode,
             repository_work: aterm_secrets::converge::RepositoryWork::Refresh,
             repository_execution: None,
+            repository_readback: Mutex::new(None),
             held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
@@ -1019,10 +1026,22 @@ impl<'a> Synced<'a> {
         if let Some(why) = self.ports.vault_held() {
             return Some(why);
         }
-        match self.ports.owed_clone() {
+        match self.read_owed_clone(aterm_secrets::converge::RepositoryWork::Repair) {
             Ok(crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why)) => Some(why),
             _ => None,
         }
+    }
+
+    fn read_owed_clone(
+        &self,
+        work: aterm_secrets::converge::RepositoryWork,
+    ) -> Result<crate::init::OwedClone, String> {
+        let readback = self
+            .repository_readback
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.ports.owed_clone(readback.as_deref(), work)
     }
 
     /// Whether this pass turns on a fabric nobody turned off: one an aterm window runs beside,
@@ -1227,7 +1246,7 @@ impl Item for Synced<'_> {
                 IdentityRead::Current(now) => Probe::Ok { now },
                 IdentityRead::Due { from, to } => Probe::Change { from, to },
             }),
-            Kind::OwedClone => read(self.ports.owed_clone(), |owed| {
+            Kind::OwedClone => read(self.read_owed_clone(self.repository_work), |owed| {
                 // Turned off in init.toml, or held in System State since the run that owes it
                 // began (principle 4); a hold that run went past by naming the group keeps it.
                 if let crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) = &owed
@@ -1497,11 +1516,21 @@ impl Item for Synced<'_> {
                     .ports
                     .clone_owed(self.repository_work, self.repository_execution.clone())
                 {
-                    Ok(said) => said,
+                    Ok(outcome) => {
+                        *self
+                            .repository_readback
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            outcome.readback.map(std::sync::Arc::new);
+                        outcome.said
+                    }
                     // A step only a person can finish waits for them: no pass runs it again
                     // until the token or init.toml changes.
                     Err(why) => {
-                        if let Ok(crate::init::OwedClone::Person(how)) = self.ports.owed_clone() {
+                        if let Ok(crate::init::OwedClone::Person(how)) = self
+                            .ports
+                            .owed_clone(None, aterm_secrets::converge::RepositoryWork::Repair)
+                        {
                             self.stand_aside(StoodAside::Waiting(how));
                             return Ok(());
                         }

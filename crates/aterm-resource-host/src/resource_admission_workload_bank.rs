@@ -4,6 +4,7 @@
 //! The original Targo bank selects every loan. The host confirms that exact
 //! loan before ARM and returns it only at a positively established no-ARM or
 //! retired-member boundary. Transport failure never makes an occupied unit free.
+use super::super::member::ReturnProgress;
 use super::*;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use trust_resource_controller::workload::host::bank as wire;
@@ -45,6 +46,14 @@ impl State {
         operation: wire::Operation,
         deadline: Instant,
     ) -> io::Result<crate::workload_transport::BankPending> {
+        self.try_bank_request(operation, deadline)?
+            .ok_or_else(|| io::ErrorKind::WouldBlock.into())
+    }
+    fn try_bank_request(
+        &mut self,
+        operation: wire::Operation,
+        deadline: Instant,
+    ) -> io::Result<Option<crate::workload_transport::BankPending>> {
         let ready = self
             .ready
             .as_ref()
@@ -62,14 +71,17 @@ impl State {
             },
             operation,
         };
-        let response = self
+        let Some(response) = self
             .control
             .as_ref()
             .ok_or_else(|| refused("original workload control missing"))?
-            .begin(request, deadline)?;
+            .try_begin(request, deadline)?
+        else {
+            return Ok(None);
+        };
         // Full local queue does not consume a sequence or create a new request.
         self.bank.sequence = sequence;
-        Ok(response)
+        Ok(Some(response))
     }
     fn accept_primary(&mut self, member: [u8; 16]) -> io::Result<bool> {
         let Some(PrimaryLoan::Pending { slot, response }) = self.bank.primaries.get(&member) else {
@@ -129,16 +141,15 @@ impl State {
         let actual = self.primary.original_for(offered)?;
         let slot = actual.slot();
         if !self.bank.primaries.contains_key(&member) {
-            let response = match self.bank_request(
+            let Some(response) = self.try_bank_request(
                 wire::Operation::Primary {
                     member_attempt: member,
                     slot,
                 },
                 deadline,
-            ) {
-                Ok(response) => response,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) => return Err(error),
+            )?
+            else {
+                return Ok(None);
             };
             self.bank
                 .primaries
@@ -162,25 +173,25 @@ impl State {
         &mut self,
         member: [u8; 16],
         deadline: Instant,
-    ) -> io::Result<()> {
+    ) -> io::Result<ReturnProgress> {
         if self
             .bank
             .workers
             .keys()
             .any(|(parent, _)| *parent == member)
         {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Ok(ReturnProgress::Pending);
         }
         if !self.bank.primaries.contains_key(&member) {
-            return Ok(());
+            return Ok(ReturnProgress::Returned);
         }
         // A canceled pending attempt may have raced an actual grant. Observe
         // the SAME outstanding reply first; never discard it and replay.
         if !self.accept_primary(member)? {
             return if self.bank.primaries.contains_key(&member) {
-                Err(io::ErrorKind::WouldBlock.into())
+                Ok(ReturnProgress::Pending)
             } else {
-                Ok(())
+                Ok(ReturnProgress::Returned)
             };
         }
         let Some(PrimaryLoan::Granted(grant)) = self.bank.primaries.get(&member) else {
@@ -192,7 +203,9 @@ impl State {
                 loan: grant.loan,
                 slot: grant.slot,
             };
-            let response = self.bank_request(operation, deadline)?;
+            let Some(response) = self.try_bank_request(operation, deadline)? else {
+                return Ok(ReturnProgress::Pending);
+            };
             let Some(PrimaryLoan::Granted(grant)) = self.bank.primaries.get_mut(&member) else {
                 return Err(refused("original primary return changed"));
             };
@@ -207,7 +220,7 @@ impl State {
             .ok_or_else(|| refused("original return reply missing"))?
             .poll()?
         else {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Ok(ReturnProgress::Pending);
         };
         if !matches!(answer.reply.decision, wire::Decision::Returned) || answer.original.is_some() {
             return Err(refused(
@@ -215,7 +228,7 @@ impl State {
             ));
         }
         self.bank.primaries.remove(&member);
-        Ok(())
+        Ok(ReturnProgress::Returned)
     }
     pub(super) fn confirmed_primary(&self, member: [u8; 16], slot: u32) -> bool {
         matches!(self.bank.primaries.get(&member),Some(PrimaryLoan::Granted(grant)) if grant.slot==slot&&grant.returning.is_none())

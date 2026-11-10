@@ -49,13 +49,13 @@ impl Terminal {
     fn row_display_order_full(&self, view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize>) {
         let (chars, continuation) = render_scalars(view);
         let mut levels = aterm_bidi::Scratch::default();
-        let mut map = visual_order_cells_into(
+        let mut map = visual_order_cells(
             self.modes.bidi_mode,
             self.modes.bidi_direction,
             self.modes.bidi_autodetection,
             &chars,
             &continuation,
-            &mut levels,
+            Some(&mut levels),
         );
         map.extend(map.len()..usize::from(cols));
         let mut text = String::with_capacity(usize::from(cols));
@@ -104,13 +104,20 @@ impl Terminal {
             self.modes.bidi_autodetection,
             &classes,
         );
-        let levels = aterm_bidi::cell_levels(&classes, &brackets, &wide, base);
-        if !levels.iter().any(|&lvl| lvl > 0) {
-            return (col, false);
-        }
-        let order = aterm_bidi::reorder_cells_with_classes(&classes, &brackets, &wide, base);
+        // The permutation and direction must come from the same resolution. Expanding
+        // cell levels separately would resolve the entire row a second time per hit.
+        let mut levels = aterm_bidi::Scratch::default();
+        let mut order = Vec::new();
+        aterm_bidi::reorder_cells_with_classes_into(
+            &classes,
+            &brackets,
+            &wide,
+            base,
+            &mut levels,
+            &mut order,
+        );
         let logical = order.get(visual).copied().unwrap_or(visual);
-        let rtl = levels.get(logical).is_some_and(|level| level % 2 == 1);
+        let rtl = levels.cell_is_rtl(logical);
         (u16::try_from(logical).unwrap_or(col), rtl)
     }
 
@@ -293,23 +300,23 @@ pub fn compute_visual_order_cells(
     cell_chars: &[char],
     is_wide_continuation: &[bool],
 ) -> Vec<usize> {
-    visual_order_cells_into(
+    visual_order_cells(
         mode,
         dir,
         autodetect,
         cell_chars,
         is_wide_continuation,
-        &mut aterm_bidi::Scratch::default(),
+        None,
     )
 }
 
-fn visual_order_cells_into(
+fn visual_order_cells(
     mode: BiDiMode,
     dir: ParagraphDirection,
     autodetect: bool,
     cell_chars: &[char],
     is_wide_continuation: &[bool],
-    levels: &mut aterm_bidi::Scratch,
+    levels: Option<&mut aterm_bidi::Scratch>,
 ) -> Vec<usize> {
     if mode == BiDiMode::Disabled || !cell_chars.iter().any(|&c| c >= '\u{0590}') {
         return (0..cell_chars.len()).collect();
@@ -326,16 +333,23 @@ fn visual_order_cells_into(
         .iter()
         .map(|&c| aterm_bidi::bracket_of(c))
         .collect();
-    let mut order = Vec::new();
-    aterm_bidi::reorder_cells_with_classes_into(
-        &classes,
-        &brackets,
-        is_wide_continuation,
-        base,
-        levels,
-        &mut order,
-    );
-    order
+    match levels {
+        Some(levels) => {
+            let mut order = Vec::new();
+            aterm_bidi::reorder_cells_with_classes_into(
+                &classes,
+                &brackets,
+                is_wide_continuation,
+                base,
+                levels,
+                &mut order,
+            );
+            order
+        }
+        None => {
+            aterm_bidi::reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
+        }
+    }
 }
 
 /// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi`
@@ -382,6 +396,60 @@ mod tests {
 
     const ALEF: char = '\u{05D0}';
     const BET: char = '\u{05D1}';
+
+    #[test]
+    fn pointer_direction_matches_expanded_levels_and_painted_order() {
+        for text in [
+            "plain ASCII row",
+            "中 🦀 xyz",
+            "abc אב 12 ג def",
+            "中 אב (12) 🦀 xyz",
+            "abc مرحبا 123 xyz",
+            "אב e\u{301} (12) ג",
+            "abc \u{202b}אב 12\u{202c} xyz",
+            "abc \u{2067}אב 12\u{2069} xyz",
+        ] {
+            for dir in [
+                ParagraphDirection::Auto,
+                ParagraphDirection::Ltr,
+                ParagraphDirection::Rtl,
+                ParagraphDirection::AutoRtl,
+            ] {
+                for autodetect in [false, true] {
+                    let mut term = Terminal::new(4, 40);
+                    term.process(text.as_bytes());
+                    term.modes.bidi_direction = dir;
+                    term.modes.bidi_autodetection = autodetect;
+                    let view = term.grid().visible_row_view(0);
+                    let (chars, wide) = render_scalars(&view);
+                    let classes: Vec<_> =
+                        chars.iter().map(|&c| aterm_bidi::bidi_class(c)).collect();
+                    let brackets: Vec<_> =
+                        chars.iter().map(|&c| aterm_bidi::bracket_of(c)).collect();
+                    let levels = aterm_bidi::cell_levels(
+                        &classes,
+                        &brackets,
+                        &wide,
+                        base_direction_from_classes(dir, autodetect, &classes),
+                    );
+                    let reordered = may_reorder(&view)
+                        && chars.iter().any(|&c| c >= '\u{0590}')
+                        && aterm_bidi::has_bidi_classes(&classes);
+                    let frame = term.cell_frame(4, 40);
+                    for visual in 0..40 {
+                        let logical = frame.logical_col(0, visual);
+                        let rtl = reordered && levels.get(logical).is_some_and(|l| l % 2 == 1);
+                        assert_eq!(
+                            term.viewport_cell_logical(0, u16::try_from(visual).unwrap()),
+                            (u16::try_from(logical).unwrap(), rtl),
+                            "{text:?}, {dir:?}, autodetect={autodetect}, visual={visual}"
+                        );
+                    }
+                    assert_eq!(term.viewport_cell_logical(0, u16::MAX), (u16::MAX, false));
+                }
+            }
+        }
+    }
 
     #[test]
     fn scp_direction_change_reorders_and_damages_an_existing_row() {

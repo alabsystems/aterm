@@ -3780,8 +3780,11 @@ impl<C: Ctl> Session<'_, C> {
         action = self.guard_account_execution(action, opts, now);
         // An observed agent's turn end is decided as ever, so an escalation still raises; an act
         // that would type into it is withheld (`observe.rs`), and a withheld act concludes no
-        // managed worker's wall.
-        let withheld = types_input(&action) && self.observing();
+        // managed worker's wall. A host-certified scoped account event goes to that harness,
+        // never through aterm's built-in restart lane.
+        let scoped = matches!(&action, TurnEndAction::Restart { why, .. }
+            if opts.idle_host.as_ref().is_some_and(|host| host.scoped_restart(why)));
+        let withheld = types_input(&action) && !scoped && self.observing();
         if withheld {
             if let Some(steps) = trace.as_mut() {
                 steps.push(TraceStep {

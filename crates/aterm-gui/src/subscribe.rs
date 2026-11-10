@@ -667,6 +667,7 @@ pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         "human" => Some("human"),
         "render" => Some("render"),
         crate::harness_policy_verb::HARNESS_POLICY_EVENT => Some("harness-policy"),
+        crate::restart_act::RESTART_EVENT => Some("restart"),
         crate::sys_host::JOB_CHANGE => Some("job"),
         crate::occupancy_wakes::WAKE_READY => Some("wake"),
         crate::session_timeline::PROGRAM_STATE => Some("program"),

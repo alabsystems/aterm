@@ -12,6 +12,20 @@ use super::formula::{Formula, Requirement, version_cmp};
 use super::machine::Machine;
 use super::prefix::{Installed, Kind, Prefix, symlink_dir, symlink_file};
 
+#[cfg(unix)]
+mod shared_namespace;
+#[cfg(unix)]
+use shared_namespace::with_shared_namespaces;
+
+#[cfg(not(unix))]
+fn with_shared_namespaces<T>(
+    _prefix: &Prefix,
+    _payload: Option<&Path>,
+    action: impl FnOnce() -> Result<T, InstallError>,
+) -> Result<T, InstallError> {
+    action()
+}
+
 /// Formats the formula's keg version string (including revision when non-zero).
 pub(super) fn keg_version(f: &Formula) -> String {
     if f.revision == 0 {
@@ -1719,21 +1733,31 @@ fn install_one(
         ],
         &[("runtime_dependencies", &runtime_deps)],
     )?;
-    let mut links = Vec::new();
-    if !f.keg_only && link {
-        plan_links(&poured, &keg, &prefix.root, &mut links)?;
-    }
-    links.push(InstallLink {
-        source: keg.clone(),
-        destination: prefix.opt(&f.name),
-        directory: true,
-    });
-    let keg_base = prefix.cellar().join(&f.name);
-    match replace {
-        ReplaceMode::None => publish_payload(prefix, &poured, &keg, &links),
-        ReplaceMode::NewKeg => publish_payload_replacing(prefix, &poured, &keg, &links, &keg_base),
-        ReplaceMode::SameKeg => publish_payload_reinstall(prefix, &poured, &keg, &links, &keg_base),
-    }
+    with_shared_namespaces(
+        prefix,
+        (!f.keg_only && link).then_some(poured.as_path()),
+        || {
+            let mut links = Vec::new();
+            if !f.keg_only && link {
+                plan_links(&poured, &keg, &prefix.root, &mut links)?;
+            }
+            links.push(InstallLink {
+                source: keg.clone(),
+                destination: prefix.opt(&f.name),
+                directory: true,
+            });
+            let keg_base = prefix.cellar().join(&f.name);
+            match replace {
+                ReplaceMode::None => publish_payload(prefix, &poured, &keg, &links),
+                ReplaceMode::NewKeg => {
+                    publish_payload_replacing(prefix, &poured, &keg, &links, &keg_base)
+                }
+                ReplaceMode::SameKeg => {
+                    publish_payload_reinstall(prefix, &poured, &keg, &links, &keg_base)
+                }
+            }
+        },
+    )
 }
 
 /// Planned symlink in a new payload's activation plan.
@@ -1941,15 +1965,23 @@ fn plan_links(
     root: &Path,
     links: &mut Vec<InstallLink>,
 ) -> Result<(), InstallError> {
+    // These two values remain fixed throughout one recursive tree plan.
+    struct LinkContext<'a> {
+        sub: &'a str,
+        root: &'a Path,
+    }
+
     fn walk(
-        sub: &str,
+        context: &LinkContext<'_>,
         rel: &str,
         staged: &Path,
         live: &Path,
         dst: &Path,
-        root: &Path,
+        view: Option<&Path>,
         links: &mut Vec<InstallLink>,
     ) -> Result<(), InstallError> {
+        let sub = context.sub;
+        let root = context.root;
         let mut entries: Vec<_> = std::fs::read_dir(staged)
             .map_err(|e| format!("abrew: {e}"))?
             .collect::<Result<_, _>>()
@@ -1965,6 +1997,8 @@ fn plan_links(
             };
             let destination = dst.join(&name);
             let source = live.join(&name);
+            let viewed_destination = view.map(|path| path.join(&name));
+            let observed = viewed_destination.as_deref().unwrap_or(&destination);
             if kind.is_symlink() || kind.is_file() {
                 if link_file_skipped(
                     sub,
@@ -1985,22 +2019,43 @@ fn plan_links(
                 if name.to_string_lossy().ends_with(".app") {
                     continue;
                 }
-                // A foreign directory symlink in the way is
-                // never walked into or replaced: refuse here,
-                // as activation's snapshot would. Our own
-                // whole-directory link is planned as-is so
-                // link-state probes can judge it.
-                if std::fs::symlink_metadata(&destination).is_ok_and(|m| m.file_type().is_symlink())
-                {
-                    let own = std::fs::canonicalize(&destination)
-                        .ok()
-                        .zip(std::fs::canonicalize(&source).ok())
-                        .is_some_and(|(a, b)| a == b);
-                    if !own {
-                        return Err(InstallError::Failed(format!(
+                // Unowned directory aliases are never traversed. An owned
+                // alias can be projected for a dry run; actual activation
+                // expands it transactionally before planning writes. The
+                // exact current-keg alias remains useful to state probes.
+                if std::fs::symlink_metadata(observed).is_ok_and(|m| m.file_type().is_symlink()) {
+                    if view.is_some() {
+                        return Err(format!(
                             "abrew: refusing foreign link destination {}",
                             destination.display()
-                        )));
+                        )
+                        .into());
+                    }
+                    let own = link_points_to(&destination, &source) == Some(true);
+                    if !own {
+                        #[cfg(unix)]
+                        {
+                            // Dry-run projection only: activation expands this admitted
+                            // namespace transactionally before planning real writes.
+                            let owned =
+                                shared_namespace::owned_directory(&Prefix::at(root), &destination)?;
+                            walk(
+                                context,
+                                &rel,
+                                &entry.path(),
+                                &source,
+                                &destination,
+                                Some(&owned),
+                                links,
+                            )?;
+                            continue;
+                        }
+                        #[cfg(not(unix))]
+                        return Err(format!(
+                            "abrew: refusing foreign link destination {}",
+                            destination.display()
+                        )
+                        .into());
                     }
                     links.push(InstallLink {
                         source,
@@ -2011,16 +2066,32 @@ fn plan_links(
                 }
                 // An existing real prefix directory is walked
                 // into, never replaced by a symlink.
-                let real_dst_dir = std::fs::symlink_metadata(&destination)
+                let real_dst_dir = std::fs::symlink_metadata(observed)
                     .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
                 if real_dst_dir {
-                    walk(sub, &rel, &entry.path(), &source, &destination, root, links)?;
+                    walk(
+                        context,
+                        &rel,
+                        &entry.path(),
+                        &source,
+                        &destination,
+                        viewed_destination.as_deref(),
+                        links,
+                    )?;
                     continue;
                 }
                 match link_dir_mode(sub, &rel) {
                     DirMode::Skip => {}
                     DirMode::Mkpath => {
-                        walk(sub, &rel, &entry.path(), &source, &destination, root, links)?;
+                        walk(
+                            context,
+                            &rel,
+                            &entry.path(),
+                            &source,
+                            &destination,
+                            viewed_destination.as_deref(),
+                            links,
+                        )?;
                     }
                     DirMode::Link => links.push(InstallLink {
                         source,
@@ -2046,7 +2117,15 @@ fn plan_links(
         let src = staged.join(sub);
         match std::fs::symlink_metadata(&src) {
             Ok(m) if m.file_type().is_dir() => {
-                walk(sub, "", &src, &keg.join(sub), &root.join(sub), root, links)?;
+                walk(
+                    &LinkContext { sub, root },
+                    "",
+                    &src,
+                    &keg.join(sub),
+                    &root.join(sub),
+                    None,
+                    links,
+                )?;
             }
             Ok(_) => {
                 return Err(format!("abrew: not a physical directory: {}", src.display()).into());
@@ -2224,6 +2303,7 @@ fn publish_payload_with(
     relocated: Option<&RelocatedKeg>,
     mut place: impl FnMut(&InstallLink) -> Result<(), String>,
 ) -> Result<(), InstallError> {
+    let mut directories = CreatedDirectories::new(prefix);
     let parent = live
         .parent()
         .ok_or_else(|| "abrew: payload has no parent".to_string())?;
@@ -2266,7 +2346,7 @@ fn publish_payload_with(
     let prepared_receipt = stash.path().join(receipt_name);
     std::fs::rename(receipt, &prepared_receipt).map_err(|e| format!("abrew: {e}"))?;
     let identity = std::fs::symlink_metadata(staged).map_err(|e| format!("abrew: {e}"))?;
-    ensure_directory(parent)?;
+    directories.ensure(parent)?;
     super::prefix::publish_directory(staged, live, false)
         .map_err(|e| format!("abrew: cannot publish payload: {e}"))?;
     let mut placed: Vec<(&InstallLink, std::fs::Metadata)> = Vec::new();
@@ -2274,7 +2354,7 @@ fn publish_payload_with(
     let result = (|| {
         for link in links {
             if let Some(parent) = link.destination.parent() {
-                ensure_directory(parent)?;
+                directories.ensure(parent)?;
                 check_directory(parent, &prefix.root)?;
             }
             if let Some((_, old_target, expected)) = replaced
@@ -2344,7 +2424,62 @@ fn publish_payload_with(
         #[cfg(not(unix))]
         let _ = identity;
     }
+    directories.committed = result.is_ok();
     result
+}
+
+/// Removes only empty directories created by this activation when it fails.
+/// Existing containers and intervening user data are never removed.
+struct CreatedDirectories<'a> {
+    prefix: &'a Prefix,
+    paths: Vec<(PathBuf, std::fs::Metadata)>,
+    committed: bool,
+}
+
+impl<'a> CreatedDirectories<'a> {
+    fn new(prefix: &'a Prefix) -> Self {
+        Self {
+            prefix,
+            paths: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn ensure(&mut self, path: &Path) -> Result<(), InstallError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(format!("abrew: refusing non-directory {}", path.display()).into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    self.ensure(parent)?;
+                    check_directory(parent, &self.prefix.root)?;
+                }
+                std::fs::create_dir(path).map_err(|e| format!("abrew: {e}"))?;
+                let identity =
+                    std::fs::symlink_metadata(path).map_err(|e| format!("abrew: {e}"))?;
+                self.paths.push((path.to_path_buf(), identity));
+                Ok(())
+            }
+            Err(error) => Err(format!("abrew: {error}").into()),
+        }
+    }
+}
+
+impl Drop for CreatedDirectories<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            for (path, identity) in self.paths.iter().rev() {
+                if path
+                    .parent()
+                    .is_some_and(|p| check_directory(p, &self.prefix.root).is_ok())
+                    && same_path_identity(path, identity)
+                {
+                    // remove_dir refuses a nonempty directory atomically.
+                    let _ = std::fs::remove_dir(path);
+                }
+            }
+        }
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<(), InstallError> {
@@ -2486,12 +2621,16 @@ pub fn relink(prefix: &Prefix, f: &Formula) -> Result<usize, InstallError> {
     let inst = prefix
         .installed_one(Kind::Formula, &f.name)
         .ok_or_else(|| InstallError::Failed(format!("abrew: {} is not installed", f.name)))?;
-    let (keg, links) = activation_links(prefix, &f.name, &inst.version, f.keg_only)?;
-    // Brew's count is every keg symlink placed; the plan's
-    // leading entry is the opt link, which brew does not count.
-    let created = links.len().saturating_sub(1);
-    activate_keg(prefix, &keg, &links, false)?;
-    Ok(created)
+    let payload = prefix.keg(&f.name, &inst.version);
+    admit_keg(prefix, &payload)?;
+    with_shared_namespaces(prefix, (!f.keg_only).then_some(payload.as_path()), || {
+        let (keg, links) = activation_links(prefix, &f.name, &inst.version, f.keg_only)?;
+        // Brew's count is every keg symlink placed; the plan's
+        // leading entry is the opt link, which brew does not count.
+        let created = links.len().saturating_sub(1);
+        activate_keg(prefix, &keg, &links, false)?;
+        Ok(created)
+    })
 }
 
 /// Returns whether all files in the keg's link plan already point into the keg.
@@ -2526,8 +2665,12 @@ pub(super) fn switch_keg(
     version: &str,
     keg_only: bool,
 ) -> Result<(), InstallError> {
-    let (keg, links) = activation_links(prefix, name, version, keg_only)?;
-    activate_keg(prefix, &keg, &links, true)
+    let payload = prefix.keg(name, version);
+    admit_keg(prefix, &payload)?;
+    with_shared_namespaces(prefix, (!keg_only).then_some(payload.as_path()), || {
+        let (keg, links) = activation_links(prefix, name, version, keg_only)?;
+        activate_keg(prefix, &keg, &links, true)
+    })
 }
 
 fn activation_links(
@@ -2610,8 +2753,11 @@ fn admit_keg(prefix: &Prefix, keg: &Path) -> Result<(), InstallError> {
 
 /// Links a keg's payload directories into the prefix, returning the number of links created.
 pub fn link_keg(prefix: &Prefix, keg: &Path, _overwrite: bool) -> Result<(), InstallError> {
-    let links = keg_link_plan(prefix, keg)?;
-    activate_keg(prefix, keg, &links, false)
+    admit_keg(prefix, keg)?;
+    with_shared_namespaces(prefix, Some(keg), || {
+        let links = keg_link_plan(prefix, keg)?;
+        activate_keg(prefix, keg, &links, false)
+    })
 }
 
 fn keg_link_plan(prefix: &Prefix, keg: &Path) -> Result<Vec<InstallLink>, InstallError> {
@@ -2667,6 +2813,7 @@ fn activate_keg_with(
     remove_old: bool,
     mut place: impl FnMut(&InstallLink) -> Result<(), String>,
 ) -> Result<(), InstallError> {
+    let mut directories = CreatedDirectories::new(prefix);
     struct Change<'a> {
         before: Option<(PathBuf, std::fs::Metadata)>,
         after: Option<&'a InstallLink>,
@@ -2700,7 +2847,7 @@ fn activate_keg_with(
     for (path, change) in &mut changes {
         change.before = snapshot_keg_link(prefix, keg, path)?;
         if let Some(parent) = path.parent() {
-            ensure_directory(parent)?;
+            directories.ensure(parent)?;
         }
     }
     let mut applied = Vec::new();
@@ -2790,6 +2937,7 @@ fn activate_keg_with(
             )))
         };
     }
+    directories.committed = true;
     Ok(())
 }
 
@@ -2857,7 +3005,16 @@ pub(super) fn owned_keg_links_for(
     let cellar = prefix.cellar().join(name);
     let versions: Vec<PathBuf> = versions.iter().map(|v| cellar.join(v)).collect();
     let mut links = Vec::new();
-    for sub in ["bin", "etc", "include", "lib", "sbin", "share", "var"] {
+    for sub in [
+        "bin",
+        "etc",
+        "include",
+        "lib",
+        "sbin",
+        "share",
+        "var",
+        "Frameworks",
+    ] {
         let mut found = Vec::new();
         owned_links(&prefix.root.join(sub), &cellar, &versions, &mut found)?;
         found.sort();
@@ -3551,6 +3708,343 @@ mod tests {
         // A NUL-bearing file is not text: left byte-identical for the
         // leftover scan to delegate.
         assert_eq!(std::fs::read(&binary).unwrap(), raw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_namespace_preserves_payloads_and_unlink_independence() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for namespace in [
+            "share/vim",
+            "lib/opaque-widget",
+            "include/opaque-widget",
+            "Frameworks/opaque-widget",
+        ] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let prefix = Prefix::at(&tmp.path().join("prefix"));
+            prefix.ensure().unwrap();
+            let make = |name: &str| {
+                let keg = prefix.keg(name, "1.0");
+                let path = keg.join(namespace).join("nested").join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, name).unwrap();
+                prefix
+                    .write_receipt(
+                        &keg,
+                        &[
+                            ("name", name),
+                            ("version", "1.0"),
+                            ("installed_by", "abrew"),
+                        ],
+                    )
+                    .unwrap();
+                (keg, path)
+            };
+            let (left, left_file) = make("left");
+            let (right, right_file) = make("right");
+            let left_identity = std::fs::metadata(&left_file).unwrap();
+            link_keg(&prefix, &left, false).unwrap();
+            let shared = prefix.root.join(namespace);
+            assert!(
+                shared.is_symlink(),
+                "first installation retains the directory policy"
+            );
+            link_keg(&prefix, &right, false).unwrap();
+            assert!(!shared.is_symlink());
+            assert!(shared.is_dir());
+            assert_eq!(std::fs::read(shared.join("nested/left")).unwrap(), b"left");
+            assert_eq!(
+                std::fs::read(shared.join("nested/right")).unwrap(),
+                b"right"
+            );
+            assert!(is_linked(&prefix, "left", "1.0"));
+            assert!(is_linked(&prefix, "right", "1.0"));
+            unlink_keg(&prefix, "left").unwrap();
+            assert!(!shared.join("nested/left").exists());
+            assert_eq!(
+                std::fs::read(shared.join("nested/right")).unwrap(),
+                b"right"
+            );
+            link_keg(&prefix, &left, false).unwrap();
+            unlink_keg(&prefix, "right").unwrap();
+            assert_eq!(std::fs::read(shared.join("nested/left")).unwrap(), b"left");
+            assert!(!shared.join("nested/right").exists());
+            assert_eq!(std::fs::read(&left_file).unwrap(), b"left");
+            assert_eq!(std::fs::read(&right_file).unwrap(), b"right");
+            assert_eq!(
+                std::fs::metadata(&left_file).unwrap().ino(),
+                left_identity.ino()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn shared_namespace_keg(
+        prefix: &Prefix,
+        name: &str,
+        version: &str,
+        files: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let keg = prefix.keg(name, version);
+        for (rel, bytes) in files {
+            let path = keg.join("share/vim").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        prefix
+            .write_receipt(
+                &keg,
+                &[
+                    ("name", name),
+                    ("version", version),
+                    ("installed_by", "abrew"),
+                ],
+            )
+            .unwrap();
+        keg
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_namespace_rolls_back_activation_and_empty_parent_creation() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let left = shared_namespace_keg(&prefix, "left", "1.0", &[("nested/left", b"left")]);
+        let right =
+            shared_namespace_keg(&prefix, "right", "1.0", &[("new/a", b"a"), ("new/b", b"b")]);
+        // Model a previously published whole-directory alias beneath a
+        // namespace whose current policy creates parents for each leaf.
+        for keg in [&left, &right] {
+            std::fs::create_dir_all(keg.join("etc")).unwrap();
+            std::fs::rename(keg.join("share/vim"), keg.join("etc/shared")).unwrap();
+        }
+        let namespace = prefix.root.join("etc/shared");
+        symlink_dir(&left.join("etc/shared"), &namespace).unwrap();
+        let identity = std::fs::symlink_metadata(&namespace).unwrap();
+        let target = std::fs::read_link(&namespace).unwrap();
+        let result = with_shared_namespaces(&prefix, Some(&right), || {
+            let links = keg_link_plan(&prefix, &right)?;
+            let mut placed = 0;
+            activate_keg_with(&prefix, &right, &links, false, |link| {
+                placed += 1;
+                if placed == 2 {
+                    return Err("injected later activation failure".into());
+                }
+                symlink_file(&link.source, &link.destination)
+            })
+        });
+        assert_eq!(
+            result,
+            Err(InstallError::Failed(
+                "injected later activation failure".into()
+            ))
+        );
+        assert_eq!(std::fs::read_link(&namespace).unwrap(), target);
+        assert_eq!(
+            std::fs::symlink_metadata(&namespace).unwrap().ino(),
+            identity.ino()
+        );
+        assert_eq!(
+            std::fs::read(namespace.join("nested/left")).unwrap(),
+            b"left"
+        );
+        assert!(!namespace.join("new").exists());
+        assert_eq!(std::fs::read(right.join("etc/shared/new/a")).unwrap(), b"a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_namespace_restores_install_upgrade_and_reinstall_failures() {
+        use std::os::unix::fs::MetadataExt as _;
+        for mode in [ReplaceMode::None, ReplaceMode::NewKeg, ReplaceMode::SameKeg] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let prefix = Prefix::at(&tmp.path().join("prefix"));
+            prefix.ensure().unwrap();
+            let old = shared_namespace_keg(&prefix, "left", "1.0", &[("nested/left", b"old")]);
+            link_keg(&prefix, &old, false).unwrap();
+            point_opt(&prefix, "left", "1.0").unwrap();
+            let old_receipt = std::fs::read(old.join("INSTALL_RECEIPT.json")).unwrap();
+            let namespace = prefix.root.join("share/vim");
+            let identity = std::fs::symlink_metadata(&namespace).unwrap();
+            let owner = if mode == ReplaceMode::None {
+                "right"
+            } else {
+                "left"
+            };
+            let version = if mode == ReplaceMode::NewKeg {
+                "2.0"
+            } else {
+                "1.0"
+            };
+            let live = prefix.keg(owner, version);
+            let work = aterm_tempfile::TempDir::new_in(prefix.cellar()).unwrap();
+            let stage = work.path().join("payload");
+            std::fs::create_dir_all(stage.join("share/vim/new")).unwrap();
+            std::fs::write(stage.join("share/vim/new/a"), b"a").unwrap();
+            std::fs::create_dir_all(stage.join("share/vim/nested")).unwrap();
+            std::fs::write(stage.join("share/vim/nested/left"), b"new").unwrap();
+            // A fresh install must use a distinct leaf; a same-name leaf is a
+            // genuine conflict owned by the first formula.
+            if mode == ReplaceMode::None {
+                std::fs::rename(
+                    stage.join("share/vim/nested/left"),
+                    stage.join("share/vim/nested/right"),
+                )
+                .unwrap();
+            }
+            prefix
+                .write_receipt(
+                    &stage,
+                    &[
+                        ("name", owner),
+                        ("version", version),
+                        ("installed_by", "abrew"),
+                    ],
+                )
+                .unwrap();
+            let result = with_shared_namespaces(&prefix, Some(&stage), || {
+                let mut links = Vec::new();
+                plan_links(&stage, &live, &prefix.root, &mut links)?;
+                let mut count = 0;
+                let place = |link: &InstallLink| {
+                    count += 1;
+                    if count == 2 {
+                        return Err("injected publication failure".to_string());
+                    }
+                    symlink_file(&link.source, &link.destination)
+                };
+                if mode == ReplaceMode::SameKeg {
+                    reinstall_payload_with(
+                        &prefix,
+                        &stage,
+                        &live,
+                        &links,
+                        &prefix.cellar().join(owner),
+                        place,
+                    )
+                } else {
+                    publish_payload_with(
+                        &prefix,
+                        &stage,
+                        &live,
+                        &links,
+                        (mode == ReplaceMode::NewKeg)
+                            .then_some(prefix.cellar().join(owner))
+                            .as_deref(),
+                        None,
+                        place,
+                    )
+                }
+            });
+            assert_eq!(
+                result,
+                Err(InstallError::Failed("injected publication failure".into()))
+            );
+            assert_eq!(
+                std::fs::read_link(&namespace).unwrap(),
+                old.join("share/vim")
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&namespace).unwrap().ino(),
+                identity.ino()
+            );
+            assert_eq!(
+                std::fs::read(old.join("share/vim/nested/left")).unwrap(),
+                b"old"
+            );
+            assert_eq!(
+                std::fs::read(old.join("INSTALL_RECEIPT.json")).unwrap(),
+                old_receipt
+            );
+            assert_eq!(std::fs::read_link(prefix.opt("left")).unwrap(), old);
+            if mode != ReplaceMode::SameKeg {
+                assert!(!live.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_namespace_refuses_foreign_aliases_and_real_leaf_conflicts() {
+        for case in 0..4 {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let prefix = Prefix::at(&tmp.path().join("prefix"));
+            prefix.ensure().unwrap();
+            let left = shared_namespace_keg(&prefix, "left", "1.0", &[("nested/item", b"left")]);
+            let right = shared_namespace_keg(&prefix, "right", "1.0", &[("nested/item", b"right")]);
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("keep"), b"user bytes").unwrap();
+            let namespace = prefix.root.join("share/vim");
+            match case {
+                0 => {
+                    symlink_dir(&outside, &namespace).unwrap();
+                }
+                1 => {
+                    symlink_dir(&left.join("share"), &namespace).unwrap();
+                }
+                2 => {
+                    std::fs::remove_dir_all(left.join("share/vim")).unwrap();
+                    symlink_dir(&outside, &left.join("share/vim")).unwrap();
+                    symlink_dir(&left.join("share/vim"), &namespace).unwrap();
+                }
+                _ => {
+                    link_keg(&prefix, &left, false).unwrap();
+                }
+            }
+            let target = std::fs::read_link(&namespace).unwrap();
+            assert!(link_keg(&prefix, &right, true).is_err());
+            assert_eq!(std::fs::read_link(&namespace).unwrap(), target);
+            assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"user bytes");
+            assert_eq!(
+                std::fs::read(right.join("share/vim/nested/item")).unwrap(),
+                b"right"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_namespace_never_traverses_payload_symlinks_or_deletes_foreign_rollback_data() {
+        for conflict in [false, true] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let prefix = Prefix::at(&tmp.path().join("prefix"));
+            prefix.ensure().unwrap();
+            let left = shared_namespace_keg(&prefix, "left", "1.0", &[("left", b"left")]);
+            let right = shared_namespace_keg(&prefix, "right", "1.0", &[("alias/new", b"right")]);
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("keep"), b"user bytes").unwrap();
+            symlink_dir(&outside, &left.join("share/vim/alias")).unwrap();
+            link_keg(&prefix, &left, false).unwrap();
+            let namespace = prefix.root.join("share/vim");
+            if conflict {
+                let error = with_shared_namespaces::<()>(&prefix, Some(&right), || {
+                    std::fs::write(namespace.join("user-file"), b"retained").unwrap();
+                    Err(InstallError::Failed(
+                        "injected failure with foreign data".into(),
+                    ))
+                })
+                .unwrap_err();
+                assert!(error.message().contains("original alias retained"));
+                assert_eq!(
+                    std::fs::read(namespace.join("user-file")).unwrap(),
+                    b"retained"
+                );
+            } else {
+                assert!(link_keg(&prefix, &right, false).is_err());
+                assert_eq!(
+                    std::fs::read_link(&namespace).unwrap(),
+                    left.join("share/vim")
+                );
+                assert!(!outside.join("new").exists());
+            }
+            assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"user bytes");
+            assert_eq!(std::fs::read(left.join("share/vim/left")).unwrap(), b"left");
+        }
     }
 
     #[test]

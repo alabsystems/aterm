@@ -10217,7 +10217,7 @@ fn a_long_answer_at_a_read_wall_is_no_work_whether_or_not_its_reader_reads_tool_
     for (program, rows_read) in [
         (Program::Claude, true),
         (Program::Muse, true),
-        (Program::Kimi, false),
+        (Program::Kimi, true),
         (Program::Grok, false),
     ] {
         assert_eq!(program.reader().reads_tool_rows(), rows_read, "{program:?}");
@@ -24323,6 +24323,44 @@ fn a_measured_outage_holds_the_continuation_and_its_return_types_it() {
         t,
     );
     assert!(matches!(far, Some(AccountAdvice::Wait { until }) if until > t));
+}
+
+#[test]
+fn a_kimi_quota_wall_moves_accounts_without_a_reset() {
+    let message = "Error: [provider.rate_limit] 429 You exceeded your current quota";
+    let reading = TurnEndReading {
+        phase: Phase::Limited {
+            message: message.to_string(),
+            reset: None,
+        },
+        program: aterm_phase::Program::Kimi,
+        account: Some(AccountAdvice::Move {
+            to: "work".to_string(),
+            yields: None,
+        }),
+        ..walled(WallKind::UsageSession, message, Some(3 * MIN))
+    };
+    let mut st = TurnEndState::default();
+    let action = at(&mut st, &reading, t0());
+    assert!(
+        restarts(&action, &to_account("work", AccountAt::Wall), RULE_ACCOUNT),
+        "{action:?}"
+    );
+}
+
+#[test]
+fn claude_and_kimi_move_accounts() {
+    for (program, want) in [
+        (aterm_phase::Program::Claude, true),
+        (aterm_phase::Program::Codex, false),
+        (aterm_phase::Program::Grok, false),
+        (aterm_phase::Program::Kimi, true),
+        (aterm_phase::Program::Agy, false),
+        (aterm_phase::Program::Muse, false),
+        (aterm_phase::Program::Generic, false),
+    ] {
+        assert_eq!(moves_accounts(program), want, "{program:?}");
+    }
 }
 
 #[path = "sysmsg_replay_tests.rs"]

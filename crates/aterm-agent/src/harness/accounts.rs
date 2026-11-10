@@ -3204,7 +3204,9 @@ impl Logins {
         let mut o = Map::new();
         o.insert(
             "schema".to_owned(),
-            Value::from(if self.enrollment.has_native_rows() {
+            Value::from(if self.enrollment.has_catalogue_witness() {
+                11
+            } else if self.enrollment.has_native_rows() {
                 10
             } else if self.enrollment.has_owner_witness() || self.enrollment.has_artifacts() {
                 9
@@ -3340,12 +3342,12 @@ impl Logins {
         }
         let schema = doc.get("schema").and_then(Value::as_u64);
         let legacy = match schema {
-            Some(4..=10) => false,
+            Some(4..=11) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7, 8, 9 and 10"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7, 8, 9, 10 and 11"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
@@ -3554,16 +3556,21 @@ impl Logins {
                 sign_in_receipts.insert(label.clone(), receipt);
             }
         }
-        let enrollment = if matches!(schema, Some(7..=10)) {
+        let enrollment = if matches!(schema, Some(7..=11)) {
             let book = super::codex_enrollment::Operations::decode(&doc["enrollment"])
                 .map_err(Unread::NotOurs)?;
-            if schema != Some(10) && book.has_native_rows() {
+            if schema != Some(11) && book.has_catalogue_witness() {
+                return Err(Unread::NotOurs(
+                    "global catalogue witnesses require schema 11".into(),
+                ));
+            }
+            if !matches!(schema, Some(10 | 11)) && book.has_native_rows() {
                 return Err(Unread::NotOurs(
                     "native row admission requires schema 10".into(),
                 ));
             }
 
-            if !matches!(schema, Some(9 | 10)) && book.has_owner_witness() {
+            if !matches!(schema, Some(9..=11)) && book.has_owner_witness() {
                 return Err(Unread::NotOurs(
                     "owner freshness witnesses require schema 9".into(),
                 ));
@@ -3573,7 +3580,7 @@ impl Logins {
                     "native enrollment custody requires schema 8".into(),
                 ));
             }
-            if !matches!(schema, Some(9 | 10)) && book.has_artifacts() {
+            if !matches!(schema, Some(9..=11)) && book.has_artifacts() {
                 return Err(Unread::NotOurs(
                     "native artifact custody requires schema 9".into(),
                 ));

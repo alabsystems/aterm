@@ -15,18 +15,20 @@
 //! 1. the proven scoped claim (`<id>@<leader> contract=3 scope=relaunch,upgrade`);
 //! 2. a crash relaunch, by the harness, on the same session, with no act of aterm's built-in lane
 //!    logged (no stand-down shown: [`judge::relaunch`]);
-//! 3. no move while a draft is present, none while a person types (`key|send as=person`), then
+//! 3. for Kimi, a measured quota wall moves a real account pool onto its work overlay, preserving
+//!    the session and proving the child's `login=work` claim;
+//! 4. no move while a draft is present, none while a person types (`key|send as=person`), then
 //!    the move onto the second build at a safe point, under the same harness pid;
-//! 4. the harness's own re-exec onto a second build of itself: same pid, claimed again;
-//! 5. signal and exit propagation: the group's `SIGINT` reaches the child and both run on; the
+//! 5. the harness's own re-exec onto a second build of itself: same pid, claimed again;
+//! 6. signal and exit propagation: the group's `SIGINT` reaches the child and both run on; the
 //!    child's exit 130, a forwarded `SIGTERM` (143) and `SIGHUP` (129) reach the shell, and nothing
 //!    is relaunched after an intended end.
 //!
 //! THE NEGATIVE CONTROL is an aterm that answers no `contract=3` (`ATERM_DEV_NO_CONTRACT3=1`,
 //! `crates/aterm-gui/src/harness_claim.rs`): the harness must pass through (the vendor in its
-//! place, unclaimed) and aterm's built-in lanes must take the session (a crash relaunched by aterm's
-//! resume line). It is calibrated first: the stand-in run bare must be taken by those lanes, else
-//! the control is UNOBSERVED, never a harness's FAIL.
+//! place, unclaimed). Where the vendor has a built-in lane, that lane must take the session (a
+//! crash relaunched by aterm's resume line), calibrated on the bare stand-in first. Where it has
+//! none (Kimi), the control instead proves that no built-in lane takes over.
 //!
 //! A wait for something that must happen is a one-minute hang detector ([`MUST`]); a window in
 //! which nothing may happen is sized from the harness's own clocks ([`Play`]). The worlds are always
@@ -76,6 +78,8 @@ pub(crate) struct Subject {
     pub vendor: &'static str,
     /// The scope its claim names in §9 step 2 and 3.
     pub scope: &'static str,
+    /// Whether aterm has a built-in crash-relaunch lane for this vendor.
+    pub builtin_relaunch: bool,
     /// What the stand-in plays for it, `None` while it plays no such vendor.
     pub play: Option<Play>,
 }
@@ -88,6 +92,7 @@ pub(crate) static SUBJECTS: [Subject; 5] = [
         tool: "muse-alab",
         vendor: "muse",
         scope: "relaunch,upgrade",
+        builtin_relaunch: true,
         play: Some(Play {
             builds: ["1.4.10-R6427.1", "1.4.13-R6996.1"],
             build_id: crate::upgrade_muse::revision_build_id,
@@ -101,6 +106,7 @@ pub(crate) static SUBJECTS: [Subject; 5] = [
         tool: "agy-alab",
         vendor: "agy",
         scope: "relaunch,upgrade",
+        builtin_relaunch: true,
         play: None,
     },
     Subject {
@@ -108,6 +114,7 @@ pub(crate) static SUBJECTS: [Subject; 5] = [
         tool: "claude-alab",
         vendor: "claude",
         scope: "relaunch,upgrade",
+        builtin_relaunch: true,
         play: None,
     },
     Subject {
@@ -115,6 +122,7 @@ pub(crate) static SUBJECTS: [Subject; 5] = [
         tool: "grok-alab",
         vendor: "grok",
         scope: "relaunch,upgrade",
+        builtin_relaunch: true,
         play: None,
     },
     Subject {
@@ -122,7 +130,16 @@ pub(crate) static SUBJECTS: [Subject; 5] = [
         tool: "kimi-alab",
         vendor: "kimi",
         scope: "relaunch,upgrade",
-        play: None,
+        builtin_relaunch: false,
+        play: Some(Play {
+            builds: ["2.3.1", "2.3.2"],
+            build_id: |version| {
+                atpkg::vendor_direct::Version::parse(version).map(|version| version.build_id())
+            },
+            timing: ("KIMI_ALAB_POLL_MS", "50"),
+            grace: Duration::from_millis(1000),
+            settle: Duration::from_millis(400),
+        }),
     },
 ];
 
@@ -341,6 +358,56 @@ struct Rig {
     proj: PathBuf,
     standin: PathBuf,
     standin_log: PathBuf,
+    /// Kimi's second pool row and its overlay home, where this proof has one.
+    account_home: Option<PathBuf>,
+}
+
+fn seed_kimi_account_pool(world: &World) -> Result<PathBuf, String> {
+    use aterm_agent::harness::{accounts, accounts_pool};
+
+    let default = world.home.join(".kimi-code");
+    let work = world.dir.join("account home");
+    for home in [&default, &work] {
+        let credentials = home.join("credentials");
+        crate::util::create_private_dir_all(&credentials).map_err(|e| e.to_string())?;
+        crate::sys::put(
+            &credentials.join("kimi-code.json"),
+            0o600,
+            &crate::sys::PutSrc::Bytes(b"{}\n"),
+        )
+        .map_err(|e| format!("the fixture login: {e}"))?;
+    }
+    let roster = world
+        .cfg
+        .join("aterm")
+        .join(accounts::Cli::Kimi.accounts().roster_file);
+    let text = format!(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+         [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+        work.display()
+    );
+    crate::sys::put(&roster, 0o600, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+        .map_err(|e| format!("the Kimi roster: {e}"))?;
+    let root = world.state().join("harness/claude-harness");
+    let store = accounts::Store::at_for(&root, accounts::Cli::Kimi, &world.home);
+    let now = aterm_time::unix_secs()
+        .and_then(|now| i64::try_from(now).ok())
+        .ok_or("no clock for the account fixture")?;
+    store
+        .transact_within(&accounts::LOCK_LADDER, now, &mut None, |state| {
+            state.active = Some("main".to_string());
+            state.proven = true;
+            Ok(Vec::new())
+        })
+        .map_err(|e| format!("seed the Kimi account store: {e:?}"))?;
+    let row = accounts::Row {
+        label: "work".to_string(),
+        dir: Some(work.to_string_lossy().into_owned()),
+        ..accounts::Row::default()
+    };
+    accounts_pool::login_env(accounts::Cli::Kimi, &row, &world.home)
+        .map_err(|e| format!("link the Kimi account overlay: {e}"))?;
+    Ok(work)
 }
 
 /// The instance's sandbox: no network at all, and the owner's homes fenced
@@ -355,7 +422,8 @@ fn policy(scratch: &Path) -> Result<String, String> {
     }
     Ok(format!(
         "(version 1)(allow default)(deny network-outbound (remote ip))(deny network-inbound (local ip))\
-         (deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\n{}{}",
+         (deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
+         (allow process-exec (literal \"/bin/ps\") (with no-sandbox))\n{}{}",
         crate::jail::PREFERENCES,
         crate::codex_rig::home_guards(&homes)?
     ))
@@ -407,6 +475,14 @@ impl Rig {
                 dir.display()
             ))
         })?;
+        let account_home = if s.vendor == "kimi" {
+            Some(
+                seed_kimi_account_pool(&world)
+                    .map_err(|e| Fail::die(format!("harness-proof: the account pool: {e}")))?,
+            )
+        } else {
+            None
+        };
         let sandbox = policy(&dir).map_err(|e| Fail::die(format!("harness-proof: {e}")))?;
         let sstr = |p: &Path| p.to_string_lossy().into_owned();
         let mut env: Vec<(String, String)> = vec![
@@ -447,6 +523,7 @@ impl Rig {
             proj,
             standin: standin.to_path_buf(),
             standin_log,
+            account_home,
         };
         rig.land_vendor(play.builds[0])
             .map_err(|e| Fail::die(format!("harness-proof: the vendor's first build: {e}")))?;
@@ -591,6 +668,19 @@ impl Rig {
 
     fn seen(&self, sid: &str) -> ClaimSeen {
         judge::claim_seen(&self.on(sid, &["status"]).first())
+    }
+
+    /// The latest status, once aterm has classified the foreground job as `vendor` or its alias.
+    fn seen_vendor(&self, sid: &str, vendor: &str) -> Result<ClaimSeen, Stopped> {
+        let mut seen = ClaimSeen::default();
+        Self::wait_for(MUST, || {
+            seen = self.seen(sid);
+            seen.program
+                .as_deref()
+                .and_then(aterm_phase::program_of)
+                .is_some_and(|program| program.name() == vendor)
+        })?;
+        Ok(seen)
     }
 
     fn leader(&self, sid: &str) -> Option<u32> {
@@ -777,6 +867,122 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+fn kimi_account_leg(
+    rig: &Rig,
+    sid: &str,
+    base: &Frame,
+    leader: Option<u32>,
+    r: &mut Report,
+) -> Result<Option<Frame>, Fail> {
+    use aterm_agent::harness::accounts;
+
+    let Some(home) = rig.account_home.as_ref() else {
+        return Ok(None);
+    };
+    for args in [
+        &["meta", "set", "autopilot", "cruise"][..],
+        &["task", "mark", "working", "from=ctl"][..],
+    ] {
+        let reply = rig.on(sid, args);
+        if reply.code != 0 || reply.stdout.starts_with("ERR") {
+            return Err(Fail::die(format!(
+                "harness-proof: prepare the account worker ({}): {}",
+                args.join(" "),
+                reply.first()
+            )));
+        }
+    }
+    rig.type_line(sid, "/quota")?;
+    let moved = rig.wait_frame(sid, MUST, |frame| {
+        frame.pid != base.pid && frame.session == base.session
+    })?;
+    let acknowledged = Rig::wait_for(MUST, || {
+        rig.aterm_log()
+            .contains("account move to work: relaunched:scoped-account")
+    })?;
+    let standin = crate::util::scratch_text(&rig.standin_log);
+    let expected_home = home
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() && *byte != b'%' {
+                char::from(*byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    let on_work = moved.as_ref().is_some_and(|frame| {
+        standin.lines().any(|line| {
+            line.contains(&format!(" start pid={} ", frame.pid))
+                && line.contains(&format!("home={expected_home} "))
+        })
+    });
+    let now = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok());
+    let active = now.and_then(|now| {
+        accounts::Store::at_for(
+            &rig.world.state().join("harness/claude-harness"),
+            accounts::Cli::Kimi,
+            &rig.world.home,
+        )
+        .load(now)
+        .ok()
+        .and_then(|(state, _)| state.active)
+    });
+    if moved.is_none() || !acknowledged {
+        let at = format!("@{sid}");
+        let sock = rig.inst.sock.to_string_lossy().into_owned();
+        let phase = rig
+            .inst
+            .cli(None, &["drive", "--socket", &sock, "phase", &at]);
+        println!("      account-wall phase: {}", phase.first());
+        rig.diagnose(sid);
+    }
+    let seen = rig.seen(sid);
+    let same_holder =
+        leader.is_some_and(|pid| seen.holder.as_deref() == Some(&format!("kimi-alab@{pid}")));
+    let checks = vec![
+        Check {
+            label: format!(
+                "the quota wall moved the child to a new pid (was {})",
+                base.pid
+            ),
+            ok: moved.as_ref().is_some_and(|frame| frame.pid != base.pid),
+        },
+        Check {
+            label: format!(
+                "the move resumed session {} as its next start",
+                base.session
+            ),
+            ok: moved.as_ref().is_some_and(|frame| {
+                frame.session == base.session && frame.start == base.start + 1
+            }),
+        },
+        Check {
+            label: "the selected KIMI_CODE_HOME is the pool's work overlay".to_string(),
+            ok: on_work,
+        },
+        Check {
+            label: "aterm committed work as the active pool row".to_string(),
+            ok: active.as_deref() == Some("work"),
+        },
+        Check {
+            label: "the child reclaimed with login=work before aterm reported the move".to_string(),
+            ok: acknowledged,
+        },
+        Check {
+            label: "the same harness still holds the proven scoped claim".to_string(),
+            ok: same_holder && seen.proven && rig.leader(sid) == leader,
+        },
+    ];
+    r.leg(
+        "a scoped account-pool move at a measured quota wall",
+        &checks,
+    );
+    Ok(moved)
+}
+
 /// The legs on an aterm serving contract 3.
 #[allow(clippy::too_many_lines)]
 fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
@@ -846,7 +1052,7 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         "      info: aterm booked the harness's acts {:?}",
         rig.acts(&sid)
     );
-    let Some(base) = (match back {
+    let Some(mut base) = (match back {
         Some(f) => Some(f),
         None => rig.start_harness(&sid)?,
     }) else {
@@ -857,8 +1063,11 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         return Ok(());
     };
     let leader = rig.leader(&sid);
+    if let Some(moved) = kimi_account_leg(rig, &sid, &base, leader, r)? {
+        base = moved;
+    }
 
-    // 3. No move while a draft or a person's typing is present; then the move.
+    // 4. No move while a draft or a person's typing is present; then the move.
     let sent = rig.on(&sid, &["send", DRAFT]);
     let drafted = rig.wait_frame(&sid, MUST, |f| f.composer == DRAFT)?;
     let mark = rig.aterm_log().len();
@@ -926,7 +1135,7 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         rig.acts(&sid)
     );
 
-    // 4. The harness's own re-exec.
+    // 5. The harness's own re-exec.
     let child = rig.frame(&sid).unwrap_or_else(|| typing.clone());
     let leader = rig.leader(&sid);
     let mark = rig.aterm_log().len();
@@ -947,7 +1156,7 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
     let next = built.next_version.as_str();
     Rig::wait_for(MUST, || {
         on_new(rig.leader(&sid))
-            || judge::held_lines(&rig.log_since(mark), &sid)
+            && judge::held_lines(&rig.log_since(mark), &sid)
                 .iter()
                 .any(|h| h.versions.starts_with(&format!("{} {next} ", s.id)))
     })?;
@@ -968,7 +1177,7 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         ),
     );
 
-    // 5. Signal and exit propagation.
+    // 6. Signal and exit propagation.
     let before = rig.frame(&sid).unwrap_or(child);
     let leader = rig.leader(&sid);
     let _ = rig.on(&sid, &["signal", "int"]);
@@ -1050,44 +1259,51 @@ fn control_legs(rig: &Rig, r: &mut Report) -> Result<(), Fail> {
     println!("  tab {cal}: {} bare (calibration)", s.vendor);
     rig.type_line(&cal, s.vendor)?;
     let bare = rig.wait_frame(&cal, MUST, |_| true)?;
-    let calibrated = match &bare {
-        None => Err("the stand-in run bare never showed its frame".to_string()),
-        Some(f) => {
-            let program = rig.seen(&cal).program;
-            let recorded = rig.recorded(&cal, f.pid)?;
-            rig.type_line(&cal, "/crash")?;
-            let back = rig.wait_frame(&cal, MUST, |g| g.pid != f.pid)?;
-            let typed = judge::resume_typed(&rig.blocks(&cal), &f.session);
-            if program.as_deref() == Some(s.vendor) && recorded && typed && back.is_some() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "aterm named it {}, {} its launch, and its built-in lane {} the bare stand-in",
-                    program.as_deref().unwrap_or("-"),
-                    if recorded {
-                        "recorded"
-                    } else {
-                        "never recorded"
-                    },
-                    if typed && back.is_some() {
-                        "relaunched"
-                    } else {
-                        "did not relaunch"
-                    }
-                ))
+    if s.builtin_relaunch {
+        let calibrated = match &bare {
+            None => Err("the stand-in run bare never showed its frame".to_string()),
+            Some(f) => {
+                let program = rig.seen_vendor(&cal, s.vendor)?.program;
+                let recorded = rig.recorded(&cal, f.pid)?;
+                rig.type_line(&cal, "/crash")?;
+                let back = rig.wait_frame(&cal, MUST, |g| g.pid != f.pid)?;
+                let typed = judge::resume_typed(&rig.blocks(&cal), &f.session);
+                if program.as_deref() == Some(s.vendor) && recorded && typed && back.is_some() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "aterm named it {}, {} its launch, and its built-in lane {} the bare stand-in",
+                        program.as_deref().unwrap_or("-"),
+                        if recorded {
+                            "recorded"
+                        } else {
+                            "never recorded"
+                        },
+                        if typed && back.is_some() {
+                            "relaunched"
+                        } else {
+                            "did not relaunch"
+                        }
+                    ))
+                }
             }
+        };
+        if let Err(why) = calibrated {
+            rig.diagnose(&cal);
+            r.unobserved(CONTROL[0], &why);
+            r.unobserved(CONTROL[1], &why);
+            return Ok(());
         }
-    };
-    if let Err(why) = calibrated {
-        rig.diagnose(&cal);
-        r.unobserved(CONTROL[0], &why);
-        r.unobserved(CONTROL[1], &why);
-        return Ok(());
+        println!(
+            "  calibrated: aterm names the bare stand-in {} and its built-in lane relaunches it",
+            s.vendor
+        );
+    } else {
+        println!(
+            "  calibration: {} has no built-in relaunch lane; the control checks that none takes over",
+            s.vendor
+        );
     }
-    println!(
-        "  calibrated: aterm names the bare stand-in {} and its built-in lane relaunches it",
-        s.vendor
-    );
     let sid = rig.open_tab()?;
     println!("  tab {sid}: {}", s.tool);
     let Some(first) = rig.start_harness(&sid)? else {
@@ -1106,20 +1322,51 @@ fn control_legs(rig: &Rig, r: &mut Report) -> Result<(), Fail> {
         CONTROL[0],
         &judge::passed_through(
             s.vendor,
-            &rig.seen(&sid),
+            &rig.seen_vendor(&sid, s.vendor)?,
             rig.leader(&sid),
             Some(&first),
             &rig.host(),
         ),
     );
-    let recorded = rig.recorded(&sid, first.pid)?;
+    let mark = rig.aterm_log().len();
+    let recorded = if s.builtin_relaunch {
+        rig.recorded(&sid, first.pid)?
+    } else {
+        false
+    };
     rig.type_line(&sid, "/crash")?;
-    let back = rig.wait_frame(&sid, MUST, |f| f.pid != first.pid)?;
+    let limit = if s.builtin_relaunch {
+        MUST
+    } else {
+        still_window(rig.play)
+    };
+    let back = rig.wait_frame(&sid, limit, |f| f.pid != first.pid)?;
     let typed = judge::resume_typed(&rig.blocks(&sid), &first.session);
-    let took = r.leg(
-        CONTROL[1],
-        &judge::builtin_took(&first, recorded, typed, back.as_ref()),
-    );
+    let (name, checks) = if s.builtin_relaunch {
+        (
+            CONTROL[1],
+            judge::builtin_took(&first, recorded, typed, back.as_ref()),
+        )
+    } else {
+        (
+            CONTROL_NO_LANE,
+            vec![
+                Check {
+                    label: "no built-in relaunch act was logged".to_string(),
+                    ok: judge::builtin_acts(&rig.log_since(mark), &sid, "relaunch").is_empty(),
+                },
+                Check {
+                    label: "no built-in resume line was typed".to_string(),
+                    ok: !typed,
+                },
+                Check {
+                    label: "no built-in lane replaced the child".to_string(),
+                    ok: back.is_none(),
+                },
+            ],
+        )
+    };
+    let took = r.leg(name, &checks);
     if !(through && took) {
         rig.diagnose(&sid);
     }
@@ -1131,6 +1378,7 @@ const CONTROL: [&str; 2] = [
     "no contract=3 served: the harness passes through",
     "no contract=3 served: aterm's built-in lanes take the session",
 ];
+const CONTROL_NO_LANE: &str = "no contract=3 served: no built-in lane takes the session";
 
 /// `harness-proof <id> --repo DIR [--aterm PATH] [--target-dir DIR]`.
 /// # Errors

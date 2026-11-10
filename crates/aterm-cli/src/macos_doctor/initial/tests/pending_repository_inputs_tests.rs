@@ -41,6 +41,10 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         let read_checkout = checkout.clone();
         let read_git = git_dir.clone();
         sys.simulate(move |sys, command| {
+            let committed_head = command.args.windows(4).any(|args| {
+                args[0] == "rev-parse" && args[1] == "--verify"
+                    && args[2] == "--quiet" && args[3] == "HEAD^{commit}"
+            });
             let command = command.display();
             Some(if command.ends_with(" credential fill") {
                 Ran::ok("protocol=https\nhost=github.com\nusername=tester\npassword=inert_repository_tools_token\n")
@@ -54,6 +58,9 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
                 }
             } else if command.ends_with(" config --get-all remote.origin.url") {
                 Ran::ok("https://github.com/tester/arrived.git\n")
+            } else if committed_head {
+                assert!(sys.stat(&read_git).is_ok(), "only the completed checkout has a HEAD");
+                Ran::ok("1234567890abcdef1234567890abcdef12345678\n")
             } else {
                 panic!("unexpected repository effect: {command}")
             })

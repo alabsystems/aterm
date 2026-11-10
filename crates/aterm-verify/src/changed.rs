@@ -77,6 +77,15 @@ impl Members {
             .map(|m| m.name.as_str())
     }
 
+    /// The repo-relative directory of the member `name`.
+    #[must_use]
+    pub fn dir(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.dir.as_str())
+    }
+
     /// Whether any member in `crates` declares a library target.
     #[must_use]
     pub fn any_has_lib(&self, crates: &[String]) -> bool {
@@ -148,6 +157,10 @@ pub enum Selection {
         /// The members, by name, one edge from a seed, normal, build or dev ([`Reach::direct`]):
         /// those whose code can name what the change touched.
         direct_dependents: Vec<String>,
+        /// The members among `seeds`, by name, whose every changed file is confined to their own
+        /// tests ([`crate::own_tests`]): no build of a dependent reads the change, so the cone
+        /// holds none of theirs and judges them alone.
+        alone: Vec<String>,
     },
 }
 
@@ -415,7 +428,10 @@ pub fn owning_member<'a>(
     members.at(dir)
 }
 
-/// Select the workspace crates that the change cone must build and test.
+/// Select the workspace crates that the change cone must build and test. `confined` says whether a
+/// member's changed files (the second argument) are all confined to its own tests
+/// ([`crate::own_tests::confined`]); such a member is judged alone ([`Selection::Narrowed`]'s
+/// `alone`).
 #[must_use]
 pub fn select(
     paths: &[String],
@@ -424,6 +440,7 @@ pub fn select(
     path_packages: &dyn Fn() -> Option<Vec<(String, String)>>,
     dependents: &dyn Fn(&str) -> Option<Reach>,
     replan: &dyn Fn(&str) -> Replan,
+    confined: &dyn Fn(&str, &[&str]) -> bool,
 ) -> Selection {
     if members.is_empty() {
         return Selection::Widened("`targo tree` returned no workspace members".to_string());
@@ -457,12 +474,28 @@ pub fn select(
     let mut cone: BTreeSet<String> = seeds.clone();
     cone.extend(replanned.iter().filter(|p| names.contains(*p)).cloned());
     let own = seeds.clone();
+    let forked = forks_touched(paths, &packages);
+    // A member a lock or root manifest row also names, or a fork it is, builds differently for
+    // every dependent whatever its files say.
+    let alone: BTreeSet<String> = own
+        .iter()
+        .filter(|seed| !replanned.contains(*seed) && !forked.contains(*seed))
+        .filter(|seed| {
+            let owned: Vec<&str> = paths
+                .iter()
+                .filter(|p| owning_member(p, manifests, members) == Some(seed.as_str()))
+                .map(String::as_str)
+                .collect();
+            confined(seed, &owned)
+        })
+        .cloned()
+        .collect();
     let mut seeds = seeds;
     seeds.extend(replanned);
-    seeds.extend(forks_touched(paths, &packages));
+    seeds.extend(forked);
     let mut dev_only: BTreeSet<String> = BTreeSet::new();
     let mut direct_dependents: BTreeSet<String> = BTreeSet::new();
-    for seed in &seeds {
+    for seed in seeds.iter().filter(|seed| !alone.contains(*seed)) {
         let Some(found) = dependents(seed.as_str()) else {
             return Selection::Widened(format!(
                 "`targo tree --invert {seed}` failed or could not be read, so its dependents are \
@@ -512,6 +545,7 @@ pub fn select(
         all_targets,
         unlinted,
         direct_dependents: direct_dependents.into_iter().collect(),
+        alone: alone.into_iter().collect(),
     }
 }
 
@@ -584,6 +618,7 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             all_targets,
             unlinted,
             direct_dependents,
+            alone,
         } => {
             let dependents = crates.iter().filter(|c| !seeds.contains(c)).count();
             let more = if dependents == 0 {
@@ -591,13 +626,24 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             } else {
                 format!(" + {dependents} dependent(s)")
             };
+            let named: Vec<String> = seeds
+                .iter()
+                .map(|seed| {
+                    if alone.contains(seed) {
+                        format!("{seed} (its own tests)")
+                    } else {
+                        seed.clone()
+                    }
+                })
+                .collect();
             (
                 Scope::changed(base, crates.clone(), *any_lib)
                     .with_seeds(seeds.clone())
                     .with_all_targets(all_targets.clone())
                     .with_unlinted(unlinted.clone())
-                    .with_direct_dependents(direct_dependents.clone()),
-                format!("the change cone since {base}: {}{more}", seeds.join(" ")),
+                    .with_direct_dependents(direct_dependents.clone())
+                    .with_alone(alone.clone()),
+                format!("the change cone since {base}: {}{more}", named.join(" ")),
             )
         }
     }
@@ -633,23 +679,46 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         Ok(found) => found,
         Err(why) => return Selection::Widened(why),
     };
-    resolve_paths(root, tools, path_env, &merge_base, paths)
+    resolve_paths(root, tools, path_env, &merge_base, paths, Some(&merge_base))
 }
 
-/// Resolve an explicit committed path selection through the ordinary dependency cone.
+/// Resolve an explicit committed path selection through the ordinary dependency cone. `from` is
+/// the tree every one of `paths` changed from, whose files [`crate::own_tests::confined`] compares
+/// with the working tree's; with none (paths gathered from several commits), no member is judged
+/// alone.
 pub fn resolve_paths(
     root: &Path,
     tools: &Toolchain,
     path_env: &OsStr,
     merge_base: &str,
     paths: Vec<String>,
+    from: Option<&str>,
 ) -> Selection {
     let members = read_members(root, tools, path_env);
-    let paths = match with_shared_inputs(root, path_env, paths, &members) {
-        Ok(paths) => paths,
+    let listed = if paths.is_empty() {
+        Vec::new()
+    } else {
+        match listed_files(root, path_env) {
+            Ok(listed) => listed,
+            Err(why) => return Selection::Widened(why),
+        }
+    };
+    let changed: BTreeSet<String> = paths.iter().cloned().collect();
+    let Shared {
+        paths,
+        readers,
+        named,
+    } = match with_shared_inputs(root, &listed, paths, &members) {
+        Ok(shared) => shared,
         Err(why) => return Selection::Widened(why),
     };
     let manifests = manifests_near(root, &paths);
+    let checkout = from.map(|base| crate::own_tests::Checkout {
+        root,
+        path_env,
+        base,
+        listed: &listed,
+    });
     select(
         &paths,
         &manifests,
@@ -657,7 +726,42 @@ pub fn resolve_paths(
         &|| read_path_packages(root, tools, path_env, &members),
         &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
         &|p| replan_of(root, path_env, merge_base, p),
+        // What another member reads, or a file that reads another's, is the cone's to follow.
+        &|member, owned| {
+            owned
+                .iter()
+                .all(|p| changed.contains(*p) && !readers.contains(*p) && !named.contains(*p))
+                && match (&checkout, members.dir(member)) {
+                    (Some(checkout), Some(dir)) => {
+                        crate::own_tests::confined(checkout, dir, owned).is_ok()
+                    }
+                    _ => false,
+                }
+        },
     )
+}
+
+/// Every file of the checkout, tracked or not, by repo-relative path.
+fn listed_files(root: &Path, path_env: &OsStr) -> Result<Vec<String>, String> {
+    let out = git(root, path_env)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .map_err(|e| format!("cannot list the checkout's files: {e}"))?;
+    if !out.status.success() {
+        return Err("git could not list the checkout's files".into());
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
 }
 
 /// Replan for `path` since `merge_base` ([`manifest_replan`], [`lock_replan`]).
@@ -680,31 +784,47 @@ fn replan_of(root: &Path, path_env: &OsStr, merge_base: &str, path: &str) -> Rep
     }
 }
 
+/// A change with what other members read of it ([`with_shared_inputs`]).
+struct Shared {
+    /// The changed paths and every member source that reads one of them from outside its member.
+    paths: Vec<String>,
+    /// Every member source that reads one of `paths` from outside its member by a `../` literal
+    /// ([`shares_changed_input`]), whether it changed itself or not.
+    readers: BTreeSet<String>,
+    /// The changed paths whose repo-relative path a source of another member spells.
+    named: BTreeSet<String>,
+}
+
+/// `paths` and every member source, of the checkout's `listed` files, that reads one of them from
+/// outside its member by a `../` literal ([`shares_changed_input`]), with those readers and the
+/// paths another member's source names by their repo-relative path.
 fn with_shared_inputs(
     root: &Path,
-    path_env: &OsStr,
+    listed: &[String],
     mut paths: Vec<String>,
     members: &Members,
-) -> Result<Vec<String>, String> {
+) -> Result<Shared, String> {
+    let mut readers = BTreeSet::new();
+    let mut named = BTreeSet::new();
     if paths.is_empty() {
-        return Ok(paths);
+        return Ok(Shared {
+            paths,
+            readers,
+            named,
+        });
     }
-    let out = git(root, path_env)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        .map_err(|e| format!("cannot list shared source inputs: {e}"))?;
-    if !out.status.success() {
-        return Err("git could not list shared source inputs".into());
-    }
+    let owner = |path: &str| {
+        members
+            .0
+            .iter()
+            .find(|m| {
+                path.strip_prefix(&m.dir)
+                    .is_some_and(|p| p.starts_with('/'))
+            })
+            .map(|m| m.dir.as_str())
+    };
     let mut sources = Vec::new();
-    for entry in out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let source = String::from_utf8_lossy(entry);
+    for source in listed {
         if !source.ends_with(".rs") {
             continue;
         }
@@ -715,22 +835,31 @@ fn with_shared_inputs(
         }) else {
             continue;
         };
-        let file = root.join(source.as_ref());
+        let file = root.join(source);
         let text = match crate::read_regular_text(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("cannot read shared input {}: {e}", file.display())),
         };
+        named.extend(
+            paths
+                .iter()
+                .filter(|p| owner(p) != Some(member.dir.as_str()) && text.contains(p.as_str()))
+                .cloned(),
+        );
         if text.contains("../") {
-            sources.push((source.into_owned(), file, text, root.join(&member.dir)));
+            sources.push((source.clone(), file, text, root.join(&member.dir)));
         }
     }
     loop {
         let changed: Vec<_> = paths.iter().map(|p| root.join(p)).collect();
         let before = paths.len();
         for (source, file, text, member) in &sources {
-            if !paths.contains(source) && shares_changed_input(file, text, member, &changed) {
-                paths.push(source.clone());
+            if !readers.contains(source) && shares_changed_input(file, text, member, &changed) {
+                readers.insert(source.clone());
+                if !paths.contains(source) {
+                    paths.push(source.clone());
+                }
             }
         }
         if paths.len() == before {
@@ -739,7 +868,11 @@ fn with_shared_inputs(
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    Ok(Shared {
+        paths,
+        readers,
+        named,
+    })
 }
 
 /// The path a literal continues from a directory it does not spell: what follows its leading `/`
@@ -760,7 +893,7 @@ fn continued_path(literal: &str) -> Option<&str> {
 /// other literal may start at the source's folder (`include_str!`) or the member (`Path::join`, a build
 /// script). The literal names one file unless it ends in `/`, which names a folder: a change
 /// under `steps` selects no reader of `"/../a/steps"`, and one of `"/../a/steps/"` does.
-fn shares_changed_input(
+pub(crate) fn shares_changed_input(
     source: &Path,
     text: &str,
     member: &Path,
@@ -1658,6 +1791,7 @@ mod tests {
             path_packages,
             &|name| dependents(name).map(linking),
             &|_| replan_everything(),
+            &|_, _| false,
         )
     }
 
@@ -1841,6 +1975,7 @@ checksum = "aaa"
                 &no_packages,
                 &|name| graph(edges)(name).map(linking),
                 &|_| replan.clone(),
+                &|_, _| false,
             )
         };
         assert_eq!(narrowed(&pick(Replan::Nothing)), (vec![], vec![]));
@@ -1875,6 +2010,7 @@ checksum = "aaa"
             &forks,
             &|name| graph(edges)(name).map(linking),
             &|_| replan.clone(),
+            &|_, _| false,
         ) {
             Selection::Narrowed { all_targets, .. } => all_targets,
             Selection::Widened(why) => panic!("widened unexpectedly: {why}"),
@@ -1956,9 +2092,15 @@ checksum = "aaa"
         let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
         let pick = |changed: &[&str]| {
             let manifests: Manifests = ["crates/seed", "crates/seed-two"].into_iter().collect();
-            super::select(&paths(changed), &manifests, &m, &forks, &reach, &|_| {
-                Replan::Nothing
-            })
+            super::select(
+                &paths(changed),
+                &manifests,
+                &m,
+                &forks,
+                &reach,
+                &|_| Replan::Nothing,
+                &|_, _| false,
+            )
         };
         let touched = [
             "crates/seed/src/lib.rs",
@@ -2031,6 +2173,7 @@ checksum = "aaa"
             &|| Some(Vec::new()),
             &reach,
             &|_| Replan::Nothing,
+            &|_, _| false,
         );
         let Selection::Narrowed {
             direct_dependents, ..
@@ -2210,6 +2353,194 @@ checksum = "aaa"
         ("aterm-gui", "aterm-cli"),
         ("aterm-grid", "aterm-bench"),
     ];
+
+    /// A member whose change only its own tests compile is judged alone: the cone holds none of its
+    /// dependents and says so. `confined` is asked of each member with the files of its own that
+    /// changed. CONTROL: the same change unconfined reaches its dependents, a confined seed beside
+    /// an unconfined one leaves the other's in, and a member a lock row also names is never alone.
+    #[test]
+    fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
+        let m = members(&["aterm-grid", "aterm-gui", "aterm-cli", "aterm-bench"]);
+        let pick = |changed: &[&str], confined: &dyn Fn(&str, &[&str]) -> bool, replan: Replan| {
+            super::select(
+                &paths(changed),
+                &manifests(),
+                &m,
+                &no_packages,
+                &|name| graph(EDGES)(name).map(linking),
+                &|_| replan.clone(),
+                confined,
+            )
+        };
+        let grid = [
+            "crates/aterm-grid/src/lib.rs",
+            "crates/aterm-grid/src/tests.rs",
+        ];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let sel = pick(
+            &grid,
+            &|member, owned| {
+                asked.borrow_mut().push((member.to_string(), paths(owned)));
+                true
+            },
+            Replan::Nothing,
+        );
+        assert_eq!(
+            asked.into_inner(),
+            [("aterm-grid".to_string(), paths(&grid))]
+        );
+        assert_eq!(
+            sel,
+            Selection::Narrowed {
+                seeds: paths(&["aterm-grid"]),
+                crates: paths(&["aterm-grid"]),
+                any_lib: true,
+                all_targets: paths(&["aterm-grid"]),
+                unlinted: Vec::new(),
+                direct_dependents: Vec::new(),
+                alone: paths(&["aterm-grid"]),
+            }
+        );
+        let (scope, summary) = cone("base", &sel);
+        assert_eq!(
+            summary,
+            "the change cone since base: aterm-grid (its own tests)"
+        );
+        assert!(scope.touches("aterm-grid") && !scope.reaches_dependents("aterm-grid"));
+        let unconfined = pick(&grid, &|_, _| false, Replan::Nothing);
+        assert_eq!(
+            narrowed(&unconfined),
+            (
+                paths(&["aterm-grid"]),
+                paths(&["aterm-bench", "aterm-cli", "aterm-grid", "aterm-gui"])
+            )
+        );
+        assert!(!cone("base", &unconfined).1.contains("own tests"));
+        let both = pick(
+            &[
+                "crates/aterm-grid/src/lib.rs",
+                "crates/aterm-gui/src/lib.rs",
+            ],
+            &|member, _| member == "aterm-grid",
+            Replan::Nothing,
+        );
+        assert_eq!(
+            narrowed(&both),
+            (
+                paths(&["aterm-grid", "aterm-gui"]),
+                paths(&["aterm-cli", "aterm-grid", "aterm-gui"])
+            )
+        );
+        let locked = pick(
+            &["Cargo.lock", "crates/aterm-grid/src/lib.rs"],
+            &|_, _| true,
+            Replan::Packages(BTreeSet::from(["aterm-grid".to_string()])),
+        );
+        assert!(
+            matches!(&locked, Selection::Narrowed { alone, crates, .. }
+                if alone.is_empty() && crates.contains(&"aterm-gui".to_string())),
+            "{locked:?}"
+        );
+    }
+
+    /// End to end on a real checkout and graph: a change inside a member's test module, or to a
+    /// file only its tests mount, selects that member alone; a change to a shipped line selects its
+    /// dependent too; a test-only change to a file another member embeds by a `../` literal keeps
+    /// that reader in the cone with its own dependents but leaves the member's linker out, and the
+    /// reader stays whole when its own change is test-only. CONTROL: a file another member names by
+    /// its repo path, or a change gathered from no one tree, keeps every dependent.
+    #[test]
+    fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
+        let made = crate::mktemp_dir("atv-changed-own-tests").expect("mktemp");
+        let root = std::fs::canonicalize(&made).expect("the fixture's own path");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nmembers=['crates/a','crates/b','crates/c']\n",
+        )
+        .expect("workspace manifest");
+        let services = "pub fn tester() -> &'static str {\n    \"tester\"\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names() {\n        assert_eq!(super::tester(), \"tester\");\n    }\n}\n";
+        let untested = "#[cfg(test)]\nmod tests {}\n";
+        let tested = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        let reader = "pub const PEEK: &str = include_str!(\"../../a/src/peek.rs\");\npub const NAMED: &str = \"crates/a/src/named.rs\";\n";
+        for (dir, rest, files) in [
+            (
+                "a",
+                "",
+                vec![
+                    (
+                        "src/lib.rs",
+                        "pub mod services;\n\n#[cfg(test)]\n#[path = \"lib_tests.rs\"]\nmod tests;\n",
+                    ),
+                    ("src/services.rs", services),
+                    ("src/lib_tests.rs", "#[test]\nfn one() {}\n"),
+                    ("src/peek.rs", untested),
+                    ("src/named.rs", untested),
+                ],
+            ),
+            (
+                "b",
+                "[dependencies]\na={path='../a'}\n",
+                vec![("src/lib.rs", "pub use a::services::tester;\n")],
+            ),
+            ("c", "", vec![("src/lib.rs", reader)]),
+        ] {
+            let package = root.join("crates").join(dir);
+            std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
+            for (path, text) in files {
+                std::fs::write(package.join(path), text).expect("fixture source");
+            }
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{dir}'\nversion='0.1.0'\nedition='2021'\n{rest}"),
+            )
+            .expect("package manifest");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        targo_tree(
+            &root,
+            Path::new(env!("CARGO")),
+            &path,
+            &["tree", "--workspace"],
+        )
+        .expect("cargo writes the lock");
+        let checkout = Committed::new(&root);
+        let picked = |selection: Selection| match selection {
+            Selection::Narrowed {
+                seeds,
+                crates,
+                alone,
+                ..
+            } => (seeds, crates, alone),
+            Selection::Widened(why) => panic!("widened: {why}"),
+        };
+        let test_hunk = services.replace("\"tester\");", "\"probe\");");
+        let tests = picked(checkout.change(&[("crates/a/src/services.rs", &test_hunk)]));
+        let mounted =
+            picked(checkout.change(&[("crates/a/src/lib_tests.rs", "#[test]\nfn two() {}\n")]));
+        let shipped = picked(checkout.change(&[(
+            "crates/a/src/services.rs",
+            &services.replace("    \"tester\"\n", "    \"probe\"\n"),
+        )]));
+        let embedded = picked(checkout.change(&[("crates/a/src/peek.rs", tested)]));
+        let reader_tests = format!("{reader}{tested}");
+        let both = picked(checkout.change(&[
+            ("crates/a/src/peek.rs", tested),
+            ("crates/c/src/lib.rs", &reader_tests),
+        ]));
+        let named = picked(checkout.change(&[("crates/a/src/named.rs", tested)]));
+        let gathered = picked(checkout.gathered(&[("crates/a/src/services.rs", &test_hunk)]));
+        let _ = std::fs::remove_dir_all(&made);
+        let a = paths(&["a"]);
+        let ab = paths(&["a", "b"]);
+        let ac = paths(&["a", "c"]);
+        assert_eq!(tests, (a.clone(), a.clone(), a.clone()));
+        assert_eq!(mounted, (a.clone(), a.clone(), a.clone()));
+        assert_eq!(shipped, (a.clone(), ab.clone(), Vec::new()));
+        assert_eq!(embedded, (ac.clone(), ac.clone(), a.clone()));
+        assert_eq!(both, (ac.clone(), ac, a.clone()));
+        assert_eq!(named, (a.clone(), ab.clone(), Vec::new()));
+        assert_eq!(gathered, (a, ab, Vec::new()));
+    }
 
     fn narrowed(sel: &Selection) -> (Vec<String>, Vec<String>) {
         match sel {
@@ -2434,7 +2765,8 @@ checksum = "aaa"
             "no-such-package",
             &m,
         );
-        let after_change_to = committed_fixture(&root);
+        let checkout = Committed::new(&root);
+        let after_change_to = |file: &str| checkout.change(&[(file, "pub fn changed() {}\n")]);
         let member_file = after_change_to("anchored/src/lib.rs");
         let offhost_file = after_change_to("offhost/src/lib.rs");
         let _ = std::fs::remove_dir_all(&made);
@@ -2465,38 +2797,69 @@ checksum = "aaa"
         );
     }
 
-    /// `root`, whose lock cargo has written, committed as the branch `base`: what [`resolve`] selects
-    /// on it, run with this test's cargo, after a change to one file.
-    fn committed_fixture(root: &Path) -> impl Fn(&str) -> Selection + '_ {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let git = {
-            let path = path.clone();
-            move |args: &[&str]| {
-                let out = git(root, &path)
-                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                    .args(args)
-                    .output()
-                    .expect("git runs");
-                assert!(out.status.success(), "git {args:?}: {out:?}");
+    /// A fixture checkout, whose lock cargo has written, committed as the branch `base`, on which a
+    /// change is resolved with this test's cargo.
+    struct Committed<'a> {
+        root: &'a Path,
+        path: std::ffi::OsString,
+        tools: Toolchain,
+    }
+
+    impl<'a> Committed<'a> {
+        fn new(root: &'a Path) -> Self {
+            let mut tools = Toolchain::discover(
+                Some(Path::new("/nonexistent")),
+                Path::new("/nonexistent"),
+                OsStr::new(""),
+                None,
+                None,
+            );
+            tools.targo = env!("CARGO").into();
+            tools.refused = None;
+            let committed = Self {
+                root,
+                path: std::env::var_os("PATH").unwrap_or_default(),
+                tools,
+            };
+            committed.git(&["init", "-q"]);
+            committed.git(&["add", "-A"]);
+            committed.git(&["commit", "-qm", "base"]);
+            committed.git(&["branch", "base"]);
+            committed
+        }
+
+        fn git(&self, args: &[&str]) {
+            let out = git(self.root, &self.path)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+
+        /// What [`resolve`] selects with each repo-relative file of `files` holding its text; the
+        /// files are restored after.
+        fn change(&self, files: &[(&str, &str)]) -> Selection {
+            self.written(files, || {
+                resolve(self.root, &self.tools, &self.path, "base")
+            })
+        }
+
+        /// What [`resolve_paths`] selects for the same change gathered from no one tree, as
+        /// `release_input` gathers its unreceipted commits'.
+        fn gathered(&self, files: &[(&str, &str)]) -> Selection {
+            let paths = files.iter().map(|(file, _)| (*file).to_string()).collect();
+            self.written(files, || {
+                resolve_paths(self.root, &self.tools, &self.path, "base", paths, None)
+            })
+        }
+
+        fn written(&self, files: &[(&str, &str)], select: impl FnOnce() -> Selection) -> Selection {
+            for (file, text) in files {
+                std::fs::write(self.root.join(file), text).expect("the change");
             }
-        };
-        git(&["init", "-q"]);
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "base"]);
-        git(&["branch", "base"]);
-        let mut tools = Toolchain::discover(
-            Some(Path::new("/nonexistent")),
-            Path::new("/nonexistent"),
-            OsStr::new(""),
-            None,
-            None,
-        );
-        tools.targo = env!("CARGO").into();
-        tools.refused = None;
-        move |file: &str| {
-            std::fs::write(root.join(file), "pub fn changed() {}\n").expect("the change");
-            let selection = resolve(root, &tools, &path, "base");
-            git(&["checkout", "-q", "--", "."]);
+            let selection = select();
+            self.git(&["checkout", "-q", "--", "."]);
             selection
         }
     }
@@ -2560,7 +2923,8 @@ checksum = "aaa"
             &["tree", "--workspace"],
         )
         .expect("cargo writes the lock");
-        let after_change_to = committed_fixture(&root);
+        let checkout = Committed::new(&root);
+        let after_change_to = |file: &str| checkout.change(&[(file, "pub fn changed() {}\n")]);
         let member = after_change_to("crates/shared-052/src/lib.rs");
         let off_host = after_change_to("crates/shared/src/lib.rs");
         let on_host = after_change_to("crates/held/src/lib.rs");
@@ -2674,6 +3038,7 @@ checksum = "aaa"
                 &no_packages,
                 &|name| dependents(name).map(linking),
                 &|_| row.clone(),
+                &|_, _| false,
             )
         };
         for answer in [vec![], vec!["offhost".to_string()]] {
@@ -2706,6 +3071,7 @@ checksum = "aaa"
                 &no_packages,
                 &|name| graph(EDGES)(name).map(linking),
                 &|p| replan_of(Path::new("/no-such-checkout"), OsStr::new(""), "HEAD", p),
+                &|_, _| false,
             )
         };
         for config in ["clippy.toml", ".clippy.toml", "rust-toolchain"] {
@@ -2969,8 +3335,10 @@ checksum = "aaa"
                 })
                 .collect(),
         );
-        let source =
-            with_shared_inputs(&repo, &path_env, paths(&["crates/a/src/shared.rs"]), &m).unwrap();
+        let listed = listed_files(&repo, &path_env).expect("the fixture lists");
+        let source = with_shared_inputs(&repo, &listed, paths(&["crates/a/src/shared.rs"]), &m)
+            .unwrap()
+            .paths;
         assert_eq!(
             source,
             paths(&[
@@ -2979,8 +3347,9 @@ checksum = "aaa"
                 "crates/c/src/lib.rs"
             ])
         );
-        let asset =
-            with_shared_inputs(&repo, &path_env, paths(&["crates/a/assets/font.bin"]), &m).unwrap();
+        let asset = with_shared_inputs(&repo, &listed, paths(&["crates/a/assets/font.bin"]), &m)
+            .unwrap()
+            .paths;
         assert_eq!(
             asset,
             paths(&[
@@ -2993,7 +3362,9 @@ checksum = "aaa"
         );
         let docs = paths(&["docs/PROCESS.md"]);
         assert_eq!(
-            with_shared_inputs(&repo, &path_env, docs.clone(), &m).unwrap(),
+            with_shared_inputs(&repo, &listed, docs.clone(), &m)
+                .unwrap()
+                .paths,
             docs
         );
         std::fs::remove_dir_all(repo).unwrap();
@@ -3156,8 +3527,12 @@ checksum = "aaa"
 
     #[test]
     fn the_lib_question_is_answered_from_the_manifest_or_yes() {
-        let tmp = std::env::temp_dir().join(format!("atv-scoped-lib-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("atv-scoped-lib-")
+            .suffix(".noindex")
+            .tempdir()
+            .unwrap();
+        let tmp = scratch.path();
         let bin_only = tmp.join("crates/binonly");
         std::fs::create_dir_all(bin_only.join("src")).unwrap();
         std::fs::write(
@@ -3165,9 +3540,9 @@ checksum = "aaa"
             "[package]\nname = \"binonly\"\n",
         )
         .unwrap();
-        assert!(!crate_dir_has_lib(&tmp, "binonly"));
+        assert!(!crate_dir_has_lib(tmp, "binonly"));
         std::fs::write(bin_only.join("src/lib.rs"), "").unwrap();
-        assert!(crate_dir_has_lib(&tmp, "binonly"));
+        assert!(crate_dir_has_lib(tmp, "binonly"));
         let declared = tmp.join("crates/declared");
         std::fs::create_dir_all(&declared).unwrap();
         std::fs::write(
@@ -3175,9 +3550,8 @@ checksum = "aaa"
             "[package]\nname = \"declared\"\n[lib]\npath = \"other.rs\"\n",
         )
         .unwrap();
-        assert!(crate_dir_has_lib(&tmp, "declared"));
-        assert!(crate_dir_has_lib(&tmp, "no-such-member"));
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(crate_dir_has_lib(tmp, "declared"));
+        assert!(crate_dir_has_lib(tmp, "no-such-member"));
         let m = Members::new(vec![
             Member {
                 name: "aterm-lab".into(),

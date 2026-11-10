@@ -879,3 +879,43 @@ fn chrome_reads_the_title_from_the_glass_the_frame_noted() {
         "the frame drew it: {landed:?}"
     );
 }
+
+#[test]
+fn split_and_zoomed_panes_reuse_one_leaf_plan_or_skip_it() {
+    let (mut app, wid, left, _reader, _host) = desk();
+    assert!(app.apply_term_resize(wid, 25, 160));
+    let right = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Vertical);
+    draw_claude(&app, left, BYPASS);
+    claude(&app, right);
+    frame(&mut app, wid);
+
+    crate::reset_visible_leaf_plan_builds();
+    let lines = app.drawn_chip_lines();
+    assert_eq!(
+        crate::visible_leaf_plan_builds(),
+        1,
+        "an unzoomed split tab with two supervised panes must reuse one VisibleLeafPlan: {lines:?}"
+    );
+    assert_eq!(drawn(&line_of(&app, left)).as_deref(), Some("\u{221E}"));
+    assert_eq!(drawn(&line_of(&app, right)).as_deref(), Some("\u{221E}"));
+
+    app.toggle_pane_zoom();
+    assert!(app.apply_term_resize(wid, 24, 160));
+    assert_eq!(app.focused_session_id(wid), Some(right));
+    draw_claude(&app, right, BYPASS);
+    frame(&mut app, wid);
+    crate::reset_visible_leaf_plan_builds();
+    let _ = app.drawn_chip_lines();
+    assert_eq!(
+        crate::visible_leaf_plan_builds(),
+        0,
+        "a zoomed split tab needs no VisibleLeafPlan in drawn_chip_lines"
+    );
+    assert_eq!(drawn(&line_of(&app, right)).as_deref(), Some("\u{221E}"));
+    let zoomed_out = line_of(&app, left);
+    assert_eq!(
+        (drawn(&zoomed_out), token(&zoomed_out, "why")),
+        (None, "not-drawn"),
+        "the zoomed-out sibling is not drawn: {zoomed_out}"
+    );
+}

@@ -1008,12 +1008,7 @@ mod tests {
     /// child may hold files it opened itself (dyld opens `/dev/dtracehelper` while it starts).
     #[test]
     fn a_childs_paths_and_descriptors_are_read_in_process() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("lab-procs-open-paths-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestScratch::new("procs");
         let held = dir.join("held");
         let master = std::fs::OpenOptions::new()
             .read(true)
@@ -1022,7 +1017,7 @@ mod tests {
             .expect("a PTY master");
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("600")
-            .current_dir(&dir)
+            .current_dir(&*dir)
             .stdin(master)
             .stdout(std::fs::File::create(&held).unwrap())
             .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -1032,7 +1027,6 @@ mod tests {
         let (paths, count) = (open_paths(pid), crate::sys::fd_count(pid));
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
         let want: Vec<PathBuf> = [
             dir.as_path(),
             Path::new("/bin/sleep"),

@@ -7039,6 +7039,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
     std::fs::create_dir_all(&runs).map_err(|e| format!("{}: {e}", runs.display()))?;
     let run_guard = aterm_tempfile::Builder::new()
         .prefix("run-")
+        .suffix(".noindex")
         .tempdir_in(&runs)
         .map_err(|e| format!("{}: {e}", runs.display()))?;
     let run = run_guard.path();

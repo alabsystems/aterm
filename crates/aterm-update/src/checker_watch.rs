@@ -302,6 +302,7 @@ pub struct CheckerWatch {
     beat: AtomicU64,
     /// Packed check-lane holder (`0` when unheld; see [`Self::hold_lane`]).
     lane: AtomicU64,
+    /// Registered cadence ceiling, inherited unchanged by every replacement.
     max_interval: AtomicU64,
     respawns: AtomicU64,
     /// Generation-prefixed count, saturated to [`COUNT_MASK`].
@@ -429,13 +430,6 @@ impl CheckerWatch {
         let word = self.next_check.load(Ordering::Acquire);
         let generation = generation_of(word);
         (generation != 0 && self.is_current(generation)).then_some(word & DEADLINE_SECS_MASK)
-    }
-
-    /// Publishes the loop's maximum wait interval between stamps (`Cadence::max_wait`).
-    pub fn set_max_interval(&self, generation: u64, secs: u64) {
-        if self.is_current(generation) {
-            self.max_interval.store(secs, Ordering::Relaxed);
-        }
     }
 
     /// Publish the consecutive count of `checker.lock` deferrals to a holder showing no progress.
@@ -804,11 +798,10 @@ mod tests {
         assert_eq!(snap.generation, second);
         assert_eq!(snap.phase, CheckerPhase::Starting);
         assert_eq!(snap.respawns, 1);
-        watch.set_max_interval(first, 1);
         assert_eq!(
             watch.snapshot().unwrap().max_interval_secs,
             100,
-            "a superseded thread cannot move the budget either"
+            "a replacement inherits the registered cadence ceiling"
         );
         let mut live = second;
         for _ in 1..MAX_RESPAWNS {

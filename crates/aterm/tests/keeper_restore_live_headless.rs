@@ -779,6 +779,7 @@ fn an_instance_hearing_a_system_at_critical_sheds_its_ring() {
 fn a_keeper_has_run_once_its_copy_says_so_or_it_wrote_a_line() {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("akran-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch world");
     let root = scratch.path();
@@ -814,6 +815,7 @@ fn a_keeper_has_run_once_its_copy_says_so_or_it_wrote_a_line() {
 fn a_keeper_s_start_waits_for_its_copy_s_stamp_then_its_mark() {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("akstart-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch world");
     let root = scratch.path();
@@ -844,6 +846,7 @@ fn a_world_holding_a_keeper_copy_that_never_ran_is_kept() {
     let made = |ran: bool| {
         let root = aterm_tempfile::Builder::new()
             .prefix("akkept-")
+            .suffix(".noindex")
             .tempdir()
             .expect("a scratch world")
             .keep();

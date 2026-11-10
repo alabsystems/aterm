@@ -214,7 +214,7 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         )
         .unwrap();
     }
-    if cli != Cli::Codex {
+    if !matches!(cli, Cli::Codex | Cli::Kimi) {
         let result = super::session_move_using(&world.seat(), &s, |_| {
             panic!("unmeasured running-session moves must not prepare a relaunch")
         });
@@ -222,9 +222,7 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         assert!(world.load(cli).rotations.is_empty());
         return (false, 0);
     }
-    let result = super::session_move_using(&world.seat(), &s, |row| {
-        let env = login_env(cli, row, &world.home).unwrap();
-        let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
+    let mut prepare = |_: &Row| {
         match case {
             2..=4 => {
                 let next = if case == 2 {
@@ -370,18 +368,39 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         }
         rotations.set(world.load(cli).rotations.len());
         *after.borrow_mut() = Some(files.each_ref().map(|path| std::fs::read(path).ok()));
-        Some(line)
-    });
+    };
+    let prepared = if cli == Cli::Kimi {
+        super::session_plan_with(
+            &world.seat(),
+            &s,
+            Some(s.relaunch.exe),
+            |row| {
+                prepare(row);
+                login_env(cli, row, &world.home).ok()
+            },
+            |note| note.record(),
+            super::MoveAuthority::Window,
+        )
+        .commit(NOW)
+        .line
+        .is_some()
+    } else {
+        super::session_move_using(&world.seat(), &s, |row| {
+            prepare(row);
+            let env = login_env(cli, row, &world.home).unwrap();
+            Some(relaunch::pool_line(&s.relaunch, cli, &env).unwrap())
+        })
+        .line
+        .is_some()
+    };
     drop(held);
     let after = after.into_inner();
     assert_eq!(
         after.is_none(),
         matches!(case, 23 | 24),
-        "{cli:?}, follows={follows}, case={case}: unexpected prepare state: {result:?}"
+        "{cli:?}, follows={follows}, case={case}: unexpected prepare state"
     );
-    if result.line.is_none()
-        && let Some(after) = after
-    {
+    if !prepared && let Some(after) = after {
         assert_eq!(
             files.each_ref().map(|path| std::fs::read(path).ok()),
             after,
@@ -389,7 +408,7 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         );
     }
     let committed = world.load(cli).rotations.len() - rotations.get();
-    (result.line.is_some(), committed as i64)
+    (prepared, committed as i64)
 }
 
 pub(crate) fn move_transition(

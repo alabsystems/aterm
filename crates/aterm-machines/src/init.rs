@@ -1939,7 +1939,32 @@ const PERSON_MARK: &str = "mark ";
 ///
 /// # Errors
 /// The record, this login's context or its init.toml cannot be read.
-pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClone, String> {
+pub fn owed_clone(
+    sys: &dyn System,
+    state: &Path,
+    now: &Holds,
+    readback: Option<&crate::init_github::RepositoryReadback>,
+) -> Result<OwedClone, String> {
+    owed_clone_in_pass(
+        sys,
+        state,
+        now,
+        readback,
+        aterm_secrets::converge::RepositoryWork::Repair,
+    )
+}
+
+/// An admitted pass can refresh a preserved default checkout's remote observation.
+/// Ordinary status readers use [`owed_clone`] and remain local.
+/// # Errors
+/// As [`owed_clone`], including a failed bounded remote observation during Refresh.
+pub fn owed_clone_in_pass(
+    sys: &dyn System,
+    state: &Path,
+    now: &Holds,
+    readback: Option<&crate::init_github::RepositoryReadback>,
+    work: aterm_secrets::converge::RepositoryWork,
+) -> Result<OwedClone, String> {
     if !now.holds(Setting::Repositories)
         && let Ok(ctx) = repository_context(sys)
         && crate::init_github::RepositoryCredentialWithdrawal::capture(sys, &ctx)?.is_some()
@@ -1948,7 +1973,7 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
             "the default repository credential request is no longer needed".into(),
         ));
     }
-    owed_clone_with(sys, state, now, None)
+    owed_clone_with(sys, state, now, None, readback, work)
 }
 
 /// Run only local credential-request retirement, retaining fresh caller holds at every
@@ -1985,12 +2010,14 @@ pub fn owed_clone_captured(
     now: &Holds,
     inputs: crate::init_github::InitialRepositoryInputs,
     current: impl FnOnce() -> Result<bool, String>,
+    readback: Option<&crate::init_github::RepositoryReadback>,
+    work: aterm_secrets::converge::RepositoryWork,
 ) -> Result<OwedClone, String> {
     let ctx = repository_context(sys)?;
     if let Err(why) = inputs.validate_default_context(sys, &ctx) {
         return Ok(OwedClone::Waiting(why));
     }
-    let value = owed_clone_with(sys, state, now, Some(&inputs))?;
+    let value = owed_clone_with(sys, state, now, Some(&inputs), readback, work)?;
     let syncing = || {
         OwedClone::Waiting(
             "repository inputs changed or are still syncing; waiting for a new ready snapshot"
@@ -2021,12 +2048,14 @@ fn owed_clone_with(
     state: &Path,
     now: &Holds,
     inputs: Option<&crate::init_github::InitialRepositoryInputs>,
+    readback: Option<&crate::init_github::RepositoryReadback>,
+    work: aterm_secrets::converge::RepositoryWork,
 ) -> Result<OwedClone, String> {
     let dir = converge_state(state);
     let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
         Ok(record) => String::from_utf8_lossy(&record).into_owned(),
         Err(aterm_uds::private_file::PrivateFileError::Missing) => {
-            return automatic_clone(sys, now, inputs);
+            return automatic_clone(sys, now, inputs, readback);
         }
         Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
     };
@@ -2116,7 +2145,7 @@ fn owed_clone_with(
     {
         if crate::init_github::uses_vault_inventory(sys, &ctx)? {
             // Old records describe only the source, not what blocked the checkout. Re-probe
-            // the default inventory locally, without applying or enumerating GitHub, so a
+            // the default inventory without applying or enumerating GitHub, so a
             // corrected worktree can resume even with an untyped pre-upgrade Person mark.
             // Explicit profiles keep their auth cache and never repeat its network probe.
             let rows = match inputs {
@@ -2124,11 +2153,18 @@ fn owed_clone_with(
                     sys,
                     &ctx,
                     Mode::Plan,
-                    aterm_secrets::converge::RepositoryWork::Repair,
+                    work,
                     inputs.clone(),
                     || Ok(true),
                 )?,
-                None => crate::init_github::run_initial_repositories(sys, &ctx, Mode::Plan)?,
+                None => crate::init_github::run_initial_repositories_captured(
+                    sys,
+                    &ctx,
+                    Mode::Plan,
+                    work,
+                    crate::init_github::InitialRepositoryInputs::capture_ready(sys, &ctx)?,
+                    || Ok(true),
+                )?,
             };
             for row in rows
                 .iter()
@@ -2149,7 +2185,7 @@ fn owed_clone_with(
                             total: count,
                         });
                     }
-                    Outcome::Planned if present < count => {
+                    Outcome::Planned => {
                         return Ok(OwedClone::Due(format!(
                             "local checkout work now allows repository setup to finish ({present}/{count} ready)"
                         )));
@@ -2200,6 +2236,7 @@ fn automatic_clone(
     sys: &dyn System,
     now: &Holds,
     inputs: Option<&crate::init_github::InitialRepositoryInputs>,
+    readback: Option<&crate::init_github::RepositoryReadback>,
 ) -> Result<OwedClone, String> {
     let nothing = || OwedClone::Nothing("aterm init owes no clone".into());
     let Ok(ctx) = repository_context(sys) else {
@@ -2267,7 +2304,9 @@ fn automatic_clone(
         ));
     }
     let counted = match inputs {
-        Some(inputs) => crate::init_github::automatic_inventory_counts_captured(sys, &ctx, inputs),
+        Some(inputs) => {
+            crate::init_github::automatic_inventory_counts_captured(sys, &ctx, inputs, readback)
+        }
         None => crate::init_github::automatic_inventory_counts(sys, &ctx),
     };
     match counted {
@@ -2318,7 +2357,7 @@ pub fn clone_owed(
     sys: &dyn System,
     state: &Path,
     work: aterm_secrets::converge::RepositoryWork,
-) -> Result<String, String> {
+) -> Result<CloneOwedOutcome, String> {
     clone_owed_in_pass(sys, state, work, None)
 }
 
@@ -2331,7 +2370,7 @@ pub fn clone_owed_in_pass(
     state: &Path,
     work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
-) -> Result<String, String> {
+) -> Result<CloneOwedOutcome, String> {
     clone_owed_in_pass_with_withdrawal_guard(sys, state, work, execution, None)
 }
 
@@ -2345,8 +2384,17 @@ pub fn clone_owed_in_pass_with_withdrawal_guard(
     work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
     withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
-) -> Result<String, String> {
+) -> Result<CloneOwedOutcome, String> {
     let ctx = repository_context(sys)?;
+    if crate::init_github::uses_vault_inventory(sys, &ctx)? {
+        let inputs = crate::init_github::InitialRepositoryInputs::capture_ready(sys, &ctx)?
+            .with_repository_execution(execution);
+        return clone_owed_captured(sys, state, work, inputs, move || {
+            withdrawal_current
+                .as_ref()
+                .map_or(Ok(true), |current| current())
+        });
+    }
     let items = crate::init_github::items_for_execution_with_withdrawal_guard(
         sys,
         &ctx,
@@ -2365,7 +2413,10 @@ pub fn clone_owed_in_pass_with_withdrawal_guard(
     let mut journal = sys.journal()?;
     let rows = aterm_converge::run(&bound, Mode::Apply, journal.as_mut())
         .map_err(|why| why.to_string())?;
-    settle_owed_clone(sys, state, &ctx, &rows)
+    settle_owed_clone(sys, state, &ctx, &rows).map(|said| CloneOwedOutcome {
+        said,
+        readback: None,
+    })
 }
 
 /// Clone from inputs captured under the selected vault's complete materialization. The
@@ -2379,7 +2430,7 @@ pub fn clone_owed_captured(
     work: aterm_secrets::converge::RepositoryWork,
     inputs: crate::init_github::InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
-) -> Result<String, String> {
+) -> Result<CloneOwedOutcome, String> {
     let ctx = repository_context(sys)?;
     let rows = crate::init_github::run_initial_repositories_captured(
         sys,
@@ -2389,7 +2440,18 @@ pub fn clone_owed_captured(
         inputs,
         current,
     )?;
-    settle_owed_clone(sys, state, &ctx, &rows)
+    let said = settle_owed_clone(sys, state, &ctx, &rows)?;
+    Ok(CloneOwedOutcome {
+        said,
+        readback: rows.readback,
+    })
+}
+
+/// One completed native repository attempt and its pass-owned empty-origin readback.
+#[derive(Debug)]
+pub struct CloneOwedOutcome {
+    pub said: String,
+    pub readback: Option<crate::init_github::RepositoryReadback>,
 }
 
 /// Record one repository attempt after the native or captured runner has returned.
@@ -10249,14 +10311,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             nothing()
         );
         note_owed(&[waiting], Action::Apply, Some(state.path()), &Holds::NONE).unwrap();
-        let owed = owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        let owed = owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap();
         assert!(matches!(owed, OwedClone::Waiting(_)), "{owed:?}");
         crate::init_github::scripted::converged(&sys, &user("alice", 501), "notes");
-        let owed = owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        let owed = owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap();
         assert!(matches!(owed, OwedClone::Due(_)), "{owed:?}");
         clone_owed(
             &sys,
@@ -10265,7 +10327,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Verified {
                 present: 1,
                 total: 1
@@ -10306,7 +10368,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Verified {
                 present: 1,
                 total: 1
@@ -10323,7 +10385,7 @@ mod tests {
         let who = user("alice", 501);
         crate::init_github::scripted::converged(&sys, &who, "notes");
         assert_eq!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Verified {
                 present: 1,
                 total: 1
@@ -10350,13 +10412,13 @@ mod tests {
             },
         );
         assert!(matches!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Due(_)
         ));
         let mut held = Holds::NONE;
         held.off.set(Setting::Repositories, true);
         assert!(matches!(
-            owed_clone(&sys, state.path(), &held).unwrap(),
+            owed_clone(&sys, state.path(), &held, None).unwrap(),
             OwedClone::Held(_)
         ));
         let path = Path::new(&who.home).join(".config/aterm/init.toml");
@@ -10373,7 +10435,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Off(_)
         ));
     }
@@ -14767,10 +14829,15 @@ mod tests {
             },
         );
         let cloned = AtomicBool::new(false);
-        let owed = || owed_clone(&sys, &state, &holds);
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            owed_clone(&sys, &state, &holds, readback)
+        };
         let clone = || {
             cloned.store(true, Ordering::SeqCst);
-            Ok("cloned".to_owned())
+            Ok(CloneOwedOutcome {
+                said: "cloned".to_owned(),
+                readback: None,
+            })
         };
         let ports = Hooked {
             inner: crate::sync::tests::Inert::new(&state),
@@ -14779,7 +14846,11 @@ mod tests {
             clone: &clone,
             forget: &|| forget_owed_clone(&state),
         };
-        assert!(matches!(owed(), Ok(OwedClone::Due(_))), "{:?}", owed());
+        assert!(
+            matches!(owed(None), Ok(OwedClone::Due(_))),
+            "{:?}",
+            owed(None)
+        );
         let _ = crate::sync::converge(
             &ports,
             crate::sync::Trigger::Subscriber,
@@ -14790,7 +14861,7 @@ mod tests {
         assert!(
             cloned.load(Ordering::SeqCst),
             "the clone the person's own `aterm init --clone` owed was forgotten: {:?}",
-            owed()
+            owed(None)
         );
     }
 }

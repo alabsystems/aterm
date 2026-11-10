@@ -211,7 +211,7 @@ fn read(
                 if scope.cancelled() {
                     return None;
                 }
-                let progress = slot::refresh(&env, &owner, &original).ok()?;
+                let progress = slot::refresh(&env, &owner, &original, scope).ok()?;
                 if let slot::RefreshProgress::Retaining(mut retention) = progress {
                     // Cancellation cannot discard a rotated response. This
                     // counted worker retains its claim until encryption and

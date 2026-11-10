@@ -465,23 +465,15 @@ mod tests {
     /// A run, a socket dir, a state dir and a user temp dir under one scratch
     /// tree, removed when it drops.
     struct Dirs {
-        top: std::path::PathBuf,
+        top: crate::TestScratch,
         run: String,
         sock: String,
         state: String,
         ut: String,
     }
 
-    impl Drop for Dirs {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.top);
-        }
-    }
-
     fn dirs() -> Dirs {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let top = std::env::temp_dir().join(format!("lab-jail-{}-{n}", std::process::id()));
+        let top = crate::TestScratch::new("jail");
         let (run, sock, state, ut) = (
             top.join("run"),
             top.join("sock"),
@@ -894,7 +886,7 @@ mod tests {
                         .iter()
                         .map(|o| o.name().to_owned())
                         .collect::<Vec<_>>();
-                    let kept = d.top.clone();
+                    let kept = d.top.to_path_buf();
                     std::mem::forget(shared);
                     std::mem::forget(d);
                     panic!("{name}: {error}; retained {kept:?} and named shm {names:?}");

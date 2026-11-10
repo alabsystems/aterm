@@ -1046,6 +1046,15 @@ fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     }
 }
 
+/// Qualification candidates opt in independently of shipped Source capability.
+/// This observation grants no launch, process, source or credential authority.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn isolated_source_proof_candidate(path: &Path) -> std::io::Result<bool> {
+    Ok(alab_bytes(path)
+        && managed_credential_capable(path, true)?
+        && file_holds(path, b"aterm isolated source proof candidate v1")?)
+}
+
 /// Compiled managed-auth ABI support. The caller separately proves the mapped
 /// image, account source and grant custody; these bytes confer no authority.
 pub(super) fn managed_credential_capable(

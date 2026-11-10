@@ -302,18 +302,9 @@ mod tests {
     #[test]
     fn a_live_lab_is_kept_from_the_tmp_cleaner() {
         use std::os::unix::fs::MetadataExt as _;
-        struct Top(std::path::PathBuf);
-        impl Drop for Top {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let top = Top(std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-keep-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&top.0);
-        let run = top.0.join("state/runs/t");
-        let sock = top.0.join("at.sock");
+        let top = crate::TestScratch::new("keep");
+        let run = top.join("state/runs/t");
+        let sock = top.join("at.sock");
         let scratch = run.join("scratch");
         let mut dirs = vec![run.join("bin"), scratch.join("unpinned"), sock.join("proj")];
         dirs.extend(
@@ -331,7 +322,7 @@ mod tests {
             sock.join("a.sock.token"),
         ];
         let jailed = scratch.join("home/agent.json");
-        let outside = top.0.join("outside");
+        let outside = top.join("outside");
         for f in own.iter().chain([&jailed, &outside]) {
             std::fs::write(f, "x\n").unwrap();
         }
@@ -369,7 +360,7 @@ mod tests {
             pinned.contains(&sock.join("proj")) && pinned.len() > 5,
             "{pinned:?}"
         );
-        let before = cleaner_would_take(&top.0);
+        let before = cleaner_would_take(&top);
         assert!(
             pinned.is_subset(&before) && before.contains(&scratch.join("unpinned")),
             "{before:?}"
@@ -399,7 +390,7 @@ mod tests {
             assert!(meta(d).mtime() >= start_s, "{} made new", d.display());
         }
         assert!(meta(&scratch).mtime() >= start_s);
-        let after = cleaner_would_take(&top.0);
+        let after = cleaner_would_take(&top);
         assert!(pinned.is_disjoint(&after), "{after:?}");
         assert!(made >= own.len() + pinned.len(), "{made}");
         assert_eq!(

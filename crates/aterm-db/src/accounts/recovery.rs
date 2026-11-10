@@ -225,10 +225,10 @@ impl Recovery {
     )]
     fn pending_at_until(&self, now: u64, deadline: Instant) -> Result<Vec<Request>> {
         require_time(deadline)?;
-        let paths = crate::generation::selected(&self.paths)?;
+        let paths = crate::generation::observed_generation_until(&self.paths, deadline)?;
         let bootstrap =
             Bootstrap::required_until(&paths, deadline).map_err(crate::table::failure)?;
-        let session = Session::observe_until(&bootstrap, deadline)?;
+        let session = Session::observe_named_until(&bootstrap, deadline)?;
         let directory = Directory::new(&paths, bootstrap.trust());
         let state = directory.ring_view(&session, &RECOVERIES);
         let mut latest: BTreeMap<DecisionKey, ((u64, u64), Request)> = BTreeMap::new();

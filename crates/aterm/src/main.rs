@@ -18104,20 +18104,19 @@ mod tests {
         }
     }
 
-    fn scratch_layout(label: &str) -> atpkg::store::Layout {
-        let prefix = std::env::temp_dir().join(format!(
-            "aterm-session-lane-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
-        std::fs::create_dir_all(&prefix).expect("scratch prefix");
-        atpkg::store::Layout { prefix }
+    fn scratch_layout(label: &str) -> (aterm_tempfile::TempDir, atpkg::store::Layout) {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-session-lane-{label}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch prefix");
+        let prefix = dir.path().to_path_buf();
+        (dir, atpkg::store::Layout { prefix })
     }
 
     #[test]
     fn the_session_pass_is_due_on_the_machine_rule_and_claimed_once() {
-        let layout = scratch_layout("pass");
+        let (_dir, layout) = scratch_layout("pass");
         let now = 1_790_000_000_i64;
         assert!(
             session_pass_due(&layout, now),
@@ -18177,12 +18176,11 @@ mod tests {
         )
         .unwrap();
         assert!(session_pass_due(&layout, attempt + 5 * 60));
-        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
     #[test]
     fn a_failing_or_running_pass_is_not_respawned_by_every_tab() {
-        let layout = scratch_layout("failing");
+        let (_dir, layout) = scratch_layout("failing");
         let attempt =
             aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-22T13:00:00Z").expect("stamp");
         std::fs::write(
@@ -18202,7 +18200,7 @@ mod tests {
             session_pass_due(&layout, attempt + 6 * 3600),
             "the negative control: six hours on, one tab tries again"
         );
-        let fresh = scratch_layout("running");
+        let (_fresh_dir, fresh) = scratch_layout("running");
         let now = attempt + 7 * 3600;
         std::fs::write(
             fresh.progress_file(),
@@ -18222,20 +18220,17 @@ mod tests {
             session_pass_due(&fresh, now),
             "the negative control: nothing running"
         );
-        let _ = std::fs::remove_dir_all(&layout.prefix);
-        let _ = std::fs::remove_dir_all(&fresh.prefix);
     }
 
     #[test]
     #[cfg(unix)]
     fn a_detached_pass_is_neither_our_child_nor_in_our_process_group() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-detached-pass-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-detached-pass-")
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
+            .expect("scratch dir");
+        let dir = scratch.path();
         let pid_file = dir.join("pid");
         let env_file = dir.join("env");
         let script = format!(
@@ -18272,7 +18267,6 @@ mod tests {
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
         let env = std::fs::read_to_string(&env_file).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             env.trim(),
             atpkg::cli::SPAWNER_DETACHED,
@@ -19169,7 +19163,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_windowed_sibling_is_the_shipped_image_or_a_build_trees_own() {
-        let dir = scratch_dir("windowed-sibling");
+        let scratch = scratch_dir("windowed-sibling");
+        let dir = scratch.path();
         let exe = dir.join("aterm.exe");
         let found = || aterm_gui::windowed_front_door_beside(&exe);
         assert_eq!(found(), None);
@@ -19186,7 +19181,6 @@ mod tests {
         );
         std::fs::write(dir.join("aterm-windowed.exe"), b"").expect("the target name");
         assert_eq!(found(), Some(dir.join("aterm-windowed.exe")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A build tree's windowed image stands for this build only when it is as new as this one,
@@ -19335,14 +19329,12 @@ mod tests {
         aterm_log::env::unset(env);
     }
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-front-door-{tag}-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-front-door-{tag}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch dir")
     }
 
     #[test]
@@ -19352,7 +19344,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let scratch = scratch_dir("agents-handoff");
         let layout = atpkg::store::Layout {
-            prefix: scratch.join("pkg"),
+            prefix: scratch.path().join("pkg"),
         };
         assert_eq!(agents_dir_handoff(None), None, "no layout, nothing handed");
         assert!(
@@ -19402,7 +19394,6 @@ mod tests {
             None,
             "no layout ⇒ not set, not empty"
         );
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// A prefix that refuses the `mkdir`, or a symlink at `agents/`, hands nothing (said on
@@ -19414,7 +19405,8 @@ mod tests {
         let _env_lock = NO_REROUTE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let scratch = scratch_dir("agents-refused");
+        let scratch_dir = scratch_dir("agents-refused");
+        let scratch = scratch_dir.path();
         let var = atpkg::reroute::AGENTS_DIR_ENV;
         let real = scratch.join("real-agents");
         std::fs::create_dir_all(&real).unwrap();
@@ -19447,7 +19439,6 @@ mod tests {
         );
         // SAFETY: getuid() takes no arguments and cannot fail.
         if unsafe { libc::getuid() } == 0 {
-            let _ = std::fs::remove_dir_all(&scratch);
             aterm_spec::host::could_not_run(
                 "running as root, where a read-only prefix refuses nothing: the refusal leg cannot run",
             );
@@ -19456,6 +19447,14 @@ mod tests {
             prefix: scratch.join("pkg"),
         };
         std::fs::create_dir_all(&layout.prefix).unwrap();
+        struct RestorePerms(std::path::PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = RestorePerms(layout.prefix.clone());
         std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
         assert_eq!(agents_dir_handoff(Some(&layout)), None);
         assert!(!layout.agents_dir().exists(), "nothing created");
@@ -19477,7 +19476,6 @@ mod tests {
             0o700
         );
         aterm_log::env::unset(var);
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

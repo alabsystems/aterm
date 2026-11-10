@@ -2463,7 +2463,7 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
          stall() {{\n\
          \x20 rm -f \"$clock.seen\"\n\
          \x20 while [ \"$(cat \"$clock.seen\" 2>/dev/null)\" != \"$clock_ms\" ]; do sleep 0.02; done\n\
-         \x20 clock_ms=$((clock_ms + $1)); printf '%s' \"$clock_ms\" > \"$clock\"\n\
+         \x20 clock_ms=$((clock_ms + $1)); printf '%s' \"$clock_ms\" > \"$clock.next\" && mv \"$clock.next\" \"$clock\"\n\
          \x20 while [ \"$(cat \"$clock.seen\" 2>/dev/null)\" != \"$clock_ms\" ]; do sleep 0.02; done\n\
          }}\n\
          while IFS= read -r -n 1 -d '' c; do\n\
@@ -3004,8 +3004,14 @@ fn a_worker_of_a_lead_behind_a_wrapper_starts_at_the_floor() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
-    let mut image =
-        aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().expect("scratch").keep());
+    let mut image = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("athl-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch")
+            .keep(),
+    );
     let node = image.path().join("node");
     aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &node);
     // `status` names a copy once the kernel has, before macOS has assessed its first exec.
@@ -3324,6 +3330,7 @@ fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
 fn contents_sees_an_empty_directory() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-contents-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a dir");
     assert!(contents(dir.path()).is_empty());
@@ -3483,6 +3490,7 @@ fn a_hosted_run_is_taped_and_replays_offline_in_a_changed_world() {
 
     let elsewhere = aterm_tempfile::Builder::new()
         .prefix("aterm-elsewhere-")
+        .suffix(".noindex")
         .tempdir()
         .expect("another world");
     let root = elsewhere.path();

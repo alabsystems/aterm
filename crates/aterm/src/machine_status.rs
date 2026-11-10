@@ -1190,7 +1190,13 @@ fn read_areas() -> Vec<Area> {
         })
     };
     let agents = bounded(read_agents);
-    let owed = bounded(|| aterm_machines::sync::Ports::owed_clone(&crate::converge::Live::here()));
+    let owed = bounded(|| {
+        aterm_machines::sync::Ports::owed_clone(
+            &crate::converge::Live::here(),
+            None,
+            aterm_secrets::converge::RepositoryWork::Repair,
+        )
+    });
 
     let setup = setup(deadline);
     let mut areas = Vec::with_capacity(9);

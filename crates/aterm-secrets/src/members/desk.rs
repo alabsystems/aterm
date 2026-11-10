@@ -229,6 +229,8 @@ pub struct Local {
     /// ([`client::take_handover_hold`]) before it touches a phrase. `None` for a test's member
     /// ([`Local::with`]), whose runs hold nothing.
     paths: Option<Paths>,
+    /// Every read [`Local::of`] made it from answered ([`Local::whole`]).
+    whole: bool,
 }
 
 /// Where a member's desk reads its home LAN again from ([`Desk::home_from`]), so its lane can
@@ -268,12 +270,17 @@ impl Local {
     /// the membership log, or a vault still busy at the read's deadline while a seat is read.
     pub fn of(paths: &Paths) -> Result<Option<Self>> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Whether every read below answered: each one that fails gives way to a default (no
+        // writer bound, no seat, no removal), which a reader that keeps what it read must not
+        // keep ([`Local::whole`]).
+        let mut whole = true;
         let (device, trust, bound, can_allow) = match Bootstrap::observe_until(paths, deadline)? {
             Availability::Available(bootstrap) => {
                 let Some(device) = Device::open(paths)? else {
                     return Ok(None);
                 };
                 let access = bootstrap.access();
+                whole &= access.is_ok();
                 let bound = match &access {
                     Ok(Some(access)) => access
                         .members()
@@ -282,7 +289,11 @@ impl Local {
                         .collect(),
                     _ => std::collections::BTreeSet::new(),
                 };
-                let can_allow = matches!(access, Ok(Some(_))) || client::admits_by_log(paths);
+                let can_allow = matches!(access, Ok(Some(_))) || {
+                    let seated = client::log_seated(paths);
+                    whole &= seated.is_ok();
+                    seated.unwrap_or(false)
+                };
                 (device, bootstrap.trust(), bound, can_allow)
             }
             // Only Commons control is not this Mac's: its vault is applied and admits it. What
@@ -298,25 +309,45 @@ impl Local {
             }
             Availability::Unavailable(_) => return Ok(None),
         };
-        let admitted = client::log_admitted_actors(paths);
+        let admitted = client::log_admitted_actors_read(paths);
+        whole &= admitted.is_ok();
+        let admitted = admitted.unwrap_or_default();
         let request = device.request(trust.network, trust.authority)?;
-        let config = client::config(paths)?;
-        let live_genesis = client::on_live_genesis(paths);
+        // Where `source.toml` names no `followed`, the signer's chain is the held envelope's, and
+        // it decides whether this is the ALab vault: `config` takes a failed read of it as no
+        // chain, which reads an ALab vault as another. `config_whole` fails instead, and the
+        // member `config` then gives is not whole.
+        let config = match client::config_whole(paths) {
+            Ok(config) => config,
+            Err(_) => {
+                whole = false;
+                client::config(paths)?
+            }
+        };
+        let live_genesis = client::live_genesis_read(paths);
+        whole &= live_genesis.is_ok();
+        let live_genesis = live_genesis.unwrap_or_else(|_| client::on_live_genesis(paths));
         let alab_url = config.as_ref().is_some_and(|config| {
             client::alab_vault(config) && matches!(&config.source, crate::transport::Source::Url(_))
         });
         // A debug build's lab vault names its own home LAN (`super::lab_lan`); a release build
         // compiles no such seam, and its desk admits by the live vault's home alone.
         #[cfg(any(test, debug_assertions))]
-        let lab_home = super::lab_lan::home(paths, config.as_ref(), live_genesis);
+        let lab_home = {
+            let home = super::lab_lan::home(paths, config.as_ref(), live_genesis);
+            whole &= home.is_ok();
+            home.unwrap_or(None)
+        };
         #[cfg(not(any(test, debug_assertions)))]
         let lab_home: Option<crate::home_lan::HomeNet> = None;
         let automatic_lan = alab_url || lab_home.is_some();
         let name = config.map(|config| config.host).unwrap_or_default();
         // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
         // holds, read without the state lock (the records file is written whole).
-        let removed = client::removed_notes(paths).unwrap_or_default();
-        let kept = client::kept_seats(paths).unwrap_or_default();
+        let removed = client::removed_notes(paths);
+        let kept = client::kept_seats(paths);
+        whole &= removed.is_ok() && kept.is_ok();
+        let (removed, kept) = (removed.unwrap_or_default(), kept.unwrap_or_default());
         let admitted_recipients = if automatic_lan {
             client::swarm_roster_until(paths, deadline)?.map_or_else(Default::default, |roster| {
                 roster
@@ -364,7 +395,45 @@ impl Local {
             home_from,
             live_genesis,
             paths: Some(paths.clone()),
+            whole,
         }))
+    }
+
+    /// Whether every read [`Local::of`] made this member from answered: none failed and gave way
+    /// to a default (no writer bound, no log seat, no admitted seat, no signer's chain, no
+    /// removal, no kept seat, the genesis judged by the vault config, no lab home). A reader that
+    /// keeps a member while its inputs stand ([`client::desk_inputs`]) keeps only a whole one, so
+    /// a moment's fault is read again at its next look. A test's member ([`Local::with`]) read
+    /// nothing, and is whole.
+    #[must_use]
+    pub const fn whole(&self) -> bool {
+        self.whole
+    }
+
+    /// Whether `other` is this member as [`Local::of`] read it: every field it reads, the device
+    /// by the request it signs.
+    #[cfg(test)]
+    pub(crate) fn reads_as(&self, other: &Self) -> bool {
+        self.request.bytes() == other.request.bytes()
+            && self.trust == other.trust
+            && self.can_allow == other.can_allow
+            && self.name == other.name
+            && self.removed == other.removed
+            && self.kept == other.kept
+            && self.admitted == other.admitted
+            && self.bound == other.bound
+            && self.automatic_lan == other.automatic_lan
+            && self.admitted_recipients == other.admitted_recipients
+            && self.home == other.home
+            && self.home_from == other.home_from
+            && self.live_genesis == other.live_genesis
+    }
+
+    /// Where this member's home LAN ([`Local::automatically_admits`]) is read again from: what
+    /// [`Desk::home_from`] answers of the desk made from it.
+    #[must_use]
+    pub const fn home_from(&self) -> HomeFrom {
+        self.home_from
     }
 
     /// A member of `trust` with `device`, named `name`, that can allow or not: the seam a
@@ -391,6 +460,7 @@ impl Local {
             home_from: HomeFrom::None,
             live_genesis: false,
             paths: None,
+            whole: true,
         })
     }
 
@@ -445,6 +515,15 @@ impl Local {
             home_from: HomeFrom::Place,
             ..self
         }
+    }
+
+    /// This member as a read that answered whole gives it (`true`) or as one a fault shaped
+    /// (`false`, [`Local::whole`]): the seam a test hands a reader that keeps a whole member one
+    /// it must read again.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_whole(self, whole: bool) -> Self {
+        Self { whole, ..self }
     }
 
     /// This member on the live ALab genesis (`true`) or another (`false`): the seam a test puts a

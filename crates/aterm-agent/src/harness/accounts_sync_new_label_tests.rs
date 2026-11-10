@@ -283,7 +283,11 @@ fn sync_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     let result = sync_cli_with_replan(
         cli,
         (&bed.home, &bed.state, &bed.aterm_toml()),
-        ((case == 22).then_some("fixture.toml"), None),
+        (
+            (case == 22).then_some("https://example.invalid/fixture.toml"),
+            None,
+        ),
+        false,
         NOW,
         (&fetch, &[]),
         || {

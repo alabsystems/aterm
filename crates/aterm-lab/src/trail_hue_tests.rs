@@ -6,8 +6,6 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use crate::trail_contrast::Grid;
 
 /// Solarized Dark's page.
@@ -83,13 +81,8 @@ fn encode_rgb(img: &Image) -> Vec<u8> {
     out
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lab-trail-hue-{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(tag: &str) -> crate::TestScratch {
+    crate::TestScratch::new(tag)
 }
 
 /// One gallery frame of `style` with its clean twin (the bare page), status, cursor (row 1, col 3) and dims.
@@ -279,7 +272,6 @@ fn a_gallery_is_read_and_a_planted_green_flame_is_caught() {
         Some(1),
         "the 8 px spark is under --min-px 10, the 16 px fringe is not"
     );
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(GRID.cell_box(1, 3, 1).x0, 20);
 }
 

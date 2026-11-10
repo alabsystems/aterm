@@ -1881,6 +1881,7 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
     ),
     lit("kimi.busy.working", "Working\u{2026}", "2.4.0"),
     lit("kimi.resumed", "Resumed session (", "2.4.0"),
+    lit("kimi.turn.interrupted", "Interrupted by user", "2.4.0"),
     lit("kimi.box.run", "Run this command?", "2.4.0"),
     lit("kimi.box.plan", "Ready to build with this plan?", "2.4.0"),
     lit("kimi.box.question", "question", "2.4.0"),

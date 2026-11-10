@@ -325,6 +325,7 @@ pub(super) fn build_staged(
     let remap = toolchain.std_source_remap()?;
     let neutral = aterm_tempfile::Builder::new()
         .prefix("aterm-wasm-glue-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("could not create neutral build directory: {e}"))?;
     let _ = writeln!(

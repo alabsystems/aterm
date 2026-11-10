@@ -44,7 +44,8 @@ impl Page {
 fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     let runtime = aterm_tempfile::Builder::new()
         .prefix("atl-rt-")
-        .tempdir()
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
         .expect("a scratch XDG_RUNTIME_DIR");
     let mut c = Command::new(harness::aterm_to_launch());
     c.arg("link");

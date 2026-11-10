@@ -83,6 +83,19 @@ thread_local! {
     static PRIMARY_CHECKED: std::cell::RefCell<ReplayObserver> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static OPENS_AND_CHECKS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many stores this thread has opened and how many times it has checked one
+/// ([`Store::check`]). Every open ends `open_region` by checking its store, so a read that stands
+/// on that check adds none.
+#[cfg(test)]
+pub(crate) fn test_opens_and_checks() -> (usize, usize) {
+    OPENS_AND_CHECKS.get()
+}
+
 /// `read`, with `observe` run once a combined store's check has checked its primary and before it
 /// reads its own claim: where a writer that primary's waiting check let in has written.
 #[cfg(test)]
@@ -396,6 +409,90 @@ pub struct Store {
     observation: [u8; 64],
     /// A merged reader keeps the other snapshot's custody checks, never its writer.
     observed_primary: Option<Box<Store>>,
+}
+
+/// What [`Store::check`] reads of an observed store's custody, kept apart from its records: the
+/// scope, actor and access observation the store was read under, and its folders and the
+/// enrollment claim it read; and its region, so a round can tell a recovery store's fence
+/// ([`Self::is_recovery`]). It grants no authority and holds no guard, lock or file, so it can
+/// outlive the batch that read the store and cross network I/O.
+/// An observer's records are the claim's witnessed prefix (`replay::read_observed`), so where
+/// [`Self::stands`] in a later session, a read of the store then that succeeds reads the same
+/// records.
+pub(crate) struct Fence {
+    region: Region,
+    scope: Scope,
+    actor: Actor,
+    observation: [u8; 64],
+    data_dir: PathBuf,
+    claim_dir: PathBuf,
+    claim_name: String,
+    claim: Vec<u8>,
+}
+
+impl Fence {
+    pub(crate) const fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    pub(crate) const fn is_recovery(&self) -> bool {
+        matches!(self.region, Region::Recovery)
+    }
+
+    /// Whether the store stands in `session` as it was read: what [`Store::check`] holds, by the
+    /// same judgments ([`Custody`]): the session current for the scope, the same actor and access
+    /// observation, and the claim read again equal to the one read then. A changed claim is
+    /// `false`, not the check's `snapshot_changed`: the caller reads the store again.
+    ///
+    /// # Errors
+    /// The session's currency ask fails ([`Custody::admits`]), or the claim read does
+    /// ([`Custody::current_claim`]).
+    pub(crate) fn stands(&self, session: &Session<'_>) -> Result<bool> {
+        let custody = Custody {
+            scope: self.scope,
+            actor: self.actor,
+            observation: &self.observation,
+            data_dir: &self.data_dir,
+            claim_dir: &self.claim_dir,
+            claim_name: &self.claim_name,
+            claim: &self.claim,
+        };
+        Ok(custody.admits(session)?
+            && custody.current_claim()?.as_deref() == Some(self.claim.as_slice()))
+    }
+}
+
+/// The custody a store was read under, which [`Store::check`] and a [`Fence`] judge alike.
+struct Custody<'a> {
+    scope: Scope,
+    actor: Actor,
+    observation: &'a [u8; 64],
+    data_dir: &'a Path,
+    claim_dir: &'a Path,
+    claim_name: &'a str,
+    claim: &'a [u8],
+}
+
+impl Custody<'_> {
+    /// Whether `session` reads under the actor and access observation the store was read under.
+    ///
+    /// # Errors
+    /// The session is not current for the scope, its writer-generation check refuses or runs out
+    /// of time, or its membership read fails (busy included).
+    fn admits(&self, session: &Session<'_>) -> Result<bool> {
+        session.context(self.scope)?;
+        Ok(self.actor == session.actor() && *self.observation == session.access_observation())
+    }
+
+    /// The claim now in the claim folder, once the data folder and the claim volume are judged to
+    /// hold the claim read ([`directory::check_and_read_claim`]); none where it cannot be read.
+    ///
+    /// # Errors
+    /// The claim read is malformed, or the data folder's identity or the claim volume's witness is
+    /// unreadable or does not hold it.
+    fn current_claim(&self) -> Result<Option<Vec<u8>>> {
+        directory::check_and_read_claim(self.data_dir, self.claim_dir, self.claim_name, self.claim)
+    }
 }
 impl Store {
     /// Create a fresh table identity and enroll this replica before any write.
@@ -925,6 +1022,8 @@ impl Store {
             aterm_durable::durable_dir(&store.claim_dir)?;
             directory::remember(dir, &store.claim_dir, &store.claim_name, &store.claim)?;
         }
+        #[cfg(test)]
+        OPENS_AND_CHECKS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
         store.check(session)?;
         Ok(store)
     }
@@ -944,6 +1043,37 @@ impl Store {
         }
         Ok(custody_of(&self.claim))
     }
+    /// This store's custody as [`Self::check`] reads it, apart from its records ([`Fence`]); none
+    /// for a writer's store, whose records its own appends move, one whose append is uncertain, or
+    /// a combined view, whose records are two claims' prefixes.
+    pub(crate) fn fence(&self) -> Option<Fence> {
+        if self.log.is_some() || self.poisoned || self.observed_primary.is_some() {
+            return None;
+        }
+        Some(Fence {
+            region: self.region,
+            scope: self.scope,
+            actor: self.actor,
+            observation: self.observation,
+            data_dir: self.data_dir.clone(),
+            claim_dir: self.claim_dir.clone(),
+            claim_name: self.claim_name.clone(),
+            claim: self.claim.clone(),
+        })
+    }
+
+    /// The custody this store was read under, as [`Self::check`] and its [`Fence`] judge it.
+    fn custody(&self) -> Custody<'_> {
+        Custody {
+            scope: self.scope,
+            actor: self.actor,
+            observation: &self.observation,
+            data_dir: &self.data_dir,
+            claim_dir: &self.claim_dir,
+            claim_name: &self.claim_name,
+            claim: &self.claim,
+        }
+    }
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -961,9 +1091,10 @@ impl Store {
         )
     )]
     fn check(&self, session: &Session<'_>) -> Result<()> {
-        session.context(self.scope)?;
-        if self.actor != session.actor()
-            || self.observation != session.access_observation()
+        #[cfg(test)]
+        OPENS_AND_CHECKS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
+        let custody = self.custody();
+        if !custody.admits(session)?
             || self.poisoned
             || self.log.as_ref().is_some_and(Log::is_poisoned)
         {
@@ -980,12 +1111,7 @@ impl Store {
                 observe();
             }
         }
-        let current = directory::check_and_read_claim(
-            &self.data_dir,
-            &self.claim_dir,
-            &self.claim_name,
-            &self.claim,
-        )?;
+        let current = custody.current_claim()?;
         if current.as_deref() == Some(&self.claim) {
             return Ok(());
         }
@@ -1324,7 +1450,9 @@ impl Store {
         Ok(self.proof_inventory_unchecked())
     }
 
-    pub(super) fn proof_inventory_unchecked(&self) -> BTreeSet<ProofKey> {
+    /// [`Self::proof_inventory`] of a store checked in the caller's session as it opened, with
+    /// nothing admitted or read from the network since (`Round::store`'s).
+    pub(crate) fn proof_inventory_unchecked(&self) -> BTreeSet<ProofKey> {
         let forks = self.conflicted();
         let mut keys: BTreeSet<_> = forks.iter().map(|actor| proof_key(*actor, None)).collect();
         keys.extend(
@@ -2383,7 +2511,12 @@ impl Store {
         session: &Session<'_>,
     ) -> Result<impl ExactSizeIterator<Item = &Digest>> {
         self.check(session)?;
-        Ok(self.records.keys())
+        Ok(self.inventory_unchecked())
+    }
+    /// [`Self::inventory`] of a store checked in the caller's session as it opened, with nothing
+    /// admitted or read from the network since (`Round::store`'s).
+    pub(crate) fn inventory_unchecked(&self) -> impl ExactSizeIterator<Item = &Digest> {
+        self.records.keys()
     }
     /// Retained positive operations from an actor, including withheld records.
     /// Application admission limits must not reset when projection hides data.

@@ -585,6 +585,7 @@ fn run_arm(
     let profile = args.profile;
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-fabric-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let words = args.bench_words(arm);

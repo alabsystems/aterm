@@ -408,16 +408,19 @@ fn failed_no_dispatch_cleanup_keeps_owned_evidence_until_exact_retry() {
 #[test]
 fn durable_no_dispatch_recovery_refuses_only_exact_running_operation_without_grant() {
     let (_world, env, stage, request) = fixture(true);
+    // Historical issuance was prepared before native canonical admission.
+    let mut capture = prepared(&env, &stage, &request);
     let store = env
         .accounts_store_for(super::super::accounts::Cli::Codex)
         .unwrap();
     store
         .transact_logins(env.now, &mut None, |_, logins| {
-            logins.enrollment.admit_native(&request)?;
+            logins
+                .enrollment
+                .admit_historical_native_fixture(&request)?;
             Ok(Vec::new())
         })
         .unwrap();
-    let mut capture = prepared(&env, &stage, &request);
     capture.begin_exchange().unwrap();
     // A live owner claim is unavailable, and Attempted alone never becomes a
     // terminal refusal. The owner unit above separately covers a dropped claim.
@@ -1128,7 +1131,7 @@ pub(super) fn with_native_rows_at_attachment_cut(
             .replace('/', "_");
         let jwt = format!("e30.{payload}.c2ln");
         let document = aterm_json::to_string(&aterm_json::json!({"auth_mode":"chatgpt","last_refresh":env.now,
-            "tokens":{"account_id":label,"id_token":jwt,"access_token":jwt,"refresh_token":format!("test-refresh-{label}"),"login_owner_id":format!("test-owner-{label}")}})).unwrap();
+            "tokens":{"account_id":label,"id_token":jwt,"access_token":jwt,"refresh_token":format!("test-refresh-{label}"),"login_owner_id":format!("test-owner-{label}"),"oauth_provenance":{"issuer":codex_app_login::DEFAULT_ISSUER,"client_id":codex_app_login::CLIENT_ID}}})).unwrap();
         let mut pending = prepared(&env, &directory.join("auth.json"), &request);
         pending.begin_exchange().unwrap();
         pending.capture_response(

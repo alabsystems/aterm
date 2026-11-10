@@ -15676,6 +15676,7 @@ use crate::supervise::policy::turn_end::{
 /// the loop asked or told it is kept in order.
 #[derive(Debug, Default)]
 struct AccountHost {
+    scoped: std::sync::atomic::AtomicBool,
     execution_hold: std::sync::Mutex<Option<Instant>>,
     execution_checks: std::sync::atomic::AtomicUsize,
     execution_after: std::sync::atomic::AtomicUsize,
@@ -15931,6 +15932,9 @@ impl IdleHost for AccountHost {
     }
     fn can_restart(&self) -> bool {
         !self.relaunch_off.load(Ordering::SeqCst)
+    }
+    fn scoped_restart(&self, why: &Restart) -> bool {
+        self.scoped.load(Ordering::SeqCst) && matches!(why, Restart::Account { .. })
     }
     fn relaunch_off(&self) -> bool {
         self.relaunch_off_asked.fetch_add(1, Ordering::SeqCst);
@@ -35670,6 +35674,20 @@ pub(super) fn observe_row_restart() -> Vec<String> {
     let host = AccountHost::moving("work-2", "adopted");
     let _ = account_run(
         "te-observe-restart",
+        vec![busy_screen(), limited_screen()],
+        &host,
+        &ledger,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    host.said("restart")
+}
+
+pub(super) fn observe_row_scoped_restart() -> Vec<String> {
+    let (dir, ledger) = ledger_at("observe-scoped-restart");
+    let host = AccountHost::moving("work-2", "adopted");
+    host.scoped.store(true, Ordering::SeqCst);
+    let _ = account_run(
+        "te-observe-scoped-restart",
         vec![busy_screen(), limited_screen()],
         &host,
         &ledger,

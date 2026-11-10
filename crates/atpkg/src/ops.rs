@@ -493,6 +493,28 @@ mod tests {
         ToolName::new(name).unwrap()
     }
 
+    /// What `attempt` gives once every handle on a lease this test dropped has let it go. A
+    /// lease is an `flock` on its file's open description, and a sibling test spawning a child
+    /// shares that description until the child's exec closes its copy, so for that moment the
+    /// lease still reads as held (`WouldBlock`) after the test dropped it: aterm 0.192.0's
+    /// qualify tree failed this way under a loaded test phase. A lease that still holds after the
+    /// one-minute hang detector is one nothing released, and fails.
+    #[cfg(unix)]
+    fn once_released<T>(mut attempt: impl FnMut() -> io::Result<T>) -> T {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match attempt() {
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < give_up =>
+                {
+                    aterm_uds::deadline::poll_yield();
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
     fn layout(label: &str) -> crate::testdir::ScratchLayout {
         crate::testdir::layout(&format!("atpkg-ops-{label}-"))
     }
@@ -826,7 +848,7 @@ mod tests {
         );
         assert!(which(&l, "ay").is_some() && crate::store::build_is_complete(&build));
         drop(child);
-        uninstall(&l, "ay").unwrap();
+        once_released(|| uninstall(&l, "ay"));
         assert!(which(&l, "ay").is_none() && !build.exists());
         assert!(which(&l, "ny").is_some());
     }
@@ -849,7 +871,7 @@ mod tests {
         assert!(crate::store::build_is_complete(&build));
         drop(wrong);
         drop(child);
-        let guard = crate::compat::sdk_mutation_guard(&l.prefix, "ay", 18).unwrap();
+        let guard = once_released(|| crate::compat::sdk_mutation_guard(&l.prefix, "ay", 18));
         crate::store::discard_build_reclaimed(&build, &guard);
         assert!(
             !build.exists(),

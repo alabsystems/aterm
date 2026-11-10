@@ -61,7 +61,7 @@ impl Telemetry {
 }
 /// Set the mode only while both fresh descriptions are private. Every receiver
 /// can then verify live-empty with EAGAIN without mutating a shared description.
-fn host_pipe() -> io::Result<(io::PipeReader, io::PipeWriter)> {
+pub(crate) fn host_pipe() -> io::Result<(io::PipeReader, io::PipeWriter)> {
     aterm_uds::kept_out(|| {
         let (reader, writer) = io::pipe()?;
         // SAFETY: this is the fresh owned read description, not a received slot.

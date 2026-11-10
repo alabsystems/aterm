@@ -74,8 +74,13 @@ pub(crate) fn frame_of(screen: &str) -> Option<Frame> {
     let composer = rows[..at]
         .iter()
         .rev()
-        .find_map(|r| r.strip_prefix('❯'))
-        .map_or_else(String::new, |c| c.trim().to_string());
+        .find_map(|row| {
+            row.strip_prefix('❯')
+                .or_else(|| row.trim_start().strip_prefix("│ >"))
+        })
+        .map_or_else(String::new, |text| {
+            text.trim_end_matches('│').trim().to_string()
+        });
     Some(Frame {
         version: (*version).to_string(),
         pid: pid.strip_prefix("pid ")?.parse().ok()?,
@@ -558,9 +563,12 @@ pub(crate) fn passed_through(
 ) -> Vec<Check> {
     vec![
         check(
-            seen.program.as_deref() == Some(vendor),
+            seen.program
+                .as_deref()
+                .and_then(aterm_phase::program_of)
+                .is_some_and(|program| program.name() == vendor),
             format!(
-                "aterm names the tab's program {vendor}, not the harness (status program={})",
+                "aterm names the tab's program {vendor} or its harness alias (status program={})",
                 seen.program.as_deref().unwrap_or("-")
             ),
         ),

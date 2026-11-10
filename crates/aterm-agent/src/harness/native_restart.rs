@@ -141,6 +141,14 @@ fn legacy_before_prepare(opts: &Opts, client: &mut Client, st: &St) -> Result<bo
         project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ColdRetirementRecovery",
+        action = "PriorRetirement",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::cold_transition"
+    )
+)]
 pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     // A terminal no-grant hold cannot be revived by a later receipt or host epoch.
     if st.native_retired_unissued {
@@ -269,7 +277,37 @@ pub(super) fn terminal_for_test(st: &mut St, reply: &Reply) -> Option<Recovery> 
         reason = "The host's admission reply is lost before the harness reads its binding"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ColdRetirementRecovery",
+        action = "NoGrant",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::cold_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ColdRetirementRecovery",
+        action = "Unknown",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::cold_transition"
+    )
+)]
 fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
+    if cold_retirement_recheck(st) {
+        let id = retained_prepare(st)?.id.clone();
+        if matches!(
+            &reply,
+            Reply::Decision(Decision::Retired(native_act::Retirement::NotGranted))
+        ) || matches!(&reply, Reply::Lapsed(found) if *found == id)
+        {
+            let before = st.clone();
+            let outcome = lapsed(st, &id)?;
+            st.native_retired_unissued = false;
+            super::native_record::authorize_cold_retirement(&before, st);
+            return Ok(outcome);
+        }
+    }
     if let Some(outcome) = terminal_reply(st, &reply) {
         return Ok(outcome);
     }
@@ -283,6 +321,40 @@ fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
         Reply::Lapsed(id) => lapsed(st, &id),
         _ => Err("native-unknown"),
     }
+}
+
+/// Only a plain cold restart may revalidate a stored no-grant hold. Account successor debt,
+/// private renewals, and terminal history retain their existing hold semantics.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ColdRetirementRecovery",
+        action = "Cold",
+        reason = "The environment supplies the retained recipe's constructor before recovery"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ColdRetirementRecovery",
+        action = "Account",
+        reason = "The environment supplies existing account successor debt before recovery"
+    )
+)]
+pub(super) fn cold_retirement_recheck(st: &St) -> bool {
+    if st.native_account_candidate.is_some() {
+        return false;
+    }
+    let Ok(prepare) = retained_prepare(st) else {
+        return false;
+    };
+    prepare.duty == Scope::Relaunch
+        && prepare.asked.is_none()
+        && prepare.constructor() == Constructor::ColdRestart
+        && [&st.native_noexec_prepare, &st.native_completed_prepare]
+            .into_iter()
+            .flatten()
+            .all(|done| done.id != prepare.id)
 }
 
 /// Drop the saved restart prepare, and its binding, under which the host proved no exec grant
@@ -900,7 +972,10 @@ pub(super) fn replay_retained_at(
     tab: &str,
 ) -> Result<Recovery, &'static str> {
     let recovered = recover(opts, session, client, tab, st);
-    let _saved = upgrade_drive::save_checked(opts, session, st);
+    let saved = upgrade_drive::save_checked(opts, session, st);
+    if recovered == Ok(Recovery::Lapsed) && saved.is_err() {
+        return Err("native-unsaved");
+    }
     match recovered {
         Ok(
             outcome @ (Recovery::Lapsed
@@ -1018,7 +1093,7 @@ pub(super) fn recover(
     tab: &str,
     st: &mut St,
 ) -> Result<Recovery, &'static str> {
-    if st.native_retired_unissued {
+    if st.native_retired_unissued && !cold_retirement_recheck(st) {
         return Ok(Recovery::Held);
     }
     if opts.dry_run {

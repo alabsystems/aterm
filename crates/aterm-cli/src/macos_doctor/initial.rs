@@ -6186,6 +6186,8 @@ struct LiveInitial<R> {
     /// Whether the last Repositories stage stopped for want of a GitHub token
     /// ([`InitialHost::repositories_want_token`]).
     token_wanted: bool,
+    /// Actual native empty-origin observations live only through this setup pass's readback.
+    repository_readback: Option<std::sync::Arc<aterm_machines::init_github::RepositoryReadback>>,
 }
 
 impl LiveInitial<secrets_retry::Live> {
@@ -6194,6 +6196,7 @@ impl LiveInitial<secrets_retry::Live> {
             reads: secrets_retry::Live,
             repositories_failure: None,
             token_wanted: false,
+            repository_readback: None,
         }
     }
 }
@@ -6331,6 +6334,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         let sys = aterm_machines::port::Live::new();
         self.repositories_failure = None;
         self.token_wanted = false;
+        self.repository_readback = None;
         let start = initial_setup_holds();
         let ran = repositories::run_reading_guarded(
             &sys,
@@ -6348,6 +6352,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         )?;
         self.repositories_failure = ran.failure;
         self.token_wanted = ran.token;
+        self.repository_readback = ran.readback;
         Ok(ran.rows)
     }
 
@@ -6358,6 +6363,7 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
             &self.context()?,
             vault,
             aterm_machines::model::Mode::Plan,
+            self.repository_readback.clone(),
         )
     }
 
@@ -7745,6 +7751,8 @@ mod tests {
         configured_unreadable: bool,
         checked_url: Option<String>,
         native_repositories: Option<(aterm_machines::port::Fake, aterm_machines::items::Ctx)>,
+        native_repository_readback:
+            Option<std::sync::Arc<aterm_machines::init_github::RepositoryReadback>>,
         /// The live Accounts stage adapter over an inert account machine.
         native_accounts: Option<(aterm_machines::port::Fake, NativeHost)>,
         native_accounts_now: Option<std::time::SystemTime>,
@@ -7984,6 +7992,7 @@ mod tests {
             self.repositories_vault.push(vault.is_some());
             if let Some((sys, ctx)) = &self.native_repositories {
                 self.calls.push(Stage::Repositories);
+                self.native_repository_readback = None;
                 let rows = aterm_machines::init_github::run_initial_repositories(
                     sys,
                     ctx,
@@ -7991,7 +8000,8 @@ mod tests {
                 )?;
                 self.repositories_failure = repositories::failure_note(&rows);
                 self.token_wanted = repositories::want_token(&rows);
-                return Ok(item_rows(rows));
+                self.native_repository_readback = rows.readback.map(std::sync::Arc::new);
+                return Ok(item_rows(rows.rows));
             }
             self.stage(Stage::Repositories)
         }
@@ -8006,12 +8016,18 @@ mod tests {
                     // This host injects vault readiness separately. Observe the same native
                     // local inputs its repositories stage applies; the repositories module's
                     // joined-vault fixtures exercise the actual materialization boundary.
-                    aterm_machines::init_github::run_initial_repositories(
+                    aterm_machines::init_github::run_initial_repositories_captured(
                         sys,
                         ctx,
                         aterm_machines::model::Mode::Plan,
+                        aterm_secrets::converge::RepositoryWork::Repair,
+                        aterm_machines::init_github::InitialRepositoryInputs::capture_ready(
+                            sys, ctx,
+                        )?
+                        .with_repository_readback(self.native_repository_readback.clone()),
+                        || Ok(true),
                     )
-                    .map(item_rows)
+                    .map(|run| item_rows(run.rows))
                 }
                 None => Ok(vec![readiness_row(
                     Stage::Repositories.name(),
@@ -10850,6 +10866,8 @@ mod tests {
             let route = launcher.clone();
             let worktree = format!("{home}/before");
             sys.simulate(move |sys, command| {
+                let committed_head = command.args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == worktree.as_str())
+                    && command.args.windows(4).any(|args| args[0] == "rev-parse" && args[1] == "--verify" && args[2] == "--quiet" && args[3] == "HEAD^{commit}");
                 let command = command.display();
                 Some(if command.ends_with(" credential fill") {
                     if sys.read_file(Path::new(&route)).is_ok_and(|bytes| bytes == b"launcher") {
@@ -10863,6 +10881,8 @@ mod tests {
                     Ran::ok(&format!("true\n\n{worktree}\n"))
                 } else if command.ends_with(" config --get-all remote.origin.url") {
                     Ran::ok("https://github.com/tester/before.git\n")
+                } else if committed_head {
+                    Ran::ok("1111111111111111111111111111111111111111\n")
                 } else {
                     panic!("unexpected repository effect: {command}")
                 })
@@ -15640,6 +15660,7 @@ mod tests {
             reads: reads(true),
             repositories_failure: None,
             token_wanted: false,
+            repository_readback: None,
         };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));

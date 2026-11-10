@@ -134,6 +134,7 @@ impl Drop for Standin {
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("atv-probe-hang-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir")
 }

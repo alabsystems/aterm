@@ -18,6 +18,7 @@ use crate::harness::{self, FLEET, World, kv, until};
 fn the_broker_command_serves_under_the_default_limit() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atl-")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch dir");
     let said = |dir: &Path| std::fs::read_to_string(dir.join("broker.err")).unwrap_or_default();

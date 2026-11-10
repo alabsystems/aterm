@@ -202,6 +202,7 @@ fn a_supervised_prompt_is_no_need_until_its_verdict_publishes_one() {
             agent: Some(crate::presence::AgentReading {
                 phase: crate::presence::AgentPhase::Prompt { detail: None },
                 context_pct: None,
+                composer: crate::presence::ComposerState::Unknown,
             }),
             ..TFacts::default()
         },

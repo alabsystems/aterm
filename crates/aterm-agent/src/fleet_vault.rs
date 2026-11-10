@@ -78,9 +78,11 @@ const HEAD: &str = "# The vault this machine's fleet state (its key, its book an
 
 impl Vault {
     /// The vault `paths` configures now: `None` with none, one whose configuration does not
-    /// read, or one that pins no signer.
+    /// read, or one that pins no signer. Read through the configuration's memo
+    /// ([`aterm_secrets::client::config_now`]), as [`tenure`] reads it: the node's heartbeat
+    /// ([`keep`]) and its membership log's reads ask it too.
     pub(crate) fn configured(paths: &Paths) -> Option<Self> {
-        Self::of_config(&aterm_secrets::client::config(paths).ok().flatten()?)
+        Self::of_config(&aterm_secrets::client::config_now(paths).ok().flatten()?)
     }
 
     /// The vault `config` configures: `None` where it pins no signer.
@@ -205,7 +207,10 @@ impl Tenure {
 }
 
 /// Where the fleet state in `state` stands against the vault `vault` configures now
-/// ([`Tenure`]): `vault` is `None` where this process reads no vault.
+/// ([`Tenure`]): `vault` is `None` where this process reads no vault. The node's watch asks it at
+/// each tick and each fleet handshake, so the configuration is read through its memo
+/// ([`aterm_secrets::client::config_now`]), again only when `source.toml` or the envelope it takes
+/// the signer's chain from moved.
 #[must_use]
 pub fn tenure(state: &Path, vault: Option<&Paths>) -> Tenure {
     let Some(paths) = vault else {
@@ -216,7 +221,7 @@ pub fn tenure(state: &Path, vault: Option<&Paths>) -> Tenure {
         Ok(Some(taken)) => taken,
         Err(why) => return Tenure::Unread(why),
     };
-    let config = match aterm_secrets::client::config(paths) {
+    let config = match aterm_secrets::client::config_now(paths) {
         Ok(config) => config,
         Err(e) => {
             return Tenure::Unread(format!(

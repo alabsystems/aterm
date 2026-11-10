@@ -9,6 +9,8 @@ use crate::harness::codex_source_gate::SourceGateIdentity;
 
 #[path = "codex_source_reservation_origin.rs"]
 mod origin;
+#[path = "codex_source_prepared_policy.rs"]
+mod prepared_policy;
 #[path = "codex_source_reservation_seal.rs"]
 pub(crate) mod seal;
 pub use seal::SourceSeal;
@@ -16,10 +18,26 @@ pub use seal::SourceSeal;
 #[path = "codex_source_reservation_census.rs"]
 mod census;
 pub use census::{CensusCursor, CensusPage};
+#[path = "codex_source_reservation_cancel.rs"]
+mod cancel;
+pub use cancel::{CancellationProgress, Cancelled};
+#[path = "codex_source_target.rs"]
+pub(crate) mod target;
+pub use target::{InstalledTarget, TargetConstruction, TargetOpenCleanup, TargetReady};
+#[path = "codex_source_use_namespace.rs"]
+pub(in crate::harness) mod namespace;
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "codex_source_proof_use_observation.rs"]
+mod proof_observation;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) use proof_observation::ProofUses;
 
 const MAX_ACTIVE_USES: usize = 512;
 const MAX_MEMBER_USES: usize = 32;
 const RECENT_USES: usize = 8;
+const MAX_USE_HISTORY: usize = 4096;
+const MAX_MEMBER_HISTORY: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UseNonce {
@@ -97,6 +115,7 @@ struct PendingBegin {
 }
 
 struct ActiveUse {
+    role: ReadyRole,
     registration: String,
     capability: String,
     source: Arc<slot::SourceHandle>,
@@ -226,6 +245,22 @@ enum CleanupState {
     Closed,
 }
 
+fn history_capacity(state: &State, key: &str) -> Result<(), Error> {
+    let count = |uses: &Uses| {
+        uses.active.len() + uses.pending.len() + uses.ending.len() + uses.recent.len()
+    };
+    if (!state.uses.contains_key(key) && state.uses.len() >= MAX_USE_HISTORY)
+        || state.uses.values().map(count).sum::<usize>() >= MAX_USE_HISTORY
+        || state
+            .uses
+            .get(key)
+            .is_some_and(|uses| count(uses) >= MAX_MEMBER_HISTORY)
+    {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
+
 fn cleanup_state(
     state: &State,
     caller: &slot::Caller,
@@ -233,10 +268,7 @@ fn cleanup_state(
     member: &str,
     body: &CleanupBody,
 ) -> Result<CleanupState, Error> {
-    if !retained_member(state, caller, process, member)? {
-        // A retired member ordinal is not an exact use-body receipt.
-        return Err(Error::Stale);
-    }
+    let retained = retained_member(state, caller, process, member)?;
     let key = member_key(caller, member)?;
     let (nonce, registration, capability) = match body {
         CleanupBody::End { nonce, capability } => (*nonce, None, Some(capability.as_str())),
@@ -246,7 +278,7 @@ fn cleanup_state(
         } => (*nonce, Some(registration.as_str()), None),
     };
     let Some(uses) = state.uses.get(&key) else {
-        return if registration.is_some() {
+        return if retained && registration.is_some() {
             Ok(CleanupState::FenceNeeded)
         } else {
             Err(Error::Stale)
@@ -266,6 +298,9 @@ fn cleanup_state(
         };
     }
     if let Some(active) = uses.active.get(&nonce.counter) {
+        if !retained {
+            return Err(Error::Stale);
+        }
         if registration.is_some_and(|value| value != active.registration)
             || capability.is_some_and(|value| value != active.capability)
         {
@@ -274,6 +309,9 @@ fn cleanup_state(
         return Ok(CleanupState::Original(active._scope.clone()));
     }
     if let Some(pending) = uses.pending.get(&nonce.counter) {
+        if !retained {
+            return Err(Error::Stale);
+        }
         if registration != Some(pending.registration.as_str()) {
             return Err(Error::Stale);
         }
@@ -291,7 +329,7 @@ fn cleanup_state(
         }
         return Ok(CleanupState::Closed);
     }
-    if nonce.counter <= uses.highwater {
+    if !retained || nonce.counter <= uses.highwater {
         return Err(Error::Stale);
     }
     if registration.is_some() {
@@ -417,12 +455,14 @@ fn replay_use(
     process: &Process,
     request: &UseRequest<'_>,
 ) -> Result<Option<UseProgress>, Error> {
-    if !retained_member(state, caller, process, request.member)? {
-        return Err(Error::Stale);
-    }
+    let retained = retained_member(state, caller, process, request.member)?;
     let key = member_key(caller, request.member)?;
     let Some(uses) = state.uses.get(&key) else {
-        return Ok(None);
+        return if retained {
+            Ok(None)
+        } else {
+            Err(Error::Stale)
+        };
     };
     if uses.prefix != request.nonce.prefix {
         return Err(Error::Stale);
@@ -438,6 +478,9 @@ fn replay_use(
         };
     }
     if let Some(active) = uses.active.get(&request.nonce.counter) {
+        if !retained {
+            return Err(Error::Stale);
+        }
         if active.registration != request.registration {
             return Err(Error::Stale);
         }
@@ -446,6 +489,9 @@ fn replay_use(
         })));
     }
     if let Some(pending) = uses.pending.get(&request.nonce.counter) {
+        if !retained {
+            return Err(Error::Stale);
+        }
         return if pending.registration == request.registration {
             Ok(None)
         } else {
@@ -463,7 +509,7 @@ fn replay_use(
             Err(Error::Stale)
         };
     }
-    if request.nonce.counter <= uses.highwater {
+    if !retained || request.nonce.counter <= uses.highwater {
         return Err(Error::Stale);
     }
     Ok(None)
@@ -511,6 +557,9 @@ fn begin_candidate(
             }))
     {
         return Err(Error::Busy);
+    }
+    if !existing {
+        history_capacity(state, &key)?;
     }
     let actor = state.actors.get(&actor_key(caller)).ok_or(Error::Stale)?;
     let allocation = actor.issued.get(request.member).ok_or(Error::Stale)?;
@@ -577,6 +626,7 @@ impl UseSnapshot {
 }
 
 impl SourceUse {
+    #[cfg(all(test, unix))]
     pub(in crate::harness) fn expected_source(
         &self,
         caller: &slot::Caller,
@@ -1085,6 +1135,12 @@ impl Registry {
             return Err(Error::Stale);
         }
         let mut state = lock(&self.state)?;
+        if !connection.is_live() || !peer.current() {
+            return Err(Error::Stale);
+        }
+        if target::derived_open_is_closing(&state, &peer.caller, operation) {
+            return Err(Error::Stale);
+        }
         let actor = state
             .actors
             .get_mut(&actor_key(&peer.caller))
@@ -1119,6 +1175,52 @@ impl Registry {
         }))
     }
 
+    /// A new authenticated child connection can allocate only under an exact
+    /// still-active parent capability. This returns allocation correlation,
+    /// never a generic cross-connection SourceUse or credential-read grant.
+    pub fn open_member_derived_from_cap(
+        &self,
+        peer: &Peer,
+        connection: &Connection,
+        operation: &str,
+        parent: UseIdentity<'_>,
+    ) -> Result<MemberAllocation, Error> {
+        if let Some(existing) = self.resume_derived_open(
+            peer,
+            connection,
+            operation,
+            UseIdentity {
+                member: parent.member,
+                nonce: parent.nonce,
+                capability: parent.capability,
+            },
+        )? {
+            return Ok(existing);
+        }
+        let context = SourceUse {
+            state: Arc::downgrade(&self.state),
+            caller: peer.caller.clone(),
+            member: parent.member.into(),
+            nonce: parent.nonce,
+            capability: parent.capability.into(),
+        };
+        {
+            let state = lock(&self.state)?;
+            issued(&state, peer, parent.member)?;
+            let active = namespace::admitted(&state, &context)?.0;
+            if active._scope.cancelled()
+                || state
+                    .app_lifetime
+                    .as_ref()
+                    .is_none_or(|app| !active._scope.cancellation().owned_by(app))
+            {
+                return Err(Error::Stale);
+            }
+            reservation_allows_member(&state, &peer.caller, parent.member)?;
+        }
+        self.open_member_derived(peer, connection, operation, &context)
+    }
+
     pub fn open_member_derived(
         &self,
         peer: &Peer,
@@ -1142,8 +1244,11 @@ impl Registry {
         )? {
             return Ok(existing);
         }
-        if !context.current() {
-            return Err(Error::Stale);
+        context.continuation_current()?;
+        if let Some(allocation) =
+            self.open_installed_derived(peer, connection, operation, context)?
+        {
+            return Ok(allocation);
         }
         self.open_member_inner(peer, connection, operation, Some(context))
     }
@@ -1174,7 +1279,27 @@ impl Registry {
         let key = member_key(caller, request.member)?;
         let mut state = lock(&self.state)?;
         if !retained_member(&state, caller, process, request.member)? {
-            return Err(Error::Stale);
+            return match cleanup_state(
+                &state,
+                caller,
+                process,
+                request.member,
+                &CleanupBody::Close {
+                    nonce: request.nonce,
+                    registration: request.registration.into(),
+                },
+            )? {
+                CleanupState::Closed => Ok(UseProgress::Closed),
+                _ => Err(Error::Stale),
+            };
+        }
+        if !state.uses.contains_key(&key) {
+            history_capacity(&state, &key)?;
+        }
+        if state.uses.get(&key).is_some_and(|uses| {
+            request.nonce.counter > uses.highwater && uses.recent.len() < RECENT_USES
+        }) {
+            history_capacity(&state, &key)?;
         }
         let uses = state.uses.entry(key).or_insert_with(|| Uses {
             prefix: request.nonce.prefix,
@@ -1407,11 +1532,13 @@ impl Registry {
                 ending: BTreeMap::new(),
                 recent: std::collections::VecDeque::new(),
             });
+        let role = candidate.role.ok_or(Error::Stale)?;
         uses.highwater = uses.highwater.max(request.nonce.counter);
         let pending = uses.pending.remove(&request.nonce.counter);
         uses.active.insert(
             request.nonce.counter,
             ActiveUse {
+                role,
                 registration: request.registration.into(),
                 capability: capability.clone(),
                 source: candidate.source,
@@ -1506,9 +1633,7 @@ impl Registry {
         }
         let key = member_key(caller, member)?;
         let mut state = lock(&self.state)?;
-        if !retained_member(&state, caller, process, member)? {
-            return Err(Error::Stale);
-        }
+        let retained = retained_member(&state, caller, process, member)?;
         let uses = state.uses.get_mut(&key).ok_or(Error::Stale)?;
         if uses.prefix != nonce.prefix || nonce.counter > uses.highwater {
             return Err(Error::Stale);
@@ -1535,7 +1660,7 @@ impl Registry {
                 Err(Error::Stale)
             };
         };
-        if active.capability != capability {
+        if !retained || active.capability != capability {
             return Err(Error::Stale);
         }
         let active = uses.active.remove(&nonce.counter).ok_or(Error::Stale)?;
@@ -1623,11 +1748,29 @@ pub(super) fn admit_derived(
     if context.caller != peer.caller || !connection.is_live() {
         return Err(Error::Stale);
     }
-    issued_on(state, peer, &context.member, connection)?;
-    active_use(state, context)?;
+    // The child owns a new authenticated work connection. Its exact parent
+    // capability still requires the original parent member/connection alive.
+    issued(state, peer, &context.member)?;
+    let active = namespace::admitted(state, context)?.0;
+    if active._scope.cancelled()
+        || state
+            .app_lifetime
+            .as_ref()
+            .is_none_or(|app| !active._scope.cancellation().owned_by(app))
+    {
+        return Err(Error::Stale);
+    }
     reservation_allows_member(state, &peer.caller, &context.member)?;
     if let Some(cell) = state.reservations.get(&actor_key(&peer.caller)) {
         let cell = lock(cell)?;
+        if !cell.resource_phase.permits_factory()
+            && cell
+                .installed
+                .as_ref()
+                .is_some_and(|installed| same_source_scope(installed.source(), &active.source))
+        {
+            return Err(Error::Busy);
+        }
         // open_member_inner owns State through both allocation and join. Both
         // phase and budget refusal must precede Actor highwater/Issued mutation.
         if !cell.phase.admits() || cell.issued.len() >= MAX_MEMBERS {
@@ -1663,14 +1806,42 @@ pub(super) fn join_derived(
 }
 
 // Admission checks are shared by use admission and member continuations.
+pub(super) fn fresh_ordinary_preload_allowed(
+    state: &State,
+    caller: &slot::Caller,
+) -> Result<(), Error> {
+    if let Some(cell) = state.reservations.get(&actor_key(caller))
+        && !matches!(lock(cell)?.phase, seal::Phase::Terminal)
+    {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
+
 pub(super) fn reservation_allows_member(
     state: &State,
     caller: &slot::Caller,
     member: &str,
 ) -> Result<(), Error> {
+    if state
+        .preload_sequences
+        .get(&member_key(caller, member)?)
+        .is_some_and(preload_sequence::Ledger::fenced)
+    {
+        return Err(Error::Stale);
+    }
+    if target::normalize::handoff::source_revoked(state, caller, member) {
+        return Err(Error::Stale);
+    }
     if let Some(reservation) = state.reservations.get(&actor_key(caller)) {
         let reservation = lock(reservation)?;
-        if !reservation.phase.allows_member(state, caller, member)
+        if matches!(&reservation.phase, seal::Phase::Terminal)
+            && target::normalize::allows_member(state, caller, member)
+        {
+            return Ok(());
+        }
+        if (!reservation.phase.allows_member(state, caller, member)
+            && !target::allows_member(state, &reservation, caller, member))
             || reservation.quiescent.contains_key(member)
         {
             return Err(Error::Busy);
@@ -1687,7 +1858,55 @@ pub(super) struct Cell {
     issued: BTreeMap<String, String>,
     quiescent: BTreeMap<String, Quiescent>,
     phase: seal::Phase,
-    _scope: super::super::account_work::Scope,
+    target_resource: Option<Arc<crate::harness::codex_source_gate::TargetFamilyLease>>,
+    target_driver: Arc<AtomicBool>,
+    installed: Option<Arc<target::Installed>>,
+    target_issued: BTreeMap<String, String>,
+    target_constructors: BTreeMap<String, target::ConstructorEntry>,
+    target_retiring: Vec<super::super::account_work::Cancellation>,
+    resource_phase: target::resources::Phase,
+    _scope: Option<super::super::account_work::Scope>,
+    retirement: Option<super::super::account_work::Cancellation>,
+    cancelled: Option<Arc<super::super::codex_assignment::prepare::cancel::Cancelled>>,
+}
+
+// Fields retire in order: no App count may disappear before the actual native
+// resources it accounts for. A terminal Cell keeps no counted custody.
+pub(super) struct RetiredCustody {
+    _constructors: BTreeMap<String, target::ConstructorEntry>,
+    _installed: Option<Arc<target::Installed>>,
+    _resource: Option<Arc<crate::harness::codex_source_gate::TargetFamilyLease>>,
+    _phase: seal::Phase,
+    _scope: Option<super::super::account_work::Scope>,
+}
+
+impl Cell {
+    fn scope(&self) -> Result<&super::super::account_work::Scope, Error> {
+        self._scope.as_ref().ok_or(Error::Stale)
+    }
+
+    /// The caller must drop this bundle only after releasing State and Cell.
+    /// This extracts custody; it asserts neither a successful assignment nor
+    /// permission to release a source freeze without its own native proof.
+    pub(super) fn take_custody(&mut self) -> RetiredCustody {
+        let scope = self._scope.take();
+        if let Some(scope) = &scope {
+            self.retirement = Some(scope.cancellation());
+        }
+        RetiredCustody {
+            _constructors: std::mem::take(&mut self.target_constructors),
+            _installed: self.installed.take(),
+            _resource: self.target_resource.take(),
+            _phase: std::mem::replace(&mut self.phase, seal::Phase::Terminal),
+            _scope: scope,
+        }
+    }
+
+    pub(super) fn custody_retired(&self) -> bool {
+        self.retirement
+            .as_ref()
+            .is_some_and(|status| status.retired())
+    }
 }
 
 struct Quiescent {
@@ -1854,6 +2073,10 @@ fn reservation_scope(
     Ok(())
 }
 
+fn reservation_cell_scope(state: &State, cell: &Cell) -> Result<(), Error> {
+    reservation_scope(state, cell.scope()?)
+}
+
 impl Registry {
     /// Reservation minting occurs only under the real prepared Book/target
     /// callback. All account/owner guards are gone when this method returns.
@@ -1907,7 +2130,7 @@ impl Registry {
                 let actor_key = actor_key(source.caller());
                 if let Some(existing) = state.reservations.get(&actor_key) {
                     let held = lock(existing).map_err(|_| "source reservation busy")?;
-                    reservation_scope(&state, &held._scope)
+                    reservation_cell_scope(&state, &held)
                         .map_err(|_| "source reservation scope changed")?;
                     if !held.target.matches(&target) || !held.origin.same_source(&origin) {
                         return Err("source reservation changed".into());
@@ -1934,7 +2157,16 @@ impl Registry {
                         .collect(),
                     quiescent: BTreeMap::new(),
                     phase: seal::Phase::Draining,
-                    _scope: scope.clone(),
+                    target_resource: None,
+                    target_driver: Arc::new(false.into()),
+                    installed: None,
+                    target_issued: BTreeMap::new(),
+                    target_constructors: BTreeMap::new(),
+                    target_retiring: Vec::new(),
+                    resource_phase: target::resources::Phase::Initializing,
+                    _scope: Some(scope.clone()),
+                    retirement: None,
+                    cancelled: None,
                 }));
                 state.reservations.insert(actor_key, cell.clone());
                 Ok(Reservation {
@@ -1954,7 +2186,7 @@ impl Registry {
             let state = lock(&self.state)?;
             reservation_scope(&state, scope)?;
             let retained = lock(&reservation.cell)?;
-            reservation_scope(&state, &retained._scope)?;
+            reservation_cell_scope(&state, &retained)?;
         }
         Ok(reservation)
     }
@@ -2085,12 +2317,35 @@ impl Registry {
         operation: &str,
         capability: &str,
     ) -> Result<Reservation, Error> {
-        let reservation = self.reservation_for_peer(peer)?.ok_or(Error::Stale)?;
-        if reservation.operation(peer)? != operation || reservation.capability(peer)? != capability
+        if !peer.current() || !hex(operation, 32) || !hex(capability, 64) {
+            return Err(Error::Stale);
+        }
+        let state = lock(&self.state)?;
+        let actor = actor_key(&peer.caller);
+        let historical_key = format!("{actor}:{operation}");
+        let current = state
+            .reservations
+            .get(&actor)
+            .filter(|cell| lock(cell).is_ok_and(|cell| cell.target.operation() == operation));
+        let cell = current
+            .or_else(|| state.retired_reservations.get(&historical_key))
+            .ok_or(Error::Stale)?;
+        let held = lock(cell)?;
+        if held.process != peer.process
+            || held.target.caller() != &peer.caller
+            || held.target.operation() != operation
+            || held.capability != capability
+            || (current.is_none()
+                && (!matches!(held.phase, seal::Phase::Terminal) || !held.custody_retired()))
         {
             return Err(Error::Stale);
         }
-        Ok(reservation)
+        // Historical handles can only replay their typed terminal receipt.
+        // Every work factory still requires the active same_cell and phase.
+        Ok(Reservation {
+            state: Arc::downgrade(&self.state),
+            cell: cell.clone(),
+        })
     }
 
     /// Conservative negative front-door guard. It cannot grant Source access.

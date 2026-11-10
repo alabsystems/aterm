@@ -41,7 +41,7 @@ impl Preparation {
         Self::with_context(registry, env, work.ctx.self_id.as_str().into(), scope).map(Some)
     }
 
-    fn with_context(
+    pub(super) fn with_context(
         registry: Arc<Registry>,
         env: Env,
         sid: String,
@@ -114,6 +114,31 @@ impl Preparation {
                 .map_err(|_| "Codex constructor write receipt is unavailable")?;
         }
         Ok(())
+    }
+
+    /// The Rust-only joined fixture launches through spawnfd rather than the
+    /// worker UI. Bind only its actual kernel child to the same reservation;
+    /// this is not evidence that the normal main-thread UI wrote a command.
+    #[cfg(debug_assertions)]
+    pub(super) fn spawned(&mut self, pid: u32) -> Result<(), &'static str> {
+        let process = aterm_agent::harness::native_act::Process::observe(pid)
+            .ok_or("source proof child unavailable")?;
+        let caller = aterm_agent::harness::codex_session_slot::Caller {
+            sid: self.sid.clone(),
+            pid,
+            birth: process.birth,
+        };
+        let reservation = self
+            .reservation
+            .as_ref()
+            .ok_or("source proof reservation unavailable")?;
+        self.registry
+            .reserved_peer(&caller, reservation.token())
+            .map_err(|_| "source proof child does not match its reservation")?;
+        self.typed = true;
+        reservation
+            .mark_typed()
+            .map_err(|_| "source proof spawn receipt unavailable")
     }
 }
 

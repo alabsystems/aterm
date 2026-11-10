@@ -35,6 +35,10 @@ pub struct Changed {
     /// [`Changed::all_targets`], they are what the cone's required-features lint compiles
     /// ([`Scope::gated_spec_of`]).
     pub direct_dependents: Vec<String>,
+    /// The packages among [`Changed::seeds`], by name, whose change only their own tests compile
+    /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `alone`): no build of a
+    /// dependent reads it ([`Scope::reaches_dependents`]).
+    pub alone: Vec<String>,
 }
 
 impl Changed {
@@ -92,6 +96,7 @@ impl Scope {
                 .collect(),
             unlinted: Vec::new(),
             direct_dependents: Vec::new(),
+            alone: Vec::new(),
             crates,
             any_lib,
         })
@@ -133,6 +138,16 @@ impl Scope {
     pub fn with_direct_dependents(mut self, direct_dependents: Vec<String>) -> Self {
         if let Self::Changed(changed) = &mut self {
             changed.direct_dependents = direct_dependents;
+        }
+        self
+    }
+
+    /// This cone with the seeds whose change only their own tests compile ([`Changed::alone`]);
+    /// any other scope as it is.
+    #[must_use]
+    pub fn with_alone(mut self, alone: Vec<String>) -> Self {
+        if let Self::Changed(changed) = &mut self {
+            changed.alone = alone;
         }
         self
     }
@@ -217,6 +232,14 @@ impl Scope {
                 .any(|seed| spec_name(seed) == Some(name)),
             _ => self.includes_crate(name),
         }
+    }
+
+    /// Did the change touch the package `name` ([`Scope::touches`]) where a build of a dependent
+    /// reads it: not only in its own tests ([`Changed::alone`])?
+    #[must_use]
+    pub fn reaches_dependents(&self, name: &str) -> bool {
+        self.touches(name)
+            && !matches!(self, Self::Changed(changed) if changed.alone.iter().any(|n| n == name))
     }
 
     /// Would this selection compile the bare package `name`? A spec the cone
@@ -329,6 +352,17 @@ mod tests {
         assert!(seeded.touches("aterm-uds") && seeded.touches("ring"));
         assert!(!seeded.touches("aterm-gui") && seeded.includes_crate("aterm-gui"));
         assert!(changed(&["aterm-gui"]).touches("aterm-gui"));
+        // A seed whose change only its own tests compile is touched but reaches no dependent; a
+        // scope that is no cone has none alone. CONTROL: another seed of the cone reaches them.
+        let alone = seeded.clone().with_alone(vec!["aterm-uds".into()]);
+        assert!(alone.touches("aterm-uds") && !alone.reaches_dependents("aterm-uds"));
+        assert!(alone.reaches_dependents("ring") && seeded.reaches_dependents("aterm-uds"));
+        assert!(!alone.reaches_dependents("aterm-gui"));
+        assert!(
+            Scope::crate_only("aterm-uds")
+                .with_alone(vec!["aterm-uds".into()])
+                .reaches_dependents("aterm-uds")
+        );
         assert!(Scope::crate_only("aterm-gui").touches("aterm-gui"));
         assert!(Scope::workspace().touches("aterm-gui"));
         assert!(Scope::crate_only("aterm-lab").has_lib_target());

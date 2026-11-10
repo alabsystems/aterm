@@ -5875,6 +5875,86 @@ mod tests {
         assert_eq!(leapt, 0, "no flight after the box");
     }
 
+    /// THE RE-GRID A CHANGE OF DISPLAY SCALE MAKES KEEPS THE CAT ON ITS CONSOLE SEAT
+    /// ([`PetBrain::keep_place_on_restation`]): asleep on the seat the console keeps for it in
+    /// Claude Code's pane (under the composer's footer, row 16.85, its centre on column 6), the
+    /// pane's cells changed from 7x14 px to 15x28 and back, its grid and caret unchanged. The art
+    /// is 5.61 columns wide on the one and 5.23 on the other ([`art_cols`]), and the seat stays
+    /// centred, so its left edge moves by half the change (0.19 columns). The cat moves with it on
+    /// the frame that draws the new cells, its centre within a pixel of where it was, and from
+    /// there is as still as the same pane given no re-grid, frame for frame in pose, alpha and
+    /// row. Left where it was, it glided the 0.19 columns over the next 120 frames.
+    #[test]
+    fn a_scale_change_keeps_the_cat_on_its_console_seat() {
+        for (from, to) in [((7u16, 14u16), (15u16, 28u16)), ((15, 28), (7, 14))] {
+            let pane = || {
+                let mut p = AgentPane::new_warm(0);
+                p.2.cell = from;
+                p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+                for _ in 0..(30.0 / 0.016) as usize {
+                    p.frame();
+                }
+                p
+            };
+            let (mut scaled, mut control) = (pane(), pane());
+            let before = scaled.frame();
+            let _ = control.frame();
+            let (w0, w1) = (art_cols(from.0, from.1), art_cols(to.0, to.1));
+            let caret_row = f32::from(scaled.0.term.cursor().row);
+            assert!(
+                before.action == PetAction::Sleep
+                    && before.alpha == 255
+                    && (before.row - caret_row).abs() >= 0.5
+                    && scaled.0.pet.aim == Some((before.col, before.row)),
+                "fixture: {from:?}: asleep on its seat off the caret's row, got {:?} at ({}, {}) \
+                 alpha {}, aim {:?}",
+                before.action,
+                before.col,
+                before.row,
+                before.alpha,
+                scaled.0.pet.aim
+            );
+            scaled.2.cell = to;
+            scaled.0.pet.rebase_geometry();
+            let px = 1.0 / f32::from(to.0);
+            let frames: Vec<(PetFrame, PetFrame)> = (0..400)
+                .map(|_| (scaled.frame(), control.frame()))
+                .collect();
+            let (centre_was, centre_now) = (before.col + w0 / 2.0, frames[0].0.col + w1 / 2.0);
+            assert!(
+                (centre_now - centre_was).abs() < px,
+                "{from:?} to {to:?}: the seat's centre moved {:.3} columns at the re-grid",
+                centre_now - centre_was
+            );
+            let offset = frames[0].0.col - frames[0].1.col;
+            for (i, (s, c)) in frames.iter().enumerate() {
+                assert!(
+                    s.action == c.action
+                        && s.pose == c.pose
+                        && s.alpha == c.alpha
+                        && s.row == c.row,
+                    "{from:?} to {to:?}: frame {i} re-posed: {:?} {:?} alpha {} row {} against \
+                     {:?} {:?} alpha {} row {}",
+                    s.action,
+                    s.pose,
+                    s.alpha,
+                    s.row,
+                    c.action,
+                    c.pose,
+                    c.alpha,
+                    c.row
+                );
+                assert!(
+                    (s.col - c.col - offset).abs() < px,
+                    "{from:?} to {to:?}: frame {i} moved the cat: col {:.4} against {:.4} with no \
+                     re-grid, where the re-grid's frame stood {offset:.4} apart",
+                    s.col,
+                    c.col
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_walking_body_wears_its_gait_through_a_contact() {
         let mut s = Scene::new();

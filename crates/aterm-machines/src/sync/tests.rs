@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The converge pass over inert ports: nothing here reads or changes the machine.
+//! The converge pass over inert ports, with private native Git read-back controls.
 
 use super::*;
 use std::sync::Arc;
@@ -526,7 +526,11 @@ impl Ports for Inert {
             .unwrap_or_else(|| GithubRead::Current("vault helper verified".into()));
         Ok("vault helper verified".into())
     }
-    fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
+    fn owed_clone(
+        &self,
+        _readback: Option<&crate::init_github::RepositoryReadback>,
+        _work: aterm_secrets::converge::RepositoryWork,
+    ) -> Result<crate::init::OwedClone, String> {
         if self
             .prerequisites
             .as_ref()
@@ -540,21 +544,27 @@ impl Ports for Inert {
         &self,
         work: aterm_secrets::converge::RepositoryWork,
         _execution: Option<repository_refresh::Execution>,
-    ) -> Result<String, String> {
+    ) -> Result<crate::init::CloneOwedOutcome, String> {
         if matches!(
             *self.owed.lock().unwrap(),
             crate::init::OwedClone::Verified { .. }
         ) {
             assert_eq!(work, aterm_secrets::converge::RepositoryWork::Refresh);
             self.applied("refresh checkouts");
-            return Ok("refreshed".into());
+            return Ok(crate::init::CloneOwedOutcome {
+                said: "refreshed".into(),
+                readback: None,
+            });
         }
         self.applied("clone");
         *self.owed.lock().unwrap() = crate::init::OwedClone::Verified {
             present: 1,
             total: 1,
         };
-        Ok("cloned".into())
+        Ok(crate::init::CloneOwedOutcome {
+            said: "cloned".into(),
+            readback: None,
+        })
     }
     fn forget_owed_clone(&self) -> Result<(), String> {
         self.applied("forget clone");
@@ -855,7 +865,7 @@ fn the_requests_pass_runs_only_where_the_table_is_reached_and_never_in_a_plan() 
             let ports = Hooked {
                 inner,
                 held: &|| held.map(str::to_owned),
-                owed: &|| {
+                owed: &|_| {
                     Ok(crate::init::OwedClone::Due(
                         "repository credential needed".into(),
                     ))
@@ -3100,8 +3110,11 @@ pub(crate) mod owed_clone {
     pub(crate) struct Hooked<'a> {
         pub(crate) inner: Inert,
         pub(crate) held: &'a (dyn Fn() -> Option<String> + Sync),
-        pub(crate) owed: &'a (dyn Fn() -> Result<OwedClone, String> + Sync),
-        pub(crate) clone: &'a (dyn Fn() -> Result<String, String> + Sync),
+        pub(crate) owed: &'a (
+                dyn Fn(Option<&crate::init_github::RepositoryReadback>) -> Result<OwedClone, String>
+                    + Sync
+            ),
+        pub(crate) clone: &'a (dyn Fn() -> Result<crate::init::CloneOwedOutcome, String> + Sync),
         pub(crate) forget: &'a (dyn Fn() -> Result<(), String> + Sync),
     }
 
@@ -3190,14 +3203,18 @@ pub(crate) mod owed_clone {
         fn resync_accounts(&self) -> Result<String, String> {
             self.inner.resync_accounts()
         }
-        fn owed_clone(&self) -> Result<OwedClone, String> {
-            (self.owed)()
+        fn owed_clone(
+            &self,
+            readback: Option<&crate::init_github::RepositoryReadback>,
+            _work: aterm_secrets::converge::RepositoryWork,
+        ) -> Result<OwedClone, String> {
+            (self.owed)(readback)
         }
         fn clone_owed(
             &self,
             _work: aterm_secrets::converge::RepositoryWork,
             _execution: Option<repository_refresh::Execution>,
-        ) -> Result<String, String> {
+        ) -> Result<crate::init::CloneOwedOutcome, String> {
             (self.clone)()
         }
         fn forget_owed_clone(&self) -> Result<(), String> {
@@ -3263,7 +3280,9 @@ pub(crate) mod owed_clone {
                 .load(Ordering::SeqCst)
                 .then(|| "a Stop holds it".to_owned())
         };
-        let owed = || Ok(OwedClone::Due("the GitHub token is here".to_owned()));
+        let owed = |_: Option<&crate::init_github::RepositoryReadback>| {
+            Ok(OwedClone::Due("the GitHub token is here".to_owned()))
+        };
         let clone = || panic!("a Stop before repository cloning must hold it");
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
@@ -3323,7 +3342,7 @@ pub(crate) mod owed_clone {
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
-            owed: &|| Ok(OwedClone::Nothing("aterm init owes no clone".into())),
+            owed: &|_| Ok(OwedClone::Nothing("aterm init owes no clone".into())),
             clone: &|| panic!("nothing is owed"),
             forget: &|| Ok(()),
         };
@@ -3477,7 +3496,15 @@ pub(crate) mod owed_clone {
         owe_a_clone(scratch.path());
         let state = scratch.path().to_path_buf();
         let held = || None;
-        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            crate::init::owed_clone_in_pass(
+                &sys,
+                &state,
+                &crate::init::Holds::NONE,
+                readback,
+                aterm_secrets::converge::RepositoryWork::Refresh,
+            )
+        };
         let clone = || {
             crate::init::clone_owed(
                 &sys,
@@ -3560,10 +3587,12 @@ pub(crate) mod owed_clone {
         );
         owe_a_clone(scratch.path());
         let state = scratch.path().to_path_buf();
-        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
         assert!(matches!(read, OwedClone::Off(_)), "{read:?}");
         let held = || None;
-        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
+        };
         let clone = || {
             crate::init::clone_owed(
                 &sys,
@@ -3639,10 +3668,15 @@ pub(crate) mod owed_clone {
             let state = scratch.path().to_path_buf();
             let cloned = AtomicBool::new(false);
             let held = || None;
-            let owed = || crate::init::owed_clone(&sys, &state, &now);
+            let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+                crate::init::owed_clone(&sys, &state, &now, readback)
+            };
             let clone = || {
                 cloned.store(true, Ordering::SeqCst);
-                Ok("cloned".to_owned())
+                Ok(crate::init::CloneOwedOutcome {
+                    said: "cloned".to_owned(),
+                    readback: None,
+                })
             };
             let ports = Hooked {
                 inner: Inert::new(scratch.path()),
@@ -3698,7 +3732,9 @@ pub(crate) mod owed_clone {
         crate::init_github::scripted::converged(&sys, &alice, "ready");
         crate::port::System::remove(&sys, Path::new(crate::items::github::CLT_GIT)).unwrap();
         let held = || None;
-        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
+        };
         let clone = || {
             crate::init::clone_owed(
                 &sys,
@@ -3750,6 +3786,309 @@ pub(crate) mod owed_clone {
             "the tools arrived, yet the owed clone never ran"
         );
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+
+        // An unborn checkout is not offline proof of an empty remote. Only this item's
+        // actual native admission may carry that fact into its fresh outer read-back.
+        use crate::git_credential::script;
+        use crate::port::{Live, System};
+        let live = Live::new();
+        let repos = crate::checkout::tests::Repos::new(&live, "sync-empty-readback");
+        let home = Path::new(&repos.who.home);
+        let empty = home.join("empty.git");
+        repos.init(&empty, true);
+        let work = home.join("unborn");
+        repos.clone_into(&empty, &work);
+        let origin = format!("https://github.com/{}/unborn.git", repos.who.name);
+        repos.g(&work, &["remote", "set-url", "origin", &origin]);
+        let mut sys = crate::port::Fake::root();
+        sys.euid = repos.who.uid;
+        sys.linux = !live.macos();
+        sys.logged_in(&repos.who)
+            .stat_of(&repos.who.home, live.stat(home).unwrap())
+            .executable(
+                crate::items::github::need_native_git(),
+                b"selected fixture git",
+            );
+        for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+            sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+            sys.file_id_of(&path, live.file_id(&path).unwrap());
+        }
+        script::launcher(&sys, &repos.who);
+        crate::init_github::scripted::owned_source(&sys, &repos.who);
+        let inventory = || {
+            aterm_json::json!([crate::init_github::scripted::repository(
+                &repos.who.name,
+                "unborn",
+                1
+            )])
+        };
+        crate::init_github::scripted::metadata(&sys, &repos.who, inventory());
+        script::lookups_hold(
+            &sys,
+            &repos.who,
+            "github.com",
+            &repos.who.name,
+            "fixture_development_token_only",
+        );
+        script::alike(&sys, &repos.who);
+        let advertisements = Arc::new(AtomicU32::new(0));
+        let observed = Arc::clone(&advertisements);
+        let (at, bare, advertised) = (
+            work.clone(),
+            empty.clone(),
+            std::ffi::OsString::from(origin.clone()),
+        );
+        sys.simulate(move |_, command| {
+            let in_work = command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == at.as_os_str());
+            if !in_work && !command.args.iter().any(|arg| arg == &advertised) {
+                return None;
+            }
+            let remote = command.args.iter().any(|arg| arg == "ls-remote")
+                && !command.args.iter().any(|arg| arg == "--get-url");
+            let fetch = command.args.iter().any(|arg| arg == "fetch");
+            let mut command = command.clone();
+            if remote {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            if remote || fetch {
+                for arg in &mut command.args {
+                    if arg == "origin" || arg == &advertised {
+                        *arg = bare.as_os_str().to_owned();
+                    }
+                }
+            }
+            Some(Live::new().run_complete_stdout(&command).unwrap())
+        });
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&repos.who));
+        let state = home.join("sync-state");
+        let read = |readback: Option<&crate::init_github::RepositoryReadback>,
+                    now: &crate::init::Holds| {
+            crate::init::owed_clone_captured(
+                &sys,
+                &state,
+                now,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
+                || Ok(true),
+                readback,
+                aterm_secrets::converge::RepositoryWork::Repair,
+            )
+        };
+        assert!(matches!(
+            read(None, &crate::init::Holds::NONE).unwrap(),
+            OwedClone::Due(_)
+        ));
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            0,
+            "offline debt asks no remote"
+        );
+        let cloned = AtomicU32::new(0);
+        let clone = || {
+            let outcome = crate::init::clone_owed_captured(
+                &sys,
+                &state,
+                aterm_secrets::converge::RepositoryWork::Repair,
+                crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
+                || Ok(true),
+            )?;
+            let proof = outcome
+                .readback
+                .as_ref()
+                .expect("the actual empty admission returned its read-back");
+            assert!(matches!(
+                read(Some(proof), &crate::init::Holds::NONE)?,
+                OwedClone::Verified {
+                    present: 1,
+                    total: 1
+                }
+            ));
+            assert!(
+                matches!(read(None, &crate::init::Holds::NONE)?, OwedClone::Due(_)),
+                "no durable completion substitutes for the item's proof"
+            );
+            if cloned.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut left = crate::init::Holds::NONE;
+                left.off
+                    .set(aterm_types::macos_setup::Setting::Repositories, true);
+                assert!(matches!(read(Some(proof), &left)?, OwedClone::Held(_)));
+                let stopped = crate::init::Holds {
+                    stopped: Some("fixture Stop".into()),
+                    ..crate::init::Holds::NONE
+                };
+                assert!(!matches!(
+                    read(Some(proof), &stopped),
+                    Ok(OwedClone::Verified { .. })
+                ));
+                let token = home.join(crate::init_github::TOKEN_FILE);
+                let token_stat = sys.stat(&token).unwrap();
+                System::remove(&sys, &token).unwrap();
+                assert!(
+                    !matches!(
+                        read(Some(proof), &crate::init::Holds::NONE),
+                        Ok(OwedClone::Verified { .. })
+                    ),
+                    "an empty-remote proof cannot supply missing source authority"
+                );
+                crate::init_github::scripted::owned_source(&sys, &repos.who);
+                assert_eq!(sys.stat(&token).unwrap(), token_stat);
+                repos.g(
+                    &work,
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/elsewhere/unborn.git",
+                    ],
+                );
+                assert!(
+                    !matches!(
+                        read(Some(proof), &crate::init::Holds::NONE),
+                        Ok(OwedClone::Verified { .. })
+                    ),
+                    "a retargeted checkout cannot borrow the old proof"
+                );
+                repos.g(&work, &["remote", "set-url", "origin", &origin]);
+                // The raw origin and checkout identity stay unchanged, but Git's actual
+                // local endpoint can change without any vault input changing.
+                let redirected = home.join("unadmitted-empty.git");
+                let rewritten_url = format!("file://{}", redirected.display());
+                let rewrite_key = format!("url.{rewritten_url}.insteadOf");
+                repos.g(&work, &["config", "--local", &rewrite_key, &origin]);
+                assert_eq!(
+                    repos.g(&work, &["config", "--local", "--get", "remote.origin.url"]),
+                    origin
+                );
+                assert_eq!(
+                    repos.g(&work, &["ls-remote", "--get-url", "origin"]),
+                    rewritten_url
+                );
+                let before_rewrite_read = advertisements.load(Ordering::SeqCst);
+                assert!(
+                    !matches!(
+                        read(Some(proof), &crate::init::Holds::NONE),
+                        Ok(OwedClone::Verified { .. })
+                    ),
+                    "a locally rewritten endpoint cannot borrow the raw origin's proof"
+                );
+                assert_eq!(advertisements.load(Ordering::SeqCst), before_rewrite_read);
+                assert!(!redirected.exists(), "read-back performs no acquisition");
+                repos.g(&work, &["config", "--local", "--unset-all", &rewrite_key]);
+                assert!(matches!(
+                    read(Some(proof), &crate::init::Holds::NONE)?,
+                    OwedClone::Verified {
+                        present: 1,
+                        total: 1
+                    }
+                ));
+                let held_work = home.join("held-unborn");
+                std::fs::rename(&work, &held_work).unwrap();
+                repos.clone_into(&empty, &work);
+                repos.g(&work, &["remote", "set-url", "origin", &origin]);
+                for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+                    sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+                    sys.file_id_of(&path, live.file_id(&path).unwrap());
+                }
+                assert!(
+                    !matches!(
+                        read(Some(proof), &crate::init::Holds::NONE),
+                        Ok(OwedClone::Verified { .. })
+                    ),
+                    "a same-path replacement cannot borrow the old proof"
+                );
+                std::fs::remove_dir_all(&work).unwrap();
+                std::fs::rename(&held_work, &work).unwrap();
+                for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+                    sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+                    sys.file_id_of(&path, live.file_id(&path).unwrap());
+                }
+                assert!(matches!(
+                    read(Some(proof), &crate::init::Holds::NONE)?,
+                    OwedClone::Verified {
+                        present: 1,
+                        total: 1
+                    }
+                ));
+            } else {
+                // The second native batch succeeds, then a different current source lands
+                // before Synced's outer probe. The old receipt must not finish that item.
+                crate::init_github::scripted::metadata(
+                    &sys,
+                    &repos.who,
+                    aterm_json::json!([crate::init_github::scripted::repository(
+                        &repos.who.name,
+                        "unborn",
+                        2
+                    )]),
+                );
+                assert!(!matches!(
+                    read(Some(proof), &crate::init::Holds::NONE),
+                    Ok(OwedClone::Verified { .. })
+                ));
+            }
+            Ok(outcome)
+        };
+        let held = || None;
+        let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+            read(readback, &crate::init::Holds::NONE)
+        };
+        let ports = Hooked {
+            inner: Inert::new(&state),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| crate::init::forget_owed_clone(&state),
+        };
+        let complete = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Repair,
+            &mut |_| {},
+        ));
+        assert_eq!(
+            row(&complete.rows, CLONE).outcome,
+            Outcome::Changed,
+            "{complete:?}"
+        );
+        assert!(
+            complete.complete(),
+            "the actual empty native admission must settle the whole pass: {complete:?}"
+        );
+        assert_eq!(cloned.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            1,
+            "all read-backs reuse the current item's admission"
+        );
+        assert!(
+            matches!(
+                read(None, &crate::init::Holds::NONE).unwrap(),
+                OwedClone::Due(_)
+            ),
+            "a later item needs its own current admission"
+        );
+        let changed = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Repair,
+            &mut |_| {},
+        ));
+        assert!(!changed.complete(), "{changed:?}");
+        assert_ne!(
+            row(&changed.rows, CLONE).outcome,
+            Outcome::Changed,
+            "{changed:?}"
+        );
+        assert_eq!(cloned.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            2,
+            "the changed source is not silently retried within the pass"
+        );
     }
 
     /// A token file that is on this Mac but that aterm may not use (here readable by others)
@@ -3772,14 +4111,14 @@ pub(crate) mod owed_clone {
         };
         sys.file(token, b"fixture_token_only")
             .stat_of(token, stat(0o644));
-        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
         assert!(
             matches!(&read, crate::init::OwedClone::Waiting(why)
                 if why.contains(token) && why.contains("cannot be used")),
             "{read:?}"
         );
         sys.stat_of(token, stat(0o600));
-        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
         assert!(matches!(read, crate::init::OwedClone::Due(_)), "{read:?}");
     }
 
@@ -3797,7 +4136,7 @@ pub(crate) mod owed_clone {
                 .load(Ordering::SeqCst)
                 .then(|| "you stopped setup in System State".to_owned())
         };
-        let owed = || {
+        let owed = |_: Option<&crate::init_github::RepositoryReadback>| {
             // The person presses Stop while the row reads what is owed.
             stopped.store(true, Ordering::SeqCst);
             Ok(OwedClone::Due(
@@ -3806,7 +4145,10 @@ pub(crate) mod owed_clone {
         };
         let clone = || {
             cloned.store(true, Ordering::SeqCst);
-            Ok("cloned".to_owned())
+            Ok(crate::init::CloneOwedOutcome {
+                said: "cloned".to_owned(),
+                readback: None,
+            })
         };
         let ports = Hooked {
             inner: Inert::new(&state),

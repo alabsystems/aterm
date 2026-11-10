@@ -117,10 +117,11 @@ impl<'a> Reads<'a> {
         self.config
             .get_or_init(|| {
                 config_with(self.paths, |pin| {
-                    self.vault()
+                    Ok(self
+                        .vault()
                         .ok()
                         .flatten()
-                        .map_or_else(Vec::new, |vault| vault.chain(pin))
+                        .map_or_else(Vec::new, |vault| vault.chain(pin)))
                 })
             })
             .as_ref()

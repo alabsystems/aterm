@@ -1012,6 +1012,7 @@ impl Drop for Standin {
 fn one_interrupt_in_two_memory_waits_ends_the_run() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-mem-int-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let ledger = Ledger::at(dir.path().join("ledger"));
@@ -1205,6 +1206,7 @@ fn printed(child: &mut Standin) -> String {
 fn a_timed_stage_claims_memory_only_on_its_runs_quiet_machine() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-appkit-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let go = dir.path().join("r-go");

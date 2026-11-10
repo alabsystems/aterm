@@ -49,7 +49,7 @@ pub(crate) fn automatic_inventory_counts(
         return Ok(None);
     }
     let captured = InitialRepositoryInputs::capture_ready(sys, ctx)?;
-    automatic_inventory_counts_captured(sys, ctx, &captured)
+    automatic_inventory_counts_captured(sys, ctx, &captured, None)
 }
 
 /// Reuse an existing captured default source. A caller's materialization fence is
@@ -58,6 +58,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     sys: &dyn System,
     ctx: &Ctx,
     captured: &InitialRepositoryInputs,
+    readback: Option<&RepositoryReadback>,
 ) -> Result<Option<(usize, usize)>, String> {
     captured.validate_default_context(sys, ctx)?;
     if captured.local.is_err()
@@ -74,7 +75,12 @@ pub(crate) fn automatic_inventory_counts_captured(
         .as_ref()
         .ok_or("the default repository source changed while its inputs were captured")?;
     let listed = inventory.repositories();
-    let standing = repos::partition(sys, &captured.user, listed)?;
+    let empty = readback
+        .filter(|proof| {
+            proof.user == captured.user && proof.source.as_ref() == captured.source.as_ref()
+        })
+        .map_or(&[][..], |proof| proof.empty.as_slice());
+    let standing = repos::partition_with_empty(sys, &captured.user, listed, empty)?;
     let counts = (standing.present.len(), listed.len());
     // capture_ready released the shared materialization lock before any helper runs.
     let lookups = if !listed.is_empty() && counts.0 == counts.1 {
@@ -102,7 +108,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     Ok(Some(counts))
 }
 
-pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
+pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<RepositoryRun, String> {
     run_with(sys, ctx, mode, RepositoryWork::Refresh, None)
 }
 
@@ -113,7 +119,7 @@ pub(super) fn run_captured(
     work: RepositoryWork,
     inputs: InitialRepositoryInputs,
     current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
-) -> Result<Vec<ItemReport>, String> {
+) -> Result<RepositoryRun, String> {
     run_with(sys, ctx, mode, work, Some(Captured { inputs, current }))
 }
 
@@ -197,7 +203,7 @@ fn run_with(
     mode: Mode,
     work: RepositoryWork,
     captured: Option<Captured>,
-) -> Result<Vec<ItemReport>, String> {
+) -> Result<RepositoryRun, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("initial repository setup requires exactly one local user".into());
     };
@@ -210,7 +216,10 @@ fn run_with(
             Some(captured) => captured.current,
             None => Box::new(|| Ok(true)),
         };
-        return run_withdrawal(sys, ctx, mode, withdrawal, current);
+        return run_withdrawal(sys, ctx, mode, withdrawal, current).map(|rows| RepositoryRun {
+            rows,
+            readback: None,
+        });
     }
     if mode == Mode::Apply {
         // What a clone killed mid-way left (design §6.5): never a clone still running.
@@ -220,6 +229,7 @@ fn run_with(
     let keychain = keychain::Keychain::new(user.clone());
     let item = NativeRepositories {
         work,
+        observe_remote: mode == Mode::Apply || work == RepositoryWork::Refresh,
         ..NativeRepositories::new(user.clone(), captured)
     };
     let place = || Place {
@@ -236,19 +246,64 @@ fn run_with(
         sys,
         ctx,
     );
-    if mode == Mode::Apply {
+    let rows = if mode == Mode::Apply {
         let mut journal = sys.journal()?;
         aterm_converge::run(&bound, mode, journal.as_mut())
     } else {
         aterm_converge::run(&bound, mode, &mut aterm_converge::ReadOnly)
     }
-    .map_err(|why| why.to_string())
+    .map_err(|why| why.to_string())?;
+    let readback = if mode == Mode::Apply {
+        item.readback(sys)?
+    } else {
+        None
+    };
+    Ok(RepositoryRun { rows, readback })
+}
+
+/// Native rows and the current batch's optional proof of truly empty origins.
+#[derive(Debug)]
+pub struct RepositoryRun {
+    pub rows: Vec<ItemReport>,
+    pub readback: Option<RepositoryReadback>,
+}
+
+impl std::ops::Deref for RepositoryRun {
+    type Target = [ItemReport];
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+impl IntoIterator for RepositoryRun {
+    type Item = ItemReport;
+    type IntoIter = std::vec::IntoIter<ItemReport>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.into_iter()
+    }
+}
+
+/// Readback of complete empty remote advertisements. It lives only in the current
+/// item/pass; every reuse still checks current inputs and actual local storage.
+pub struct RepositoryReadback {
+    user: User,
+    source: Option<super::source::Stamp>,
+    empty: Vec<repos::EmptyCheckout>,
+}
+
+impl std::fmt::Debug for RepositoryReadback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryReadback").finish_non_exhaustive()
+    }
 }
 
 struct NativeRepositories {
     user: User,
     /// The caller's scheduling intent; it grants no authority over the captured source.
     work: RepositoryWork,
+    /// An apply acquires missing work; a Refresh also admits read-only remote observation.
+    /// A Plan/Repair readback alone cannot turn unseen remote state into missing work.
+    observe_remote: bool,
     execution: Option<Execution>,
     refresh: Mutex<Option<ActiveRefresh>>,
     lease: Mutex<Option<Arc<RepositoryPass>>>,
@@ -296,6 +351,7 @@ pub struct InitialRepositoryInputs {
     source: Option<super::source::Stamp>,
     authority: InputAuthority,
     execution: Option<Execution>,
+    readback: Option<Arc<RepositoryReadback>>,
 }
 
 struct ActiveRefresh {
@@ -358,6 +414,14 @@ impl InitialRepositoryInputs {
         self.execution = execution;
         self
     }
+
+    /// Borrow this pass's actual empty-origin observation for a fresh local readback.
+    /// Matching source/account and local checkout checks still decide whether it applies.
+    #[must_use]
+    pub fn with_repository_readback(mut self, readback: Option<Arc<RepositoryReadback>>) -> Self {
+        self.readback = readback;
+        self
+    }
     /// Read only local admitted profile/token files, for a caller holding its
     /// vault's ready materialization against writers. A blocked local reading is
     /// kept for the item's probe to report without reading those files again.
@@ -404,6 +468,7 @@ impl InitialRepositoryInputs {
             source,
             authority: InputAuthority::Caller,
             execution: None,
+            readback: None,
         }
     }
 
@@ -414,6 +479,7 @@ impl InitialRepositoryInputs {
             source: None,
             authority: InputAuthority::Caller,
             execution: None,
+            readback: None,
         };
         let table = match super::profile(sys, user) {
             Ok(profile) => profile.and_then(|profile| profile.github),
@@ -637,6 +703,7 @@ impl NativeRepositories {
         Self {
             user,
             work: RepositoryWork::Refresh,
+            observe_remote: true,
             execution: None,
             refresh: Mutex::new(None),
             lease: Mutex::new(None),
@@ -677,15 +744,42 @@ impl NativeRepositories {
     /// Read current local readiness against the apply's admitted inventory, or a new plan.
     fn read(&self, sys: &dyn System) -> Result<(Plan, repos::Partition), Block> {
         let plan = match self.take() {
-            Some(Carried::Applied(plan)) => {
+            Some(Carried::Applied(plan) | Carried::Probed(plan, _)) => {
                 self.ensure_current(sys).map_err(Block::from)?;
                 plan
             }
             _ => self.plan(sys)?,
         };
-        let standing = repos::partition(sys, &self.user, &plan.repositories)
-            .map_err(Block::of(Wait::InTheWay))?;
+        let standing =
+            repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)
+                .map_err(Block::of(Wait::InTheWay))?;
         Ok((plan, standing))
+    }
+
+    fn readback(&self, sys: &dyn System) -> Result<Option<RepositoryReadback>, String> {
+        let empty = {
+            let carried = self.carried.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(Carried::Probed(plan, standing)) = carried.as_ref() else {
+                return Ok(None);
+            };
+            if plan.empty.is_empty() || standing.present.len() != plan.repositories.len() {
+                return Ok(None);
+            }
+            plan.empty.clone()
+        };
+        self.ensure_current(sys)?;
+        let inputs = match &self.captured {
+            Some(captured) => captured.inputs.clone(),
+            None => self.prepared_inputs(sys),
+        };
+        let Some(source) = inputs.source else {
+            return Ok(None);
+        };
+        Ok(Some(RepositoryReadback {
+            user: self.user.clone(),
+            source: Some(source),
+            empty,
+        }))
     }
 }
 
@@ -787,7 +881,7 @@ impl Item for NativeRepositories {
                 }
             }
             let check = (|| {
-                let (plan, standing) = paired?;
+                let (mut plan, mut standing) = paired?;
                 if plan.empty_inventory {
                     self.ensure_current(sys).map_err(Block::from)?;
                     return Ok((plan, standing, None));
@@ -797,6 +891,62 @@ impl Item for NativeRepositories {
                 }
                 let lookups = self.lookups(sys, &plan)?;
                 self.ensure_current(sys).map_err(Block::from)?;
+                if lookups.ready() && self.observe_remote && !standing.unborn.is_empty() {
+                    let recorded =
+                        super::develop_checkouts(sys, &self.user).map_err(Block::from)?;
+                    let mut preserved = Vec::new();
+                    for candidate in &standing.unborn {
+                        plan.empty.retain(|proof| !proof.is_for(&candidate.0));
+                        match repos::observe_unborn(sys, &self.user, candidate, &recorded, &|| {
+                            self.ensure_current(sys)
+                        })
+                        .map_err(|why| Block::of(Wait::Unreached)(why.to_string()))?
+                        {
+                            repos::UnbornObservation::Empty(empty) => plan.empty.push(*empty),
+                            repos::UnbornObservation::Owed => {}
+                            repos::UnbornObservation::Preserved(why) => {
+                                preserved.push((candidate.1.clone(), why))
+                            }
+                        }
+                    }
+                    standing = repos::partition_with_empty(
+                        sys,
+                        &self.user,
+                        &plan.repositories,
+                        &plan.empty,
+                    )
+                    .map_err(Block::of(Wait::InTheWay))?;
+                    standing
+                        .unborn
+                        .retain(|(_, path)| !preserved.iter().any(|(kept, _)| kept == path));
+                    standing
+                        .notes
+                        .extend(preserved.into_iter().map(|(_, why)| why));
+                    self.ensure_current(sys).map_err(Block::from)?;
+                } else if lookups.ready() && !standing.unborn.is_empty() {
+                    let recorded =
+                        super::develop_checkouts(sys, &self.user).map_err(Block::from)?;
+                    let mut preserved = Vec::new();
+                    for (repo, path) in &standing.unborn {
+                        let why = repos::local_unborn(
+                            sys,
+                            &self.user,
+                            &(repo.clone(), path.clone()),
+                            &recorded,
+                        )
+                        .map_err(Block::from)?;
+                        if let Some(why) = why {
+                            preserved.push((path.clone(), format!("~/{}: {why}", repo.name)));
+                        }
+                    }
+                    standing
+                        .unborn
+                        .retain(|(_, path)| !preserved.iter().any(|(kept, _)| kept == path));
+                    standing
+                        .notes
+                        .extend(preserved.into_iter().map(|(_, why)| why));
+                    self.ensure_current(sys).map_err(Block::from)?;
+                }
                 // Signed in, with no repository left that fits: the row waits for room instead of
                 // a pass that would clone nothing.
                 let volume = sys.volume(Path::new(&self.user.home));
@@ -856,6 +1006,7 @@ impl Item for NativeRepositories {
                 }
             } else if standing.missing.is_empty()
                 && standing.dependencies.is_empty()
+                && standing.unborn.is_empty()
                 && !standing.notes.is_empty()
             {
                 Probe::Person {
@@ -1112,7 +1263,7 @@ impl NativeRepositories {
         if !super::settings_managed(sys, &self.user)? {
             return Ok(());
         }
-        let (plan, mut standing) = match self.take() {
+        let (mut plan, mut standing) = match self.take() {
             Some(Carried::Probed(plan, standing)) => (plan, standing),
             _ => {
                 let plan = self.plan(sys).map_err(|block| {
@@ -1128,21 +1279,14 @@ impl NativeRepositories {
                 (plan, standing)
             }
         };
-        let recorded =
-            if work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
-                Some(super::develop_checkouts(sys, &self.user)?)
-            } else {
-                None
-            };
+        let recorded = super::develop_checkouts(sys, &self.user)?;
         let current = || {
             authorized()?;
             if !super::settings_managed(sys, &self.user)? {
                 return Err("repository setup was disabled in init.toml while cloning".into());
             }
             self.ensure_current(sys)?;
-            if let Some(recorded) = &recorded
-                && *recorded != super::develop_checkouts(sys, &self.user)?
-            {
+            if recorded != super::develop_checkouts(sys, &self.user)? {
                 return Err(
                     "develop checkout selection changed while repositories were being refreshed"
                         .into(),
@@ -1167,22 +1311,53 @@ impl NativeRepositories {
         }
         let mut failed = Vec::new();
         let mut network_failed = false;
-        if let Some(recorded) = &recorded {
+        // A fresh Refresh probe has already observed its empty origins; repair uses only
+        // this item's actual readback. A newly constructed item has neither observation.
+        if !standing.unborn.is_empty() {
+            standing =
+                repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
+            if !standing.unborn.is_empty() {
+                self.retain_repository_lease(sys)?;
+            }
+            for candidate in &standing.unborn {
+                plan.empty.retain(|proof| !proof.is_for(&candidate.0));
+                match repos::acquire_unborn(
+                    sys,
+                    &self.user,
+                    std::slice::from_ref(candidate),
+                    &recorded,
+                    &current,
+                ) {
+                    Ok(empty) => plan.empty.extend(empty),
+                    Err(why) => {
+                        network_failed |= why.is_network();
+                        failed.push(why.to_string());
+                    }
+                }
+            }
+            standing =
+                repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
+        }
+        if work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
             let refreshed =
-                repos::refresh_existing(sys, &self.user, &standing, recorded, &current)?;
+                repos::refresh_existing(sys, &self.user, &standing, &recorded, &current)?;
             network_failed |= refreshed.network_failed;
             failed.extend(refreshed.failed);
             // A refreshed parent may declare different gitlinks. Never hydrate
             // dependencies from the pre-refresh parent's cached verdict.
             if refreshed.moved {
-                standing = repos::partition(sys, &self.user, &plan.repositories)?;
+                standing =
+                    repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
                 if let Some(why) = repos::named(&standing.git_waits) {
                     self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
                     failed.push(why);
                 }
             }
         }
-        if standing.missing.is_empty() && standing.dependencies.is_empty() {
+        if standing.missing.is_empty()
+            && standing.dependencies.is_empty()
+            && standing.unborn.is_empty()
+        {
             if failed.is_empty() {
                 current()?;
                 self.acknowledge_credential(sys, &plan.token, &current)?;
@@ -1207,6 +1382,7 @@ impl NativeRepositories {
         }
         let guard = repos::CloneGuard::new(&current);
         let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        plan.empty.append(&mut cloned.empty);
         network_failed |= cloned.network_failed;
         cloned.failed.extend(failed);
         let home = Path::new(&self.user.home);
@@ -1286,8 +1462,12 @@ impl NativeRepositories {
 
     fn begin_refresh(&self, sys: &dyn System) -> Result<RepositoryWork, String> {
         use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
-        if self.work != RepositoryWork::Refresh || configuration(sys, &self.user)?.is_some() {
+        if configuration(sys, &self.user)?.is_some() {
             return Ok(self.work);
+        }
+        if self.work == RepositoryWork::Repair {
+            self.retain_repository_lease(sys)?;
+            return Ok(RepositoryWork::Repair);
         }
         let scope = self.refresh_scope(sys)?;
         let execution = self.execution.clone().or_else(|| {
@@ -1311,6 +1491,7 @@ impl NativeRepositories {
             }
         };
         let RepositoryRequest::Refresh(request) = execution.request else {
+            *self.lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(execution.pass);
             return Ok(RepositoryWork::Repair);
         };
         let (work, ticket) =
@@ -1332,6 +1513,31 @@ impl NativeRepositories {
                 ticket,
             });
         Ok(work)
+    }
+
+    fn retain_repository_lease(&self, sys: &dyn System) -> Result<(), String> {
+        if self
+            .lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let execution = self.execution.as_ref().or_else(|| {
+            self.captured
+                .as_ref()
+                .and_then(|capture| capture.inputs.execution.as_ref())
+        });
+        let pass = match execution {
+            Some(execution) => Arc::clone(&execution.pass),
+            None => sys
+                .repository_pass()?
+                .pass
+                .ok_or("another repository/converge pass holds align.lock")?,
+        };
+        *self.lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(pass);
+        Ok(())
     }
 
     fn finish_refresh(&self, sys: &dyn System, complete: bool) -> Result<(), String> {
@@ -1376,6 +1582,7 @@ struct Plan {
     /// The listed repositories left out because another takes their folder
     /// ([`repos::Inventory::notes`]).
     notes: Vec<String>,
+    empty: Vec<repos::EmptyCheckout>,
 }
 
 /// Why [`NativeRepositories::plan`] cannot go on: the engine's line, and the reason System
@@ -1516,6 +1723,7 @@ impl NativeRepositories {
                 empty_inventory: repositories.is_empty(),
                 repositories,
                 notes: Vec::new(),
+                empty: self.borrowed_empty(),
             });
         }
         let account = identity(sys, &self.user, &token).map_err(Block::github)?;
@@ -1580,7 +1788,25 @@ impl NativeRepositories {
             empty_inventory: false,
             repositories: listed.repositories,
             notes: listed.notes,
+            empty: self.borrowed_empty(),
         })
+    }
+
+    fn borrowed_empty(&self) -> Vec<repos::EmptyCheckout> {
+        let inputs = self
+            .captured
+            .as_ref()
+            .map(|capture| &capture.inputs)
+            .or_else(|| self.prepared.get());
+        inputs
+            .and_then(|inputs| {
+                inputs.readback.as_ref().filter(|proof| {
+                    proof.user == self.user
+                        && proof.source.is_some()
+                        && proof.source == inputs.source
+                })
+            })
+            .map_or_else(Vec::new, |proof| proof.empty.clone())
     }
 }
 
@@ -1675,7 +1901,7 @@ pub(super) mod tests {
 
     /// [`source`] at `user`'s synced token file, owned by `user`: a live account, in a test whose
     /// git runs for real, is not the fixtures' 501.
-    fn owned_source(sys: &Fake, user: &User) {
+    pub(crate) fn owned_source(sys: &Fake, user: &User) {
         let path = Path::new(&user.home).join(crate::init_github::TOKEN_FILE);
         let path = path.to_str().unwrap();
         source(sys, path);
@@ -1779,7 +2005,7 @@ pub(super) mod tests {
 
     /// `user`'s private repository inventory from the vault, listing `repositories`, owned by
     /// `user`.
-    fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
+    pub(crate) fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
         let path = super::super::inventory::file(&user.home);
         let bytes = aterm_json::to_vec(&aterm_json::json!({
             "schema":2,"account":user.name,"repositories":repositories
@@ -1814,7 +2040,7 @@ pub(super) mod tests {
         (sys, item)
     }
 
-    fn repository(owner: &str, name: &str, id: u64) -> aterm_json::Value {
+    pub(crate) fn repository(owner: &str, name: &str, id: u64) -> aterm_json::Value {
         aterm_json::json!({"id":id,"name":name,"owner":{"login":owner},"full_name":format!("{owner}/{name}"),"private":true,"clone_url":format!("https://github.com/{owner}/{name}.git"),"default_branch":"main"})
     }
 
@@ -2133,6 +2359,8 @@ pub(super) mod tests {
                 &Holds::NONE,
                 InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
                 || Ok(true),
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap(),
             OwedClone::Person(_)
@@ -2159,6 +2387,8 @@ pub(super) mod tests {
                 &Holds::NONE,
                 InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
                 || Ok(true),
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap(),
             OwedClone::Due(_)
@@ -2179,6 +2409,8 @@ pub(super) mod tests {
                 &Holds::NONE,
                 InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
                 || Ok(true),
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap(),
             OwedClone::Verified {
@@ -2223,7 +2455,7 @@ pub(super) mod tests {
             crate::sync::GithubRead::NotApplicable(_)
         ));
         let state = aterm_tempfile::tempdir().unwrap();
-        let owed = crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        let owed = crate::init::owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap();
         assert_eq!(sys.read_file(&launcher).unwrap(), preserved);
         assert!(!sys.calls().iter().any(|call| {
             call.contains(" clone ") || call.contains("agh GET") || call.contains("--unset")
@@ -2234,7 +2466,7 @@ pub(super) mod tests {
         );
         missing.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Verified {
                 present: 1,
                 total: 1
@@ -2275,7 +2507,7 @@ pub(super) mod tests {
                 None
             });
             let state = aterm_tempfile::tempdir().unwrap();
-            let owed = crate::init::owed_clone(&sys, state.path(), &holds).unwrap();
+            let owed = crate::init::owed_clone(&sys, state.path(), &holds, None).unwrap();
             assert!(
                 match choice {
                     "missing" | "dependency" => matches!(owed, OwedClone::Due(_)),
@@ -2309,6 +2541,8 @@ pub(super) mod tests {
             &crate::init::Holds::NONE,
             inputs,
             || panic!("another account cannot reach the captured vault fence"),
+            None,
+            aterm_secrets::converge::RepositoryWork::Repair,
         )
         .unwrap();
         assert!(matches!(read, crate::init::OwedClone::Waiting(_)));
@@ -2466,7 +2700,8 @@ pub(super) mod tests {
             holds
                 .off
                 .set(Setting::Repositories, changed == "held-no-git");
-            let expected = crate::init::owed_clone(&fixture.sys, state.path(), &holds).unwrap();
+            let expected =
+                crate::init::owed_clone(&fixture.sys, state.path(), &holds, None).unwrap();
             assert!(matches!(
                 expected,
                 OwedClone::Waiting(_) | OwedClone::Held(_)
@@ -2497,6 +2732,8 @@ pub(super) mod tests {
                     checked.set(Some(current));
                     Ok(current)
                 },
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap();
             assert_eq!(
@@ -2542,7 +2779,7 @@ pub(super) mod tests {
             .simulate(|_, command| panic!("credential-pending work started {}", command.display()));
         let debt = aterm_tempfile::tempdir().unwrap();
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Waiting(_)
         ));
         let pending = NativeRepositories::new(cold.who.clone(), None);
@@ -2620,7 +2857,7 @@ pub(super) mod tests {
         });
         assert!(
             matches!(
-                crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+                crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
                 OwedClone::Due(_)
             ),
             "automatic already-present work must still own the local credential acknowledgment"
@@ -2699,13 +2936,13 @@ pub(super) mod tests {
         let ledger_file = cold.paths.dir.join(aterm_secrets::need::LEDGER);
         let pending_bytes = std::fs::read(&ledger_file).unwrap();
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Due(_)
         ));
         let mut stopped = Holds::NONE;
         stopped.stopped = Some("you stopped setup in System State".into());
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &stopped).unwrap(),
+            crate::init::owed_clone(&cold.sys, debt.path(), &stopped, None).unwrap(),
             OwedClone::Waiting(_) | OwedClone::Held(_)
         ));
         run_with(
@@ -2776,7 +3013,7 @@ pub(super) mod tests {
             "{empty_rows:?}"
         );
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Nothing(_)
         ));
         let after_empty = aterm_secrets::need::peek(&cold.paths).unwrap();
@@ -2956,7 +3193,7 @@ pub(super) mod tests {
         aterm_uds::atomic_file::write(&config_file, &config_bytes, 0o600).unwrap();
         cold.sys.remove(&profile).unwrap();
         assert!(matches!(
-            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Waiting(_)
         ));
 
@@ -3037,6 +3274,8 @@ pub(super) mod tests {
                         .is_current_now(&fixture.paths)
                         .map_err(|why| why.to_string())
                 },
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap();
             assert!(
@@ -3045,7 +3284,7 @@ pub(super) mod tests {
             );
             assert!(matches!(read, OwedClone::Nothing(_)), "{legacy}: {read:?}");
             assert!(matches!(
-                crate::init::owed_clone(&fixture.sys, state.path(), &Holds::NONE).unwrap(),
+                crate::init::owed_clone(&fixture.sys, state.path(), &Holds::NONE, None).unwrap(),
                 OwedClone::Nothing(_)
             ));
         }
@@ -3077,6 +3316,8 @@ pub(super) mod tests {
                 &holds,
                 captured.inputs.clone(),
                 || Ok(true),
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap(),
             OwedClone::Held(_)
@@ -3102,6 +3343,8 @@ pub(super) mod tests {
                         .is_current_now(&fixture.paths)
                         .map_err(|why| why.to_string())
                 },
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap(),
             OwedClone::Waiting(_)
@@ -3344,7 +3587,7 @@ pub(super) mod tests {
         );
         let state = aterm_tempfile::tempdir().unwrap();
         assert!(matches!(
-            crate::init::owed_clone(&rejected.sys, state.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone(&rejected.sys, state.path(), &Holds::NONE, None).unwrap(),
             OwedClone::Due(_)
         ));
 
@@ -4262,6 +4505,8 @@ pub(super) mod tests {
                     .is_current_now(&fixture.paths)
                     .map_err(|why| why.to_string())
             },
+            None,
+            aterm_secrets::converge::RepositoryWork::Repair,
         )
         .unwrap();
         assert!(matches!(reading, crate::init::OwedClone::Verified { .. }));
@@ -4361,6 +4606,8 @@ pub(super) mod tests {
                         .is_current_now(&final_paths)
                         .map_err(|why| why.to_string())
                 },
+                None,
+                aterm_secrets::converge::RepositoryWork::Repair,
             )
             .unwrap();
             assert_eq!(
@@ -5803,6 +6050,318 @@ pub(super) mod tests {
     fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
         use crate::port::Live;
         let git = crate::items::github::need_native_git();
+        // An empty clone is complete, but its origin can acquire its first commit later.
+        // Keep the real Git state in one private home and route only this fixture's
+        // advertised GitHub origin to its own bare repository.
+        for preserved in [
+            "none",
+            "untracked",
+            "ignored",
+            "staged",
+            "custom branch",
+            "late ignored",
+            "recorded refresh",
+            "recorded repair",
+        ] {
+            let live = Live::new();
+            let repos = crate::checkout::tests::Repos::new(&live, "native-unborn-refresh");
+            let empty = Path::new(&repos.who.home).join("empty.git");
+            repos.init(&empty, true);
+            let work = Path::new(&repos.who.home).join("unborn");
+            repos.clone_into(&empty, &work);
+            let origin = format!("https://github.com/{}/unborn.git", repos.who.name);
+            repos.g(&work, &["remote", "set-url", "origin", &origin]);
+            let head = || {
+                live.run_complete_stdout(
+                    &crate::checkout::git(&live, &repos.who, Some(&work)).args([
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "HEAD^{commit}",
+                    ]),
+                )
+                .unwrap()
+            };
+            assert!(!head().success(), "the actual empty clone has no commit");
+
+            let mut sys = Fake::root();
+            sys.euid = repos.who.uid;
+            sys.linux = !live.macos();
+            sys.logged_in(&repos.who)
+                .stat_of(
+                    &repos.who.home,
+                    live.stat(Path::new(&repos.who.home)).unwrap(),
+                )
+                .executable(git, b"selected fixture git");
+            for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+                sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+                sys.file_id_of(&path, live.file_id(&path).unwrap());
+            }
+            script::launcher(&sys, &repos.who);
+            owned_source(&sys, &repos.who);
+            metadata(
+                &sys,
+                &repos.who,
+                aterm_json::json!([repository(&repos.who.name, "unborn", 1)]),
+            );
+            script::lookups_hold(&sys, &repos.who, GITHUB, &repos.who.name, TOKEN);
+            script::alike(&sys, &repos.who);
+            if preserved.starts_with("recorded ") {
+                let path = Path::new(&repos.who.home).join(".config/aterm/init.toml");
+                let bytes = b"[develop]\ncheckouts=['~/unborn']\n";
+                sys.file(path.to_str().unwrap(), bytes).stat_of(
+                    path.to_str().unwrap(),
+                    Stat {
+                        uid: repos.who.uid,
+                        gid: repos.who.gid,
+                        len: bytes.len() as u64,
+                        ..stat(false, 0o600)
+                    },
+                );
+            }
+            let (at, bare, advertised) = (
+                work.clone(),
+                empty.clone(),
+                std::ffi::OsString::from(origin.clone()),
+            );
+            let late_ignored = Arc::new(Mutex::new(None));
+            let injected = Arc::clone(&late_ignored);
+            sys.simulate(move |sys, command| {
+                let in_work = command
+                    .args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-C" && pair[1] == at.as_os_str());
+                if !in_work
+                    && !command
+                        .args
+                        .iter()
+                        .any(|arg| arg.as_os_str() == advertised.as_os_str())
+                {
+                    return None;
+                }
+                let remote = command.args.iter().any(|arg| arg == "ls-remote")
+                    && !command.args.iter().any(|arg| arg == "--get-url");
+                let fetch = command.args.iter().any(|arg| arg == "fetch");
+                let mut command = command.clone();
+                if remote || fetch {
+                    for arg in &mut command.args {
+                        if arg == "origin" || arg.as_os_str() == advertised.as_os_str() {
+                            *arg = bare.as_os_str().to_owned();
+                        }
+                    }
+                }
+                if fetch {
+                    command
+                        .args
+                        .push("+refs/heads/*:refs/remotes/origin/*".into());
+                }
+                let late_collision =
+                    preserved == "late ignored" && command.args.iter().any(|arg| arg == "checkout");
+                if late_collision {
+                    // The last producer census has passed; Git must protect this
+                    // ignored collision at the actual checkout boundary.
+                    let mut before = injected.lock().unwrap();
+                    assert!(before.is_none(), "the first checkout is attempted once");
+                    let path = at.join("README");
+                    std::fs::write(&path, b"late ignored owner work\n").unwrap();
+                    let live = Live::new();
+                    sys.file(path.to_str().unwrap(), b"late ignored owner work\n")
+                        .stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+                    *before = Some(live.file_id(&path).unwrap());
+                }
+                let result = Live::new().run_complete_stdout(&command).unwrap();
+                if late_collision {
+                    assert!(!result.success(), "Git refuses the late ignored collision");
+                }
+                Some(result)
+            });
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&repos.who));
+            let empty_pass = run_captured(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                RepositoryWork::Refresh,
+                InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    stage(&empty_pass).outcome,
+                    crate::model::Outcome::Ok | crate::model::Outcome::Changed
+                ),
+                "an actually empty origin is complete: {empty_pass:?}"
+            );
+            assert_eq!(
+                Reading::of(stage(&empty_pass)),
+                Some(Reading::Repositories {
+                    present: 1,
+                    count: 1,
+                    signed_in: true
+                })
+            );
+            assert!(!head().success(), "empty readiness invents no local commit");
+
+            let owned = work.join("owner-notes");
+            if matches!(preserved, "untracked" | "ignored" | "staged") {
+                std::fs::write(&owned, b"the person's unfinished work\n").unwrap();
+                sys.file(owned.to_str().unwrap(), b"the person's unfinished work\n")
+                    .stat_of(owned.to_str().unwrap(), live.stat(&owned).unwrap());
+            }
+            if matches!(preserved, "ignored" | "late ignored") {
+                std::fs::create_dir_all(work.join(".git/info")).unwrap();
+            }
+            if preserved == "ignored" {
+                std::fs::write(work.join(".git/info/exclude"), b"owner-notes\n").unwrap();
+                assert!(
+                    repos.status(&work).is_empty(),
+                    "normal status hides ignored files"
+                );
+            } else if preserved == "staged" {
+                repos.g(&work, &["add", "--", "owner-notes"]);
+            } else if preserved == "custom branch" {
+                repos.g(&work, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+            } else if preserved == "late ignored" {
+                std::fs::write(work.join(".git/info/exclude"), b"README\n").unwrap();
+            }
+            let owned_before = matches!(preserved, "untracked" | "ignored" | "staged")
+                .then(|| live.file_id(&owned).unwrap());
+            let branch_before = std::fs::read(work.join(".git/HEAD")).unwrap();
+            let index = || match std::fs::read(work.join(".git/index")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("private fixture index: {error}"),
+            };
+            let index_before = index();
+            if matches!(
+                preserved,
+                "untracked" | "ignored" | "staged" | "custom branch"
+            ) {
+                let still_empty = run_captured(
+                    &sys,
+                    &ctx,
+                    Mode::Apply,
+                    RepositoryWork::Refresh,
+                    InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                    Box::new(|| Ok(true)),
+                )
+                .unwrap();
+                assert!(matches!(
+                    stage(&still_empty).outcome,
+                    crate::model::Outcome::Ok | crate::model::Outcome::Changed
+                ));
+                assert_eq!(
+                    Reading::of(stage(&still_empty)),
+                    Some(Reading::Repositories {
+                        present: 1,
+                        count: 1,
+                        signed_in: true
+                    }),
+                    "{preserved}: an actually empty origin remains complete"
+                );
+                assert!(
+                    !head().success(),
+                    "{preserved}: no empty-origin commit invented"
+                );
+                assert_eq!(
+                    std::fs::read(work.join(".git/HEAD")).unwrap(),
+                    branch_before
+                );
+                assert_eq!(
+                    index(),
+                    index_before,
+                    "{preserved}: empty-origin index preserved"
+                );
+                if let Some(identity) = owned_before {
+                    assert_eq!(
+                        std::fs::read(&owned).unwrap(),
+                        b"the person's unfinished work\n"
+                    );
+                    assert_eq!(live.file_id(&owned).unwrap(), identity);
+                }
+            }
+            // The publisher adds its first commit after this clone was legitimately empty.
+            repos.g(
+                &repos.seed,
+                &["push", "--quiet", empty.to_str().unwrap(), "main"],
+            );
+            let expected = repos.head(&repos.seed);
+            let applied = run_captured(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                if preserved == "recorded repair" {
+                    RepositoryWork::Repair
+                } else {
+                    RepositoryWork::Refresh
+                },
+                InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            let actual = head();
+            if preserved == "none" {
+                assert!(
+                    actual.success(),
+                    "a formerly empty clone must acquire its origin's first commit: {applied:?}"
+                );
+                assert_eq!(actual.out().trim(), expected);
+                assert_eq!(std::fs::read(work.join("README")).unwrap(), b"one\n");
+                assert_eq!(
+                    Reading::of(stage(&applied)),
+                    Some(Reading::Repositories {
+                        present: 1,
+                        count: 1,
+                        signed_in: true
+                    })
+                );
+            } else {
+                assert!(
+                    !actual.success(),
+                    "{preserved}: owner work was not initialized over"
+                );
+                assert_eq!(
+                    std::fs::read(work.join(".git/HEAD")).unwrap(),
+                    branch_before
+                );
+                assert_eq!(index(), index_before, "{preserved}: index preserved");
+                if let Some(identity) = owned_before {
+                    assert_eq!(
+                        std::fs::read(&owned).unwrap(),
+                        b"the person's unfinished work\n"
+                    );
+                    assert_eq!(live.file_id(&owned).unwrap(), identity);
+                }
+                if preserved == "late ignored" {
+                    let identity = late_ignored
+                        .lock()
+                        .unwrap()
+                        .expect("the actual checkout reached the late collision");
+                    assert_eq!(
+                        std::fs::read(work.join("README")).unwrap(),
+                        b"late ignored owner work\n"
+                    );
+                    assert_eq!(live.file_id(&work.join("README")).unwrap(), identity);
+                } else {
+                    assert!(
+                        !work.join("README").exists(),
+                        "{preserved}: no first checkout"
+                    );
+                }
+                assert_eq!(
+                    Reading::of(stage(&applied)),
+                    Some(Reading::Repositories {
+                        present: 0,
+                        count: 1,
+                        signed_in: true
+                    }),
+                    "{preserved}: an unborn preserved worktree is unfinished"
+                );
+            }
+            assert!(sys.calls().iter().all(|call| !call.contains(" reset ")
+                && !call.contains(" clean ")
+                && !call.contains(" stash ")));
+        }
         // A git before 2.44 as git 2.43 is one: `--no-lazy-fetch` is an unknown option (129).
         let scratch = aterm_tempfile::tempdir().unwrap();
         let old_git = scratch.path().join("old-git");

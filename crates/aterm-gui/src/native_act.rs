@@ -7,6 +7,9 @@
 //! Outcome disposal and predecessor waits hold none of those locks. The table, rather than
 //! a request/connection stack, owns every started operation, including a lost final ACK.
 
+#[path = "native_source_restart.rs"]
+mod source_restart;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,7 +80,6 @@ mod source_control;
 
 /// Credential requests use this app's active configuration, just as owned
 /// constructors do. Process defaults cannot select a different account roster.
-#[cfg(unix)]
 pub(crate) fn codex_account_env() -> Result<aterm_agent::harness::cli::Env, String> {
     let mut env = aterm_agent::harness::cli::Env::from_process()?;
     env.config = crate::app_config::config_path();
@@ -117,6 +119,24 @@ pub(crate) fn serve_codex_auth(
 #[cfg(unix)]
 #[path = "codex_enrollment_control.rs"]
 mod enrollment_control;
+
+pub(crate) fn serve_codex_assignment_policy(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+    registry: &Arc<aterm_agent::harness::codex_source_registry::Registry>,
+    connection: Option<u64>,
+) -> String {
+    #[cfg(unix)]
+    {
+        source_control::serve_policy(ctx, master, line, registry, connection)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, master, line, registry, connection);
+        "ERR codex-accounts-change unsupported\n".into()
+    }
+}
 
 pub(crate) fn serve_codex_enrollment(
     ctx: &Arc<crate::SessionCtx>,
@@ -800,6 +820,8 @@ impl GrantRecord {
 
 #[derive(Debug)]
 struct LaunchChild {
+    source_constructor:
+        Option<Arc<aterm_agent::harness::codex_source_registry::RestartReservation>>,
     process: Process,
     death: Arc<SharedDeath>,
     connection: u64,
@@ -1123,6 +1145,15 @@ enum Phase {
 /// Process/image facts are injected in conformance tests; the production arm reads the
 /// kernel, never a caller's holder, argv text, pathname alone or status-as-permission.
 trait Kernel {
+    fn source_constructor(
+        &self,
+        _sid: &str,
+        _command: &RestartCommand,
+        _child: &Process,
+    ) -> Result<Option<Arc<aterm_agent::harness::codex_source_registry::RestartReservation>>, ()>
+    {
+        Ok(None)
+    }
     fn fence_account_claim(
         &self,
         _relation: &aterm_agent::harness::native_account_wire::Relation,
@@ -1243,6 +1274,15 @@ trait Kernel {
 struct System<'a>(&'a crate::native_session_policy::SessionPolicy, bool);
 
 impl Kernel for System<'_> {
+    fn source_constructor(
+        &self,
+        sid: &str,
+        command: &RestartCommand,
+        child: &Process,
+    ) -> Result<Option<Arc<aterm_agent::harness::codex_source_registry::RestartReservation>>, ()>
+    {
+        source_restart::prepare(sid, command, child)
+    }
     fn fence_account_claim(
         &self,
         relation: &aterm_agent::harness::native_account_wire::Relation,
@@ -3393,6 +3433,29 @@ fn serve_launcher_step(
     } else {
         None
     };
+    // Source selection and filesystem checks run before Meta/Operation. Losing
+    // Attach observers can only revoke an ungranted constructor, not an exec.
+    let source_command = if matches!(request, Request::Attach(..)) {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if op.authority.renewal.is_some() && op.children[phase_index(phase)].is_none() {
+            command_for(&op, phase).cloned()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let source_constructor = match source_command
+        .as_ref()
+        .map(|command| {
+            let child = armed.as_ref().map(|(process, _)| process).ok_or(())?;
+            kernel.source_constructor(ctx.self_id.as_str(), command, child)
+        })
+        .transpose()
+    {
+        Ok(constructor) => constructor.flatten(),
+        Err(()) => return DENIED.into(),
+    };
     // The account writer is outside Meta/Operation, then retained through the
     // exact first-exec grant below. The immutable command is checked again under
     // the operation predicate; already granted children retain their outcome.
@@ -3478,8 +3541,14 @@ fn serve_launcher_step(
         if armed.as_ref().is_none_or(|(watched, _)| watched != &actual) {
             return UNKNOWN.into();
         }
+        if source_constructor.as_ref().is_some_and(|constructor| {
+            command_for(&op, phase).is_none_or(|command| !constructor.matches(command, &actual))
+        }) {
+            return DENIED.into();
+        }
         let (_, death) = armed.take().expect("exact prearmed process");
         op.children[index] = Some(LaunchChild {
+            source_constructor,
             process: actual,
             death: Arc::new(SharedDeath {
                 watch: death,
@@ -3516,7 +3585,12 @@ fn serve_launcher_step(
                     aterm_codec::hex::encode_lower(intent.as_bytes()),
                 );
             }
-            let Some(command) = command_for(&op, phase).and_then(RestartCommand::encode) else {
+            let command = op.children[index]
+                .as_ref()
+                .and_then(|child| child.source_constructor.as_ref())
+                .map(|constructor| constructor.command())
+                .or_else(|| command_for(&op, phase));
+            let Some(command) = command.and_then(RestartCommand::encode) else {
                 return DENIED.into();
             };
             format!(
@@ -3669,6 +3743,12 @@ fn serve_launcher_step(
                 }
                 (GrantStep::Reserve | GrantStep::Deliver, GrantRecord::Recorded) => {}
                 _ => return UNKNOWN.into(),
+            }
+            if let Some(child) = op.children[index].as_ref()
+                && let Some(constructor) = &child.source_constructor
+                && constructor.grant(&child.process).is_err()
+            {
+                return DENIED.into();
             }
             op.children[index].as_mut().unwrap().execute_sent = true;
             op.effect_started

@@ -5,8 +5,6 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 fn typed_terminal(keys: &[u8]) -> aterm_core::terminal::Terminal {
     typed_terminal_at(keys, 72)
 }
@@ -259,7 +257,7 @@ fn focus_restore_preserves_pending_wrap_and_plain_cup_is_a_negative_control() {
 
 #[test]
 fn compiled_gallery_programs_preserve_an_occupied_script_and_argument_boundaries() {
-    let root = aterm_tempfile::tempdir().unwrap();
+    let root = crate::test_scratch_dir("compiled");
     let lab = root.path().join("lab with spaces");
     let script = root.path().join("paint.sh");
     let typing = gallery_program(root.path(), Scenario::Typing, Theme::Light, &lab).unwrap();
@@ -696,16 +694,8 @@ fn args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "lab-trail-gallery-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    std::fs::canonicalize(&dir).expect("its physical path")
+fn scratch(tag: &str) -> crate::TestScratch {
+    crate::TestScratch::new(tag)
 }
 
 #[test]
@@ -898,7 +888,6 @@ fn an_output_dir_inside_a_checkout_is_refused_however_it_is_spelled() {
     );
     let e = resolve_out(&s(root.join("outside/missing/../g")), &co).unwrap_err();
     assert!(e.contains("climbs"), "{e}");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -922,8 +911,7 @@ fn the_checkouts_are_read_from_gits_own_files() {
     assert!(from_wt.contains(&wt), "{from_wt:?}");
     let from_main = checkouts(&main);
     assert!(from_main.contains(&wt), "{from_main:?}");
-    assert_eq!(checkouts(&root), vec![root.clone()]);
-    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(checkouts(&root), vec![root.to_path_buf()]);
 }
 
 /// The cat a schedule of forward keys (ms from the first) earns, read at

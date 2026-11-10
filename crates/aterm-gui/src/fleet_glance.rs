@@ -1302,7 +1302,8 @@ impl FleetRunner for CopyRunner {
         let fleet =
             aterm_agent::fleet_view::compose_here(&self.state, self.paths.as_ref(), Ok(&view));
         let book = aterm_net::fleet_member::read_peers(&self.state).unwrap_or_default();
-        Ok(snapshot_of(&view, &fleet, &book, now_ms()))
+        let own = aterm_uds::process::lan_host_name();
+        Ok(snapshot_of(&view, &fleet, &book, own.as_deref(), now_ms()))
     }
 
     fn dials(&self) -> bool {
@@ -1317,12 +1318,15 @@ impl FleetRunner for CopyRunner {
 /// leave a Mac, so a session is its short sid), and its agents' tally and sessions by sid and word
 /// where its now/activity row is fresh; a silent one, and a seat of the log the view does
 /// not hold, a Mac that did not answer, with how long it has been silent. This Mac's own seat is
-/// left out, as the survey leaves out its own answer.
+/// left out, as the survey leaves out its own answer: a log seat that bound no node key and is
+/// named `own_host` (this Mac's LAN host name), or by a seat the view already stands for, is that
+/// seat, not another Mac.
 #[cfg(unix)]
 pub(crate) fn snapshot_of(
     view: &aterm_mesh::view::View,
     fleet: &aterm_agent::fleet_view::Fleet,
     book: &[aterm_net::fleet_member::Peer],
+    own_host: Option<&str>,
     now_ms: u64,
 ) -> FleetSnapshot {
     use aterm_mesh::presence::Standing;
@@ -1508,13 +1512,41 @@ pub(crate) fn snapshot_of(
         }
         snapshot.macs.push(mac);
     }
+    // The names the view's seats already stand under, this Mac's own among them: a log seat
+    // that bound no node key is matched to them by name, so one Mac is one seat.
+    // Compare full hosts, with a bare label's explicit `.local` alias.
+    let same_host = |left: &str, right: &str| {
+        let left = host_part(left);
+        let right = host_part(right);
+        let local_alias = |local: &str, bare: &str| {
+            local.split_once('.').is_some_and(|(label, domain)| {
+                !label.is_empty()
+                    && domain.eq_ignore_ascii_case("local")
+                    && label.eq_ignore_ascii_case(bare)
+            })
+        };
+        left.eq_ignore_ascii_case(right) || local_alias(left, right) || local_alias(right, left)
+    };
+    let seen: Vec<String> = snapshot
+        .macs
+        .iter()
+        .map(|mac| mac.dial.clone())
+        .chain(snapshot.unanswered.iter().map(|u| u.dial.clone()))
+        .chain(
+            view.seats
+                .iter()
+                .filter(|seat| seat.me)
+                .filter_map(|seat| booked(&seat.key).map(str::to_owned)),
+        )
+        .chain(own_host.map(str::to_owned))
+        .collect();
     // A seat of this Mac's log that the view does not hold (it bound no node key, or the node
     // has not read it): never read up here, and counted, so every seat is a Mac.
     for row in fleet.rows.iter().filter(|row| !row.me) {
-        let held = row
-            .node
-            .as_deref()
-            .is_some_and(|node| view.seats.iter().any(|seat| seat.principal == node));
+        let held = match row.node.as_deref() {
+            Some(node) => view.seats.iter().any(|seat| seat.principal == node),
+            None => row.name != "-" && seen.iter().any(|dial| same_host(dial, &row.name)),
+        };
         if held {
             continue;
         }

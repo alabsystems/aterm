@@ -23543,14 +23543,10 @@ fn retry_wait(state: &TurnEndState, attempts: usize) -> Option<Duration> {
 
 const fn moves_accounts(program: Program) -> bool {
     match program {
-        Program::Claude => true,
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => false,
+        Program::Claude | Program::Kimi => Some(()),
+        _ => None,
     }
+    .is_some()
 }
 
 fn account_rotates(state: &TurnEndState, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {

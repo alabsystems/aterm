@@ -15,6 +15,7 @@ mod excluded;
 mod recovery;
 mod recovery_invalidation;
 mod request_policy;
+mod unmoved;
 const TRUST: Trust = Trust {
     network: [1; 16],
     authority: [2; 32],
@@ -62,6 +63,8 @@ struct Fake {
     read_gate: Mutex<Option<Gate>>,
     refusal_gate: Mutex<Option<Gate>>,
     fail_read: AtomicBool,
+    /// What [`Backend::unmoved`] answers: `None` (the default) reads the vault at every look.
+    unmoved: Mutex<Option<Option<HomeNet>>>,
     waiting: Sender<Instant>,
     reads: AtomicUsize,
     notifications: AtomicUsize,
@@ -98,6 +101,10 @@ impl Backend for Fake {
             };
             (local, place.network.to_owned())
         }))
+    }
+
+    fn unmoved(&self, _network: &str) -> Option<Option<HomeNet>> {
+        *self.unmoved.lock_or_recover()
     }
 
     fn now(&self) -> Instant {
@@ -142,6 +149,7 @@ impl Fixture {
             read_gate: Mutex::new(None),
             refusal_gate: Mutex::new(None),
             fail_read: AtomicBool::new(false),
+            unmoved: Mutex::new(None),
             waiting,
             reads: AtomicUsize::new(0),
             notifications: AtomicUsize::new(0),

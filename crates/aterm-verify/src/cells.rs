@@ -178,8 +178,9 @@ pub fn dependents_in_graph(
 
 /// Keep an explicit package selection narrow; close a change cone over this cell's complete
 /// build inputs, including host tools that are absent from its normal library graph. Only what the
-/// change touched ([`crate::scope::Scope::touches`]) is closed over: a crate of the cone that is
-/// there for its tests alone holds the change in no build of its dependents.
+/// change touched where its dependents read it ([`crate::scope::Scope::reaches_dependents`]) is
+/// closed over: a crate of the cone that is there for its tests alone, or whose change only its
+/// own tests compile, holds the change in no build of its dependents.
 #[must_use]
 pub fn wanted_in_cell(
     normal: &BTreeSet<String>,
@@ -195,7 +196,7 @@ pub fn wanted_in_cell(
         let seeds = inputs
             .values()
             .flat_map(|nodes| nodes.iter())
-            .filter(|id| scope.touches(&id.name))
+            .filter(|id| scope.reaches_dependents(&id.name))
             .map(|id| id.name.clone())
             .collect();
         wanted.extend(dependents_in_graph(inputs, &seeds));
@@ -751,7 +752,8 @@ pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
 
 /// Does this run owe the [`WIN32_ORACLES`]? It checks a Windows cell and it did not narrow them
 /// away: its selection holds a subject (the whole workspace holds them all) or touched a driver
-/// ([`WIN32_ORACLE_DRIVERS`]), or it names `cells` with no `-p`.
+/// where the oracles run it, outside its own tests ([`WIN32_ORACLE_DRIVERS`],
+/// [`crate::scope::Scope::reaches_dependents`]), or it names `cells` with no `-p`.
 #[must_use]
 pub fn owes_win32_oracles(cells: &[Cell], scope: &crate::scope::Scope, pulled: bool) -> bool {
     use crate::scope::Scope;
@@ -760,7 +762,9 @@ pub fn owes_win32_oracles(cells: &[Cell], scope: &crate::scope::Scope, pulled: b
             || WIN32_ORACLE_SUBJECTS
                 .iter()
                 .any(|name| scope.includes_crate(name))
-            || WIN32_ORACLE_DRIVERS.iter().any(|name| scope.touches(name)))
+            || WIN32_ORACLE_DRIVERS
+                .iter()
+                .any(|name| scope.reaches_dependents(name)))
 }
 
 /// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin
@@ -2490,6 +2494,15 @@ mod tests {
         );
         let touched_core = unseeded.with_seeds(vec!["aterm-core".to_string()]);
         assert!(wanted_in_cell(&normal, Some(&inputs), &touched_core).contains("aterm-gui"));
+        // A seed whose change only its own tests compile closes over nothing: the cell builds it
+        // and no dependent. CONTROL: above, the same seed unconfined brings aterm-gui.
+        let alone =
+            crate::scope::Scope::changed("origin/main", vec!["aterm-core".to_string()], true)
+                .with_alone(vec!["aterm-core".to_string()]);
+        assert_eq!(
+            wanted_in_cell(&normal, Some(&inputs), &alone),
+            names(&["aterm-core"])
+        );
     }
 
     #[test]
@@ -3725,6 +3738,7 @@ mod tests {
     fn the_patch_table_is_read_from_the_root_manifest() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-cells-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         std::fs::write(

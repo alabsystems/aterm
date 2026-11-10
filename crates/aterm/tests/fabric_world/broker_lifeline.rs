@@ -15,6 +15,7 @@ const LAUNCHER_TEST: &str = "broker_lifeline::a_broker_ends_itself_when_its_laun
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("atb-")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch dir")
 }

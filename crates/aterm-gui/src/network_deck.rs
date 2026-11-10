@@ -656,6 +656,12 @@ pub(crate) fn details_lab_with_caption(
     {
         return field::details(fleet, target);
     }
+    if fleet.is_none()
+        && let Target::Group(_) = target
+    {
+        // An observer's tally: its groups are of the observed peers.
+        return field::details(&field::observer(&snapshot.network), target);
+    }
     let mut rows = details_with_caption(snapshot, target, caption);
     if target == Target::Overview
         && let Some(line) = lab.overview()

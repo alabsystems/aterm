@@ -31,15 +31,20 @@ impl Drop for World {
 
 /// Creates an isolated scratch world for `tag` in the first temp base whose socket paths fit.
 fn world(tag: &str) -> World {
-    let name = format!("atll{tag}-{}", std::process::id());
+    let short = &tag[..tag.floor_char_boundary(6)];
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let root = base.join(&name);
-        if !launch_isolation::sock_fits(&root.join("run/aterm/aterm-4294967295.sock.token")) {
+        let Ok(dir) = aterm_tempfile::Builder::new()
+            .prefix(&format!("atll{short}-"))
+            .suffix(".noindex")
+            .tempdir_in(base)
+        else {
+            continue;
+        };
+        if !launch_isolation::sock_fits(&dir.path().join("run/aterm/aterm-4294967295.sock.token")) {
             continue;
         }
-        let _ = std::fs::remove_dir_all(&root);
-        launch_isolation::prepare(&root).expect("prepare the scratch world");
-        return World(root);
+        launch_isolation::prepare(dir.path()).expect("prepare the scratch world");
+        return World(dir.keep());
     }
     panic!("no temp base gives a short enough socket path");
 }

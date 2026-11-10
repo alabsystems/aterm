@@ -57,6 +57,7 @@ impl Chrome {
             .map_err(|e| unavailable(format!("could not create {}: {e}", scratch.display())))?;
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-page-")
+            .suffix(".noindex")
             .tempdir_in(scratch)
             .map_err(|e| {
                 unavailable(format!(
@@ -329,6 +330,7 @@ mod tests {
     fn a_module_answers_by_value_and_a_throw_is_a_finding() {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-page-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         std::fs::write(

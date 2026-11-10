@@ -2147,7 +2147,11 @@ impl Ports for Live {
         )
     }
 
-    fn owed_clone(&self) -> Result<aterm_machines::init::OwedClone, String> {
+    fn owed_clone(
+        &self,
+        readback: Option<&aterm_machines::init_github::RepositoryReadback>,
+        work: aterm_secrets::converge::RepositoryWork,
+    ) -> Result<aterm_machines::init::OwedClone, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
@@ -2180,9 +2184,17 @@ impl Ports for Live {
                             .is_current_now(&paths)
                             .map_err(|why| why.to_string())
                     },
+                    readback,
+                    work,
                 )
             }
-            None => aterm_machines::init::owed_clone(&sys, &state, &setup_holds()),
+            None => aterm_machines::init::owed_clone_in_pass(
+                &sys,
+                &state,
+                &setup_holds(),
+                readback,
+                work,
+            ),
         }
     }
 
@@ -2190,7 +2202,7 @@ impl Ports for Live {
         &self,
         work: aterm_secrets::converge::RepositoryWork,
         execution: Option<aterm_machines::sync::repository_refresh::Execution>,
-    ) -> Result<String, String> {
+    ) -> Result<aterm_machines::init::CloneOwedOutcome, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
@@ -2208,7 +2220,11 @@ impl Ports for Live {
                 &state,
                 withdrawal,
                 || Ok(!setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)),
-            );
+            )
+            .map(|said| aterm_machines::init::CloneOwedOutcome {
+                said,
+                readback: None,
+            });
         }
         let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
             return aterm_machines::init::clone_owed_in_pass_with_withdrawal_guard(

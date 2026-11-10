@@ -4,9 +4,9 @@
 //! Tests for the presence core without a host.
 
 use crate::presence::{
-    AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Host, Level, Link, MailFacts,
-    MailLast, NeedFact, NeedSeverity, Slot, StopCause, TurnFact, WallAnswer, chip_of_attention,
-    fmt_dur, sanitize_token, short_sid, state_line,
+    AgentPhase, AgentReading, ChipLevel, ComposerState, Facts, Hand, HoldFact, Host, Level, Link,
+    MailFacts, MailLast, NeedFact, NeedSeverity, Slot, StopCause, TurnFact, WallAnswer,
+    chip_of_attention, fmt_dur, sanitize_token, short_sid, state_line,
 };
 use crate::{Duration, Instant};
 
@@ -84,6 +84,7 @@ fn agent(phase: AgentPhase<TestHost>) -> Option<AgentReading<TestHost>> {
     Some(AgentReading {
         phase,
         context_pct: Some(41),
+        composer: ComposerState::Unknown,
     })
 }
 
@@ -595,6 +596,7 @@ fn an_agents_story_closes_when_the_agent_leaves() {
     let reading = |phase| AgentReading {
         phase,
         context_pct: None,
+        composer: ComposerState::Unknown,
     };
     let mut s = TSlot::new(now);
     s.absorb(TFacts::default(), now);
@@ -927,6 +929,7 @@ fn the_programs_own_report_is_named_only_where_the_reader_names_no_phase() {
         agent: phase.map(|phase| AgentReading {
             phase,
             context_pct: None,
+            composer: ComposerState::Unknown,
         }),
         shell: Some(("running", now)),
         program: Some(("codex working", now)),
@@ -975,6 +978,7 @@ fn a_programs_own_context_figure_follows_its_report() {
         agent: phase.map(|phase| AgentReading {
             phase,
             context_pct: None,
+            composer: ComposerState::Unknown,
         }),
         shell: Some(("running", now)),
         program: Some(("codex working", now)),

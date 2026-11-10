@@ -127,15 +127,14 @@ impl Program {
         }
     }
 
-    /// Whether the supervisor's screen policy acts on this program. Grok Build's and Kimi Code's
-    /// readers are display readers ([`crate::grok::phase`], [`crate::kimi::phase`]): their
-    /// supervision belongs to grok-alab and kimi-alab, so no policy here acts on them.
+    /// Whether the supervisor's screen policy acts on this program. Grok Build's reader is for
+    /// display only; Codex carries its own supervision and a generic screen has no agent policy.
     #[inline]
     #[must_use]
     pub const fn supervisable(self) -> bool {
         match self {
-            Program::Claude | Program::Agy | Program::Muse => true,
-            Program::Codex | Program::Grok | Program::Kimi | Program::Generic => false,
+            Program::Claude | Program::Agy | Program::Muse | Program::Kimi => true,
+            Program::Codex | Program::Grok | Program::Generic => false,
         }
     }
 
@@ -144,8 +143,8 @@ impl Program {
     #[must_use]
     pub const fn harness_table(self) -> bool {
         match self {
-            Program::Claude | Program::Codex | Program::Agy | Program::Muse => true,
-            Program::Grok | Program::Kimi | Program::Generic => false,
+            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Kimi => true,
+            Program::Grok | Program::Generic => false,
         }
     }
 
@@ -1185,8 +1184,7 @@ impl ScreenReader for GrokReader {
     }
 }
 
-/// Screen reader for Kimi Code ([`crate::kimi`]), for display: its phase, composer and walls,
-/// and the boxes that wait on the person ([`kimi::prompt`]), which nothing here answers.
+/// Screen reader for Kimi Code ([`crate::kimi`]): its phase, prompts, composer and walls.
 #[derive(Debug, Clone, Copy)]
 pub struct KimiReader;
 
@@ -1194,8 +1192,7 @@ impl ScreenReader for KimiReader {
     fn program(&self) -> Program {
         Program::Kimi
     }
-    /// Busy or idle by the rows over its composer ([`kimi::phase`]); a prompt for a box drawn
-    /// between two rules in the composer's place ([`kimi::prompt`]).
+    /// A card by [`kimi::prompt`], else busy or idle by the rows over its composer.
     fn phase(&self, rows: &[String]) -> Phase {
         kimi::phase(rows).0
     }
@@ -1205,8 +1202,47 @@ impl ScreenReader for KimiReader {
     fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
         kimi::prompt(rows)
     }
+    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
+        kimi::esc(prompt)
+    }
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         kimi::wall(rows)
+    }
+    fn said_tail(&self, rows: &[String]) -> Option<String> {
+        kimi::said_tail(rows)
+    }
+    fn said_whole(&self, rows: &[String]) -> bool {
+        kimi::said_whole(rows)
+    }
+    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
+        kimi::turn_said_before(rows)
+    }
+    fn turn_messages_before(&self, rows: &[String]) -> Option<Vec<String>> {
+        kimi::turn_messages_before(rows)
+    }
+    fn turn_ran_tools(&self, rows: &[String]) -> bool {
+        kimi::turn_ran_tools(rows)
+    }
+    fn reads_tool_rows(&self) -> bool {
+        true
+    }
+    fn turn_opens_above(&self, rows: &[String]) -> bool {
+        kimi::turn_opens_above(rows)
+    }
+    fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
+        kimi::turn_opened_by(rows)
+    }
+    fn interrupted(&self, rows: &[String]) -> bool {
+        kimi::interrupted(rows)
+    }
+    fn fresh(&self, rows: &[String]) -> bool {
+        kimi::fresh(rows)
+    }
+    fn opening(&self, rows: &[String]) -> bool {
+        kimi::opening(rows)
+    }
+    fn message_drawn(&self, rows: &[String]) -> bool {
+        kimi::message_drawn(rows)
     }
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         kimi::composer(rows)

@@ -644,7 +644,7 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         (Cli::Codex, true),
         (Cli::Claude, true),
         (Cli::Grok, false),
-        (Cli::Kimi, false),
+        (Cli::Kimi, true),
     ] {
         let world = World::new(&format!("early-{}", cli.id()));
         world.two(cli);
@@ -774,6 +774,91 @@ fn a_kimi_launch_takes_its_next_row_in_an_overlay_linked_to_the_default_home() {
     std::fs::remove_file(work.join("locks")).expect("unlink");
     std::fs::create_dir(work.join("locks")).expect("own locks");
     assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_typed_kimi_session_move_returns_the_selected_home_and_keeps_shared_sessions() {
+    let world = World::new("typed-kimi-move");
+    let _work = world.two(Cli::Kimi);
+    world.on_main(Cli::Kimi, &[]);
+    let renewed = world.root.join("logins/kimi/main+1");
+    std::fs::create_dir_all(renewed.join("credentials")).expect("renewed credentials");
+    std::fs::write(renewed.join("credentials/kimi-code.json"), "{}").expect("renewed login");
+    world
+        .seat()
+        .store(Cli::Kimi)
+        .transact_logins(NOW, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                renewed.to_str().expect("renewed home"),
+                None,
+                NOW,
+            ))
+        })
+        .expect("renewed binding");
+    let mut kimi_session = session(Cli::Kimi, Supervisor::Aterm, Mode::Early, &world.exe);
+    kimi_session.point = Point::TurnEnd;
+    let plan = session_login_plan(&world.seat(), &kimi_session, |note| note.record());
+    assert!(
+        matches!(plan.advice(), Advice::Move { to, .. } if to == "main"),
+        "{:?}",
+        plan.advice()
+    );
+    assert_eq!(
+        plan.commit(NOW).line,
+        Some(LoginEnv {
+            label: "main".to_string(),
+            var: "KIMI_CODE_HOME",
+            value: Some(renewed.display().to_string()),
+        })
+    );
+    for shared in ["sessions", "locks", "workspace-trust"] {
+        assert_eq!(
+            std::fs::read_link(renewed.join(shared)).expect(shared),
+            world.home.join(".kimi-code").join(shared)
+        );
+    }
+    assert!(
+        session_login_plan(
+            &world.seat(),
+            &session(Cli::Codex, Supervisor::Aterm, Mode::Wall, &world.exe),
+            |note| note.record()
+        )
+        .prepared_command()
+        .is_none(),
+        "another CLI keeps its existing shell transport"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_typed_kimi_quota_move_commits_the_work_overlay() {
+    let world = World::new("typed kimi quota move");
+    let work = world.two(Cli::Kimi);
+    world.on_main(Cli::Kimi, &[]);
+    let mut kimi_session = session(Cli::Kimi, Supervisor::Aterm, Mode::Early, &world.exe);
+    kimi_session.point = Point::Wall {
+        window: accounts::UNNAMED_WINDOW.to_string(),
+        at: Some(NOW),
+    };
+    let plan = session_login_plan(&world.seat(), &kimi_session, |note| note.record());
+    assert!(
+        matches!(plan.advice(), Advice::Move { to, .. } if to == "work"),
+        "{:?}",
+        plan.advice()
+    );
+    assert_eq!(
+        plan.commit(NOW).line,
+        Some(LoginEnv {
+            label: "work".to_string(),
+            var: "KIMI_CODE_HOME",
+            value: Some(work.display().to_string()),
+        })
+    );
 }
 
 /// A codex roster of `main` (the default login) and `work`, whose roster dir is what `accounts

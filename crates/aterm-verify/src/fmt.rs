@@ -596,6 +596,7 @@ mod tests {
     fn tree(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-fmt-")
+            .suffix(".noindex")
             .tempdir()
             .expect("scratch");
         for (rel, text) in files {

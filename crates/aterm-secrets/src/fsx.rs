@@ -1340,29 +1340,42 @@ pub(crate) fn looks_under(dir: &Path) -> std::collections::BTreeMap<std::path::P
         .collect()
 }
 
-/// Reads of each path this test process fails before opening it ([`fail_reads`]).
+/// Reads of each path this test process lets through and then fails before opening it
+/// ([`fail_reads_after`]).
 #[cfg(test)]
-static READ_FAILS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static READ_FAILS: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, (usize, usize)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Fail the next `times` reads of `path` as an I/O error would ([`Unread::Failed`]), opening
 /// nothing.
 #[cfg(test)]
 pub(crate) fn fail_reads(path: &Path, times: usize) {
+    fail_reads_after(path, 0, times);
+}
+
+/// [`fail_reads`] once `skip` more reads of `path` went through: a fault at one read among those
+/// a caller makes of the same file.
+#[cfg(test)]
+pub(crate) fn fail_reads_after(path: &Path, skip: usize, times: usize) {
     READ_FAILS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path.to_path_buf(), times);
+        .insert(path.to_path_buf(), (skip, times));
 }
 
-/// Whether this read of `path` is one [`fail_reads`] fails, counting it.
+/// Whether this read of `path` is one [`fail_reads_after`] fails, counting it.
 #[cfg(test)]
 fn take_read_failure(path: &Path) -> bool {
     let mut fails = READ_FAILS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match fails.get_mut(path) {
-        Some(left) if *left > 0 => {
+        Some((skip, _)) if *skip > 0 => {
+            *skip -= 1;
+            false
+        }
+        Some((_, left)) if *left > 0 => {
             *left -= 1;
             true
         }

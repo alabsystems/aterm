@@ -102,10 +102,12 @@ fn every_one_binary_route_to_the_retired_hook_is_a_silent_success() {
 
 #[test]
 fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
-    let dir =
-        std::env::temp_dir().join(format!("aterm-retired-hook-shapes-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-retired-hook-shapes-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = scratch.path();
     let alias = dir.join("aterm-link");
     std::os::unix::fs::symlink(crate::launch_isolation::aterm_executable(), &alias)
         .expect("argv0 alias");
@@ -144,7 +146,6 @@ fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
             "{word:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

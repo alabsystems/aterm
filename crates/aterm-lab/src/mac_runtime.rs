@@ -20,7 +20,7 @@ use crate::{Fail, Res, stop};
 mod count_compare;
 mod measure_costs;
 
-pub(crate) const COUNT_USAGE: &str = "  count-ranks --record DIR [--candidate DIR]\n                Recompute B14's exact count ranks from retained Q4 logs; no product is run.\n                Candidate is five later default-policy takes on the same bundle and guest shape.\n                Relative directories are resolved from this checkout's root.\n  settle-ranks --record DIR\n                Recompute the matched idle-RSS setup experiment, including every row's verdicts.\n";
+pub(crate) const COUNT_USAGE: &str = "  count-ranks --record DIR [--candidate DIR]\n                Recompute B14's exact count ranks from retained Q4 logs; no product is run.\n                Candidate is five later default-policy takes on the same bundle and guest shape.\n                Relative directories are resolved from this checkout's root.\n  settle-ranks --record DIR\n                Recompute the matched idle-RSS setup experiment, including every row's verdicts.\n  wait-ranks --record DIR\n                Recompute the matched Count-readiness experiments, including setup spans.\n";
 
 pub(crate) fn settle_ranks(args: &[String]) -> Res {
     let [flag, dir] = args else {
@@ -33,6 +33,17 @@ pub(crate) fn settle_ranks(args: &[String]) -> Res {
         "{}",
         count_compare::settle_records(&paths().repo.join(dir))?
     );
+    Ok(0)
+}
+
+pub(crate) fn wait_ranks(args: &[String]) -> Res {
+    let [flag, dir] = args else {
+        return Err(Fail::usage(COUNT_USAGE));
+    };
+    if flag != "--record" {
+        return Err(Fail::usage(COUNT_USAGE));
+    }
+    println!("{}", count_compare::wait_records(&paths().repo.join(dir))?);
     Ok(0)
 }
 
@@ -656,6 +667,7 @@ fn run_in(ask: &Ask) -> Res {
     }
     let scratch = aterm_tempfile::Builder::new()
         .prefix("mac-runtime-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("runtime scratch: {e}"))?;
     let share = scratch.path().join("share");

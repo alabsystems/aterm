@@ -1926,8 +1926,9 @@ pub(super) fn relaunch(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
-    if st.native_retired_unissued {
-        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    let tab = st.tab.clone();
+    if let Some(ended) = retry_retired_cold(opts, &r, st, c, session, &tab) {
+        return ended;
     }
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, session, k);
@@ -1935,6 +1936,31 @@ pub(super) fn relaunch(
         hand.give_back(c);
     }
     r
+}
+
+/// Revalidate an exact plain-cold no-grant hold before starting another attempt. Only a fresh
+/// positive answer ends the old lane; a stored flag or an unanswered request releases nothing.
+fn retry_retired_cold(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    c: &mut Client,
+    session: &str,
+    tab: &str,
+) -> Option<Report> {
+    if !st.native_retired_unissued {
+        return None;
+    }
+    if super::native_restart::cold_retirement_recheck(st)
+        && super::native_restart::replay_retained_at(opts, c, st, session, tab)
+            == Ok(super::native_restart::Recovery::Lapsed)
+    {
+        return Some(super::native_restart::end_lapsed(opts, r, st, session));
+    }
+    Some(said(
+        r.clone(),
+        super::native_restart::WAIT_RETIRED_UNISSUED,
+    ))
 }
 
 /// Whether `prepare` is the rollback [`super::native_restart::begin_completed_rollback`] mints
@@ -2822,8 +2848,9 @@ pub(super) fn await_new(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
-    if st.native_retired_unissued {
-        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    let tab = st.tab.clone();
+    if let Some(ended) = retry_retired_cold(opts, &r, st, c, session, &tab) {
+        return ended;
     }
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, session, k);
@@ -7692,7 +7719,7 @@ fn after_exit_as(
     let mut relaunched_before = false;
     if let Some(mut st) = prior.filter(St::in_flight) {
         if st.native_retired_unissued {
-            return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+            return carry_in_flight(opts, r, st, &session, &snap.tab);
         }
         r.to = format!("{}({})", st.to, st.source);
         if st.tab != snap.tab && !host_ended {
@@ -7975,7 +8002,9 @@ fn launch_after_exit(
     // is handed, so the rewrite below made first would turn a held record back into a relaunch
     // in flight, rebound to this exit's agent and line with a new exit clock, on every pass that
     // meets it. The replay goes to this exit's tab, where its host is now.
-    if !st.native_retired_unissued && (st.native.is_some() || !st.native_prepare.is_empty()) {
+    if (!st.native_retired_unissued || super::native_restart::cold_retirement_recheck(&st))
+        && (st.native.is_some() || !st.native_prepare.is_empty())
+    {
         match super::native_restart::replay_retained_at(opts, &mut c, &mut st, &session, &snap.tab)
         {
             Ok(super::native_restart::Recovery::Completed) => return said(r, "wait:relaunched"),
@@ -8299,7 +8328,7 @@ pub(super) fn exit_fallback(
 }
 
 fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
-    if st.native_retired_unissued {
+    if st.native_retired_unissued && !super::native_restart::cold_retirement_recheck(&st) {
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
     if opts.dry_run {
@@ -8308,6 +8337,9 @@ fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str)
     let Ok(mut c) = connect(opts, tab) else {
         return said(r, "wait:no-socket");
     };
+    if let Some(ended) = retry_retired_cold(opts, &r, &mut st, &mut c, session, tab) {
+        return ended;
+    }
     if let Some(r) = close_if_taken(opts, &r, &mut st, session, &mut c, tab) {
         return r;
     }
@@ -8517,6 +8549,9 @@ fn told_by_its_row(opts: &Opts, r: Report, session: &str) -> Report {
 
 fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
     if st.native_retired_unissued {
+        if super::native_restart::cold_retirement_recheck(&st) {
+            return carry_in_flight(opts, r, st, session, tab);
+        }
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
     let refused = |r: Report, why: &str| {

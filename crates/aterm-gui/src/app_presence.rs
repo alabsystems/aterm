@@ -1231,26 +1231,27 @@ impl App {
         // THE WORKERS LIST ON SCREEN IS A LOOK AT THE ROWS IT SHOWS: each concluded row says how
         // its task ended, a landing too, as its tab would. A program's own turn end is no row's.
         let list = ws.tab_set.home() == Some(tab.id);
-        let shown = if list {
-            ws.tab_set
-                .parked()
-                .iter()
-                .flat_map(|parked| parked.root.leaves())
-                .collect()
-        } else if tab.zoomed {
-            vec![tab.focus]
-        } else {
-            tab.root.leaves()
-        };
-        for view in shown {
-            let Some(session) = self
+        let mut sessions = Vec::new();
+        let mut push_view = |view: crate::tab_model::ViewId| {
+            if let Some(session) = self
                 .view_store
                 .get(view)
                 .copied()
                 .and_then(crate::tab_model::View::terminal_session)
-            else {
-                continue;
-            };
+            {
+                sessions.push(session);
+            }
+        };
+        if list {
+            for parked in ws.tab_set.parked() {
+                parked.root.visit(&mut |&view| push_view(view));
+            }
+        } else if tab.zoomed {
+            push_view(tab.focus);
+        } else {
+            tab.root.visit(&mut |&view| push_view(view));
+        }
+        for session in sessions {
             let ended = self
                 .task_done
                 .get(&session)
@@ -3039,14 +3040,21 @@ mod tests {
                 aterm_phase::WallKind::Overloaded,
                 aterm_phase::WallKind::Auth,
             ] {
-                for agent in [
-                    aterm_phase::Program::Grok,
-                    aterm_phase::Program::Kimi,
-                    aterm_phase::Program::Codex,
+                for (agent, expected) in [
+                    (aterm_phase::Program::Grok, presence::WallAnswer::Nobody),
+                    (
+                        aterm_phase::Program::Kimi,
+                        if kind == aterm_phase::WallKind::Auth {
+                            presence::WallAnswer::Nobody
+                        } else {
+                            presence::WallAnswer::Harness
+                        },
+                    ),
+                    (aterm_phase::Program::Codex, presence::WallAnswer::Nobody),
                 ] {
                     assert_eq!(
                         host.wall_answer(agent, kind, true),
-                        presence::WallAnswer::Nobody,
+                        expected,
                         "{agent:?} {kind:?}"
                     );
                 }

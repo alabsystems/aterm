@@ -342,12 +342,19 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
 struct Lane {
     paths: aterm_secrets::client::Paths,
     clock: fn() -> std::time::Instant,
+    /// This Mac as a member: [`Local::of`], a test's own.
+    of: Of,
     /// When the last [`Lane::look`] finished: the next is [`LOCAL_EVERY`] after it.
     looked: Option<std::time::Instant>,
     /// The desk's inputs ([`aterm_secrets::client::desk_inputs`]) as they stood across the last
-    /// read that settled: a member read, or a Mac that left, with its removals read, while no file
-    /// moved, and no home read with the vault ([`HomeFrom::Vault`]). While they stand so, a look
-    /// reads nothing of the vault again.
+    /// read that settled: a whole member read ([`Local::whole`]), or a Mac that left, with its
+    /// removals read, while no file moved (taken before the read and equal after it), and no home
+    /// read with the vault ([`HomeFrom::Vault`]). While they stand so, a look reads nothing of the
+    /// vault again. Taken before the read alone they would not do: a write moves a file's stamp
+    /// for good (a new inode, a change time nothing sets back), but `state.toml` is stamped by a
+    /// digest of what it holds ([`aterm_secrets::client::state_standing`]), which can go from A
+    /// to B during the read and back to A after it, and a member read under B would then stand
+    /// under A's stamps until a file moved, which a vault round does not.
     settled: Option<aterm_secrets::client::DeskInputs>,
     /// How many looks read the vault: the test's count.
     #[cfg(test)]
@@ -359,6 +366,7 @@ impl Lane {
         Self {
             paths,
             clock,
+            of: Local::of,
             looked: None,
             settled: None,
             #[cfg(test)]
@@ -386,7 +394,7 @@ impl Lane {
             {
                 self.reads += 1;
             }
-            let read = follow_local(slot, &self.paths);
+            let read = follow_local(slot, &self.paths, self.of);
             let undo = follow_undo(&self.paths);
             let with_vault = home_from(slot) == Some(HomeFrom::Vault);
             self.settled = inputs.filter(|inputs| {
@@ -413,21 +421,26 @@ impl Lane {
     }
 }
 
-/// Read this Mac's membership under `paths` into `slot` ([`Local::of`]: its membership log seat,
-/// whether or not Commons control is its own): a member's desk made, or refreshed keeping what it
-/// heard; none once this Mac left the vault ([`left`]), so its rows end, an `ask` is refused and
-/// Allow finds no desk. A vault mid-apply and unreadable state leave `slot` as it was. Whether the
-/// read settled: a member read, or a Mac that left.
-fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths) -> bool {
-    match Local::of(paths) {
+/// How the desk lane reads this Mac as a member: [`Local::of`], a test's own.
+type Of = fn(&aterm_secrets::client::Paths) -> aterm_secrets::Result<Option<Local>>;
+
+/// Read this Mac's membership under `paths` into `slot` (`of`, [`Local::of`]: its membership log
+/// seat, whether or not Commons control is its own): a member's desk made, or refreshed keeping
+/// what it heard; none once this Mac left the vault ([`left`]), so its rows end, an `ask` is
+/// refused and Allow finds no desk. A vault mid-apply and unreadable state leave `slot` as it
+/// was. Whether the read settled: a member every read of which answered ([`Local::whole`]; one a
+/// fault shaped is shown, and read again at the next look), or a Mac that left.
+fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths, of: Of) -> bool {
+    match of(paths) {
         Ok(Some(local)) => {
+            let whole = local.whole();
             let mut slot = slot.lock_or_recover();
             if let Some(desk) = slot.as_ref() {
                 desk.lock_or_recover().refresh(local);
             } else {
                 *slot = Some(Arc::new(Mutex::new(Desk::new(local))));
             }
-            true
+            whole
         }
         Ok(None) if left(paths) => {
             *slot.lock_or_recover() = None;

@@ -3,16 +3,14 @@
 
 use super::super::super::{
     account_work, codex_assignment::prepare, codex_session_slot::metadata_fixture,
+    codex_source_registry::FixtureConnection,
 };
 use super::*;
-
-static CONNECTION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX - 1000);
 
 struct Fixture {
     registry: Registry,
     peer: Peer,
-    connection: Connection,
+    connection: FixtureConnection,
     member: String,
     operation: String,
     registration: String,
@@ -28,7 +26,10 @@ impl Fixture {
         // claimed. Process observation, gates, connections and scopes are real.
         let home = aterm_tempfile::tempdir().unwrap();
         let process = Process::observe(std::process::id()).unwrap();
-        let id = CONNECTION.fetch_sub(1, Ordering::SeqCst);
+        let lifetime = account_work::Lifetime::default();
+        let registry = Registry::for_app(&lifetime);
+        let connection = registry.fixture_connection();
+        let id = connection.id;
         let peer = Peer {
             caller: slot::Caller {
                 sid: format!("s-use-fixture-{id}"),
@@ -38,9 +39,6 @@ impl Fixture {
             process,
             launch: None,
         };
-        let lifetime = account_work::Lifetime::default();
-        let registry = Registry::for_app(&lifetime);
-        let connection = registry.connection(id).unwrap();
         let operation = "a".repeat(32);
         let allocation = registry
             .open_member(&peer, &connection, &operation)
@@ -70,6 +68,7 @@ impl Fixture {
                 source,
                 readiness,
                 unknown: false,
+                work_rebound: false,
             },
         );
         drop(state);
@@ -141,7 +140,16 @@ impl Fixture {
                 .collect(),
             quiescent: BTreeMap::new(),
             phase: seal::Phase::Draining,
-            _scope: self.scope.as_ref().unwrap().clone(),
+            target_resource: None,
+            target_driver: Arc::new(false.into()),
+            installed: None,
+            target_issued: BTreeMap::new(),
+            target_constructors: BTreeMap::new(),
+            target_retiring: Vec::new(),
+            resource_phase: target::resources::Phase::Initializing,
+            _scope: Some(self.scope.as_ref().unwrap().clone()),
+            retirement: None,
+            cancelled: None,
         }));
         state
             .reservations
@@ -160,6 +168,75 @@ fn auth() -> AuthState {
         source: 3,
         login: 4,
     }
+}
+
+#[test]
+fn terminal_reservation_keeps_metadata_without_pinning_its_own_custody() {
+    // Synthetic source/peer; actual App captures, kernel locks and retirement.
+    // No cancellation or Applied producer authority is claimed by this fixture.
+    let mut fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    let seal = seal::kernel_fixture(&reservation);
+    let capture = reservation.cell.lock().unwrap().scope().unwrap().clone();
+    drop(fixture.scope.take());
+    let pause = fixture.lifetime.pause().unwrap();
+    let custody = {
+        let _state = fixture.registry.state.lock().unwrap();
+        let mut cell = reservation.cell.lock().unwrap();
+        let prior = std::mem::replace(&mut cell.phase, seal::Phase::Terminal);
+        cell.phase = seal::Phase::Cancelling(Box::new(prior));
+        let custody = cell.take_custody();
+        assert!(cell.scope().is_err());
+        assert!(!cell.custody_retired());
+        custody
+    };
+    // Only outside State/Cell may the real resource and original Scope retire.
+    drop(custody);
+    assert!(!seal.current());
+    assert!(
+        crate::harness::codex_source_gate::PublicationLock::try_for_home(fixture._home.path())
+            .unwrap()
+            .is_some()
+    );
+    assert!(!reservation.cell.lock().unwrap().custody_retired());
+    let pause = pause
+        .try_wait()
+        .expect_err("captured native Scope still blocks drain");
+    drop(capture);
+    assert!(reservation.cell.lock().unwrap().custody_retired());
+    pause.try_wait().unwrap().resume().unwrap();
+    // Both the external handle and registry still retain this metadata Cell.
+    assert!(
+        fixture
+            .registry
+            .state
+            .lock()
+            .unwrap()
+            .reservations
+            .contains_key(&actor_key(&fixture.peer.caller))
+    );
+}
+
+#[test]
+fn captured_native_source_kernel_keeps_original_operation_count_until_actual_drop() {
+    // Synthetic source admission, actual kernel/Scope ownership. The source
+    // weak handle never substitutes for an actual captured native resource.
+    let mut fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    let sealed = seal::kernel_fixture(&reservation);
+    let captured = sealed.retained_kernel().unwrap();
+    drop(fixture.scope.take());
+    let pause = fixture.lifetime.pause().unwrap();
+    let custody = reservation.cell.lock().unwrap().take_custody();
+    drop(custody);
+    assert!(!reservation.cell.lock().unwrap().custody_retired());
+    let pause = pause
+        .try_wait()
+        .expect_err("actual kernel capture still owns original Scope");
+    assert!(!sealed.current());
+    drop(captured);
+    assert!(reservation.cell.lock().unwrap().custody_retired());
+    pause.try_wait().unwrap().resume().unwrap();
 }
 
 #[test]
@@ -536,10 +613,7 @@ fn accepted_capability_survives_refresh_for_cleanup_and_eof_retains_scope() {
     let pause = pause
         .try_wait()
         .expect_err("EOF and handle drop cannot retire the active use");
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     fixture
         .registry
         .open_member(&fixture.peer, &connection, &fixture.operation)
@@ -642,12 +716,9 @@ fn policy_unavailable_and_no_reader_members_cannot_mint_managed_use() {
 
 #[test]
 fn dedicated_cleanup_does_not_reopen_ready_or_fabricate_unknown_retired_use_receipts() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let capability = fixture.begin(1);
-    let cleanup = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let cleanup = fixture.registry.fixture_connection();
     // Original work connection is still live; cleanup must not steal/rebind it.
     fixture
         .registry
@@ -694,7 +765,7 @@ fn dedicated_cleanup_does_not_reopen_ready_or_fabricate_unknown_retired_use_rece
                 fixture.request(1).nonce,
                 &capability
             )
-            .is_err()
+            .is_ok()
     );
     assert!(
         fixture
@@ -707,6 +778,87 @@ fn dedicated_cleanup_does_not_reopen_ready_or_fabricate_unknown_retired_use_rece
             )
             .is_err()
     );
+    fixture.registry.reap_gone();
+    assert!(
+        fixture
+            .registry
+            .end_use(
+                &fixture.peer,
+                &cleanup,
+                &fixture.member,
+                fixture.request(1).nonce,
+                &capability
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        fixture
+            .registry
+            .begin_use(
+                peer(&fixture.peer),
+                &cleanup,
+                fixture.request(1),
+                fixture.scope.as_ref().unwrap()
+            )
+            .unwrap(),
+        UseProgress::Closed
+    ));
+    assert!(
+        fixture
+            .registry
+            .close_unaccepted_use(&fixture.peer, &cleanup, fixture.request(3))
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .end_use(
+                &fixture.peer,
+                &cleanup,
+                &fixture.member,
+                fixture.request(1).nonce,
+                &"0".repeat(64)
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture.registry.state.lock().unwrap().uses
+            [&member_key(&fixture.peer.caller, &fixture.member).unwrap()]
+            .highwater,
+        2
+    );
+    drop(fixture.scope.take());
+    let drained = fixture.lifetime.pause().unwrap().try_wait().unwrap();
+    assert!(
+        matches!(
+            fixture
+                .registry
+                .prepare_use_cleanup(
+                    &fixture.peer.caller,
+                    &cleanup,
+                    UseCleanupRequest::End {
+                        member: &fixture.member,
+                        nonce: fixture.request(1).nonce,
+                        capability: &capability,
+                    }
+                )
+                .unwrap(),
+            CleanupAdmission::Closed
+        ),
+        "known exact replay is correlation-only after drain sealing"
+    );
+    assert!(
+        fixture
+            .registry
+            .prepare_use_cleanup(
+                &fixture.peer.caller,
+                &cleanup,
+                UseCleanupRequest::Close(fixture.request(3))
+            )
+            .is_err(),
+        "a retired highwater cannot mint a late closed receipt"
+    );
+    drained.resume().unwrap();
 }
 
 #[test]
@@ -1019,6 +1171,521 @@ fn reserved_census_allows_parent_drain_and_derived_join_then_requires_end_before
 }
 
 #[test]
+fn target_open_strings_cannot_allocate_without_actual_installed_custody() {
+    let fixture = Fixture::new();
+    let _reservation = fixture.reservation();
+    let before = {
+        let state = fixture.registry.state.lock().unwrap();
+        let actor = state.actors.get(&actor_key(&fixture.peer.caller)).unwrap();
+        (
+            actor.highwater,
+            actor.issued.len(),
+            state.target_opens.len(),
+        )
+    };
+    assert!(
+        fixture
+            .registry
+            .prepare_target_open(
+                &fixture.peer,
+                &fixture.connection,
+                &"a".repeat(32),
+                &"c".repeat(64),
+                &"e".repeat(32)
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .prepare_target_preload_context(
+                &fixture.peer,
+                &fixture.connection,
+                &"a".repeat(32),
+                &"c".repeat(64),
+                &fixture.member,
+                &"e".repeat(32),
+                PreloadSequence::parse("0123456789abcdef0000000000000001").unwrap()
+            )
+            .is_err()
+    );
+    let state = fixture.registry.state.lock().unwrap();
+    let actor = state.actors.get(&actor_key(&fixture.peer.caller)).unwrap();
+    assert_eq!(
+        (
+            actor.highwater,
+            actor.issued.len(),
+            state.target_opens.len()
+        ),
+        before
+    );
+}
+
+#[test]
+fn derived_child_owns_new_connection_without_transferring_parent_use_authority() {
+    // Synthetic source admission only; actual peer process, source gate,
+    // counted uses and independent persistent connection lifetimes.
+    let fixture = Fixture::new();
+    let _reservation = fixture.reservation();
+    let capability = fixture.begin(1);
+    let nonce = fixture.request(1).nonce;
+    let context = fixture
+        .registry
+        .use_context(
+            &fixture.peer,
+            &fixture.connection,
+            &fixture.member,
+            nonce,
+            &capability,
+        )
+        .unwrap();
+    let child_connection = fixture.registry.fixture_connection();
+    let operation = "d".repeat(32);
+    let child = fixture
+        .registry
+        .open_registered_derived(
+            &fixture.peer.caller,
+            &child_connection,
+            &operation,
+            UseIdentity {
+                member: &fixture.member,
+                nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    {
+        let state = fixture.registry.state.lock().unwrap();
+        let actor = state.actors.get(&actor_key(&fixture.peer.caller)).unwrap();
+        assert!(
+            actor
+                .issued
+                .get(&child.member)
+                .unwrap()
+                .connection
+                .same(&child_connection)
+        );
+        assert!(
+            actor
+                .issued
+                .get(&fixture.member)
+                .unwrap()
+                .connection
+                .same(&fixture.connection)
+        );
+    }
+    assert!(
+        fixture
+            .registry
+            .open_registered_derived(
+                &fixture.peer.caller,
+                &child_connection,
+                &"f".repeat(32),
+                UseIdentity {
+                    member: &fixture.member,
+                    nonce,
+                    capability: &"0".repeat(64)
+                }
+            )
+            .is_err()
+    );
+    let mut foreign = fixture.peer.caller.clone();
+    foreign.sid.push_str("-foreign");
+    let mut reused = fixture.peer.caller.clone();
+    reused.birth += 1;
+    for caller in [&foreign, &reused] {
+        assert!(
+            fixture
+                .registry
+                .open_registered_derived(
+                    caller,
+                    &child_connection,
+                    &"e".repeat(32),
+                    UseIdentity {
+                        member: &fixture.member,
+                        nonce,
+                        capability: &capability
+                    },
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        fixture
+            .registry
+            .registered_source_use(
+                &fixture.peer.caller,
+                &fixture.connection,
+                &fixture.member,
+                nonce,
+                &capability,
+            )
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .registry
+            .registered_source_use(
+                &fixture.peer.caller,
+                &child_connection,
+                &fixture.member,
+                nonce,
+                &capability,
+            )
+            .is_err(),
+        "derived socket cannot borrow its parent's refresh/use authority"
+    );
+    fixture
+        .registry
+        .end_use(
+            &fixture.peer,
+            &fixture.connection,
+            &fixture.member,
+            nonce,
+            &capability,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .registry
+            .open_member_derived(&fixture.peer, &child_connection, &operation, &context)
+            .unwrap()
+            .member,
+        child.member
+    );
+    assert!(
+        fixture
+            .registry
+            .open_member_derived(&fixture.peer, &child_connection, &"e".repeat(32), &context)
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .open_registered_derived(
+                &fixture.peer.caller,
+                &child_connection,
+                &operation,
+                UseIdentity {
+                    member: &fixture.member,
+                    nonce,
+                    capability: &capability
+                },
+            )
+            .unwrap()
+            .member,
+        child.member,
+        "exact allocation replay is not a fresh use"
+    );
+    assert!(
+        fixture
+            .registry
+            .open_registered_derived(
+                &fixture.peer.caller,
+                &child_connection,
+                &"e".repeat(32),
+                UseIdentity {
+                    member: &fixture.member,
+                    nonce,
+                    capability: &capability
+                },
+            )
+            .is_err(),
+        "closed parent cannot grant another constructor"
+    );
+    assert!(
+        fixture
+            .registry
+            .registered_source_use(
+                &fixture.peer.caller,
+                &fixture.connection,
+                &fixture.member,
+                nonce,
+                &capability,
+            )
+            .is_err(),
+        "closed parent cannot refresh"
+    );
+    assert!(child_connection.is_live());
+}
+
+#[test]
+fn owned_preload_retirement_retains_native_count_and_gate_until_actual_worker_drop() {
+    // Explicit synthetic source injection; actual process/connection, kernel
+    // gate, Pending worker and App release/retirement machinery are exercised.
+    let mut fixture = Fixture::new();
+    let operation = "d".repeat(32);
+    let attempt = preload_sequence::Attempt {
+        sequence: PreloadSequence::parse("0123456789abcdef0000000000000001").unwrap(),
+        operation: operation.clone(),
+        origin: preload_sequence::Origin::Ordinary,
+    };
+    let worker = preload_custody::enter_sequenced(
+        &fixture.registry,
+        &fixture.peer,
+        &fixture.member,
+        &operation,
+        &fixture.connection,
+        &attempt,
+    )
+    .unwrap();
+    let key = member_key(&fixture.peer.caller, &fixture.member).unwrap();
+    let pending_readiness = SourceReadiness::preload(
+        SourceWorkLease::for_home(fixture._home.path()).unwrap(),
+        None,
+    )
+    .unwrap();
+    {
+        let mut state = fixture.registry.state.lock().unwrap();
+        let member = state.members.get_mut(&key).unwrap();
+        member.operation = operation.clone();
+        member.readiness = pending_readiness;
+        let generation = member.source.credential_generation();
+        let digest = member.source.digest().to_owned();
+        state
+            .preload_sequences
+            .get_mut(&key)
+            .unwrap()
+            .loaded(&attempt, &fixture.registration, generation, &digest)
+            .unwrap();
+    }
+    let cleanup = fixture.registry.fixture_connection();
+    let retirement = || target::MemberRetirementRequest {
+        operation: "cccccccccccccccccccccccccccccccc",
+        member: &fixture.member,
+        preload_operation: &operation,
+        preload_sequence: attempt.sequence,
+        registration: Some(&fixture.registration),
+    };
+    let target::MemberRetirementPreparation::Pending(command) = fixture
+        .registry
+        .prepare_member_retirement(&fixture.peer.caller, &cleanup, retirement())
+        .unwrap()
+    else {
+        panic!("a live worker cannot already be Closed");
+    };
+    assert!(!fixture.registry.retire_member_owned(command).unwrap());
+    assert!(worker.scope().cancelled());
+    assert!(
+        super::super::super::codex_source_gate::PublicationLock::for_home(fixture._home.path())
+            .is_err()
+    );
+    drop(fixture.scope.take());
+    let pause = fixture.lifetime.pause().unwrap();
+    // Native retains the cleanup turn even after the observer command ended.
+    let pause = match pause.try_wait() {
+        Err(pause) => pause,
+        Ok(_) => panic!("native cleanup remains counted"),
+    };
+    assert!(
+        preload_custody::enter_sequenced(
+            &fixture.registry,
+            &fixture.peer,
+            &fixture.member,
+            &operation,
+            &fixture.connection,
+            &attempt
+        )
+        .is_err()
+    );
+    drop(worker);
+    let target::MemberRetirementPreparation::Pending(command) = fixture
+        .registry
+        .prepare_member_retirement(&fixture.peer.caller, &cleanup, retirement())
+        .unwrap()
+    else {
+        panic!("the retained native fence still requires final settlement");
+    };
+    assert!(fixture.registry.retire_member_owned(command).unwrap());
+    assert!(
+        super::super::super::codex_source_gate::PublicationLock::for_home(fixture._home.path())
+            .is_ok()
+    );
+    let _drained = match pause.try_wait() {
+        Ok(drained) => drained,
+        Err(_) => panic!("actual original captures and cleanup retired"),
+    };
+    assert!(matches!(
+        fixture
+            .registry
+            .prepare_member_retirement(&fixture.peer.caller, &cleanup, retirement()),
+        Ok(target::MemberRetirementPreparation::Closed)
+    ));
+    let changed = target::MemberRetirementRequest {
+        operation: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        ..retirement()
+    };
+    assert!(
+        fixture
+            .registry
+            .prepare_member_retirement(&fixture.peer.caller, &cleanup, changed)
+            .is_err()
+    );
+}
+
+#[test]
+fn unrelated_member_cannot_enter_managed_preload_or_leave_a_counted_attempt() {
+    // Synthetic peer/source metadata only; call actual NoNativeReader
+    // completion and PRELOAD admission. No API credential or owner is minted.
+    let fixture = Fixture::new();
+    let open = "e".repeat(32);
+    let member = fixture
+        .registry
+        .open_member(&fixture.peer, &fixture.connection, &open)
+        .unwrap()
+        .member;
+    fixture
+        .registry
+        .complete_unrelated(
+            Peer {
+                caller: fixture.peer.caller.clone(),
+                process: fixture.peer.process.clone(),
+                launch: None,
+            },
+            &fixture.connection,
+            &member,
+            &open,
+            NoNativeReaderKind::ApiKey,
+        )
+        .unwrap();
+    let env = Env {
+        state: fixture._home.path().join("state"),
+        aterm_state: None,
+        cwd: fixture._home.path().into(),
+        home: Some(fixture._home.path().into()),
+        claude_dir: None,
+        claude_config_unusable: None,
+        claude_profile: None,
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        codex_login: None,
+        agy_conversation: None,
+        now: 0,
+        sid: fixture.peer.caller.sid.clone(),
+        sock: None,
+        config: None,
+        claude_tmp: None,
+        claude_running: None,
+        tz_s: 0,
+    };
+    assert!(matches!(
+        fixture.registry.preload_managed(
+            &env,
+            Peer {
+                caller: fixture.peer.caller.clone(),
+                process: fixture.peer.process.clone(),
+                launch: None,
+            },
+            &member,
+            &"f".repeat(32),
+            &fixture.connection,
+            PreloadSequence::parse("0123456789abcdef0000000000000001").unwrap()
+        ),
+        Err(Error::Denied)
+    ));
+    let key = member_key(&fixture.peer.caller, &member).unwrap();
+    let state = fixture.registry.state.lock().unwrap();
+    assert!(!state.preloads.contains_key(&key));
+    assert!(!state.preload_sequences.contains_key(&key));
+}
+
+#[test]
+fn owned_member_retirement_closes_original_target_open_without_fabricating_open_cleanup() {
+    // Metadata target allocation injection only; real independent constructor
+    // Scope/weak retirement, native release turn and caller identity are used.
+    let fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    let constructor = fixture.lifetime.enter().unwrap();
+    target::open_cleanup_fixture(
+        &fixture.registry,
+        &reservation.cell,
+        &fixture.peer,
+        &fixture.connection,
+        (&fixture.member, &fixture.operation),
+        &constructor,
+        true,
+    );
+    let assignment = reservation
+        .cell
+        .lock()
+        .unwrap()
+        .target
+        .operation()
+        .to_owned();
+    let attempt = preload_sequence::Attempt {
+        sequence: PreloadSequence::parse("0123456789abcdef0000000000000001").unwrap(),
+        operation: "d".repeat(32),
+        origin: preload_sequence::Origin::Target {
+            assignment,
+            context: "c".repeat(64),
+        },
+    };
+    let key = member_key(&fixture.peer.caller, &fixture.member).unwrap();
+    {
+        let mut state = fixture.registry.state.lock().unwrap();
+        preload_sequence::accept(
+            &mut state,
+            &key,
+            &fixture.peer.process,
+            &attempt,
+            &constructor,
+        )
+        .unwrap();
+        let member = state.members.get(&key).unwrap();
+        let generation = member.source.credential_generation();
+        let digest = member.source.digest().to_owned();
+        state
+            .preload_sequences
+            .get_mut(&key)
+            .unwrap()
+            .loaded(&attempt, &fixture.registration, generation, &digest)
+            .unwrap();
+    }
+    let request = || target::MemberRetirementRequest {
+        operation: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        member: &fixture.member,
+        preload_operation: &attempt.operation,
+        preload_sequence: attempt.sequence,
+        registration: Some(&fixture.registration),
+    };
+    let target::MemberRetirementPreparation::Pending(command) = fixture
+        .registry
+        .prepare_member_retirement(&fixture.peer.caller, &fixture.connection, request())
+        .unwrap()
+    else {
+        panic!("constructor capture is still held");
+    };
+    assert!(!fixture.registry.retire_member_owned(command).unwrap());
+    assert!(constructor.cancelled());
+    drop(constructor);
+    let target::MemberRetirementPreparation::Pending(command) = fixture
+        .registry
+        .prepare_member_retirement(&fixture.peer.caller, &fixture.connection, request())
+        .unwrap()
+    else {
+        panic!("actual native retirement still needs settlement");
+    };
+    assert!(fixture.registry.retire_member_owned(command).unwrap());
+    assert_eq!(
+        target::member_retirement_fixture_state(
+            &fixture.registry,
+            &fixture.peer.caller,
+            &fixture.operation
+        ),
+        (true, true, true)
+    );
+    let state = fixture.registry.state.lock().unwrap();
+    assert!(
+        !state.actors[&actor_key(&fixture.peer.caller)]
+            .issued
+            .contains_key(&fixture.member)
+    );
+}
+
+#[test]
 fn derived_open_replay_keeps_exact_parent_and_cannot_allocate_after_parent_ends() {
     let fixture = Fixture::new();
     let _reservation = fixture.reservation();
@@ -1123,10 +1790,7 @@ fn registered_work_binds_actual_scope_connection_registration_and_instance() {
             )
             .is_err()
     );
-    let other_connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let other_connection = fixture.registry.fixture_connection();
     assert!(
         fixture
             .registry
@@ -1265,10 +1929,7 @@ fn release_only_cleanup_survives_work_eof_ready_loss_and_scope_cancellation() {
     let mut fixture = Fixture::new();
     let capability = fixture.begin(1);
     fixture.registry.connection_closed(fixture.connection.id);
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let cleanup = fixture
         .registry
         .registered_member_cleanup(
@@ -1348,10 +2009,7 @@ fn release_only_identity_rejects_wrong_app_registry_caller_and_cleanup_eof() {
             )
             .is_err()
     );
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let cleanup = fixture
         .registry
         .registered_member_cleanup(
@@ -1395,10 +2053,7 @@ fn pending_begin_counts_before_waiting_and_close_fences_resume() {
         fixture.registry.reserve_registered_use(&work).unwrap(),
         BeginAdmission::Pending
     ));
-    let cleanup_connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let cleanup_connection = fixture.registry.fixture_connection();
     let cleanup = fixture
         .registry
         .registered_member_cleanup(
@@ -1570,10 +2225,7 @@ fn paused_cleanup_resolves_pending_custody_without_ordinary_enter() {
     let pause = pause
         .try_wait()
         .expect_err("pending original operation precedes sealing");
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let CleanupAdmission::Mutable(cleanup) = fixture
         .registry
         .prepare_use_cleanup(
@@ -1628,10 +2280,7 @@ fn release_turn_fences_before_seal_but_unrecorded_late_close_stays_uncertain() {
     let mut fixture = Fixture::new();
     let pause = fixture.lifetime.pause().unwrap();
     drop(fixture.scope.take());
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let CleanupAdmission::Mutable(cleanup) = fixture
         .registry
         .prepare_use_cleanup(
@@ -1708,10 +2357,7 @@ fn release_only_end_resolves_active_scope_after_pause_and_replays_without_entry(
     fixture.registry.connection_closed(fixture.connection.id);
     let pause = fixture.lifetime.pause().unwrap();
     drop(fixture.scope.take());
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let request = || UseCleanupRequest::End {
         member: &fixture.member,
         nonce: fixture.request(1).nonce,
@@ -1777,10 +2423,7 @@ fn actual_use_command_adapter_accounts_queue_before_waiting_and_cleanup_after_pa
     let pause = pause.try_wait().expect_err(
         "actual typed adapter has already retained Pending before a transport Waiting can exist",
     );
-    let connection = fixture
-        .registry
-        .connection(CONNECTION.fetch_sub(1, Ordering::SeqCst))
-        .unwrap();
+    let connection = fixture.registry.fixture_connection();
     let close = UseAction::Close {
         registration: fixture.registration.clone(),
     };
@@ -2034,6 +2677,7 @@ fn same_grant_in_distinct_physical_book_and_slot_claims_still_requires_both_memb
                 source: b.clone(),
                 readiness,
                 unknown: false,
+                work_rebound: false,
             },
         );
     }
@@ -2427,6 +3071,16 @@ fn kernel_departure_reaps_member_but_retains_native_ending_capture() {
         &fixture.connection,
     )
     .unwrap();
+    let resource_source = fixture.registry.state.lock().unwrap().members[&key]
+        .source
+        .clone();
+    let resource_capture = target::resources::pending_capture_fixture(
+        &fixture.registry,
+        &fixture.peer.caller,
+        &fixture.peer.process,
+        &fixture.connection,
+        resource_source,
+    );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     fixture.registry.reap_gone();
@@ -2458,8 +3112,1825 @@ fn kernel_departure_reaps_member_but_retains_native_ending_capture() {
     }
     drop(constructor);
     fixture.registry.reap_gone();
+    {
+        let state = fixture.registry.state.lock().unwrap();
+        assert!(!state.preloads.contains_key(&key));
+        assert!(
+            state.actors.contains_key(&actor_key(&fixture.peer.caller)),
+            "real native resource capture still owns its Scope"
+        );
+        assert!(target::resources::custody_pending(
+            &state,
+            &fixture.peer.caller
+        ));
+    }
+    drop(resource_capture);
+    fixture.registry.reap_gone();
     let state = fixture.registry.state.lock().unwrap();
     assert!(!state.uses.contains_key(&key));
     assert!(!state.preloads.contains_key(&key));
     assert!(!state.actors.contains_key(&actor_key(&fixture.peer.caller)));
+}
+
+#[test]
+fn admitted_namespace_rebases_to_reserved_origin_without_granting_a_new_source() {
+    let f = Fixture::new();
+    // The existing use and the proposed switch have distinct real operations.
+    // This is metadata/scope lifecycle injection, not signed Book admission.
+    let use_scope = f.lifetime.enter().unwrap();
+    let capability = match f
+        .registry
+        .begin_use(peer(&f.peer), &f.connection, f.request(1), &use_scope)
+        .unwrap()
+    {
+        UseProgress::Active(receipt) => receipt.capability,
+        UseProgress::Closed => panic!("use unexpectedly closed"),
+    };
+    drop(use_scope);
+    let context = SourceUse {
+        state: Arc::downgrade(&f.registry.state),
+        caller: f.peer.caller.clone(),
+        member: f.member.clone(),
+        nonce: f.request(1).nonce,
+        capability,
+    };
+    let before = context.namespace(&f.peer.caller, f._home.path()).unwrap();
+    assert!(before.origin().is_none());
+    let reservation = f.reservation();
+    let origin = before.revalidated(f._home.path()).unwrap();
+    assert!(origin.origin().is_some());
+    reservation
+        .cell
+        .lock()
+        .unwrap()
+        .scope()
+        .unwrap()
+        .cancellation()
+        .cancel();
+    assert!(
+        origin.current().is_ok(),
+        "a cancelled proposed switch is not cancellation of the independent A use"
+    );
+    let wrong = aterm_tempfile::tempdir().unwrap();
+    assert!(context.namespace(&f.peer.caller, wrong.path()).is_err());
+    assert!(!wrong.path().join(".aterm").exists());
+    let mut state = f.registry.state.lock().unwrap();
+    let member = state
+        .members
+        .get_mut(&member_key(&f.peer.caller, &f.member).unwrap())
+        .unwrap();
+    member.source = Arc::new(metadata_fixture::with_authority(
+        metadata_fixture::source(
+            metadata_fixture::binding("source"),
+            f._home.path().join("auth.json"),
+            1,
+        ),
+        super::super::super::codex_assignment::SourceAuthority::Startup {
+            nonce: "9".repeat(32),
+        },
+    ));
+    drop(state);
+    assert!(
+        origin.current().is_err(),
+        "startup authority cannot be collapsed into generation zero"
+    );
+}
+
+#[test]
+fn reader_namespace_retains_the_actual_shared_claim_without_reacquiring_it() {
+    let f = Fixture::new();
+    let mut readiness =
+        SourceReadiness::preload(SourceWorkLease::for_home(f._home.path()).unwrap(), None).unwrap();
+    readiness.complete(ReadyRole::ReaderLoaded).unwrap();
+    let original = match readiness.gate.as_ref().unwrap() {
+        ReaderGate::Global(lease) => lease.clone(),
+        _ => panic!("wrong gate class"),
+    };
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&member_key(&f.peer.caller, &f.member).unwrap())
+        .unwrap()
+        .readiness = readiness;
+    let capability = f.begin(1);
+    let context = SourceUse {
+        state: Arc::downgrade(&f.registry.state),
+        caller: f.peer.caller.clone(),
+        member: f.member.clone(),
+        nonce: f.request(1).nonce,
+        capability,
+    };
+    let namespace = context.namespace(&f.peer.caller, f._home.path()).unwrap();
+    let borrowed = namespace.source_lease().unwrap().unwrap();
+    assert!(Arc::ptr_eq(&original, &borrowed));
+    assert!(borrowed.current().is_ok());
+    assert!(
+        crate::harness::codex_source_gate::PublicationLock::try_for_home(f._home.path())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn target_open_retirement_binds_actual_recorded_context_before_and_after_closed() {
+    // Ledger-only target injection; real socket/process, Scope and cleanup
+    // transitions, without minting an InstalledTarget or credential permission.
+    let f = Fixture::new();
+    let reservation = f.reservation();
+    let assignment = reservation
+        .cell
+        .lock()
+        .unwrap()
+        .target
+        .operation()
+        .to_owned();
+    let removed = f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .remove(&member_key(&f.peer.caller, &f.member).unwrap());
+    drop(removed);
+    target::open_cleanup_fixture(
+        &f.registry,
+        &reservation.cell,
+        &f.peer,
+        &f.connection,
+        (&f.member, &f.operation),
+        f.scope.as_ref().unwrap(),
+        false,
+    );
+    let context = "c".repeat(64);
+    let cleanup = "e".repeat(32);
+    let wrong_assignment = "f".repeat(32);
+    let wrong_context = "d".repeat(64);
+    let prepare = |assignment: &str, context: &str| {
+        f.registry.prepare_target_open_retirement(
+            &f.peer.caller,
+            &f.connection,
+            target::TargetOpenRetirement {
+                operation: &cleanup,
+                open_operation: &f.operation,
+                assignment,
+                context,
+                member: None,
+            },
+        )
+    };
+    assert!(prepare(&wrong_assignment, &context).is_err());
+    assert!(prepare(&assignment, &wrong_context).is_err());
+    let command = prepare(&assignment, &context).unwrap();
+    f.registry.retire_target_open(command).unwrap();
+    let _pause = f.lifetime.pause().unwrap();
+    assert!(f.lifetime.enter().is_none());
+    assert!(prepare(&wrong_assignment, &context).is_err());
+    assert!(prepare(&assignment, &wrong_context).is_err());
+    f.registry
+        .retire_target_open(prepare(&assignment, &context).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn target_open_cleanup_keeps_exact_lost_reply_fence_after_pause_and_context_loss() {
+    let f = Fixture::new();
+    let reservation = f.reservation();
+    let removed = f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .remove(&member_key(&f.peer.caller, &f.member).unwrap());
+    drop(removed);
+    target::open_cleanup_fixture(
+        &f.registry,
+        &reservation.cell,
+        &f.peer,
+        &f.connection,
+        (&f.member, &f.operation),
+        f.scope.as_ref().unwrap(),
+        false,
+    );
+    let capture = target::captured_open_fixture(&reservation.cell, &f.operation);
+    let release = f.registry.fixture_connection();
+    f.registry.connection_closed(f.connection.id);
+    let cleanup_operation = "e".repeat(32);
+    let cleanup = f
+        .registry
+        .prepare_target_open_cleanup(
+            &f.peer.caller,
+            &release,
+            &cleanup_operation,
+            &f.operation,
+            None,
+        )
+        .unwrap();
+    let _paused = f.lifetime.pause();
+    assert!(matches!(
+        f.registry.retire_target_open(cleanup),
+        Err(Error::Busy)
+    ));
+    drop(capture);
+    let cleanup = f
+        .registry
+        .prepare_target_open_cleanup(
+            &f.peer.caller,
+            &release,
+            &cleanup_operation,
+            &f.operation,
+            None,
+        )
+        .unwrap();
+    f.registry.retire_target_open(cleanup).unwrap();
+    // Exact accepted cleanup remains correlatable without context/Ready or an
+    // ordinary App enter. Unknown operations never become Closed by absence.
+    let replay = f
+        .registry
+        .prepare_target_open_cleanup(
+            &f.peer.caller,
+            &release,
+            &cleanup_operation,
+            &f.operation,
+            None,
+        )
+        .unwrap();
+    f.registry.retire_target_open(replay).unwrap();
+    assert!(
+        f.registry
+            .prepare_target_open_cleanup(
+                &f.peer.caller,
+                &release,
+                &cleanup_operation,
+                &"f".repeat(32),
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        f.registry
+            .prepare_target_open_cleanup(
+                &f.peer.caller,
+                &release,
+                &cleanup_operation,
+                &f.operation,
+                Some(&f.member)
+            )
+            .is_err()
+    );
+    assert!(
+        !f.registry.state.lock().unwrap().actors[&actor_key(&f.peer.caller)]
+            .issued
+            .contains_key(&f.member)
+    );
+}
+
+#[test]
+fn target_open_cleanup_cannot_discard_an_accepted_preload_or_loaded_member() {
+    let f = Fixture::new();
+    let reservation = f.reservation();
+    target::open_cleanup_fixture(
+        &f.registry,
+        &reservation.cell,
+        &f.peer,
+        &f.connection,
+        (&f.member, &f.operation),
+        f.scope.as_ref().unwrap(),
+        true,
+    );
+    assert!(
+        f.registry
+            .prepare_target_open_cleanup(
+                &f.peer.caller,
+                &f.connection,
+                &"e".repeat(32),
+                &f.operation,
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        f.registry
+            .state
+            .lock()
+            .unwrap()
+            .members
+            .contains_key(&member_key(&f.peer.caller, &f.member).unwrap())
+    );
+}
+
+#[test]
+fn distinct_target_retains_actual_global_share_without_retaining_a_exclusive() {
+    // Explicit synthetic phase/target injection tests only actual kernel
+    // lifetime separation, not installation, owner, image or release authority.
+    let fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    let sealed = seal::kernel_fixture(&reservation);
+    let kernel = sealed.retained_kernel().unwrap();
+    let intent = reservation.cell.lock().unwrap().target.intent();
+    let resource = kernel.target_resource(&intent).unwrap();
+    let source = fixture
+        .registry
+        .ready_source(&fixture.peer.caller, &fixture.member)
+        .unwrap();
+    assert!(
+        crate::harness::codex_source_gate::FamilyWork::acquire(
+            crate::harness::codex_source_gate::FamilySource::Manager(&source)
+        )
+        .is_err()
+    );
+    fixture
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .reservations
+        .remove(&actor_key(&fixture.peer.caller));
+    drop(reservation);
+    drop(sealed);
+    drop(kernel); // synthetic test-only teardown
+    resource.current().unwrap();
+    let a = crate::harness::codex_source_gate::FamilyWork::acquire(
+        crate::harness::codex_source_gate::FamilySource::Manager(&source),
+    )
+    .unwrap();
+    assert!(
+        crate::harness::codex_source_gate::PublicationLock::for_home(fixture._home.path()).is_err()
+    );
+    drop(a);
+    drop(resource);
+    crate::harness::codex_source_gate::PublicationLock::for_home(fixture._home.path()).unwrap();
+}
+
+#[test]
+fn same_grant_target_borrows_actual_family_without_relocking_or_drop_unfreeze() {
+    let fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    reservation.cell.lock().unwrap().target = prepare::reservation_metadata_fixture(
+        fixture.peer.caller.clone(),
+        metadata_fixture::binding("source"),
+        metadata_fixture::binding("source"),
+    );
+    let sealed = seal::kernel_fixture(&reservation);
+    let kernel = sealed.retained_kernel().unwrap();
+    let intent = reservation.cell.lock().unwrap().target.intent();
+    let resource = kernel.target_resource(&intent).unwrap();
+    resource.current().unwrap();
+    kernel.current().unwrap();
+    let source = fixture
+        .registry
+        .ready_source(&fixture.peer.caller, &fixture.member)
+        .unwrap();
+    fixture
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .reservations
+        .remove(&actor_key(&fixture.peer.caller));
+    drop(reservation);
+    drop(sealed);
+    drop(kernel);
+    assert!(
+        crate::harness::codex_source_gate::FamilyWork::acquire(
+            crate::harness::codex_source_gate::FamilySource::Manager(&source)
+        )
+        .is_err(),
+        "before a verified ACK/handoff, dropping A handles cannot assert unlock"
+    );
+    drop(resource);
+    crate::harness::codex_source_gate::FamilyWork::acquire(
+        crate::harness::codex_source_gate::FamilySource::Manager(&source),
+    )
+    .unwrap();
+}
+
+#[test]
+fn source_seal_or_operation_string_cannot_prepare_target_factory() {
+    let fixture = Fixture::new();
+    let reservation = fixture.reservation();
+    let _sealed = seal::kernel_fixture(&reservation);
+    let before = {
+        let state = fixture.registry.state.lock().unwrap();
+        let actor = &state.actors[&actor_key(&fixture.peer.caller)];
+        (actor.highwater, actor.issued.len(), state.version)
+    };
+    assert!(matches!(
+        fixture.registry.prepare_target_constructor(
+            &fixture.peer,
+            &fixture.connection,
+            &target::absent_role_fixture(),
+            &"a".repeat(32)
+        ),
+        Err(Error::Stale)
+    ));
+    let state = fixture.registry.state.lock().unwrap();
+    let actor = &state.actors[&actor_key(&fixture.peer.caller)];
+    assert_eq!((actor.highwater, actor.issued.len(), state.version), before);
+    assert!(
+        reservation
+            .cell
+            .lock()
+            .unwrap()
+            .target_constructors
+            .is_empty()
+    );
+}
+
+#[test]
+fn settled_history_capacity_refuses_new_use_before_highwater_and_preserves_exact_cleanup() {
+    // Actual counted Begin/End occurrences; synthetic source/image fixture.
+    // Bounded refusal is not authenticated indefinite epoch compaction.
+    let fixture = Fixture::new();
+    let mut first = None;
+    for counter in 1..=MAX_MEMBER_HISTORY as u64 {
+        let capability = fixture.begin(counter);
+        if counter == 1 {
+            first = Some(capability.clone());
+        }
+        fixture
+            .registry
+            .end_use(
+                &fixture.peer,
+                &fixture.connection,
+                &fixture.member,
+                fixture.request(counter).nonce,
+                &capability,
+            )
+            .unwrap();
+    }
+    let next = MAX_MEMBER_HISTORY as u64 + 1;
+    assert!(matches!(
+        fixture.registry.begin_use(
+            peer(&fixture.peer),
+            &fixture.connection,
+            fixture.request(next),
+            &fixture.lifetime.enter().unwrap()
+        ),
+        Err(Error::Busy)
+    ));
+    let state = fixture.registry.state.lock().unwrap();
+    let uses = &state.uses[&member_key(&fixture.peer.caller, &fixture.member).unwrap()];
+    assert_eq!(uses.highwater, MAX_MEMBER_HISTORY as u64);
+    assert_eq!(uses.ending.len(), MAX_MEMBER_HISTORY);
+    assert!(uses.active.is_empty() && uses.pending.is_empty());
+    drop(state);
+    fixture
+        .registry
+        .end_use(
+            &fixture.peer,
+            &fixture.connection,
+            &fixture.member,
+            fixture.request(1).nonce,
+            first.as_deref().unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn contextual_preload_owns_independent_scope_after_parent_end() {
+    // Synthetic source/peer only. Genuine process, gate, App operation and
+    // End lifecycle; this does not qualify the supported owner/image path.
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let context = f
+        .registry
+        .use_context(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let parent_identity = context
+        .namespace(&f.peer.caller, f._home.path())
+        .unwrap()
+        .scope()
+        .operation_identity();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    assert!(
+        f.registry
+            .prepare_preload_use(
+                &f.peer.caller,
+                &f.member,
+                &"c".repeat(32),
+                sequence,
+                &f.connection,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &"0".repeat(64)
+                }
+            )
+            .is_err()
+    );
+    let command = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &f.connection,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    assert!(command.scope().operation_identity() != parent_identity);
+    f.registry
+        .end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    assert!(!context.current());
+    assert!(command.current().is_ok());
+    drop(command);
+    let replay = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &f.connection,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    assert!(replay.current().is_ok());
+    drop(replay);
+    assert!(
+        f.registry
+            .prepare_preload_use(
+                &f.peer.caller,
+                &f.member,
+                &"d".repeat(32),
+                sequence,
+                &f.connection,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+    let next = PreloadSequence::parse("1234567890abcdef0000000000000002").unwrap();
+    assert!(
+        f.registry
+            .prepare_preload_use(
+                &f.peer.caller,
+                &f.member,
+                &"d".repeat(32),
+                next,
+                &f.connection,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn contextual_preload_cancel_keeps_actual_worker_counted_until_drop() {
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let context = f
+        .registry
+        .use_context(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let command = f
+        .registry
+        .prepare_preload_for_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &f.connection,
+            &context,
+        )
+        .unwrap();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let pending = f.registry.state.lock().unwrap().preloads[&key].clone();
+    pending.revoke_departed();
+    assert!(command.current().is_err());
+    assert!(!pending.retired());
+    drop(command);
+    assert!(pending.retired());
+}
+
+#[test]
+fn work_rebind_transfers_exact_pending_scope_without_restoring_ready() {
+    // Metadata injection only; actual kernel process, connection EOF, App
+    // Scope and original native Pending transfer are exercised here.
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let context = f
+        .registry
+        .use_context(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let command = f
+        .registry
+        .prepare_preload_for_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &f.connection,
+            &context,
+        )
+        .unwrap();
+    let identity = command.scope().operation_identity();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let original = f.registry.state.lock().unwrap().preloads[&key].clone();
+    f.registry.connection_closed(f.connection.id);
+    let replacement = f.registry.fixture_connection();
+    let request = || target::WorkRebindRequest {
+        operation: &f.operation,
+        member: &f.member,
+        kind: target::WorkRebindKind::Ordinary,
+    };
+    assert!(matches!(
+        f.registry
+            .rebind_member_work(&f.peer.caller, &replacement, request()),
+        Err(Error::Busy)
+    ));
+    assert!(
+        f.registry.state.lock().unwrap().actors[&actor_key(&f.peer.caller)].issued[&f.member]
+            .connection
+            .same(&f.connection)
+    );
+    drop(command);
+    f.registry
+        .rebind_member_work(&f.peer.caller, &replacement, request())
+        .unwrap();
+    let resumed = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &replacement,
+            namespace::PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    assert!(resumed.scope().operation_identity() == identity);
+    assert!(resumed.current().is_ok());
+    assert!(
+        !original.retired(),
+        "the replacement owns the same real occurrence"
+    );
+    let state = f.registry.state.lock().unwrap();
+    assert!(state.members[&key].unknown, "Bound is not Ready");
+    assert!(state.preloads[&key].connection.same(&replacement));
+}
+
+#[test]
+fn work_rebind_checks_original_body_and_never_mutates_after_app_seal() {
+    let mut f = Fixture::new();
+    f.registry.connection_closed(f.connection.id);
+    let replacement = f.registry.fixture_connection();
+    assert!(
+        f.registry
+            .rebind_member_work(
+                &f.peer.caller,
+                &replacement,
+                target::WorkRebindRequest {
+                    operation: &f.operation,
+                    member: &f.member,
+                    kind: target::WorkRebindKind::Derived {
+                        use_member: &f.member,
+                        use_operation: "1234567890abcdef0000000000000001",
+                        capability: &"f".repeat(64)
+                    }
+                }
+            )
+            .is_err()
+    );
+    let pause = f.lifetime.pause().unwrap();
+    drop(f.scope.take());
+    let _drained = match pause.try_wait() {
+        Ok(drained) => drained,
+        Err(_) => panic!("fixture has no pending native operation"),
+    };
+    assert!(matches!(
+        f.registry.rebind_member_work(
+            &f.peer.caller,
+            &replacement,
+            target::WorkRebindRequest {
+                operation: &f.operation,
+                member: &f.member,
+                kind: target::WorkRebindKind::Ordinary
+            }
+        ),
+        Err(Error::Busy)
+    ));
+    let state = f.registry.state.lock().unwrap();
+    assert!(
+        state.actors[&actor_key(&f.peer.caller)].issued[&f.member]
+            .connection
+            .same(&f.connection)
+    );
+}
+
+#[test]
+fn reader_use_keeps_read_permission_without_manager_refresh_authority() {
+    let f = Fixture::new();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let mut readiness =
+        SourceReadiness::preload(SourceWorkLease::for_home(f._home.path()).unwrap(), None).unwrap();
+    readiness.complete(ReadyRole::ReaderLoaded).unwrap();
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .readiness = readiness;
+    let capability = f.begin(1);
+    let context = f
+        .registry
+        .use_context(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let proof = context.namespace(&f.peer.caller, f._home.path()).unwrap();
+    assert!(proof.current().is_ok());
+    assert!(matches!(proof.refresh_allowed(), Err(Error::Denied)));
+    assert!(matches!(
+        context.prepare_refresh(
+            &f.peer.caller,
+            f._home.path(),
+            slot::RefreshRequest::new(
+                proof.source().slot().into(),
+                "e".repeat(32),
+                proof.source().digest().into()
+            )
+        ),
+        Err(Error::Denied)
+    ));
+}
+
+#[test]
+fn admitted_manager_refresh_role_survives_same_scope_ready_reset() {
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let context = f
+        .registry
+        .use_context(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    assert!(context.current());
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .readiness
+        .role = None;
+    let recovered = f
+        .registry
+        .registered_source_use(
+            &f.peer.caller,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let proof = recovered.namespace(&f.peer.caller, f._home.path()).unwrap();
+    assert!(proof.refresh_allowed().is_ok());
+    assert!(
+        recovered
+            .prepare_refresh(
+                &f.peer.caller,
+                f._home.path(),
+                slot::RefreshRequest::new(
+                    proof.source().slot().into(),
+                    "e".repeat(32),
+                    proof.source().digest().into()
+                )
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        recovered.prepare_refresh(
+            &f.peer.caller,
+            f._home.path(),
+            slot::RefreshRequest::new(
+                "666f726569676e".into(),
+                "e".repeat(32),
+                proof.source().digest().into()
+            )
+        ),
+        Err(Error::Denied)
+    ));
+    let foreign = f.registry.fixture_connection();
+    assert!(
+        f.registry
+            .registered_source_use(
+                &f.peer.caller,
+                &foreign,
+                &f.member,
+                f.request(1).nonce,
+                &capability
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        f.registry.end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        ),
+        Err(Error::Busy)
+    ));
+    // The actual read namespace owns a counted Scope. SourceUse handles are
+    // only lookup metadata; keep both alive while releasing the real loan.
+    drop(proof);
+    f.registry
+        .end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    assert!(
+        f.registry
+            .registered_source_use(
+                &f.peer.caller,
+                &f.connection,
+                &f.member,
+                f.request(1).nonce,
+                &capability
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn ordinary_resample_keeps_the_actual_accepted_read_operation() {
+    let mut f = Fixture::new();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let attempt = preload_sequence::Attempt {
+        sequence,
+        operation: f.operation.clone(),
+        origin: preload_sequence::Origin::Ordinary,
+    };
+    let worker = preload_custody::enter_sequenced(
+        &f.registry,
+        &f.peer,
+        &f.member,
+        &f.operation,
+        &f.connection,
+        &attempt,
+    )
+    .unwrap();
+    let identity = worker.scope().operation_identity();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let source = f.registry.state.lock().unwrap().members[&key]
+        .source
+        .clone();
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .preload_sequences
+        .get_mut(&key)
+        .unwrap()
+        .loaded(
+            &attempt,
+            &f.registration,
+            source.credential_generation(),
+            source.digest(),
+        )
+        .unwrap();
+    drop(worker);
+    let previous = PreloadPredecessor {
+        registration: f.registration.clone(),
+        credential_generation: source.credential_generation(),
+        digest: source.digest().into(),
+    };
+    let command = match f
+        .registry
+        .prepare_ordinary_preload_resample(
+            &f.peer.caller,
+            &f.member,
+            &f.operation,
+            sequence,
+            &f.connection,
+            &previous,
+        )
+        .unwrap()
+    {
+        namespace::ResamplePreparation::Pending(command) => command,
+        _ => panic!("an actual unresolved read was expected"),
+    };
+    assert!(command.scope().operation_identity() == identity);
+    let pending = f.registry.state.lock().unwrap().preloads[&key].clone();
+    let pause = f.lifetime.pause().unwrap();
+    drop(f.scope.take());
+    assert!(command.current().is_err());
+    let pause = match pause.try_wait() {
+        Err(pause) => pause,
+        Ok(_) => panic!("native read still owns its count"),
+    };
+    pending.revoke_departed();
+    drop(command);
+    assert!(pause.try_wait().is_ok());
+}
+
+#[test]
+fn owned_ordinary_ready_freezes_report_before_any_source_validation() {
+    let f = Fixture::new();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let attempt = preload_sequence::Attempt {
+        sequence,
+        operation: f.operation.clone(),
+        origin: preload_sequence::Origin::Ordinary,
+    };
+    let worker = preload_custody::enter_sequenced(
+        &f.registry,
+        &f.peer,
+        &f.member,
+        &f.operation,
+        &f.connection,
+        &attempt,
+    )
+    .unwrap();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let source = f.registry.state.lock().unwrap().members[&key]
+        .source
+        .clone();
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .preload_sequences
+        .get_mut(&key)
+        .unwrap()
+        .loaded(
+            &attempt,
+            &f.registration,
+            source.credential_generation(),
+            source.digest(),
+        )
+        .unwrap();
+    drop(worker);
+    let report = |auth| Ready::Loaded {
+        credential_generation: source.credential_generation(),
+        digest: source.digest().into(),
+        account: source.account().into(),
+        user: source.user().into(),
+        auth,
+    };
+    let pending = f
+        .registry
+        .prepare_ordinary_ready(
+            &f.peer.caller,
+            &f.connection,
+            &f.member,
+            &f.operation,
+            sequence,
+            &f.registration,
+            report(auth()),
+        )
+        .unwrap();
+    assert!(matches!(
+        pending,
+        namespace::CapturedReadyPreparation::Pending(_)
+    ));
+    drop(pending); // Simulate accepted but unstarted worker removal.
+    let mut changed = auth();
+    changed.generation += 1;
+    assert!(matches!(
+        f.registry.prepare_ordinary_ready(
+            &f.peer.caller,
+            &f.connection,
+            &f.member,
+            &f.operation,
+            sequence,
+            &f.registration,
+            report(changed)
+        ),
+        Err(Error::Stale)
+    ));
+}
+
+#[test]
+fn historical_context_without_actual_applied_normalizer_cannot_mint_a_read_scope() {
+    let mut f = Fixture::new();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    assert!(
+        f.registry
+            .prepare_normalized_preload(
+                &f.peer.caller,
+                &f.connection,
+                target::normalize::NormalizedMemberRequest {
+                    assignment: &"a".repeat(32),
+                    context: &"b".repeat(64),
+                    member: &f.member,
+                    operation: &"c".repeat(32)
+                },
+                sequence
+            )
+            .is_err()
+    );
+    assert!(f.registry.state.lock().unwrap().preloads.is_empty());
+    let pause = f.lifetime.pause().unwrap();
+    drop(f.scope.take());
+    assert!(pause.try_wait().is_ok());
+}
+
+#[test]
+fn contextual_resample_ready_hint_requires_exact_recorded_attempt_even_after_parent_end() {
+    // Synthetic source metadata, real process/gate/App/capability lifecycle.
+    // This qualifies correlation/admission only, not a physical owner refresh.
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let operation = "c".repeat(32);
+    let command = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &f.member,
+            &operation,
+            sequence,
+            &f.connection,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let previous = {
+        let mut state = f.registry.state.lock().unwrap();
+        let source = state.members[&key].source.clone();
+        let attempt = preload_sequence::Attempt {
+            sequence,
+            operation: operation.clone(),
+            origin: preload_sequence::Origin::Use {
+                member: f.member.clone(),
+                nonce: format!(
+                    "{:016x}{:016x}",
+                    f.request(1).nonce.prefix,
+                    f.request(1).nonce.counter
+                ),
+                capability: capability.clone(),
+            },
+        };
+        let ledger = state.preload_sequences.get_mut(&key).unwrap();
+        ledger
+            .loaded(
+                &attempt,
+                &f.registration,
+                source.credential_generation(),
+                source.digest(),
+            )
+            .unwrap();
+        ledger
+            .accept_ready(&attempt, &f.registration, ReadyRole::Manager(auth()))
+            .unwrap();
+        ledger.complete(&attempt, &f.registration).unwrap();
+        PreloadPredecessor {
+            registration: f.registration.clone(),
+            credential_generation: source.credential_generation(),
+            digest: source.digest().into(),
+        }
+    };
+    drop(command);
+    f.registry
+        .end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let result = f
+        .registry
+        .prepare_contextual_preload_resample(
+            &f.peer.caller,
+            &f.member,
+            &operation,
+            sequence,
+            &f.connection,
+            &previous,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(result,ResamplePreparation::Settled(PreloadResample::ReadyCommitted { previous: actual }) if actual==previous)
+    );
+    let mut foreign = previous.clone();
+    foreign.digest = "0".repeat(64);
+    assert!(
+        f.registry
+            .prepare_contextual_preload_resample(
+                &f.peer.caller,
+                &f.member,
+                &operation,
+                sequence,
+                &f.connection,
+                &foreign,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        f.registry
+            .prepare_contextual_preload_resample(
+                &f.peer.caller,
+                &f.member,
+                &operation,
+                sequence,
+                &f.connection,
+                &previous,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &"0".repeat(64)
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn existing_derived_work_rebind_after_parent_end_is_metadata_only_not_new_read_or_use() {
+    // Synthetic source metadata; actual process, native connection/EOF and use state.
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let child_connection = f.registry.fixture_connection();
+    let open = "d".repeat(32);
+    let child = f
+        .registry
+        .open_registered_derived(
+            &f.peer.caller,
+            &child_connection,
+            &open,
+            UseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    f.registry.connection_closed(child_connection.id);
+    f.registry
+        .end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let replacement = f.registry.fixture_connection();
+    let nonce = format!(
+        "{:016x}{:016x}",
+        f.request(1).nonce.prefix,
+        f.request(1).nonce.counter
+    );
+    assert!(
+        f.registry
+            .rebind_member_work(
+                &f.peer.caller,
+                &replacement,
+                target::WorkRebindRequest {
+                    operation: &open,
+                    member: &child.member,
+                    kind: target::WorkRebindKind::Derived {
+                        use_member: &f.member,
+                        use_operation: &nonce,
+                        capability: &"0".repeat(64)
+                    },
+                }
+            )
+            .is_err()
+    );
+    f.registry
+        .rebind_member_work(
+            &f.peer.caller,
+            &replacement,
+            target::WorkRebindRequest {
+                operation: &open,
+                member: &child.member,
+                kind: target::WorkRebindKind::Derived {
+                    use_member: &f.member,
+                    use_operation: &nonce,
+                    capability: &capability,
+                },
+            },
+        )
+        .unwrap();
+    assert!(
+        f.registry
+            .registered_source_use(
+                &f.peer.caller,
+                &f.connection,
+                &f.member,
+                f.request(1).nonce,
+                &capability
+            )
+            .is_err()
+    );
+    assert!(
+        f.registry
+            .prepare_preload_use(
+                &f.peer.caller,
+                &child.member,
+                &"e".repeat(32),
+                PreloadSequence::parse("11111111111111110000000000000001").unwrap(),
+                &replacement,
+                PreloadUseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+    let state = f.registry.state.lock().unwrap();
+    assert!(
+        !state
+            .members
+            .contains_key(&member_key(&f.peer.caller, &child.member).unwrap())
+    );
+    assert!(
+        state.actors[&actor_key(&f.peer.caller)].issued[&child.member]
+            .connection
+            .same(&replacement)
+    );
+}
+
+#[test]
+fn derived_constructor_continues_actual_parent_during_owned_preload_ready_reset() {
+    // Synthetic source row, real native Process/gates/counted PRELOAD/App/use.
+    // No physical owner, HTTP or fresh Ready is supplied by this fixture.
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let pending = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &f.member,
+            &"c".repeat(32),
+            sequence,
+            &f.connection,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    // Descriptive Ready resets on the original admitted source's publication.
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .readiness
+        .role = None;
+    let new_scope = f.lifetime.enter().unwrap();
+    assert!(
+        f.registry
+            .begin_use(peer(&f.peer), &f.connection, f.request(2), &new_scope)
+            .is_err(),
+        "new root/use still requires actual Ready"
+    );
+    let child_connection = f.registry.fixture_connection();
+    let open = "d".repeat(32);
+    assert!(
+        f.registry
+            .open_registered_derived(
+                &f.peer.caller,
+                &child_connection,
+                &open,
+                UseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &"0".repeat(64)
+                }
+            )
+            .is_err()
+    );
+    let child = f
+        .registry
+        .open_registered_derived(
+            &f.peer.caller,
+            &child_connection,
+            &open,
+            UseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    let child_read = f
+        .registry
+        .prepare_preload_use(
+            &f.peer.caller,
+            &child.member,
+            &"e".repeat(32),
+            sequence,
+            &child_connection,
+            PreloadUseIdentity {
+                member: &f.member,
+                nonce: f.request(1).nonce,
+                capability: &capability,
+            },
+        )
+        .unwrap();
+    assert!(child_read.scope().operation_identity() != pending.scope().operation_identity());
+    assert!(
+        f.registry
+            .registered_source_use(
+                &f.peer.caller,
+                &child_connection,
+                &f.member,
+                f.request(1).nonce,
+                &capability
+            )
+            .is_err(),
+        "child connection cannot become original parent work"
+    );
+    f.registry
+        .end_use(
+            &f.peer,
+            &f.connection,
+            &f.member,
+            f.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    let another = f.registry.fixture_connection();
+    assert!(
+        f.registry
+            .open_registered_derived(
+                &f.peer.caller,
+                &another,
+                &"f".repeat(32),
+                UseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err(),
+        "Closed capability cannot mint another child"
+    );
+    assert!(
+        child_read.current().is_ok(),
+        "accepted child's own counted completion survives parent End"
+    );
+    drop(child_read);
+    drop(pending);
+}
+
+#[test]
+fn derived_continuation_after_ready_reset_refuses_foreign_source_and_parent_socket_eof() {
+    let f = Fixture::new();
+    let capability = f.begin(1);
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let original = {
+        let mut state = f.registry.state.lock().unwrap();
+        let member = state.members.get_mut(&key).unwrap();
+        member.readiness.role = None;
+        member.source.clone()
+    };
+    let child = f.registry.fixture_connection();
+    {
+        let mut state = f.registry.state.lock().unwrap();
+        state.members.get_mut(&key).unwrap().source = Arc::new(metadata_fixture::source(
+            metadata_fixture::binding("foreign"),
+            f._home.path().join("foreign.json"),
+            1,
+        ));
+    }
+    assert!(
+        f.registry
+            .open_registered_derived(
+                &f.peer.caller,
+                &child,
+                &"e".repeat(32),
+                UseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .source = original;
+    f.registry.connection_closed(f.connection.id);
+    assert!(
+        f.registry
+            .open_registered_derived(
+                &f.peer.caller,
+                &child,
+                &"e".repeat(32),
+                UseIdentity {
+                    member: &f.member,
+                    nonce: f.request(1).nonce,
+                    capability: &capability
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn release_only_plain_retirement_cannot_bypass_native_use_or_managed_reader() {
+    let fixture = Fixture::new();
+    let cleanup = fixture.registry.fixture_connection();
+    let capability = fixture.begin(1);
+    assert_eq!(
+        fixture.registry.retire_nonpreloaded_member(
+            &fixture.peer.caller,
+            &cleanup,
+            &fixture.member,
+            None
+        ),
+        Err(Error::Busy)
+    );
+    fixture
+        .registry
+        .end_use(
+            &fixture.peer,
+            &cleanup,
+            &fixture.member,
+            fixture.request(1).nonce,
+            &capability,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.registry.retire_nonpreloaded_member(
+            &fixture.peer.caller,
+            &cleanup,
+            &fixture.member,
+            None
+        ),
+        Err(Error::Denied)
+    );
+    let key = member_key(&fixture.peer.caller, &fixture.member).unwrap();
+    fixture
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .readiness
+        .role = Some(ReadyRole::ReaderLoaded);
+    assert_eq!(
+        fixture.registry.retire_nonpreloaded_member(
+            &fixture.peer.caller,
+            &cleanup,
+            &fixture.member,
+            Some(&fixture.registration)
+        ),
+        Err(Error::Denied)
+    );
+    assert!(
+        fixture
+            .registry
+            .state
+            .lock()
+            .unwrap()
+            .members
+            .contains_key(&key)
+    );
+}
+
+fn rebound_manager_fixture() -> (Fixture, PreloadSequence, FixtureConnection) {
+    // Explicit synthetic source/ledger injection, not a positive physical Slot
+    // or image qualification. Process, native EOF/rebind, App scopes and gate
+    // are real. Deliberately no Begin/Use exists before this recovery.
+    let f = Fixture::new();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    let attempt = preload_sequence::Attempt {
+        sequence,
+        operation: f.operation.clone(),
+        origin: preload_sequence::Origin::Ordinary,
+    };
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    {
+        let mut state = f.registry.state.lock().unwrap();
+        let source = state.members[&key].source.clone();
+        let mut ledger = preload_sequence::Ledger::new(f.peer.process.clone(), attempt.clone());
+        ledger
+            .loaded(
+                &attempt,
+                &f.registration,
+                source.credential_generation(),
+                source.digest(),
+            )
+            .unwrap();
+        ledger
+            .accept_ready(&attempt, &f.registration, ReadyRole::Manager(auth()))
+            .unwrap();
+        ledger.complete(&attempt, &f.registration).unwrap();
+        state.preload_sequences.insert(key, ledger);
+    }
+    f.registry.connection_closed(f.connection.id);
+    let replacement = f.registry.fixture_connection();
+    f.registry
+        .rebind_member_work(
+            &f.peer.caller,
+            &replacement,
+            target::WorkRebindRequest {
+                operation: &f.operation,
+                member: &f.member,
+                kind: target::WorkRebindKind::Ordinary,
+            },
+        )
+        .unwrap();
+    (f, sequence, replacement)
+}
+
+#[test]
+fn rebound_read_before_first_native_use_has_counted_custody_and_keeps_http_closed() {
+    let (f, _, replacement) = rebound_manager_fixture();
+    let operation = "e".repeat(32);
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000002").unwrap();
+    let mut command = f
+        .registry
+        .prepare_rebound_preload(
+            &f.peer.caller,
+            &replacement,
+            &f.member,
+            &operation,
+            sequence,
+        )
+        .unwrap();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    assert!(
+        !f.registry.state.lock().unwrap().uses.contains_key(&key),
+        "read recovery invents no native HTTP use"
+    );
+    assert!(f.registry.state.lock().unwrap().members[&key].unknown);
+    assert!(
+        f.registry
+            .begin_use(
+                peer(&f.peer),
+                &replacement,
+                f.request(1),
+                f.scope.as_ref().unwrap()
+            )
+            .is_err()
+    );
+    assert!(command.current().is_ok());
+    let env = Env {
+        state: f._home.path().join("state"),
+        aterm_state: None,
+        cwd: f._home.path().into(),
+        home: Some(f._home.path().into()),
+        claude_dir: None,
+        claude_config_unusable: None,
+        claude_profile: None,
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        codex_login: None,
+        agy_conversation: None,
+        now: 0,
+        sid: f.peer.caller.sid.clone(),
+        sock: None,
+        config: None,
+        claude_tmp: None,
+        claude_running: None,
+        tz_s: 0,
+    };
+    // The synthetic row has no signed physical namespace. Actual read must fail
+    // rather than promoting it from same account/counter metadata.
+    assert!(command.preload(&env).is_err());
+    assert!(f.registry.state.lock().unwrap().members[&key].unknown);
+    f.registry.connection_closed(replacement.id);
+    assert!(command.current().is_err());
+    drop(command);
+    assert!(
+        f.registry.state.lock().unwrap().preloads.contains_key(&key),
+        "observer/worker drop does not close the owned read"
+    );
+}
+
+#[test]
+fn rebound_ready_requires_exact_manager_report_and_native_rebound_occurrence() {
+    let (f, sequence, replacement) = rebound_manager_fixture();
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let report = || {
+        let state = f.registry.state.lock().unwrap();
+        let source = &state.members[&key].source;
+        Ready::Loaded {
+            credential_generation: source.credential_generation(),
+            digest: source.digest().into(),
+            account: source.account().into(),
+            user: source.user().into(),
+            auth: auth(),
+        }
+    };
+    assert!(
+        f.registry
+            .prepare_rebound_ready(
+                &f.peer.caller,
+                &replacement,
+                ReboundReadyRequest {
+                    member: &f.member,
+                    operation: &f.operation,
+                    sequence,
+                    registration: &"0".repeat(32),
+                    ready: report()
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        f.registry
+            .prepare_rebound_ready(
+                &f.peer.caller,
+                &f.connection,
+                ReboundReadyRequest {
+                    member: &f.member,
+                    operation: &f.operation,
+                    sequence,
+                    registration: &f.registration,
+                    ready: report()
+                }
+            )
+            .is_err()
+    );
+    let command = f
+        .registry
+        .prepare_rebound_ready(
+            &f.peer.caller,
+            &replacement,
+            ReboundReadyRequest {
+                member: &f.member,
+                operation: &f.operation,
+                sequence,
+                registration: &f.registration,
+                ready: report(),
+            },
+        )
+        .unwrap();
+    assert!(
+        f.registry.state.lock().unwrap().members[&key].unknown,
+        "prepared command is not a completion"
+    );
+    drop(command);
+    let command = f
+        .registry
+        .prepare_rebound_ready(
+            &f.peer.caller,
+            &replacement,
+            ReboundReadyRequest {
+                member: &f.member,
+                operation: &f.operation,
+                sequence,
+                registration: &f.registration,
+                ready: report(),
+            },
+        )
+        .unwrap();
+    assert!(
+        f.registry.state.lock().unwrap().members[&key].unknown,
+        "lost observer does not clear Unknown"
+    );
+    drop(command);
+    f.registry
+        .state
+        .lock()
+        .unwrap()
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .readiness
+        .role = Some(ReadyRole::ReaderLoaded);
+    assert!(
+        f.registry
+            .prepare_rebound_preload(
+                &f.peer.caller,
+                &replacement,
+                &f.member,
+                &"e".repeat(32),
+                PreloadSequence::parse("1234567890abcdef0000000000000002").unwrap()
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn rebound_preload_does_not_replace_ordinary_or_sealed_constructor_admission() {
+    let f = Fixture::new();
+    let sequence = PreloadSequence::parse("1234567890abcdef0000000000000001").unwrap();
+    assert!(
+        f.registry
+            .prepare_rebound_preload(
+                &f.peer.caller,
+                &f.connection,
+                &f.member,
+                &"c".repeat(32),
+                sequence
+            )
+            .is_err()
+    );
+    let (f, _, replacement) = rebound_manager_fixture();
+    let _pause = f.lifetime.pause().unwrap();
+    assert!(
+        f.registry
+            .prepare_rebound_preload(
+                &f.peer.caller,
+                &replacement,
+                &f.member,
+                &"c".repeat(32),
+                PreloadSequence::parse("1234567890abcdef0000000000000002").unwrap()
+            )
+            .is_err()
+    );
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    assert!(
+        !f.registry.state.lock().unwrap().preloads.contains_key(&key),
+        "closed App cannot acquire recovery read custody"
+    );
 }

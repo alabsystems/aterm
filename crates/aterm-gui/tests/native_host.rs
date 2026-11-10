@@ -7,6 +7,40 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let argv = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(all(unix, debug_assertions))]
+    if argv
+        .first()
+        .is_some_and(|word| word == "--source-proof-task" || word == aterm_uds::tether::VERB)
+        && let Some(exit) = aterm_uds::tether::entry()
+    {
+        return exit;
+    }
+    #[cfg(all(unix, debug_assertions))]
+    if argv.len() == 2 && argv[0] == "--source-proof-task" {
+        let task = std::path::Path::new(&argv[1]);
+        let result = task
+            .parent()
+            .zip(task.file_name().and_then(|name| name.to_str()))
+            .ok_or_else(|| "source proof task path unavailable".to_owned())
+            .and_then(|(directory, name)| {
+                aterm_uds::private_file::read_private(directory, name, 32 * 1024)
+                    .map_err(|_| "source proof task unavailable".to_owned())
+            })
+            .and_then(|bytes| {
+                if bytes.len() > 32 * 1024 {
+                    return Err("source proof task too large".into());
+                }
+                String::from_utf8(bytes).map_err(|_| "invalid source proof task".into())
+            })
+            .and_then(aterm_gui::run_native_source_proof_fixture);
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("native_host: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // This must precede every fixture role and option. The production retained
     // command names this same executable as `harness native-launch ...`, and
     // System::own_launcher compares the actual current executable's identity.

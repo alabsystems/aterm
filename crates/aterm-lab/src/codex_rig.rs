@@ -13,13 +13,20 @@ use aterm_sysprobe::kproc;
 
 use crate::pyjson::{J, PY};
 
-/// The instance's `sandbox-exec` profile.
+const DENY_IP: &str = "(version 1)(allow default)(deny network-outbound (remote ip))(deny network-inbound (local ip))\
+    (deny network-outbound (literal \"/private/var/run/mDNSResponder\"))";
+
+/// An instance's sandbox profile with no inbound or outbound IP exception.
+#[must_use]
+pub fn no_ip_jail_policy() -> String {
+    format!("{DENY_IP}\n{}", crate::jail::PREFERENCES)
+}
+
+/// The instance's `sandbox-exec` profile with its model's loopback port allowed.
 #[must_use]
 pub fn jail_policy(port: u16) -> String {
     format!(
-        "(version 1)(allow default)(deny network-outbound (remote ip))(deny network-inbound (local ip))\
-         (deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\
-         (allow network-outbound (remote ip \"localhost:{port}\"))\n{}",
+        "{DENY_IP}(allow network-outbound (remote ip \"localhost:{port}\"))\n{}",
         crate::jail::PREFERENCES
     )
 }
@@ -904,6 +911,52 @@ pub const MCP_ECHO_TOOL: &str = "lab_echo";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_ip_policy_parses_and_denies_the_live_loopback_exception() {
+        fn run(policy: &str, program: &str, args: &[&str]) -> std::process::Output {
+            let mut command = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+            command
+                .args(["-p", policy, program])
+                .args(args)
+                .stdin(aterm_uds::spawnfd::Stdio::null());
+            aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60))
+                .expect("bounded sandbox policy control")
+        }
+
+        let denied = no_ip_jail_policy();
+        let parsed = run(&denied, "/usr/bin/true", &[]);
+        assert!(parsed.status.success(), "sandbox must parse: {parsed:?}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let port_text = port.to_string();
+        let args = ["-z", "-G", "1", "127.0.0.1", port_text.as_str()];
+        let allowed = run(&jail_policy(port), "/usr/bin/nc", &args);
+        assert!(
+            allowed.status.success(),
+            "explicit loopback port: {allowed:?}"
+        );
+        drop(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("the allowed process really connected"),
+        );
+
+        let blocked = run(&denied, "/usr/bin/nc", &args);
+        assert!(!blocked.status.success(), "no IP exception: {blocked:?}");
+        assert!(matches!(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
 
     /// A record on the terminal numbered 3, started at 1000.
     fn record() -> kproc::Record {

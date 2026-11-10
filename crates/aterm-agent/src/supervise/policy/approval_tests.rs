@@ -87,6 +87,20 @@ fn on_screen(rows: &[String], ctx: &ApprovalCtx) -> Decision {
     decide_screen(Some("claude"), rows, ctx).expect("a box on the screen")
 }
 
+#[test]
+fn a_kimi_read_only_shell_approval_is_approved_once() {
+    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::kimi::fixtures::BOX_SHELL_240);
+    let decision = decide_screen(Some("kimi"), &rows, &ctx()).expect("Kimi approval");
+    assert_eq!(approved(&decision), Some(RULE_READ_ONLY), "{decision:?}");
+    assert!(matches!(
+        decision,
+        Decision::Approve {
+            choice: Choice::Digit(1),
+            ..
+        }
+    ));
+}
+
 fn approved(d: &Decision) -> Option<&'static str> {
     match d {
         Decision::Approve { rule_id, .. } => Some(rule_id),

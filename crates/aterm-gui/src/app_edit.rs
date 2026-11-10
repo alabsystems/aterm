@@ -462,9 +462,7 @@ impl App {
             .iter()
             .find_map(|tab| {
                 tab.root
-                    .leaves()
-                    .into_iter()
-                    .any(|view| {
+                    .any_leaf(&mut |&view| {
                         self.view_store
                             .get(view)
                             .copied()
@@ -1097,9 +1095,7 @@ impl App {
             return false;
         };
         tab.root
-            .leaves()
-            .into_iter()
-            .any(|leaf| self.edit_view_attention(leaf))
+            .any_leaf(&mut |&leaf| self.edit_view_attention(leaf))
     }
 
     /// Clears `edit` attention marks on all views in `wid`'s active tab.

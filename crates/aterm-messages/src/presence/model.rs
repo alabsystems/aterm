@@ -16,6 +16,34 @@ pub struct AgentReading<V: Host> {
     pub phase: AgentPhase<V>,
     /// The context left, in percent, when the screen shows it.
     pub context_pct: Option<u8>,
+    /// The composer's contents, when the reader can prove them.
+    pub composer: ComposerState,
+}
+
+/// What an agent's composer contains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerState {
+    /// No typed or placeholder text.
+    Empty,
+    /// Placeholder text, not a person's draft.
+    Placeholder,
+    /// A person's unsent draft.
+    Draft,
+    /// No composer is drawn, or placeholder text cannot be told from a draft.
+    Unknown,
+}
+
+impl ComposerState {
+    /// The contract-v3 `composer=` wire word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Placeholder => "placeholder",
+            Self::Draft => "draft",
+            Self::Unknown => "-",
+        }
+    }
 }
 
 /// The worker's phase as the wire spells it.

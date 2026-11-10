@@ -20,7 +20,7 @@ pub fn account_pool_move_policy_model() -> Model {
             action Choose when (phase == 0) { phase = 1; }
             action Finish when (phase == 1) {
                 phase = 2;
-                line = if provider > 1 {if provider == 2 && Buggy == 22 {1} else {0}}
+                line = if provider == 2 {if provider == 2 && Buggy == 22 {1} else {0}}
                     else if case == 1 {if Buggy == 1 {0} else {1}}
                     else if case == 13 {if Buggy == 13 {0} else {1}}
                     else if case == 14 {if Buggy == 14 {0} else {1}}
@@ -35,7 +35,7 @@ pub fn account_pool_move_policy_model() -> Model {
                         || (case == 19 && Buggy == 23) || (case == 20 && Buggy == 24)
                         || (case == 21 && Buggy == 25) || (case == 22 && Buggy == 26)
                         || (case == 23 && Buggy == 27) || (case == 24 && Buggy == 28) {1} else {0};
-                committed = if provider > 1 {0}
+                committed = if provider == 2 {0}
                     else if (case == 1 || case == 13 || case == 14 || case == 15) && follows == 0 {
                     if case == 1 && Buggy == 20 {0} else {1}
                 } else if case == 2 && Buggy == 19 {1}
@@ -43,14 +43,14 @@ pub fn account_pool_move_policy_model() -> Model {
                     else if case == 23 && follows == 0 && Buggy == 29 {1} else {0};
             }
             invariant NoStaleLine: line == 0 || case == 1 || case == 13 || case == 14 || case == 15;
-            invariant CurrentMovesAllowed: phase <= 1 || provider > 1
+            invariant CurrentMovesAllowed: phase <= 1 || provider == 2
                 || (case > 1 && 13 > case) || case > 15 || line == 1;
             invariant RefusalChangesNoRotation: committed == 0
                 || case == 1 || case == 13 || case == 14 || case == 15;
-            invariant CurrentRotationCommitted: phase <= 1 || provider > 1 || follows == 1
+            invariant CurrentRotationCommitted: phase <= 1 || provider == 2 || follows == 1
                 || (case > 1 && 13 > case) || case > 15 || committed == 1;
             invariant FollowingDoesNotRotate: follows == 0 || committed == 0;
-            invariant UnmeasuredNeverMoves: provider == 1 || (line == 0 && committed == 0);
+            invariant UnmeasuredNeverMoves: provider == 1 || provider == 3 || (line == 0 && committed == 0);
         }
     }
 }

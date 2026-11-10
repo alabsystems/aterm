@@ -481,7 +481,7 @@ fn a_mac_that_left_the_vault_drops_its_desk_and_allows_nothing() {
     // m1's scratch home keeps its identity but holds no vault now: Commons reads no member.
     let gone = Paths::for_home(&root.path().join("m1"));
     assert!(Local::of(&gone).expect("readable").is_none());
-    follow_local(app.members.slot, &gone);
+    follow_local(app.members.slot, &gone, Local::of);
     app.refresh_member_rows();
     app.close_spent_phrase_sheet();
 
@@ -688,7 +688,7 @@ fn a_member_commons_control_leaves_out_keeps_its_desk() {
         "the member's Commons observation is control-excluded"
     );
     assert!(!left(&fixture.member), "a seated member has not left");
-    follow_local(app.members.slot, &fixture.member);
+    follow_local(app.members.slot, &fixture.member, Local::of);
     assert!(
         app.members.desk().is_some(),
         "the excluded member has a desk"
@@ -727,13 +727,13 @@ fn a_member_commons_control_leaves_out_keeps_its_desk() {
         left(&fixture.member),
         "a member with no pinned anchor has left"
     );
-    follow_local(app.members.slot, &fixture.member);
+    follow_local(app.members.slot, &fixture.member, Local::of);
     assert!(
         app.members.desk().is_none(),
         "the desk of a member with no pinned anchor is dropped"
     );
     std::fs::rename(&kept, &pin).expect("the pin put back");
-    follow_local(app.members.slot, &fixture.member);
+    follow_local(app.members.slot, &fixture.member, Local::of);
     assert!(
         app.members.desk().is_some(),
         "its desk is back with its pin"
@@ -742,7 +742,7 @@ fn a_member_commons_control_leaves_out_keeps_its_desk() {
     client::remove_member(&fixture.admin, "member", false).expect("the admin removes the member");
     client::sync(&fixture.member, None).expect("the member syncs its removal");
     assert!(left(&fixture.member), "a member its log removed has left");
-    follow_local(app.members.slot, &fixture.member);
+    follow_local(app.members.slot, &fixture.member, Local::of);
     assert!(app.members.desk().is_none(), "its desk is dropped");
     let unavailable = || match aterm_secrets::commons::observe(&fixture.member) {
         Ok(aterm_secrets::commons::Observation::Unavailable(why)) => Some(why),
@@ -816,6 +816,117 @@ fn the_lane_reads_the_vault_again_only_once_it_moved() {
         lane.look(slot);
     }
     assert_eq!(lane.reads, 2, "a Mac that left, its vault standing still");
+    fixture.server.stop();
+}
+
+/// A member a fault shaped (`Local::whole` false: a read that failed gave way to a default) shows
+/// on the desk, and the lane reads it again at every look while its vault stands still, where a
+/// whole member's is read once ([`the_lane_reads_the_vault_again_only_once_it_moved`]). Counted
+/// on a simulated clock, never timed.
+///
+/// NEGATIVE CONTROL (2026-11-09): with `follow_local` settling every member it read (`true` in
+/// place of `whole`), the three looks read once (`left: 1, right: 3`).
+#[test]
+fn a_member_a_fault_shaped_is_read_again_at_every_look() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = || SIMULATED.with(|now| now.set(Some(simulated() + LOCAL_EVERY)));
+    let mut lane = Lane {
+        of: |paths| Ok(Local::of(paths)?.map(|local| local.with_whole(false))),
+        ..Lane::new(fixture.member.clone(), simulated)
+    };
+    for _ in 0..3 {
+        lane.look(slot);
+        advance();
+    }
+    assert!(slot.lock().unwrap().is_some(), "the member's desk shows");
+    assert_eq!(lane.reads, 3);
+    fixture.server.stop();
+}
+
+/// Rewrite `paths`' `state.toml` by rename, as every writer of it does, with `text`.
+fn write_state(paths: &Paths, text: &str) {
+    let state = paths.dir.join("state.toml");
+    let next = state.with_extension("next");
+    std::fs::write(&next, text).expect("the next state");
+    std::fs::set_permissions(
+        &next,
+        std::fs::metadata(&state).expect("the state").permissions(),
+    )
+    .expect("the next state's mode");
+    std::fs::rename(&next, &state).expect("the next state renamed in");
+}
+
+/// [`Local::of`], then `state.toml` rewritten with its `requested` line moved: the state moving
+/// during the read, as an apply that fails partway through it moves it.
+fn of_moving_the_state(paths: &Paths) -> aterm_secrets::Result<Option<Local>> {
+    let local = Local::of(paths)?;
+    let text = std::fs::read_to_string(paths.dir.join("state.toml")).expect("the state");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("requested = "))
+        .unwrap_or_else(|| panic!("state.toml holds requested: {text}"));
+    let value: i64 = line["requested = ".len()..].parse().expect("a number");
+    write_state(
+        paths,
+        &text.replace(line, &format!("requested = {}", value + 60)),
+    );
+    Ok(local)
+}
+
+/// A read during which `state.toml` moved settles nothing, though the file holds what it held
+/// before the read once the read is done: the state is stamped by a digest of what it holds
+/// (`client::state_standing`), which can go from A to B and back to A, so a member read under B
+/// (an apply that failed partway through `Local::of`, its roster unread) is never kept under A's
+/// stamps. Here the read itself writes B, and A is written back after it; the next look reads
+/// again, and once read with nothing moving, the member stands. Counted on a simulated clock,
+/// never timed.
+///
+/// NEGATIVE CONTROL (2026-11-09): with `Lane::look` settling by the inputs taken before the read
+/// alone (no `desk_inputs` taken after it), the next look reads nothing (`a read during which the
+/// state moved is read again`, `left: 1, right: 2`).
+#[test]
+fn a_read_during_which_the_state_moved_and_came_back_is_read_again() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let before = std::fs::read_to_string(fixture.member.dir.join("state.toml")).expect("the state");
+    let standing = client::state_standing(&fixture.member).expect("the state's standing");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = || SIMULATED.with(|now| now.set(Some(simulated() + LOCAL_EVERY)));
+    let mut lane = Lane {
+        of: of_moving_the_state,
+        ..Lane::new(fixture.member.clone(), simulated)
+    };
+    lane.look(slot);
+    assert_eq!(lane.reads, 1);
+    assert!(
+        slot.lock().unwrap().is_some(),
+        "PRECONDITION: the member's desk"
+    );
+    assert_ne!(
+        client::state_standing(&fixture.member).expect("the state's standing"),
+        standing,
+        "PRECONDITION: the read moved the state"
+    );
+    write_state(&fixture.member, &before);
+    assert_eq!(
+        client::state_standing(&fixture.member).expect("the state's standing"),
+        standing,
+        "PRECONDITION: the state holds what it held before the read"
+    );
+    lane.of = Local::of;
+    advance();
+    lane.look(slot);
+    assert_eq!(
+        lane.reads, 2,
+        "a read during which the state moved is read again"
+    );
+    advance();
+    lane.look(slot);
+    assert_eq!(lane.reads, 2, "CONTROL: a read nothing moved during stands");
     fixture.server.stop();
 }
 

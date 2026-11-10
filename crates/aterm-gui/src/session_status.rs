@@ -4801,6 +4801,11 @@ impl crate::App {
             return Err(format!("no such session {session}"));
         };
         let enabled = self.config.tab_status_or_default();
+        let composer = self
+            .session_status
+            .agent_reading(session)
+            .1
+            .map_or("-", |reading| reading.composer.word());
         let hold = u8::from(pooled.ctx.fabric.hold().is_some());
         let hold_advisory = pooled
             .ctx
@@ -5102,7 +5107,7 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
-                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
+                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} composer={composer} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
                  {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
                  human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
@@ -5136,7 +5141,7 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
-             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
+             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} composer={composer} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
              {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
              human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \

@@ -13,6 +13,9 @@ use std::{
 use trust_resource_controller::{MetadataFile, MetadataPrepared, SealedMetadataRequest};
 use trust_resource_provenance::program::HeldProgram;
 
+#[path = "resource_admission_metadata/linker_lifeline.rs"]
+mod linker_lifeline;
+
 /// Keep the separately negotiated purpose through paid preparation. Sharing
 /// native input custody never converts a resolver query into metadata role 3.
 #[derive(Clone)]
@@ -173,6 +176,8 @@ pub(super) struct Inputs {
     prelude: crate::metadata_prelude::Owner,
     host_store: bool,
     linker: Option<trust_resource_controller::linker::Request>,
+    linker_lifeline: Option<linker_lifeline::Lifeline>,
+    linker_sdk: Option<OwnedFd>,
 }
 pub(super) struct Command {
     pub(super) command: spawnfd::Command,
@@ -191,6 +196,7 @@ pub(super) enum Preparation {
     Linker {
         request: trust_resource_controller::linker::Request,
         held: std::sync::Arc<HeldProgram>,
+        sdk: OwnedFd,
     },
 }
 impl Preparation {
@@ -209,7 +215,7 @@ impl Preparation {
                 held,
                 targets,
             } => prepare_native(command, held, targets, deadline),
-            Self::Linker { request, held } => prepare_linker(request, held, deadline),
+            Self::Linker { request, held, sdk } => prepare_linker(request, held, sdk, deadline),
         }
     }
 }
@@ -328,6 +334,8 @@ pub(super) fn prepare_with_held(
             prelude,
             host_store: false,
             linker: None,
+            linker_lifeline: None,
+            linker_sdk: None,
         },
     })
 }
@@ -355,12 +363,15 @@ pub(super) fn prepare_native(
             prelude,
             host_store: true,
             linker: None,
+            linker_lifeline: None,
+            linker_sdk: None,
         },
     })
 }
 fn prepare_linker(
     request: trust_resource_controller::linker::Request,
     held: std::sync::Arc<HeldProgram>,
+    sdk: OwnedFd,
     deadline: Instant,
 ) -> io::Result<Command> {
     request.validate()?;
@@ -376,6 +387,24 @@ fn prepare_linker(
         ));
     }
     held.validate(deadline)?;
+    // The caller cannot choose or duplicate the Host-only writer. Reject every
+    // reserved spelling before injecting our own single final-exec reader.
+    if request
+        .member
+        .command
+        .args
+        .iter()
+        .any(|arg| arg.starts_with(b"--resource-lifeline"))
+    {
+        return Err(refused("caller-supplied linker lifeline is not authorized"));
+    }
+    let lifeline = linker_lifeline::Lifeline::new()?;
+    let mut arguments = request.member.command.args.clone();
+    // Keep the recipe's final three worker caps as actual final options.
+    arguments.insert(
+        arguments.len() - 3,
+        linker_lifeline::ARGUMENT.as_bytes().to_vec(),
+    );
     let mut command = spawnfd::command(held.program());
     command
         .env_clear()
@@ -388,14 +417,7 @@ fn prepare_linker(
                 .map(|(key, value)| (OsStr::from_bytes(key), OsStr::from_bytes(value))),
         )
         .envs(held.runtime_environment()?)
-        .args(
-            request
-                .member
-                .command
-                .args
-                .iter()
-                .map(|arg| OsStr::from_bytes(arg)),
-        )
+        .args(arguments.iter().map(|arg| OsStr::from_bytes(arg)))
         .current_dir(OsStr::from_bytes(&request.member.command.cwd));
     let cpu = request
         .member
@@ -403,7 +425,11 @@ fn prepare_linker(
         .cpu
         .ok_or(io::ErrorKind::InvalidData)?
         .target;
-    let (prelude, command) = crate::metadata_prelude::Owner::new(&command, &[cpu], deadline)?;
+    let (prelude, command) = crate::metadata_prelude::Owner::new(
+        &command,
+        &[cpu, linker_lifeline::TARGET, linker_lifeline::SDK_TARGET],
+        deadline,
+    )?;
     Ok(Command {
         command,
         inputs: Inputs {
@@ -412,6 +438,8 @@ fn prepare_linker(
             prelude,
             host_store: false,
             linker: Some(request),
+            linker_lifeline: Some(lifeline),
+            linker_sdk: Some(sdk),
         },
     })
 }
@@ -424,6 +452,20 @@ pub(super) struct Resources {
     pub(super) _compiler: Option<compiler::Selection>,
     pub(super) _primary: Option<std::sync::Arc<workload::Primary>>,
     pub(super) _output: Option<std::sync::Arc<workload::OutputLocks>>,
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+impl Resources {
+    pub(super) fn close_linker_lifeline(&mut self) -> bool {
+        let Some(lifeline) = self
+            .inputs
+            .as_mut()
+            .and_then(|inputs| inputs.linker_lifeline.as_mut())
+        else {
+            return false;
+        };
+        lifeline.close();
+        true
+    }
 }
 impl member::MemberResources for Resources {
     fn take_producer_inputs(&mut self) -> io::Result<Option<member_custody::ProducerInputs>> {
@@ -444,6 +486,22 @@ impl member::MemberResources for Resources {
                 extra.push((crate::runtime::workload_store_description()?, 7));
             }
             if inputs.linker.is_some() {
+                extra.push(
+                    inputs
+                        .linker_lifeline
+                        .as_mut()
+                        .ok_or_else(|| refused("linker host lifeline missing"))?
+                        .extra()?,
+                );
+                // Close-only SAME original Host lease, retained by the payload
+                // after Host/parent loss. No SDK locator or grant is exported.
+                extra.push((
+                    inputs
+                        .linker_sdk
+                        .take()
+                        .ok_or_else(|| refused("linker original SDK guard missing"))?,
+                    linker_lifeline::SDK_TARGET as i32,
+                ));
                 self.scheduling.configure_linker(command, extra)?;
             } else {
                 self.scheduling.configure_with_extra(command, extra)?;

@@ -27,7 +27,6 @@ const COLD_SHOTS: usize = 24;
 const COLD_GAP: Duration = Duration::from_millis(100);
 const CAT_SLOT: Duration = Duration::from_millis(250);
 const CAT_TAIL: Duration = Duration::from_secs(1);
-const PLANE_DECAY: Duration = Duration::from_secs(1);
 const COMPANION_STILLS: usize = 3;
 /// The plane's caret row and column, zero-based (`ESC [10;10H`, [`PLANE_ROW`]).
 const PLANE_CARET: &str = "9";
@@ -193,6 +192,7 @@ fn run_take(
     sampler: &Sampler,
     budget: Budget,
 ) -> Result<Take, CouldNotRun> {
+    let mut timing = Timing::default();
     let started = Instant::now();
     let world = World::prepare(root, &config_head(row))
         .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
@@ -205,7 +205,7 @@ fn run_take(
     }
     let alt_wait_ms = stage_scene(rig, &inst, row.scene)?;
     if row.companion.is_some() || row.scene == Scene::Plane {
-        stage_plane(&inst)?;
+        stage_plane(&inst, &mut timing, Plane::Fresh)?;
     }
     let (cell, typed_row) = cell_of(ctl, row)?;
     if row.scene == Scene::ColdStreamer {
@@ -217,9 +217,9 @@ fn run_take(
     let staging_s = staged.elapsed().as_secs_f64();
     let captured = Instant::now();
     let capture = match row.capture {
-        Capture::PinnedVideo => capture_video(ctl, row, sampler)?,
+        Capture::PinnedVideo => capture_video(ctl, row, sampler, &mut timing)?,
         Capture::UnpinnedFocused | Capture::UnpinnedUnfocused => {
-            capture_burst(&inst, row, sampler)?
+            capture_burst(&inst, row, sampler, &mut timing)?
         }
     };
     let capture_s = captured.elapsed().as_secs_f64();
@@ -258,12 +258,9 @@ fn run_take(
     };
     let shape = judge(row, &ledger, &scan)?;
     let typed_gap_ms = typed_gaps(&capture.frames_dir, &capture.typed_shots);
-    eprintln!(
-        "measure setup: paint scene={:?} launch_s={launch_s:.6} staging_s={staging_s:.6} capture_s={capture_s:.6} scan_s={:.6}",
-        row.scene,
-        scanned.elapsed().as_secs_f64()
-    );
-    Ok(Take {
+    let scan_s = scanned.elapsed().as_secs_f64();
+    let replay = Instant::now();
+    let take = Take {
         backend,
         scan,
         ledger,
@@ -274,7 +271,45 @@ fn run_take(
         band: inst.band.clone(),
         checks: super::instance::replay_checks(ctl),
         subject_gpu: SubjectGpu::of_metrics(&metrics),
-    })
+    };
+    let replay_s = replay.elapsed().as_secs_f64();
+    let stop = Instant::now();
+    drop(inst);
+    eprintln!(
+        "measure setup: paint scene={:?} launch_s={launch_s:.6} staging_s={staging_s:.6} capture_s={capture_s:.6} scan_s={scan_s:.6} replay_s={replay_s:.6} stop_s={:.6} plane_wait_s={:.6} image_s={:.6} status_s={:.6} key_s={:.6} pacing_s={:.6} video_first_s={:.6} video_join_s={:.6} images={}",
+        row.scene,
+        stop.elapsed().as_secs_f64(),
+        timing.plane.as_secs_f64(),
+        timing.image.as_secs_f64(),
+        timing.status.as_secs_f64(),
+        timing.key.as_secs_f64(),
+        timing.pacing.as_secs_f64(),
+        timing.video_first.as_secs_f64(),
+        timing.video_join.as_secs_f64(),
+        timing.images,
+    );
+    Ok(take)
+}
+
+/// Driver wall spans. Capture subspans are nested inside capture_s, not extra row time;
+/// image_s includes the subject's render/readback/PNG completion fence and CLI transport.
+#[derive(Default)]
+struct Timing {
+    plane: Duration,
+    image: Duration,
+    status: Duration,
+    key: Duration,
+    pacing: Duration,
+    video_first: Duration,
+    video_join: Duration,
+    images: usize,
+}
+
+fn timed<T>(total: &mut Duration, action: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = action();
+    *total += started.elapsed();
+    result
 }
 
 /// A kept take's ledger beside its frames, so the take can become a scanner fixture:
@@ -381,10 +416,31 @@ fn stage_scene(rig: &Rig, inst: &Instance, scene: Scene) -> Result<u64, CouldNot
     Ok(waited)
 }
 
+/// Whether the plane precedes the take's first typed characters or follows them.
+#[derive(Clone, Copy)]
+enum Plane {
+    Fresh,
+    AfterTyping,
+}
+
+fn settle_plane(
+    plane: Plane,
+    fresh: impl FnOnce() -> Result<(), CouldNotRun>,
+    decay: impl FnOnce(),
+) -> Result<(), CouldNotRun> {
+    match plane {
+        Plane::Fresh => fresh(),
+        Plane::AfterTyping => {
+            decay();
+            Ok(())
+        }
+    }
+}
+
 /// Stage [`plane`] and wait for its caret. A plane that does not come names the caret's last
 /// reading, and [`with_screen`] the whole screen: the plane's caret row is near the top, above the
 /// rows [`scene_missed`] shows.
-fn stage_plane(inst: &Instance) -> Result<(), CouldNotRun> {
+fn stage_plane(inst: &Instance, timing: &mut Timing, origin: Plane) -> Result<(), CouldNotRun> {
     let ctl = &inst.ctl;
     ctl.ok(&["send", &plane()])?;
     ctl.ok(&["key", "enter"])?;
@@ -402,8 +458,43 @@ fn stage_plane(inst: &Instance) -> Result<(), CouldNotRun> {
         let e = e.map(|why| format!("{why} (the caret last read: {})", last.trim()));
         with_screen(inst, e, &["text"], "the screen")
     })?;
-    std::thread::sleep(PLANE_DECAY);
+    timed(&mut timing.plane, || {
+        settle_plane(
+            origin,
+            || {
+                // A fresh instance has seen only bulk send and enter, not typed characters.
+                // Prove that no previous trail exists instead of spending its decay interval.
+                let first = ctl.ok(&["trail", "status"])?;
+                if plane_dark(&first)? {
+                    return Ok(());
+                }
+                ctl.await_event("the fresh plane being dark", || {
+                    let reply = ctl.call(&["trail", "status"]);
+                    (reply.ok() && plane_dark(reply.line()) == Ok(true)).then_some(())
+                })
+            },
+            || {
+                // A headless trail status is the last rendered state. Polling it does not
+                // advance decay after typing; keep the interval before the next still.
+                std::thread::sleep(Duration::from_secs(1));
+            },
+        )
+    })?;
     Ok(())
+}
+
+fn plane_dark(line: &str) -> Result<bool, CouldNotRun> {
+    let mut dark = true;
+    for (key, quiet) in [
+        ("ribbon_active", "false"),
+        ("sparks", "0"),
+        ("glow_active", "false"),
+    ] {
+        let value = field(line, key)
+            .ok_or_else(|| CouldNotRun::Unanswered(format!("trail status lacks {key}: {line}")))?;
+        dark &= value == quiet;
+    }
+    Ok(dark)
 }
 
 /// The cell `dims` reports, and on the plane the typed row's place on the frames: the grid's
@@ -502,21 +593,28 @@ fn elapsed_ms(reply: &str) -> Option<i64> {
     field(reply, "elapsed_ms").and_then(|v| v.parse().ok())
 }
 
-fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Captured, CouldNotRun> {
+fn capture_video(
+    ctl: &Ctl,
+    row: &PaintRow,
+    sampler: &Sampler,
+    timing: &mut Timing,
+) -> Result<Captured, CouldNotRun> {
     sampler.open_window();
     let secs = row.record_secs().to_string();
     let recorder = {
         let ctl = ctl.clone();
         std::thread::spawn(move || ctl.call(&["video", &secs, "full", "pace"]))
     };
-    let opened = ctl.await_event("the recording's first frame", || {
-        if recorder.is_finished() {
-            return Some(None);
-        }
-        let line = ctl.call(&["video", "status"]).line().to_string();
-        (field(&line, "recording") == Some("true")
-            && uint_field(&line, "frames").is_some_and(|n| n >= 1))
-        .then_some(Some(line))
+    let opened = timed(&mut timing.video_first, || {
+        ctl.await_event("the recording's first frame", || {
+            if recorder.is_finished() {
+                return Some(None);
+            }
+            let line = ctl.call(&["video", "status"]).line().to_string();
+            (field(&line, "recording") == Some("true")
+                && uint_field(&line, "frames").is_some_and(|n| n >= 1))
+            .then_some(Some(line))
+        })
     });
     let mut driven_ms = None;
     if let Ok(Some(opened)) = &opened
@@ -525,15 +623,14 @@ fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
         let lo = elapsed_ms(opened);
         for (i, key) in row.keys().iter().enumerate() {
             if i > 0 {
-                std::thread::sleep(VIDEO_KEY_GAP);
+                timed(&mut timing.pacing, || std::thread::sleep(VIDEO_KEY_GAP));
             }
-            let _ = ctl.call(&["key", key]);
+            let _ = timed(&mut timing.key, || ctl.call(&["key", key]));
         }
         let hi = elapsed_ms(ctl.call(&["video", "status"]).line());
         driven_ms = lo.zip(hi);
     }
-    let reply = recorder
-        .join()
+    let reply = timed(&mut timing.video_join, || recorder.join())
         .map_err(|_| CouldNotRun::Refused("the recording thread panicked".into()))?;
     sampler.close_window();
     if opened?.is_none() && !row.keys.is_empty() {
@@ -580,9 +677,10 @@ struct Burst<'a> {
 }
 
 impl Burst<'_> {
-    fn shot(&mut self) -> Result<(), CouldNotRun> {
+    fn shot(&mut self, timing: &mut Timing) -> Result<(), CouldNotRun> {
         let name = format!("shot_{:04}.png", self.shots);
-        let reply = self.ctl.ok(&["image", &name])?;
+        let reply = timed(&mut timing.image, || self.ctl.ok(&["image", &name]))?;
+        timing.images += 1;
         let mut parts = reply.splitn(4, ' ');
         let path = match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("OK"), Some(_), Some(_), Some(path)) => PathBuf::from(path),
@@ -591,7 +689,7 @@ impl Burst<'_> {
         if self.dir.is_none() {
             self.dir = path.parent().map(Path::to_path_buf);
         }
-        let status = self.ctl.ok(&["trail", "status"])?;
+        let status = timed(&mut timing.status, || self.ctl.ok(&["trail", "status"]))?;
         if !status.starts_with("trail ") {
             return could_not_run(format!("ctl trail status answered no row ({status})"));
         }
@@ -605,6 +703,7 @@ fn capture_burst(
     inst: &Instance,
     row: &PaintRow,
     sampler: &Sampler,
+    timing: &mut Timing,
 ) -> Result<Captured, CouldNotRun> {
     let ctl = &inst.ctl;
     sampler.open_window();
@@ -614,56 +713,56 @@ fn capture_burst(
         dir: None,
         rows: Vec::new(),
     };
-    burst.shot()?;
+    burst.shot(timing)?;
     let keys = row.keys();
     let mut typed_shots = Vec::with_capacity(keys.len());
     if keys.is_empty() {
         for _ in 0..COLD_SHOTS {
-            burst.shot()?;
-            std::thread::sleep(COLD_GAP);
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(COLD_GAP));
         }
     } else if row.companion == Some(Companion::Cat) {
         let mut tail_end = Instant::now();
         for key in &keys {
             let slot = Instant::now();
             tail_end = slot + CAT_TAIL;
-            let _ = ctl.call(&["key", key]);
+            let _ = timed(&mut timing.key, || ctl.call(&["key", key]));
             typed_shots.push(burst.shots);
-            burst.shot()?;
+            burst.shot(timing)?;
             if slot.elapsed() < CAT_SLOT / 2 {
-                std::thread::sleep(BURST_GAP);
-                burst.shot()?;
+                timed(&mut timing.pacing, || std::thread::sleep(BURST_GAP));
+                burst.shot(timing)?;
             }
-            pace_until(slot + CAT_SLOT);
+            timed(&mut timing.pacing, || pace_until(slot + CAT_SLOT));
         }
         for _ in 0..TAIL_SHOTS {
-            burst.shot()?;
-            std::thread::sleep(TAIL_GAP);
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(TAIL_GAP));
             if Instant::now() >= tail_end {
                 break;
             }
         }
     } else {
         for key in &keys {
-            let _ = ctl.call(&["key", key]);
+            let _ = timed(&mut timing.key, || ctl.call(&["key", key]));
             typed_shots.push(burst.shots);
-            burst.shot()?;
-            std::thread::sleep(BURST_GAP);
-            burst.shot()?;
-            std::thread::sleep(BURST_GAP);
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(BURST_GAP));
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(BURST_GAP));
         }
         for _ in 0..TAIL_SHOTS {
-            burst.shot()?;
-            std::thread::sleep(TAIL_GAP);
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(TAIL_GAP));
         }
     }
     if row.companion.is_some() && !keys.is_empty() {
         ctl.ok(&["key", "ctrl+c"])?;
         ctl.ok(&["await", "match", r"^\$.?$", "timeout=60000"])?;
-        stage_plane(inst)?;
+        stage_plane(inst, timing, Plane::AfterTyping)?;
         for _ in 0..COMPANION_STILLS {
-            burst.shot()?;
-            std::thread::sleep(TAIL_GAP);
+            burst.shot(timing)?;
+            timed(&mut timing.pacing, || std::thread::sleep(TAIL_GAP));
         }
     }
     sampler.close_window();
@@ -694,4 +793,48 @@ fn typed_gaps(dir: &Path, typed: &[usize]) -> Option<(u64, u64)> {
     gaps.sort_unstable();
     let worst = *gaps.last()?;
     Some((gaps[gaps.len().div_ceil(2) - 1], worst))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_plane_uses_its_fence_and_a_typed_plane_keeps_its_decay() {
+        let used = std::cell::RefCell::new(Vec::new());
+        for plane in [Plane::Fresh, Plane::AfterTyping] {
+            settle_plane(
+                plane,
+                || {
+                    used.borrow_mut().push("fence");
+                    Ok(())
+                },
+                || used.borrow_mut().push("decay"),
+            )
+            .unwrap();
+        }
+        assert_eq!(*used.borrow(), ["fence", "decay"]);
+        assert!(
+            settle_plane(
+                Plane::Fresh,
+                || could_not_run("no evidence"),
+                || panic!("a delay must not replace the fence")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plane_settle_needs_every_live_trail_component_dark() {
+        let quiet = "trail ribbon_active=false sparks=0 glow_active=false pet_active=true licensed=100 spawns=100";
+        assert_eq!(plane_dark(quiet), Ok(true));
+        for (old, new) in [
+            ("ribbon_active=false", "ribbon_active=true"),
+            ("sparks=0", "sparks=1"),
+            ("glow_active=false", "glow_active=true"),
+        ] {
+            assert_eq!(plane_dark(&quiet.replace(old, new)), Ok(false));
+            assert!(plane_dark(&quiet.replace(old, "")).is_err());
+        }
+    }
 }

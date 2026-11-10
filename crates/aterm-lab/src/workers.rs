@@ -1867,11 +1867,7 @@ mod tests {
 
     #[test]
     fn a_bounded_read_takes_a_short_file_and_refuses_a_long_one() {
-        let d = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-workers-read-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::TestScratch::new("workers");
         let f = d.join("b1.output");
         std::fs::write(&f, "@s-1 rev=2 state=done\n").unwrap();
         assert_eq!(
@@ -1882,7 +1878,6 @@ mod tests {
         let link = d.join("link.output");
         std::os::unix::fs::symlink(&f, &link).unwrap();
         assert!(read_bounded(&link, 64).is_err(), "a link is not followed");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -625,6 +625,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
+    let mut phases = super::instance::Phases::new(format!("row=spin scene={:?}", row.scene));
     super::instance::first_exec(&rig.fake_tui)?;
     let budget = Budget::from_now(if row.scene.pet() {
         PET_BUDGET_SECS
@@ -661,6 +662,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         Instance::launch(&rig.aterm, &world, budget)?
     };
     let ctl = &inst.ctl;
+    phases.end("launch");
     if row.scene.pet() {
         prepare_pet_focus(ctl)?;
     }
@@ -694,6 +696,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             return could_not_run(format!("the Rewind view did not open ({open})"));
         }
     }
+    phases.end("settle");
     ctl.ok(&["metrics", "reset"])?;
     // Window events count from the reset, and the owners' fires from the metrics read after the
     // pet: what an event before the reset left the pet doing (its fade back in, its gaze's heat)
@@ -716,12 +719,14 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         ctl.ok(&["send", &launch])?;
         ctl.ok(&["key", "enter"])?;
     }
+    phases.end("open");
     let sampled = if row.scene.windowed() {
         sample(inst.pid(), row.window)?
     } else {
         std::thread::sleep(row.window);
         None
     };
+    phases.end("samples");
     let mut reasons = None;
     if row.scene == SpinScene::ClaudeShaped {
         let modes = ctl.ok(&["modes"])?;
@@ -817,7 +822,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         )
     })
     .collect();
-    Ok(SpinReport {
+    let report = SpinReport {
         row: *row,
         sampled,
         past_deadline_arms: arms,
@@ -849,7 +854,11 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         needle,
         deck_clock,
         checks: super::instance::replay_checks(ctl),
-    })
+    };
+    phases.end("fences");
+    drop(inst);
+    phases.end("stop");
+    Ok(report)
 }
 
 #[cfg(test)]

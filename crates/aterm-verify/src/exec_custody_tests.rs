@@ -52,6 +52,7 @@ impl Owned {
     fn start(alias: &str) -> io::Result<Self> {
         let directory = aterm_tempfile::Builder::new()
             .prefix("vg")
+            .suffix(".noindex")
             .tempdir_in("/tmp")?;
         let command = Cmd::new(std::env::current_exe()?).args([
             "--exact",

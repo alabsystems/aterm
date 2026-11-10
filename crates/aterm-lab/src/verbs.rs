@@ -2065,11 +2065,7 @@ mod tests {
 
     #[test]
     fn both_headers_verbs_writes_stand_in_the_one_file() {
-        let d = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-verbs-headers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::TestScratch::new("headers");
         let p = d.join("headers.json");
         let read = || {
             J::parse(&std::fs::read_to_string(&p).unwrap())
@@ -2082,7 +2078,6 @@ mod tests {
         let both = read();
         atomic_write(&p, flat.as_bytes()).unwrap();
         let over = read();
-        let _ = std::fs::remove_dir_all(&d);
         assert_eq!(
             both,
             r#"{"on429": {"a": "1"}, "x-codex-primary-used-percent": "76.0"}"#

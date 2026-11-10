@@ -272,6 +272,12 @@ pub(crate) fn plan(
     let reverse = graph.reverse_packages(&ctx.root, &member_packages);
     let mut packages = Vec::new();
     for (spec, dir) in member_packages {
+        if ctx.input_paths.is_some()
+            && (crate::scope::spec_name(&spec).is_none_or(|name| ctx.scope.spec_of(name).is_none())
+                || matches!(&ctx.scope, crate::Scope::Changed(changed) if !changed.linted().any(|selected| selected == &spec)))
+        {
+            continue;
+        }
         let (evidence, package_commands) = match commands(&spec) {
             Ok(package_commands) => (
                 builder.evidence(&spec, &dir, &package_commands),
@@ -350,11 +356,15 @@ impl<'a> EvidenceBuilder<'a> {
         let package = declared_package(&self.ctx.root, dir)?;
         let closure = self.graph.closure(&package.root)?;
         let mut hash = aterm_digest::Sha256::new();
-        part(&mut hash, b"domain", b"aterm-lint-package-content-v1");
+        part(&mut hash, b"domain", b"aterm-lint-package-content-v2");
         part(&mut hash, b"spec", spec.as_bytes());
         part(&mut hash, b"carry-context", context.as_bytes());
         part(&mut hash, b"verifier", verifier.as_bytes());
-        part(&mut hash, b"locked-metadata", self.graph.digest.as_bytes());
+        part(
+            &mut hash,
+            b"locked-metadata",
+            self.graph.package_metadata(&closure)?.as_bytes(),
+        );
         let workspace_manifests = self
             .workspace_manifests
             .get_or_init(|| self.graph.workspace_manifests_digest())
@@ -535,11 +545,11 @@ struct MetadataNode {
     dependencies: Vec<String>,
 }
 
-/// The one locked graph all package keys bind. Besides supplying dependency closures, its full
-/// digest binds resolver.feature-unification="workspace": an unrelated member's feature change
-/// can otherwise change a selected package's compiler unit.
+/// The locked graph supplies source closures and resolved node features. Each package key
+/// binds its projection, including features unified by otherwise unrelated workspace members.
 struct CargoGraph {
     digest: String,
+    metadata: Option<aterm_json::Value>,
     workspace: BTreeSet<String>,
     packages: BTreeMap<String, MetadataPackage>,
     nodes: BTreeMap<String, Vec<String>>,
@@ -605,6 +615,7 @@ impl CargoGraph {
         part(&mut digest, b"locked-metadata-json", text.as_bytes());
         Ok(Self {
             digest: aterm_codec::hex::encode_lower(&digest.finalize()),
+            metadata: Some(aterm_json::from_str(text).map_err(|e| e.to_string())?),
             workspace,
             packages,
             nodes,
@@ -725,9 +736,49 @@ impl CargoGraph {
                 b"workspace-manifest",
                 &os_bytes(manifest.as_os_str()),
             );
-            hash_tree(&mut hash, manifest, manifest)?;
+            // Dependency manifests are hashed in the package's source closure. Outside that
+            // closure only feature resolution can affect this compilation; package_metadata
+            // binds Cargo's resolved features, including workspace feature unification.
+            let text = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
+            let mut value: aterm_toml::Value =
+                aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+            remove_field(&mut value, &["package", "version"]);
+            part(
+                &mut hash,
+                b"manifest-settings",
+                aterm_toml::to_string(&value)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            );
         }
         Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
+    }
+
+    fn package_metadata(&self, closure: &[PathBuf]) -> Result<String, String> {
+        let Some(metadata) = &self.metadata else {
+            return Ok(self.digest.clone());
+        };
+        let ids: BTreeSet<_> = closure
+            .iter()
+            .filter_map(|root| self.member_by_root.get(root).cloned())
+            .collect();
+        let mut projection = Vec::new();
+        for field in ["packages", "resolve"] {
+            let rows = if field == "packages" {
+                &metadata[field]
+            } else {
+                &metadata[field]["nodes"]
+            };
+            let rows = rows
+                .as_array()
+                .ok_or_else(|| format!("metadata has no {field} rows"))?;
+            for row in rows {
+                if row["id"].as_str().is_some_and(|id| ids.contains(id)) {
+                    projection.push(row.clone());
+                }
+            }
+        }
+        aterm_json::to_string(&projection).map_err(|e| e.to_string())
     }
 }
 
@@ -753,14 +804,47 @@ fn hash_global_files(
 ) -> Result<(), String> {
     for file in [
         "Cargo.toml",
-        "Cargo.lock",
         "rust-toolchain",
         "rust-toolchain.toml",
         "trust.lock",
         "clippy.toml",
         ".clippy.toml",
     ] {
-        hash_optional_file(hash, b"workspace-global", &ctx.root.join(file))?;
+        if file == "Cargo.toml" {
+            // Cargo.lock is represented by successfully resolved locked metadata. Bounded
+            // closures are entirely workspace-local, so there is no omitted registry checksum.
+            // Only the product version can leave the root manifest projection: all other
+            // settings stay exact, and any closure inheriting the version retains it too.
+            let text = std::fs::read_to_string(ctx.root.join(file)).map_err(|e| e.to_string())?;
+            let mut value: aterm_toml::Value =
+                aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+            let inherits_version = source_roots.iter().any(|root| {
+                std::fs::read_to_string(root.join("Cargo.toml"))
+                    .ok()
+                    .and_then(|text| aterm_toml::from_str::<aterm_toml::Value>(&text).ok())
+                    .map(|value| {
+                        value
+                            .get("package")
+                            .and_then(|v| v.get("version"))
+                            .and_then(|v| v.get("workspace"))
+                            .and_then(aterm_toml::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true)
+            });
+            if !inherits_version {
+                remove_field(&mut value, &["workspace", "package", "version"]);
+            }
+            part(
+                hash,
+                b"workspace-global",
+                aterm_toml::to_string(&value)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            );
+        } else {
+            hash_optional_file(hash, b"workspace-global", &ctx.root.join(file))?;
+        }
     }
 
     let allowed_tools = allowed_compiler_tools(ctx, tippy, &package.tools)?;
@@ -844,6 +928,22 @@ fn hash_global_files(
         hash_clippy_directory(hash, &directory)?;
     }
     Ok(())
+}
+
+fn remove_field(value: &mut aterm_toml::Value, path: &[&str]) {
+    let Some((name, tail)) = path.split_first() else {
+        return;
+    };
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    let Some(mut child) = table.remove(name) else {
+        return;
+    };
+    if !tail.is_empty() {
+        remove_field(&mut child, tail);
+        table.insert((*name).into(), child);
+    }
 }
 
 const TOOL_ENV_SELECTORS: [&str; 6] = [
@@ -1881,6 +1981,7 @@ mod tests {
         let package_root = package_root.canonicalize().unwrap();
         let graph = CargoGraph {
             digest: "22".repeat(32),
+            metadata: None,
             workspace: BTreeSet::from([id.clone()]),
             packages: BTreeMap::from([(
                 id.clone(),
@@ -2004,6 +2105,7 @@ mod tests {
         std::fs::write(&clippy, "msrv = '1.80'\n").unwrap();
         let graph = CargoGraph {
             digest: "00".repeat(32),
+            metadata: None,
             workspace: BTreeSet::new(),
             packages: BTreeMap::new(),
             nodes: BTreeMap::new(),
@@ -2032,9 +2134,13 @@ mod tests {
 
         std::fs::write(&manifest, "[package]\nname='p'\nversion='0.0.1'\n").unwrap();
         let manifest_changed = capture();
-        assert_ne!(
+        assert_eq!(
             source_changed.0, manifest_changed.0,
-            "fresh common snapshot"
+            "an unrelated package version is not a common compiler input"
+        );
+        assert_ne!(
+            source_changed.1, manifest_changed.1,
+            "a package's own version stays in its source closure"
         );
         assert_eq!(
             source_changed.2, manifest_changed.2,

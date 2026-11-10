@@ -18,9 +18,9 @@
 //! retry's detail or a queued message's block between it and the border; the turn's end takes it
 //! away and leaves a blank row there ([`phase`]). An approval, a question, a plan, the trust
 //! prompt and the session picker are drawn in the composer's place and wait on the person. The
-//! first four are boxes a tool or a launch raised: each is a prompt, read as a box for display
-//! ([`prompt`]) and answered by no one here, since Kimi Code is read, not supervised. The session
-//! picker is the person's own and decides nothing. Other widths are unmeasured.
+//! first four are boxes a tool or a launch raised: each is read whole by [`prompt`] for the
+//! supervisor's policy. The session picker is the person's own and decides nothing. Other widths
+//! are unmeasured.
 
 use crate::phase::Phase;
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
@@ -30,7 +30,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 18, "0.18");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 19, "0.19");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -182,6 +182,158 @@ pub fn composer(rows: &[String]) -> Option<(usize, Vec<String>)> {
         lines.push(crate::text::trim(inner.strip_suffix('│').unwrap_or(inner)).to_string());
     }
     Some((caret, lines))
+}
+
+fn reply_rows(rows: &[String]) -> usize {
+    composer_rows(rows).map_or(rows.len(), |(top, _, _)| top)
+}
+
+fn last_reply(rows: &[String]) -> Option<usize> {
+    rows[..reply_rows(rows)]
+        .iter()
+        .rposition(|row| crate::text::trim_start(row).starts_with('●'))
+}
+
+fn last_user(rows: &[String], before: usize) -> Option<usize> {
+    rows[..before]
+        .iter()
+        .rposition(|row| crate::text::trim_start(row).starts_with('❯'))
+}
+
+fn reply_block(rows: &[String], start: usize, end: usize) -> String {
+    rows[start..end]
+        .iter()
+        .enumerate()
+        .filter_map(|(at, row)| {
+            let text = crate::text::trim(row);
+            if text.is_empty() {
+                return None;
+            }
+            Some(if at == 0 {
+                crate::text::trim_start(text.strip_prefix('●').unwrap_or(text)).to_string()
+            } else {
+                text.to_string()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The worker's last reply above the composer, continuation rows included.
+#[must_use]
+pub fn said_tail(rows: &[String]) -> Option<String> {
+    let at = last_reply(rows)?;
+    Some(reply_block(rows, at, reply_rows(rows)))
+}
+
+/// Whether the last reply's header is visible.
+#[must_use]
+pub fn said_whole(rows: &[String]) -> bool {
+    last_reply(rows).is_some()
+}
+
+/// Earlier replies in the same user turn, oldest first.
+#[must_use]
+pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
+    let last = last_reply(rows)?;
+    let user = last_user(rows, last);
+    let mut replies: Vec<(usize, String)> = rows[..last]
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| crate::text::trim_start(row).starts_with('●'))
+        .map(|(at, _)| (at, String::new()))
+        .collect();
+    let start = user.map_or(0, |at| at + 1);
+    replies.retain(|(at, _)| *at >= start);
+    if replies.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (index, (at, _)) in replies.iter().enumerate() {
+        let end = replies.get(index + 1).map_or(last, |next| next.0);
+        out.push(reply_block(rows, *at, end));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The last reply's earlier text in the same turn, joined.
+#[must_use]
+pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    turn_messages_before(rows).map(|messages| crate::reader::join_messages(&messages))
+}
+
+/// Whether this turn used a tool, as Kimi draws command execution.
+#[must_use]
+pub fn turn_ran_tools(rows: &[String]) -> bool {
+    rows[..reply_rows(rows)].iter().any(|row| {
+        let text = crate::text::trim_start(row);
+        text.starts_with("● Running a command") || text.starts_with("✗ Ran a command")
+    })
+}
+
+/// Whether the last user message stands above the last reply.
+#[must_use]
+pub fn turn_opens_above(rows: &[String]) -> bool {
+    let Some(reply) = last_reply(rows) else {
+        return false;
+    };
+    last_user(rows, reply).is_some_and(|user| user < reply)
+}
+
+/// The user message that opened the last turn.
+#[must_use]
+pub fn turn_opened_by(rows: &[String]) -> Option<String> {
+    let reply = last_reply(rows).unwrap_or(reply_rows(rows));
+    let user = last_user(rows, reply)?;
+    Some(
+        crate::text::trim_start(&rows[user])
+            .strip_prefix('❯')
+            .map(str::trim_start)
+            .unwrap_or(&rows[user])
+            .to_string(),
+    )
+}
+
+/// Whether the last user turn was interrupted, as drawn after the last reply.
+#[must_use]
+pub fn interrupted(rows: &[String]) -> bool {
+    let reply = last_reply(rows).unwrap_or(reply_rows(rows));
+    let user = last_user(rows, reply).unwrap_or(0);
+    rows[user..reply_rows(rows)]
+        .iter()
+        .any(|row| crate::text::trim(row) == const { crate::anchor!("kimi.turn.interrupted") })
+}
+
+/// Whether no user message has been sent in this session.
+#[must_use]
+pub fn fresh(rows: &[String]) -> bool {
+    last_user(rows, reply_rows(rows)).is_none()
+}
+
+/// Whether the launch card and one opening exchange are visible.
+#[must_use]
+pub fn opening(rows: &[String]) -> bool {
+    let end = reply_rows(rows);
+    let user = |row: &String| crate::text::trim_start(row).starts_with('❯');
+    let Some(first) = rows[..end].iter().position(user) else {
+        return false;
+    };
+    !rows[first + 1..end].iter().any(user)
+        && rows[..first]
+            .iter()
+            .any(|row| crate::text::contains(row, const { crate::anchor!("kimi.welcome") }))
+}
+
+/// Whether a user message is visible.
+#[must_use]
+pub fn message_drawn(rows: &[String]) -> bool {
+    last_user(rows, reply_rows(rows)).is_some()
+}
+
+/// What Esc does on a card [`prompt`] read.
+#[must_use]
+pub fn esc(prompt: &PromptV2) -> Option<crate::prompt::CancelEffect> {
+    prompt.cancel.as_ref().map(|cancel| cancel.effect)
 }
 
 /// Whether `row` is Kimi Code's spinner row (measured on 2.4.0's busy frames): a moon phase
@@ -634,10 +786,23 @@ fn shell(rows: &[String], from: usize, to: usize, edge: usize) -> Option<Shell> 
     Some(Shell { lines, described })
 }
 
-/// The box that waits on the person in the composer's place on `rows` ([`card`]), for display:
-/// `None` on any other screen. Nothing answers it here: Kimi Code is read, not supervised
-/// ([`crate::Program::supervisable`]), so its options carry no role ([`Role::Other`]), and Esc on
-/// an open box is unmeasured, so none is read as cancelling it.
+fn option_role(kind: PromptKind, label: &str) -> Role {
+    match (kind, label) {
+        (PromptKind::Question, "Other" | "Cancel") => Role::Other,
+        (PromptKind::Question, _) => Role::Answer,
+        (PromptKind::Trust, "Trust and continue") => Role::Trust,
+        (PromptKind::Trust, "Exit") => Role::Exit,
+        (_, "Approve once") => Role::Once,
+        (_, "Approve for this session") => Role::Session,
+        (_, "Reject" | "Reject with feedback") => Role::Deny,
+        _ => Role::Other,
+    }
+}
+
+/// The box that waits on the person in the composer's place on `rows` ([`card`]), for the
+/// supervisor: `None` on any other screen. Options carry only their measured roles; an unknown
+/// choice is [`Role::Other`], which the policy leaves to the person. Esc on an approval box is
+/// unmeasured, so none is read as cancelling it.
 ///
 /// A command's approval reads its command's lines and description ([`shell`]): its rows are the
 /// lines, and its last row at the description's depth, the description or the last line's wrap,
@@ -689,7 +854,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
                 Opt {
                     n: None,
                     label: label.unwrap_or(text).to_string(),
-                    role: Role::Other,
+                    role: option_role(c.kind, label.unwrap_or(text)),
                     focused: label.is_some(),
                     row: i,
                     kept: false,
@@ -717,7 +882,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
                 Some(Opt {
                     n,
                     label: label.to_string(),
-                    role: Role::Other,
+                    role: option_role(c.kind, label),
                     focused,
                     row: i,
                     kept: false,

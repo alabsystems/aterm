@@ -3,7 +3,8 @@
 
 //! Canonical admission fixture. Synthetic provider bytes exercise the real
 //! encrypted store and generation writer; this does not qualify OAuth or the
-//! prospective launch/publication barrier.
+//! prospective launch/publication barrier. The response precedes admission on
+//! purpose: this is historical per-state custody, not a new catalogue issuance.
 
 use super::super::{account_work, accounts, codex_session_slot};
 use super::*;
@@ -112,7 +113,9 @@ pub(super) fn fixture() -> Fixture {
     let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
     store
         .transact_logins(env.now, &mut None, |_, logins| {
-            logins.enrollment.admit_native(&request)?;
+            logins
+                .enrollment
+                .admit_historical_native_fixture(&request)?;
             Ok(Vec::new())
         })
         .unwrap();

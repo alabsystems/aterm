@@ -12,8 +12,8 @@ use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
     CutState, EngineNow, EngineRows, Facts, JOURNAL_FILE, Journal, Prover, PublishGate,
-    RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions, Reservation, Side, StageTarget,
-    Step, run_with,
+    RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions, Reservation, SELECTION_FILE,
+    Side, StageTarget, Step, run_with,
 };
 use crate::release_steps::Real;
 
@@ -98,6 +98,13 @@ fn hop_of(fix: &str) -> String {
 struct World {
     input_refusal: Option<Refusal>,
     fleet_refusal: Option<String>,
+    supersede_preflight_refusal: Option<Refusal>,
+    supersede_unknown_once: bool,
+    supersede_unknown_absent_once: bool,
+    supersede_classify_unknown: bool,
+    supersede_final_save_error: bool,
+    prepare_clone_refusal: Option<Refusal>,
+    missing_origin_tip: bool,
     fleet_selected: Option<Line>,
     existing_fleet_line: Option<Line>,
     supersession: Option<crate::line::Supersession>,
@@ -119,6 +126,7 @@ struct World {
     history: Vec<String>,
     versions: BTreeMap<String, String>,
     head: String,
+    candidate_before_tip_move: bool,
     on_main: bool,
     origin_tags: BTreeMap<String, String>,
     ledger: Vec<String>,
@@ -235,6 +243,7 @@ struct World {
     landing_fails: bool,
     /// The prover the world resolves (TRUST_STAGE2_BIN, the journal's, the store's).
     prover: Prover,
+    prover_error: Option<String>,
     lease_error: Option<String>,
     /// Why step 1's build-inputs seal cannot be taken.
     seal_error: Option<String>,
@@ -318,6 +327,13 @@ impl World {
         Self {
             input_refusal: None,
             fleet_refusal: None,
+            supersede_preflight_refusal: None,
+            supersede_unknown_once: false,
+            supersede_unknown_absent_once: false,
+            supersede_classify_unknown: false,
+            supersede_final_save_error: false,
+            prepare_clone_refusal: None,
+            missing_origin_tip: false,
             fleet_selected: None,
             existing_fleet_line: None,
             supersession: None,
@@ -340,6 +356,7 @@ impl World {
             history: vec![OLD.into(), TIP.into()],
             versions,
             head: TIP.into(),
+            candidate_before_tip_move: false,
             on_main: true,
             origin_tags,
             ledger: vec!["0.4.0".into(), "0.5.0".into()],
@@ -408,6 +425,7 @@ impl World {
             generator_refuses: false,
             landing_fails: false,
             prover: prover(),
+            prover_error: None,
             lease_error: None,
             seal_error: None,
             engine: "e7e7e7e7e7".into(),
@@ -1206,20 +1224,116 @@ impl Backend for World {
     ) -> Result<Option<crate::line::Supersession>, Refusal> {
         Ok(self.supersession.clone())
     }
-    fn supersede_line(&mut self, line: &Line) -> Result<String, String> {
+    fn preflight_supersede(
+        &mut self,
+        line: &Line,
+        expected_previous: Option<&Line>,
+    ) -> Result<Line, Refusal> {
+        self.calls.push("supersede-preflight".into());
+        let previous = self
+            .existing_fleet_line
+            .clone()
+            .ok_or_else(|| Refusal::new("no existing fleet line", "drop --supersede"))?;
+        if expected_previous.is_some_and(|expected| *expected != previous) {
+            return Err(Refusal::new(
+                "the fleet line advanced",
+                "resume the current line",
+            ));
+        }
+        if self.supersession.is_some() {
+            return Err(Refusal::new(
+                "the line already has a durable supersession",
+                "resume the current line",
+            ));
+        }
+        if let Some(refusal) = self.supersede_preflight_refusal.clone() {
+            return Err(refusal);
+        }
+        let tagged = self.origin_tags.contains_key(&format!("v{}", line.version));
+        let ledgered = self.ledger.iter().any(|version| version == &line.version)
+            || self
+                .cut
+                .as_ref()
+                .is_some_and(|cut| cut.version == line.version);
+        let published = self
+            .newest
+            .as_deref()
+            .is_some_and(|commit| self.versions.get(commit) == Some(&line.version))
+            || std::iter::once(previous.base.as_str())
+                .chain(previous.hops.iter().map(|hop| hop.commit.as_str()))
+                .any(|commit| self.published.contains_key(commit));
+        crate::line::require_unpublished([tagged, ledgered, published, false, false])
+            .map_err(|why| Refusal::new(why, crate::release::fix_remedy(previous.head())))?;
+        Ok(previous)
+    }
+    fn classify_supersede(
+        &mut self,
+        previous: &Line,
+        line: &Line,
+    ) -> crate::release::SupersedeResult {
+        if self.supersede_classify_unknown {
+            return crate::release::SupersedeResult::Unknown(
+                "planted authoritative reread failure".into(),
+            );
+        }
+        match self.supersession.clone() {
+            Some(record)
+                if record.previous == *previous
+                    && record.replacement == *line
+                    && record.reason == "explicit request" =>
+            {
+                crate::release::SupersedeResult::Committed(
+                    "the exact earlier supersession is durable".into(),
+                )
+            }
+            Some(record) => crate::release::SupersedeResult::Refused {
+                why: "a different durable supersession won".into(),
+                retry: false,
+                winner: Some(record.replacement),
+            },
+            None => crate::release::SupersedeResult::Refused {
+                why: "the earlier source write is absent".into(),
+                retry: true,
+                winner: None,
+            },
+        }
+    }
+    fn supersede_line(&mut self, previous: &Line, line: &Line) -> crate::release::SupersedeResult {
         self.calls.push("supersede".into());
         if let Some(why) = &self.fleet_refusal {
-            return Err(why.clone());
+            return crate::release::SupersedeResult::Refused {
+                why: format!("{why} — {}", crate::release::fix_remedy(previous.head())),
+                retry: false,
+                winner: None,
+            };
         }
-        let previous = self.existing_fleet_line.clone().ok_or("no fleet line")?;
-        self.supersession = Some(crate::line::Supersession {
-            previous,
+        let record = crate::line::Supersession {
+            previous: previous.clone(),
             replacement: line.clone(),
             reason: "explicit request".into(),
-        });
+        };
+        if std::mem::take(&mut self.supersede_unknown_absent_once) {
+            return crate::release::SupersedeResult::Unknown(
+                "planted response loss before an absent source write".into(),
+            );
+        }
+        self.supersession = Some(record);
         self.existing_fleet_line = Some(line.clone());
         self.fleet_selected = Some(line.clone());
-        Ok("SUPERSEDED".into())
+        if std::mem::take(&mut self.supersede_unknown_once) {
+            crate::release::SupersedeResult::Unknown(
+                "planted response loss after the source write".into(),
+            )
+        } else {
+            crate::release::SupersedeResult::Committed("SUPERSEDED".into())
+        }
+    }
+    fn save_supersede_journal(&mut self, journal: &Journal, path: &Path) -> Result<(), String> {
+        if std::mem::take(&mut self.supersede_final_save_error) {
+            Err("planted final candidate write refusal".into())
+        } else {
+            journal.save(path)
+        }
     }
     fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, Refusal> {
         let line = self
@@ -1307,7 +1421,9 @@ impl Backend for World {
     }
     fn prover(&mut self, _journaled: Option<&str>) -> Result<Prover, String> {
         self.observations.push("prover");
-        Ok(self.prover.clone())
+        self.prover_error
+            .clone()
+            .map_or_else(|| Ok(self.prover.clone()), Err)
     }
     fn lease(&mut self, _prover: &Prover) -> Result<(), String> {
         self.calls.push("lease".into());
@@ -1340,7 +1456,13 @@ impl Backend for World {
     fn branch_is_main(&mut self) -> bool {
         self.on_main
     }
+    fn prepare_clone(&mut self) -> Result<(), Refusal> {
+        self.prepare_clone_refusal.clone().map_or(Ok(()), Err)
+    }
     fn rev(&mut self, rev: &str) -> Option<String> {
+        if self.missing_origin_tip && rev == "origin/main^{commit}" {
+            return None;
+        }
         self.pos(rev).map(|i| self.history[i].clone())
     }
     fn version_at(&mut self, rev: &str) -> Option<String> {
@@ -1518,6 +1640,9 @@ impl Backend for World {
 
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
         self.calls.push(format!("move {}", &commit[..4]));
+        if commit == TIP && self.release_dir().join(SELECTION_FILE).exists() {
+            self.candidate_before_tip_move = true;
+        }
         self.head = commit.to_string();
         self.interrupt_at("move");
         Ok(())
@@ -1981,6 +2106,288 @@ fn supersession_is_explicit_and_refuses_public_or_live_lines() {
     assert_ne!(code, 0);
     assert!(public.supersession.is_none());
     assert_eq!(public.count("stage"), 0);
+}
+
+/// Supersession preflight is read-only in both real and dry paths, the candidate's cutter
+/// repeats it, and only an entered source write may retain candidate.toml for exact recovery.
+#[test]
+fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
+    fn setup() -> World {
+        let mut world = World::new();
+        world.history = vec![OLD.into(), NEXT.into(), FIX.into(), TIP.into()];
+        for commit in [NEXT, FIX, TIP] {
+            world.versions.insert(commit.into(), "0.6.0".into());
+        }
+        world.head = NEXT.into();
+        let line = Line::start("0.6.0", NEXT, 100);
+        world.existing_fleet_line = Some(line.clone());
+        std::fs::create_dir_all(world.release_dir()).unwrap();
+        Journal {
+            version: line.version.clone(),
+            commit: line.head().into(),
+            prover: world.prover.bin.display().to_string(),
+            trustc: world.prover.commit.clone(),
+            started: line.started,
+            line: Some(line),
+            ..Journal::default()
+        }
+        .save(&world.release_dir().join(JOURNAL_FILE))
+        .unwrap();
+        world
+    }
+    let options = |dry_run| ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        dry_run,
+        ..mac()
+    };
+    let staged = || {
+        Refusal::new(
+            "the line has a staged publication; cannot supersede",
+            crate::release::fix_remedy(NEXT),
+        )
+    };
+
+    for dry_run in [false, true] {
+        let mut world = setup();
+        world.supersede_preflight_refusal = Some(staged());
+        let journal_path = world.release_dir().join(JOURNAL_FILE);
+        let before = std::fs::read(&journal_path).unwrap();
+        let fleet = world.existing_fleet_line.clone();
+        let (code, last) = world.run(options(dry_run));
+        assert_ne!(code, 0, "{last}");
+        assert!(world.out.join("\n").contains("--fix"), "{:#?}", world.out);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+        assert!(!world.release_dir().join(SELECTION_FILE).exists());
+        assert_eq!(world.head, NEXT);
+        assert_eq!(world.existing_fleet_line, fleet);
+        assert!(world.supersession.is_none());
+        assert_eq!(world.count("supersede-preflight"), 1);
+        assert_eq!(world.count("supersede"), 0);
+        if dry_run {
+            assert_eq!(world.fetches, 0, "dry preflight precedes step 1 fetch");
+        } else {
+            world.supersede_preflight_refusal = None;
+            let (code, last) = world.run(fix(&[FIX]));
+            assert_eq!(code, 0, "{last}\n{:#?}", world.out);
+            let line = world.journal().unwrap().line();
+            assert_eq!(line.base, NEXT);
+            assert_eq!(line.hops.len(), 1);
+            assert_eq!(line.hops[0].carries, FIX);
+        }
+    }
+
+    // The replacement cutter repeats preflight. A surface that turns red after launcher
+    // dispatch restores the exact checkout and leaves release.toml untouched.
+    let mut selected = setup();
+    selected.own_cutter = false;
+    selected.exec_result = Ok(());
+    let journal_path = selected.release_dir().join(JOURNAL_FILE);
+    let before = std::fs::read(&journal_path).unwrap();
+    assert_eq!(selected.run(options(false)).0, 0);
+    assert_eq!(selected.head, TIP);
+    assert!(
+        selected.candidate_before_tip_move,
+        "candidate.toml must hold the exact rollback transaction before HEAD moves"
+    );
+    assert!(selected.release_dir().join(SELECTION_FILE).exists());
+    selected.own_cutter = true;
+    selected.supersede_preflight_refusal = Some(staged());
+    let (code, last) = selected.run(options(false));
+    assert_ne!(code, 0, "{last}");
+    assert_eq!(selected.head, NEXT);
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+    assert!(!selected.release_dir().join(SELECTION_FILE).exists());
+    assert_eq!(selected.count("supersede"), 0);
+
+    // The replacement image can fail its own toolchain gates before repeated preflight. Those
+    // failures still restore the launcher's exact pre-selection state.
+    type Gate = fn(&mut World);
+    let gates: [(&str, Gate); 5] = [
+        ("branch", |world| world.on_main = false),
+        ("clone", |world| {
+            world.prepare_clone_refusal = Some(Refusal::new(
+                "planted selected clone refusal",
+                "restore the clone",
+            ));
+        }),
+        ("origin", |world| world.missing_origin_tip = true),
+        ("prover", |world| {
+            world.prover_error = Some("planted selected prover refusal".into());
+        }),
+        ("lease", |world| {
+            world.lease_error = Some("planted selected lease refusal".into());
+        }),
+    ];
+    for (gate, block) in gates {
+        let mut early = setup();
+        early.own_cutter = false;
+        early.exec_result = Ok(());
+        let journal_path = early.release_dir().join(JOURNAL_FILE);
+        let before = std::fs::read(&journal_path).unwrap();
+        assert_eq!(early.run(options(false)).0, 0);
+        assert_eq!(early.head, TIP);
+        assert!(early.release_dir().join(SELECTION_FILE).exists());
+        early.own_cutter = true;
+        block(&mut early);
+        let (code, last) = early.run(options(false));
+        assert_ne!(code, 0, "{gate}: {last}");
+        assert_eq!(early.head, NEXT, "{gate}");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before, "{gate}");
+        assert!(!early.release_dir().join(SELECTION_FILE).exists(), "{gate}");
+        assert_eq!(early.count("supersede"), 0, "{gate}");
+    }
+
+    // The under-claim recheck can also refuse after candidate selection and gets the same exact
+    // rollback.
+    let mut late = setup();
+    late.fleet_refusal = Some("planted under-claim refusal".into());
+    let journal_path = late.release_dir().join(JOURNAL_FILE);
+    let before = std::fs::read(&journal_path).unwrap();
+    let (code, last) = late.run(options(false));
+    assert_ne!(code, 0, "{last}");
+    assert!(late.out.join("\n").contains("--fix"), "{:#?}", late.out);
+    assert_eq!(late.head, NEXT);
+    assert_eq!(std::fs::read(journal_path).unwrap(), before);
+    assert!(!late.release_dir().join(SELECTION_FILE).exists());
+
+    // An unreadable candidate may be the only durable identity of an entered source write.
+    // --forget therefore preserves its exact bytes instead of treating parse failure as absence.
+    let mut malformed = setup();
+    let selection = malformed.release_dir().join(SELECTION_FILE);
+    let malformed_bytes = b"supersede = [this is torn\n";
+    std::fs::write(&selection, malformed_bytes).unwrap();
+    let release_before = std::fs::read(malformed.release_dir().join(JOURNAL_FILE)).unwrap();
+    let (code, last) = malformed.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(std::fs::read(&selection).unwrap(), malformed_bytes);
+    assert_eq!(
+        std::fs::read(malformed.release_dir().join(JOURNAL_FILE)).unwrap(),
+        release_before
+    );
+
+    // Once the source writer is entered, Unknown retains the sole transaction. The exact retry
+    // classifies the full durable record before public preflight and never writes it twice.
+    let mut unknown = setup();
+    unknown.supersede_unknown_once = true;
+    let (code, last) = unknown.run(options(false));
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(unknown.head, TIP);
+    let candidate = Journal::load(&unknown.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert!(
+        candidate
+            .supersede
+            .as_ref()
+            .is_some_and(|txn| txn.cas_unknown)
+    );
+    let candidate_before = std::fs::read(unknown.release_dir().join(SELECTION_FILE)).unwrap();
+    assert_eq!(unknown.count("supersede"), 1);
+    let preflights = unknown.count("supersede-preflight");
+    let (code, last) = unknown.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(
+        std::fs::read(unknown.release_dir().join(SELECTION_FILE)).unwrap(),
+        candidate_before,
+        "--forget cannot erase an unknown source write"
+    );
+
+    unknown.supersede_classify_unknown = true;
+    unknown.on_main = false;
+    let (code, last) = unknown.run(options(false));
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(
+        std::fs::read(unknown.release_dir().join(SELECTION_FILE)).unwrap(),
+        candidate_before,
+        "an unavailable authoritative reread retains the exact transaction"
+    );
+    assert_eq!(unknown.count("supersede"), 1);
+    assert_eq!(unknown.count("supersede-preflight"), preflights);
+    unknown.supersede_classify_unknown = false;
+    unknown.on_main = true;
+
+    // Dry recovery performs the same read-only classification first. A newly red staging
+    // surface cannot make it contradict the exact durable record, and dry writes nothing.
+    unknown.supersede_preflight_refusal = Some(staged());
+    let (code, last) = unknown.run(options(true));
+    assert_eq!(code, 0, "{last}\n{:#?}", unknown.out);
+    assert_eq!(
+        std::fs::read(unknown.release_dir().join(SELECTION_FILE)).unwrap(),
+        candidate_before
+    );
+    assert_eq!(unknown.count("supersede-preflight"), preflights);
+    unknown.supersede_preflight_refusal = None;
+    let (code, last) = unknown.run(options(false));
+    assert_eq!(code, 0, "{last}\n{:#?}", unknown.out);
+    assert_eq!(unknown.count("supersede"), 1);
+    assert_eq!(unknown.count("supersede-preflight"), preflights);
+    assert!(!unknown.release_dir().join(SELECTION_FILE).exists());
+    let journal = unknown.journal().unwrap();
+    assert_eq!(journal.commit, TIP);
+    assert!(journal.supersede.is_none());
+
+    // An authoritative absence clears ambiguity, repeats preflight, and enters the writer once
+    // more. The successful second entry is the only retry.
+    let mut absent = setup();
+    absent.supersede_unknown_absent_once = true;
+    assert_eq!(absent.run(options(false)).0, 3);
+    assert!(absent.supersession.is_none());
+    let preflights = absent.count("supersede-preflight");
+    let (code, last) = absent.run(options(false));
+    assert_eq!(code, 0, "{last}\n{:#?}", absent.out);
+    assert_eq!(absent.count("supersede"), 2);
+    assert_eq!(absent.count("supersede-preflight"), preflights + 1);
+    assert!(!absent.release_dir().join(SELECTION_FILE).exists());
+
+    // A different durable winner is authoritative: the retry adopts it in HEAD and release.toml
+    // instead of restoring the line it retired.
+    let mut raced = setup();
+    raced.supersede_unknown_once = true;
+    assert_eq!(raced.run(options(false)).0, 3);
+    let transaction = Journal::load(&raced.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap()
+        .supersede
+        .unwrap();
+    let winner = Line::start("0.6.0", FIX, 300);
+    raced.supersession = Some(crate::line::Supersession {
+        previous: transaction.previous,
+        replacement: winner.clone(),
+        reason: "another cutter won".into(),
+    });
+    raced.existing_fleet_line = Some(winner.clone());
+    raced.fleet_selected = Some(winner.clone());
+    let preflights = raced.count("supersede-preflight");
+    let writes = raced.count("supersede");
+    let (code, last) = raced.run(options(false));
+    assert_eq!(code, 2, "{last}");
+    assert_eq!(raced.head, FIX);
+    assert_eq!(raced.journal().unwrap().line(), winner);
+    assert!(!raced.release_dir().join(SELECTION_FILE).exists());
+    assert_eq!(raced.count("supersede-preflight"), preflights);
+    assert_eq!(raced.count("supersede"), writes);
+
+    // Once the source CAS committed, a failed final candidate write reports that the exact
+    // cas_unknown transaction remains recoverable; its retry classifies instead of writing twice.
+    let mut final_save = setup();
+    final_save.supersede_final_save_error = true;
+    let (code, last) = final_save.run(options(false));
+    assert_eq!(code, 3, "{last}");
+    let retained = Journal::load(&final_save.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert!(retained.supersede.is_some_and(|txn| txn.cas_unknown));
+    let writes = final_save.count("supersede");
+    let (code, last) = final_save.run(options(false));
+    assert_eq!(code, 0, "{last}\n{:#?}", final_save.out);
+    assert_eq!(final_save.count("supersede"), writes);
 }
 
 #[test]
@@ -3995,8 +4402,10 @@ fn supersession_is_performed_by_its_replacement_cutter_once() {
     w.own_cutter = true;
     let (code, last) = w.run(options.clone());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("supersede-preflight"), 2);
     assert_eq!(w.count("supersede"), 1);
-    assert_eq!(w.run(options).0, 0);
+    let (code, last) = w.run(options);
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(
         w.count("supersede"),
         1,

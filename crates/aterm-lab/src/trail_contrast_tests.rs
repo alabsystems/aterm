@@ -5,8 +5,6 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 const PAGE: Rgb = [0x0d, 0x11, 0x17];
 const INK: Rgb = [0xe6, 0xed, 0xf3];
 const EDGE: Rgb = [0x7a, 0x80, 0x87];
@@ -108,16 +106,8 @@ fn trail_frame() -> Image {
     img
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "lab-trail-contrast-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(tag: &str) -> crate::TestScratch {
+    crate::TestScratch::new(tag)
 }
 
 fn gallery_files(dir: &Path, frame: &Image) -> PathBuf {
@@ -485,7 +475,6 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
         report(&parse_args(&args(&[&png_s, "--row", "1", "--no-clean"])).unwrap()).unwrap();
     assert_eq!(coarse.get("clean"), Some(&J::Null));
     assert!(coarse.get("diff_vs_clean").is_none());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--lowered-min` judges what the effects did: under a bar every glyph reads below, only the one
@@ -531,7 +520,6 @@ fn lowered_min_counts_only_the_glyphs_the_effects_took_down() {
     ]))
     .unwrap();
     assert!(report(&blind).unwrap_err().starts_with("--lowered-min"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--lowered-min X` judges the letter guard's law: a glyph whose own clean reading is X or more
@@ -969,7 +957,6 @@ fn the_report_renders_one_cell_per_line_and_parses_back() {
         .filter(|l| l.contains("\"selector\": "))
         .count();
     assert_eq!(cell_lines, cells);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -998,7 +985,6 @@ fn a_grid_that_does_not_fit_or_a_missing_grid_is_an_error() {
     assert!(report(&none).unwrap_err().starts_with("no grid"));
     let half = parse_args(&args(&[&png_s, "--origin", "2,1"])).unwrap();
     assert!(report(&half).unwrap_err().contains("go together"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

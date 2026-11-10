@@ -4,6 +4,7 @@
 //! The selected vault's repository inputs and their admission to GitHub work.
 
 use super::{Plan, Row, Stage, item_rows, readiness_row};
+use aterm_machines::init_github::{RepositoryReadback, RepositoryRun};
 use aterm_machines::items::Ctx;
 use aterm_machines::model::Mode;
 use aterm_machines::port::System;
@@ -16,27 +17,20 @@ pub(super) fn run(
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
+    readback: Option<Arc<RepositoryReadback>>,
 ) -> Result<Vec<Row>, String> {
-    run_reading(sys, ctx, vault, mode).map(|ran| ran.rows)
+    items_current(sys, ctx, vault, mode, false, None, readback).map(|rows| reading(rows).rows)
 }
 
-/// What a Repositories stage [`run_reading`] ran came to.
+/// What a Repositories stage [`run_reading_guarded`] ran came to.
 pub(super) struct Ran {
     pub rows: Vec<Row>,
     /// The reason a part that failed gives ([`failure_note`]).
     pub failure: Option<&'static str>,
     /// It stopped for want of a GitHub token to sign in with ([`want_token`]).
     pub token: bool,
-}
-
-/// [`run`], with what its rows say it waits on.
-pub(super) fn run_reading(
-    sys: &dyn System,
-    ctx: &Ctx,
-    vault: Option<&Plan>,
-    mode: Mode,
-) -> Result<Ran, String> {
-    Ok(reading(items(sys, ctx, vault, mode, false)?))
+    /// Actual native empty-origin evidence owned only by this setup host/pass.
+    pub readback: Option<Arc<RepositoryReadback>>,
 }
 
 /// Run with the current setup choice checked at each clone boundary, including when the
@@ -49,7 +43,15 @@ pub(super) fn run_reading_guarded(
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<Ran, String> {
     let current: Current = Arc::new(current);
-    let result = items_current(sys, ctx, vault, mode, false, Some(Arc::clone(&current)));
+    let result = items_current(
+        sys,
+        ctx,
+        vault,
+        mode,
+        false,
+        Some(Arc::clone(&current)),
+        None,
+    );
     if let Err(why) = current().and_then(|ready| {
         ready
             .then_some(())
@@ -64,17 +66,19 @@ pub(super) fn run_reading_guarded(
             }],
             failure: None,
             token: false,
+            readback: None,
         });
     }
     result.map(reading)
 }
 
-fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
+fn reading(rows: Option<RepositoryRun>) -> Ran {
     match rows {
-        Some(rows) => Ran {
-            failure: failure_note(&rows),
-            token: want_token(&rows),
-            rows: item_rows(rows),
+        Some(run) => Ran {
+            failure: failure_note(&run.rows),
+            token: want_token(&run.rows),
+            rows: item_rows(run.rows),
+            readback: run.readback.map(Arc::new),
         },
         None => Ran {
             rows: vec![readiness_row(
@@ -84,6 +88,7 @@ fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
             )],
             failure: None,
             token: false,
+            readback: None,
         },
     }
 }
@@ -138,8 +143,8 @@ fn items(
     vault: Option<&Plan>,
     mode: Mode,
     own: bool,
-) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
-    items_current(sys, ctx, vault, mode, own, None)
+) -> Result<Option<RepositoryRun>, String> {
+    items_current(sys, ctx, vault, mode, own, None, None)
 }
 
 fn local_items(
@@ -147,27 +152,31 @@ fn local_items(
     ctx: &Ctx,
     mode: Mode,
     current: Option<Current>,
-) -> Result<Vec<aterm_machines::model::ItemReport>, String> {
+    readback: Option<Arc<RepositoryReadback>>,
+) -> Result<RepositoryRun, String> {
     if current.is_some()
         && let Some(rows) = withdrawal_items(sys, ctx, mode, current.clone(), None)?
     {
         return Ok(rows);
     }
-    match current {
-        None => aterm_machines::init_github::run_initial_repositories(sys, ctx, mode),
-        Some(current) => {
-            let inputs =
-                aterm_machines::init_github::InitialRepositoryInputs::capture_ready(sys, ctx)?;
-            aterm_machines::init_github::run_initial_repositories_captured(
-                sys,
-                ctx,
-                mode,
-                aterm_secrets::converge::RepositoryWork::Refresh,
-                inputs,
-                move || current(),
-            )
-        }
+    if current.is_none() && readback.is_none() {
+        return aterm_machines::init_github::run_initial_repositories(sys, ctx, mode);
     }
+    let work = if readback.is_some() {
+        aterm_secrets::converge::RepositoryWork::Repair
+    } else {
+        aterm_secrets::converge::RepositoryWork::Refresh
+    };
+    let inputs = aterm_machines::init_github::InitialRepositoryInputs::capture_ready(sys, ctx)?
+        .with_repository_readback(readback);
+    aterm_machines::init_github::run_initial_repositories_captured(
+        sys,
+        ctx,
+        mode,
+        work,
+        inputs,
+        move || current.as_ref().map_or(Ok(true), |current| current()),
+    )
 }
 
 fn withdrawal_items(
@@ -179,7 +188,7 @@ fn withdrawal_items(
         &aterm_secrets::client::Paths,
         &aterm_secrets::client::Config,
     )>,
-) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
+) -> Result<Option<RepositoryRun>, String> {
     let Ok(Some(withdrawal)) =
         aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(sys, ctx)
     else {
@@ -206,7 +215,12 @@ fn withdrawal_items(
             }
         },
     )
-    .map(Some)
+    .map(|rows| {
+        Some(RepositoryRun {
+            rows,
+            readback: None,
+        })
+    })
 }
 
 fn items_current(
@@ -216,9 +230,10 @@ fn items_current(
     mode: Mode,
     own: bool,
     current: Option<Current>,
-) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
+    readback: Option<Arc<RepositoryReadback>>,
+) -> Result<Option<RepositoryRun>, String> {
     let Some(vault) = vault else {
-        return local_items(sys, ctx, mode, current).map(Some);
+        return local_items(sys, ctx, mode, current, readback).map(Some);
     };
     let [user] = ctx.users.as_slice() else {
         return Err("repository setup needs exactly one console account".into());
@@ -234,7 +249,7 @@ fn items_current(
         if !own {
             return Ok(None);
         }
-        return local_items(sys, ctx, mode, current)
+        return local_items(sys, ctx, mode, current, readback)
             .map(|rows| (!want_token(&rows)).then_some(rows));
     };
     // This selected vault still admits its current local empty/disabled intent when the
@@ -259,12 +274,17 @@ fn items_current(
     let Some(captured) = captured else {
         return Ok(None);
     };
+    let work = if readback.is_some() {
+        aterm_secrets::converge::RepositoryWork::Repair
+    } else {
+        aterm_secrets::converge::RepositoryWork::Refresh
+    };
     aterm_machines::init_github::run_initial_repositories_captured(
         sys,
         ctx,
         mode,
-        aterm_secrets::converge::RepositoryWork::Refresh,
-        captured.inputs,
+        work,
+        captured.inputs.with_repository_readback(readback),
         move || {
             if let Some(current) = &current
                 && !current()?
@@ -434,7 +454,7 @@ mod tests {
     #[test]
     fn a_partial_sync_after_readiness_blocks_repository_inputs() {
         let (_root, plan, sys, ctx) = after_sync_failure();
-        let _result = run(&sys, &ctx, Some(&plan), Mode::Plan);
+        let _result = run(&sys, &ctx, Some(&plan), Mode::Plan, None);
         assert!(
             !sys.calls().iter().any(|call| call.contains(" agh GET ")),
             "incomplete selected vault reached GitHub: {:?}",
@@ -463,7 +483,7 @@ mod tests {
     #[test]
     fn leaving_secrets_as_is_uses_the_existing_local_repository_token() {
         let (_root, _plan, sys, ctx) = after_sync_failure();
-        let _result = run(&sys, &ctx, None, Mode::Plan);
+        let _result = run(&sys, &ctx, None, Mode::Plan, None);
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
@@ -472,7 +492,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let source = root.path().join("team.secrets");
         let home = root.path().join("home");
-        joined(&home, &source);
+        let paths = joined(&home, &source);
         let plan = Plan {
             vault_url: source.to_string_lossy().into_owned(),
             ..Plan::default()
@@ -489,6 +509,185 @@ mod tests {
             "{result:?}"
         );
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+
+        // Apply's actual empty advertisement must survive this adapter until the same
+        // host's fresh final observation. Independent observations retain no such fact.
+        use aterm_machines::port::{Cmd, Live};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let live = Live::new();
+        let git = aterm_machines::items::github::installed_git_without_atpkg(&live).unwrap_or_else(
+            || {
+                aterm_uds::host::could_not_run(
+                    "native Git is not installed for the private repository fixture",
+                )
+            },
+        );
+        let (mut sys, mut ctx) = fake(&home);
+        sys.euid = live.euid();
+        sys.linux = !live.macos();
+        let user = &mut ctx.users[0];
+        user.uid = live.euid();
+        user.gid = live.stat(&home).unwrap().gid;
+        ctx.console = Some(user.clone());
+        sys.logged_in(user)
+            .executable(git.to_str().unwrap(), b"selected fixture Git");
+        let launcher = aterm_types::installed_command::legacy(&home)[0].clone();
+        sys.executable(launcher.to_str().unwrap(), b"fixture launcher");
+        let user = user.clone();
+        let command = || {
+            Cmd::new(&git)
+                .as_user(&user)
+                .env("HOME", home.to_string_lossy())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_NO_LAZY_FETCH", "1")
+        };
+        let bare = root.path().join("empty.git");
+        let checkout = home.join("fixture");
+        for cmd in [
+            command()
+                .args([
+                    "init",
+                    "--quiet",
+                    "--bare",
+                    "--template=",
+                    "--initial-branch=main",
+                ])
+                .arg(&bare),
+            command()
+                .args(["clone", "--quiet", "--template="])
+                .arg(&bare)
+                .arg(&checkout),
+            command().arg("-C").arg(&checkout).args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/alice/fixture.git",
+            ]),
+        ] {
+            let ran = live.run_complete_stdout(&cmd).unwrap();
+            assert!(ran.success(), "{}: {}", cmd.display(), ran.describe());
+        }
+        for path in [
+            home.clone(),
+            home.join(".secrets/gh_access_token"),
+            home.join(".secrets/github-repositories.json"),
+            checkout.clone(),
+            checkout.join(".git"),
+            checkout.join(".git/objects"),
+        ] {
+            sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+            sys.file_id_of(&path, live.file_id(&path).unwrap());
+        }
+        let advertisements = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&advertisements);
+        let at = checkout.clone();
+        let native_git = git.clone();
+        sys.simulate(move |_, cmd| {
+            if cmd.args.iter().any(|arg| arg == "fill") {
+                return Some(Ran::ok(&format!(
+                    "protocol=https\nhost=github.com\nusername=alice\npassword={TOKEN}\n"
+                )));
+            }
+            let displayed = cmd.display();
+            if displayed.contains(" config --null --show-origin --get-regexp ") {
+                return Some(Ran::ok(""));
+            }
+            let in_checkout = cmd
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == at.as_os_str());
+            if !in_checkout
+                && !cmd
+                    .args
+                    .iter()
+                    .any(|arg| arg == "https://github.com/alice/fixture.git")
+            {
+                return None;
+            }
+            let remote = cmd.args.iter().any(|arg| arg == "ls-remote")
+                && !cmd.args.iter().any(|arg| arg == "--get-url");
+            let mut cmd = cmd.clone();
+            // The Fake's selected tool executes this fixture's admitted native Git,
+            // including on a Mac whose fallback comes from Xcode rather than the CLT.
+            cmd.program = native_git.clone();
+            if remote {
+                seen.fetch_add(1, Ordering::SeqCst);
+                for arg in &mut cmd.args {
+                    if arg == "origin" || arg == "https://github.com/alice/fixture.git" {
+                        *arg = bare.as_os_str().to_owned();
+                    }
+                }
+            }
+            Some(Live::new().run_complete_stdout(&cmd).unwrap())
+        });
+        let applied =
+            run_reading_guarded(&sys, &ctx, Some(&plan), Mode::Apply, || Ok(true)).unwrap();
+        assert!(
+            super::super::rows_ready(&applied.rows),
+            "{:?}",
+            applied.rows
+        );
+        let proof = applied
+            .readback
+            .expect("actual native empty admission crossed the adapter");
+        let current = run(
+            &sys,
+            &ctx,
+            Some(&plan),
+            Mode::Plan,
+            Some(Arc::clone(&proof)),
+        )
+        .unwrap();
+        assert!(super::super::rows_ready(&current), "{current:?}");
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            1,
+            "the final owned observation repeats no advertisement"
+        );
+        let independent = run(&sys, &ctx, Some(&plan), Mode::Plan, None).unwrap();
+        assert!(super::super::rows_ready(&independent), "{independent:?}");
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            2,
+            "an independent admitted observation needs a fresh full advertisement"
+        );
+        let held = run_reading_guarded(&sys, &ctx, Some(&plan), Mode::Apply, || Ok(false)).unwrap();
+        assert!(held.readback.is_none());
+        assert!(!super::super::rows_ready(&held.rows), "{:?}", held.rows);
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            2,
+            "owned read-back and held work repeat no acquisition"
+        );
+        assert!(
+            !live
+                .run_complete_stdout(&command().arg("-C").arg(&checkout).args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "HEAD^{commit}"
+                ]))
+                .unwrap()
+                .success(),
+            "read-only empty observation never hydrates a checkout"
+        );
+        let changed_inventory = INVENTORY.replace("\"id\":1", "\"id\":2");
+        std::fs::write(&source, format!("gh_access_token={TOKEN}\ngithub-repositories.json={changed_inventory}\ntool-other=before\n")).unwrap();
+        client::sync(&paths, None).unwrap();
+        let inventory = home.join(".secrets/github-repositories.json");
+        sys.file(
+            inventory.to_str().unwrap(),
+            &std::fs::read(&inventory).unwrap(),
+        )
+        .stat_of(inventory.to_str().unwrap(), live.stat(&inventory).unwrap());
+        let changed = run(&sys, &ctx, Some(&plan), Mode::Plan, Some(proof)).unwrap();
+        assert!(!super::super::rows_ready(&changed), "{changed:?}");
+        assert_eq!(
+            advertisements.load(Ordering::SeqCst),
+            2,
+            "a stale owned receipt does not admit a new acquisition"
+        );
     }
 
     #[test]
@@ -653,7 +852,7 @@ mod tests {
             )
         );
         // The settings row before it has nothing to do, so the stage's own row decides the park.
-        let rows = run(&sys, &ctx, None, Mode::Plan).unwrap();
+        let rows = run(&sys, &ctx, None, Mode::Plan, None).unwrap();
         assert_eq!(
             rows.last().map(|row| row.status.as_str()),
             Some(super::super::WAITING),
@@ -689,7 +888,7 @@ mod tests {
             ..Plan::default()
         };
         for vault in [None, Some(&plan)] {
-            let why = run(&sys, &ctx, vault, Mode::Apply).unwrap_err();
+            let why = run(&sys, &ctx, vault, Mode::Apply, None).unwrap_err();
             assert!(why.contains("exactly one"), "{why}");
             assert!(observe(&sys, &ctx, vault, false).is_err());
         }

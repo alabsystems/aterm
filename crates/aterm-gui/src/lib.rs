@@ -195,6 +195,7 @@ mod native_mail;
 mod native_mail_host;
 mod native_observe;
 mod native_session_policy;
+mod native_usage_retention;
 mod native_workers;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
@@ -555,6 +556,10 @@ mod glass_yield_host_tests;
 /// The host unreachability pin: no dark ground reaches the light fork through the frame path.
 #[cfg(all(test, unix))]
 mod light_fork_pin_tests;
+/// A window dragged between displays of other scales under a sleeping pet, through the live present
+/// (macOS: its fixture holds the cells this Mac's fonts give at 1x and 2x).
+#[cfg(all(test, target_os = "macos"))]
+mod pet_display_drag_tests;
 /// The dump's script and printer, run by the tests on [`trail_rig`].
 #[cfg(all(test, unix))]
 mod trail_dump_tests;
@@ -649,6 +654,9 @@ pub use control::native_host_fixture::run_native_host_fixture;
 #[cfg(all(unix, debug_assertions))]
 #[doc(hidden)]
 pub use control::native_host_fixture::run_native_host_fixture_with_policy;
+#[cfg(all(unix, debug_assertions))]
+#[doc(hidden)]
+pub use control::native_host_fixture::run_native_source_proof_fixture;
 #[cfg(all(unix, debug_assertions))]
 #[doc(hidden)]
 pub use control::native_host_fixture::{NativeRenewalFixture, run_native_renewal_host_fixture};
@@ -6307,16 +6315,21 @@ fn register_terminal_tab(
 ) -> Result<tab_model::Tab, tab_model::IdExhausted> {
     let tab_id = tab_ids.allocate()?;
     let mut registered = Vec::with_capacity(layout.len());
-    for session in layout.sessions() {
+    let mut alloc_err = None;
+    layout.visit_sessions(&mut |session| {
+        if alloc_err.is_some() {
+            return;
+        }
         match views.insert_terminal(session) {
             Ok(view) => registered.push((session, view)),
-            Err(error) => {
-                for (_, view) in registered {
-                    views.remove(view);
-                }
-                return Err(error);
-            }
+            Err(error) => alloc_err = Some(error),
         }
+    });
+    if let Some(error) = alloc_err {
+        for (_, view) in registered {
+            views.remove(view);
+        }
+        return Err(error);
     }
     let by_session: HashMap<u64, tab_model::ViewId> = registered.iter().copied().collect();
     let root = layout.map_sessions(|session| by_session[&session]);
@@ -16109,12 +16122,16 @@ impl App {
     }
 
     fn reset_pane_space_decorations(&mut self, wid: WindowId) {
-        let Some(live) = self.active_tree(wid).map(|tree| tree.sessions()) else {
+        let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx.decos_mut().retain_panes(|s| live.contains(&s));
-        }
+        let WindowState {
+            layouts, tabs, fx, ..
+        } = &mut **ws;
+        let Some(tree) = layouts.get(tabs.active) else {
+            return;
+        };
+        fx.decos_mut().retain_panes(|s| tree.contains(s));
     }
 
     #[cfg(test)]

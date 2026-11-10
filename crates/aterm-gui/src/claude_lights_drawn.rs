@@ -237,20 +237,18 @@ impl App {
                         return;
                     };
                     let sid = entry.ctx.self_id.as_str();
-                    let published = entry
+                    let has_footer = entry
                         .ctx
                         .timeline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .agent()
                         .program
-                        .clone();
-                    if published
                         .as_deref()
                         .and_then(aterm_phase::program_of)
                         .and_then(crate::claude_footer::chip_line)
-                        .is_none()
-                    {
+                        .is_some();
+                    if !has_footer {
                         lines.push(drawn_chip_line(
                             sid,
                             wid.0,
@@ -276,10 +274,9 @@ impl App {
                             Drawn::NoRule
                         }
                     } else {
-                        if plan.is_none() {
-                            plan = active_id
-                                .and_then(|active| self.visible_leaf_plan_for_tab(wid, active));
-                        }
+                        let plan = plan.get_or_insert_with(|| {
+                            active_id.and_then(|active| self.visible_leaf_plan_for_tab(wid, active))
+                        });
                         plan.as_ref()
                             .and_then(|plan| {
                                 plan.leaves.iter().enumerate().find(|(_, l)| l.view == view)

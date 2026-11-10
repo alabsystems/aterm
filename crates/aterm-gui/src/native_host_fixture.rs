@@ -13,6 +13,11 @@ use std::io;
 use std::time::{Duration, Instant};
 
 const MUST_HAPPEN: Duration = Duration::from_secs(60);
+type SourceOutcomeObserver<'a> =
+    dyn Fn(Option<u32>, Option<u64>, Option<aterm_json::Value>) -> bool + Send + Sync + 'a;
+#[path = "native_source_proof_fixture.rs"]
+mod source_proof;
+pub use source_proof::run_native_source_proof_fixture;
 
 fn failure(words: impl Into<String>) -> io::Error {
     io::Error::other(words.into())
@@ -129,6 +134,15 @@ fn serve_connection_mode(
     stream: CtlStream,
     real_child: bool,
 ) -> io::Result<bool> {
+    serve_connection_observed(context, stream, real_child, None)
+}
+
+fn serve_connection_observed(
+    context: &ControlWorkerContext,
+    stream: CtlStream,
+    real_child: bool,
+    observe: Option<&SourceOutcomeObserver<'_>>,
+) -> io::Result<bool> {
     control_auth::peer_check(&stream).map_err(failure)?;
     stream.set_write_timeout(Some(MUST_HAPPEN))?;
     let _connection = ConnectionScope::enter(
@@ -206,7 +220,7 @@ fn serve_connection_mode(
                 .collect::<Vec<_>>()
                 .windows(2)
                 .any(|words| words == ["native-act", "signal"]);
-        let request = Request::parse(line);
+        let request = Request::parse(line.clone());
         let native_trace = real_child
             .then(|| fixture_native_action(&request.head()))
             .flatten();
@@ -214,6 +228,19 @@ fn serve_connection_mode(
             .enter(&request.head())
             .or_else(|| context.owed_input_reply(&request));
         let disposition = context.serve_line(request, scope, &stream, &mut reader, &mut out);
+        if observe.is_some_and(|observe| {
+            observe(
+                serving_peer_pid(),
+                serving_connection(),
+                out.fixture_source_outcome(&line),
+            )
+        }) {
+            // Only the explicit joined fixture can request this negative fault.
+            // Dispatch has already produced an actual accepted Ready response;
+            // close the real socket before any of that Outbox is transmitted.
+            stream.shutdown(std::net::Shutdown::Both)?;
+            return Ok(true);
+        }
         if let Some((action, operation)) = native_trace {
             // Record only after actual dispatch has returned. The controller can
             // await a denied Resume while a real native hold stands, then lift it.

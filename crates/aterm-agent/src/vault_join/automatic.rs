@@ -2,15 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The node generation's automatic admission worker. It keeps a current snapshot of this
-//! member's membership and home ALab LAN (at most `REFRESH_EVERY` old, read again at once on a
-//! network move or a membership change). A Mac on that LAN, or one recovering an existing seat
-//! from elsewhere, proves itself on the connection (`prove`), as a window's desk lets it in
-//! (`aterm_secrets::client::readmit`): being on the LAN is the admission, so a member with no
-//! window open lets new Macs in too.
+//! member's membership and home ALab LAN (at most `REFRESH_EVERY` old, looked at again at once on
+//! a network move or a membership change). A look reads the vault again only where a file the
+//! desk is read from moved since the last read settled (`Backend::unmoved`); otherwise it keeps
+//! the member and reads again only what no vault file decides: the network and the home LAN.
+//! A Mac on that LAN, or one recovering an existing seat from elsewhere, proves itself on the
+//! connection (`prove`), as a window's desk lets it in (`aterm_secrets::client::readmit`): being
+//! on the LAN is the admission, so a member with no window open lets new Macs in too.
 
-use aterm_secrets::client::Paths;
+use aterm_secrets::client::{DeskInputs, Paths};
 use aterm_secrets::converge::{Last, RunnerRetry};
-use aterm_secrets::members::desk::{self, Desk, Local};
+use aterm_secrets::home_lan::HomeNet;
+use aterm_secrets::members::desk::{self, Desk, HomeFrom, Local};
 use aterm_secrets::{Error, Result, SecretBytes};
 use aterm_types::MutexExt as _;
 use std::net::IpAddr;
@@ -64,8 +67,25 @@ struct Snapshot {
     desk: Arc<Mutex<Desk>>,
 }
 
+/// What one look of the worker found ([`Shared::run`]).
+enum Looked {
+    /// Nothing the published member was read from moved ([`Backend::unmoved`]): its home LAN as
+    /// read again now.
+    Unmoved(Option<HomeNet>),
+    /// The vault read again ([`Backend::read`]), its member boxed: a look that reads nothing
+    /// carries a few bytes.
+    Read(Result<Option<(Box<Local>, String)>>),
+}
+
 trait Backend: Send + Sync + 'static {
     fn read(&self) -> Result<Option<(Local, String)>>;
+    /// Whether the member the last [`Backend::read`] gave stands: that read settled, no file it
+    /// was read from moved since, no writer holds the vault, and this Mac is on `network` still.
+    /// `Some` holds its home LAN as read again now (what [`Desk::on_home`] takes), the one part
+    /// of its policy no vault file decides; `None` reads the vault again.
+    fn unmoved(&self, _network: &str) -> Option<Option<HomeNet>> {
+        None
+    }
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -92,17 +112,87 @@ trait Backend: Send + Sync + 'static {
 
 struct Vault {
     paths: Paths,
+    /// The last read, where it settled ([`Settled`]).
+    settled: Mutex<Option<Settled>>,
+    /// The network this Mac is on now: [`aterm_secrets::heard::network_key`], a test's own.
+    network: fn() -> Option<String>,
+    /// This Mac's home ALab LAN as its place gives it now: [`aterm_secrets::home_lan::home_net`],
+    /// a test's own.
+    home: fn() -> Option<HomeNet>,
+    /// This Mac as a member: [`Local::of`], a test's own.
+    local: fn(&Paths) -> Result<Option<Local>>,
+}
+
+/// A read of this Mac's membership that settled: a whole member ([`Local::whole`]) read on one
+/// network while none of the files it is read from moved ([`aterm_secrets::client::desk_inputs`],
+/// the stamps a window's desk lane keeps its member by, taken before the read and equal after
+/// it), whose home LAN its place gives or none does ([`HomeFrom`]; a lab vault's, which its vault
+/// and route give together, is read only with the vault). Stamps taken before the read alone do
+/// not do: a write moves a file's stamp for good (a new inode, a change time nothing sets back),
+/// but `state.toml` is stamped by a digest of what it holds
+/// ([`aterm_secrets::client::state_standing`]), which can go from A to B during the read and back
+/// to A after it, and a member read under B (an apply that failed partway, its roster unread)
+/// would then stand under A's stamps until a file moved, which a vault round does not.
+struct Settled {
+    inputs: DeskInputs,
+    network: String,
+    home_from: HomeFrom,
+}
+
+impl Vault {
+    fn new(paths: Paths) -> Self {
+        Self {
+            paths,
+            settled: Mutex::new(None),
+            network: aterm_secrets::heard::network_key,
+            home: aterm_secrets::home_lan::home_net,
+            local: Local::of,
+        }
+    }
 }
 
 impl Backend for Vault {
     fn read(&self) -> Result<Option<(Local, String)>> {
+        let mut settled = self.settled.lock_or_recover();
+        *settled = None;
+        // Taken before the read, and again after it: the read settles only where they are equal
+        // ([`Settled`]: the state's digest can go from A to B during the read and back to A).
+        let inputs = aterm_secrets::client::desk_inputs(&self.paths);
         // A move while the local vault was read cannot publish a mixed-network snapshot.
-        let before = aterm_secrets::heard::network_key();
-        let local = Local::of(&self.paths)?;
-        let after = aterm_secrets::heard::network_key();
-        Ok(match (local, before, after) {
-            (Some(local), Some(before), Some(after)) if before == after => Some((local, after)),
-            _ => None,
+        let before = (self.network)();
+        let local = (self.local)(&self.paths)?;
+        let after = (self.network)();
+        let (local, network) = match (local, before, after) {
+            (Some(local), Some(before), Some(after)) if before == after => (local, after),
+            _ => return Ok(None),
+        };
+        let home_from = local.home_from();
+        if local.whole()
+            && home_from != HomeFrom::Vault
+            && let Some(inputs) = inputs
+            && aterm_secrets::client::desk_inputs(&self.paths).as_ref() == Some(&inputs)
+        {
+            *settled = Some(Settled {
+                inputs,
+                network: network.clone(),
+                home_from,
+            });
+        }
+        Ok(Some((local, network)))
+    }
+
+    fn unmoved(&self, network: &str) -> Option<Option<HomeNet>> {
+        let settled = self.settled.lock_or_recover();
+        let settled = settled
+            .as_ref()
+            .filter(|settled| settled.network == network)?;
+        // Under a shared observation of the vault's state lock: a writer that holds it meets a
+        // fresh read, as a quiet memo's reader does.
+        let unmoved = aterm_secrets::client::desk_inputs_quiet(&self.paths)? == settled.inputs
+            && (self.network)().as_deref() == Some(network);
+        unmoved.then(|| match settled.home_from {
+            HomeFrom::Place => (self.home)(),
+            HomeFrom::None | HomeFrom::Vault => None,
         })
     }
 
@@ -141,7 +231,7 @@ impl AutomaticJoins {
     /// # Errors
     /// The worker thread could not start.
     pub fn start(paths: Paths, ready: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Self> {
-        Self::with_backend(Arc::new(Vault { paths }), ready)
+        Self::with_backend(Arc::new(Vault::new(paths)), ready)
     }
 
     fn with_backend(
@@ -201,7 +291,8 @@ impl AutomaticJoinHandle {
     /// Wake admission when the node watcher's cached membership verdict changes, including
     /// arrival or loss of the log. `LocalLog::keys` reuses its allocation for unchanged inputs;
     /// a new allocation can reflect changed vault policy even when the node keys are equal.
-    /// This invalidates cached policy; the worker reads fresh policy before publishing it again.
+    /// This invalidates cached policy; the worker looks again before publishing it again, and
+    /// reads the vault where a file the desk is read from moved (`Backend::unmoved`).
     pub fn observe_membership(&self, keys: Option<&Arc<aterm_net::fleet_member::MemberKeys>>) {
         let mut state = self.shared.state.lock_or_recover();
         let same = match (&state.membership, keys) {
@@ -329,13 +420,17 @@ impl Shared {
         let started = self.backend.now();
         let mut retry = RunnerRetry::default();
         let mut retry_epoch = None;
+        // Whether the snapshot is the one the backend's last read gave: a read whose epoch passed
+        // before it published leaves the snapshot an older read's, which no look may keep.
+        let mut published = false;
         loop {
-            let epoch = {
+            let (epoch, kept) = {
                 let state = self.state.lock_or_recover();
                 if state.stopped {
                     return;
                 }
-                state.epoch
+                let kept = state.snapshot.as_ref().filter(|_| published);
+                (state.epoch, kept.map(|snapshot| snapshot.network.clone()))
             };
             if retry_epoch != Some(epoch) {
                 // Changed membership or place gets a fresh failure budget and an immediate
@@ -344,7 +439,16 @@ impl Shared {
                 retry_epoch = Some(epoch);
             }
             retry.started();
-            let current = self.backend.read();
+            // A look at once after a move or a membership change, or at the next refresh, keeps
+            // the published member where nothing it was read from moved, its home LAN read again.
+            let current = match kept.as_deref().and_then(|net| self.backend.unmoved(net)) {
+                Some(home) => Looked::Unmoved(home),
+                None => Looked::Read(
+                    self.backend
+                        .read()
+                        .map(|read| read.map(|(local, network)| (Box::new(local), network))),
+                ),
+            };
             let now = self.backend.now();
             let now_ms = u64::try_from(now.saturating_duration_since(started).as_millis())
                 .unwrap_or(u64::MAX);
@@ -356,20 +460,32 @@ impl Shared {
                     return;
                 }
                 if state.epoch != epoch {
+                    published &= matches!(current, Looked::Unmoved(_));
                     continue;
                 }
                 match current {
-                    Ok(Some((local, network))) => {
+                    Looked::Unmoved(home) => {
+                        became_ready = state.valid_until.is_none();
+                        // The snapshot `kept` named: only this worker replaces it.
+                        if let Some(snapshot) = state.snapshot.as_ref() {
+                            snapshot.desk.lock_or_recover().on_home(home);
+                        }
+                        state.valid_until = Some(next_refresh);
+                        retry.reaped(Last::Ended, now_ms);
+                        self.changed.notify_all();
+                    }
+                    Looked::Read(Ok(Some((local, network)))) => {
+                        published = true;
                         became_ready = state.valid_until.is_none();
                         let same = state.snapshot.as_ref().filter(|snapshot| {
                             snapshot.network == network
                                 && snapshot.desk.lock_or_recover().local().key() == local.key()
                         });
                         let desk = if let Some(snapshot) = same {
-                            snapshot.desk.lock_or_recover().refresh(local);
+                            snapshot.desk.lock_or_recover().refresh(*local);
                             Arc::clone(&snapshot.desk)
                         } else {
-                            let mut desk = Desk::new(local);
+                            let mut desk = Desk::new(*local);
                             desk.on_network(Some(network.clone()));
                             Arc::new(Mutex::new(desk))
                         };
@@ -380,7 +496,8 @@ impl Shared {
                         retry.reaped(Last::Ended, now_ms);
                         self.changed.notify_all();
                     }
-                    result => {
+                    Looked::Read(result) => {
+                        published = false;
                         became_ready = false;
                         state.valid_until = None;
                         // An invalid read supplies no usable policy to cache for 30 seconds.

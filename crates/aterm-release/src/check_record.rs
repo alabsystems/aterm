@@ -350,6 +350,27 @@ pub fn input_missing(root: &Path, tree: &str, seal: &str) -> Result<Vec<String>,
     Ok(missing)
 }
 
+/// Bounded package successes from one completed preflight. These are candidates only: the
+/// verifier reconstructs the current package's complete key before carrying any of them.
+pub fn input_lint_candidates(
+    root: &Path,
+    tree: &str,
+    seal: &str,
+) -> Result<aterm_verify::lint_content::Passed, String> {
+    let mut passed = aterm_verify::lint_content::Passed::new();
+    if let Read::Record(record) = read(&path(root, tree, seal, "lint", None))?
+        && answers(&record, "lint", tree, seal, None)
+        && record.outcome == OK
+    {
+        for package in record.lint_packages {
+            if let Some(proof) = package.proof() {
+                passed.insert(proof.spec.clone(), proof);
+            }
+        }
+    }
+    Ok(passed)
+}
+
 /// The records of bundle check `check` in `seal_dir`, one per executable: each U and
 /// its record's path, in U order.
 fn bundle_records(seal_dir: &Path, check: &str) -> Result<Vec<(String, PathBuf)>, String> {
@@ -2151,6 +2172,71 @@ mod tests {
         )
         .unwrap();
         assert!(input_missing(&f.root, TREE, facts.seal).is_err());
+    }
+
+    #[test]
+    fn input_package_candidates_require_a_matching_successful_a19_record() {
+        let f = Fixture::new();
+        let mut events = all_ok();
+        let good = lint_package("good", 1, OK);
+        events.lint_packages = vec![good.clone(), lint_package("red", 2, FAIL)];
+        f.write("input", "", 0, &events);
+        let carried = input_lint_candidates(&f.root, TREE, "input").unwrap();
+        assert_eq!(carried.keys().cloned().collect::<Vec<_>>(), ["good"]);
+        assert!(
+            crate::input_record::previous_lint(&f.root, "base")
+                .unwrap()
+                .is_empty()
+        );
+        crate::input_record::attempted(&f.root, "base", TREE, "input").unwrap();
+        assert_eq!(
+            crate::input_record::previous_lint(&f.root, "base").unwrap(),
+            carried
+        );
+        assert!(
+            crate::input_record::previous_lint(&f.root, "another-base")
+                .unwrap()
+                .is_empty()
+        );
+        let mut interrupted = f.facts("input", "");
+        interrupted.tree = "3333333333333333333333333333333333333333";
+        begin_run(&f.root, &interrupted).unwrap();
+        crate::input_record::attempted(&f.root, "base", interrupted.tree, "input").unwrap();
+        assert!(
+            crate::input_record::previous_lint(&f.root, "base")
+                .unwrap()
+                .is_empty(),
+            "a newer begun attempt cannot revive the preceding tree's green packages"
+        );
+        crate::input_record::attempted(&f.root, "base", TREE, "input").unwrap();
+        assert!(
+            input_lint_candidates(&f.root, TREE, "different seal")
+                .unwrap()
+                .is_empty()
+        );
+        let red = RunEvents {
+            finished: vec![finished("lint", FAIL)],
+            lint_packages: vec![good],
+            ..RunEvents::default()
+        };
+        f.write("input", "", 1, &red);
+        assert!(
+            input_lint_candidates(&f.root, TREE, "input")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::input_record::previous_lint(&f.root, "base")
+                .unwrap()
+                .is_empty()
+        );
+        f.end("input", "", 0, Ok(&events)).unwrap();
+        assert!(
+            input_lint_candidates(&f.root, TREE, "input")
+                .unwrap()
+                .is_empty(),
+            "saved red stays red"
+        );
     }
 
     /// Compilation may uplift the verifier path. Both halves use their captured running

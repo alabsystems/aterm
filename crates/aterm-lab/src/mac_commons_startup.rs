@@ -326,6 +326,7 @@ pub(crate) fn cmd(args: &[String]) -> Res {
     aterm_uds::private_file::check_private_dir(&ask.record).map_err(fail)?;
     let scratch = aterm_tempfile::Builder::new()
         .prefix("mac-commons-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(fail)?;
     let share = scratch.path().join("share");

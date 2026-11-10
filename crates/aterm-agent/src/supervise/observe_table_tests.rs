@@ -289,3 +289,12 @@ fn an_observed_agent_is_never_restarted() {
         assert_eq!(asked.len(), restarts, "{mode:?}: {asked:?}");
     }
 }
+
+#[test]
+fn a_scoped_account_event_reaches_the_harness_while_observed() {
+    TABLE.with_borrow_mut(|t| *t = Some((Mode::Observe, Vec::new())));
+    let unset = Unset;
+    let asked = super::turn_end::observe_row_scoped_restart();
+    drop(unset);
+    assert_eq!(asked.len(), 1, "{asked:?}");
+}

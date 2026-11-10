@@ -1291,7 +1291,23 @@ pub fn migrate(
         .acquire_within(ladder)
         .map_err(|why| format!("{}: {why}", store.dir.display()))?
         .ok_or_else(|| format!("{} at {}", accounts::LOCK_HELD, store.dir.display()))?;
-    store.recover_sync_held(&held, roster_path)?;
+    migrate_held(lab, cli, store, &held, roster_path, now, false)
+}
+
+/// Apply native label migration while the caller retains this store's writer.
+pub(super) fn migrate_held(
+    lab: &Lab,
+    cli: Cli,
+    store: &Store,
+    held: &accounts::Lock,
+    roster_path: &Path,
+    now: i64,
+    retire: bool,
+) -> Result<Migrated, String> {
+    if !lab.settled {
+        return Ok(Migrated::default());
+    }
+    store.recover_sync_held(held, roster_path)?;
     let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
     let before = accounts::roster_text(&write_to)?;
     let Some(text) = before.as_deref() else {
@@ -1318,8 +1334,8 @@ pub fn migrate(
         .iter()
         .map(|(from, to)| (from.as_str(), to.as_str()))
         .collect();
-    store.transact_sync_held(
-        &held,
+    store.transact_sync_policy_held(
+        held,
         now,
         &mut None,
         accounts::SyncTarget {
@@ -1329,39 +1345,13 @@ pub fn migrate(
             after: Some(&after),
             mode: keep_mode,
         },
-        |state, logins| {
+        (retire, |state, logins| {
             accounts::move_accounts(state, logins, &pairs)?;
             Ok(Vec::new())
-        },
+        }),
         || Ok(()),
     )?;
     Ok(planned)
-}
-
-/// What a sync of `cli` runs before it reads its source, where that source is the lab's
-/// ([`chosen`] picks it for the source `named` and the `aterm.toml` at `config`): [`migrate`]
-/// with the lab this process holds, so the fleet it then reads ([`fleet_for`]) already finds
-/// every row under the lab's label and the sync renames nothing.
-///
-/// # Errors
-/// As [`migrate`].
-pub(super) fn migrate_before_sync(
-    cli: Cli,
-    store: &Store,
-    (roster_path, config): (&Path, Option<&Path>),
-    named: Option<&str>,
-    now: i64,
-    ladder: &[std::time::Duration],
-) -> Result<Migrated, String> {
-    let source = snapshot();
-    match (
-        source.lab(),
-        chosen_from(&source, cli, Some(roster_path), named, config),
-    ) {
-        (Some(lab), Ok(Some(_))) => migrate(&lab, cli, store, roster_path, now, ladder),
-        // The sync's own read of its source says why the lab is not one.
-        _ => Ok(Migrated::default()),
-    }
 }
 
 /// What this Mac runs of `cli` that it does not prefer, from its `roster` and the lab: each row

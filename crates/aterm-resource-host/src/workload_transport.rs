@@ -76,26 +76,24 @@ impl Link {
             },
         )
     }
-    pub(crate) fn begin(
+    pub(crate) fn try_begin(
         &self,
         request: trust_resource_controller::workload::host::bank::Request,
         deadline: Instant,
-    ) -> io::Result<BankPending> {
+    ) -> io::Result<Option<BankPending>> {
         if self.closed() {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         let (reply, receive) = mpsc::sync_channel(1);
-        self.send
-            .try_send(BankMessage {
-                request,
-                deadline,
-                reply,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
-                mpsc::TrySendError::Disconnected(_) => io::Error::from(io::ErrorKind::BrokenPipe),
-            })?;
-        Ok(BankPending { receive })
+        match self.send.try_send(BankMessage {
+            request,
+            deadline,
+            reply,
+        }) {
+            Ok(()) => Ok(Some(BankPending { receive })),
+            Err(mpsc::TrySendError::Full(_)) => Ok(None),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::ErrorKind::BrokenPipe.into()),
+        }
     }
     pub(crate) fn closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -800,6 +798,10 @@ pub(super) fn worker_return(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "workload_transport/bank_pending_tests.rs"]
+mod bank_pending_tests;
 
 #[cfg(test)]
 mod tests {

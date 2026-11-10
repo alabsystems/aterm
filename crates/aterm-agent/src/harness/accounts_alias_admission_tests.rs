@@ -228,6 +228,7 @@ fn represented_sync(
             Cli::Codex,
             (&bed.home, &bed.state, &bed.aterm_toml()),
             (None, None),
+            false,
             NOW,
             (&read_named, &[]),
             || {

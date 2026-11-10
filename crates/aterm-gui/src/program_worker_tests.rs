@@ -93,6 +93,67 @@ const QUIET: Unwatched = Unwatched {
     job: false,
 };
 
+#[test]
+fn an_adopted_program_concludes_without_a_disk_maintenance_pass() {
+    for (local, status) in [(7902, 0), (7903, 3)] {
+        let (mut session, _) = program_worker(local);
+        session.handoff_local_id = Some(42);
+        let block = ran(&mut session.term.lock().unwrap(), "build");
+        noted(&session, block);
+        printed(&mut session.term.lock().unwrap(), &["built after adoption"]);
+        if status == 0 {
+            exited(&mut session.term.lock().unwrap(), status);
+        }
+        let store = crate::session_store::new_store();
+        crate::App::register_session(&store, &session, None);
+        if status != 0 {
+            assert_eq!(record_of(&session).state, TaskState::Working);
+            exited(&mut session.term.lock().unwrap(), status);
+            session.ctx.watchers.ring_watchers();
+        }
+        let done = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || {
+                let record = record_of(&session);
+                record.state.has_an_end_to_read().then_some(record)
+            },
+        )
+        .expect("adopted program never concluded without a disk maintenance pass");
+        let want = if status == 0 {
+            TaskState::Done
+        } else {
+            TaskState::Failed
+        };
+        assert_eq!((done.state, done.exit), (want, Some(status)));
+        assert_eq!(done.why, Some(crate::task_record::WHY_EXIT_STATUS));
+        assert_eq!(
+            crate::task_record::cmd_result(&session.ctx, session.id, ""),
+            "OK 1 source=output bytes=20\nbuilt after adoption\n"
+        );
+    }
+}
+
+#[test]
+fn an_adopted_program_watch_ends_when_its_registry_is_dropped() {
+    let (session, _) = program_worker(7904);
+    let block = ran(&mut session.term.lock().unwrap(), "build");
+    noted(&session, block);
+    let store = crate::session_store::new_store();
+    crate::App::register_session(&store, &session, None);
+    let watch = resume(&store, &session).expect("an open program has a watch");
+    drop(store);
+    session.ctx.watchers.ring_watchers();
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || watch.is_finished().then_some(()),
+    )
+    .expect("the watcher retained the registry it was observing");
+    watch.join().expect("the watcher returned normally");
+    assert_eq!(record_of(&session).state, TaskState::Working);
+}
+
 /// EXIT 0 FINISHES THE TASK, ITS OUTPUT TAIL ITS RESULT: the shell's status for the program's block
 /// marks it `done why=exit-status exit=0`, and `result` answers `source=output` with what the
 /// program printed, none of the prompt or the line typed. The concluded record keeps no block.

@@ -188,17 +188,12 @@ mod tests {
     /// from outside it; once it is reaped neither names anything.
     #[test]
     fn a_childs_directory_and_open_file_read_from_outside_it() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("lab-relaunch-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestScratch::new("relaunch");
         let lock = dir.join("presence.lock");
         std::fs::write(&lock, b"").unwrap();
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("600")
-            .current_dir(&dir)
+            .current_dir(&*dir)
             .stdin(std::fs::File::open(&lock).unwrap())
             .spawn()
             .expect("spawn a holder");
@@ -206,7 +201,6 @@ mod tests {
         let (cwd, files) = (cwd_of(pid), open_files(pid));
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(cwd.as_deref(), Some(&*dir.to_string_lossy()));
         assert!(
             files.contains(&lock.to_string_lossy().into_owned()),

@@ -219,17 +219,8 @@ impl CcHost {
         if let Some(dir) = self.developer_override() {
             return Ok(dir.to_path_buf());
         }
-        match std::fs::read_link(&self.xcode_select_link) {
-            Ok(dir) => {
-                return Ok(if dir.is_absolute() {
-                    dir
-                } else {
-                    self.xcode_select_link
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(dir)
-                });
-            }
+        match aterm_types::clt_shim::read_developer_selection(&self.xcode_select_link) {
+            Ok(dir) => return Ok(dir),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
@@ -239,7 +230,7 @@ impl CcHost {
             }
         }
         if let Some(dir) = &self.xcode_developer_dir
-            && holds_clang(dir)?
+            && holds_clang(dir, self)?
         {
             return Ok(dir.clone());
         }
@@ -315,10 +306,12 @@ pub fn probe(path_var: Option<&OsStr>) -> CcVerdict {
 }
 
 /// [`probe_with`], keeping a `Ready` verdict in `cache` under [`cc_key`]: a later probe whose
-/// key matches answers `Ready` with nothing spawned (no `xcrun`, no compile and link); any other
-/// verdict is probed every time. When a key is available, revalidate it before returning a
+/// key and discovered-compiler identity match answers `Ready` with nothing spawned (no `xcrun`,
+/// no compile and link); any other verdict is probed every time. Revalidate the key before returning a
 /// verdict or publishing a cached fact; an observed change leaves the current toolchain unproven.
-/// A native driver the text cache cannot represent is returned without caching.
+/// The discovered compiler's metadata identity is captured before compilation, revalidated
+/// afterward, and kept beside its path for each hit to verify. A driver whose executable
+/// identity is unreadable, or whose native path the text cache cannot represent, is not cached.
 #[must_use]
 pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCache>) -> CcVerdict {
     const CHANGED: &str = "C toolchain inputs changed or became unreadable during the check";
@@ -331,10 +324,14 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
     };
     let kept = cache.and_then(|cache| Some((cache, cc_key(&located, path_var, host, cache)?)));
     if let Some((cache, key)) = &kept
-        && let Some(driver) = crate::probe_cache::get(&cache.file, key)
+        && let Some(value) = crate::probe_cache::get(&cache.file, key)
+        && let Ok((driver, identity)) = aterm_json::from_str::<(String, String)>(&value)
+        && crate::probe_cache::identity(Path::new(&driver)).as_ref() == Some(&identity)
     {
         let driver = PathBuf::from(driver);
-        if cc_key(&located, path_var, host, cache).as_ref() != Some(key) {
+        if cc_key(&located, path_var, host, cache).as_ref() != Some(key)
+            || crate::probe_cache::identity(&driver).as_ref() != Some(&identity)
+        {
             return CcVerdict::Unproven {
                 driver,
                 why: CHANGED.into(),
@@ -342,7 +339,12 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
         }
         return CcVerdict::Ready { driver };
     }
-    let verdict = probe_located(&located, path_var, host);
+    let mut observed = None;
+    let verdict = probe_located_observing(&located, path_var, host, |driver| {
+        if kept.is_some() && matches!(is_executable(driver), Ok(true)) {
+            observed = crate::probe_cache::identity(driver).map(|id| (driver.to_owned(), id));
+        }
+    });
     if let Some((cache, key)) = &kept {
         if cc_key(&located, path_var, host, cache).as_ref() != Some(key) {
             return CcVerdict::Unproven {
@@ -352,16 +354,26 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
                 why: CHANGED.into(),
             };
         }
-        if let CcVerdict::Ready { driver } = &verdict
-            && let Some(driver) = driver.to_str()
+        if let Some((driver, identity)) = &observed
+            && crate::probe_cache::identity(driver).as_ref() != Some(identity)
         {
-            crate::probe_cache::put(&cache.file, key, driver);
+            return CcVerdict::Unproven {
+                driver: driver.clone(),
+                why: CHANGED.into(),
+            };
+        }
+        if let CcVerdict::Ready { driver } = &verdict
+            && let Some((_, identity)) = &observed
+            && let Some(driver) = driver.to_str()
+            && let Ok(value) = aterm_json::to_string(&(driver, identity))
+        {
+            crate::probe_cache::put(&cache.file, key, &value);
         }
     }
     verdict
 }
 
-/// What a `Ready` verdict for `located` depends on, read without spawning: the compiler as it is
+/// The base key for a `Ready` verdict for `located`, read without spawning: the compiler as it is
 /// now ([`crate::probe_cache::identity`]), the shim's discovery executable, the active developer
 /// directory (`DEVELOPER_DIR`, else `xcode-select`'s link, else Xcode or the standalone tools),
 /// the identity of its `clang`,
@@ -433,7 +445,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v14".to_owned()),
+        Some("fresh-executable-link-v15".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(discovery),
@@ -514,17 +526,25 @@ pub(crate) fn probe_with_elapsed(
 
 /// [`probe_with`] past [`locate`]: the compiler asked, then the build probe.
 fn probe_located(located: &Located, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
-    let cc = match located {
-        Located::Plain(cc) => {
-            return match ask(cc, cc, CcQuery::Version, host) {
-                CcVerdict::Ready { driver } => build_probe(cc, driver, path_var, host),
-                other => other,
-            };
-        }
-        Located::Shim(cc) => cc,
+    probe_located_observing(located, path_var, host, |_| {})
+}
+
+/// Observe the discovered driver's identity before compilation can use or replace it.
+fn probe_located_observing(
+    located: &Located,
+    path_var: Option<&OsStr>,
+    host: &CcHost,
+    before_build: impl FnOnce(&Path),
+) -> CcVerdict {
+    let (cc, bin, query) = match located {
+        Located::Plain(cc) => (cc, cc.clone(), CcQuery::Version),
+        Located::Shim(cc) => (cc, discovery_program(cc, host), CcQuery::Find),
     };
-    match ask(&discovery_program(cc, host), cc, CcQuery::Find, host) {
-        CcVerdict::Ready { driver } => build_probe(cc, driver, path_var, host),
+    match ask(&bin, cc, query, host) {
+        CcVerdict::Ready { driver } => {
+            before_build(&driver);
+            build_probe(cc, driver, path_var, host)
+        }
         other => other,
     }
 }
@@ -582,7 +602,12 @@ fn same_path(selected: &Path, known: &Path) -> bool {
 
 fn is_system_shim(cc: &Path, host: &CcHost) -> bool {
     host.shim_dir.as_deref().is_some_and(|shim| {
-        cc.parent().is_some_and(|dir| same_path(dir, shim)) || same_path(cc, &shim.join("cc"))
+        cc.parent().is_some_and(|dir| same_path(dir, shim))
+            || same_path(cc, &shim.join("cc"))
+            || std::fs::canonicalize(cc)
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_owned))
+                .is_some_and(|dir| same_path(&dir, shim))
     })
 }
 
@@ -636,7 +661,7 @@ fn locate_without_setup_shim(
         why,
     };
     let developer_dir = host.developer_dir().map_err(unread)?;
-    if holds_clang(&developer_dir).map_err(unread)? {
+    if holds_clang(&developer_dir, host).map_err(unread)? {
         Ok(Located::Shim(cc))
     } else {
         Err(CcVerdict::NoDeveloperDir)
@@ -653,9 +678,9 @@ fn clang_paths(developer: &Path) -> [PathBuf; 2] {
     ]
 }
 
-fn holds_clang(developer: &Path) -> Result<bool, String> {
+fn holds_clang(developer: &Path, host: &CcHost) -> Result<bool, String> {
     for clang in clang_paths(developer) {
-        if is_executable(&clang)? {
+        if is_executable(&clang)? && !is_system_shim(&clang, host) {
             return Ok(true);
         }
     }
@@ -1442,6 +1467,9 @@ mod tests {
             .enumerate()
         {
             let path = root.join(std::ffi::OsString::from_vec(name.to_vec()));
+            if path.to_str().is_some() {
+                script(&path, "exit 0");
+            }
             let mut bytes = path.as_os_str().as_encoded_bytes().to_vec();
             bytes.extend_from_slice(b"\r\n");
             std::fs::write(&answer, bytes).unwrap();
@@ -1512,6 +1540,26 @@ mod tests {
         );
         assert!(!ran.exists(), "the shim was spawned");
         assert!(!xcrun_ran.exists(), "xcrun was spawned");
+
+        let clang = clang_dir.join("usr/bin/clang");
+        std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+        script(&shim.join("clang"), "exit 1");
+        std::os::unix::fs::symlink(shim.join("clang"), &clang).unwrap();
+        assert_eq!(
+            probe_with(Some(alias.as_os_str()), &host),
+            CcVerdict::NoDeveloperDir
+        );
+        assert!(!ran.exists(), "a developer alias admitted the install shim");
+        assert!(!xcrun_ran.exists(), "a developer alias admitted xcrun");
+        let standalone = root.join("standalone-tools");
+        script(&standalone.join("usr/bin/clang"), "exit 0");
+        let fallback = CcHost {
+            xcode_developer_dir: Some(clang_dir.clone()),
+            default_developer_dir: standalone.clone(),
+            ..host.clone()
+        };
+        assert_eq!(fallback.developer_dir().unwrap(), standalone);
+        std::fs::remove_file(&clang).unwrap();
 
         script(&clang_dir.join("usr/bin/clang"), "exit 0");
         assert_eq!(
@@ -2635,7 +2683,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        // The preceding execute-access policy's namespace cannot supply a kept fact.
+        // A preceding path-only cached value cannot supply a compiler identity fact.
         let current = cc_key(
             &Located::Plain(cc.clone()),
             Some(bin.as_os_str()),
@@ -2644,8 +2692,8 @@ mod tests {
         )
         .unwrap();
         old_keys.push(current.replacen(
+            "fresh-executable-link-v15",
             "fresh-executable-link-v14",
-            "fresh-executable-link-v13",
             1,
         ));
         // The old receipt reader also called an unread receipt absent. Retire that fact
@@ -2812,6 +2860,7 @@ mod tests {
             let developer = root.join("developer");
             let driver = developer.join("usr/bin/cc");
             let compiled = root.join("compiled");
+            script(&driver, "exit 0");
             script(&developer.join("usr/bin/clang"), "exit 0");
             script(&xcrun, &format!("echo '{}'", driver.display()));
             script(
@@ -2891,6 +2940,9 @@ mod tests {
         let xcode = root.join("Xcode.app/Contents/Developer");
         let clang = xcode.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
         script(&clang, "exit 0");
+        let compiler = xcode.join("usr/bin/cc");
+        script(&compiler, "exit 0");
+        let mutate = root.join("mutate-compiler");
         script(
             &shim.join("xcrun"),
             &format!("echo '{}/usr/bin/cc'", xcode.display()),
@@ -2898,8 +2950,11 @@ mod tests {
         script(
             &shim.join("cc"),
             &format!(
-                "echo \"$1\" >> '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
-                asked.display()
+                "echo \"$1\" >> '{}'; [ -x '{}' ] || {{ echo 'selected compiler is not executable' >&2; exit 1; }}; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; if [ -f '{}' ]; then /bin/chmod 644 '{}'; fi; }}",
+                asked.display(),
+                compiler.display(),
+                mutate.display(),
+                compiler.display()
             ),
         );
         let host = CcHost {
@@ -2932,6 +2987,26 @@ mod tests {
         script(&clang, "echo updated; exit 0");
         assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
         assert_eq!(runs(), 2, "an updated Xcode kept the old verdict");
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            matches!(probe_cached(path, &host, Some(&cache)), CcVerdict::Broken { why, .. }
+                if why == "selected compiler is not executable"),
+            "an independently changed discovered compiler retained its successful verdict"
+        );
+        assert_eq!(runs(), 3);
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&cache.receipt, "2").unwrap();
+        std::fs::write(&mutate, "yes").unwrap();
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Unproven { .. }
+        ));
+        assert_eq!(runs(), 4, "an in-flight replacement was not retained");
+        std::fs::remove_file(&mutate).unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 5, "the repaired compiler remains warm");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

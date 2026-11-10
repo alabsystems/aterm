@@ -2532,6 +2532,7 @@ fn mac_row(
     .collect();
     let what = match mac.needs.len() {
         0 if agents.is_empty() && mac.instances_unread > 0 => "other instances unread".to_string(),
+        0 if mac.activity.is_none() => "agents not read".to_string(),
         0 if agents.is_empty() => "quiet".to_string(),
         0 => agents.join(" \u{b7} "),
         n => {
@@ -2570,11 +2571,14 @@ fn mac_row(
     }
 }
 
-/// Whether a fleet Mac is quiet: no need, no agent busy, waiting or at a limit, and no other
-/// instance reported unread.
+/// Whether a fleet Mac is quiet: its agents read, no need, no agent busy, waiting or at a limit,
+/// and no other instance reported unread. A Mac whose agents were not read is not quiet: absent,
+/// never zero.
 #[cfg(any(target_os = "macos", test))]
 fn quiet_mac(mac: &crate::fleet_glance::FleetMac) -> bool {
-    let t = mac.activity.unwrap_or_default();
+    let Some(t) = mac.activity else {
+        return false;
+    };
     mac.needs.is_empty()
         && t.busy == 0
         && t.waiting == 0
@@ -5597,6 +5601,11 @@ mod tests {
                 with("mac-idle", 0, 0),
                 with("mac-walled", 0, 2),
                 with("mac-waiting", 1, 0),
+                // Its agents were not read: absent, never quiet.
+                crate::fleet_glance::FleetMac {
+                    activity: None,
+                    ..mac("mac-unread", 0, 0, false)
+                },
             ],
             10_000,
         );
@@ -5617,6 +5626,10 @@ mod tests {
             "{labels:?}"
         );
         assert!(labels.contains(&"1 quiet Mac"), "{labels:?}");
+        assert!(
+            labels.contains(&"mac-unread \u{2014} agents not read"),
+            "{labels:?}"
+        );
         assert!(
             !labels.iter().any(|l| l.starts_with("mac-idle")),
             "{labels:?}"

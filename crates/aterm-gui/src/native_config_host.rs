@@ -259,27 +259,22 @@ impl App {
             return false;
         }
 
-        let views = {
-            let windows = &self.windows;
-            let view_store = &self.view_store;
-            let runtime = &self.native_runtime;
-            windows
-                .iter()
-                .flat_map(|(window, state)| {
-                    state.tab_set.tabs().iter().flat_map(move |tab| {
-                        tab.root.leaves().into_iter().filter_map(move |view| {
-                            let crate::tab_model::View::Native(native) =
-                                view_store.get(view).copied()?
-                            else {
-                                return None;
-                            };
-                            (runtime.document_id(native.instance) == Some(completion.document))
-                                .then_some((*window, native.instance, view))
-                        })
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut views = Vec::new();
+        for (&window, state) in &self.windows {
+            for tab in state.tab_set.tabs() {
+                tab.root.visit(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) =
+                        self.view_store.get(view).copied()
+                    else {
+                        return;
+                    };
+                    if self.native_runtime.document_id(native.instance) == Some(completion.document)
+                    {
+                        views.push((window, native.instance, view));
+                    }
+                });
+            }
+        }
         for (window, instance, view) in views {
             self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
             self.refresh_native_presentation(window, instance, view);

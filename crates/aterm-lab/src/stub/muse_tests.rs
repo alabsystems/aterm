@@ -157,7 +157,7 @@ fn get(port: &str, path: &str) -> (u16, String) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-muse-{}", std::process::id()));
+    let dir = crate::TestScratch::new("muse");
     std::fs::create_dir_all(dir.join("modes")).unwrap();
     let log = dir.join("stub.log");
     let tool_file = dir.join("tool.json");
@@ -365,12 +365,11 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
     for want in wants {
         assert!(logged.contains(want), "{want} in\n{logged}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn the_log_observation_keeps_present_lines_and_refuses_missing_ones() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::test_scratch_dir("logobs");
     let log = dir.path().join("stub.log");
     std::fs::write(&log, "early\n tool:done result='x'\n").unwrap();
     let got = logged_with(&log, &["early", " tool:done "], Duration::from_secs(60));

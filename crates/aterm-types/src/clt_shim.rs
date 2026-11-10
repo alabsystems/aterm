@@ -389,7 +389,7 @@ pub fn developer_content_dir_with(
 
 /// The developer directories a call to `<tool>` is served from, in the order `xcode-select -p`
 /// answers, read without running it: `$DEVELOPER_DIR` (`developer_dir`), the directory
-/// `xcode-select` selected (`selected`, [`XCODE_SELECT_LINK`]'s target), Xcode's own
+/// `xcode-select` selected (`selected`, [`read_developer_selection`]'s answer), Xcode's own
 /// ([`XCODE_DEVELOPER`]), then the Command Line Tools ([`CLT_DIR`]). Only absolute ones count,
 /// each once. Application roots resolve to their developer contents; an unread contents
 /// directory retains its original candidate for the tool's own presence check.
@@ -417,6 +417,23 @@ pub fn developer_dirs(
     dirs
 }
 
+/// Read the developer-directory selection symlink without starting Apple's selector.
+/// Relative targets resolve beside the selection link, as the filesystem resolves them;
+/// invocation paths retain their spelling rather than resolving application aliases.
+///
+/// # Errors
+/// The selection link could not be read.
+pub fn read_developer_selection(link: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let dir = std::fs::read_link(link)?;
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        link.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(dir)
+    })
+}
+
 /// The developer tools' own `<tool>` among `dirs` ([`developer_dirs`]): the first of each
 /// directory's `usr/bin/<tool>` and then its default toolchain's ([`DEFAULT_TOOLCHAIN_BIN`])
 /// that `is_file` finds, never one in `/usr/bin` itself (Apple's stubs), and never a name with
@@ -441,17 +458,17 @@ pub fn developer_tool_in(
         .find(|path| is_file(path))
 }
 
-/// [`developer_tool_in`] on this Mac: the developer tools' own `<tool>`, read with a stat and a
-/// readlink (no child process, so nothing can raise Apple's install dialog). `None` where no
-/// developer directory carries a nonempty executable file for it, and off macOS. Compiler
-/// links are followed, as Apple's toolchains use them.
+/// [`developer_tool_in`] on this Mac: the developer tools' own `<tool>`, inspected without a
+/// child process, so nothing can raise Apple's install dialog. `None` where no developer
+/// directory carries a nonempty executable file for it, and off macOS. Compiler links are
+/// followed, as Apple's toolchains use them; resolved paths inside `/usr/bin` are excluded.
 #[must_use]
 pub fn developer_tool(tool: &str) -> Option<std::path::PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
     let developer_dir = std::env::var_os("DEVELOPER_DIR").map(std::path::PathBuf::from);
-    let selected = std::fs::read_link(XCODE_SELECT_LINK).ok();
+    let selected = read_developer_selection(std::path::Path::new(XCODE_SELECT_LINK)).ok();
     developer_tool_in(
         tool,
         &developer_dirs(developer_dir.as_deref(), selected.as_deref()),
@@ -460,7 +477,13 @@ pub fn developer_tool(tool: &str) -> Option<std::path::PathBuf> {
 }
 
 fn developer_executable(path: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if resolved.starts_with("/usr/bin") {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(resolved) else {
         return false;
     };
     if !meta.is_file() || meta.len() == 0 {
@@ -535,6 +558,26 @@ mod tests {
                 Some(expected)
             );
         }
+        let selection = root.path().join("db/selection");
+        std::fs::create_dir_all(selection.parent().unwrap()).unwrap();
+        for (target, expected) in [
+            (bundle.clone(), git.clone()),
+            (
+                std::path::PathBuf::from("../Developer Suite"),
+                root.path()
+                    .join("db/../Developer Suite/Contents/Developer/usr/bin/git"),
+            ),
+        ] {
+            symlink(target, &selection).unwrap();
+            let selected = read_developer_selection(&selection).unwrap();
+            assert_eq!(
+                developer_tool_in("git", &developer_dirs(None, Some(&selected)), |path| {
+                    path.starts_with(root.path()) && developer_executable(path)
+                }),
+                Some(expected)
+            );
+            std::fs::remove_file(&selection).unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -564,6 +607,43 @@ mod tests {
         std::fs::remove_file(&empty).unwrap();
         symlink(&good, &empty).unwrap();
         assert_eq!(find(), Some(empty));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn aliases_of_apple_stubs_do_not_hide_real_developer_tools() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let stub = std::path::Path::new("/usr/bin/git");
+        let meta = std::fs::metadata(stub).unwrap();
+        assert!(meta.is_file() && meta.len() > 0 && meta.permissions().mode() & 0o111 != 0);
+
+        let root = crate::test_scratch_dir("clt-stub-alias");
+        let root_alias = root.path().join("root");
+        symlink("/", &root_alias).unwrap();
+        let linked = root.path().join("linked");
+        std::fs::create_dir_all(linked.join("usr/bin")).unwrap();
+        symlink(stub, linked.join("usr/bin/git")).unwrap();
+        let upper = root.path().join("upper");
+        std::fs::create_dir_all(upper.join("usr/bin")).unwrap();
+        symlink("/USR/BIN/git", upper.join("usr/bin/git")).unwrap();
+        let complete = root.path().join("complete");
+        let good = complete.join("usr/bin/git");
+        std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+        std::fs::write(&good, "developer git fixture").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for alias in [root_alias.clone(), root_alias.join(".."), linked, upper] {
+            assert_eq!(
+                developer_tool_in("git", std::slice::from_ref(&alias), developer_executable),
+                None,
+                "an alias of Apple's stub is not an installed developer tool: {alias:?}"
+            );
+            assert_eq!(
+                developer_tool_in("git", &[alias, complete.clone()], developer_executable),
+                Some(good.clone()),
+                "the later real developer tool still wins"
+            );
+        }
     }
 
     #[test]

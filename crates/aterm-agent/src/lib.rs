@@ -1001,17 +1001,16 @@ COMMANDS
                            options on a multi-select; `submit` on the review tab. Moves
                            the focus to each and presses Enter, fenced on that row (never
                            a digit, Esc, typed text or the chat row).
-                         agy: an option number or label; types the option's
+                         agy or Kimi Code: an option number or label; types the option's
                            digit, fenced on the title row.
                          Muse Code: an option number or label; moves the focus and
                            presses Enter, fenced on the question row.
                        A label matches whole, in any case. Each also takes `recommended`
                        (the window's own choice) and `human` (types nothing). Refused: a
-                       free-text row (Muse's `None of the above` too), a policy word
-                       that names no option (`long-term`, `short-term`;
-                       `meta set questions <word>` sets one), and Grok Build's and Kimi
-                       Code's questions, which are read, not supervised, and stay a
-                       person's. `--box TOKEN` (`phase`'s
+                       free-text row (Muse's `None of the above` and Kimi's `Other` too),
+                       a policy word that names no option (`long-term`, `short-term`;
+                       `meta set questions <word>` sets one), and Grok Build's questions,
+                       which are read, not supervised, and stay a person's. `--box TOKEN` (`phase`'s
                        `box`) refuses when the dialog on screen is another box. A
                        person's input within `[harness] human_grace_s` leaves the dialog
                        to them. Prints one line:

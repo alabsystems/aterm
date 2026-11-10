@@ -1181,3 +1181,45 @@ fn history_read_counts_value(
         "replacements": counts.replacements,
     })
 }
+
+/// A table round's reads stand on the check each store's open ran in their session
+/// (`Round::store`), and its matching inventory on the operation inventory's fence
+/// (`Round::fenced_observation`): over the explicit pair, whose first Mac holds a record the
+/// second lacks until the first round sends it, each of the initiator's rounds checks each store
+/// it opens once. The first round opens its store four times (its tables' witnesses, the conflict
+/// proof inventory, the operation inventory and the batch that sends the record) and observes no
+/// matching inventory, since the two inventories differ; each later round opens it twice (the
+/// conflict proof inventory and the operation inventory) and observes one. The inventory reads
+/// checked each store again, seven checks for the first round's four opens and six for a later
+/// round's three, whose third open was the matching inventory's (2026-11-09).
+/// NEGATIVE CONTROL: `Round::inventory`, the conflict round's proof inventory or
+/// `table_witnesses` reading through a checked accessor fails it, and so does the matching
+/// inventory reading the store again where its fence stands.
+#[test]
+fn each_round_checks_a_store_once_as_it_opens() {
+    let pair = log_pair();
+    let (a, b) = (pair.endpoint(0, true), pair.endpoint(1, true));
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut opened = Vec::new();
+    for _ in 0..=SUITE_ROUNDS {
+        let (opens, checks) = crate::table::store::test_opens_and_checks();
+        loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        let (now_opens, now_checks) = crate::table::store::test_opens_and_checks();
+        let (opens, checks) = (now_opens - opens, now_checks - checks);
+        assert_eq!(checks, opens, "a round checks each store it opens once");
+        let matched = ra.application().unwrap().matching_inventory.is_some();
+        opened.push((opens, matched));
+    }
+    assert_eq!(
+        opened[0],
+        (4, false),
+        "the first round with a peer reads its tables' witnesses and sends the record its peer \
+         lacks"
+    );
+    assert!(
+        opened[1..].iter().all(|round| *round == (2, true)),
+        "a converged round opens its store for its two inventories and observes its matching \
+         inventory on the fence of the second: {opened:?}"
+    );
+}

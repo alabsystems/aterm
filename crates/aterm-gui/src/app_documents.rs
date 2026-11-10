@@ -2873,35 +2873,28 @@ impl App {
             return Err("Buffer name is required; no document changed".to_string());
         }
 
-        let matches = self.windows.get(&wid).map_or_else(Vec::new, |state| {
-            state
-                .tab_set
-                .tabs()
-                .iter()
-                .enumerate()
-                .flat_map(|(index, tab)| {
-                    tab.root.leaves().into_iter().map(move |view| (index, view))
-                })
-                .filter_map(|(index, view)| {
-                    let crate::tab_model::View::Native(native) =
-                        self.view_store.get(view).copied()?
+        let mut matches = Vec::new();
+        if let Some(state) = self.windows.get(&wid) {
+            for (index, tab) in state.tab_set.tabs().iter().enumerate() {
+                tab.root.visit(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) =
+                        self.view_store.get(view).copied()
                     else {
-                        return None;
+                        return;
                     };
-                    let NativeApp::Editor(editor) = self.native_runtime.app(native.instance)?
+                    let Some(NativeApp::Editor(editor)) = self.native_runtime.app(native.instance)
                     else {
-                        return None;
+                        return;
                     };
-                    let uri = self.document_store.canonical_uri(editor.document)?;
-                    (editor.title == query || uri == query).then_some((
-                        index,
-                        native.instance,
-                        view,
-                        editor.title.clone(),
-                    ))
-                })
-                .collect::<Vec<_>>()
-        });
+                    let Some(uri) = self.document_store.canonical_uri(editor.document) else {
+                        return;
+                    };
+                    if editor.title == query || uri == query {
+                        matches.push((index, native.instance, view, editor.title.clone()));
+                    }
+                });
+            }
+        }
         let [(index, instance, target_view, title)] = matches.as_slice() else {
             return Err(if matches.is_empty() {
                 let open_elsewhere = self.windows.iter().any(|(candidate_window, state)| {
@@ -3904,13 +3897,10 @@ impl App {
                 .and_then(|window| self.windows.get(&window))
                 .and_then(|ws| ws.tab_set.get(close.tab))
                 .is_some_and(|tab| {
-                    let live = tab
-                        .root
-                        .leaves()
-                        .into_iter()
-                        .map(|view| DocumentViewId(view.get()))
-                        .collect::<BTreeSet<_>>();
-                    close.views.iter().all(|view| live.contains(view))
+                    close
+                        .views
+                        .iter()
+                        .all(|view| tab.root.any_leaf(&mut |&live| live.get() == view.0))
                 });
             let Some(window) = window.filter(|_| unchanged) else {
                 // The tab or its leaf is gone: nothing is left to close, and the

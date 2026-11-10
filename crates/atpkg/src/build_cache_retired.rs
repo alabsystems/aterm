@@ -103,6 +103,12 @@ pub struct Answer {
 pub trait Git {
     /// `git -C <dir> <args>`, with git's optional locks off so no read writes its index.
     fn run(&self, dir: &Path, args: &[&str]) -> Answer;
+
+    /// `git -C <dir> <args>`, adding `alt` to `GIT_ALTERNATE_OBJECT_DIRECTORIES` when given.
+    fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
+        let _ = alt;
+        self.run(dir, args)
+    }
 }
 
 /// `git` on `PATH`.
@@ -119,14 +125,21 @@ fn git_path(path: &Path) -> &Path {
 
 impl Git for GitCli {
     fn run(&self, dir: &Path, args: &[&str]) -> Answer {
-        let out = aterm_uds::spawnfd::command("git")
-            .arg("-C")
+        self.run_with_alt(dir, args, None)
+    }
+
+    fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
+        let mut cmd = aterm_uds::spawnfd::command("git");
+        cmd.arg("-C")
             .arg(git_path(dir))
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output();
+            .stdin(aterm_uds::spawnfd::Stdio::null());
+        if let Some(alt) = alt {
+            cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", git_path(alt));
+        }
+        let out = cmd.output();
         match out {
             Ok(o) => Answer {
                 code: o.status.code(),
@@ -537,23 +550,7 @@ fn judge_snapshot(
         ));
     }
     let short = in_main(git, checkout, &entry.head)?;
-    let status = git.run(
-        wt,
-        &[
-            "status",
-            "--porcelain",
-            "--ignore-submodules=none",
-            "--untracked-files=normal",
-        ],
-    );
-    if status.code != Some(0) {
-        return Err(Unreadable::read(&status.err).words());
-    }
-    let changed: Vec<&str> = status
-        .out
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let changed = snapshot_changes(git, checkout, wt)?;
     if let Some(first) = changed.first() {
         return Err(format!(
             "it has {} uncommitted change(s) ({}{})",
@@ -574,6 +571,126 @@ fn judge_snapshot(
         checkout.display(),
         age(UNWRITTEN)
     ))
+}
+
+/// Dirty or untracked entries in `wt` and its submodules, reading `checkout`'s own `.git/modules`
+/// object store when a submodule's `objects/info/alternates` points at a since-removed worktree.
+fn snapshot_changes(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Vec<String>, String> {
+    let status = git.run(
+        wt,
+        &[
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+            "--untracked-files=normal",
+        ],
+    );
+    if status.code == Some(0) {
+        return Ok(status
+            .out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect());
+    }
+    let unread = Unreadable::read(&status.err);
+    if unread.submodule.is_none() || unread.missing_store.is_none() {
+        return Err(unread.words());
+    }
+    let top = git.run(
+        wt,
+        &[
+            "status",
+            "--porcelain",
+            "--ignore-submodules=all",
+            "--untracked-files=normal",
+        ],
+    );
+    if top.code != Some(0) {
+        return Err(unread.words());
+    }
+    let mut changed: Vec<String> = top
+        .out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let cached = git.run(wt, &["diff-index", "--cached", "--name-only", "HEAD"]);
+    if cached.code != Some(0) {
+        return Err(unread.words());
+    }
+    for staged in cached.out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let entry = format!("M  {staged}");
+        if !changed.iter().any(|existing| existing.ends_with(staged)) {
+            changed.push(entry);
+        }
+    }
+    let ls = git.run(wt, &["ls-files", "-z", "--stage"]);
+    if ls.code != Some(0) {
+        return Err(unread.words());
+    }
+    for row in ls.out.split('\0').filter(|r| !r.is_empty()) {
+        let Some((meta, rel_path)) = row.split_once('\t') else {
+            return Err(unread.words());
+        };
+        let mut parts = meta.split_whitespace();
+        let (Some(mode), Some(sha), Some(stage), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(unread.words());
+        };
+        if mode != "160000" {
+            continue;
+        }
+        if stage != "0" {
+            changed.push(format!("U {rel_path}"));
+            continue;
+        }
+        if !Path::new(rel_path)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(unread.words());
+        }
+        let sub_dir = wt.join(rel_path);
+        if std::fs::symlink_metadata(sub_dir.join(".git")).is_err() {
+            match std::fs::read_dir(&sub_dir) {
+                Ok(mut d) => {
+                    if d.next().is_some() {
+                        changed.push(format!("?? {rel_path}/"));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(unread.words()),
+            }
+            continue;
+        }
+        let module_objs = checkout.join(".git/modules").join(rel_path).join("objects");
+        let alt = module_objs.is_dir().then_some(module_objs.as_path());
+        let head = git.run_with_alt(&sub_dir, &["rev-parse", "--verify", "HEAD^{commit}"], alt);
+        if head.code != Some(0) {
+            return Err(unread.words());
+        }
+        let sub_status = git.run_with_alt(
+            &sub_dir,
+            &[
+                "status",
+                "--porcelain",
+                "--ignore-submodules=none",
+                "--untracked-files=normal",
+            ],
+            alt,
+        );
+        if sub_status.code != Some(0) {
+            return Err(unread.words());
+        }
+        if head.out.trim() != sha || sub_status.out.lines().any(|l| !l.trim().is_empty()) {
+            changed.push(format!("M {rel_path}"));
+        }
+    }
+    Ok(changed)
 }
 
 fn in_main(git: &dyn Git, checkout: &Path, head: &str) -> Result<String, String> {

@@ -8031,17 +8031,17 @@ impl App {
             let focused = self.frontmost_window == Some(*wid);
             let mut seen: Vec<u64> = Vec::new();
             for tab in ws.tab_set.tabs() {
-                for view in tab.root.leaves() {
+                tab.root.visit(&mut |&view| {
                     let Some(session) = self
                         .view_store
                         .get(view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                     else {
-                        continue;
+                        return;
                     };
                     if seen.contains(&session) {
-                        continue;
+                        return;
                     }
                     seen.push(session);
                     let row = SessionWindowRow {
@@ -8062,7 +8062,7 @@ impl App {
                         }
                         None => rows.push(row),
                     }
-                }
+                });
             }
         }
         rows.sort_by_key(|r| r.local);

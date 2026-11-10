@@ -900,6 +900,17 @@ pub fn admits_by_log(paths: &Paths) -> bool {
     admits_by_log_until(paths, Instant::now() + SEAT_READ)
 }
 
+/// [`admits_by_log`], or why its seat could not be read (local state that cannot be read, or a
+/// vault pass still holding this Mac's state at [`SEAT_READ`]), which `admits_by_log` takes as no
+/// seat: for a reader that keeps what it read only where nothing failed
+/// (`members::desk::Local::whole`).
+///
+/// # Errors
+/// As [`log_seat`] with a deadline.
+pub(crate) fn log_seated(paths: &Paths) -> crate::Result<bool> {
+    Ok(log_seat(paths, Some(Instant::now() + SEAT_READ))?.is_some())
+}
+
 /// [`admits_by_log`], waiting for a pass until `deadline` rather than [`SEAT_READ`]: a test's
 /// read waits under the hang detector while a real pass runs.
 #[must_use]
@@ -1007,37 +1018,46 @@ pub fn member_by_log(paths: &Paths) -> crate::Result<bool> {
 }
 
 /// The members the trusted membership log at `paths` currently lets in (`Body::Genesis` founders
-/// and `Body::Admit` entrants not removed by `Body::Remove`).
+/// and `Body::Admit` entrants not removed by `Body::Remove`); none where it cannot be read.
 #[must_use]
 pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::MemberId> {
-    (|| -> crate::Result<BTreeSet<crate::membership_log::MemberId>> {
-        let Some(config) = config(paths)? else {
-            return Ok(BTreeSet::new());
-        };
-        let Some(log) = log_entries::trusted_local_log(paths, &config)? else {
-            return Ok(BTreeSet::new());
-        };
-        let roster = log_entries::local_swarm_roster_for_log(paths, &log)?;
-        let membership = log.membership();
-        Ok(membership
-            .members()
-            .iter()
-            .filter(|(actor, member)| {
-                !log.recipient_is_removed(&member.binding.recipient())
-                    && !membership.member_node_removed(member)
-                    && !log.audience_left_out(&EpochAudience::Everyone, actor)
-                    && !log.audience_left_out_recipient(
-                        &EpochAudience::Everyone,
-                        &member.binding.recipient(),
-                    )
-                    && !roster
-                        .as_ref()
-                        .is_some_and(|r| log_entries::member_denied_by_roster(r, member))
-            })
-            .map(|(actor, _)| *actor)
-            .collect())
-    })()
-    .unwrap_or_default()
+    log_admitted_actors_read(paths).unwrap_or_default()
+}
+
+/// [`log_admitted_actors`], or why the log or its roster could not be read, which
+/// `log_admitted_actors` takes as none: for a reader that keeps what it read only where nothing
+/// failed (`members::desk::Local::whole`).
+///
+/// # Errors
+/// The configuration, the trusted log or its roster cannot be read.
+pub(crate) fn log_admitted_actors_read(
+    paths: &Paths,
+) -> crate::Result<BTreeSet<crate::membership_log::MemberId>> {
+    let Some(config) = config(paths)? else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(log) = log_entries::trusted_local_log(paths, &config)? else {
+        return Ok(BTreeSet::new());
+    };
+    let roster = log_entries::local_swarm_roster_for_log(paths, &log)?;
+    let membership = log.membership();
+    Ok(membership
+        .members()
+        .iter()
+        .filter(|(actor, member)| {
+            !log.recipient_is_removed(&member.binding.recipient())
+                && !membership.member_node_removed(member)
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && !log.audience_left_out_recipient(
+                    &EpochAudience::Everyone,
+                    &member.binding.recipient(),
+                )
+                && !roster
+                    .as_ref()
+                    .is_some_and(|r| log_entries::member_denied_by_roster(r, member))
+        })
+        .map(|(actor, _)| *actor)
+        .collect())
 }
 
 /// The bundle this member hands the Mac a run proved ([`members::desk::serve`]'s `bundle`): the

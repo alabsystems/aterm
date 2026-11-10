@@ -7,18 +7,6 @@
 
 use super::*;
 
-fn expected<'a>(
-    env: &'a Env,
-    caller: &Caller,
-    context: &super::super::codex_source_registry::SourceUse,
-) -> Result<(std::sync::Arc<SourceHandle>, &'a Path), SlotError> {
-    let home = env.home.as_deref().ok_or(SlotError::Unavailable)?;
-    let source = context
-        .expected_source(caller, home)
-        .map_err(|_| SlotError::Unavailable)?;
-    Ok((source, home))
-}
-
 /// Read/reconcile only the active native use's original source. This is a
 /// private member continuation; it does not replace the legacy source ABI.
 /// # Errors
@@ -29,11 +17,19 @@ pub fn source_for_use(
     operation: &str,
     context: &super::super::codex_source_registry::SourceUse,
 ) -> Result<SourceProgress, SlotError> {
-    let (source, home) = expected(env, caller, context)?;
-    let progress = source_inner(env, caller, operation, Some(&source))?;
-    context
-        .expected_source(caller, home)
+    let namespace = context
+        .namespace(caller, env.home.as_deref().ok_or(SlotError::Unavailable)?)
         .map_err(|_| SlotError::Unavailable)?;
+    let source = namespace.source();
+    let progress = source_inner_using_namespace(
+        env,
+        caller,
+        operation,
+        Some(source),
+        Some(SourceReadNamespace::ActiveUse(&namespace)),
+    )?;
+    namespace.current().map_err(|_| SlotError::Unavailable)?;
+    check_source(&progress, source)?;
     Ok(progress)
 }
 
@@ -47,11 +43,27 @@ pub fn refresh_for_use(
     request: &RefreshRequest,
     context: &super::super::codex_source_registry::SourceUse,
 ) -> Result<RefreshProgress, SlotError> {
-    let (source, home) = expected(env, caller, context)?;
-    let progress = refresh_inner(env, caller, request, Some(&source))?;
+    let namespace =
+        RefreshNamespace::for_use(env, caller, context).map_err(|_| SlotError::Unavailable)?;
+    let source = namespace.expected();
+    let progress = refresh_inner_using_namespace(
+        env,
+        caller,
+        request,
+        namespace.scope(),
+        Some(source),
+        Some(&namespace),
+    )?;
     if !matches!(&progress, RefreshProgress::Retaining(_)) {
-        context
-            .expected_source(caller, home)
+        namespace
+            .with_current(
+                env,
+                caller,
+                source.binding(),
+                source.assignment_generation(),
+                source.source_authority(),
+                || Ok(()),
+            )
             .map_err(|_| SlotError::Unavailable)?;
     }
     Ok(progress)
@@ -120,3 +132,25 @@ pub(super) fn note_owner_entry() {
 #[cfg(all(test, unix))]
 #[path = "codex_session_slot_use_guard_tests.rs"]
 mod tests;
+
+/// Read only the source of an independently counted, already accepted PRELOAD.
+/// The proof cannot be passed to the provider refresh engine.
+pub(in crate::harness) fn source_for_preload(
+    env: &Env,
+    caller: &Caller,
+    operation: &str,
+    proof: &super::super::codex_source_registry::PreloadReadNamespace,
+) -> Result<SourceProgress, SlotError> {
+    proof.current().map_err(|_| SlotError::Unavailable)?;
+    let source = proof.source();
+    let result = source_inner_using_namespace(
+        env,
+        caller,
+        operation,
+        Some(source),
+        Some(SourceReadNamespace::CapturedPreload(proof)),
+    )?;
+    proof.current().map_err(|_| SlotError::Unavailable)?;
+    check_source(&result, source)?;
+    Ok(result)
+}

@@ -1080,6 +1080,7 @@ fn survey_every_window(
     let deadline = Instant::now() + SURVEY_ANSWER_WITHIN;
     let order = windows.in_order();
     let (tx, rx) = std::sync::mpsc::channel::<(usize, WindowSurvey)>();
+    let windows_n = order.len();
     let mut asked = 0;
     for (at, (_pid, path)) in order.into_iter().enumerate() {
         let (wire, request, tx) = (wire.clone(), request.to_owned(), tx.clone());
@@ -1128,7 +1129,13 @@ fn survey_every_window(
     if let Some(line) = refused {
         return WindowsSurveyed::Answered(line);
     }
-    WindowsSurveyed::Untaken(busy.or_else(|| (asked > 0).then(|| "no window answered".to_owned())))
+    // `Untaken(None)` is a Mac with no window; one whose windows were not asked (no thread
+    // started) is a read that failed, never a count of none.
+    WindowsSurveyed::Untaken(busy.or_else(|| {
+        (asked > 0)
+            .then(|| "no window answered".to_owned())
+            .or_else(|| (windows_n > 0).then(|| "no survey thread started".to_owned()))
+    }))
 }
 
 /// The windows' survey answers (`OK <n>`, one `instance` line, `session` rows, then the Mac's

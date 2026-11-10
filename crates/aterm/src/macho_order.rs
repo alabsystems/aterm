@@ -1497,12 +1497,12 @@ mod tests {
 
     #[test]
     fn linker_arg_collection_and_order_file_roundtrip() {
-        let scratch = std::env::temp_dir().join(format!(
-            "aterm-macho-order-test-{}.noindex",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let scratch_dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-macho-order-test-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("create scratch dir");
+        let scratch = scratch_dir.path();
 
         let obj_a = scratch.join("alpha.o");
         let obj_b = scratch.join("beta.o");
@@ -1609,7 +1609,5 @@ mod tests {
                 "-order_file must place __atpad_t_00003 before __atpad_t_00000:\n{nm_text}"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

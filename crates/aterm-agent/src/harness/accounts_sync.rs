@@ -30,6 +30,10 @@ mod returned;
 mod source_admission;
 use source_admission::{AutomaticSource, SourceRequest};
 
+#[path = "accounts_provider_source.rs"]
+mod provider_source;
+use provider_source::ProviderSource;
+
 #[path = "accounts_source_selection.rs"]
 mod source_selection;
 use source_selection::{Scope as SourceScope, Selection as SelectedSource};
@@ -5942,6 +5946,27 @@ fn pool_execution_pending<
 mod shared_retention_tests;
 
 #[cfg(test)]
+#[path = "accounts_directory_cleanup_tests.rs"]
+mod directory_cleanup_tests;
+
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_CLEANUP_MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn cleanup_vacated_login_dirs(dirs: Vec<PathBuf>) {
+    #[cfg(test)]
+    if DIRECTORY_CLEANUP_MUTANT.get() == 2 {
+        return;
+    }
+    for dir in dirs {
+        // A login arriving since selection makes the directory nonempty and
+        // preserves it. Cleanup is never necessary for receipt recovery.
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+#[cfg(test)]
 fn persist_accounts_sync(
     store: &accounts::Store,
     roster_path: &Path,
@@ -5976,6 +6001,22 @@ fn persist_accounts_sync(
         machine = "AccountIdentityCompletion",
         action = "Repeat",
         project = "aterm_agent::harness::accounts_sync::alab_tests::native_migration_tests::completion::completion_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSyncCleanup",
+        action = "Cut",
+        reason = "The environment chooses a durable replay interruption."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSyncCleanup",
+        action = "Sync",
+        project = "aterm_agent::harness::accounts_sync::directory_cleanup_tests::transition"
     )
 )]
 fn persist_accounts_sync_with_pool(
@@ -6574,10 +6615,9 @@ fn persist_accounts_sync_with_pool(
             Ok(events)
         }), || {
             publishing = true;
-            // A moved row leaves its login directory only where it held nothing when the sync
-            // chose: removing only an empty directory keeps one a login has reached since.
-            for dir in left_dirs.take() {
-                let _ = fs::remove_dir(dir);
+            #[cfg(test)]
+            if DIRECTORY_CLEANUP_MUTANT.get() == 1 {
+                cleanup_vacated_login_dirs(left_dirs.take());
             }
             for row in &roster.rows {
                 if let Some(dir) = &row.dir {
@@ -6607,6 +6647,9 @@ fn persist_accounts_sync_with_pool(
                 format!("sync refused before roster publication: {why}")
             }
         })?;
+    // Only the completed receipt makes these directories unreferenced. An
+    // interrupted replay keeps them for the old roster and for recovery.
+    cleanup_vacated_login_dirs(left_dirs.take());
     let changed = changed || state_changed || !events.is_empty();
     if changed {
         store.touch_wake().map_err(|why| {
@@ -10614,6 +10657,7 @@ fn load_cli_fleet(
 type LoadedFleet<P = super::ai_pool::Pool, I = super::ai_pool::LocalPoolIdentity> =
     (CliFleet, Option<PoolSyncCtx<P, I>>, Option<String>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalCliSource {
     path: PathBuf,
     csv: bool,
@@ -10626,6 +10670,15 @@ fn local_cli_source(
     present: &mut dyn FnMut(&Path, bool) -> bool,
 ) -> Result<Option<LocalCliSource>, String> {
     let policy = accounts::Store::at_for(&env.state, cli, home).source_policy()?;
+    local_cli_source_observed(cli, home, &policy, present)
+}
+
+fn local_cli_source_observed(
+    cli: Cli,
+    home: &Path,
+    policy: &accounts::source_policy::Snapshot,
+    present: &mut dyn FnMut(&Path, bool) -> bool,
+) -> Result<Option<LocalCliSource>, String> {
     let secrets = home.join(".secrets");
     let pool = secrets.join(super::ai_pool::AI_POOL_FILE);
     let toml = secrets.join(cli_fleet_file(cli));
@@ -10881,49 +10934,53 @@ pub(super) fn codex_completion_source(
     row: &Row,
 ) -> Result<CodexCompletionSource, String> {
     let home = env.home.as_deref().ok_or("no home directory")?;
-    let path = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
-    if pool_entry_present(&path) {
-        let raw = read_local_source_text(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let pool = super::ai_pool::Pool::from_toml(&raw, &path.display().to_string())?;
-        let identity =
-            super::ai_pool::resolve_local_pool_identity(Some(home), env.config.as_deref(), None)?;
+    let mut source_env = env.clone();
+    let config = source_env
+        .config
+        .get_or_insert_with(|| env.state.join("aterm.toml"))
+        .clone();
+    let roster =
+        accounts::roster_beside_for(&config, Cli::Codex).ok_or("no Codex roster directory")?;
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, home);
+    let no_network =
+        |_: &Env, _: &str| Err("metadata completion cannot fetch a remote source".to_owned());
+    let captured = ProviderSource::capture(
+        Cli::Codex,
+        &source_env,
+        &store,
+        &roster,
+        (None, None),
+        false,
+        &no_network,
+    )?;
+    let loaded = captured.load(Cli::Codex, &roster)?;
+    let pool_text = loaded.as_ref().and_then(|_| captured.pool_text());
+    let mut held_by = None;
+    if let Some(raw) = pool_text {
+        let pool = super::ai_pool::Pool::from_toml(raw, super::ai_pool::AI_POOL_FILE)?;
+        let identity = loaded
+            .as_ref()
+            .and_then(|(_, context, _)| context.as_ref())
+            .map(|context| &context.identity);
         let matched = pool.accounts.iter().find(|account| {
             account.provider == Cli::Codex
                 && row
                     .expected_identity_email()
                     .is_some_and(|email| accounts::email_matches(email, &account.email))
         });
-        let held_by = matched.and_then(|account| {
-            if identity
-                .as_ref()
-                .is_some_and(|identity| account.is_warm_for(identity))
-            {
+        held_by = matched.and_then(|account| {
+            if identity.is_some_and(|identity| account.is_warm_for(identity)) {
                 None
             } else {
                 Some(account.holder_word().to_owned())
             }
         });
-        let fleet = CliFleet {
-            cli: Cli::Codex,
-            roster: project_pool_fleet(&pool, Cli::Codex, identity.as_ref()),
-            held: Vec::new(),
-        };
-        return Ok(CodexCompletionSource {
-            fleet: Some(fleet),
-            held_by,
-            pool_text: Some(raw),
-        });
     }
-    // No named source: this branch reads only bounded local source files. Never put a
-    // network fetch under the caller's native-login/writer locks, including on recheck.
-    let no_network =
-        |_: &Env, _: &str| Err("metadata completion cannot fetch a remote source".to_owned());
-    let loaded = load_cli_fleet_source(Cli::Codex, env, home, None, None, &no_network)?;
+    captured.validate(Cli::Codex, &source_env)?;
     Ok(CodexCompletionSource {
         fleet: loaded.map(|(fleet, _, _)| fleet),
-        held_by: None,
-        pool_text: None,
+        held_by,
+        pool_text: pool_text.map(str::to_owned),
     })
 }
 
@@ -10946,6 +11003,7 @@ pub fn account_source_table(cli: Cli, env: &Env, source: Option<&str>) -> Result
         .ok_or_else(|| format!("no source table for {}", cli.connector().product))
 }
 
+#[cfg(test)]
 fn sync_cli_with(
     cli: Cli,
     paths: (&Path, &Path, &Path),
@@ -10953,7 +11011,7 @@ fn sync_cli_with(
     now: i64,
     reads: (&Fetch<'_>, &[Duration]),
 ) -> Result<CliSync, String> {
-    sync_cli_with_replan(cli, paths, source, now, reads, || {})
+    sync_cli_with_replan(cli, paths, source, false, now, reads, || {})
 }
 
 fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
@@ -11017,75 +11075,64 @@ fn sync_cli_with_replan(
     cli: Cli,
     (home, state_dir, config): (&Path, &Path, &Path),
     (source, machine_override): (Option<&str>, Option<&str>),
+    automatic: bool,
     now: i64,
     (fetch, ladder): (&Fetch<'_>, &[Duration]),
+    after_unlock: impl FnOnce(),
+) -> Result<CliSync, String> {
+    let env = quiet_env(home, state_dir, config, now);
+    sync_cli_in_env(
+        cli,
+        (home, state_dir, config),
+        (source, machine_override),
+        automatic,
+        now,
+        (&env, fetch, ladder),
+        after_unlock,
+    )
+}
+
+fn sync_cli_in_env(
+    cli: Cli,
+    (home, state_dir, config): (&Path, &Path, &Path),
+    (source, machine_override): (Option<&str>, Option<&str>),
+    automatic: bool,
+    now: i64,
+    (env, fetch, ladder): (&Env, &Fetch<'_>, &[Duration]),
     after_unlock: impl FnOnce(),
 ) -> Result<CliSync, String> {
     let product = cli.connector().product;
     let roster_path = accounts::roster_beside_for(config, cli)
         .ok_or_else(|| format!("{} has no directory", config.display()))?;
     let named = source.is_some_and(|s| !s.trim().is_empty());
-    // No roster kept here and no source named: only a pool that syncs by default reads its
-    // fleet, and it writes nothing until the fleet lists rows of this machine's.
+    // With no local roster or explicit source, only a provider enabled for default sync
+    // reads its fleet. An empty native assignment can still retire the legacy source.
     let by_default = !named && !roster_path.is_file();
     if by_default && !syncs_by_default(cli) {
         return Ok(CliSync::Off);
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let recovered_commit = store.recover_sync_within(ladder, &roster_path)?;
-    super::alab_roster::migrate_before_sync(
+    let mut recovered_commit = store.recover_sync_within(ladder, &roster_path)?;
+    let mut captured = ProviderSource::capture(
         cli,
+        env,
         &store,
-        (&roster_path, Some(config)),
-        source,
-        now,
-        ladder,
+        &roster_path,
+        (source, machine_override),
+        automatic,
+        fetch,
     )?;
-    let env = quiet_env(home, state_dir, config, now);
-    let Some((fleet, pool_ctx, machine)) =
-        load_cli_fleet_source(cli, &env, home, source, machine_override, fetch)?
-    else {
-        return sync_without_source(cli, (&env, &store), &roster_path, ladder, now);
+    // Read-only absence and non-membership need no writer or new store directory.
+    // Replacement retirement is a write, including an empty native/pool assignment.
+    let Some((observed, _, observed_machine)) = captured.load(cli, &roster_path)? else {
+        return sync_without_source(cli, (env, &store), &roster_path, ladder, now);
     };
-    let machine = if by_default {
-        match by_default_admits(&store, &fleet, machine, now)? {
-            Ok(machine) => machine,
-            Err(instead) => return Ok(instead),
-        }
-    } else {
-        machine.ok_or_else(|| {
-            "could not determine machine id (`m<N>`); pass `--machine m8`".to_owned()
-        })?
-    };
-    let fleet_accounts = pool_ctx
-        .as_ref()
-        .map_or(fleet.roster.accounts.len(), |ctx| {
-            ctx.pool.accounts_for_cli(cli).len()
-        });
-    let mine = fleet.roster.accounts_for_machine(&machine);
-    // Under the lab an empty fleet is this Mac preferring no account of `cli`: nothing is added,
-    // every row stays, and the sync still clears old holds and orders the rows below
-    // ([`CliSynced::prefers_none`]). Only another source naming no row of this machine's is an
-    // error, since there it means the wrong machine or the wrong file.
-    let lab_fleet = fleet.roster.alab.is_some();
-    if named && mine.is_empty() && !lab_fleet {
-        return Err(with_conflicts(
-            format!(
-                "no active {product} accounts found for machine `{machine}` in {}",
-                fleet.roster.source
-            ),
-            &fleet.roster.conflicts_for(Some(&machine)),
-        ));
+    if by_default
+        && let Err(instead) = by_default_admits(&store, &observed, observed_machine, now)?
+        && (matches!(instead, CliSync::Left { .. }) || !captured.needs_retirement())
+    {
+        return Ok(instead);
     }
-    let held: Vec<String> = fleet
-        .held
-        .iter()
-        .filter(|a| {
-            let norm = normalize_machine_id(&machine).unwrap_or_else(|| machine.clone());
-            a.machines.contains(&norm)
-        })
-        .map(|a| a.label.clone())
-        .collect();
     let take_writer = || {
         store
             .acquire_within(ladder)
@@ -11113,8 +11160,64 @@ fn sync_cli_with_replan(
         mut own_row,
         rows_changed,
         mut default_login,
+        fleet,
+        machine,
+        fleet_accounts,
+        held,
+        prefers_none,
     ) = loop {
+        recovered_commit |= store.recover_sync_held(&lock, &roster_path)?;
+        captured.validate(cli, env)?;
         let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
+        captured.protect(cli, env, &write_to)?;
+        recovered_commit |= captured.migrate(cli, env, &store, &lock, &roster_path)?;
+        let Some((fleet, pool_ctx, machine)) = captured.load(cli, &roster_path)? else {
+            drop(lock);
+            return sync_without_source(cli, (env, &store), &roster_path, ladder, now);
+        };
+        let retire = captured.retires();
+        let machine = if !named && !roster_path.is_file() {
+            match by_default_admits(&store, &fleet, machine, now)? {
+                Ok(machine) => machine,
+                Err(instead) => {
+                    captured.validate(cli, env)?;
+                    if retire && !matches!(instead, CliSync::Left { .. }) {
+                        store.retire_source_held(&lock, now)?;
+                    }
+                    return Ok(instead);
+                }
+            }
+        } else {
+            machine.ok_or_else(|| {
+                "could not determine machine id (`m<N>`); pass `--machine m8`".to_owned()
+            })?
+        };
+        let fleet_accounts = pool_ctx
+            .as_ref()
+            .map_or(fleet.roster.accounts.len(), |ctx| {
+                ctx.pool.accounts_for_cli(cli).len()
+            });
+        let mine = fleet.roster.accounts_for_machine(&machine);
+        // Native empty assignments preserve local rows while clearing obsolete holds.
+        let lab_fleet = fleet.roster.alab.is_some();
+        if named && mine.is_empty() && !lab_fleet {
+            return Err(with_conflicts(
+                format!(
+                    "no active {product} accounts found for machine `{machine}` in {}",
+                    fleet.roster.source
+                ),
+                &fleet.roster.conflicts_for(Some(&machine)),
+            ));
+        }
+        let held: Vec<String> = fleet
+            .held
+            .iter()
+            .filter(|account| {
+                let norm = normalize_machine_id(&machine).unwrap_or_else(|| machine.clone());
+                account.machines.contains(&norm)
+            })
+            .map(|account| account.label.clone())
+            .collect();
         let existing_image = accounts::roster_text(&write_to)?;
         let existing_text = existing_image.as_deref().unwrap_or_default();
         let existing = Roster::parse_for(cli, existing_text).map_err(|why| {
@@ -11256,6 +11359,8 @@ fn sync_cli_with_replan(
         // Roster admission and the pool identity it describes share one pending receipt.
         // A crash must not leave a new roster paired with the previous machine or warm set.
         roster_wrote = next_image != existing_image;
+        captured.validate(cli, env)?;
+        captured.protect(cli, env, &write_to)?;
         let target = accounts::SyncTarget {
             path: &write_to,
             before: existing_image.as_deref(),
@@ -11264,30 +11369,37 @@ fn sync_cli_with_replan(
             fleet: None,
         };
         state_wrote = if let Some(ctx) = &pool_ctx {
-            store.transact_roster_state_held(&lock, now, &mut None, target, |state| {
-                let home_accounts = merged_existing
-                    .iter()
-                    .filter(|row| row.held_by.is_none() && ctx.is_home_for_row(cli, row))
-                    .map(|row| row.label.clone())
-                    .collect();
-                apply_pool_execution(state, &merged_existing, cli, ctx);
-                let target_label = Some(ctx.identity.primary.clone());
-                if state.swarm_label != target_label
-                    || state.swarm_aliases != ctx.identity.aliases
-                    || state.home_accounts != home_accounts
-                {
-                    state.swarm_label = target_label;
-                    state.swarm_aliases.clone_from(&ctx.identity.aliases);
-                    state.home_accounts = home_accounts;
-                }
-                Ok(Vec::new())
-            })?
-        } else if roster_wrote {
-            store.transact_roster_held(&lock, now, &mut None, target)?
+            store.transact_roster_state_held(
+                &lock,
+                now,
+                &mut None,
+                target,
+                (retire, |state| {
+                    let home_accounts = merged_existing
+                        .iter()
+                        .filter(|row| row.held_by.is_none() && ctx.is_home_for_row(cli, row))
+                        .map(|row| row.label.clone())
+                        .collect();
+                    apply_pool_execution(state, &merged_existing, cli, ctx);
+                    let target_label = Some(ctx.identity.primary.clone());
+                    if state.swarm_label != target_label
+                        || state.swarm_aliases != ctx.identity.aliases
+                        || state.home_accounts != home_accounts
+                    {
+                        state.swarm_label = target_label;
+                        state.swarm_aliases.clone_from(&ctx.identity.aliases);
+                        state.home_accounts = home_accounts;
+                    }
+                    Ok(Vec::new())
+                }),
+            )?
+        } else if roster_wrote || retire {
+            store.transact_roster_held(&lock, now, &mut None, target, retire)?
         } else {
             false
         };
         let rows_changed = RowChanges::between(&existing.rows, &merged_existing);
+        let prefers_none = lab_fleet && mine.is_empty();
         break (
             write_to,
             total,
@@ -11297,6 +11409,11 @@ fn sync_cli_with_replan(
             own_row,
             rows_changed,
             default_login,
+            fleet,
+            machine,
+            fleet_accounts,
+            held,
+            prefers_none,
         );
     };
     drop(lock);
@@ -11304,7 +11421,7 @@ fn sync_cli_with_replan(
     drop(creation_signin);
     let reassigned = follow_default_login(
         cli,
-        (&env, &store),
+        (env, &store),
         (&roster_path, &write_to),
         ladder,
         fleet
@@ -11358,7 +11475,7 @@ fn sync_cli_with_replan(
         kept,
         conflicts,
         changed,
-        prefers_none: lab_fleet && mine.is_empty(),
+        prefers_none,
         rows_changed,
         clashes: fleet.roster.clashes.clone(),
         default_login,
@@ -12077,7 +12194,7 @@ pub fn account_provider_realm_environment() {}
 pub fn account_alias_admission_environment() {}
 
 /// `aterm harness accounts sync --cli <id> [<source>] [--machine <mN>] [--json]`
-/// ([`sync_cli_with`]).
+/// ([`sync_cli_in_env`]).
 pub fn run_cli_accounts_sync(
     cli: Cli,
     (env, program): (&Env, Option<&Path>),
@@ -12119,15 +12236,15 @@ pub(super) fn run_cli_accounts_sync_with(
         );
         return ExitCode::FAILURE;
     };
-    // The pool helper reconstructs a home-based environment for background upkeep.
-    // An explicit CLI fetch keeps the session context captured by this invocation.
-    let fetch_in_session = |_: &Env, source: &str| fetch(env, source);
-    let synced = sync_cli_with(
+    // The fetch and its later byte/path validation use the same captured session context.
+    let synced = sync_cli_in_env(
         cli,
         (home, &env.state, config),
         (source, machine_override),
+        false,
         env.now,
-        (&fetch_in_session, &sync_lock_ladder()),
+        (env, fetch, &sync_lock_ladder()),
+        || {},
     );
     let file = cli.accounts().roster_file;
     let synced = match synced {
@@ -12548,12 +12665,14 @@ fn sync_cli_accounts_with(
     OTHER_CLIS
         .into_iter()
         .map(|cli| {
-            let synced = sync_cli_with(
+            let synced = sync_cli_with_replan(
                 cli,
                 (home, state_dir, &config),
                 (None, None),
+                true,
                 now,
                 (fetch, &ladder),
+                || {},
             )
             .and_then(default_refusal_fails);
             let synced = if cli == Cli::Codex && synced.is_ok() {
@@ -12688,12 +12807,14 @@ fn upkeep_pools(
         if syncs && (syncs_by_default(cli) || has_roster) {
             let by_default = (!has_roster).then(|| cli_sync_inputs(cli, home, state_dir, &config));
             if !by_default.is_some_and(|inputs| default_sync_holds(fx.rediscovery, cli, &inputs)) {
-                let synced = sync_cli_with(
+                let synced = sync_cli_with_replan(
                     cli,
                     (home, state_dir, &config),
                     (None, None),
+                    true,
                     now,
                     (fx.fetch, &[]),
+                    || {},
                 );
                 if fx
                     .scope
@@ -12741,27 +12862,19 @@ fn cli_sync_inputs(cli: Cli, home: &Path, state_dir: &Path, config: &Path) -> [u
     let secrets = home.join(".secrets");
     let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
     let mut hash = aterm_digest::Sha256::new();
-    hash.update(b"aterm-cli-sync-inputs-v2");
+    hash.update(b"aterm-cli-sync-inputs-v4");
     hash.update(cli.id().as_bytes());
     let policy = match accounts::Store::at_for(state_dir, cli, home).source_policy() {
-        Ok(policy) => {
-            match policy.encoded() {
-                Some(bytes) => {
-                    hash.update([1]);
-                    hash.update((bytes.len() as u64).to_be_bytes());
-                    hash.update(bytes);
-                }
-                None => hash.update([0]),
-            }
-            policy
-        }
+        // Eligibility is reflected by selection below. Recording our own retirement
+        // does not change a still-selected pool, while policy loss remains a refusal.
+        Ok(policy) => policy,
         Err(why) => {
             hash.update([2]);
             hash.update(why.as_bytes());
             return hash.finalize();
         }
     };
-    // Where the lab names this Mac its projection stands for the vault's files ([`sync_cli_with`]
+    // Where the lab names this Mac its projection stands for the vault's files ([`sync_cli_in_env`]
     // reads the lab), and no sheet or fleet file is read.
     if let Some(lab) = super::alab_roster::fleet_digest(cli) {
         hash.update(lab);
@@ -12777,17 +12890,43 @@ fn cli_sync_inputs(cli: Cli, home: &Path, state_dir: &Path, config: &Path) -> [u
     }
     // The sheet only where the harness may read it ([`sheet_read_here`]): while the lab may name
     // this Mac and could not be read yet, an edit to it calls for no sync.
-    let fleet = [
-        Some(secrets_pool.clone()),
-        (!policy.retired()).then(|| secrets.join(cli_fleet_file(cli))),
-        sheet_read_here().then(|| secrets.join(ACCOUNTS_CSV_FILE)),
-    ]
-    .map(|path| path.and_then(|path| read_local_source_text(&path).map(String::into_bytes).ok()));
-    let pool_identity = pool_entry_present(&secrets_pool).then(|| {
-        super::ai_pool::resolve_local_pool_identity(Some(home), Some(config), None)
-            .map(|id| id.map(|id| format!("{}:{}", id.primary, id.aliases.join(",")).into_bytes()))
-            .unwrap_or_else(|why| Some(why.into_bytes()))
-    });
+    let selected = match local_cli_source_observed(cli, home, &policy, &mut |path, pool| {
+        if pool {
+            pool_entry_present(path)
+        } else {
+            source_entry_present(path)
+        }
+    }) {
+        Ok(selected) => selected,
+        Err(why) => {
+            hash.update([2]);
+            hash.update(why.as_bytes());
+            return hash.finalize();
+        }
+    };
+    if let Some(selected) = &selected {
+        let bytes = selected.path.as_os_str().as_encoded_bytes();
+        hash.update([1]);
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    } else {
+        hash.update([0]);
+    }
+    let fleet = [selected.as_ref().and_then(|selected| {
+        read_local_source_text(&selected.path)
+            .map(String::into_bytes)
+            .ok()
+    })];
+    let pool_identity = selected
+        .as_ref()
+        .is_some_and(|source| source.path == secrets_pool)
+        .then(|| {
+            super::ai_pool::resolve_local_pool_identity(Some(home), Some(config), None)
+                .map(|id| {
+                    id.map(|id| format!("{}:{}", id.primary, id.aliases.join(",")).into_bytes())
+                })
+                .unwrap_or_else(|why| Some(why.into_bytes()))
+        });
     for read in fleet
         .into_iter()
         .chain([super::ai_pool::read_bounded_bytes(config, 2 * 1024 * 1024)])

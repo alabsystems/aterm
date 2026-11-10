@@ -204,19 +204,23 @@ impl App {
     /// Each terminal leaf of the window's parked tabs, in tab order: a tab split by hand keeps a
     /// row for its worker and gains one for the new pane.
     fn parked_sessions(&self, wid: WindowId) -> Vec<u64> {
-        self.windows.get(&wid).map_or_else(Vec::new, |ws| {
-            ws.tab_set
-                .parked()
-                .iter()
-                .flat_map(|tab| tab.root.leaves())
-                .filter_map(|view| {
-                    self.view_store
-                        .get(view)
-                        .copied()
-                        .and_then(View::terminal_session)
-                })
-                .collect()
-        })
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut sessions = Vec::new();
+        for tab in ws.tab_set.parked() {
+            tab.root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(View::terminal_session)
+                {
+                    sessions.push(session);
+                }
+            });
+        }
+        sessions
     }
 
     /// Whether the window's page lists other sessions than its parked tabs hold now, and its
@@ -478,21 +482,16 @@ impl App {
             return false;
         };
         // Each session the kept tab holds (a worker's split panes too) is the person's now.
-        let held: Vec<u64> = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.tab_set.get(tab))
-            .map(|kept| {
-                kept.root
-                    .leaves()
-                    .into_iter()
-                    .filter_map(|view| match self.view_store.get(view).copied() {
-                        Some(crate::tab_model::View::Terminal(terminal)) => Some(terminal.session),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut held = Vec::new();
+        if let Some(kept) = self.windows.get(&wid).and_then(|ws| ws.tab_set.get(tab)) {
+            kept.root.visit(&mut |&view| {
+                if let Some(crate::tab_model::View::Terminal(terminal)) =
+                    self.view_store.get(view).copied()
+                {
+                    held.push(terminal.session);
+                }
+            });
+        }
         let views = &self.view_store;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;

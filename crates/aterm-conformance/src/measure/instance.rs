@@ -22,6 +22,31 @@ const POLL_GAP: Duration = Duration::from_millis(50);
 /// that times out answers for itself before the client gives up.
 const CTL_TIMEOUT_SECS: u64 = 120;
 
+/// Disjoint wall spans of a measurement, including its instance's explicit stop.
+pub(super) struct Phases {
+    name: String,
+    since: Instant,
+}
+
+impl Phases {
+    pub(super) fn new(name: String) -> Self {
+        Self {
+            name,
+            since: Instant::now(),
+        }
+    }
+
+    pub(super) fn end(&mut self, phase: &str) {
+        let now = Instant::now();
+        eprintln!(
+            "measure phase: {} phase={phase} seconds={:.6}",
+            self.name,
+            now.duration_since(self.since).as_secs_f64()
+        );
+        self.since = now;
+    }
+}
+
 /// Why a take decided nothing: never a pass and never a paint finding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CouldNotRun {

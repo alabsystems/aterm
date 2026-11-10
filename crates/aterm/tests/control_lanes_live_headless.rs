@@ -87,16 +87,21 @@ impl Drop for Reaped {
 }
 
 fn world(tag: &str) -> World {
-    let name = format!("atln{tag}-{}", std::process::id());
+    let short = &tag[..tag.floor_char_boundary(6)];
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let root = base.join(&name);
-        if !launch_isolation::sock_fits(&root.join("run/aterm/lanes.sock.token")) {
+        let Ok(dir) = aterm_tempfile::Builder::new()
+            .prefix(&format!("atln{short}-"))
+            .suffix(".noindex")
+            .tempdir_in(base)
+        else {
+            continue;
+        };
+        if !launch_isolation::sock_fits(&dir.path().join("run/aterm/lanes.sock.token")) {
             continue;
         }
-        if launch_isolation::prepare(&root).is_ok() {
-            return World(root);
+        if launch_isolation::prepare(dir.path()).is_ok() {
+            return World(dir.keep());
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
     could_not_run("no scratch base with a socket path short enough for sun_path")
 }

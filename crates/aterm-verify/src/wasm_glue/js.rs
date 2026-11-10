@@ -890,6 +890,7 @@ mod tests {
     fn drive_lifetimes(js: &str, keep: bool) -> (bool, String) {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-gl-life-")
+            .suffix(".noindex")
             .tempdir()
             .expect("exclusive fixture root");
         std::fs::write(dir.path().join("lifetime.js"), js).expect("owned generated glue");

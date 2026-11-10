@@ -332,7 +332,8 @@ impl Prepared {
         self.configure_original(command, extra, false)
     }
     /// Owner-private original parked compiler continuation. It receives only
-    /// CPU5 and cannot select compiler startup or acquire/delegate more units.
+    /// CPU5 plus the Host-selected read-only lifeline and cannot select compiler
+    /// startup or acquire/delegate more units.
     pub(crate) fn configure_linker(
         &mut self,
         command: &mut spawnfd::Command,

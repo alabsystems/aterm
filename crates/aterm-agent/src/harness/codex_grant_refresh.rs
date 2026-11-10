@@ -10,12 +10,16 @@ use crate::harness::codex_assignment::SourceAuthority;
 use crate::harness::codex_enrollment::{OwnerAttempt, OwnerWitness};
 use crate::harness::{codex_session_slot as slot, native_custody_platform as pending_native_store};
 
+#[path = "codex_grant_refresh_lineage.rs"]
+mod lineage;
+pub(super) use lineage::{LineageUncertainty, OwnedRefreshInventorySource, lineage_history};
+
 const MAX_JOURNAL: usize = 4 * 1024 * 1024;
 const MAX_OPERATIONS: usize = 256;
 
 #[path = "codex_grant_refresh_transaction.rs"]
 mod transaction;
-pub(in crate::harness) use transaction::with_refreshed_owner;
+pub(in crate::harness) use transaction::{with_refreshed_owner, with_refreshed_owner_in_namespace};
 
 pub(super) struct CredentialRevision {
     pub(super) identity: Identity,
@@ -115,6 +119,32 @@ impl Operation {
     }
 }
 
+#[path = "codex_grant_native_usage.rs"]
+mod native_usage;
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "codex_grant_source_proof_refresh.rs"]
+mod source_proof_refresh;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(in crate::harness) use source_proof_refresh::advance as advance_source_proof;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(in crate::harness) fn reconcile_source_proof(
+    env: &Env,
+    binding: &GrantBinding,
+    scope: &crate::harness::account_work::Scope,
+) -> Result<(), OwnerRefreshError> {
+    transaction::reconcile_retained(env, binding, scope)
+}
+pub(in crate::harness) use native_usage::NativeUsageGrant;
+pub use native_usage::{
+    NativeUsageContinuation, NativeUsageDeferred, NativeUsageDiscoveryCursor, NativeUsageOutcome,
+    NativeUsageRequest, NativeUsageRetention, NativeUsageSettlement, NativeUsageSourceLease,
+    discover_native_usage_deferred, read_native_usage, read_native_usage_observed,
+};
+
+#[path = "codex_grant_refresh_actor.rs"]
+mod actor;
+use actor::JournalOperation;
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
@@ -154,11 +184,19 @@ impl Response {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuarantineReason {
+    KnownAlias,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
-    operation: Operation,
+    operation: JournalOperation,
     phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarantine_reason: Option<QuarantineReason>,
     base_generation: u64,
     base_digest: String,
     token_digest: Option<String>,
@@ -168,7 +206,7 @@ struct Pending {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Completed {
-    operation: Operation,
+    operation: JournalOperation,
     // Actual provider attempts retain lineage evidence; coalesced deliveries do not.
     spent_token_digest: Option<String>,
     generation: u64,
@@ -213,14 +251,14 @@ fn pending_matches(pending: &Pending, attempt: &OwnerAttempt) -> bool {
     let Ok(digest) = operation_digest(&pending.operation) else {
         return false;
     };
-    pending.operation.id == attempt.operation
+    pending.operation.id() == attempt.operation
         && digest == attempt.request_digest
         && pending.base_generation == attempt.base_generation
         && pending.base_digest == attempt.base_digest
         && pending.token_digest.as_deref() == Some(attempt.token_digest.as_str())
 }
 
-fn operation_digest(operation: &Operation) -> Result<String, String> {
+fn operation_digest(operation: &impl Serialize) -> Result<String, String> {
     let bytes = aterm_json::to_vec(&("aterm/codex-owner-refresh-operation/v1", operation))
         .map_err(|_| "owner operation unavailable")?;
     Ok(aterm_codec::hex::encode_lower(
@@ -236,7 +274,7 @@ fn journal_pending(journal: &Journal) -> Result<Option<OwnerAttempt>, String> {
         return Ok(None);
     }
     Ok(Some(OwnerAttempt {
-        operation: pending.operation.id.clone(),
+        operation: pending.operation.id().to_owned(),
         request_digest: operation_digest(&pending.operation)?,
         base_generation: pending.base_generation,
         base_digest: pending.base_digest.clone(),
@@ -320,7 +358,7 @@ impl JournalTransition {
 }
 impl Journal {
     fn valid(&self) -> bool {
-        if self.schema != 3
+        if !matches!(self.schema, 3 | 4)
             || !self.binding.request.valid()
             || !self.binding.reference.valid()
             || self.binding.generation == 0
@@ -332,7 +370,7 @@ impl Journal {
         }
         let mut ids = std::collections::BTreeSet::new();
         if self.completed.iter().any(|done| {
-            !done.operation.valid()
+            !done.operation.valid(self.schema)
                 || done
                     .spent_token_digest
                     .as_ref()
@@ -342,13 +380,17 @@ impl Journal {
                 || done.generation > self.current.generation
                 || (done.generation == self.current.generation
                     && done.digest != self.current.digest)
-                || !ids.insert(done.operation.id.as_str())
+                || !ids.insert(done.operation.id())
         }) {
             return false;
         }
         self.pending.as_ref().is_none_or(|pending| {
-            if !pending.operation.valid()
-                || ids.contains(pending.operation.id.as_str())
+            if !pending.operation.valid(self.schema)
+                || (pending.quarantine_reason.is_some()
+                    && !(self.schema == 4
+                        && pending.phase == Phase::Quarantined
+                        && known_alias_response(self, pending)))
+                || ids.contains(pending.operation.id())
                 || pending.base_generation == 0
                 || !valid_hex(&pending.base_digest, 64)
                 || pending
@@ -376,6 +418,32 @@ impl Journal {
             }
         })
     }
+}
+
+fn known_alias_response(journal: &Journal, pending: &Pending) -> bool {
+    if pending.quarantine_reason != Some(QuarantineReason::KnownAlias)
+        || journal.previous_current.is_some()
+        || pending.base_generation != journal.current.generation
+        || pending.base_digest != journal.current.digest
+    {
+        return false;
+    }
+    let Some(response) = &pending.response else {
+        return false;
+    };
+    let Some(at) = response.received_at else {
+        return false;
+    };
+    let (Ok(current), Ok(body)) = (journal.current.open(), response.bytes()) else {
+        return false;
+    };
+    codex_app_login::merge_owned_refresh(
+        current.document.as_slice(),
+        response.status,
+        body.as_slice(),
+        at,
+    )
+    .is_ok()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1024,5 +1092,7 @@ impl OwnerRefreshContinuation {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(in crate::harness) use transaction::fixture_promote_lineage_response;
 #[cfg(all(test, unix))]
 pub(in crate::harness) use transaction::fixture_promote_received_response;

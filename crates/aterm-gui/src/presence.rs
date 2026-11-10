@@ -614,6 +614,7 @@ fn unreadable_verdict(
         reading: AgentReading {
             phase: AgentPhase::Unknown,
             context_pct: None,
+            composer: aterm_messages::presence::ComposerState::Unknown,
         },
         by_frame: false,
         subject: None,
@@ -640,6 +641,14 @@ pub(crate) fn classify(
         Cursor::Unknown => reader.read_titled(rows, None, runs),
     };
     let turn = TurnFacts::of(reader.program(), &r);
+    let composer = match &r.composer {
+        None => aterm_messages::presence::ComposerState::Unknown,
+        Some((_, lines)) if lines.iter().all(|line| line.trim().is_empty()) => {
+            aterm_messages::presence::ComposerState::Empty
+        }
+        Some(_) if reader.placeholder() => aterm_messages::presence::ComposerState::Unknown,
+        Some(_) => aterm_messages::presence::ComposerState::Draft,
+    };
     let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
         let until = reset
             .as_deref()
@@ -718,6 +727,7 @@ pub(crate) fn classify(
         AgentReading {
             phase,
             context_pct: r.context_left,
+            composer,
         },
         subject,
         TurnFacts { keys, ..turn },
@@ -1400,6 +1410,28 @@ mod tests {
     }
 
     #[test]
+    fn kimi_composer_status_distinguishes_empty_draft_and_no_composer() {
+        use aterm_messages::presence::ComposerState;
+        use aterm_phase::kimi::fixtures::{BOX_SHELL_240, DRAFT, IDLE};
+        use aterm_phase::prompt::fixtures::screen;
+
+        for (fixture, want) in [
+            (IDLE, ComposerState::Empty),
+            (DRAFT, ComposerState::Draft),
+            (BOX_SHELL_240, ComposerState::Unknown),
+        ] {
+            let (reading, _, _) = classify(
+                &aterm_phase::KimiReader,
+                &screen(fixture),
+                Cursor::Unknown,
+                "",
+                Instant::now(),
+            );
+            assert_eq!(reading.composer, want);
+        }
+    }
+
+    #[test]
     fn a_reader_panic_degrades_the_verdict_to_unknown_and_the_thread_lives() {
         let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_RM);
         let boom = || -> AgentVerdict { panic!("stand-in reader panic") };
@@ -1409,7 +1441,8 @@ mod tests {
                 AgentVerdict::Agent {
                     reading: AgentReading {
                         phase: AgentPhase::Unknown,
-                        context_pct: None
+                        context_pct: None,
+                        composer: aterm_messages::presence::ComposerState::Unknown,
                     },
                     by_frame: false,
                     subject: None,
@@ -1940,6 +1973,7 @@ mod tests {
                 until: None,
             },
             context_pct: Some(40),
+            composer: aterm_messages::presence::ComposerState::Unknown,
         };
         let now = t0();
         let past = RetryPlan::with_offset(i64::MIN, Some(0));
@@ -1971,6 +2005,7 @@ mod tests {
                     until: None,
                 },
                 context_pct: Some(40),
+                composer: aterm_messages::presence::ComposerState::Unknown,
             })
         };
         let unreachable = WallKind::ApiError {
@@ -2041,6 +2076,7 @@ mod tests {
                 Some(AgentReading {
                     phase: AgentPhase::Idle,
                     context_pct: None,
+                    composer: aterm_messages::presence::ComposerState::Unknown,
                 }),
                 Some(NOW_UNIX + 60),
             ),

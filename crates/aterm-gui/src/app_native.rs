@@ -10918,67 +10918,63 @@ impl App {
 
     /// Fold presentation across every leaf of the active split.
     pub(crate) fn refresh_active_split_presentation(&mut self, wid: WindowId) {
-        let Some((tab_id, focused, leaves, stale_title)) =
-            self.windows.get(&wid).and_then(|window| {
-                let tab = window.tab_set.active()?;
-                Some((
-                    tab.id,
-                    tab.focus,
-                    tab.root.leaves(),
-                    tab.presentation.title.clone(),
-                ))
-            })
-        else {
-            return;
-        };
-        let mut presentations = Vec::with_capacity(leaves.len());
-        for view in leaves {
-            let Some(linked) = self.view_store.get(view).copied() else {
-                continue;
-            };
-            let presentation = match linked {
-                crate::tab_model::View::Terminal(terminal) => {
-                    let title = match self.pool.get(terminal.session) {
-                        Some(session) => match session.term.try_lock() {
-                            Ok(term) => Some(term.title().to_string()),
-                            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                                Some(poisoned.into_inner().title().to_string())
-                            }
-                            Err(std::sync::TryLockError::WouldBlock) => Some(stale_title.clone()),
-                        },
-                        None => None,
-                    };
-                    let title = title
-                        .filter(|title| !title.is_empty())
-                        .unwrap_or_else(|| "aterm".to_string());
-                    let mut presentation = crate::tab_model::TabPresentation::terminal(title);
-                    presentation.indicators = self.session_status_indicators(terminal.session);
-                    presentation
-                }
-                crate::tab_model::View::Native(native) => {
-                    let Ok(presentation) = self.native_runtime.presentation(native.instance, view)
-                    else {
-                        continue;
-                    };
-                    crate::tab_model::TabPresentation {
-                        title: presentation.title,
-                        icon: Some(presentation.icon),
-                        indicators: crate::tab_model::TabIndicators {
-                            dirty: presentation.indicators.dirty,
-                            busy: presentation.indicators.busy,
-                            attention: presentation.indicators.attention,
-                            status_attention: false,
-                        },
-                        conn: None,
-                        closable: presentation.closable,
-                        tooltip: presentation.tooltip,
+        let Some((tab_id, presentation)) = self.windows.get(&wid).and_then(|window| {
+            let tab = window.tab_set.active()?;
+            let stale_title = tab.presentation.title.as_str();
+            let mut presentations = Vec::with_capacity(tab.root.len());
+            tab.root.visit(&mut |&view| {
+                let Some(linked) = self.view_store.get(view).copied() else {
+                    return;
+                };
+                let presentation = match linked {
+                    crate::tab_model::View::Terminal(terminal) => {
+                        let title = match self.pool.get(terminal.session) {
+                            Some(session) => match session.term.try_lock() {
+                                Ok(term) => Some(term.title().to_string()),
+                                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                                    Some(poisoned.into_inner().title().to_string())
+                                }
+                                Err(std::sync::TryLockError::WouldBlock) => {
+                                    Some(stale_title.to_string())
+                                }
+                            },
+                            None => None,
+                        };
+                        let title = title
+                            .filter(|title| !title.is_empty())
+                            .unwrap_or_else(|| "aterm".to_string());
+                        let mut presentation = crate::tab_model::TabPresentation::terminal(title);
+                        presentation.indicators = self.session_status_indicators(terminal.session);
+                        presentation
                     }
-                }
-            };
-            presentations.push((view, presentation));
-        }
-        let Some(presentation) = crate::tab_model::aggregate_presentations(focused, presentations)
-        else {
+                    crate::tab_model::View::Native(native) => {
+                        let Ok(presentation) =
+                            self.native_runtime.presentation(native.instance, view)
+                        else {
+                            return;
+                        };
+                        crate::tab_model::TabPresentation {
+                            title: presentation.title,
+                            icon: Some(presentation.icon),
+                            indicators: crate::tab_model::TabIndicators {
+                                dirty: presentation.indicators.dirty,
+                                busy: presentation.indicators.busy,
+                                attention: presentation.indicators.attention,
+                                status_attention: false,
+                            },
+                            conn: None,
+                            closable: presentation.closable,
+                            tooltip: presentation.tooltip,
+                        }
+                    }
+                };
+                presentations.push((view, presentation));
+            });
+            Some((
+                tab.id,
+                crate::tab_model::aggregate_presentations(tab.focus, presentations)?,
+            ))
+        }) else {
             return;
         };
         if let Some(window) = self.windows.get_mut(&wid)

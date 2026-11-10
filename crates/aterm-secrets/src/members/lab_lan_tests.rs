@@ -155,7 +155,9 @@ fn a_lab_desk_has_a_home_only_on_the_network_its_vault_names() {
         Ipv4Addr::new(255, 255, 255, 0),
     );
 
-    let found = script_here(at_home.clone(), || home(&lab, Some(&served()), false));
+    let found = script_here(at_home.clone(), || {
+        home(&lab, Some(&served()), false).unwrap()
+    });
     assert_eq!(found, Some(expected), "every gate holds");
     let found = found.unwrap();
     assert!(found.holds("192.168.1.45".parse().unwrap()));
@@ -165,7 +167,7 @@ fn a_lab_desk_has_a_home_only_on_the_network_its_vault_names() {
     }
 
     let gated = |paths: &Paths, config: Option<&Config>, live: bool, script| {
-        script_here(script, || home(paths, config, live))
+        script_here(script, || home(paths, config, live).unwrap())
     };
     assert_eq!(gated(&lab, None, false, at_home.clone()), None, "no vault");
     assert_eq!(

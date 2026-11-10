@@ -257,6 +257,7 @@ fn run_arm(
 ) -> Result<PathBuf, Halt> {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-restore-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let words = args.bench_words(arm);

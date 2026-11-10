@@ -115,12 +115,14 @@ pub fn control_listening(sock: impl AsRef<Path>) -> bool {
 /// The root could not be created or prepared: a broken fixture.
 #[allow(dead_code)]
 pub fn scratch_root(label: &str) -> aterm_tempfile::TempDir {
+    let short = &label[..label.floor_char_boundary(12)];
     #[cfg(unix)]
     let base = std::path::PathBuf::from("/tmp");
     #[cfg(not(unix))]
     let base = std::env::temp_dir();
     let root = aterm_tempfile::Builder::new()
-        .prefix(&format!("{label}-"))
+        .prefix(&format!("{short}-"))
+        .suffix(".noindex")
         .tempdir_in(base)
         .expect("create a private root");
     prepare(root.path()).expect("prepare a private root");

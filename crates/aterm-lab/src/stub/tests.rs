@@ -1837,7 +1837,7 @@ fn a_wham_usage_read_echoes_only_the_selected_account_header() {
 
 #[test]
 fn served_on_loopback_it_answers_codex_as_the_modes_say() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-codex-{}", std::process::id()));
+    let dir = crate::TestScratch::new("codex");
     std::fs::create_dir_all(dir.join("modes")).unwrap();
     let log = dir.join("stub.log");
     let headers_file = dir.join("headers.json");
@@ -2010,13 +2010,11 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
         !logged.contains("lab-refresh-A") && !logged.contains(&jwt),
         "no token is ever logged"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-account-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::TestScratch::new("account");
     let log = dir.join("stub.log");
     let account_file = dir.join("account.json");
     let args = Args {
@@ -2065,7 +2063,6 @@ fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
         assert!(text.contains(w), "{w:?} is not in the log:\n{text}");
     }
     assert!(!text.contains(&oat), "the token is never logged");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2565,8 +2562,8 @@ fn the_shared_wall_modes_answer_each_api_in_its_shape() {
 
 #[test]
 fn requests_in_flight_together_are_each_dumped() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-dumps-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = crate::TestScratch::new("dumps");
+    let dir = scratch.join("dumps");
     let stub = Stub::new(Args {
         dump_dir: Some(dir.clone()),
         ..Args::default()
@@ -2594,7 +2591,6 @@ fn requests_in_flight_together_are_each_dumped() {
     want.sort();
     assert_eq!(bodies, want);
     assert_eq!(stub.st().n_requests, 0, "the control");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

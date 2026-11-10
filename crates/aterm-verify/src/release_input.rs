@@ -41,6 +41,10 @@ impl Input {
 }
 
 fn git(root: &Path, path: &OsStr, args: &[&str]) -> Result<String, String> {
+    git_read(root, path, args, false)
+}
+
+fn git_read(root: &Path, path: &OsStr, args: &[&str], grep: bool) -> Result<String, String> {
     let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     command
         .current_dir(root)
@@ -52,9 +56,13 @@ fn git(root: &Path, path: &OsStr, args: &[&str]) -> Result<String, String> {
     for key in crate::changed::GIT_REDIRECTS {
         command.env_remove(key);
     }
-    let out = aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
+    let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
+        &mut command,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+    )
+    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() && !(grep && out.status.code() == Some(1)) {
         return Err(format!(
             "git {}: {}",
             args.join(" "),
@@ -77,7 +85,13 @@ fn ancestors(nodes: &BTreeMap<String, Commit>, start: &str) -> BTreeSet<String> 
     seen
 }
 
-fn unchecked(nodes: &BTreeMap<String, Commit>, composed: &BTreeSet<String>) -> Vec<String> {
+fn unchecked(
+    root: &Path,
+    path: &OsStr,
+    nodes: &BTreeMap<String, Commit>,
+    composed: &BTreeSet<String>,
+    empty_lint: &BTreeSet<(String, String)>,
+) -> Vec<String> {
     let mut covered = BTreeSet::new();
     for (landing, commit) in nodes {
         let Some(receipt) = &commit.receipt else {
@@ -86,14 +100,38 @@ fn unchecked(nodes: &BTreeMap<String, Commit>, composed: &BTreeSet<String>) -> V
         if commit.parents.len() != 2 {
             continue;
         }
-        let reachable = ancestors(nodes, landing);
+        // Bind the last judgment to the actual landing before trusting any part of its
+        // receipt. Merely finding a named tree somewhere in the imported main is not proof.
+        if !receipt
+            .checked
+            .last()
+            .is_some_and(|c| c.tree == commit.tree)
+            && !composed.contains(landing)
+        {
+            continue;
+        }
+        let mut spine = BTreeSet::new();
+        let mut next = Some(landing.as_str());
+        while let Some(id) = next {
+            if !spine.insert(id.to_owned()) {
+                break;
+            }
+            next = nodes
+                .get(id)
+                .and_then(|c| c.parents.first())
+                .map(String::as_str);
+        }
         let mut valid = false;
         for checked in &receipt.checked {
             if !NAMES.iter().all(|name| {
-                checked
-                    .rows
-                    .iter()
-                    .any(|r| r.check == *name && r.word == "ok")
+                checked.rows.iter().any(|r| {
+                    r.check == *name
+                        && (r.word == "ok"
+                            || (*name == "lint"
+                                && r.word == "skip"
+                                && empty_lint
+                                    .contains(&(checked.base.clone(), checked.tree.clone()))))
+                })
             }) {
                 continue;
             }
@@ -103,24 +141,26 @@ fn unchecked(nodes: &BTreeMap<String, Commit>, composed: &BTreeSet<String>) -> V
                 Some(landing.as_str())
             } else {
                 nodes.iter().find_map(|(id, c)| {
-                    (c.tree == checked.tree && reachable.contains(id)).then_some(id.as_str())
+                    (c.tree == checked.tree && spine.contains(id)).then_some(id.as_str())
                 })
             };
             let Some(target) = target else { continue };
             let judged = ancestors(nodes, target);
-            if !judged.contains(&checked.base) {
+            if !judged.contains(&checked.base)
+                && (nodes.contains_key(&checked.base)
+                    || git(
+                        root,
+                        path,
+                        &["merge-base", "--is-ancestor", &checked.base, target],
+                    )
+                    .is_err())
+            {
                 continue;
             }
             covered.extend(judged.difference(&ancestors(nodes, &checked.base)).cloned());
-            valid = true;
+            valid |= receipt.checked.last() == Some(checked);
         }
-        if valid
-            && (receipt
-                .checked
-                .last()
-                .is_some_and(|c| c.tree == commit.tree)
-                || composed.contains(landing))
-        {
+        if valid {
             covered.insert(landing.clone());
         }
     }
@@ -129,6 +169,117 @@ fn unchecked(nodes: &BTreeMap<String, Commit>, composed: &BTreeSet<String>) -> V
         .filter(|id| !covered.contains(*id))
         .cloned()
         .collect()
+}
+
+/// A skip alone is not a pass: a missing Tippy also produces one. Prove the empty
+/// selection from immutable trees, conservatively treating every manifest as a member.
+/// Use the cone selector's ownership, replan, tested-file and shared-input rules.
+fn lint_has_no_inputs(root: &Path, path: &OsStr, base: &str, tree: &str) -> Result<bool, String> {
+    let changed = git(
+        root,
+        path,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            base,
+            tree,
+            "--",
+        ],
+    )?;
+    let changed: Vec<_> = changed
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let listed = git(root, path, &["ls-tree", "-r", "-z", tree])?;
+    let mut manifests = crate::changed::Manifests::new();
+    let mut entries = Vec::new();
+    for entry in listed.split('\0').filter(|p| !p.is_empty()) {
+        let Some((kind, file)) = entry.split_once('\t') else {
+            return Ok(false);
+        };
+        if (kind.starts_with("160000 ")
+            && changed
+                .iter()
+                .any(|p| p == file || p.starts_with(&format!("{file}/"))))
+            || (kind.starts_with("120000 ") && file.ends_with(".rs"))
+        {
+            return Ok(false);
+        }
+        if let Some(dir) = file.strip_suffix("/Cargo.toml") {
+            manifests.insert(dir);
+            entries.push(crate::changed::Member {
+                name: dir.into(),
+                dir: dir.into(),
+                has_lib: true,
+            });
+        }
+    }
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    // A root package owns root inputs too; the normal workspace ownership walk
+    // intentionally stops before the root. Such a workspace needs its real lint.
+    let root_manifest = git(root, path, &["show", &format!("{tree}:Cargo.toml")])?;
+    let manifest: aterm_toml::Table = match aterm_toml::from_str(&root_manifest) {
+        Ok(table) => table,
+        Err(_) => return Ok(false),
+    };
+    if manifest.get("package").is_some() {
+        return Ok(false);
+    }
+    let members = crate::changed::Members::new(entries);
+    let (seeds, replan) = crate::changed::seeds(&changed, &manifests, &members);
+    if !seeds.is_empty()
+        || replan.is_some()
+        || changed
+            .iter()
+            .any(|p| crate::changed::tested_by(p).next().is_some())
+    {
+        return Ok(false);
+    }
+    let shared = git_read(
+        root,
+        path,
+        &[
+            "grep",
+            "--no-textconv",
+            "--full-name",
+            "-n",
+            "-z",
+            "-F",
+            "-e",
+            "../",
+            tree,
+            "--",
+            "*.rs",
+        ],
+        true,
+    )?;
+    let changed: Vec<_> = changed.iter().map(|p| root.join(p)).collect();
+    for line in shared.lines() {
+        let fields: Vec<_> = line.splitn(3, '\0').collect();
+        if fields.len() != 3 {
+            return Ok(false);
+        }
+        let Some(source) = fields[0].strip_prefix(&format!("{tree}:")) else {
+            return Ok(false);
+        };
+        let Some(member) = crate::changed::owning_member(source, &manifests, &members) else {
+            continue;
+        };
+        if crate::changed::shares_changed_input(
+            &root.join(source),
+            fields[2],
+            &root.join(member),
+            &changed,
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Read Git's actual landing trailers and union only the unjudged commits' changed paths.
@@ -162,60 +313,38 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
         );
     }
     let mut composed = BTreeSet::new();
+    let mut empty_lint = BTreeSet::new();
     for (id, commit) in &nodes {
         let Some(receipt) = &commit.receipt else {
             continue;
         };
-        let (Some(onto), Some(checked)) = (&receipt.composed_onto, receipt.checked.last()) else {
+        for checked in &receipt.checked {
+            let key = (checked.base.clone(), checked.tree.clone());
+            if checked
+                .rows
+                .iter()
+                .any(|r| r.check == "lint" && r.word == "skip")
+                && !empty_lint.contains(&key)
+                && lint_has_no_inputs(root, path, &checked.base, &checked.tree).unwrap_or(false)
+            {
+                empty_lint.insert(key);
+            }
+        }
+        let (Some(onto), Some(checked), [parent, main]) = (
+            &receipt.composed_onto,
+            receipt.checked.last(),
+            commit.parents.as_slice(),
+        ) else {
             continue;
         };
-        let reachable = ancestors(&nodes, id);
-        if !commit.parents.contains(onto)
-            || !reachable.contains(&checked.base)
-            || !nodes
-                .iter()
-                .any(|(id, c)| c.tree == checked.tree && reachable.contains(id))
+        if onto == main
+            && nodes.get(parent).is_some_and(|c| c.tree == checked.tree)
+            && crate::land::receipt_composition(root, path, parent, onto, &commit.tree)?
         {
-            continue;
-        }
-        let imported = git(
-            root,
-            path,
-            &[
-                "diff",
-                "--name-only",
-                "-z",
-                &checked.tree,
-                &commit.tree,
-                "--",
-            ],
-        )?;
-        let own = git(
-            root,
-            path,
-            &[
-                "diff",
-                "--name-only",
-                "-z",
-                &checked.base,
-                &checked.tree,
-                "--",
-            ],
-        )?;
-        let imported: Vec<_> = imported.split('\0').filter(|p| !p.is_empty()).collect();
-        if imported
-            .iter()
-            .any(|p| own.split('\0').any(|own| own == *p))
-        {
-            continue;
-        }
-        let mut args = vec!["diff", "--name-only", "-z", onto, &commit.tree, "--"];
-        args.extend(imported);
-        if git(root, path, &args)?.is_empty() {
             composed.insert(id.clone());
         }
     }
-    let commits = unchecked(&nodes, &composed);
+    let commits = unchecked(root, path, &nodes, &composed, &empty_lint);
     let mut paths = BTreeSet::new();
     for commit in &commits {
         let merge_diff = if nodes[commit].parents.len() > 2 {
@@ -259,6 +388,24 @@ pub fn judge(
     events: Option<crate::event_log::EventLog>,
     log: &mut (dyn std::io::Write + Send),
 ) -> Result<String, (bool, String)> {
+    judge_with_lint(root, base, tip, checks, events, log, LintCarry::default())
+}
+
+#[derive(Default)]
+struct LintCarry {
+    passed: Option<crate::lint_content::Passed>,
+    context: Option<String>,
+}
+
+fn judge_with_lint(
+    root: &Path,
+    base: &str,
+    tip: &str,
+    checks: &[Check],
+    events: Option<crate::event_log::EventLog>,
+    log: &mut (dyn std::io::Write + Send),
+    carry: LintCarry,
+) -> Result<String, (bool, String)> {
     let began = std::time::Instant::now();
     let env = EnvSnapshot::capture();
     let input = discover(root, &env.path, base, tip).map_err(|why| (false, why))?;
@@ -275,7 +422,9 @@ pub fn judge(
     let tools = crate::preflight(&env, root).map_err(|why| (false, why))?;
     let scratch = aterm_tempfile::tempdir().map_err(|e| (false, e.to_string()))?;
     let selection =
-        crate::changed::resolve_paths(root, &tools, &env.path, base, input.paths.clone());
+        // The paths are the unreceipted commits', which no one tree precedes: a revert of a
+        // receipted change compares equal to `base`.
+        crate::changed::resolve_paths(root, &tools, &env.path, base, input.paths.clone(), None);
     let (scope, cone) = crate::changed::cone(base, &selection);
     let (_leases, _) = crate::hold_toolchain(&env, &tools, root);
     let mut ctx = Ctx::new_with_tools(
@@ -290,6 +439,8 @@ pub fn judge(
     .with_events(events)
     .with_memory(crate::memory::Book::live());
     ctx.input_paths = Some(input.paths.clone());
+    ctx.passed_lint_packages = carry.passed;
+    ctx.carry_context = carry.context;
     ctx.head_at_start = Some(tip.into());
     let mut unavailable = Vec::new();
     for check in checks.iter().copied() {
@@ -344,11 +495,26 @@ pub fn run_cli(args: &[String], root: &Path) -> i32 {
     }
     let mut checks = CHECKS.to_vec();
     let mut events = None;
+    let mut passed = None;
+    let mut context = None;
     for pair in args[2..].chunks(2) {
         if pair.len() != 2 {
             return crate::exit::USAGE;
         }
         match pair[0].as_str() {
+            "--carry-context" => context = Some(pair[1].clone()),
+            "--passed-lint-packages" => {
+                passed = match std::fs::read_to_string(&pair[1])
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| crate::lint_content::read_passed(&text))
+                {
+                    Ok(passed) => Some(passed),
+                    Err(why) => {
+                        eprintln!("cannot read lint package evidence: {why}");
+                        return crate::exit::COULD_NOT_RUN;
+                    }
+                };
+            }
             "--checks" => {
                 let names: Vec<_> = pair[1].split(',').collect();
                 if names.iter().any(|name| !NAMES.contains(name)) {
@@ -379,13 +545,14 @@ pub fn run_cli(args: &[String], root: &Path) -> i32 {
             return crate::exit::COULD_NOT_RUN;
         }
     };
-    let code = match judge(
+    let code = match judge_with_lint(
         root,
         &args[1],
         &tip,
         &checks,
         events,
         &mut std::io::stdout(),
+        LintCarry { passed, context },
     ) {
         Ok(note) => {
             println!("{note}");
@@ -468,6 +635,20 @@ mod tests {
                 ..Stated::default()
             }
             .trailers()
+        }
+        fn landing(&self, tree: &str, branch: &str, main: &str, receipt: &Stated) -> String {
+            let id = self.git(&[
+                "commit-tree",
+                tree,
+                "-p",
+                branch,
+                "-p",
+                main,
+                "-m",
+                &format!("land\n\n{}", receipt.trailers()),
+            ]);
+            self.git(&["update-ref", "HEAD", &id]);
+            id
         }
     }
 
@@ -655,6 +836,132 @@ mod tests {
         assert!(r.input(&base).paths.contains(&"branch".into()));
     }
 
+    /// A re-judge names the prior checked branch as its base, not the main ancestor
+    /// from which the later composition's disjoint files must be computed.
+    #[test]
+    fn composed_rejudgment_uses_the_parents_common_main() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        r.write("branch", "checked\n");
+        let branch = r.commit("branch");
+        let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.git(&["checkout", "--detach", &base]);
+        r.write("main", "first\n");
+        let main = r.commit("main");
+        r.git(&["checkout", "--detach", &branch]);
+        r.git(&["merge", "--no-ff", "-m", "rejudge", &main]);
+        let rejudged = r.git(&["rev-parse", "HEAD"]);
+        receipt
+            .checked
+            .extend(Stated::of_trailers(&r.receipt(&branch)).unwrap().checked);
+        r.git(&["checkout", "--detach", &main]);
+        r.write("main", "second\n");
+        let moved = r.commit("moved main");
+        r.git(&["checkout", "--detach", &rejudged]);
+        r.git(&["merge", "--no-ff", "-m", "compose", &moved]);
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+        receipt.composed_onto = Some(moved.clone());
+        r.landing(&tree, &rejudged, &moved, &receipt);
+        let input = r.input(&base);
+        assert_eq!(input.commits.as_slice(), std::slice::from_ref(&moved));
+        assert_eq!(input.paths, ["main"]);
+        // A stated composition cannot authorize an extra resolution edit.
+        r.write("branch", "forged\n");
+        r.git(&["add", "."]);
+        let bad = r.git(&["write-tree"]);
+        r.landing(&bad, &rejudged, &moved, &receipt);
+        assert!(r.input(&base).paths.contains(&"branch".into()));
+    }
+
+    /// Trust an empty lint skip, never a missing compiler's skip over actual source
+    /// or a document read by source. All evidence comes from the named tree.
+    #[test]
+    fn empty_lint_skip_is_proven_from_the_checked_tree() {
+        let r = Repo::new();
+        std::fs::create_dir_all(r.0.path().join("crates/member/src")).unwrap();
+        r.write("Cargo.toml", "[workspace]\nmembers=['crates/member']\n");
+        r.write(
+            "crates/member/Cargo.toml",
+            "[package]\nname='member'\nversion='0.0.0'\n",
+        );
+        r.write("crates/member/src/lib.rs", "pub fn value() {}\n");
+        let base = r.commit("workspace");
+        let land = |base: &str| {
+            let branch = r.git(&["rev-parse", "HEAD"]);
+            let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+            let mut receipt = Stated::of_trailers(&r.receipt(base)).unwrap();
+            receipt.checked[0]
+                .rows
+                .iter_mut()
+                .find(|r| r.check == "lint")
+                .unwrap()
+                .word = "skip".into();
+            r.landing(&tree, &branch, base, &receipt)
+        };
+        r.write("REPORT.md", "documentation\n");
+        r.commit("document");
+        land(&base);
+        assert!(r.input(&base).commits.is_empty());
+        r.git(&["checkout", "--detach", &base]);
+        r.write("crates/member/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
+        let source = r.commit("source without lint");
+        land(&base);
+        assert!(r.input(&base).commits.contains(&source));
+        r.git(&["checkout", "--detach", &base]);
+        r.write("REPORT.md", "included\n");
+        r.write(
+            "crates/member/src/lib.rs",
+            "pub const REPORT: &str = include_str!(\"../../../REPORT.md\");\n",
+        );
+        let reader = r.commit("source reads report");
+        r.write("REPORT.md", "unlinted input\n");
+        let input = r.commit("change shared input");
+        land(&reader);
+        assert!(r.input(&reader).commits.contains(&input));
+    }
+
+    /// An existing ancestor tree is no more authority than a nonexistent forged tree:
+    /// without a valid composition it cannot hide even that ancestor's branch delta.
+    #[test]
+    fn unrelated_tree_trailer_cannot_cover_a_branch_prefix() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        r.write("branch", "checked prefix\n");
+        let branch = r.commit("branch");
+        let receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.write("extra", "unchecked\n");
+        r.commit("extra");
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+        let parent = r.git(&["rev-parse", "HEAD"]);
+        r.landing(&tree, &parent, &base, &receipt);
+        let input = r.input(&base);
+        assert!(input.commits.contains(&branch));
+        assert_eq!(input.paths, ["branch", "extra"]);
+    }
+
+    /// The release boundary truncates the in-memory graph, not the receipt's actual
+    /// ancestry. A base before that boundary is valid; an unrelated base is not.
+    #[test]
+    fn receipt_base_before_the_release_boundary_is_checked_in_git() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        r.write("released", "released\n");
+        let released = r.commit("released");
+        r.write("branch", "checked\n");
+        let branch = r.commit("branch");
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+        let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.landing(&tree, &branch, &released, &receipt);
+        assert!(r.input(&released).commits.is_empty());
+        r.git(&["checkout", "--detach", &base]);
+        r.write("other", "unrelated\n");
+        let unrelated = r.commit("unrelated base");
+        r.git(&["checkout", "--detach", &branch]);
+        receipt.checked[0].base = unrelated;
+        r.landing(&tree, &branch, &released, &receipt);
+        assert!(r.input(&released).commits.contains(&branch));
+    }
+
     /// Sixty commits, only two without evidence: history size does not widen the input.
     #[test]
     fn sixty_commit_cone_keeps_only_two_unchecked_changes() {
@@ -748,5 +1055,157 @@ mod tests {
             "release-input lint fixture: red_and_clean_s={:.3}",
             start.elapsed().as_secs_f64()
         );
+    }
+
+    /// Run the production preflight and Tippy scheduler across a moved tip and a product bump.
+    /// The dependent must run when its dependency changes; an unrelated package must carry.
+    #[test]
+    fn preflight_package_receipts_follow_dependency_content_across_a_bump() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        let source = aterm_tempfile::manifest_dir().join("../..");
+        r.write(".gitignore", "/target/\n");
+        for name in ["trust.lock", "rust-toolchain.toml"] {
+            std::fs::copy(source.join(name), r.0.path().join(name)).unwrap();
+        }
+        r.write("Cargo.toml", "[workspace]\nmembers=['a','b','c','aterm']\nresolver='2'\n[workspace.package]\nversion='1.0.0'\n");
+        for name in ["a", "b", "c", "aterm"] {
+            std::fs::create_dir_all(r.0.path().join(name).join("src")).unwrap();
+            r.write(&format!("{name}/Cargo.toml"), &format!(
+                "[package]\nname='{name}'\n{}\nedition='2024'\n\
+                 [package.metadata.aterm.lint-inputs]\nbounded=true\ncontent-only=true\nread-only=true\n\
+                 paths=[]\nworkspace-paths=[]\ntools=[]\nvolatile-environment=[]\n{}",
+                if name == "aterm" { "version.workspace=true" } else { "version='0.0.0'" },
+                if name == "a" { "[dependencies]\nb={path='../b'}\n" } else { "" }
+            ));
+            r.write(
+                &format!("{name}/src/lib.rs"),
+                "pub fn value() -> u8 { 1 }\n",
+            );
+        }
+        let env = EnvSnapshot::capture();
+        let tools = crate::preflight(&env, &source).unwrap();
+        let lockfile = || {
+            let mut command = aterm_uds::spawnfd::command(&tools.targo);
+            command
+                .current_dir(r.0.path())
+                .args(["generate-lockfile", "--offline"]);
+            aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
+                .unwrap()
+        };
+        let output = lockfile();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let first = r.commit("dry tip");
+        let logs = aterm_tempfile::tempdir().unwrap();
+        let run = |tip: &str, previous: Option<crate::lint_content::Passed>, name: &str| {
+            let events = logs.path().join(format!("{name}.events"));
+            let mut output = Vec::new();
+            let start = std::time::Instant::now();
+            let result = judge_with_lint(
+                r.0.path(),
+                &base,
+                tip,
+                &[Check::Lint],
+                Some(crate::event_log::EventLog::open(&events).unwrap()),
+                &mut output,
+                LintCarry {
+                    passed: previous,
+                    context: Some("ab".repeat(32)),
+                },
+            );
+            assert!(
+                result.is_ok(),
+                "{result:?}\n{}",
+                String::from_utf8_lossy(&output)
+            );
+            let mut passed = crate::lint_content::Passed::new();
+            let mut ran = BTreeSet::new();
+            for line in std::fs::read_to_string(events).unwrap().lines() {
+                let Some(text) = line.strip_prefix("verify-event: ") else {
+                    continue;
+                };
+                let row: aterm_json::Value = aterm_json::from_str(text).unwrap();
+                if row["event"].as_str() != Some("lint-package-finished") {
+                    continue;
+                }
+                let spec = row["spec"].as_str().unwrap().to_string();
+                assert_eq!(row["inputs_bounded"].as_bool(), Some(true), "{row}");
+                if row["carried"].as_bool() != Some(true) {
+                    ran.insert(spec.clone());
+                }
+                passed.insert(
+                    spec.clone(),
+                    crate::lint_content::CarryProof {
+                        schema: crate::lint_content::SCHEMA,
+                        spec,
+                        outcome: "ok".into(),
+                        content_key: row["content_key"].as_str().map(str::to_owned),
+                        inputs_bounded: true,
+                        input_reason: None,
+                        execution_s: row["execution_s"].as_f64().unwrap(),
+                    },
+                );
+            }
+            let wall = start.elapsed().as_secs_f64();
+            println!(
+                "preflight package pair {name}: wall_s={:.3}, ran={ran:?}",
+                wall
+            );
+            assert_eq!(passed.len(), 4);
+            (passed, ran, wall)
+        };
+        let (prior, ran, _) = run(&first, None, "dry");
+        assert_eq!(ran.len(), 4);
+        r.write("b/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+        let moved = r.commit("change dependency");
+        let (prior, ran, _) = run(&moved, Some(prior), "moved");
+        assert_eq!(ran, BTreeSet::from(["a".into(), "b".into()]));
+        r.write("Cargo.toml", "[workspace]\nmembers=['a','b','c','aterm']\nresolver='2'\n[workspace.package]\nversion='1.1.0'\n");
+        let output = lockfile();
+        assert!(output.status.success());
+        let bumped = r.commit("bump product version");
+        let (_, ran, _) = run(&bumped, Some(prior), "bump");
+        assert_eq!(
+            ran,
+            BTreeSet::from(["aterm".into()]),
+            "only the version-inheriting leaf reads the product version"
+        );
+        // ABBA uses the actual old preflight path (no package context) as its negative
+        // control. The recorded walls are measurements, never latency assertions.
+        for (take, carry) in [false, true, true, false].into_iter().enumerate() {
+            let mut previous = None;
+            let mut walls = Vec::new();
+            let mut counts = Vec::new();
+            for (phase, tip) in [("dry", &first), ("real", &bumped)] {
+                r.git(&["checkout", "--detach", tip]);
+                if carry {
+                    let (passed, ran, wall) = run(tip, previous, &format!("abba-{take}-{phase}"));
+                    previous = Some(passed);
+                    walls.push(wall);
+                    counts.push(ran.len());
+                } else {
+                    let start = std::time::Instant::now();
+                    let mut output = Vec::new();
+                    let result = judge(r.0.path(), &base, tip, &[Check::Lint], None, &mut output);
+                    assert!(
+                        result.is_ok(),
+                        "{result:?}\n{}",
+                        String::from_utf8_lossy(&output)
+                    );
+                    walls.push(start.elapsed().as_secs_f64());
+                    counts.push(4);
+                }
+            }
+            println!(
+                "preflight ABBA {take} carry={carry}: dry_s={:.3} real_s={:.3} pair_s={:.3} packages={counts:?}",
+                walls[0],
+                walls[1],
+                walls.iter().sum::<f64>()
+            );
+        }
     }
 }

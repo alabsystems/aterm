@@ -1283,12 +1283,13 @@ fn a_snapshot_half_removed_by_git_is_judged_and_goes() {
     );
 }
 
-/// A SNAPSHOT GIT CANNOT READ STAYS AND SAYS WHAT A PERSON DOES: its submodule borrowed its
-/// objects from a store an `objects/info/alternates` entry names (as this Mac's snapshot
-/// borrowed from a worktree since removed), and that store is gone: `git status` fails, the
-/// snapshot stays with the submodule and the missing store named and the remedy (repair those
-/// alternates or remove it), and its cells lane with it. NEGATIVE CONTROL: while the store is
-/// there, git reads it through the alternates and the snapshot goes.
+/// A SNAPSHOT GIT CANNOT READ EVEN THROUGH THE CHECKOUT'S MODULE STORE STAYS AND NAMES THE REMEDY:
+/// its submodule holds an unpushed commit whose objects lived only in a store an
+/// `objects/info/alternates` entry names, and that store is gone: `git status` fails even with the
+/// main checkout's `.git/modules` store, so the snapshot stays with the submodule, the missing
+/// store and the remedy named, and its cells lane with it. NEGATIVE CONTROL: while the store is
+/// there, or when the snapshot's submodule is at a commit the main checkout's `.git/modules` store
+/// holds, the snapshot is proved clean (or dirty if changed) without asking a person.
 #[test]
 fn a_snapshot_git_cannot_read_stays_and_names_the_remedy() {
     let g = gate();
@@ -1325,12 +1326,43 @@ fn a_snapshot_git_cannot_read_stays_and_names_the_remedy() {
             "--untracked-files=normal",
         ],
     );
-    assert_ne!(status.code, Some(0), "git cannot read it");
+    assert_ne!(status.code, Some(0), "git cannot read it directly");
     let why = super::Unreadable::read(&status.err);
     assert_eq!(
         (why.submodule.as_deref(), why.missing_store.as_deref()),
         (Some("vendor/astream"), Some(store.as_path())),
         "{status:?}"
+    );
+
+    // While the main checkout's own `.git/modules/vendor/astream/objects` still holds the
+    // submodule's commit and tree (as when the snapshot borrowed from a removed worktree of the
+    // same checkout), `plan` proves a dirty submodule dirty and a clean one eligible read-only.
+    let dirty = sub.join("untracked.rs");
+    std::fs::write(&dirty, "// local work\n").expect("written");
+    g.written(&dirty, Duration::from_secs(30 * 24 * 3600));
+    g.written(&sub, Duration::from_secs(30 * 24 * 3600));
+    let dirty_plan = plan(&g.roots, g.now, &GitCli);
+    assert!(
+        dirty_plan[0]
+            .verdict
+            .as_ref()
+            .is_err_and(|e| e.contains("uncommitted change(s)")),
+        "dirty submodule kept: {dirty_plan:#?}"
+    );
+    std::fs::remove_file(&dirty).expect("clean again");
+    g.written(&sub, Duration::from_secs(30 * 24 * 3600));
+    let rescued = plan(&g.roots, g.now, &GitCli);
+    assert!(
+        rescued[0].goes() && rescued[1].goes(),
+        "clean snapshot rescued through checkout module store: {rescued:#?}"
+    );
+
+    // When the main checkout's module store also lacks the objects, nothing can prove the
+    // submodule clean, so the snapshot and its cells lane stay with `Unreadable`.
+    let checkout_mod_objs = g.checkout().join(".git/modules/vendor/astream/objects");
+    assert!(
+        crate::build_cache::remove::tree(&checkout_mod_objs).whole(),
+        "checkout module objects removed"
     );
     let planned = plan(&g.roots, g.now, &GitCli);
     assert_eq!(planned[0].verdict, Err(why.words()), "{planned:#?}");
@@ -1338,6 +1370,36 @@ fn a_snapshot_git_cannot_read_stays_and_names_the_remedy() {
     let done = retire(&g.roots, g.now, &GitCli);
     assert!(done[0].1.is_err() && done[1].1.is_err(), "{done:#?}");
     assert!(g.snapshot().join("Cargo.toml").is_file() && g.cells().is_dir());
+}
+
+#[test]
+fn a_snapshot_whose_submodule_borrowed_from_a_removed_worktree_retires_cleanly() {
+    let g = gate();
+    let sub = g.snapshot().join("vendor/astream");
+    let sub_git = GitCli.run(&sub, &["rev-parse", "--absolute-git-dir"]);
+    assert_eq!(sub_git.code, Some(0), "{}", sub_git.err);
+    let sub_git = PathBuf::from(sub_git.out.trim());
+    let gone = g
+        .checkout()
+        .join(".git/worktrees/removed-wt/modules/vendor/astream/objects");
+    std::fs::create_dir_all(&gone).expect("a folder");
+    assert!(crate::build_cache::remove::tree(&sub_git.join("objects")).whole());
+    std::fs::create_dir_all(sub_git.join("objects/info")).expect("a folder");
+    std::fs::write(
+        sub_git.join("objects/info/alternates"),
+        format!("{}\n", gone.display()),
+    )
+    .expect("written");
+    assert!(crate::build_cache::remove::tree(gone.parent().unwrap()).whole());
+
+    let planned = plan(&g.roots, g.now, &GitCli);
+    assert!(planned[0].goes() && planned[1].goes(), "{planned:#?}");
+    let done = retire(&g.roots, g.now, &GitCli);
+    assert!(done.iter().all(|(_, r)| r.is_ok()), "{done:#?}");
+    for p in [g.snapshot(), g.cells()] {
+        assert!(p.symlink_metadata().is_err(), "{} is gone", p.display());
+    }
+    assert!(g.checkout().join("Cargo.toml").is_file());
 }
 
 /// A SNAPSHOT WHOSE `.git` WILL NOT GO IS LEFT WHOLE: its `.git` goes first, and while that

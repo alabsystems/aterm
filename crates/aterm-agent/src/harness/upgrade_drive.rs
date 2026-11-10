@@ -6664,9 +6664,10 @@ mod record {
             project = "aterm_agent::harness::native_account_handoff::tests::transition"
         )
     )]
-    fn check_pending(previous: Option<&St>, next: &St) -> std::io::Result<()> {
+    fn check_pending(previous: Option<&St>, caller: &St, next: &St) -> std::io::Result<()> {
         if previous.is_some_and(|previous| {
             !super::super::native_account_handoff::preserves_pending(previous, next)
+                && !super::super::native_record::permits_cold_retirement(caller, previous, next)
         }) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -6880,7 +6881,7 @@ mod record {
             || on_disk
                 .as_ref()
                 .is_some_and(super::super::native_restart::coordinated);
-        check_pending(on_disk.as_ref(), &out)?;
+        check_pending(on_disk.as_ref(), st, &out)?;
         super::super::native_record::check(on_disk.as_ref(), st, &out)?;
         let restoring = matches!(kind, WriteKind::Restore | WriteKind::CheckedRestore);
         if !restoring {

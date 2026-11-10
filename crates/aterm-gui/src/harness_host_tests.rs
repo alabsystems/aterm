@@ -13,6 +13,23 @@ use aterm_agent::harness::upgrade::SessionFile;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn cold_read_excludes_concurrent_probe_and_releases_only_unspent_allowance() {
+    let used = ColdUse::default();
+    let admitted = used.begin_read().expect("first cold probe");
+    std::thread::scope(|scope| {
+        scope.spawn(|| assert!(used.begin_read().is_none()));
+    });
+    drop(admitted);
+    let retry = used
+        .begin_read()
+        .expect("pre-contact refusal spends nothing");
+    used.note_read();
+    drop(retry);
+    assert!(used.begin_read().is_none());
+    assert!(used.has_read());
+}
+
 #[path = "harness_transcript_observation_tests.rs"]
 mod transcript_observation_tests;
 
@@ -7775,6 +7792,8 @@ impl Acting {
             claim_epoch: Arc::new(|| 0),
             acts: Acts {
                 observe_snapshot: Arc::new(|_| {}),
+                scoped: Arc::new(|_| None),
+                scoped_account: Arc::new(|_, _, _| false),
                 tap_born: Arc::new(|_| None),
                 account_screen_wall: Arc::new(|_, _| None),
                 open: Arc::new(move |sid| {
@@ -11240,7 +11259,7 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
 }
 
 #[test]
-fn a_kimi_wall_stays_unmeasured_until_a_real_wall_is_seen() {
+fn a_measured_kimi_wall_advises_the_healthy_row() {
     let a = Accts::new();
     let kimi_roster = a.roster_path().with_file_name("accounts-kimi.toml");
     std::fs::rename(a.roster_path(), &kimi_roster).unwrap();
@@ -11266,7 +11285,121 @@ fn a_kimi_wall_stays_unmeasured_until_a_real_wall_is_seen() {
         })
     });
     a.wall(ACCT_TALK_A, ACCT_NOW - 10);
-    assert_eq!(kimi.account(usage_wall()), None);
+    assert!(matches!(
+        kimi.account(usage_wall()),
+        Some(AccountAdvice::Move { to, .. }) if to == "work-2"
+    ));
+}
+
+#[test]
+fn a_scoped_kimi_wall_needs_no_builtin_snapshot() {
+    let a = Accts::new();
+    let kimi_roster = a.roster_path().with_file_name("accounts-kimi.toml");
+    std::fs::rename(a.roster_path(), &kimi_roster).unwrap();
+    for label in ["work-2", "pool-a"] {
+        let credentials = format!("{}/credentials", a.login_dir(label));
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(format!("{credentials}/kimi-code.json"), "{}").unwrap();
+    }
+    let accts = a.clone();
+    let mut kimi = a.worker("s-kimi-no-snapshot", &on());
+    kimi.agent = Program::Kimi;
+    kimi.hooks.acts.account_seat = Arc::new(move || {
+        Some(AccountSeat {
+            roster: Some(kimi_roster.clone()),
+            state: accts.state_root(),
+            home: accts.tmp.path().join("home"),
+            now: accts.clock(),
+            ladder: accts.ladder(),
+        })
+    });
+    let pid = std::process::id();
+    let scoped = crate::harness_claim::Scoped {
+        proven: crate::self_claim::Proven {
+            pid,
+            start: aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap(),
+        },
+        ..crate::session_timeline::scoped_input_tests::scoped(&[
+            aterm_agent::harness::contract::Scope::Relaunch,
+        ])
+    };
+    kimi.hooks.acts.scoped = Arc::new(move |_| Some(scoped.clone()));
+    a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+    assert!(kimi.can_restart(), "the scoped harness supplies the lane");
+    assert!(
+        aterm_agent::supervise::IdleHost::can_restart(&kimi),
+        "the turn-end loop sees the scoped lane"
+    );
+    assert!(aterm_agent::supervise::IdleHost::scoped_restart(
+        &kimi,
+        &Restart::Account {
+            to: "work-2".to_string(),
+            at: AccountAt::Wall,
+        }
+    ));
+    assert_eq!(kimi.account_wall(), "scoped");
+    assert!(matches!(
+        kimi.account(usage_wall()),
+        Some(AccountAdvice::Move { to, .. }) if to == "work-2"
+    ));
+    kimi.hooks.acts.scoped_account = Arc::new(|_, _, _| true);
+    assert_eq!(
+        kimi.restart_once(&Restart::Account {
+            to: "work-2".to_string(),
+            at: AccountAt::Wall,
+        })
+        .as_deref(),
+        Some("relaunched:scoped-account")
+    );
+}
+
+#[test]
+fn a_scoped_account_move_waits_for_the_childs_login_claim() {
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle_on(4242, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let sid = handle.sid.as_str().to_string();
+    store.write().unwrap().register(handle);
+    crate::session_timeline::scoped_input_tests::install(
+        &ctx,
+        71,
+        &[aterm_agent::harness::contract::Scope::Relaunch],
+    );
+    let announced = ctx.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(25));
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[
+            aterm_agent::harness::contract::Scope::Relaunch,
+        ]);
+        scoped.claim.login = Some("work".to_string());
+        crate::session_timeline::claim_supervisor_scoped(
+            &announced,
+            "grok-alab@4242",
+            Some(71),
+            scoped,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the child's account claim");
+    });
+    assert!(scoped_account_now(
+        &store,
+        &sid,
+        "account",
+        &accounts_pool::LoginEnv {
+            label: "work".to_string(),
+            var: "KIMI_CODE_HOME",
+            value: Some("/tmp/account home".to_string()),
+        }
+    ));
+    let rows = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
+    assert_eq!(
+        rows.last().map(|row| (row.kind, row.payload.as_ref())),
+        Some((
+            crate::restart_act::RESTART_EVENT,
+            "cause=account to=work home=/tmp/account%20home"
+        ))
+    );
 }
 
 #[test]
@@ -11277,15 +11410,17 @@ fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
 /// THE OTHER POOLS READ THEIR OWN SWITCHES: Claude Code switched off (`[harness.claude] enabled
 /// = false`) leaves Kimi Code's pool on, so its turn end still proves its row, while the
 /// switches Kimi Code's pool reads stop it: `[harness] accounts = "off"` with `logins = "off"`
-/// (either alone leaves the pool's look on), and the harness switched off (Kimi Code has no
-/// `[harness.kimi]` table, so no config turns it off alone).
-/// NEGATIVE CONTROL: before, the host read Claude Code's switch for every pool, so Claude Code
-/// off stopped Grok's and Kimi's rotation bookkeeping too.
+/// (either alone leaves the pool's look on), `[harness.kimi] enabled = false`, and the harness
+/// switched off. NEGATIVE CONTROL: before, the host read Claude Code's switch for every pool, so
+/// Claude Code off stopped Grok's and Kimi's rotation bookkeeping too.
 #[test]
 fn claude_code_switched_off_leaves_the_other_pools_on() {
     let claude_off = SupervisorConfig::from_aterm_toml("[harness.claude]\nenabled = false\n").0;
     assert!(claude_off.off.contains(&Program::Claude));
     assert!(kimi_turn_end_proves(&claude_off), "Claude Code off");
+    let kimi_off = SupervisorConfig::from_aterm_toml("[harness.kimi]\nenabled = false\n").0;
+    assert!(kimi_off.off.contains(&Program::Kimi));
+    assert!(!kimi_turn_end_proves(&kimi_off), "Kimi Code off");
     let mut pool_off = on();
     pool_off.set("accounts", "off").unwrap();
     pool_off.set("logins", "off").unwrap();
@@ -13742,7 +13877,7 @@ fn a_limit_reset_is_claimed_only_at_the_process_own_wall_with_a_reset_a_grant_cl
 }
 
 #[test]
-fn a_limit_reset_qualifies_by_a_long_wall_or_a_grant_that_ends_within_a_day() {
+fn a_limit_reset_qualifies_at_twelve_hours_or_by_a_grant_that_ends_within_a_day() {
     let sid = "s-reset-qual";
     const HOUR: i64 = 3600;
     const DAY: i64 = 24 * HOUR;
@@ -13752,12 +13887,18 @@ fn a_limit_reset_qualifies_by_a_long_wall_or_a_grant_that_ends_within_a_day() {
         let idle = a.worker(sid, &resetting());
         (a, idle)
     };
-    for day in [None, Some(ACCT_NOW + 7 * DAY)] {
-        let (_a, idle) = world(25 * HOUR);
-        assert_eq!(
-            idle.reset_take(&reset_ask(day)),
-            ResetWord::Take(reset_go(25 * HOUR, true))
-        );
+    for until_in in [12 * HOUR, 12 * HOUR + 1] {
+        for day in [None, Some(ACCT_NOW + 7 * DAY)] {
+            let (a, idle) = world(until_in);
+            assert_eq!(
+                idle.reset_take(&reset_ask(day)),
+                ResetWord::Take(reset_go(until_in, true))
+            );
+            assert!(
+                a.state().reset.is_some(),
+                "actual dispatch claimed the wall"
+            );
+        }
     }
     let today = ACCT_NOW - 10 * HOUR;
     let (a, idle) = world(3 * HOUR);
@@ -13767,7 +13908,7 @@ fn a_limit_reset_qualifies_by_a_long_wall_or_a_grant_that_ends_within_a_day() {
     );
     assert!(a.state().reset.is_some());
     for day in [Some(ACCT_NOW + 7 * DAY), None] {
-        let (a, idle) = world(3 * HOUR);
+        let (a, idle) = world(12 * HOUR - 1);
         assert_eq!(
             idle.reset_claimed(&reset_ask(day), &mut None),
             Err(NoReset::NotQualifying)
@@ -13780,9 +13921,13 @@ fn a_limit_reset_qualifies_by_a_long_wall_or_a_grant_that_ends_within_a_day() {
     }
 
     let now = ACCT_NOW;
-    assert_eq!(reset_qualifies(now + DAY + 1, None, now), Some(true));
-    assert_eq!(reset_qualifies(now + DAY, None, now), None, "a day exactly");
-    assert_eq!(reset_qualifies(now + DAY, Some(today), now), Some(false));
+    assert_eq!(reset_qualifies(now + 12 * HOUR - 1, None, now), None);
+    assert_eq!(reset_qualifies(now + 12 * HOUR, None, now), Some(true));
+    assert_eq!(reset_qualifies(now + 12 * HOUR + 1, None, now), Some(true));
+    assert_eq!(
+        reset_qualifies(now + 12 * HOUR - 1, Some(today), now),
+        Some(false)
+    );
     for (day_start, near) in [
         (now + DAY - 1, true),
         (now + DAY, false),
@@ -48220,4 +48365,102 @@ fn a_seats_store_judges_a_lapsed_default_login_where_it_is_a_file() {
         !keychain,
         "the keychain platform reads nothing for the default login"
     );
+}
+
+/// WITNESS RENEWAL ON THE HOST'S TIMER (2026-11-06, m14): the host renewed a supervised agent's
+/// passive crash witness only when its snapshot landed or moved, so an idle agent's lapsed after
+/// half an hour and its exit could never be relaunched. On a simulated clock across 40 minutes
+/// with no snapshot moving, the host renews each supervised Claude Code agent's witness at its
+/// first pass and then every [`WITNESS_RENEW`] (well inside its lifetime), never more than one
+/// renewal out at a time, and never for another lane's agent or one with no published snapshot.
+#[test]
+fn the_host_renews_each_idle_supervised_claude_agents_crash_witness_on_its_own_timer() {
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, parking_body(&world));
+    let (tx, rx) = std::sync::mpsc::channel::<(String, u32)>();
+    let tx = Mutex::new(tx);
+    hooks.acts.observe_snapshot = Arc::new(move |snap: &Snapshot| {
+        tx.lock()
+            .unwrap()
+            .send((snap.tab.clone(), snap.pid))
+            .unwrap();
+    });
+    let (claude, codex, unpublished) = (
+        "s-witness-renewed-claude",
+        "s-witness-renewed-codex",
+        "s-witness-renewed-unpublished",
+    );
+    crate::harness_host::publish_snapshot_for_test(claude, Some(&snap(claude)));
+    crate::harness_host::publish_snapshot_for_test(codex, Some(&snap(codex)));
+    let mut workers = Workers(HashMap::new());
+    for (sid, agent) in [
+        (claude, Program::Claude),
+        (codex, Program::Codex),
+        (unpublished, Program::Claude),
+    ] {
+        workers.0.insert(
+            sid.to_string(),
+            Worker {
+                agent,
+                ..idle_worker()
+            },
+        );
+    }
+    let mut witnesses = HashMap::new();
+    let start = Instant::now();
+    let mut renewed_at = Vec::new();
+    for minute in 0..=40u64 {
+        let now = start + Duration::from_secs(minute * 60);
+        let next = renew_crash_witnesses(&mut witnesses, &workers, now, &hooks)
+            .expect("a supervised Claude Code agent always has its next renewal");
+        assert!(next > now && next <= now + WITNESS_RENEW, "minute {minute}");
+        // A renewal's thread is marked out before it starts and sends before it is over.
+        let out = witnesses[claude].out.load(Ordering::SeqCst);
+        let ran = if out {
+            Some(
+                rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the renewal marked out runs"),
+            )
+        } else {
+            rx.try_recv().ok()
+        };
+        if let Some((sid, pid)) = ran {
+            assert_eq!((sid.as_str(), pid), (claude, 4242), "minute {minute}");
+            renewed_at.push(minute);
+            until("the renewal is over", || {
+                !witnesses[claude].out.load(Ordering::SeqCst)
+            });
+        }
+    }
+    assert_eq!(renewed_at, vec![0, 5, 10, 15, 20, 25, 30, 35, 40]);
+    assert!(
+        renewed_at.windows(2).all(|w| {
+            Duration::from_secs((w[1] - w[0]) * 60).as_micros()
+                < u128::from(crate::native_observe::LIFETIME_US)
+        }),
+        "every renewal comes inside the witness's lifetime"
+    );
+    assert!(
+        !witnesses.contains_key(codex),
+        "another lane plans no witnessed relaunch"
+    );
+    // One renewal out at a time: a renewal still out at its due time is not doubled.
+    witnesses
+        .get(claude)
+        .unwrap()
+        .out
+        .store(true, Ordering::SeqCst);
+    let late = start + Duration::from_secs(45 * 60);
+    renew_crash_witnesses(&mut witnesses, &workers, late, &hooks);
+    assert!(rx.try_recv().is_err(), "no second renewal while one is out");
+    // Its worker gone, the agent's renewal goes with it.
+    workers.0.remove(claude);
+    workers.0.remove(unpublished);
+    assert_eq!(
+        renew_crash_witnesses(&mut witnesses, &workers, late, &hooks),
+        None
+    );
+    assert!(witnesses.is_empty());
+    crate::harness_host::publish_snapshot_for_test(claude, None);
+    crate::harness_host::publish_snapshot_for_test(codex, None);
 }

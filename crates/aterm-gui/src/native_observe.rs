@@ -19,7 +19,8 @@ use crate::session_timeline::{SupervisorAuthority, SupervisorInputCaller};
 
 const MAX_RECORDS: usize = 2;
 const MAX_HISTORY: usize = 128;
-const LIFETIME_US: u64 = 30 * 60 * 1_000_000;
+/// How long a passive witness is kept from its last refresh ([`crate::harness_host::WITNESS_RENEW`]).
+pub(crate) const LIFETIME_US: u64 = 30 * 60 * 1_000_000;
 
 /// Host-side observations, never request words accepted as facts. In particular conversation
 /// is the host-verified immutable record/conversation key; a caller string alone is not proof.

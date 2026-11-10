@@ -4456,12 +4456,12 @@ fn a_rostered_harness_claims_its_scope_through_meta_proven_or_refused_whole() {
     ));
     assert_eq!(
         serve(
-            "set supervisor kimi-alab@4242 contract=3 scope=relaunch",
+            "set supervisor other-alab@4242 contract=3 scope=relaunch",
             true
         ),
         "OK\n"
     );
-    assert_eq!(shown(ctx), (Some("kimi-alab@4242".to_string()), false));
+    assert_eq!(shown(ctx), (Some("other-alab@4242".to_string()), false));
     assert_eq!(
         scoped_now(),
         (None, false),

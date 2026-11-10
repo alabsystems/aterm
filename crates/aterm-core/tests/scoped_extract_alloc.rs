@@ -12,12 +12,23 @@ thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
     static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+    static RETAINED_DELTA: Cell<i128> = const { Cell::new(0) };
 }
 
 struct Counting;
 
 // SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
 unsafe impl Observer for Counting {
+    fn retained(&self, old: usize, new: usize) {
+        let _ = ACTIVE.try_with(|active| {
+            if active.get() {
+                let _ = RETAINED_DELTA.try_with(|n| {
+                    n.set(n.get().wrapping_add(new as i128).wrapping_sub(old as i128));
+                });
+            }
+        });
+    }
+
     fn requested(&self, size: usize) {
         let _ = ACTIVE.try_with(|active| {
             if active.get() {
@@ -34,6 +45,7 @@ static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     ALLOC_CALLS.with(|n| n.set(0));
     ALLOC_BYTES.with(|n| n.set(0));
+    RETAINED_DELTA.with(|n| n.set(0));
     ACTIVE.with(|a| a.set(true));
     let r = f();
     ACTIVE.with(|a| a.set(false));
@@ -555,5 +567,385 @@ fn styled_ansi_grows_only_its_output_and_appends_without_temporary_allocations()
         terminal.process(b"\r\nQ");
         restored.process(b"\r\nQ");
         assert_same_styled_cells(&terminal, &restored, 2, cols);
+    }
+}
+
+/// Local component measurement; opt-test timings are not pointer-to-glass latency.
+#[test]
+#[ignore = "manual BiDi pointer mapping allocation and CPU measurement"]
+fn bidi_pointer_mapping_cost() {
+    use aterm_core::terminal::Terminal;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for (name, text) in [
+        ("latin", "plain ASCII row"),
+        ("mixed", "abc אב 12 ג def"),
+        ("wide", "中 אב (12) 🦀 xyz"),
+        ("arabic", "abc مرحبا 123 xyz"),
+    ] {
+        let mut term = Terminal::new(4, 80);
+        term.process(text.as_bytes());
+        let (_, calls) = allocs_in(|| black_box(term.viewport_cell_logical(0, 5)));
+        for sample in 0..5 {
+            let before = instructions();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "manual benchmark wall-clock boundary"
+            )]
+            let start = Instant::now();
+            for i in 0..20_000u16 {
+                black_box(term.viewport_cell_logical(0, black_box(i % 80)));
+            }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "manual benchmark wall-clock boundary"
+            )]
+            let elapsed = start.elapsed();
+            let instructions = before
+                .zip(instructions())
+                .map(|(before, after)| after.saturating_sub(before));
+            println!(
+                "bidi-pointer case={name} sample={sample} calls={calls} iterations=20000 instructions={instructions:?} ms={:.6}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+#[test]
+fn bidi_pointer_mapping_does_not_allocate_two_resolvers() {
+    use aterm_core::terminal::Terminal;
+
+    for text in ["abc אב 12 ג def", "中 אב (12) 🦀 xyz", "abc مرحبا 123 xyz"] {
+        let mut term = Terminal::new(4, 80);
+        term.process(text.as_bytes());
+        let (_, calls) = allocs_in(|| term.viewport_cell_logical(0, 5));
+        // One resolution needs at most 33 calls here; the duplicate-resolution
+        // implementation needs at least 47. Leave room for allocator growth changes.
+        assert!(calls < 40, "{text:?}: {calls} allocations");
+    }
+}
+
+fn check_bidi_map_allocations(enforce: bool) {
+    use aterm_bidi::{
+        BaseDirection, Scratch, bidi_class, bracket_of, reorder_cells_with_classes_into,
+    };
+
+    for n in [0, 1, 4, 5, 80, 257] {
+        for paired in [false, true] {
+            let chars: Vec<_> = (0..n)
+                .map(|i| ['א', 'ב', ' ', '(', '1', '2', ')', '中'][i % 8])
+                .collect();
+            let classes: Vec<_> = chars.iter().copied().map(bidi_class).collect();
+            let brackets: Vec<_> = chars.iter().copied().map(bracket_of).collect();
+            let wide: Vec<_> = (0..n).map(|i| paired && i % 2 == 1).collect();
+            let mut scratch = Scratch::default();
+            let mut expected = Vec::new();
+            reorder_cells_with_classes_into(
+                &classes,
+                &brackets,
+                &wide,
+                BaseDirection::Auto,
+                &mut scratch,
+                &mut expected,
+            );
+            let (mut out, cold) = allocs_in(|| {
+                let mut out = Vec::new();
+                reorder_cells_with_classes_into(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                    &mut scratch,
+                    &mut out,
+                );
+                out
+            });
+            let bytes = ALLOC_BYTES.with(Cell::get);
+            assert_eq!(out, expected);
+            let (_, warm) = allocs_in(|| {
+                reorder_cells_with_classes_into(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                    &mut scratch,
+                    &mut out,
+                )
+            });
+            assert_eq!(out, expected);
+            let mut seen = out.clone();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..n).collect::<Vec<_>>(),
+                "every input cell survives once"
+            );
+            println!(
+                "bidi-map cells={n} paired={paired} cold={cold} warm={warm} requested_bytes={bytes} capacity={}",
+                out.capacity()
+            );
+            if enforce {
+                assert!(
+                    cold <= 1,
+                    "cells={n} paired={paired}: output map grew {cold} times"
+                );
+                assert_eq!(warm, 0, "reused output and scratch");
+            }
+        }
+    }
+}
+
+#[test]
+fn bidi_map_allocates_once_for_a_known_cell_count() {
+    check_bidi_map_allocations(true);
+}
+
+#[test]
+#[ignore = "manual cold and warm BiDi output allocation measurement"]
+fn bidi_map_allocation_measurement() {
+    check_bidi_map_allocations(false);
+}
+
+#[test]
+#[ignore = "manual BiDi output capacity measurement across changing row widths"]
+fn bidi_map_resize_measurement() {
+    use aterm_bidi::{BaseDirection, BidiClass, Bracket, Scratch, reorder_cells_with_classes_into};
+
+    let classes = vec![BidiClass::R; 257];
+    let brackets = vec![Bracket::None; 257];
+    let wide = vec![false; 257];
+    let mut scratch = Scratch::default();
+    let mut initial = Vec::new();
+    reorder_cells_with_classes_into(
+        &classes,
+        &brackets,
+        &wide,
+        BaseDirection::Auto,
+        &mut scratch,
+        &mut initial,
+    );
+    let mut out = Vec::new();
+    for n in [80, 100, 80, 257, 80] {
+        let (_, calls) = allocs_in(|| {
+            reorder_cells_with_classes_into(
+                &classes[..n],
+                &brackets[..n],
+                &wide[..n],
+                BaseDirection::Auto,
+                &mut scratch,
+                &mut out,
+            )
+        });
+        let bytes = ALLOC_BYTES.with(Cell::get);
+        assert_eq!(out.len(), n);
+        assert!(out.capacity() >= n);
+        println!(
+            "bidi-map-resize cells={n} calls={calls} requested_bytes={bytes} capacity={}",
+            out.capacity()
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual BiDi scratch allocations, retained layouts and optimized instruction measurement"]
+fn bidi_scratch_cost() {
+    use aterm_bidi::{
+        BaseDirection, Scratch, bidi_class, bracket_of, reorder_cells_with_classes_into,
+    };
+    use std::hint::black_box;
+
+    for n in [80, 257] {
+        for paired in [false, true] {
+            let chars: Vec<_> = (0..n)
+                .map(|i| ['א', 'ב', ' ', '(', '1', '2', ')', 'ג'][i % 8])
+                .collect();
+            let classes: Vec<_> = chars.iter().copied().map(bidi_class).collect();
+            let brackets: Vec<_> = chars.iter().copied().map(bracket_of).collect();
+            let wide: Vec<_> = (0..n).map(|i| paired && i % 2 == 1).collect();
+            let ((mut scratch, mut out), cold) = allocs_in(|| {
+                let mut scratch = Scratch::default();
+                let mut out = Vec::new();
+                reorder_cells_with_classes_into(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                    &mut scratch,
+                    &mut out,
+                );
+                (scratch, out)
+            });
+            let bytes = ALLOC_BYTES.with(Cell::get);
+            let retained = RETAINED_DELTA.with(Cell::get);
+            assert!(retained >= 0);
+            assert_eq!(out.len(), n);
+            for _ in 0..100 {
+                reorder_cells_with_classes_into(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                    &mut scratch,
+                    &mut out,
+                );
+                for &cell in &out {
+                    black_box(scratch.cell_is_rtl(black_box(cell)));
+                }
+            }
+            let (_, warm) = allocs_in(|| {
+                reorder_cells_with_classes_into(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                    &mut scratch,
+                    &mut out,
+                )
+            });
+            for sample in 0..5 {
+                let before = instructions();
+                for _ in 0..1000 {
+                    reorder_cells_with_classes_into(
+                        black_box(&classes),
+                        black_box(&brackets),
+                        black_box(&wide),
+                        BaseDirection::Auto,
+                        &mut scratch,
+                        &mut out,
+                    );
+                    for &cell in &out {
+                        black_box(scratch.cell_is_rtl(black_box(cell)));
+                    }
+                }
+                let instructions = before
+                    .zip(instructions())
+                    .map(|(before, after)| after.saturating_sub(before));
+                println!(
+                    "bidi-scratch cells={n} paired={paired} sample={sample} iterations=1000 cold={cold} warm={warm} requested_bytes={bytes} retained_layout_bytes={retained} instructions={instructions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn single_cell_bidi_rows_avoid_redundant_scratch_storage() {
+    use aterm_bidi::{
+        BaseDirection, Scratch, bidi_class, bracket_of, reorder_cells_with_classes_into,
+    };
+
+    let chars: Vec<_> = (0..80)
+        .map(|i| ['א', 'ב', ' ', '(', '1', '2', ')', 'ג'][i % 8])
+        .collect();
+    let classes: Vec<_> = chars.iter().copied().map(bidi_class).collect();
+    let brackets: Vec<_> = chars.iter().copied().map(bracket_of).collect();
+    let ((scratch, out), calls) = allocs_in(|| {
+        let mut scratch = Scratch::default();
+        let mut out = Vec::new();
+        reorder_cells_with_classes_into(
+            &classes,
+            &brackets,
+            &[],
+            BaseDirection::Auto,
+            &mut scratch,
+            &mut out,
+        );
+        (scratch, out)
+    });
+    let retained = RETAINED_DELTA.with(Cell::get);
+    println!("bidi-scratch-budget cold={calls} retained_layout_bytes={retained}");
+    // The folded baseline uses 40 requests and 6,444 live layout bytes. The
+    // direct path uses 17 and 3,500; leave space without admitting the old path.
+    assert!(calls <= 20, "redundant cold scratch allocations: {calls}");
+    assert!(
+        (0..=4000).contains(&retained),
+        "redundant retained scratch: {retained}"
+    );
+    assert_eq!(out.len(), 80);
+    assert!(out.iter().any(|&cell| scratch.cell_is_rtl(cell)));
+}
+
+#[test]
+#[ignore = "manual retained BiDi scratch layouts across width and glyph-shape changes"]
+fn bidi_scratch_transition_layouts() {
+    use aterm_bidi::{
+        BaseDirection, Scratch, bidi_class, bracket_of, reorder_cells_with_classes_into,
+    };
+
+    let mut scratch = Scratch::default();
+    let mut out = Vec::new();
+    let mut live = 0i128;
+    for (n, paired) in [(80, false), (258, true), (300, true), (80, false)] {
+        let chars: Vec<_> = (0..n)
+            .map(|i| ['א', 'ב', ' ', '(', '1', '2', ')', 'ג'][i % 8])
+            .collect();
+        let classes: Vec<_> = chars.iter().copied().map(bidi_class).collect();
+        let brackets: Vec<_> = chars.iter().copied().map(bracket_of).collect();
+        let wide: Vec<_> = (0..n).map(|i| paired && i % 2 == 1).collect();
+        let (_, calls) = allocs_in(|| {
+            reorder_cells_with_classes_into(
+                &classes,
+                &brackets,
+                &wide,
+                BaseDirection::Auto,
+                &mut scratch,
+                &mut out,
+            )
+        });
+        live += RETAINED_DELTA.with(Cell::get);
+        assert!(live >= 0);
+        assert_eq!(out.len(), n);
+        println!(
+            "bidi-scratch-transition cells={n} paired={paired} calls={calls} retained_layout_bytes={live}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual map-only BiDi entry point instruction and allocation comparison"]
+fn bidi_map_only_cost() {
+    use aterm_bidi::{BaseDirection, bidi_class, bracket_of, reorder_cells_with_classes};
+    use std::hint::black_box;
+
+    for n in [80, 257] {
+        for paired in [false, true] {
+            let chars: Vec<_> = (0..n)
+                .map(|i| ['א', 'ב', ' ', '(', '1', '2', ')', 'ג'][i % 8])
+                .collect();
+            let classes: Vec<_> = chars.iter().copied().map(bidi_class).collect();
+            let brackets: Vec<_> = chars.iter().copied().map(bracket_of).collect();
+            let wide: Vec<_> = (0..n).map(|i| paired && i % 2 == 1).collect();
+            let (out, cold) = allocs_in(|| {
+                reorder_cells_with_classes(&classes, &brackets, &wide, BaseDirection::Auto)
+            });
+            assert_eq!(out.len(), n);
+            for _ in 0..100 {
+                black_box(reorder_cells_with_classes(
+                    &classes,
+                    &brackets,
+                    &wide,
+                    BaseDirection::Auto,
+                ));
+            }
+            for sample in 0..5 {
+                let before = instructions();
+                for _ in 0..1000 {
+                    black_box(reorder_cells_with_classes(
+                        black_box(&classes),
+                        black_box(&brackets),
+                        black_box(&wide),
+                        BaseDirection::Auto,
+                    ));
+                }
+                let instructions = before
+                    .zip(instructions())
+                    .map(|(before, after)| after.saturating_sub(before));
+                println!(
+                    "bidi-map-only cells={n} paired={paired} sample={sample} iterations=1000 cold={cold} instructions={instructions:?}"
+                );
+            }
+        }
     }
 }

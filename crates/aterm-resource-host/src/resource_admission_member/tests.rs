@@ -37,6 +37,7 @@ struct Fixture {
     defer_bind: bool,
     defer_retire: bool,
     defer_return: bool,
+    pending_return: bool,
     cancelled: usize,
     retired: usize,
     before_arm_error: bool,
@@ -78,6 +79,7 @@ impl Fixture {
             defer_bind: false,
             defer_retire: false,
             defer_return: false,
+            pending_return: false,
             cancelled: 0,
             retired: 0,
             before_arm_error: false,
@@ -124,16 +126,17 @@ impl MemberCustody for Fixture {
     fn return_producer(
         &mut self,
         retirement: Box<ProducerRetirement>,
-    ) -> Result<Box<ReturnedProducer>, (io::Error, Box<ProducerRetirement>)> {
+    ) -> Result<ProducerReturn, (io::Error, Box<ProducerRetirement>)> {
         let returned = (|| {
             self.validate()?;
             retirement.check_fixture(&mut self.root, &binding())?;
             self.return_unit(ReturnReceipt::ScopeClosed)
         })();
         match returned {
-            Ok(()) => {
+            Ok(ReturnProgress::Pending) => Ok(ProducerReturn::Pending(retirement)),
+            Ok(ReturnProgress::Returned) => {
                 self.producer_returns += 1;
-                Ok(retirement.returned_fixture())
+                Ok(ProducerReturn::Returned(retirement.returned_fixture()))
             }
             Err(error) => Err((error, retirement)),
         }
@@ -184,11 +187,18 @@ impl MemberCustody for Fixture {
         self.retired += 1;
         Ok(())
     }
-    fn return_unit(&mut self, _: ReturnReceipt) -> io::Result<()> {
+    fn return_unit(&mut self, _: ReturnReceipt) -> io::Result<ReturnProgress> {
         if self.defer_return {
-            Err(io::Error::other("lost durable return acknowledgment"))
+            // A genuine refusal may use the same OS kind as a socket wait.
+            // Only the typed Pending variant is asynchronous progress.
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "lost durable return acknowledgment",
+            ))
+        } else if self.pending_return {
+            Ok(ReturnProgress::Pending)
         } else {
-            Ok(())
+            Ok(ReturnProgress::Returned)
         }
     }
     fn validate(&mut self) -> io::Result<()> {
@@ -908,7 +918,16 @@ fn native_producer_return_control(lose_owner: bool) {
     );
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     fixture.defer_retire = false;
+    // Isolate the return boundary from the earlier injected retirement error.
+    // This changes diagnostic flags only; the actual native closure and original
+    // retirement capability below still come from the retained fixture custody.
+    member.failure = None;
+    member.uncertain = false;
     member.poll(&mut fixture, None);
+    assert!(
+        member.uncertain && member.failure.is_some(),
+        "a genuine WouldBlock refusal is not Pending"
+    );
     let retirement = member
         .producer_retirement
         .as_ref()
@@ -958,6 +977,24 @@ fn native_producer_return_control(lose_owner: bool) {
         return;
     }
     fixture.defer_return = false;
+    fixture.pending_return = true;
+    let original = member.producer_retirement.as_deref().unwrap() as *const _;
+    let failure = member.failure.clone();
+    let uncertain = member.uncertain;
+    let progress = member.poll(&mut fixture, None);
+    assert!(!progress.retired && !progress.drained);
+    assert_eq!(
+        member.failure, failure,
+        "typed pending does not invent a fault"
+    );
+    assert_eq!(member.uncertain, uncertain);
+    assert!(std::ptr::eq(
+        member.producer_retirement.as_deref().unwrap(),
+        original
+    ));
+    assert_eq!(fixture.producer_returns, 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    fixture.pending_return = false;
     loop {
         if member.poll(&mut fixture, None).drained {
             break;

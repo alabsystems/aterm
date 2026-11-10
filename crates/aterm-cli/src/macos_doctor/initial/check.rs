@@ -144,6 +144,7 @@ impl InitialCheckHost for LiveCheck {
             &LiveInitial::live().context()?,
             Stage::Secrets.selected(plan).then_some(plan),
             aterm_machines::model::Mode::Plan,
+            None,
         )
     }
 }

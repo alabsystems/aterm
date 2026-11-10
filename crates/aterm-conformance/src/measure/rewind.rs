@@ -220,6 +220,7 @@ pub fn steps_standing(sched: &SchedReading, max_p99_us: u64) -> Starvation {
 /// [`CouldNotRun`] when the instance did not start, a request failed, the output was not one chain, or a step's fold was never shown; [`CouldNotRun::Unanswered`] when the subject lacks a verb or a field the row reads.
 pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> {
     let _one = super::take(!matches!(row.scene, RewindScene::Idle { .. }));
+    let mut phases = super::instance::Phases::new(format!("row=rewind scene={:?}", row.scene));
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("atrewind")
         .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
@@ -231,6 +232,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     super::write_fresh(world.home.join("chain.txt"), chain_text(row.chain_bytes))
         .map_err(|e| CouldNotRun::Refused(format!("cannot write the chain file: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
+    phases.end("launch");
     let ctl = &inst.ctl;
     ctl.ok(&["await", "idle", "500", "timeout=60000"])?;
     ctl.ok(&["send", "cat chain.txt"])?;
@@ -250,7 +252,9 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         .ok_or_else(|| {
             CouldNotRun::Unanswered(format!("rewind open named no state=<n>/<N> ({open})"))
         })?;
+    phases.end("stage");
     std::thread::sleep(SETTLE);
+    phases.end("settle");
     ctl.ok(&["metrics", "reset"])?;
     let mut report = RewindReport {
         row: *row,
@@ -268,6 +272,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         disposition: Disposition::Fail,
         checks: String::new(),
     };
+    phases.end("open");
     match row.scene {
         RewindScene::Steps { steps, max_p99_us } => {
             // A subject that books no step-to-shown sample (0.138.0 predates it) has no answer to
@@ -321,10 +326,14 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
             }
         }
     }
+    phases.end("samples");
     let _ = ctl.ok(&["rewind", "close"]);
     report.checks = super::instance::replay_checks(ctl);
     report.verdict = judge(row, &report);
     report.disposition = dispose(row, &report);
+    phases.end("fences");
+    drop(inst);
+    phases.end("stop");
     Ok(report)
 }
 

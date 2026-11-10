@@ -249,6 +249,7 @@ fn an_interrupted_run_writes_its_log_before_it_dies() {
     use std::os::unix::process::ExitStatusExt as _;
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-int-report-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let record = standin_disk(dir.path()).record;
@@ -301,6 +302,7 @@ fn an_interrupted_run_that_never_ends_dies_at_the_watchdogs_grace() {
     use std::os::unix::process::ExitStatusExt as _;
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-int-watchdog-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let (status, took, _) = interrupted(dir.path(), true);

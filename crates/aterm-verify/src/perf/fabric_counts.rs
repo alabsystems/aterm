@@ -600,6 +600,7 @@ fn measure() -> Result<Vec<Count>, Halt> {
 fn run_world(targo: &Targo<'_>, args: &fabric::Args, built: &Built) -> Result<Value, Halt> {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-fabric-counts-")
+        .suffix(".noindex")
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let arm = args.plan()[0];
@@ -711,6 +712,7 @@ mod tests {
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()
             .prefix("fabric-counts-")
+            .suffix(".noindex")
             .tempdir()
             .expect("a scratch directory")
     }

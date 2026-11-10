@@ -3211,10 +3211,11 @@ impl Pool {
     /// The report's `at a weekly limit:` of a session on `label`, against what moves one: for Codex
     /// the handoff a codex-alab proves, end to end (`codex_rotation::prepare`, the provider's reads
     /// answered, then `with_prepared_writer`'s verdict), for another CLI the plan a window's
-    /// supervisor asks at a wall (`accounts_pool::session_plan`). The same row, or no move in both.
+    /// supervisor asks at a wall (`accounts_pool::session_plan`, `session_login_plan` for Kimi).
+    /// The same row, or no move in both.
     /// A row with no login here runs no session, so the report has no line of it.
     fn law_wall(&self, host: &LawHost, label: &str) -> Vec<String> {
-        use crate::harness::accounts_pool::{Session, session_plan};
+        use crate::harness::accounts_pool::{Session, session_login_plan, session_plan};
         let (cli, now) = (self.cli, self.env.now);
         let path = self.env.accounts_roster_for(cli).expect("a roster");
         let store = self.env.accounts_store_for(cli).expect("a store");
@@ -3273,6 +3274,17 @@ impl Pool {
                 label,
                 &session(accounts::Supervisor::Own, "seven_day", Some(now)),
             )
+        } else if cli == Cli::Kimi {
+            let plan = session_login_plan(
+                &self.seat(),
+                &session(accounts::Supervisor::Aterm, "five_hour", None),
+                |_| {},
+            );
+            let moves = match plan.advice() {
+                accounts::Advice::Move { to, .. } if to != label => Some(to.clone()),
+                _ => None,
+            };
+            (moves, format!("{:?}", plan.advice()))
         } else {
             let plan = session_plan(
                 &self.seat(),
@@ -4558,7 +4570,15 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
         }
         let pool = Pool::of(cli, "wall-moves-unmeasured");
         let (_, doc) = pool.report(None);
-        assert!(moves(&doc).is_empty(), "{}: CONTROL: {doc}", cli.id());
+        let expected = if cli == Cli::Kimi {
+            vec![
+                ("main".to_string(), "work".to_string()),
+                ("work".to_string(), "main".to_string()),
+            ]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(moves(&doc), expected, "{}: CONTROL: {doc}", cli.id());
     }
 }
 
@@ -4867,7 +4887,7 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
             false,
         ),
         ("Grok Build", Cli::Grok, LawBuild::Grok, |_| {}, false),
-        ("Kimi Code CLI", Cli::Kimi, LawBuild::Kimi, |_| {}, false),
+        ("Kimi Code CLI", Cli::Kimi, LawBuild::Kimi, |_| {}, true),
     ];
     for (world, cli, build, set, moves) in worlds {
         if !links_here(cli) {

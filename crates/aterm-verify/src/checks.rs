@@ -872,6 +872,7 @@ mod tests {
                 &|| Some(Vec::new()),
                 &dependents,
                 &|_| Replan::Nothing,
+                &|_, _| false,
             );
             assert!(
                 matches!(sel, Selection::Narrowed { .. }),

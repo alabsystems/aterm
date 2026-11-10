@@ -10,6 +10,9 @@ use aterm_types::land_trailer::KEYS;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+#[path = "land_rejudge_tests.rs"]
+mod rejudge;
+
 #[test]
 fn a_closed_foreign_intent_refreshes_main_before_any_new_attempt() {
     use std::cell::Cell;
@@ -1239,7 +1242,7 @@ fn a_large_git_path_listing_keeps_shared_paths() {
 /// files and the merge clean, so the pass is composed onto it without a run: one judgment, the
 /// landing's parents the judged commit and the new main, `Aterm-Composed-Onto` naming it.
 /// NEGATIVE CONTROL: main moved touching a file the branch changed (the merge still clean), so
-/// it is merged and only its delta judged again, since the judged commit, and nothing is composed.
+/// it is merged and the branch's delta from the moved main judged again, and nothing is composed.
 #[test]
 fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged() {
     let world = world();
@@ -1293,12 +1296,12 @@ fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged()
     let receipt = stated(&control, &landing).expect("stated");
     assert_eq!(receipt.checked.len(), 2);
     assert_eq!(receipt.composed_onto, None);
-    let first_judged = git(&control.work, &["rev-parse", &format!("{landing}^1")]);
+    let moved_main = git(&control.work, &["rev-parse", &format!("{landing}^2")]);
     assert_eq!(
-        bases[1], first_judged,
-        "the re-judge's cone is the delta since the judged commit"
+        bases[1], moved_main,
+        "the re-judge's cone is the branch's delta from the moved main"
     );
-    assert_eq!(receipt.checked[1].base, first_judged);
+    assert_eq!(receipt.checked[1].base, moved_main);
     assert_eq!(
         git(&control.work, &["show", &format!("{landing}:shared.txt")]),
         "one\n2\n3\n4\n5\n6\n7\neight"
@@ -1610,6 +1613,22 @@ fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged()
             composed.then_some(moved.as_str()),
             "{change}"
         );
+        if composed {
+            let parents = git(&world.work, &["show", "-s", "--format=%P", &landing]);
+            let checked = parents.split_whitespace().next().unwrap();
+            let tree = git(&world.work, &["rev-parse", &format!("{landing}^{{tree}}")]);
+            assert!(
+                receipt_composition(
+                    &world.work,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                    checked,
+                    &moved,
+                    &tree,
+                )
+                .unwrap(),
+                "{change}"
+            );
+        }
         let lock = git(&world.work, &["show", &format!("{landing}:Cargo.lock")]);
         assert!(lock.contains(
             if matches!(

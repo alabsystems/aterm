@@ -21,6 +21,8 @@ const ROLE: &str = "ATERM_WORKLOAD_NATIVE_TEST_ROLE";
 const STORE: &str = "ATERM_WORKLOAD_NATIVE_TEST_STORE";
 const CASE: &str = "ATERM_WORKLOAD_NATIVE_TEST_CASE";
 const LOCK_CHECKPOINT: [u8; 32] = [38; 32];
+#[path = "workload_native/linker.rs"]
+mod linker;
 fn descriptor_population() -> (libc::rlim_t, usize) {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -51,6 +53,7 @@ static ROOT_MARKER: Marker = Marker(wire::WORKLOAD_PROTOCOL_MARKER);
 #[unsafe(link_section = "__TEXT,__trust_member")]
 static MEMBER_MARKER: Marker = Marker(wire::WORKLOAD_MEMBER_PROTOCOL_MARKER);
 extern "C" fn entry() {
+    linker::early_entry();
     #[cfg(target_arch = "aarch64")]
     if matches!(std::env::args_os().skip(1).collect::<Vec<_>>().as_slice(),[arg] if arg=="--list" || arg=="--test-threads=1")
         && std::env::args_os().next().is_some_and(|arg| {
@@ -111,6 +114,12 @@ fn actual_original_workload_root_and_phases_keep_all_resources_until_retirement(
     }
 }
 #[test]
+#[ignore = "requires explicitly selected independently qualified native LLD artifact"]
+fn actual_registered_compiler_direct_lld_retirement() {
+    run_case("real-lld");
+    run_case("real-lld-eof");
+}
+#[test]
 #[cfg(target_arch = "aarch64")]
 fn actual_complete_contained_population_retains_owners_with_original_fd_limit() {
     run_case("contained-full-population");
@@ -132,7 +141,7 @@ fn run_case(case: &str) {
         .env(CASE, case);
     let output = match deadline::output_within(
         &mut command,
-        attempt_budget(case == "contained-full-population"),
+        attempt_budget(case == "contained-full-population" || linker::selected(case)),
     ) {
         Ok(output) => output,
         Err(error) => panic!(
@@ -150,7 +159,7 @@ fn run_case(case: &str) {
     );
     for line in String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.starts_with("contained "))
+        .filter(|line| line.starts_with("contained ") || line.starts_with("real-lld "))
     {
         println!("{line}");
     }
@@ -177,14 +186,14 @@ fn host_process() {
         };
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     }
-    let budget = attempt_budget(case == "contained-full-population");
+    let budget = attempt_budget(case == "contained-full-population" || linker::selected(&case));
     let store = ImageStore::open_at(&path).unwrap();
     let program = store.cache_current().unwrap();
     let socket = path.join("workload.sock");
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
-    crate::runtime::test_endpoint_with_store(&path).unwrap();
+    crate::runtime::test_endpoint_with_native_store(&path).unwrap();
     // Selected native inputs require private, non-writable ancestors. Keep
     // only the Unix socket name in the short temporary namespace; the owned
     // SDK/output/CPU fixture is independent account-cache data, never install.
@@ -192,7 +201,10 @@ fn host_process() {
         .unwrap()
         .join(".cache/aterm/workload-owner-fixtures.noindex");
     fs::create_dir_all(&parent).unwrap();
-    let scratch = Scratch::at(&parent);
+    let mut scratch = Scratch::at(&parent);
+    // Keep genuine payload images and output evidence, including a silent
+    // successful LLD. Never unlink its copied Mach-O during OS assessment.
+    scratch.preserve = linker::selected(&case);
     let (mut owner, namespace, retirement) = World::prepare(&scratch);
     let artifacts = scratch.path.join("managed-sdk");
     let layout = atpkg::store::Layout {
@@ -206,7 +218,11 @@ fn host_process() {
     let compiler = build.join("bin/trustc");
     fs::copy(program.path(), &service).unwrap();
     fs::copy(program.path(), &compiler).unwrap();
-    fs::copy(program.path(), build.join("bin/rust-lld")).unwrap();
+    if linker::selected(&case) {
+        linker::install(&build);
+    } else {
+        fs::copy(program.path(), build.join("bin/rust-lld")).unwrap();
+    }
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
     let source = scratch.path.join("source");
@@ -238,10 +254,10 @@ fn host_process() {
         } else {
             1
         },
-        // Full-population native actions use the one-minute hang detector within
-        // their ten-minute attempt. Single-pass phases retain room for admission
-        // and preparation inside their original whole-attempt minute.
-        timeout_ns: if case == "contained-full-population" {
+        // Full-population and real-linker actions use the one-minute native
+        // hang detector within a ten-minute preparation attempt. Ordinary
+        // phases retain room inside their original whole-attempt minute.
+        timeout_ns: if case == "contained-full-population" || linker::selected(&case) {
             HANG
         } else {
             Duration::from_secs(5)
@@ -288,6 +304,8 @@ fn host_process() {
     let mut reserved = false;
     let mut cancelled = false;
     let mut locks_observed = false;
+    let mut loan_observed = false;
+    let mut blocked_input = None;
     let (original_fd_limit, _) = descriptor_population();
     let mut fd_trace = File::create(scratch.path.join("host-descriptors")).unwrap();
     writeln!(fd_trace, "soft={original_fd_limit}").unwrap();
@@ -325,6 +343,42 @@ fn host_process() {
                     .iter()
                     .all(|slot| matches!(slot, aterm_capacity::build_cpu::SlotState::Held { .. }))
             );
+        }
+        if linker::selected(&case)
+            && !loan_observed
+            && linker::loan_is_parked(&namespace, &binding, &build.join("bin/rust-lld"))
+        {
+            assert_eq!(debt.reserved().unwrap(), 2);
+            assert_eq!(
+                ledger.cohort_claim_state(&memory).unwrap(),
+                CohortClaimState::Retained
+            );
+            assert!(matches!(
+                atpkg::lease::holders(
+                    &layout.prefix,
+                    &atpkg::lease::Subject::build("trust", 1).unwrap()
+                ),
+                atpkg::lease::Holders::Held(holders) if !holders.is_empty()
+            ));
+            assert_eq!(
+                aterm_uds::file_lock::LockFile::take_existing(
+                    &output.join(".cargo-lock"),
+                    Instant::now(),
+                    "busy"
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            if case == "real-lld-eof" {
+                if let Some(writer) = linker::hold_input(&source) {
+                    blocked_input = Some(writer);
+                    linker::close_writer(binding.clone());
+                    loan_observed = true;
+                }
+            } else {
+                loan_observed = linker::release_input(&source);
+            }
         }
         if !locks_observed && source.join("original-lock-dropped").is_file() {
             // Root has closed its original guard. Only the actual Host SCM
@@ -472,6 +526,15 @@ fn host_process() {
         ),
         atpkg::lease::Holders::Free
     ));
+    if linker::selected(&case) {
+        assert!(
+            loan_observed,
+            "actual parked edge and retained original owners must be observed before releasing LLD input"
+        );
+        linker::retired_receipt(&namespace, &source);
+        println!("real-lld fixture={}", scratch.path.display());
+    }
+    drop(blocked_input);
     if case == "contained-full-population" {
         println!("contained host soft={original_fd_limit} peak={peak_descriptors}");
         print!(
@@ -642,6 +705,16 @@ fn root() -> i32 {
         };
         panic!("native Root forged compiler refusal unavailable: {reason}");
     }
+    if linker::selected(&case) {
+        linker::run(
+            &client,
+            &mut control,
+            &request,
+            &reply,
+            &originals,
+            deadline,
+        );
+    }
     if matches!(case.as_str(), "unknown" | "cancel") {
         fs::write(source.join("original-lock-dropped"), "actual local close").unwrap();
     }
@@ -798,6 +871,13 @@ fn root() -> i32 {
             observed
                 .iter()
                 .all(|entry| entry.retired && entry.drained && entry.started.is_some())
+        );
+    } else if linker::selected(&case) {
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed
+                .iter()
+                .all(|entry| entry.retired && entry.started.is_some())
         );
     } else {
         assert!(observed.is_empty());

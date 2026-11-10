@@ -25,6 +25,7 @@ impl Scratch {
             .map_err(|e| format!("could not create {}: {e}", root.display()))?;
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("{SCRATCH_PREFIX}{row}-"))
+            .suffix(".noindex")
             .tempdir_in(root)
             .map_err(|e| format!("could not create a scratch under {}: {e}", root.display()))?;
         Ok(Self { dir })
@@ -113,6 +114,7 @@ impl Scratch {
         let name = dest.file_name().unwrap_or_default().to_string_lossy();
         aterm_tempfile::Builder::new()
             .prefix(&format!(".replaced-{name}-"))
+            .suffix(".noindex")
             .tempdir_in(root)
             .map(aterm_tempfile::TempDir::keep)
             .map_err(|e| format!("could not create a folder under {}: {e}", root.display()))

@@ -912,13 +912,8 @@ fn keeps_reset(opt: &Opt) -> bool {
 
 const fn draws_claude_boxes(program: Program) -> bool {
     match program {
-        Program::Claude => true,
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => false,
+        Program::Claude | Program::Kimi => true,
+        Program::Codex | Program::Grok | Program::Agy | Program::Muse | Program::Generic => false,
     }
 }
 
@@ -1343,13 +1338,11 @@ fn decide_unfenced(
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::ChromeIntro
     {
-        let decision = if !draws_claude_boxes(reading.program)
-            || reading.phase != Phase::Prompt
-            || !reading.phase_authoritative
-        {
-            Decision::escalate("no Claude in Chrome intro the reader vouches for")
-        } else {
-            chrome_intro(prompt, rows, ctx)
+        let decision = match reading.program {
+            Program::Claude if reading.phase == Phase::Prompt && reading.phase_authoritative => {
+                chrome_intro(prompt, rows, ctx)
+            }
+            _ => Decision::escalate("no Claude in Chrome intro the reader vouches for"),
         };
         return decided_at(trace, "chrome-intro", decision);
     }
@@ -1864,7 +1857,8 @@ fn row_of(rows: &[String], prompt: &PromptV2, text: &str) -> Option<usize> {
     let (top, bottom) = prompt.span;
     (top + 1..bottom.min(rows.len())).find(|&k| {
         let t = rows[k].trim();
-        t.strip_prefix('│').map_or(t, str::trim) == text
+        let t = t.strip_prefix('│').map_or(t, str::trim);
+        t == text || t.strip_prefix("$ ").is_some_and(|rest| rest == text)
     })
 }
 
@@ -1947,7 +1941,10 @@ fn is_option_row(t: &str) -> bool {
 fn no_option_above_the_question(prompt: &PromptV2, rows: &[String]) -> Result<(), String> {
     let (top, bottom) = prompt.span;
     let bottom = bottom.min(rows.len());
-    let Some(q) = (top + 1..bottom).rev().find(|&k| asks(&rows[k])) else {
+    let question = prompt
+        .question
+        .filter(|question| (top + 1..bottom).contains(question));
+    let Some(q) = question.or_else(|| (top + 1..bottom).rev().find(|&k| asks(&rows[k]))) else {
         return Err("a box with no question row".to_string());
     };
     if (top + 1..q).any(|k| is_option_row(rows[k].trim())) {
@@ -2010,10 +2007,15 @@ fn command_readings(prompt: &PromptV2, rows: &[String], rm_breaker: bool) -> (Ve
     (out, head)
 }
 
+fn bash_title(prompt: &PromptV2) -> bool {
+    prompt.base_title().as_deref() == Some(aterm_phase::anchor!("box.bash"))
+        || prompt.title == aterm_phase::anchor!("kimi.box.run")
+}
+
 fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     // Every header form aterm-phase reads: an origin, `(unsandboxed)`,
-    // `(runs on <m>)`. An unreadable suffix is no Bash header.
-    if prompt.base_title().as_deref() != Some(aterm_phase::anchor!("box.bash")) {
+    // `(runs on <m>)`, or Kimi's measured command-approval title. An unreadable suffix is none.
+    if !bash_title(prompt) {
         return Decision::escalate(format!(
             "the box header is not a Bash header: {}",
             prompt.title
@@ -2207,7 +2209,7 @@ fn disk_words(
     rows: &[String],
     ctx: &ApprovalCtx,
 ) -> Result<(Vec<String>, String, usize), String> {
-    if prompt.base_title().as_deref() != Some(aterm_phase::anchor!("box.bash")) {
+    if !bash_title(prompt) {
         return Err(format!(
             "the box header is not a Bash header: {}",
             prompt.title

@@ -147,7 +147,7 @@ fn codex_renewal_fixture_counts_real_human_source_only() {
     assert!(handle.ctx.human_input.seq() > before);
 }
 
-struct Pump {
+pub(super) struct Pump {
     ctx: Arc<SessionCtx>,
     term: Arc<Mutex<Terminal>>,
     handle: crate::session_store::SessionHandle,
@@ -162,6 +162,18 @@ impl ApplicationHandler<Wake> for Pump {
 }
 
 impl Pump {
+    pub(super) fn source_fixture(
+        handle: crate::session_store::SessionHandle,
+        term: Arc<Mutex<Terminal>>,
+    ) -> Self {
+        Self {
+            ctx: Arc::clone(&handle.ctx),
+            term,
+            handle,
+            unhandled_wakes: Default::default(),
+        }
+    }
+
     fn dispatch(&mut self, wake: Wake) {
         let wake = crate::control::control_media::take_hop(wake);
         let named = match &wake {

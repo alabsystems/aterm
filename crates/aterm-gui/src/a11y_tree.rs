@@ -838,6 +838,15 @@ pub(crate) fn tab_action_index(
     (request.context == Some(expected)).then_some(index)
 }
 
+fn character_lengths_of(text: &str) -> Box<[u8]> {
+    if text.is_ascii() {
+        return vec![1; text.len()].into_boxed_slice();
+    }
+    let mut lengths = Vec::with_capacity(text.chars().count());
+    lengths.extend(text.chars().map(|c| c.len_utf8() as u8));
+    lengths.into_boxed_slice()
+}
+
 fn word_starts_of(line: &str) -> Box<[u8]> {
     // The u8 offset space bounds both the useful scalar prefix and the scratch.
     const INDEX_SPACE: usize = u8::MAX as usize + 1;
@@ -908,10 +917,7 @@ fn push_terminal_document(
             row_ids.push(id);
             let mut run = Node::new(Role::TextRun);
             run.set_value(line);
-            let character_lengths: Vec<u8> = line
-                .chars()
-                .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
-                .collect();
+            let character_lengths = character_lengths_of(line);
             let characters = character_lengths.len();
             run.set_character_lengths(character_lengths);
             run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
@@ -1053,11 +1059,7 @@ fn push_text_field(
 ) {
     let mut run = Node::new(Role::TextRun);
     run.set_value(text.to_owned());
-    run.set_character_lengths(
-        text.chars()
-            .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
-            .collect::<Vec<u8>>(),
-    );
+    run.set_character_lengths(character_lengths_of(text));
     run.set_word_starts(word_starts_of(text));
     nodes.push((run_id, run));
 
@@ -1404,6 +1406,106 @@ mod tests {
 
     fn node(update: &TreeUpdate, id: NodeId) -> &Node {
         &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1
+    }
+
+    #[test]
+    fn character_metadata_allocates_only_its_owned_slice() {
+        let mut observed = Vec::new();
+        for text in [
+            String::new(),
+            "\n".to_string(),
+            "hello".to_string(),
+            "中é🦀".to_string(),
+            "é".repeat(257),
+            "x".repeat(1024),
+        ] {
+            let mut run = Node::new(Role::TextRun);
+            let (_, allocations) = aterm_heap_count::allocations_in(|| {
+                run.set_character_lengths(character_lengths_of(std::hint::black_box(&text)));
+                std::hint::black_box(run.character_lengths());
+            });
+            println!(
+                "bytes={} characters={} allocations={allocations}",
+                text.len(),
+                run.character_lengths().len()
+            );
+            observed.push(allocations);
+        }
+        assert_eq!(observed, [0, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn character_metadata_preserves_every_scalar_and_byte() {
+        for (text, expected) in [
+            (String::new(), vec![]),
+            ("a\n".to_string(), vec![1, 1]),
+            ("中é🦀".to_string(), vec![3, 2, 4]),
+            ("e\u{301}".to_string(), vec![1, 2]),
+            ("é".repeat(257), vec![2; 257]),
+            ("x".repeat(1024), vec![1; 1024]),
+        ] {
+            let mut run = Node::new(Role::TextRun);
+            run.set_character_lengths(character_lengths_of(&text));
+            assert_eq!(run.character_lengths(), expected);
+            assert_eq!(
+                run.character_lengths()
+                    .iter()
+                    .map(|&n| usize::from(n))
+                    .sum::<usize>(),
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measures character metadata construction; run alone"]
+    fn character_metadata_construction_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const CALLS: usize = 200_000;
+        fn vector_reference(text: &str) -> Box<[u8]> {
+            text.chars()
+                .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
+                .collect::<Vec<u8>>()
+                .into_boxed_slice()
+        }
+        for (case, text) in [
+            ("empty", String::new()),
+            ("newline", "\n".to_string()),
+            ("ascii", "hello".to_string()),
+            ("ascii_long", "x".repeat(1024)),
+            ("unicode", "中é🦀".to_string()),
+            ("unicode_long", "é".repeat(1024)),
+            ("combining", "e\u{301}".repeat(128)),
+        ] {
+            assert_eq!(character_lengths_of(&text), vector_reference(&text));
+            for sample in 0..5 {
+                for reference in if sample % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    let make: fn(&str) -> Box<[u8]> = if reference {
+                        vector_reference
+                    } else {
+                        character_lengths_of
+                    };
+                    for _ in 0..100 {
+                        drop(black_box(make(black_box(&text))));
+                    }
+                    let start = Instant::now();
+                    for _ in 0..CALLS {
+                        let mut run = Node::new(Role::TextRun);
+                        run.set_character_lengths(make(black_box(&text)));
+                        black_box(run.character_lengths());
+                    }
+                    println!(
+                        "case={case} calls={CALLS} sample={sample} reference={reference} elapsed_ns={}",
+                        start.elapsed().as_nanos()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

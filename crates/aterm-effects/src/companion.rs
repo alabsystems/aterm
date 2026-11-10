@@ -1741,7 +1741,7 @@ impl CompanionOwner {
         self.clear_surface_state();
     }
 
-    /// The same surface, re-gridded (a resize, a font step, a DPI change, a divider drag): the body keeps its place, alpha and pose; only the facts measured against the old grid and the hit rect go.
+    /// The same surface, re-gridded (a resize, a font step, a DPI change, a divider drag): the body keeps its place, alpha and pose; only the facts measured against the old grid and the hit rect go. The brain's next tick measures its station on the new grid: a body on a station only the art's width moved stays on it, its anchor where it was (`PetBrain::keep_place_on_restation`); a station the new grid moves otherwise (the wall's law's other side as columns come or go, a clamp at a moved grid edge, a reflowed caret) is the walk's or the leap's to reach.
     #[inline]
     pub fn rebase_geometry(&mut self) {
         self.pet.rebase_geometry();

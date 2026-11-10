@@ -27,6 +27,7 @@ impl Scratch {
     fn new(label: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-doctor-{label}-"))
+            .suffix(".noindex")
             .tempdir()
             .expect("a scratch directory");
         let root = dir.path().canonicalize().unwrap();
@@ -2598,6 +2599,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     use aterm_converge::Probe;
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-doctor-pools-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch directory");
     let root = dir.path().canonicalize().unwrap();
@@ -2836,6 +2838,7 @@ fn base_ai_accounts_counts_the_token_states() {
     use aterm_converge::Probe;
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-doctor-tokens-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch directory");
     let root = dir.path().canonicalize().unwrap();
@@ -2936,6 +2939,7 @@ fn a_symlinked_fleet_file_counts_as_present() {
     use aterm_converge::Probe;
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-doctor-fleet-link-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch directory");
     let root = dir.path().canonicalize().unwrap();

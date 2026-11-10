@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(policy_agent(&named(Some("grok-alab"))), Program::Grok);
         assert_eq!(policy_agent(&named(Some("grok"))), Program::Grok);
         assert_eq!(policy_agent(&named(Some("claude"))), Program::Claude);
-        assert_eq!(policy_agent(&named(Some("kimi"))), Program::Codex);
+        assert_eq!(policy_agent(&named(Some("kimi"))), Program::Kimi);
         assert_eq!(policy_agent(&named(Some("zsh"))), Program::Codex);
         assert_eq!(policy_agent(&named(None)), Program::Codex);
     }

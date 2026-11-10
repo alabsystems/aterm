@@ -17,6 +17,7 @@ fn stored() -> (aterm_tempfile::TempDir, Env, Record, SourceHandle) {
     opened.save(record.clone()).unwrap();
     drop(opened);
     let expected = SourceHandle {
+        policy: None,
         namespaces: None,
         binding: std::sync::Arc::new(record.binding.clone()),
         slot: slot_key(&record.caller, &record.binding).unwrap(),
@@ -50,7 +51,18 @@ fn stale_a_scope_cannot_enter_b_owner_or_create_b_materialization() {
         "b".repeat(32),
         expected.digest().into(),
     );
-    assert!(refresh_inner(&env, &record.caller, &request, Some(&expected)).is_err());
+    assert!(
+        refresh_inner(
+            &env,
+            &record.caller,
+            &request,
+            &crate::harness::account_work::Lifetime::default()
+                .enter()
+                .unwrap(),
+            Some(&expected)
+        )
+        .is_err()
+    );
     assert_eq!(OWNER_ENTRIES.with(std::cell::Cell::get), 0);
     assert!(!other.exists());
 }
@@ -93,7 +105,18 @@ fn distinct_startup_nonce_cannot_collapse_into_native_intent_none() {
         "b".repeat(32),
         expected.digest().into(),
     );
-    assert!(refresh_inner(&env, &record.caller, &request, Some(&expected)).is_err());
+    assert!(
+        refresh_inner(
+            &env,
+            &record.caller,
+            &request,
+            &crate::harness::account_work::Lifetime::default()
+                .enter()
+                .unwrap(),
+            Some(&expected)
+        )
+        .is_err()
+    );
     assert_eq!(OWNER_ENTRIES.with(std::cell::Cell::get), 0);
 }
 
@@ -106,6 +129,7 @@ fn legitimate_same_scope_revision_advance_preserves_identity_and_digest_fences()
     record.revision.generation += 1;
     assert!(check_record(&env, &record.caller, &record, &expected).is_ok());
     let mut actual = SourceHandle {
+        policy: None,
         namespaces: None,
         binding: expected.binding.clone(),
         slot: expected.slot.clone(),
@@ -118,6 +142,7 @@ fn legitimate_same_scope_revision_advance_preserves_identity_and_digest_fences()
     };
     assert!(check_source(&SourceProgress::Ready(actual), &expected).is_ok());
     actual = SourceHandle {
+        policy: None,
         namespaces: None,
         binding: expected.binding.clone(),
         slot: expected.slot.clone(),

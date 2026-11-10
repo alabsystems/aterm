@@ -8,6 +8,36 @@ use super::*;
 use crate::harness::auth_deadline::Deadline;
 use aterm_secrets::SecretBytes;
 
+#[cfg(test)]
+thread_local! {
+    static FIXTURE_ENDPOINT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Redirect only the final send after real document/issuer/client admission.
+/// This is a local transport fixture, never production issuer authority.
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn with_refresh_fixture_endpoint<R>(
+    endpoint: &str,
+    run: impl FnOnce() -> R,
+) -> R {
+    let address = endpoint
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/oauth/token")
+        .unwrap();
+    let address: std::net::SocketAddr = address.parse().unwrap();
+    assert!(address.ip().is_loopback());
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIXTURE_ENDPOINT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prior = FIXTURE_ENDPOINT.with(|slot| slot.replace(Some(endpoint.to_owned())));
+    let _reset = Reset(prior);
+    run()
+}
+
 pub(in crate::harness) struct ReceivedRefresh {
     status: u16,
     body: SecretBytes,
@@ -101,8 +131,14 @@ fn exchange_owned_refresh_with_clock(
     if left < MIN_REFRESH_BUDGET {
         return Ok(RefreshExchange::NotSent);
     }
-    let response = http_client(&authority.token_url, left)
-        .request(Method::Post, &authority.token_url)
+    #[cfg(test)]
+    let fixture_endpoint = FIXTURE_ENDPOINT.with(|slot| slot.borrow().clone());
+    #[cfg(test)]
+    let token_url = fixture_endpoint.as_deref().unwrap_or(&authority.token_url);
+    #[cfg(not(test))]
+    let token_url = authority.token_url.as_str();
+    let response = http_client(token_url, left)
+        .request(Method::Post, token_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .header("User-Agent", "codex-cli")

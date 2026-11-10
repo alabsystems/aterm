@@ -30,6 +30,12 @@ pub use execution::{
     ExecutionGuard, ExecutionIntent, admit_execution, admit_external_execution, capture_execution,
 };
 
+pub use super::codex_grant_owner::{
+    NativeUsageContinuation, NativeUsageDeferred, NativeUsageDiscoveryCursor, NativeUsageOutcome,
+    NativeUsageRequest, NativeUsageRetention, NativeUsageSettlement, NativeUsageSourceLease,
+    discover_native_usage_deferred, read_native_usage, read_native_usage_observed,
+};
+
 /// How old a row's usage sample may be before a launch about to start on it reads it again
 /// ([`read_launch_rows`]).
 pub const USAGE_FRESH_S: i64 = 300;
@@ -92,6 +98,27 @@ pub struct UsageObservation {
 }
 
 impl UsageObservation {
+    pub(in crate::harness) fn from_native(
+        reading: Reading,
+        context: Option<super::codex_app_login::CredentialContext>,
+    ) -> Self {
+        Self { reading, context }
+    }
+    /// No provider answer or credential context is asserted.
+    #[must_use]
+    pub fn unread() -> Self {
+        Self {
+            reading: Reading::Unread,
+            context: None,
+        }
+    }
+
+    /// Consume this one observation without repeating its provider request.
+    #[must_use]
+    pub fn into_reading(self) -> Reading {
+        self.reading
+    }
+
     /// Attach a synthetic provider answer to its fixture's actual read-only credential
     /// snapshot. Unreadable or non-file credentials supply no fixture authority.
     #[doc(hidden)]
@@ -3880,6 +3907,29 @@ pub fn session_plan(
     session_plan_using(seat, s, |row| prepare_session_line(seat, s, row), note)
 }
 
+/// [`session_plan`] with the selected Kimi account home as its dispatch payload, rather than a
+/// shell line. The external harness owns the resume argv and process stop; the pool retains its
+/// identity, usage, overlay and commit-time revalidation. Its overlay links sessions, locks and
+/// folder trust to the default home, so the same conversation resumes on the selected login.
+#[must_use]
+pub fn session_login_plan(
+    seat: &Seat<'_>,
+    s: &Session<'_>,
+    note: impl FnOnce(SessionNote<'_>),
+) -> SessionPlan<LoginEnv> {
+    if s.cli != Cli::Kimi {
+        return SessionPlan::stay(StayWhy::NothingDue);
+    }
+    session_plan_with(
+        seat,
+        s,
+        Some(s.relaunch.exe),
+        |row| login_env(Cli::Kimi, row, seat.home).ok(),
+        note,
+        MoveAuthority::Window,
+    )
+}
+
 /// Prepare a self-supervised Codex weekly-quota move using the normal pool's
 /// policy and commit-time revalidation. The caller must first verify the native
 /// failed turn and its credential identity. This function grants no process
@@ -4152,6 +4202,12 @@ fn session_plan_with<T, R>(
     };
     let who = accounts::ProcessLogin::of_env_for(s.cli, s.env.iter().copied());
     let me = who.me(&roster);
+    if me
+        .label()
+        .is_some_and(|label| roster.row(label).is_some_and(held_source))
+    {
+        return SessionPlan::stay(StayWhy::OtherSupervisor);
+    }
     if let Some(label) = me
         .label()
         .filter(|_| me.default_home && me.route.on_account())

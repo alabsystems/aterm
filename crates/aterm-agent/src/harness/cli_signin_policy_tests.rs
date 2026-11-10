@@ -1101,7 +1101,7 @@ fn signin_observation_policy_uses_the_admitted_roster_image() {
         );
         assert_eq!(world.records(), before);
         assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_before);
-        // A conflicting edit after that read fences the admitted record and is preserved.
+        // A conflicting edit after that read refuses new intent and is preserved.
         assert!(
             accounts_observe_signin(
                 &world.store,
@@ -1116,9 +1116,27 @@ fn signin_observation_policy_uses_the_admitted_roster_image() {
             .is_err()
         );
         assert_eq!(std::fs::read(&world.path).unwrap(), changed);
-        assert!(world.store.load(NOW).is_err());
+        assert!(world.store.load(NOW).is_ok());
+        assert_eq!(world.records(), before);
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_before);
         std::fs::write(&world.path, original).unwrap();
-        assert!(world.store.recover_sync_within(&[], &world.path).unwrap());
+        assert!(!world.store.recover_sync_within(&[], &world.path).unwrap());
+        assert!(
+            world
+                .store
+                .tail(100)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != accounts::Kind::SignIn)
+        );
+        accounts_observe_signin(
+            &world.store,
+            &world.path,
+            NOW,
+            &mut Vec::new(),
+            |raw, _, _| record(raw),
+        )
+        .unwrap();
         assert_eq!(
             world
                 .store

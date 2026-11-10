@@ -18,15 +18,54 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[path = "codex_source_restart.rs"]
+mod restart;
+pub use restart::RestartReservation;
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "codex_source_proof_observation.rs"]
+mod proof_observation;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use proof_observation::{SOURCE_PROOF_OBSERVATION_LIMIT, SourceProofObservation};
+
+#[path = "codex_source_derived.rs"]
+mod derived;
+#[path = "codex_source_plain_retirement.rs"]
+mod plain_retirement;
 #[path = "codex_source_preload_custody.rs"]
 mod preload_custody;
+#[path = "codex_source_preload_sequence.rs"]
+mod preload_sequence;
+pub use preload_sequence::{PreloadPredecessor, PreloadSequence};
 #[path = "codex_source_reservation.rs"]
 mod reservation;
-pub(in crate::harness) use reservation::seal::SealingSource;
+pub use reservation::namespace::{
+    CapturedPreloadCommand, CapturedReadyCommand, CapturedReadyPreparation,
+    OwnedPreloadPreparation, OwnedUseRefresh, PreloadResample, PreloadUseIdentity,
+    ReboundReadyCommand, ReboundReadyOutcome, ReboundReadyRequest, ResamplePreparation,
+};
+pub(in crate::harness) use reservation::namespace::{PreloadReadNamespace, UseNamespace};
+pub(in crate::harness) use reservation::target::TargetSnapshotRead;
+pub use reservation::target::normalize::NormalizedMemberRequest;
+pub(in crate::harness) use reservation::target::normalize::NormalizedRead;
+pub(in crate::harness) use reservation::target::resources::TargetAckPermit;
+pub use reservation::target::{
+    AckPreparation, MemberRetirementPreparation, MemberRetirementRequest, OwnedMemberRetirement,
+    ResourcePreparation, ResourceReport, TargetAckCommand, TargetApplied, TargetNoReaderCommand,
+    TargetNoReaderPreparation, TargetNoReaderRequest, TargetOpenPreparation, TargetOpenRetirement,
+    TargetPreloadPreparation, TargetReadyCommand, TargetReadyPreparation, TargetReadyReport,
+    TargetResampleCommand, TargetResamplePreparation, TargetResampleRequest, TargetResourceCommand,
+    TargetResourceReceipt, WorkRebindKind, WorkRebindRequest,
+};
 pub use reservation::{
-    BeginAdmission, CensusCondition, CensusMember, CleanupAdmission, OwnedUseCleanup, Quiescence,
-    RegisteredMemberCleanup, RegisteredMemberWork, Reservation, SourceSeal, SourceUse, UseAction,
-    UseCleanupRequest, UseCommand, UseIdentity, UseNonce, UseProgress, UseReceipt, UseRequest,
+    BeginAdmission, CensusCondition, CensusCursor, CensusMember, CensusPage, CleanupAdmission,
+    InstalledTarget, OwnedUseCleanup, Quiescence, RegisteredMemberCleanup, RegisteredMemberWork,
+    Reservation, SourceSeal, SourceUse, TargetConstruction, TargetOpenCleanup, TargetReady,
+    UseAction, UseCleanupRequest, UseCommand, UseIdentity, UseNonce, UseProgress, UseReceipt,
+    UseRequest,
+};
+pub(in crate::harness) use reservation::{
+    seal::SealingSource,
+    target::{InstalledRead, TargetAdmission},
 };
 
 pub const LAUNCH_ENV: &str = "ATERM_CODEX_SOURCE_LAUNCH";
@@ -201,9 +240,10 @@ struct Launch {
     expected_unset: Vec<&'static str>,
     process: Option<Process>,
     typed: bool,
-    gate: Option<SourceWorkLease>,
+    gate: Option<Arc<SourceWorkLease>>,
     _scope: Option<super::account_work::Scope>,
     initial: Option<Arc<InitialCell>>,
+    native_restart: Option<Arc<restart::NativeRestart>>,
 }
 
 impl Drop for Launch {
@@ -236,6 +276,44 @@ impl LaunchReservation {
     pub fn token(&self) -> &str {
         &self.token
     }
+    /// Borrow the real constructor gate for a counted natural quota read.
+    /// Kernel custody alone does not authorize any credential or provider use.
+    pub fn native_usage_source(
+        &self,
+        scope: &super::account_work::Scope,
+    ) -> Result<owner::NativeUsageSourceLease, Error> {
+        let state = self.state.upgrade().ok_or(Error::Stale)?;
+        let capture = || {
+            let state = lock(&state)?;
+            let launch = state.launches.get(&self.token).ok_or(Error::Stale)?;
+            if launch.typed
+                || launch.process.is_some()
+                || scope.cancelled()
+                || !launch
+                    ._scope
+                    .as_ref()
+                    .is_some_and(|held| held.operation_identity() == scope.operation_identity())
+            {
+                return Err(Error::Stale);
+            }
+            Ok((
+                launch.gate.as_ref().ok_or(Error::Stale)?.clone(),
+                launch.image.clone(),
+            ))
+        };
+        let (gate, image) = capture()?;
+        // No filesystem/kernel observation occurs under the registry mutex.
+        gate.current().map_err(|_| Error::Stale)?;
+        if scope.cancelled() || Image::at(&self.executable).as_ref() != Some(&image) {
+            return Err(Error::Stale);
+        }
+        let (current, current_image) = capture()?;
+        if !Arc::ptr_eq(&gate, &current) || image != current_image {
+            return Err(Error::Stale);
+        }
+        Ok(owner::NativeUsageSourceLease { inner: gate })
+    }
+
     /// Build the actual launch from the admitted starter, bypassing the mutable
     /// managed twin and retaining the ordinary sign-in recheck.
     pub fn arm(
@@ -419,8 +497,20 @@ enum ReadyRole {
     PolicyUnavailable,
 }
 
+enum ReaderGate {
+    Global(Arc<SourceWorkLease>),
+    Target(Arc<super::codex_source_gate::TargetFamilyLease>),
+}
+impl ReaderGate {
+    fn current(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Global(gate) => gate.current(),
+            Self::Target(gate) => gate.current(),
+        }
+    }
+}
 struct SourceReadiness {
-    gate: Option<SourceWorkLease>,
+    gate: Option<ReaderGate>,
     identity: super::codex_source_gate::SourceGateIdentity,
     role: Option<ReadyRole>,
     // Reconnect does not retire any earlier direct-reader/derived use.
@@ -428,6 +518,12 @@ struct SourceReadiness {
 }
 impl SourceReadiness {
     fn preload(gate: SourceWorkLease, previous: Option<&mut Self>) -> Result<Self, Error> {
+        Self::preload_shared(Arc::new(gate), previous)
+    }
+    fn preload_shared(
+        gate: Arc<SourceWorkLease>,
+        previous: Option<&mut Self>,
+    ) -> Result<Self, Error> {
         let new_identity = gate.identity().map_err(|_| Error::Stale)?;
         if previous
             .as_ref()
@@ -453,7 +549,7 @@ impl SourceReadiness {
             }
         });
         let reader_owned = previous_reader.is_some();
-        let gate = previous_reader.unwrap_or(gate);
+        let gate = previous_reader.unwrap_or(ReaderGate::Global(gate));
         // All fallible checks precede transferring an old reader's held lock.
         Ok(Self {
             gate: Some(gate),
@@ -462,15 +558,29 @@ impl SourceReadiness {
             reader_owned,
         })
     }
+    fn target(
+        resource: Arc<super::codex_source_gate::TargetFamilyLease>,
+        reader_owned: bool,
+    ) -> Result<Self, Error> {
+        resource.current().map_err(|_| Error::Stale)?;
+        Ok(Self {
+            identity: resource.gate_identity().clone(),
+            gate: Some(ReaderGate::Target(resource)),
+            role: None,
+            reader_owned,
+        })
+    }
     fn complete(&mut self, role: ReadyRole) -> Result<(), Error> {
-        if (self.reader_owned && role != ReadyRole::ReaderLoaded)
-            || self.role.is_some_and(|previous| previous != role)
-        {
-            return Err(Error::Stale);
-        }
         if let Some(gate) = &self.gate {
             gate.current().map_err(|_| Error::Stale)?;
-        } else if role == ReadyRole::ReaderLoaded {
+        }
+        self.complete_recorded(role)
+    }
+    fn complete_recorded(&mut self, role: ReadyRole) -> Result<(), Error> {
+        if (self.reader_owned && role != ReadyRole::ReaderLoaded)
+            || self.role.is_some_and(|previous| previous != role)
+            || (role == ReadyRole::ReaderLoaded && self.gate.is_none())
+        {
             return Err(Error::Stale);
         }
         self.role = Some(role);
@@ -502,12 +612,14 @@ struct Member {
     source: Arc<slot::SourceHandle>,
     readiness: SourceReadiness,
     unknown: bool,
+    work_rebound: bool,
 }
 
 struct Issued {
     operation: String,
     connection: Connection,
     parent_use: Option<reservation::ParentUse>,
+    target: Option<Weak<reservation::target::Installed>>,
 }
 struct Actor {
     process: Process,
@@ -526,11 +638,18 @@ struct State {
     version: u64,
     members: BTreeMap<String, Member>,
     unrelated: BTreeMap<String, UnrelatedMember>,
+    // Only in-flight release custody; settled closure is Actor ordinal metadata.
+    plain_retiring: BTreeMap<String, ()>,
     launches: BTreeMap<String, Launch>,
     actors: BTreeMap<String, Actor>,
     uses: BTreeMap<String, reservation::Uses>,
     preloads: BTreeMap<String, Arc<preload_custody::Pending>>,
+    preload_sequences: BTreeMap<String, preload_sequence::Ledger>,
     reservations: BTreeMap<String, Arc<Mutex<reservation::Cell>>>,
+    retired_reservations: BTreeMap<String, Arc<Mutex<reservation::Cell>>>,
+    target_opens: BTreeMap<String, reservation::target::OpenRecord>,
+    target_resources: BTreeMap<String, reservation::target::resources::Record>,
+    normalized_targets: BTreeMap<String, Arc<reservation::target::normalize::NormalizedTarget>>,
 }
 #[derive(Default)]
 pub struct Registry {
@@ -556,6 +675,48 @@ static CONNECTIONS: std::sync::OnceLock<Mutex<BTreeMap<u64, Arc<AtomicBool>>>> =
     std::sync::OnceLock::new();
 fn connections() -> &'static Mutex<BTreeMap<u64, Arc<AtomicBool>>> {
     CONNECTIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Fixtures share the process-wide connection table, so their IDs must share
+/// one allocator too. Keep them outside the small IDs used by wire fixtures.
+#[cfg(test)]
+fn fixture_connection_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX / 2);
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("fixture connection IDs exhausted")
+}
+
+/// Own the fixture's front door independently of any cloned work tokens.
+/// Dropping the front door delivers real EOF and releases its bounded slot.
+#[cfg(test)]
+pub(in crate::harness) struct FixtureConnection {
+    registry: Registry,
+    connection: Connection,
+}
+#[cfg(test)]
+impl std::ops::Deref for FixtureConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+#[cfg(test)]
+impl Drop for FixtureConnection {
+    fn drop(&mut self) {
+        self.registry.connection_closed(self.connection.id);
+    }
+}
+#[cfg(test)]
+impl Registry {
+    pub(in crate::harness) fn fixture_connection(&self) -> FixtureConnection {
+        FixtureConnection {
+            registry: Registry {
+                state: self.state.clone(),
+            },
+            connection: self.connection(fixture_connection_id()).unwrap(),
+        }
+    }
 }
 
 fn member_key(caller: &slot::Caller, member: &str) -> Result<String, Error> {
@@ -638,6 +799,7 @@ fn revision_descends(next: u64, next_digest: &str, old: u64, old_digest: &str) -
     next >= old && (next > old || next_digest == old_digest)
 }
 
+#[derive(Clone)]
 pub struct Preload {
     pub member: String,
     pub operation: String,
@@ -676,7 +838,11 @@ impl ReadySourceProof {
         let Ok(state) = lock(&state) else {
             return false;
         };
-        let current = state.members.get(&self.key).is_some_and(|member| {
+        let current = !reservation::target::normalize::handoff::source_is_revoked(
+            &state,
+            &self.caller,
+            &self.source,
+        ) && state.members.get(&self.key).is_some_and(|member| {
             member.version == self.version
                 && member.readiness.manager()
                 && !member.unknown
@@ -735,7 +901,11 @@ impl ReaderSourceProof {
         let Ok(state) = lock(&state) else {
             return false;
         };
-        let current = state.members.get(&self.key).is_some_and(|member| {
+        let current = !reservation::target::normalize::handoff::source_is_revoked(
+            &state,
+            &self.caller,
+            &self.source,
+        ) && state.members.get(&self.key).is_some_and(|member| {
             member.version == self.version
                 && member.readiness.reader()
                 && !member.unknown
@@ -836,7 +1006,7 @@ impl Registry {
             .iter_mut()
             .find(|(_, issued)| issued.operation == operation)
         {
-            if issued.parent_use != parent_use {
+            if issued.target.is_some() || issued.parent_use != parent_use {
                 return Err(Error::Stale);
             }
             if !issued.connection.same(connection) {
@@ -870,6 +1040,7 @@ impl Registry {
                 operation: operation.into(),
                 connection: connection.clone(),
                 parent_use,
+                target: None,
             },
         );
         if closed {
@@ -897,6 +1068,11 @@ impl Registry {
         let mut state = lock(&self.state)?;
         if !peer.current() || !connection.is_live() {
             return Err(Error::Stale);
+        }
+        if state.preload_sequences.contains_key(&key) {
+            // Owned PRELOAD has exact release-only retirement; the legacy
+            // member verb cannot discard its fence or manufacture a receipt.
+            return Err(Error::Denied);
         }
         if reservation::has_credential_uses(&state, &key) || preload_custody::running(&state, &key)
         {
@@ -934,8 +1110,14 @@ impl Registry {
         } else if registration.is_some() || !allocation.connection.same(connection) {
             return Err(Error::Stale);
         }
+        reservation::target::resources::check_retirement(&state, &peer.caller, member)?;
+        let target_constructor =
+            reservation::target::retire_constructor(&state, &peer.caller, member)?;
+        let target_resources =
+            reservation::target::resources::revoke_member(&mut state, &peer.caller, member);
         let preload = state.preloads.remove(&key);
-        state.uses.remove(&key);
+        // Exact settled use receipts remain metadata for release-only replay.
+        // No Scope survives explicit member retirement.
         state.members.remove(&key);
         state.unrelated.remove(&key);
         state
@@ -945,8 +1127,12 @@ impl Registry {
             .issued
             .remove(member);
         version(&mut state)?;
+        let normalized = reservation::target::normalize::take_unused(&mut state);
         drop(state);
+        drop(normalized);
         drop(preload);
+        drop(target_constructor);
+        drop(target_resources);
         Ok(())
     }
 
@@ -995,6 +1181,9 @@ impl Registry {
             .get(&actor_key(&peer.caller))
             .and_then(|actor| actor.issued.get(member))
             .ok_or(Error::Stale)?;
+        if allocation.target.is_some() {
+            return Err(Error::Denied);
+        }
         if allocation.operation != operation
             || !allocation.connection.same(connection)
             || state.members.contains_key(&key)
@@ -1021,6 +1210,7 @@ impl Registry {
                 gate.current().map_err(|_| Error::Stale)?;
             }
         }
+        reservation::target::resources::check_member_update(&state, &peer.caller, member)?;
         let registration = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
         state.unrelated.insert(
             key,
@@ -1131,9 +1321,10 @@ impl Registry {
                     .collect(),
                 process: None,
                 typed: false,
-                gate: Some(gate),
+                gate: Some(Arc::new(gate)),
                 _scope: Some(scope.clone()),
                 initial,
+                native_restart: None,
             },
         );
         Ok(LaunchReservation {
@@ -1152,6 +1343,10 @@ impl Registry {
         let mut state = lock(&self.state)?;
         let launch = state.launches.get_mut(token).ok_or(Error::Denied)?;
         if launch.sid != caller.sid
+            || launch
+                .native_restart
+                .as_ref()
+                .is_some_and(|native| !native.admits(&process))
             || launch.image != process.image
             || launch.process.as_ref().is_some_and(|old| old != &process)
             || launch
@@ -1281,18 +1476,43 @@ impl Registry {
         member: &str,
         operation: &str,
         connection: &Connection,
+        sequence: PreloadSequence,
     ) -> Result<Preload, Error> {
         if !hex(operation, 32) || !connection.alive.load(Ordering::Acquire) || !peer.current() {
             return Err(Error::Denied);
         }
         let key = member_key(&peer.caller, member)?;
+        let attempt = preload_sequence::Attempt {
+            sequence,
+            operation: operation.into(),
+            origin: preload_sequence::Origin::Ordinary,
+        };
         let expected = {
             let state = lock(&self.state)?;
             issued_on(&state, &peer, member, connection)?;
+            if state.unrelated.contains_key(&key) {
+                return Err(Error::Denied);
+            }
+            reservation::target::resources::check_member_update(&state, &peer.caller, member)?;
+            if state
+                .actors
+                .get(&actor_key(&peer.caller))
+                .and_then(|actor| actor.issued.get(member))
+                .is_some_and(|issued| issued.target.is_some())
+            {
+                return Err(Error::Denied);
+            }
             reservation::reservation_allows_member(&state, &peer.caller, member)?;
+            if let Some(ledger) = state.preload_sequences.get(&key) {
+                ledger.check_attempt(&peer.process, &attempt)?;
+                if let Some(original) = ledger.initial_preload(&attempt) {
+                    return Ok(original);
+                }
+            }
             state.members.get(&key).map(|member| member.source.clone())
         };
-        let _worker = preload_custody::enter(self, &peer, member, operation, connection)?;
+        let _worker =
+            preload_custody::enter_sequenced(self, &peer, member, operation, connection, &attempt)?;
         let gate = SourceWorkLease::for_home(env.home.as_deref().ok_or(Error::Unavailable)?)
             .map_err(|_| Error::Busy)?;
         let progress = match expected.as_ref() {
@@ -1316,6 +1536,7 @@ impl Registry {
             }
         };
         let mut state = lock(&self.state)?;
+        preload_sequence::check_current(&state, &key, &peer.process, &attempt)?;
         if let Some(token) = peer.launch.as_ref()
             && let Some(initial) = state
                 .launches
@@ -1358,12 +1579,36 @@ impl Registry {
                 });
             }
         }
+        reservation::target::resources::check_member_update(&state, &peer.caller, member)?;
         let registration = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
         let version = version(&mut state)?;
         let readiness = SourceReadiness::preload(
             gate,
             state.members.get_mut(&key).map(|old| &mut old.readiness),
         )?;
+        state
+            .preload_sequences
+            .get_mut(&key)
+            .ok_or(Error::Stale)?
+            .loaded(
+                &attempt,
+                &registration,
+                source.credential_generation(),
+                source.digest(),
+            )?;
+        state
+            .preload_sequences
+            .get_mut(&key)
+            .ok_or(Error::Stale)?
+            .record_initial(
+                &attempt,
+                Preload {
+                    member: member.into(),
+                    operation: operation.into(),
+                    registration: registration.clone(),
+                    source: source.clone(),
+                },
+            )?;
         state.members.insert(
             key,
             Member {
@@ -1376,6 +1621,7 @@ impl Registry {
                 source: source.clone(),
                 readiness,
                 unknown: false,
+                work_rebound: false,
             },
         );
         Ok(Preload {
@@ -1399,24 +1645,77 @@ impl Registry {
         registration: &str,
         connection: &Connection,
         ready: Ready,
+        sequence: PreloadSequence,
     ) -> Result<(), Error> {
         let key = member_key(&peer.caller, member)?;
+        let attempt = preload_sequence::Attempt {
+            sequence,
+            operation: operation.into(),
+            origin: preload_sequence::Origin::Ordinary,
+        };
         if !peer.current() || !connection.alive.load(Ordering::Acquire) {
             return Err(Error::Stale);
         }
-        {
+        let recorded = || -> Result<bool, Error> {
             let state = lock(&self.state)?;
-            issued(&state, &peer, member)?;
+            preload_sequence::check_current(&state, &key, &peer.process, &attempt)?;
+            issued_on(&state, &peer, member, connection)?;
             reservation::reservation_allows_member(&state, &peer.caller, member)?;
+            let current = state.members.get(&key).ok_or(Error::Stale)?;
+            if current.process != peer.process
+                || current.operation != operation
+                || current.registration != registration
+                || current.unknown
+                || !current.connection.same(connection)
+            {
+                return Err(Error::Stale);
+            }
+            let role = reservation::target::reported_role(&ready, &current.source)?;
+            Ok(!state.preloads.contains_key(&key)
+                && current.readiness.role == Some(role)
+                && state
+                    .preload_sequences
+                    .get(&key)
+                    .is_some_and(|ledger| ledger.completed(registration)))
+        };
+        if recorded()? {
+            return Ok(());
         }
+        let expected = {
+            let state = lock(&self.state)?;
+            preload_sequence::check_current(&state, &key, &peer.process, &attempt)?;
+            issued(&state, &peer, member)?;
+            if state
+                .actors
+                .get(&actor_key(&peer.caller))
+                .and_then(|actor| actor.issued.get(member))
+                .is_some_and(|issued| issued.target.is_some())
+            {
+                return Err(Error::Denied);
+            }
+            reservation::reservation_allows_member(&state, &peer.caller, member)?;
+            state.members.get(&key).ok_or(Error::Stale)?.source.clone()
+        };
+        let worker =
+            match preload_custody::enter_completion(self, &peer, member, operation, connection) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    if recorded()? {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            };
         let _gate = SourceWorkLease::for_home(env.home.as_deref().ok_or(Error::Unavailable)?)
             .map_err(|_| Error::Busy)?;
-        let now =
-            match slot::source(env, &peer.caller, operation).map_err(|_| Error::Unavailable)? {
-                slot::SourceProgress::Ready(source) => source,
-                slot::SourceProgress::Waiting => return Err(Error::Busy),
-            };
+        let now = match slot::source_matching_registered(env, &peer.caller, operation, &expected)
+            .map_err(|_| Error::Unavailable)?
+        {
+            slot::SourceProgress::Ready(source) => source,
+            slot::SourceProgress::Waiting => return Err(Error::Busy),
+        };
         let mut state = lock(&self.state)?;
+        preload_sequence::check_current(&state, &key, &peer.process, &attempt)?;
         if !connection.is_live() || !peer.current() {
             return Err(Error::Stale);
         }
@@ -1476,9 +1775,15 @@ impl Registry {
             Ready::PolicyUnavailable => ReadyRole::PolicyUnavailable,
         };
         // A Ready ACK cannot outrun the source worker whose custody it settles.
-        preload_custody::check_completion(&state, &key, operation, connection)?;
+        worker.check_completion(&state, &key)?;
+        reservation::target::resources::check_member_update(&state, &peer.caller, member)?;
         let current = state.members.get_mut(&key).ok_or(Error::Stale)?;
         current.readiness.complete(role)?;
+        state
+            .preload_sequences
+            .get_mut(&key)
+            .ok_or(Error::Stale)?
+            .complete(&attempt, registration)?;
         let preload = state.preloads.remove(&key);
         if let Some(token) = peer.launch
             && let Some(launch) = state.launches.get_mut(&token)
@@ -1502,7 +1807,8 @@ impl Registry {
         let key = member_key(caller, member)?;
         let state = lock(&self.state)?;
         let current = state.members.get(&key).ok_or(Error::Unavailable)?;
-        if !current.readiness.manager()
+        if reservation::target::normalize::handoff::source_revoked(&state, caller, member)
+            || !current.readiness.manager()
             || current.unknown
             || !current.connection.alive.load(Ordering::Acquire)
             || Process::observe(caller.pid).as_ref() != Some(&current.process)
@@ -1528,7 +1834,8 @@ impl Registry {
         let key = member_key(caller, member)?;
         let state = lock(&self.state)?;
         let current = state.members.get(&key).ok_or(Error::Unavailable)?;
-        if !current.readiness.reader()
+        if reservation::target::normalize::handoff::source_revoked(&state, caller, member)
+            || !current.readiness.reader()
             || current.unknown
             || !current.connection.is_live()
             || Process::observe(caller.pid).as_ref() != Some(&current.process)
@@ -1584,7 +1891,7 @@ impl Registry {
     }
 
     /// Off-main drain step after closing the App admission epoch, before waiting
-    /// for its scopes. At most MAX_LAUNCHES permissions are considered; no file
+    /// for its scopes. Bounded launch/resource permissions are considered; no file
     /// observation or process probing occurs. Busy is retried by the drain worker.
     /// Revocation denies late mandatory-bind consumers; it asserts no process death.
     pub fn revoke_cancelled_unclaimed(&self) -> Result<usize, Error> {
@@ -1597,30 +1904,83 @@ impl Registry {
                     .as_ref()
                     .is_some_and(|scope| scope.cancelled()))
         });
-        Ok(before - state.launches.len())
+        let retired = reservation::target::resources::refuse_cancelled(&mut state);
+        let removed = before - state.launches.len() + retired.len();
+        drop(state);
+        drop(retired);
+        Ok(removed)
     }
 
     pub fn reap_gone(&self) {
-        let processes = {
+        let (mut processes, target_owners) = {
             let Ok(state) = lock(&self.state) else { return };
-            state
+            let mut owners = reservation::target::owners(&state);
+            owners.extend(reservation::target::resources::owners(&state));
+            let processes = state
                 .members
                 .values()
                 .map(|item| item.process.clone())
                 .chain(state.unrelated.values().map(|item| item.process.clone()))
                 .chain(state.actors.values().map(|item| item.process.clone()))
-                .chain(
-                    state
-                        .launches
-                        .values()
-                        .filter_map(|item| item.process.clone()),
-                )
-                .collect::<Vec<_>>()
+                .chain(state.launches.values().flat_map(|item| {
+                    item.process.clone().into_iter().chain(
+                        item.native_restart
+                            .as_ref()
+                            .map(|native| native.child.clone()),
+                    )
+                }))
+                .chain(owners.iter().map(|(_, process)| process.clone()))
+                .collect::<Vec<_>>();
+            (processes, owners)
         };
+        // Deduplicate outside State: many accepted operations share one caller.
+        processes.sort_by(|a, b| {
+            (
+                a.pid,
+                a.birth,
+                a.parent,
+                a.group,
+                a.session,
+                a.image.device,
+                a.image.inode,
+                &a.image.path,
+            )
+                .cmp(&(
+                    b.pid,
+                    b.birth,
+                    b.parent,
+                    b.group,
+                    b.session,
+                    b.image.device,
+                    b.image.inode,
+                    &b.image.path,
+                ))
+        });
+        processes.dedup();
         // Process observation stays outside State. Exact process identities are
         // rechecked below; an unread process is never treated as departed.
         let departed = processes.into_iter().filter(gone).collect::<Vec<_>>();
         let is_gone = |process: &Process| departed.iter().any(|old| old == process);
+        let mut target_owners = target_owners
+            .into_iter()
+            .filter(|(_, process)| is_gone(process))
+            .collect::<Vec<_>>();
+        target_owners.sort_by(|(a, ap), (b, bp)| {
+            (
+                actor_key(a),
+                ap.image.device,
+                ap.image.inode,
+                &ap.image.path,
+            )
+                .cmp(&(
+                    actor_key(b),
+                    bp.image.device,
+                    bp.image.inode,
+                    &bp.image.path,
+                ))
+        });
+        target_owners.dedup_by(|a, b| a == b);
+
         let departed_preloads = {
             let Ok(state) = lock(&self.state) else { return };
             state
@@ -1643,6 +2003,18 @@ impl Registry {
         let Ok(mut state) = lock(&self.state) else {
             return;
         };
+        let mut target_constructors = Vec::new();
+        let mut target_resources = Vec::new();
+        for (caller, process) in &target_owners {
+            if let Ok(retired) =
+                reservation::target::revoke_dead_constructor_custody(&state, caller, process)
+            {
+                target_constructors.extend(retired);
+            }
+            target_resources.push(reservation::target::resources::revoke_departed(
+                &mut state, caller, process,
+            ));
+        }
         let preloads = departed_preloads
             .iter()
             .filter(|(key, pending)| {
@@ -1681,18 +2053,30 @@ impl Registry {
         let launch_keys = state
             .launches
             .iter()
-            .filter(|(_, item)| item.process.as_ref().is_some_and(is_gone))
+            .filter(|(_, item)| {
+                item.process.as_ref().is_some_and(is_gone)
+                    || item
+                        .native_restart
+                        .as_ref()
+                        .is_some_and(|native| native.cancelled() || is_gone(&native.child))
+            })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let launches = launch_keys
             .iter()
             .filter_map(|key| state.launches.remove(key))
             .collect::<Vec<_>>();
-        let actor_keys = state
+        let mut actor_keys = state
             .actors
             .iter()
             .filter(|(key, actor)| {
                 is_gone(&actor.process)
+                    && !target_owners.iter().any(|(caller, process)| {
+                        actor_key(caller) == **key
+                            && *process == actor.process
+                            && (reservation::target::constructor_custody_pending(&state, caller)
+                                || reservation::target::resources::custody_pending(&state, caller))
+                    })
                     && !state
                         .preloads
                         .keys()
@@ -1701,9 +2085,47 @@ impl Registry {
                         member.starts_with(&format!("{key}:"))
                             && reservation::has_credential_uses(&state, member)
                     })
+                    && !state.preload_sequences.iter().any(|(member, ledger)| {
+                        member.starts_with(&format!("{key}:"))
+                            && ledger.fenced()
+                            && !ledger.retired()
+                    })
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
+        let mut departed_custody = Vec::new();
+        actor_keys.retain(|key| {
+            let owner = target_owners.iter().find(|(caller, process)| {
+                actor_key(caller) == *key
+                    && state
+                        .actors
+                        .get(key)
+                        .is_some_and(|actor| actor.process == *process)
+            });
+            if let Some((caller, process)) = owner {
+                match reservation::target::take_departed_custody(&state, caller, process) {
+                    Ok(Some(custody)) => {
+                        departed_custody.push(custody);
+                        true
+                    }
+                    Ok(None) => true,
+                    Err(_) => false,
+                }
+            } else {
+                !state.reservations.contains_key(key)
+            }
+        });
+        let departed_open_owners = actor_keys
+            .iter()
+            .filter_map(|key| {
+                state
+                    .actors
+                    .get(key)
+                    .map(|actor| (key.clone(), actor.process.clone()))
+            })
+            .collect::<Vec<_>>();
+        let open_custody =
+            reservation::target::take_departed_open_custody(&mut state, &departed_open_owners);
         let actors = actor_keys
             .iter()
             .filter_map(|key| state.actors.remove(key))
@@ -1712,11 +2134,31 @@ impl Registry {
             .iter()
             .filter_map(|key| state.reservations.remove(key))
             .collect::<Vec<_>>();
+        let retired_keys = state
+            .retired_reservations
+            .keys()
+            .filter(|key| {
+                actor_keys
+                    .iter()
+                    .any(|actor| key.starts_with(&format!("{actor}:")))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let retired_reservations = retired_keys
+            .into_iter()
+            .filter_map(|key| state.retired_reservations.remove(&key))
+            .collect::<Vec<_>>();
         let stale_uses = state
             .uses
             .keys()
             .filter(|key| {
-                !state.members.contains_key(*key) && !reservation::has_credential_uses(&state, key)
+                (actor_keys
+                    .iter()
+                    .any(|actor| key.starts_with(&format!("{actor}:")))
+                    || state.actors.iter().any(|(actor, current)| {
+                        is_gone(&current.process) && key.starts_with(&format!("{actor}:"))
+                    }))
+                    && !reservation::has_credential_uses(&state, key)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1724,14 +2166,38 @@ impl Registry {
             .iter()
             .filter_map(|key| state.uses.remove(key))
             .collect::<Vec<_>>();
+        // Exact terminal PRELOAD receipts have no Scope. Keep them for the
+        // live native incarnation; only actual kernel departure discards them.
+        let sequence_keys = state
+            .preload_sequences
+            .keys()
+            .filter(|key| {
+                actor_keys
+                    .iter()
+                    .any(|actor| key.starts_with(&format!("{actor}:")))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let sequences = sequence_keys
+            .into_iter()
+            .filter_map(|key| state.preload_sequences.remove(&key))
+            .collect::<Vec<_>>();
+        let normalizations = reservation::target::normalize::take_unused(&mut state);
         drop(state);
         drop((
+            departed_custody,
+            target_constructors,
+            target_resources,
+            normalizations,
             members,
             unrelated,
             launches,
             actors,
             reservations,
+            retired_reservations,
             uses,
+            sequences,
+            open_custody,
             scopes,
             preloads,
             departed_preloads,
@@ -1757,6 +2223,29 @@ redacted!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_front_door_drop_retires_clones_and_releases_only_its_slot() {
+        let registry = Registry::default();
+        let survivor = registry.fixture_connection();
+        // More sequential owners than the whole table can retain. No global
+        // size assertion: other tests may own live connections concurrently.
+        for _ in 0..257 {
+            let front_door = registry.fixture_connection();
+            let token = front_door.clone();
+            assert!(token.is_live());
+            assert_ne!(token.id, survivor.id);
+            drop(front_door);
+            assert!(!token.is_live());
+            assert!(!connections().lock().unwrap().contains_key(&token.id));
+            assert!(survivor.is_live());
+        }
+        let token = survivor.clone();
+        registry.connection_closed(token.id);
+        drop(survivor);
+        assert!(!token.is_live());
+        assert!(!connections().lock().unwrap().contains_key(&token.id));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1792,7 +2281,7 @@ mod tests {
         // kernel gate. It does not fabricate a qualified SDK/source/manager.
         let home = aterm_tempfile::tempdir().unwrap();
         let registry = Registry::default();
-        let connection = registry.connection(u64::MAX - 41).unwrap();
+        let connection = registry.fixture_connection();
         let mut reader =
             SourceReadiness::preload(SourceWorkLease::for_home(home.path()).unwrap(), None)
                 .unwrap();
@@ -1885,6 +2374,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn constructor_quota_borrows_only_its_actual_scope_and_gate_incarnation() {
+        // Constructor/kernel custody only, not a source or provider capability.
+        let home = aterm_tempfile::tempdir().unwrap();
+        let process = Process::observe(std::process::id()).unwrap();
+        let lifetime = super::super::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let foreign = lifetime.enter().unwrap();
+        let registry = Registry::default();
+        let token = aterm_uds::rand::hex_token::<16>().unwrap();
+        registry.state.lock().unwrap().launches.insert(
+            token.clone(),
+            Launch {
+                sid: "s-quota-constructor-fixture".into(),
+                image: process.image.clone(),
+                expected_env: Vec::new(),
+                expected_unset: Vec::new(),
+                process: None,
+                typed: false,
+                gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
+                _scope: Some(scope.clone()),
+                initial: None,
+                native_restart: None,
+            },
+        );
+        let reservation = LaunchReservation {
+            token: token.clone(),
+            executable: std::env::current_exe().unwrap(),
+            state: Arc::downgrade(&registry.state),
+        };
+        assert!(reservation.native_usage_source(&foreign).is_err());
+        let borrowed = reservation.native_usage_source(&scope).unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                &borrowed.inner,
+                state.launches[&token].gate.as_ref().unwrap()
+            ));
+        }
+        scope.cancellation().cancel();
+        assert!(reservation.native_usage_source(&scope).is_err());
+        assert_eq!(registry.revoke_cancelled_unclaimed().unwrap(), 1);
+        assert!(reservation.native_usage_source(&scope).is_err());
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
+        drop(borrowed);
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn revoking_unclaimed_typed_permission_releases_gate_but_not_claimed_process() {
         // Constructor permission metadata only; this does not mint a qualified
         // SDK peer or a source/Ready proof.
@@ -1902,9 +2440,10 @@ mod tests {
                     expected_unset: Vec::new(),
                     process: claimed.then(|| process.clone()),
                     typed: true,
-                    gate: Some(SourceWorkLease::for_home(home.path()).unwrap()),
+                    gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
                     _scope: Some(lifetime.enter().unwrap()),
                     initial: None,
+                    native_restart: None,
                 },
             );
             LaunchReservation {
@@ -1952,7 +2491,7 @@ mod tests {
             launch: Some("unrelated".into()),
         };
         let registry = Registry::default();
-        let connection = registry.connection(u64::MAX - 3).unwrap();
+        let connection = registry.fixture_connection();
         let lifetime = super::super::account_work::Lifetime::default();
         registry.state.lock().unwrap().launches.insert(
             "unrelated".into(),
@@ -1963,9 +2502,10 @@ mod tests {
                 expected_unset: Vec::new(),
                 process: Some(process.clone()),
                 typed: true,
-                gate: Some(SourceWorkLease::for_home(home.path()).unwrap()),
+                gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
                 _scope: Some(lifetime.enter().unwrap()),
                 initial: None,
+                native_restart: None,
             },
         );
         let operation = "1234567890abcdef1234567890abcdef";
@@ -2011,7 +2551,7 @@ mod tests {
             ),
             Err(Error::Stale)
         );
-        let replacement = registry.connection(u64::MAX - 4).unwrap();
+        let replacement = registry.fixture_connection();
         assert!(
             registry
                 .open_member(&peer(), &replacement, operation)
@@ -2074,9 +2614,10 @@ mod tests {
             expected_unset: Vec::new(),
             process: None,
             typed: true,
-            gate: Some(SourceWorkLease::for_home(home.path()).unwrap()),
+            gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
             _scope: Some(scope),
             initial: None,
+            native_restart: None,
         };
         let pending = lifetime.enter().unwrap();
         let pending_cancel = pending.cancellation();
@@ -2124,7 +2665,7 @@ mod tests {
     #[test]
     fn eof_invalidates_connection_while_member_table_is_busy() {
         let registry = Registry::default();
-        let connection = registry.connection(u64::MAX - 1).unwrap();
+        let connection = registry.fixture_connection();
         let held = registry.state.lock().unwrap();
         registry.connection_closed(connection.id);
         assert!(!connection.alive.load(Ordering::Acquire));
@@ -2148,7 +2689,7 @@ mod tests {
             launch: None,
         };
         let registry = Registry::default();
-        let connection = registry.connection(u64::MAX - 2).unwrap();
+        let connection = registry.fixture_connection();
         let mut first = None;
         for number in 0..(MAX_MEMBERS + 32) {
             let operation = format!("{number:032x}");

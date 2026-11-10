@@ -251,6 +251,28 @@ fn read_json(path: &Path) -> Result<Value, Fail> {
 
 /// The setup comparison uses the same exact rank calculation but never changes row kinds.
 pub(super) fn settle_records(dir: &Path) -> Result<Value, Fail> {
+    setup_records(
+        dir,
+        "measure-settle",
+        "rewind::an_idle_recording_pane_adds_at_most_one_panes_budget_rss",
+    )
+}
+
+pub(super) fn wait_records(dir: &Path) -> Result<Value, Fail> {
+    let input = read_json(&dir.join("inputs.json"))?;
+    let lane = match input["lane"].as_str() {
+        Some("count-waits") => "count-waits",
+        Some("count-waits-only") => "count-waits-only",
+        _ => return Err(Fail::die("unknown Count-readiness experiment")),
+    };
+    setup_records(
+        dir,
+        lane,
+        "rewind::twenty_busy_recording_panes_add_at_most_the_pool",
+    )
+}
+
+fn setup_records(dir: &Path, lane: &str, planted_row: &str) -> Result<Value, Fail> {
     let dir = &std::fs::canonicalize(dir).map_err(|e| Fail::die(format!("settle record: {e}")))?;
     let log = |file: &str| -> Result<String, Fail> {
         let path = std::fs::canonicalize(dir.join(file))
@@ -275,9 +297,7 @@ pub(super) fn settle_records(dir: &Path) -> Result<Value, Fail> {
             return Err(Fail::die(format!("inconsistent settle evidence: {key}")));
         }
     }
-    if summary["complete"].as_bool() != Some(true)
-        || summary["lane"].as_str() != Some("measure-settle")
-    {
+    if summary["complete"].as_bool() != Some(true) || summary["lane"].as_str() != Some(lane) {
         return Err(Fail::die(
             "settle comparison needs the complete matched experiment",
         ));
@@ -310,8 +330,14 @@ pub(super) fn settle_records(dir: &Path) -> Result<Value, Fail> {
         if row["artifacts"]["verifier_log"].as_str() != Some(file.as_str()) {
             return Err(Fail::die("settle log does not belong to its take"));
         }
-        let text = log(&file)?;
+        let mut text = log(&file)?;
         let parsed = parse(&text)?;
+        // Direct bench drivers keep their phase clocks on stderr; the full verifier
+        // captures both streams in its human log. Retain the same spans for either driver.
+        if lane == "count-waits-only" {
+            text.push('\n');
+            text.push_str(&log(&format!("take-{}.stderr", i + 1))?);
+        }
         let wall = super::measure_costs::read(&text)?;
         if wall["rows"]
             .as_object()
@@ -336,9 +362,10 @@ pub(super) fn settle_records(dir: &Path) -> Result<Value, Fail> {
     }
     let control = read_json(&dir.join("negative-control.json"))?;
     let control_rows = parse(&log("negative-control.stdout")?)?;
-    let idle = "rewind::an_idle_recording_pane_adds_at_most_one_panes_budget_rss";
     if control["expected_failure"].as_bool() != Some(true)
-        || control_rows.get(idle).is_none_or(|r| r.verdict != "FAIL")
+        || control_rows
+            .get(planted_row)
+            .is_none_or(|r| r.verdict != "FAIL")
     {
         return Err(Fail::die("the planted RSS regression was not caught"));
     }
@@ -513,104 +540,153 @@ mod tests {
 
     #[test]
     fn settle_evidence_keeps_the_matched_plan_and_detects_a_planted_value_shift() {
-        let tmp = aterm_tempfile::Builder::new()
-            .prefix("settle-evidence-")
-            .tempdir()
-            .unwrap();
-        let dir = tmp.path();
-        let inputs = json!({"source_commit":"frozen", "astream_commit":"astream", "bundle_sha256":"bundle", "image":"image", "lane":"measure-settle", "guest":{"cpus":8}, "driver":"App"});
-        std::fs::write(dir.join("inputs.json"), inputs.to_string()).unwrap();
-        let row_name = "rewind::an_idle_recording_pane_adds_at_most_one_panes_budget_rss";
-        let started = json!({"event":"measure-row-started","matrix":"rewind","row":"an_idle_recording_pane_adds_at_most_one_panes_budget_rss","at_unix_ms":1000,"seconds":0.0});
-        let ended = json!({"event":"measure-row-finished","matrix":"rewind","row":"an_idle_recording_pane_adds_at_most_one_panes_budget_rss","at_unix_ms":2000,"seconds":1.0});
-        let other_start = json!({"event":"measure-row-started","matrix":"zz","row":"stable","at_unix_ms":2000,"seconds":0.0});
-        let other_end = json!({"event":"measure-row-finished","matrix":"zz","row":"stable","at_unix_ms":3000,"seconds":1.0});
-        let stable = format!(
-            "measure kind: {row_name} Timing\nverify-event: {started}\nverify-event: {ended}\nmeasure row: {row_name} PASS\nCOST idle_rss off_median_bytes=100 on_median_bytes=101 extra_bytes=1 off_app_median_bytes=50 on_app_median_bytes=51\nverify-event: {other_start}\nverify-event: {other_end}\nmeasure row: zz::stable PASS\ntext\n"
-        );
-        let mut rows = Vec::new();
-        for (i, mode) in "ABBAABBAAB".chars().enumerate() {
-            let file = format!("take-{}.verifier.log", i + 1);
-            std::fs::write(dir.join(&file), &stable).unwrap();
-            rows.push(json!({"take":i+1, "settle_mode":if mode=='A' {"baseline"} else {"candidate"}, "exit":0, "success":true, "usage":{"real":1.0,"user":0.1,"sys":0.1}, "artifacts":{"verifier_log":file}}));
-        }
-        for warm in ["warmup", "warmup-candidate"] {
+        for (lane, short, detail) in [
+            (
+                "measure-settle",
+                "an_idle_recording_pane_adds_at_most_one_panes_budget_rss",
+                "COST idle_rss off_median_bytes=100 on_median_bytes=101 extra_bytes=1 off_app_median_bytes=50 on_app_median_bytes=51",
+            ),
+            (
+                "count-waits",
+                "twenty_busy_recording_panes_add_at_most_the_pool",
+                "COST busy_rss off_bytes=100 on_bytes=101 extra_bytes=1 pool_used=50",
+            ),
+            (
+                "count-waits-only",
+                "twenty_busy_recording_panes_add_at_most_the_pool",
+                "COST busy_rss off_bytes=100 on_bytes=101 extra_bytes=1 pool_used=50",
+            ),
+        ] {
+            let settle_records = |dir: &Path| {
+                if lane.starts_with("count-waits") {
+                    wait_records(dir)
+                } else {
+                    super::settle_records(dir)
+                }
+            };
+            let tmp = aterm_tempfile::Builder::new()
+                .prefix("settle-evidence-")
+                .tempdir()
+                .unwrap();
+            let dir = tmp.path();
+            let inputs = json!({"source_commit":"frozen", "astream_commit":"astream", "bundle_sha256":"bundle", "image":"image", "lane":lane, "guest":{"cpus":8}, "driver":"App"});
+            std::fs::write(dir.join("inputs.json"), inputs.to_string()).unwrap();
+            let row_name = format!("rewind::{short}");
+            let started = json!({"event":"measure-row-started","matrix":"rewind","row":short,"at_unix_ms":1000,"seconds":0.0});
+            let ended = json!({"event":"measure-row-finished","matrix":"rewind","row":short,"at_unix_ms":2000,"seconds":1.0});
+            let other_start = json!({"event":"measure-row-started","matrix":"zz","row":"stable","at_unix_ms":2000,"seconds":0.0});
+            let other_end = json!({"event":"measure-row-finished","matrix":"zz","row":"stable","at_unix_ms":3000,"seconds":1.0});
+            let stable = format!(
+                "measure kind: {row_name} Timing\nverify-event: {started}\nverify-event: {ended}\nmeasure row: {row_name} PASS\n{detail}\nverify-event: {other_start}\nverify-event: {other_end}\nmeasure row: zz::stable PASS\ntext\n"
+            );
+            let mut rows = Vec::new();
+            for (i, mode) in "ABBAABBAAB".chars().enumerate() {
+                let file = format!("take-{}.verifier.log", i + 1);
+                std::fs::write(dir.join(&file), &stable).unwrap();
+                if lane == "count-waits-only" {
+                    std::fs::write(
+                        dir.join(format!("take-{}.stderr", i + 1)),
+                        "measure phase: row=busy_rss record=false phase=ready seconds=0.5\n",
+                    )
+                    .unwrap();
+                }
+                rows.push(json!({"take":i+1, "settle_mode":if mode=='A' {"baseline"} else {"candidate"}, "exit":0, "success":true, "usage":{"real":1.0,"user":0.1,"sys":0.1}, "artifacts":{"verifier_log":file}}));
+            }
+            for warm in ["warmup", "warmup-candidate"] {
+                std::fs::write(
+                    dir.join(format!("{warm}.json")),
+                    r#"{"exit":0,"success":true}"#,
+                )
+                .unwrap();
+                std::fs::write(dir.join(format!("{warm}.verifier.log")), &stable).unwrap();
+            }
             std::fs::write(
-                dir.join(format!("{warm}.json")),
-                r#"{"exit":0,"success":true}"#,
+                dir.join("negative-control.json"),
+                r#"{"expected_failure":true,"exit":101}"#,
             )
             .unwrap();
-            std::fs::write(dir.join(format!("{warm}.verifier.log")), &stable).unwrap();
+            let control = format!("measure row: {row_name} FAIL\nplanted RSS regression\n");
+            std::fs::write(dir.join("negative-control.stdout"), &control).unwrap();
+            let mut summary = inputs.clone();
+            let object = summary.as_object_mut().unwrap();
+            object.insert("complete".into(), json!(true));
+            object.insert("rows".into(), json!(rows));
+            std::fs::write(dir.join("rows.json"), summary.to_string()).unwrap();
+            let report = settle_records(dir).unwrap();
+            if lane == "count-waits-only" {
+                assert_eq!(report["wall_takes"][0]["wall"]["setup_phases"]["row=busy_rss record=false"]["ready"].as_f64(), Some(0.5));
+                std::fs::write(
+                    dir.join("take-1.stderr"),
+                    "measure phase: row=busy_rss record=false phase=ready seconds=NaN\n",
+                )
+                .unwrap();
+                assert!(
+                    settle_records(dir).is_err(),
+                    "invalid phase evidence in stderr cannot be ignored"
+                );
+                std::fs::write(
+                    dir.join("take-1.stderr"),
+                    "measure phase: row=busy_rss record=false phase=ready seconds=0.5\n",
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                report["whole_check"]["baseline"]["wall_s"]["median"].as_f64(),
+                Some(1.0)
+            );
+            assert_eq!(
+                report["rows"][0]["metrics"]["extra_bytes"]["p_two_sided"].as_f64(),
+                Some(1.)
+            );
+            assert!(
+                report["rows"][0]["kind"].is_null(),
+                "the offline reader must not reclassify a Timing row"
+            );
+            let missing_boundaries = stable
+                .lines()
+                .filter(|line| !line.contains("\"matrix\":\"zz\""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(dir.join("take-2.verifier.log"), missing_boundaries).unwrap();
+            assert!(
+                settle_records(dir).is_err(),
+                "a row with both wall boundaries missing cannot silently disappear"
+            );
+            std::fs::write(dir.join("take-2.verifier.log"), &stable).unwrap();
+            for i in [2, 3, 6, 7, 10] {
+                std::fs::write(
+                    dir.join(format!("take-{i}.verifier.log")),
+                    stable.replace("extra_bytes=1", "extra_bytes=16000000"),
+                )
+                .unwrap();
+            }
+            let shifted = settle_records(dir).unwrap();
+            assert_eq!(
+                shifted["rows"][0]["metrics"]["extra_bytes"]["shift"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                shifted["rows"][0]["metrics"]["extra_bytes"]["extreme_assignments"].as_u64(),
+                Some(2)
+            );
+            std::fs::write(dir.join("negative-control.stdout"), &stable).unwrap();
+            assert!(
+                settle_records(dir).is_err(),
+                "a passing planted regression cannot qualify"
+            );
+            std::fs::write(dir.join("negative-control.stdout"), &control).unwrap();
+            std::fs::write(dir.join("warmup.json"), r#"{"exit":1,"success":false}"#).unwrap();
+            assert!(
+                settle_records(dir).is_err(),
+                "a failed warm-up cannot be discarded"
+            );
+            std::fs::write(dir.join("warmup.json"), r#"{"exit":0,"success":true}"#).unwrap();
+            std::fs::remove_file(dir.join("take-2.verifier.log")).unwrap();
+            assert!(
+                settle_records(dir).is_err(),
+                "a missing take cannot qualify"
+            );
         }
-        std::fs::write(
-            dir.join("negative-control.json"),
-            r#"{"expected_failure":true,"exit":101}"#,
-        )
-        .unwrap();
-        let control = format!("measure row: {row_name} FAIL\nplanted RSS regression\n");
-        std::fs::write(dir.join("negative-control.stdout"), &control).unwrap();
-        let mut summary = inputs.clone();
-        let object = summary.as_object_mut().unwrap();
-        object.insert("complete".into(), json!(true));
-        object.insert("rows".into(), json!(rows));
-        std::fs::write(dir.join("rows.json"), summary.to_string()).unwrap();
-        let report = settle_records(dir).unwrap();
-        assert_eq!(
-            report["whole_check"]["baseline"]["wall_s"]["median"].as_f64(),
-            Some(1.0)
-        );
-        assert_eq!(
-            report["rows"][0]["metrics"]["extra_bytes"]["p_two_sided"].as_f64(),
-            Some(1.)
-        );
-        assert!(
-            report["rows"][0]["kind"].is_null(),
-            "the offline reader must not reclassify a Timing row"
-        );
-        let missing_boundaries = stable
-            .lines()
-            .filter(|line| !line.contains("\"matrix\":\"zz\""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(dir.join("take-2.verifier.log"), missing_boundaries).unwrap();
-        assert!(
-            settle_records(dir).is_err(),
-            "a row with both wall boundaries missing cannot silently disappear"
-        );
-        std::fs::write(dir.join("take-2.verifier.log"), &stable).unwrap();
-        for i in [2, 3, 6, 7, 10] {
-            std::fs::write(
-                dir.join(format!("take-{i}.verifier.log")),
-                stable.replace("extra_bytes=1", "extra_bytes=16000000"),
-            )
-            .unwrap();
-        }
-        let shifted = settle_records(dir).unwrap();
-        assert_eq!(
-            shifted["rows"][0]["metrics"]["extra_bytes"]["shift"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            shifted["rows"][0]["metrics"]["extra_bytes"]["extreme_assignments"].as_u64(),
-            Some(2)
-        );
-        std::fs::write(dir.join("negative-control.stdout"), &stable).unwrap();
-        assert!(
-            settle_records(dir).is_err(),
-            "a passing planted regression cannot qualify"
-        );
-        std::fs::write(dir.join("negative-control.stdout"), &control).unwrap();
-        std::fs::write(dir.join("warmup.json"), r#"{"exit":1,"success":false}"#).unwrap();
-        assert!(
-            settle_records(dir).is_err(),
-            "a failed warm-up cannot be discarded"
-        );
-        std::fs::write(dir.join("warmup.json"), r#"{"exit":0,"success":true}"#).unwrap();
-        std::fs::remove_file(dir.join("take-2.verifier.log")).unwrap();
-        assert!(
-            settle_records(dir).is_err(),
-            "a missing take cannot qualify"
-        );
     }
 
     #[test]

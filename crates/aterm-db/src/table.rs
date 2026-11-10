@@ -940,6 +940,24 @@ impl<'a> Session<'a> {
         Self::with_generation(bootstrap, journal, generation, Some(deadline), None)
     }
 
+    /// [`Self::observe_until`] for a home its reader named with
+    /// [`crate::generation::observed_generation_until`] rather than authorizing its chain as a
+    /// writer does ([`crate::generation::selected`]): a successor home's predecessors are observed
+    /// once, after `bootstrap`'s custody is open, and the session keeps that observation
+    /// ([`crate::documents::application::observed_session`]), with `deadline` bounding each wait
+    /// and the session's later generation checks.
+    ///
+    /// # Errors
+    /// As [`Self::observe_until`].
+    pub(crate) fn observe_named_until(
+        bootstrap: &'a Bootstrap,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        let journal =
+            Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        crate::documents::application::observed_session(bootstrap, journal, deadline, &|| deadline)
+    }
+
     /// [`Self::observation`] as this session's home stands now: its control view read again and
     /// its access judged again, the kept generation checked as each use checks it. Nothing is
     /// established or observed again, so no holder of a predecessor's custody is waited for.

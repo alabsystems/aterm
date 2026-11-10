@@ -50,7 +50,7 @@ pub(crate) const PAGE: Page = Page {
         row(
             "agent",
             "program agent agent_detail agent_rev agent_since_ms agent_gen agent_fp wait wait_gib \
-         wait_ahead program_state program_state_ms last_act auth token",
+         wait_ahead composer program_state program_state_ms last_act auth token",
         ),
         row(
             "theme",
@@ -216,6 +216,7 @@ pub(crate) const PAGE: Page = Page {
                     "`program= agent=<busy|prompt|question|idle|survey|unknown|wall:<kind>|-> \
                      agent_detail= agent_rev= agent_since_ms= agent_gen= agent_fp= \
                      wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|-> \
+                     composer=<empty|placeholder|draft|-> \
                      program_state=<idle|working|blocked|done|error>[:<permission|question|auth>] \
                      program_state_ms= last_act= auth=<stored|token|outside|-> token=<state|->`",
                 ),
@@ -225,7 +226,8 @@ pub(crate) const PAGE: Page = Page {
                      `wait_gib=` its claim to a tenth of a GiB and `wait_ahead=` the claims ahead \
                      of it, as its ledger said at most about 5 s ago, `-` where its ledger is \
                      unread; `agent_detail=bash:read-only` is the read-only rule's advisory \
-                     verdict on a Bash box's command alone.",
+                     verdict on a Bash box's command alone; `composer=` is the composer's proven \
+                     content, with `-` where no composer is drawn or its text is not proven.",
                 ),
                 para(
                     "`program_state=` is the root OSC 7501 report of the program in front when \

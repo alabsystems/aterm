@@ -26,7 +26,7 @@ fn transition_with_early_roster(state: &State, action: &str, early_roster: bool)
     }
     let _source = TestSourceOverride::new(SourceSnapshot::Absent);
     let cli = [Cli::Codex, Cli::Grok, Cli::Kimi, Cli::Agy][state["provider"] as usize];
-    let cut = state["cut"] as usize;
+    let cut = [0, 1, 2, 3, 4, 6, 7][state["cut"] as usize];
     let bed = Bed::new("provider-publication");
     let store = bed.seed_records(cli);
     super::super::super::ai_pool::tests::seed_local_swarm_roster(&bed.home, "m100", &["m16"]);
@@ -57,6 +57,7 @@ fn transition_with_early_roster(state: &State, action: &str, early_roster: bool)
         store.state_file(),
         store.logins_file(),
         store.ledger_path(),
+        store.source_policy_file(),
     ];
     let images = || {
         paths
@@ -108,6 +109,7 @@ fn transition_with_early_roster(state: &State, action: &str, early_roster: bool)
             && current.active.as_deref() == Some("kept")
             && current.pinned
             && current.accounts["kept"].auth == accounts::Auth::SignedOut
+            && store.source_policy().unwrap().retired()
     } else {
         true
     };
@@ -128,7 +130,7 @@ fn transition_with_early_roster(state: &State, action: &str, early_roster: bool)
     next
 }
 
-/// Four providers, six durable cuts and three recovery conditions enter the real
+/// Four providers, seven durable cuts and three recovery conditions enter the real
 /// sync. A receipt around the later state write alone cannot pass cut zero.
 #[test]
 fn provider_roster_and_pool_identity_recover_as_one_publication() {
@@ -147,7 +149,7 @@ fn provider_roster_and_pool_identity_recover_as_one_publication() {
             }
         }
     }
-    assert_eq!(recoveries, 72);
+    assert_eq!(recoveries, 84);
     let premature = transition_with_early_roster(&model.init_state(), "Recover", true);
     assert!(
         !model

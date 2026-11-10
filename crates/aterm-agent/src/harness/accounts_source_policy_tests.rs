@@ -73,6 +73,29 @@ fn retirement_requires_the_matching_store_writer_before_editing() {
     let held = first.store.acquire().unwrap();
     let before = second.images();
     assert!(second.store.retire_source_held(&held, NOW).is_err());
+    for state in [false, true] {
+        let target = || SyncTarget {
+            path: &second.roster,
+            before: None,
+            after: Some(ROSTER),
+            mode: None,
+            fleet: None,
+        };
+        let result = if state {
+            second.store.transact_roster_state_held(
+                &held,
+                NOW,
+                &mut None,
+                target(),
+                (true, |_| panic!("foreign writer reached state edit")),
+            )
+        } else {
+            second
+                .store
+                .transact_roster_held(&held, NOW, &mut None, target(), true)
+        };
+        assert!(result.is_err());
+    }
     assert!(
         second
             .store
@@ -142,6 +165,30 @@ impl Bed {
         CUT.set(Some(cut));
         let result = if mode == 0 {
             self.store.retire_source_held(&held, NOW).map(|_| ())
+        } else if mode >= 4 {
+            let target = SyncTarget {
+                path: &self.roster,
+                before: None,
+                after: Some(ROSTER),
+                mode: None,
+                fleet: None,
+            };
+            if mode == 4 {
+                self.store
+                    .transact_roster_held(&held, NOW, &mut None, target, true)
+            } else {
+                self.store.transact_roster_state_held(
+                    &held,
+                    NOW,
+                    &mut None,
+                    target,
+                    (true, |state| {
+                        state.swarm_label = Some("m17".into());
+                        Ok(Vec::new())
+                    }),
+                )
+            }
+            .map(|_| ())
         } else if mode == 3 {
             self.store
                 .transact_fleet_state_policy_held(
@@ -301,6 +348,8 @@ fn retirement_is_retained_across_every_receipt_role_and_cut() {
     }
     for (mutant, mode, conflict, invariant) in [
         (1, 2, 0, "CommittedRetires"),
+        (1, 4, 0, "CommittedRetires"),
+        (1, 5, 0, "CommittedRetires"),
         (2, 2, 1, "ConflictPreservesEveryImage"),
         (3, 0, 0, "LostPolicyIsNotInitial"),
         (4, 2, 0, "PendingFencesPolicy"),

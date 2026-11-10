@@ -871,7 +871,9 @@ fn busy(
     bytes: usize,
     budget: Budget,
 ) -> Result<(u64, (u64, u64)), CouldNotRun> {
+    let mut phases = super::instance::Phases::new(format!("row=busy_rss record={record}"));
     let take = Take::launch(rig, record, budget)?;
+    phases.end("launch");
     let mut targets = vec![None];
     for _ in 1..panes {
         let sid = take.inst.ctl.ok(&["spawn", "window=0", "raise=false"])?;
@@ -881,21 +883,29 @@ fn busy(
             .ok_or_else(|| CouldNotRun::Refused(format!("spawn named no session ({sid})")))?;
         targets.push(Some(format!("@{sid}")));
     }
-    for target in targets.iter().flatten() {
+    phases.end("spawn");
+    let ready = |target: &String| {
         take.inst
             .ctl
-            .ok(&[target, "await", "idle", "500", "timeout=60000"])?;
-    }
+            .ok(&[target, "await", "idle", "500", "timeout=60000"])
+            .map(|_| ())
+    };
+    let panes: Vec<_> = targets.iter().flatten().cloned().collect();
+    await_panes(&panes, ready)?;
+    phases.end("ready");
     let outs: Vec<PathBuf> = (0..targets.len())
         .map(|n| take.home.join(format!("drain-{n}.us")))
         .collect();
     for (target, out) in targets.iter().zip(&outs) {
         take.start_drain(rig, target.as_deref(), bytes, out)?;
     }
+    phases.end("send");
     for out in &outs {
         take.drained_us(out)?;
     }
+    phases.end("drain");
     let rss = take.settled_rss()?;
+    phases.end("settle_sample");
     let status = take.inst.ctl.ok(&["temporal", "status"])?;
     let pool = |key| field(&status, key).and_then(|v| v.parse::<u64>().ok());
     let pool = match (pool("pool_used"), pool("pool_limit")) {
@@ -903,7 +913,33 @@ fn busy(
         _ if !record => (0, 0),
         _ => return unanswered(format!("temporal status named no pool ({status})")),
     };
+    phases.end("fences");
+    drop(take);
+    phases.end("stop");
     Ok((rss, pool))
+}
+
+/// Each pane must cross the same quiet fence before any producer starts. Independent
+/// fences observe together; all workers are joined even when one pane refuses.
+fn await_panes<T: Sync>(
+    panes: &[T],
+    ready: impl Fn(&T) -> Result<(), CouldNotRun> + Sync,
+) -> Result<(), CouldNotRun> {
+    std::thread::scope(|scope| {
+        let ready = &ready;
+        let waits: Vec<_> = panes
+            .iter()
+            .map(|pane| scope.spawn(move || ready(pane)))
+            .collect();
+        let mut result = Ok(());
+        for wait in waits {
+            let observed = wait
+                .join()
+                .unwrap_or_else(|_| could_not_run("a pane readiness worker panicked"));
+            result = result.and(observed);
+        }
+        result
+    })
 }
 
 const fn verdict(pass: bool) -> ShapeVerdict {
@@ -917,6 +953,48 @@ const fn verdict(pass: bool) -> ShapeVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_fences_overlap_and_a_refusal_joins_every_observer() {
+        let (started, starts) = std::sync::mpsc::channel();
+        let channels: Vec<_> = (0..3).map(|_| std::sync::mpsc::channel::<()>()).collect();
+        let (releases, panes): (Vec<_>, Vec<_>) = channels
+            .into_iter()
+            .map(|(tx, rx)| (tx, std::sync::Mutex::new(rx)))
+            .unzip();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                await_panes(&panes, |pane| {
+                    started.send(()).expect("report fence entry");
+                    pane.lock()
+                        .expect("one observer")
+                        .recv()
+                        .expect("release fence");
+                    could_not_run("planted refusal")
+                })
+            });
+            let all_entered = (0..panes.len()).all(|_| {
+                starts
+                    .recv_timeout(super::super::instance::MUST_HAPPEN)
+                    .is_ok()
+            });
+            // Release even a sequential mutant, so the negative control fails without hanging.
+            for release in releases {
+                let _ = release.send(());
+            }
+            let result = worker.join().expect("observer coordinator");
+            assert!(all_entered, "all fences must start before any is released");
+            assert_eq!(result, could_not_run("planted refusal"));
+        });
+        assert_eq!(await_panes(&[0, 1, 2], |_| Ok(())), Ok(()));
+        assert_eq!(
+            await_panes(&[0, 1, 2], |pane| {
+                assert_ne!(*pane, 1, "planted observer panic");
+                Ok(())
+            }),
+            could_not_run("a pane readiness worker panicked")
+        );
+    }
 
     #[test]
     fn idle_rss_reads_at_the_quiet_fence_and_busy_rss_keeps_its_delay() {

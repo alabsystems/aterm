@@ -694,6 +694,7 @@ mod tests {
     fn a_fake_account_home_is_guarded_beside_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
             .prefix("lab-homes-")
+            .suffix(".noindex")
             .tempdir()
             .unwrap();
         let real = std::fs::canonicalize(top.path()).unwrap();
@@ -795,21 +796,10 @@ mod tests {
         }
     }
 
-    struct Tree(PathBuf);
-
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct Tree(crate::TestScratch);
 
     fn tree(name: &str) -> Tree {
-        let top = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("lab-paths-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&top);
-        std::fs::create_dir_all(&top).unwrap();
-        Tree(top)
+        Tree(crate::TestScratch::new(name))
     }
 
     fn mode(p: &Path) -> u32 {
@@ -924,7 +914,7 @@ mod tests {
         }
         p.state = PathBuf::from("/");
         assert!(p.need_state_outside(&homes).is_err());
-        p.state.clone_from(&t.0);
+        p.state = t.0.to_path_buf();
         assert!(
             p.need_state_outside(&homes)
                 .unwrap_err()

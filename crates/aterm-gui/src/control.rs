@@ -10586,6 +10586,16 @@ fn serve_session_verb(
         );
     }
     if verb == "codex-accounts-change" {
+        if rest.split_ascii_whitespace().next() == Some("assignment-target") {
+            note_connection_claim();
+            return crate::native_act::serve_codex_assignment_policy(
+                self_ctx,
+                master,
+                rest,
+                &cx.account_services.source_registry,
+                serving_connection(),
+            );
+        }
         return crate::native_act::serve_codex_enrollment(
             self_ctx,
             master,

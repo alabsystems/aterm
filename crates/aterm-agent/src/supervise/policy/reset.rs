@@ -47,7 +47,7 @@ impl ResetAsk {
 pub struct ResetGo {
     /// The wall's reset (unix seconds), from this process's own transcript row.
     pub until: i64,
-    /// The wall stands more than a day from now.
+    /// The wall stands at least twelve hours from now.
     pub long: bool,
     /// Names the walled window is drawn by in a confirmation's body.
     pub limits: Vec<String>,

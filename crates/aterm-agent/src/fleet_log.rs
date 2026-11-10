@@ -55,7 +55,7 @@ use crate::fleet_vault::Vault;
 use aterm_net::fleet::NodeKey;
 use aterm_net::fleet_member::{MemberKeys, Standing};
 use aterm_secrets::membership_log::{Log, Membership, NodeStanding};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -357,13 +357,121 @@ fn metadata_stamp(file: &Path) -> Option<Stamp> {
     })
 }
 
+/// A cold read's physical identity. The handle prevents inode reuse while the read runs;
+/// change time catches an in-place write even when the original bytes are restored.
+struct ReadIdentity {
+    _file: std::fs::File,
+    stamp: ReadStamp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReadStamp {
+    device: u64,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+impl ReadStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl ReadIdentity {
+    fn open(path: &Path, directory: bool) -> std::io::Result<Self> {
+        let flags =
+            libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !(if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }) {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let identity = Self {
+            _file: file,
+            stamp: ReadStamp::of(&metadata),
+        };
+        if !identity.stands(path, directory) {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        Ok(identity)
+    }
+
+    fn stands(&self, path: &Path, directory: bool) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            (if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }) && self.stamp == ReadStamp::of(&metadata)
+        })
+    }
+}
+
+/// Only a cold read holds these identities. Warm semantic equality may still ignore a
+/// heartbeat's atomic state rewrite. A held ancestor witnesses a not-yet-created vault too.
+struct StateRead {
+    directory_path: PathBuf,
+    directory: ReadIdentity,
+    state: Option<ReadIdentity>,
+}
+
+impl StateRead {
+    fn of(paths: &aterm_secrets::client::Paths) -> Option<Self> {
+        let mut directory_path = paths.dir.clone();
+        let directory = loop {
+            match ReadIdentity::open(&directory_path, true) {
+                Ok(directory) => break directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    directory_path = directory_path.parent()?.to_path_buf();
+                }
+                Err(_) => return None,
+            }
+        };
+        let state_path = paths.dir.join("state.toml");
+        let state = match ReadIdentity::open(&state_path, false) {
+            Ok(state) => Some(state),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        Some(Self {
+            directory_path,
+            directory,
+            state,
+        })
+    }
+
+    fn stands(&self, paths: &aterm_secrets::client::Paths) -> bool {
+        let state_path = paths.dir.join("state.toml");
+        self.directory.stands(&self.directory_path, true)
+            && match &self.state {
+                Some(state) => state.stands(&state_path, false),
+                None => matches!(
+                    std::fs::symlink_metadata(&state_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ),
+            }
+    }
+}
+
 /// The membership store one process reads, with the verdict it last evaluated and the stamp it
 /// read it at.
 pub struct LocalLog {
     file: PathBuf,
     paths: Option<aterm_secrets::client::Paths>,
-    /// The other files the reader reads; for a store `paths` keeps, the vault's configuration
-    /// (`source.toml`) first.
+    /// The other files the reader reads, stamped by their metadata; for a store `paths` keeps,
+    /// the vault's configuration (`source.toml`) first. Its `state.toml` is stamped by what it
+    /// holds ([`StateStamp`]).
     aux_files: Vec<PathBuf>,
     read: Reader,
     held: Mutex<Option<Held>>,
@@ -376,10 +484,52 @@ struct Held {
     /// `None` while the store's file is missing.
     stamp: Option<Stamp>,
     aux_stamps: Vec<Option<Stamp>>,
+    state: StateStamp,
     /// The vault the verdict was read under; `None` with none pinned, or where its
     /// configuration moved during the read, so which one the verdict is of is unknown.
     vault: Option<Vault>,
     keys: Option<Arc<MemberKeys>>,
+}
+
+/// What a [`LocalLog`] a store's `paths` keep stamps that vault's `state.toml` by: what it holds
+/// but the heartbeat a vault round rewrites about every 25 s
+/// ([`aterm_secrets::client::state_standing`]: when the vault last heard this Mac, the receipts
+/// of its rounds), which no verdict is read from. Stamped by its metadata, each round read the
+/// store, the history and the envelope again: 16.5 MB a round on a Linux arm64 member
+/// (2026-11-09). A semantic digest can return to its old value. [`StateRead`] fences each cold
+/// read with physical state and namespace identities; [`StateStamp::across`] additionally
+/// rejects different semantic stamps at the read's endpoints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateStamp {
+    /// A store no `paths` keeps (a test's lab), whose reader reads no vault state.
+    Unkept,
+    /// What it holds but the heartbeat, digested; `None` with no file.
+    Standing(Option<[u8; 32]>),
+    /// It could not be read, or it moved during the read the verdict was held from: a stamp no
+    /// later one matches, so the next call reads again.
+    Unread,
+}
+
+impl StateStamp {
+    fn of(paths: Option<&aterm_secrets::client::Paths>) -> Self {
+        match paths.map(aterm_secrets::client::state_standing) {
+            None => Self::Unkept,
+            Some(Ok(standing)) => Self::Standing(standing),
+            Some(Err(_)) => Self::Unread,
+        }
+    }
+
+    /// Whether a verdict stamped so stands where the state is stamped `now`.
+    fn stands(self, now: Self) -> bool {
+        self == now && now != Self::Unread
+    }
+
+    /// The semantic stamp a cold verdict is held under: this one when `after` is equal,
+    /// [`Self::Unread`] otherwise. Equal semantic endpoints alone do not detect a full ABA;
+    /// a kept vault's [`StateRead`] must also stand across the cold read.
+    fn across(self, after: Self) -> Self {
+        if self == after { self } else { Self::Unread }
+    }
 }
 
 impl LocalLog {
@@ -390,10 +540,10 @@ impl LocalLog {
     pub fn of(paths: &aterm_secrets::client::Paths) -> Self {
         let from = paths.clone();
         // The vault's configuration first ([`LocalLog::same_vault`]); then the acknowledged
-        // history, which an acknowledgement alone moves.
+        // history, which an acknowledgement alone moves. `state.toml` is stamped by what it holds
+        // ([`StateStamp`]).
         let aux_files = [
             paths.dir.join("source.toml"),
-            paths.dir.join("state.toml"),
             paths.dir.join("vault"),
             paths.dir.join("identity"),
         ]
@@ -468,10 +618,12 @@ impl LocalLog {
         &self.file
     }
 
-    /// The log's admission now: read again only when a file the reader reads changed since the
-    /// last read. `None` only where a read found no log: no vault, or a store with no genesis
-    /// while the version of the vault this Mac applied names no log (one that names one fails
-    /// the read: `acknowledged_member_keys`).
+    /// The log's admission now: reuse the last verdict while its file stamps and semantic state
+    /// (`state.toml` without heartbeat telemetry, [`StateStamp`]) stand. A cold read whose physical
+    /// state or namespace identity moved ([`StateRead`]) supplies no fresh verdict. `None` only
+    /// where a read found no log: no vault, or a store with no genesis while the version of the
+    /// vault this Mac applied names no log (one that names one fails the read:
+    /// `acknowledged_member_keys`).
     /// A store that cannot be read, its data file unresolved or missing included, and the flat
     /// layout's records file gone while the history this Mac acknowledged holds its genesis,
     /// keeps the verdict last read from it while the vault it was read under stays configured
@@ -485,8 +637,9 @@ impl LocalLog {
     /// keeps that verdict too, until the store reads a log again or the vault configured is
     /// another or none.
     pub fn keys(&self) -> Option<Arc<MemberKeys>> {
-        // Taken before the read: a write between the two moves the next stamp. The data file's is
-        // `None` where that file cannot even be resolved.
+        // Snapshot the inputs for hot reuse. Cold reads take the state's semantic stamp again
+        // inside StateRead's physical fence below. The data file's is `None` where that file
+        // cannot even be resolved.
         let file_stamp = match &self.paths {
             Some(paths) => paths.records_data_file().ok(),
             None => Some(self.file.clone()),
@@ -494,6 +647,7 @@ impl LocalLog {
         .map(|file| metadata_stamp(&file));
         let aux_stamps: Vec<Option<Stamp>> =
             self.aux_files.iter().map(|p| metadata_stamp(p)).collect();
+        let state = StateStamp::of(self.paths.as_ref());
         let mut held = self
             .held
             .lock()
@@ -505,13 +659,29 @@ impl LocalLog {
         if let Some(held) = held.as_ref()
             && held.stamp == file_stamp
             && held.aux_stamps == aux_stamps
+            && held.state.stands(state)
         {
             return held.keys.clone();
         }
+        // A cold read must not give a verdict read under B after A -> B -> A: semantic
+        // equality alone cannot see that interval. Hold fresh physical identities only here,
+        // after acquiring `held`, then re-take the semantic stamp inside that fence.
+        let window = self.paths.as_ref().map(StateRead::of);
+        let state = StateStamp::of(self.paths.as_ref());
         // Read before the store, as the stamps are.
         let vault = self.vault();
-        let Ok(keys) = (self.read)() else {
-            return Some(self.kept_or_unread(held.as_ref(), &aux_stamps, vault.as_ref()));
+        let read = (self.read)();
+        let after_state = StateStamp::of(self.paths.as_ref());
+        if let Some(paths) = &self.paths
+            && !window
+                .as_ref()
+                .and_then(Option::as_ref)
+                .is_some_and(|window| window.stands(paths))
+        {
+            return Some(self.kept_now_or_unread(held.as_ref()));
+        }
+        let Ok(keys) = read else {
+            return Some(self.kept_now_or_unread(held.as_ref()));
         };
         if keys.is_none()
             && let Some(kept) = self.verdict_to_keep(held.as_ref(), &aux_stamps, vault.as_ref())
@@ -522,10 +692,13 @@ impl LocalLog {
         let vault = vault.filter(|_| {
             self.aux_files.first().map(|file| metadata_stamp(file)) == aux_stamps.first().copied()
         });
+        // A state that moved during the read can move back: its stamp stands for no verdict.
+        let state = state.across(after_state);
         let keys = keys.map(Arc::new);
         *held = Some(Held {
             stamp: file_stamp,
             aux_stamps,
+            state,
             vault,
             keys: keys.clone(),
         });
@@ -578,6 +751,26 @@ impl LocalLog {
     ) -> Arc<MemberKeys> {
         self.verdict_to_keep(held, aux_stamps, now)
             .unwrap_or_else(|| Arc::clone(&self.unread))
+    }
+
+    /// Fallback after a cold read uses the vault configured now, never the descriptor taken
+    /// before a writer moved it. A descriptor whose auxiliary inputs moved is no witness.
+    fn kept_now_or_unread(&self, held: Option<&Held>) -> Arc<MemberKeys> {
+        let before: Vec<_> = self
+            .aux_files
+            .iter()
+            .map(|path| metadata_stamp(path))
+            .collect();
+        let vault = self.vault();
+        let after: Vec<_> = self
+            .aux_files
+            .iter()
+            .map(|path| metadata_stamp(path))
+            .collect();
+        if before != after {
+            return Arc::clone(&self.unread);
+        }
+        self.kept_or_unread(held, &after, vault.as_ref())
     }
 }
 
@@ -859,7 +1052,11 @@ mod tests {
                 }
             }
         });
-        assert!(log.keys().is_some_and(|keys| keys.admits(&key)));
+        let moved = log.keys().expect("a conservative verdict");
+        assert!(
+            moved.unread().is_some() && !moved.admits(&key),
+            "a configuration moved during the read grants no fresh verdict"
+        );
         aterm_secrets::fsx::write_atomic(&source, configured("a", "m22", 1, &[]).as_bytes(), 0o600)
             .unwrap();
         aterm_secrets::fsx::write_atomic(&store, b"broken", 0o600).unwrap();
@@ -873,6 +1070,248 @@ mod tests {
             keys.unread().is_some() && !keys.admits(&key),
             "a verdict read while the configuration moved is kept as the vault's before it"
         );
+    }
+
+    /// A vault's round, and the heartbeat a round rewrites `state.toml` for (when the vault last
+    /// heard this Mac), serve the verdict held: no store, history or envelope is read again for
+    /// them ([`StateStamp`]). A change of what else the file holds reads the store again, as a
+    /// change of any file the reader reads does.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-09): with `state.toml` back among the files stamped by their
+    /// metadata, the round reads the store again (`a round serves the verdict held`); with the
+    /// state's stamp never compared (`stands` always true), the change is not read (`a change of
+    /// the state reads the store again`).
+    #[test]
+    fn a_heartbeat_of_the_vault_state_reads_no_store_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (running, paths) = seeded_vault(root.path());
+
+        let log = LocalLog::of(&paths);
+        let read = log.keys().expect("the seeded log");
+        assert!(read.unread().is_none(), "PRECONDITION: a log read");
+        let held = |when: &str| {
+            assert!(
+                Arc::ptr_eq(&read, &log.keys().expect("a verdict")),
+                "{when} serves the verdict held"
+            );
+        };
+        held("nothing moved");
+        aterm_secrets::client::sync(&paths, None).expect("a round that finds nothing new");
+        held("a round");
+        bump_state(&paths, "heard");
+        held("a heartbeat's rewrite");
+        bump_state(&paths, "requested");
+        assert!(
+            !Arc::ptr_eq(&read, &log.keys().expect("a verdict")),
+            "a change of the state reads the store again"
+        );
+        running.stop();
+    }
+
+    /// A vault served from under `root` whose one member, m22 (the returned paths), seeded its
+    /// roster, genesis and log and synced them.
+    fn seeded_vault(root: &Path) -> (aterm_secrets::server::Running, aterm_secrets::client::Paths) {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let running = aterm_secrets::server::start(
+            socket,
+            &aterm_secrets::server::Options {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: root.join("server"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(50),
+                keep_awake: false,
+            },
+        )
+        .unwrap();
+        let url = format!("http://{}/v1/test", running.addr);
+        let paths = aterm_secrets::client::Paths::for_home(&root.join("m22-home"));
+        aterm_secrets::client::create(&paths, &url, None, Some("m22")).unwrap();
+        aterm_secrets::client::admin_seed_swarm_roster(&paths, &[]).unwrap();
+        aterm_secrets::client::seed_vault_genesis(&paths, &root.join("test.genesis")).unwrap();
+        aterm_secrets::client::admin_mirror_log(&paths, &[]).unwrap();
+        aterm_secrets::client::sync(&paths, None).unwrap();
+        (running, paths)
+    }
+
+    /// Rewrite `paths`' `state.toml` (by rename, as every writer of it does) with its `key` line
+    /// 60 higher.
+    fn bump_state(paths: &aterm_secrets::client::Paths, key: &str) {
+        let state = paths.dir.join("state.toml");
+        let text = std::fs::read_to_string(&state).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{key} = ")))
+            .unwrap_or_else(|| panic!("state.toml holds {key}"));
+        let value: i64 = line[key.len() + 3..].parse().unwrap();
+        let next = text.replace(line, &format!("{key} = {}", value + 60));
+        aterm_secrets::fsx::write_atomic(&state, next.as_bytes(), 0o600).unwrap();
+    }
+
+    /// A cold read whose state moved supplies no fresh verdict, including A -> B -> A wholly
+    /// inside its reader and a state file that appears and disappears. The next stable read is
+    /// kept, and a further call serves that verdict without reading the store again.
+    ///
+    /// HISTORICAL NEGATIVE CONTROL (2026-11-09, before [`StateRead`]): using only the semantic
+    /// stamp from before the read (no [`StateStamp::across`]) kept that read on the next call
+    /// (`a verdict read while the state moved is read again`, `left: 1, right: 2`). The physical
+    /// cold fence now rejects that interval too.
+    #[test]
+    fn a_verdict_read_while_the_state_moved_and_came_back_is_read_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (running, paths) = seeded_vault(root.path());
+        let state = paths.dir.join("state.toml");
+        let before = std::fs::read(&state).unwrap();
+        let standing = aterm_secrets::client::state_standing(&paths).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut log = LocalLog::of(&paths);
+        log.read = Box::new({
+            let (paths, reads) = (paths.clone(), Arc::clone(&reads));
+            move || {
+                let keys = acknowledged_member_keys(&paths);
+                assert!(
+                    matches!(&keys, Ok(Some(keys)) if keys.unread().is_none()),
+                    "PRECONDITION: the native reader answered before the state moved"
+                );
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    bump_state(&paths, "requested");
+                }
+                keys
+            }
+        });
+        let reads = || reads.load(std::sync::atomic::Ordering::SeqCst);
+
+        let partial = log
+            .keys()
+            .expect("a conservative verdict after the moved read");
+        assert_ne!(
+            aterm_secrets::client::state_standing(&paths).unwrap(),
+            standing,
+            "PRECONDITION: the read moved the state"
+        );
+        aterm_secrets::fsx::write_atomic(&state, &before, 0o600).unwrap();
+        assert_eq!(
+            aterm_secrets::client::state_standing(&paths).unwrap(),
+            standing,
+            "PRECONDITION: the state holds what it held before the read"
+        );
+        log.keys().expect("a verdict");
+        assert_eq!(
+            reads(),
+            2,
+            "a verdict read while the state moved is read again"
+        );
+        log.keys().expect("a verdict");
+        assert_eq!(reads(), 2, "CONTROL: a read nothing moved during stands");
+
+        // The whole A -> B -> A interval can also fit inside the reader: neither outer
+        // semantic stamp sees B. The next call must still read A, rather than keep B's read.
+        let before = std::fs::read(&state).unwrap();
+        let standing = aterm_secrets::client::state_standing(&paths).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut log = LocalLog::of(&paths);
+        log.read = Box::new({
+            let (paths, before, reads) = (paths.clone(), before.clone(), Arc::clone(&reads));
+            move || {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    bump_state(&paths, "requested");
+                    assert_ne!(
+                        aterm_secrets::client::state_standing(&paths).unwrap(),
+                        standing,
+                        "PRECONDITION: B is held while the actual reader runs"
+                    );
+                    let keys = acknowledged_member_keys(&paths);
+                    aterm_secrets::fsx::write_atomic(&paths.dir.join("state.toml"), &before, 0o600)
+                        .unwrap();
+                    assert_eq!(
+                        aterm_secrets::client::state_standing(&paths).unwrap(),
+                        standing,
+                        "PRECONDITION: A is restored before the reader returns"
+                    );
+                    assert!(
+                        matches!(&keys, Ok(Some(keys)) if keys.unread().is_none()),
+                        "PRECONDITION: the native reader answered under B"
+                    );
+                    keys
+                } else {
+                    acknowledged_member_keys(&paths)
+                }
+            }
+        });
+        let full = log
+            .keys()
+            .expect("a conservative verdict after the moved read");
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        let read = log.keys().expect("A read again");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a full A to B to A inside the reader is read again"
+        );
+        assert!(
+            partial.unread().is_some(),
+            "a moved read grants no new verdict"
+        );
+        assert!(full.unread().is_some(), "a full ABA grants no new verdict");
+        assert!(read.unread().is_none(), "a settled native read answered");
+        assert!(Arc::ptr_eq(&read, &log.keys().expect("the held verdict")));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Absence also has a physical interval: a state file can come and go while its
+        // semantic stamps both say None. Once the absent state is read without a write,
+        // that healthy absence can be kept too.
+        std::fs::remove_file(&state).unwrap();
+        assert!(
+            aterm_secrets::client::state_standing(&paths)
+                .unwrap()
+                .is_none()
+        );
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut log = LocalLog::of(&paths);
+        log.read = Box::new({
+            let (paths, before, reads) = (paths.clone(), before.clone(), Arc::clone(&reads));
+            move || {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let state = paths.dir.join("state.toml");
+                    aterm_secrets::fsx::write_atomic(&state, &before, 0o600).unwrap();
+                    let keys = acknowledged_member_keys(&paths);
+                    std::fs::remove_file(&state).unwrap();
+                    assert!(
+                        matches!(&keys, Ok(Some(keys)) if keys.unread().is_none()),
+                        "PRECONDITION: the native reader answered while the file existed"
+                    );
+                    keys
+                } else {
+                    acknowledged_member_keys(&paths)
+                }
+            }
+        });
+        let appeared = log
+            .keys()
+            .expect("a conservative verdict after the file came and went");
+        assert!(
+            aterm_secrets::client::state_standing(&paths)
+                .unwrap()
+                .is_none()
+        );
+        let absent = log.keys().expect("the absent state read again");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a state file that came and went is read again"
+        );
+        assert!(
+            appeared.unread().is_some(),
+            "the moved read grants no new verdict"
+        );
+        assert!(
+            absent.unread().is_none(),
+            "a settled absent-state read answered"
+        );
+        assert!(Arc::ptr_eq(&absent, &log.keys().expect("the held verdict")));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        aterm_secrets::fsx::write_atomic(&state, &before, 0o600).unwrap();
+        running.stop();
     }
 
     #[test]

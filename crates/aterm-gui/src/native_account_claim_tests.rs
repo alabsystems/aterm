@@ -351,6 +351,7 @@ fn typed_claim_never_settles_or_readmits_a_dispatched_candidate() {
                 _ => {
                     let process = process(600, 400, 600, 400, 20);
                     op.children[0] = Some(LaunchChild {
+                        source_constructor: None,
                         death: Arc::new(SharedDeath {
                             watch: DeathWatch::Unknown,
                             outcome: std::sync::OnceLock::new(),

@@ -1759,3 +1759,142 @@ fn an_older_nodes_idle_asking_agent_still_counts_waiting() {
     snapshot.macs[0].activity = tally(0, 1, 0);
     assert_eq!(field_of(snapshot, NOW).tallies.waiting, 1);
 }
+
+/// A needs row read before the next activity count names an agent's ask while the tally still
+/// counts it busy: the agent waits, once, and leaves busy. A Mac whose tally was not read still
+/// counts the decided needs its diamond draws.
+#[test]
+fn a_decided_need_moves_its_agent_to_waiting_once() {
+    let mut snapshot = fleet(3);
+    snapshot.macs[0].activity = tally(1, 0, 0);
+    snapshot.macs[0].agent_sessions.push(FleetSession {
+        sid: "s-busy".into(),
+        program: Some("claude".into()),
+        agent: AgentWord::Busy,
+        task: None,
+        ctx_left_pct: None,
+        usage_5h_pct: None,
+        usage_7d_pct: None,
+    });
+    snapshot.macs[0].needs.push(need("s-busy", NeedWord::Ask));
+    // Two decided needs of one session are one session waiting.
+    snapshot.macs[0]
+        .needs
+        .push(need("s-busy", NeedWord::Approval));
+    let field = field_of(snapshot.clone(), NOW);
+    assert_eq!(field.tallies.waiting, 1);
+    assert_eq!(field.tallies.busy, Some(0));
+    // A Mac with no tally read and an ask: counted from its need.
+    snapshot.macs[1].activity = None;
+    snapshot.macs[1]
+        .needs
+        .push(need("s-shell", NeedWord::Question));
+    let field = field_of(snapshot.clone(), NOW);
+    assert_eq!(field.tallies.waiting, 2);
+    let diamonds = field
+        .seats
+        .iter()
+        .filter(|seat| seat.activity == Some(Activity::Waiting))
+        .count();
+    assert_eq!(diamonds, 2, "the words count what the diamonds draw");
+    // Control: without the needs nothing waits and the agent is busy.
+    snapshot.macs[0].needs.clear();
+    snapshot.macs[1].needs.clear();
+    let field = field_of(snapshot, NOW);
+    assert_eq!((field.tallies.waiting, field.tallies.busy), (0, Some(1)));
+}
+
+fn observed(n: u64) -> aterm_types::network_state::NetworkStateSnapshot {
+    let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+    network.network.visibility = Visibility::Active;
+    network.network.history = HistoryState::Ready;
+    for slot in 0..n {
+        network
+            .network
+            .peers
+            .push(aterm_types::network_state::PeerObservation {
+                slot,
+                identity: aterm_types::network_state::MachineIdentity {
+                    machine_id: [slot as u8; 16],
+                    incarnation: [1; 16],
+                    label: Some(format!("peer{slot}")),
+                },
+                first_seen_ms: 1,
+                last_seen_ms: 1000,
+                last_checked_ms: Some(2000),
+                last_repair: None,
+                last_authenticated_endpoint: None,
+                reachability: Reachability::Reachable,
+                instances: None,
+                samples: Vec::new(),
+            });
+    }
+    network
+}
+
+/// An observer field too wide for the band is a tally: the keys visit its drawn groups, each a
+/// hit, and a group's lens names the observed peers rather than an unread fleet.
+#[test]
+fn an_observer_tally_keys_reach_what_it_draws() {
+    let network = observed(63);
+    let lab = crate::lab_deck::LabDeck::default();
+    let (w, scale) = (400.0, 1.0);
+    let obs_field = observer(&network.network);
+    assert_eq!(layout(&obs_field, &network.network, w, scale).tier, Tier::C);
+    let targets = super::super::targets_with(&network, &lab, None, (w, scale));
+    let field_targets: Vec<Target> = targets
+        .iter()
+        .copied()
+        .filter(|t| matches!(t, Target::Seat(_) | Target::Group(_) | Target::Fleet))
+        .collect();
+    assert!(!field_targets.is_empty());
+    assert!(
+        field_targets.iter().all(|t| matches!(t, Target::Group(_))),
+        "{field_targets:?}"
+    );
+    let g = crate::stats_deck::DeckGeom {
+        w,
+        h: 200.0,
+        pad: 0.0,
+        scale,
+        font_px: 14.0,
+    };
+    let (_, hits) =
+        super::super::paint_with_inks(&g, 100.0, &network, &lab, None, None, &inks(), false);
+    for target in &field_targets {
+        assert!(
+            hits.iter().any(|hit| hit.kind == HitKind::Network(*target)),
+            "{target:?} has no hit"
+        );
+        let rows = super::super::details_lab_with_caption(&network, &lab, None, *target, None);
+        assert_eq!(rows[0].0, "Group", "{rows:?}");
+    }
+    // Control: a few peers are drawn seats, and the keys visit them.
+    let few = observed(3);
+    let targets = super::super::targets_with(&few, &lab, None, (700.0, 1.0));
+    assert!(targets.contains(&Target::Seat(SeatKey::Observed(0))));
+    assert!(!targets.iter().any(|t| matches!(t, Target::Group(_))));
+}
+
+/// A place caption wider than the room the status reserved leaves the status, never words past
+/// the band's margin.
+#[test]
+fn a_place_caption_that_does_not_fit_leaves_the_status() {
+    let obs = active();
+    let caption = PlaceCaption {
+        long: "Remote · cellular · far from the lab".into(),
+        short: "Remote · cellular".into(),
+        offline: false,
+    };
+    if !super::super::place_only(super::super::network_status_of(&obs), &caption) {
+        panic!("the test's caption must replace the status");
+    }
+    let room = text_w("0 reachable", 1.0);
+    assert_eq!(
+        observer_words(1.0, &obs, Some(&caption), false, room),
+        "0 reachable"
+    );
+    // Control: with room the caption is drawn.
+    let wide = observer_words(1.0, &obs, Some(&caption), false, 1000.0);
+    assert_eq!(wide, caption.long);
+}

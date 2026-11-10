@@ -109,9 +109,42 @@ pub struct World {
     pub sock: PathBuf,
     keep: bool,
     cleanup_failed: Arc<AtomicBool>,
+    #[cfg(debug_assertions)]
+    source_fixture_owned: bool,
 }
 
 impl World {
+    /// Join only the constructor-owned Source proof namespace. The fixture
+    /// retains cleanup custody until the host and SDK child have really exited.
+    #[cfg(debug_assertions)]
+    pub(crate) fn source_proof(
+        fixture: &aterm_agent::harness::codex_enrollment::NativeSourceProofWorld,
+    ) -> Result<Self, String> {
+        let mut world = Self::in_dir(fixture.directory().to_path_buf(), true);
+        world.source_fixture_owned = true;
+        if fixture.env().home.as_ref() != Some(&world.home)
+            || fixture.env().config.as_ref() != Some(&world.cfg.join("aterm/aterm.toml"))
+        {
+            return Err("source fixture layout changed".into());
+        }
+        check_world_socket_paths(&world.dir)?;
+        for path in [
+            &world.dir,
+            &world.home,
+            &world.cfg,
+            &world.cfg.join("aterm"),
+        ] {
+            aterm_uds::private_file::check_private_dir(path).map_err(|error| error.to_string())?;
+        }
+        crate::util::create_private_dir_all(&world.run).map_err(|error| error.to_string())?;
+        private_home_roots(&world.home).map_err(|error| error.to_string())?;
+        for name in [".profile", ".shrc"] {
+            crate::util::write_fresh(&world.home.join(name), "PS1='$ '\n")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(world)
+    }
+
     fn retain_start_failure(&self, error: String) -> String {
         self.cleanup_failed.store(true, Ordering::Release);
         eprintln!(
@@ -151,6 +184,8 @@ impl World {
             dir,
             keep,
             cleanup_failed: Arc::new(AtomicBool::new(false)),
+            #[cfg(debug_assertions)]
+            source_fixture_owned: false,
         }
     }
 
@@ -460,6 +495,10 @@ fn private_state_home(home: &Path) -> PathBuf {
 
 impl Drop for World {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if self.source_fixture_owned {
+            return;
+        }
         if self.keep || self.cleanup_failed.load(Ordering::Acquire) {
             eprintln!("aterm-lab: kept {}", self.dir.display());
         } else {

@@ -224,7 +224,11 @@ mod tests {
         assert_eq!(proves("grok-alab@500", facts(None, 500, true)), None);
         assert_eq!(proves("grok-alab@500", facts(Some(500), -1, true)), None);
         assert_eq!(proves("codex-alab@500", facts(Some(500), 500, true)), None);
-        assert_eq!(proves("kimi-alab@500", facts(Some(500), 500, true)), None);
+        assert_eq!(
+            proves("kimi-alab@500", facts(Some(500), 500, true)),
+            Some(500)
+        );
+        assert_eq!(proves("other-alab@500", facts(Some(500), 500, true)), None);
         let me = std::process::id();
         let proven = prove(
             &format!("grok-alab@{me}"),

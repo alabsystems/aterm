@@ -165,7 +165,7 @@ impl Args {
 
 /// The arena's cache directory reused across runs outside the checkout.
 pub(crate) fn arena_dir() -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join("aterm-arena");
+    let dir = std::env::temp_dir().join("aterm-arena.noindex");
     if dir.starts_with(workspace_root()) {
         return Err(format!(
             "the arena cache {} is inside the checkout ($TMPDIR points into it); cargo would \
@@ -207,7 +207,7 @@ impl Scratch {
         live::make_dir(&std::env::temp_dir(), &format!("aterm-{tag}-")).map(Scratch)
     }
 
-    /// Under `/tmp`, named `at.<pid>.<n>`: a run's unix sockets, short enough
+    /// Under `/tmp`, named `at.<pid>.<n>.noindex`: a run's unix sockets, short enough
     /// for every name a lane gives one ([`Scratch::sock`]).
     pub(crate) fn sockets() -> Result<Scratch, String> {
         live::make_dir(Path::new(SOCKET_BASE), "at.").map(Scratch)
@@ -1013,7 +1013,7 @@ mod tests {
     /// macOS's 49-byte per-user `$TMPDIR` — is refused before aterm sees it.
     #[test]
     fn a_socket_path_fits_sun_path_whatever_tmpdir_is() {
-        let widest = Path::new(SOCKET_BASE).join(format!("at.{}.{}", u32::MAX, u32::MAX));
+        let widest = Path::new(SOCKET_BASE).join(format!("at.{}.{}.noindex", u32::MAX, u32::MAX));
         let sock = socket_in(&widest, "trial-999-candidate.sock").expect("fits");
         assert!(sock.as_os_str().len() <= MAX_SUN_PATH, "{}", sock.display());
         let tmpdir = Path::new("/var/folders/rw/3088njqs1vsf5365hfl3yr8h0000gn/T/");

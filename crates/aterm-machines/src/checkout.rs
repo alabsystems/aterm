@@ -174,6 +174,194 @@ pub(crate) fn network(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd
     )
 }
 
+/// An absent HEAD is an unfinished branch only when its symbolic branch has no ref.
+/// A missing object, detached HEAD or unreadable ref is not an empty checkout.
+pub(crate) fn unborn(sys: &dyn System, user: &User, path: &Path) -> Result<Option<String>, String> {
+    let git = git(sys, user, Some(path));
+    let head = sys
+        .run_complete_stdout(&git.clone().args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD^{commit}",
+        ]))
+        .map_err(|why| why.to_string())?;
+    if head.success() {
+        return if oid(head.out().trim()) {
+            Ok(None)
+        } else {
+            Err("the checkout returned an invalid commit identity".into())
+        };
+    }
+    if head.status != Some(1) {
+        return Err("cannot inspect the checkout's HEAD".into());
+    }
+    let branch = sys
+        .run_complete_stdout(
+            &git.clone()
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        )
+        .map_err(|why| why.to_string())?;
+    if !branch.success() {
+        return Err("the checkout has no readable symbolic branch".into());
+    }
+    let branch = branch.out().trim().to_owned();
+    if branch.is_empty() {
+        return Err("the checkout has no readable symbolic branch".into());
+    }
+    let reference = format!("refs/heads/{branch}");
+    let absent = sys
+        .run_complete_stdout(&git.args(["show-ref", "--verify", "--quiet", &reference]))
+        .map_err(|why| why.to_string())?;
+    if absent.status != Some(1) {
+        return Err("the checkout's branch exists without a readable commit".into());
+    }
+    Ok(Some(branch))
+}
+
+/// Preserve all owner work, including ignored files and an index without a commit.
+/// This read starts no configured filter, hook or filesystem monitor.
+pub(crate) fn virgin_unborn(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    match unborn_preservation(sys, user, path, branch)? {
+        None => Ok(()),
+        Some(why) => Err(why),
+    }
+}
+
+/// Local owner work is a preservation reason; unreadable Git state remains unknown.
+pub(crate) fn unborn_preservation(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    if unborn(sys, user, path)?.as_deref() != Some(branch) {
+        return Ok(Some("the unfinished branch changed; work preserved".into()));
+    }
+    let git = git(sys, user, Some(path));
+    let programs = Programs::named(sys, git.clone())?;
+    for args in [
+        vec!["ls-files", "--stage", "-z"],
+        vec![
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    ] {
+        let read = sys
+            .run_complete_stdout(&programs.off(git.clone().args(NO_SIDE_RUNS).args(args)))
+            .map_err(|why| why.to_string())?;
+        if !read.success() {
+            return Err("cannot inspect the unfinished checkout's index and working files".into());
+        }
+        if !read.stdout.is_empty() {
+            return Ok(Some(
+                "the unfinished checkout contains owner work; left untouched".into(),
+            ));
+        }
+    }
+    for (key, expected) in [
+        (format!("branch.{branch}.remote"), "origin".to_owned()),
+        (
+            format!("branch.{branch}.merge"),
+            format!("refs/heads/{branch}"),
+        ),
+    ] {
+        let read = sys
+            .run_complete_stdout(&git.clone().args(["config", "--get-all", &key]))
+            .map_err(|why| why.to_string())?;
+        if !matches!(read.status, Some(0 | 1)) {
+            return Err("cannot inspect the unfinished branch's upstream".into());
+        }
+        if read.success() && read.out().trim() != expected {
+            return Ok(Some(
+                "the unfinished branch has another upstream; left untouched".into(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch an admitted first commit and create only the still-unborn ordinary branch.
+/// The caller owns the repository pass and revalidates source, origin and physical storage.
+pub(crate) fn hydrate_unborn(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    branch: &str,
+    tip: &str,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    current()?;
+    virgin_unborn(sys, user, path, branch)?;
+    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
+    let command = programs.off(network(sys, user, Some(path)).args(NO_SIDE_RUNS));
+    current()?;
+    acquisition_read(
+        sys,
+        &command.clone().budget(FETCH_BUDGET).args([
+            "fetch",
+            "--no-recurse-submodules",
+            "--no-tags",
+            "--",
+            "origin",
+            "refs/heads/*:refs/remotes/origin/*",
+            "refs/tags/*:refs/tags/*",
+        ]),
+        "cannot fetch the unfinished checkout's first commit",
+    )
+    .map_err(|why| why.to_string())?;
+    current()?;
+    virgin_unborn(sys, user, path, branch)?;
+    let reference = format!("refs/remotes/origin/{branch}^{{commit}}");
+    let found = sys
+        .run_complete_stdout(&git(sys, user, Some(path)).args([
+            "rev-parse",
+            "--verify",
+            &reference,
+        ]))
+        .map_err(|why| why.to_string())?;
+    if !found.success() || found.out().trim() != tip {
+        return Err(
+            "the advertised first commit changed during fetch; waiting for another pass".into(),
+        );
+    }
+    current()?;
+    let target = format!("refs/remotes/origin/{branch}");
+    let merged = sys
+        .run_complete_stdout(&command.args([
+            "checkout",
+            "--no-overwrite-ignore",
+            "--no-recurse-submodules",
+            "-b",
+            branch,
+            "--track",
+            &target,
+        ]))
+        .map_err(|why| why.to_string())?;
+    if !merged.success() {
+        return Err("the first checkout was refused; owner work preserved".into());
+    }
+    current()?;
+    let head = sys
+        .run_complete_stdout(&git(sys, user, Some(path)).args([
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]))
+        .map_err(|why| why.to_string())?;
+    if !head.success() || head.out().trim() != tip {
+        return Err("the first checkout has not reached its advertised commit".into());
+    }
+    Ok(())
+}
+
 /// Whether git's standard error says its transport could not reach the remote's host (no name
 /// resolution, no route, nothing answering), as against a refusal from a host it did reach (no
 /// access, no such repository): the one an item stands aside on, offline.

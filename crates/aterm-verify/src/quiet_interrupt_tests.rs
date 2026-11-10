@@ -208,6 +208,7 @@ fn one_interrupt_in_a_timed_stages_wait_ends_the_run() {
     for (sig, word) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-quiet-int-")
+            .suffix(".noindex")
             .tempdir()
             .expect("a scratch dir");
         let ledger = Ledger::at(dir.path().join("ledger"));
@@ -353,6 +354,7 @@ fn passes(_: &Ctx, spec: &StageSpec) -> Report {
 fn a_timed_stage_given_up_behind_a_stuck_holder_is_not_run_and_the_run_goes_on() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atv-quiet-stuck-")
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch dir");
     let ctx = Ctx::new(

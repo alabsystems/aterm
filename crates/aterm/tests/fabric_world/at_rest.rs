@@ -16,6 +16,7 @@ const KEY_NAME: &str = "rest.key";
 fn scratch() -> aterm_tempfile::TempDir {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atr-")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("scratch dir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("0700");

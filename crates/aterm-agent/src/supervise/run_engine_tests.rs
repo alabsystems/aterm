@@ -14242,38 +14242,39 @@ fn muse_controller_positive() {
     assert!(guarded_enter(m.presses()[0]), "{:#?}", m.requests);
 }
 
-/// A READ PROGRAM'S QUESTION IS A PERSON'S: a controller's answer to Grok Build's or Kimi Code's
-/// question card (measured), each read as a question box, is refused and types nothing, since
-/// neither program is supervised. NEGATIVE CONTROL: the same answer to Muse Code's question
-/// presses its choice.
+/// AN UNSUPERVISED PROGRAM'S QUESTION IS A PERSON'S: Grok Build's measured question card refuses
+/// a controller's answer and types nothing. NEGATIVE CONTROLS: the same answer to Muse Code's
+/// question presses its choice, and Kimi Code's numbered choice is accepted.
 #[test]
 fn a_controllers_answer_leaves_a_read_programs_question_to_the_person() {
     muse_controller_positive();
-    for (program, fixture) in [
-        ("grok", aterm_phase::grok::fixtures::QUESTION),
-        ("kimi", aterm_phase::kimi::fixtures::QUESTION_240),
-    ] {
-        let rows = q(fixture);
-        assert_eq!(
-            aterm_phase::read(Some(program), &rows, None)
-                .prompt
-                .map(|p| p.kind),
-            Some(aterm_phase::PromptKind::Question),
-            "PRECONDITION: {program}'s question box"
-        );
-        let mut m = questioned(vec![rows.clone(), rows]);
-        m.program = program;
-        m.human = vec!["150000"];
-        m.human_seq = Some(7);
-        let (line, code) = controller_answer(&mut m, "1", None);
-        assert_eq!(code, EXIT_REFUSED, "{program}: {line}");
-        assert!(line.starts_with("REFUSED @s-w "), "{program}: {line}");
-        assert!(
-            line.contains("is read, not supervised"),
-            "{program}: {line}"
-        );
-        assert!(m.presses().is_empty(), "{program}: {:#?}", m.requests);
-    }
+    let rows = q(aterm_phase::grok::fixtures::QUESTION);
+    assert_eq!(
+        aterm_phase::read(Some("grok"), &rows, None)
+            .prompt
+            .map(|p| p.kind),
+        Some(aterm_phase::PromptKind::Question),
+        "PRECONDITION: Grok's question box"
+    );
+    let mut m = questioned(vec![rows.clone(), rows]);
+    m.program = "grok";
+    m.human = vec!["150000"];
+    m.human_seq = Some(7);
+    let (line, code) = controller_answer(&mut m, "1", None);
+    assert_eq!(code, EXIT_REFUSED, "grok: {line}");
+    assert!(line.starts_with("REFUSED @s-w "), "grok: {line}");
+    assert!(line.contains("is read, not supervised"), "grok: {line}");
+    assert!(m.presses().is_empty(), "grok: {:#?}", m.requests);
+
+    let rows = q(aterm_phase::kimi::fixtures::QUESTION_240);
+    let mut m = questioned(vec![rows.clone(), rows]);
+    m.program = "kimi";
+    m.human = vec!["150000"];
+    m.human_seq = Some(7);
+    let (line, code) = controller_answer(&mut m, "1", None);
+    assert_eq!(code, 0, "kimi: {line}");
+    assert!(line.starts_with("ANSWERED @s-w "), "kimi: {line}");
+    assert_eq!(m.presses().len(), 1, "kimi: {:#?}", m.requests);
 }
 
 #[test]

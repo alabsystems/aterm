@@ -1683,6 +1683,14 @@ impl PaneLayout {
         out
     }
 
+    /// The first `Leaf` in this subtree in tree order without allocating a `Vec`.
+    pub(crate) fn first_leaf(&self) -> &PaneLayout {
+        match self {
+            PaneLayout::Leaf { .. } => self,
+            PaneLayout::Split { first, .. } => first.first_leaf(),
+        }
+    }
+
     fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a PaneLayout>) {
         match self {
             PaneLayout::Leaf { .. } => out.push(self),
@@ -1876,7 +1884,7 @@ impl WindowLayout {
     pub(crate) fn bootstrap_local_id(&self) -> Option<u64> {
         match self.bootstrap_terminal_leaf() {
             Some(leaf) => leaf.local_id,
-            None => self.tabs.first()?.leaves().first()?.local_id(),
+            None => self.tabs.first()?.first_leaf().local_id(),
         }
     }
 
@@ -1884,13 +1892,7 @@ impl WindowLayout {
     pub(crate) fn bootstrap_cwd(&self) -> Option<String> {
         match self.bootstrap_tab() {
             Some(tab) => tab.root.first_terminal_with_cwd()?.start_cwd(),
-            None => self
-                .tabs
-                .first()?
-                .leaves()
-                .first()?
-                .cwd()
-                .map(str::to_owned),
+            None => self.tabs.first()?.first_leaf().cwd().map(str::to_owned),
         }
     }
 

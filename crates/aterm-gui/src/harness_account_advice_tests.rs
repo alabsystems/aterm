@@ -501,7 +501,13 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         .unwrap()
         .clone();
     obsolete.value.observed_at += 1;
-    before_off.publish_progress(&idle.kept, None, usage_wall(), Some(obsolete.clone()));
+    before_off.publish_scoped(
+        &idle.kept,
+        None,
+        usage_wall(),
+        Some(obsolete.clone()),
+        false,
+    );
     assert!(model.fire("Publish", &mut policy));
     check(&policy, &epochs, None);
     assert_eq!(
@@ -530,7 +536,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         &mut epochs,
         Some(&while_off),
     );
-    while_off.publish_progress(&idle.kept, None, usage_wall(), Some(obsolete_off));
+    while_off.publish_scoped(&idle.kept, None, usage_wall(), Some(obsolete_off), false);
     assert!(model.fire("Publish", &mut policy));
     check(&policy, &epochs, None);
     read(&mut app);
@@ -552,7 +558,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         .read_account_progress(&request, usage_wall(), None, None)
         .unwrap();
     same.value = retained.clone();
-    request.publish_progress(&idle.kept, None, usage_wall(), Some(same));
+    request.publish_scoped(&idle.kept, None, usage_wall(), Some(same), false);
     assert!(model.fire("Publish", &mut policy));
     check(&policy, &epochs, None);
     assert!(model.fire("Read", &mut policy));

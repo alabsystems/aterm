@@ -140,6 +140,11 @@ impl PaneTree {
         self.root.leaves()
     }
 
+    /// Visit leaf session IDs in tree order without allocating a `Vec`.
+    pub(crate) fn visit_sessions(&self, f: &mut impl FnMut(u64)) {
+        self.root.visit(&mut |&session| f(session));
+    }
+
     /// Map leaf session IDs through `map` while preserving split structure and ratios.
     #[must_use]
     pub(crate) fn map_sessions<T>(&self, mut map: impl FnMut(u64) -> T) -> SplitTree<T> {

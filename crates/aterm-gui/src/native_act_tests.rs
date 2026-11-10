@@ -1255,23 +1255,9 @@ fn replacing_the_captured_physical_restart_target_refuses_actual_admission() {
 
 #[test]
 fn sealed_cold_restart_admission_requires_builtin_relaunch_without_rollback() {
-    use aterm_agent::harness::native_act::{ColdBilling, ColdIntent};
     for case in 0..4 {
         let (handle, facts, mut request, mut actor) = closed_restart::fixture(7980 + case);
-        let NativePlan::Restart { cold, rollback, .. } = &mut request.plan else {
-            unreachable!();
-        };
-        *cold = Some(Box::new(ColdIntent {
-            login: None,
-            home: None,
-            auth_observed: false,
-            route: aterm_agent::harness::accounts::AuthRoute::Stored,
-            conversation: Some("captured-conversation".into()),
-            profile: None,
-            mode: aterm_agent::harness::accounts::Mode::Wall,
-            billing: ColdBilling::Keep,
-        }));
-        *rollback = None;
+        cold_restart(&mut request);
         assert_eq!(request.plan.constructor(), Constructor::ColdRestart);
         match case {
             1 => actor.principal = Principal::Instance,

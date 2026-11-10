@@ -2075,8 +2075,9 @@ fn imported_successor(lab: &mut Lab) -> (Scope, Paths, std::path::PathBuf) {
 /// ([`observed_generation_until`]) and opens a session observes the predecessors once, after it
 /// opens the selected home's custody, as the label read does
 /// ([`a_successor_homes_read_observes_its_predecessor_once`]): the account service read,
-/// `observe_store_if_here`, and `aterm db commons-tables` and `commons-inventory`; and
-/// `commons-status` reports `ready` from one verified selection and reads its home from it.
+/// `observe_store_if_here`, `aterm db commons-tables` and `commons-inventory`, the account claims
+/// read and the recovery pending read (`Session::observe_named_until`); and `commons-status`
+/// reports `ready` from one verified selection and reads its home from it.
 /// A holder of a predecessor's custody that comes as that one observation judges it neither stops
 /// the read nor makes it wait: the account service read is given a spent wait, so observing again
 /// would read busy, and the others wait for a holder, so observing again would wait on it, which
@@ -2090,6 +2091,11 @@ fn imported_successor(lab: &mut Lab) -> (Scope, Paths, std::path::PathBuf) {
 /// alone added), the account read's rows read busy (`Unknown`) and the commons-status,
 /// commons-tables, commons-inventory and `observe_store_if_here` rows each waited on the holder;
 /// the label read's rows passed.
+/// NEGATIVE CONTROL (2026-11-09): with the account claims read and the recovery pending read
+/// back on `generation::selected` and `Session::observe` / `observe_until` (90ed0753c0, their
+/// two call sites alone reverted), their rows failed at the moment before they observe, never
+/// held: they observed no predecessor after the selected home's custody opened. Their rows as
+/// they observe passed: in this fixture their second observation met no holder the first had not.
 #[test]
 fn a_successor_homes_readers_observe_their_predecessor_once() {
     use crate::documents::application::{
@@ -2116,7 +2122,7 @@ fn a_successor_homes_readers_observe_their_predecessor_once() {
         let mut options = options.iter().copied().collect();
         crate::catalog::command::run_at(name, &mut options, &original, &config)
     };
-    let readers: [Reader<'_>; 6] = [
+    let readers: [Reader<'_>; 8] = [
         (
             "label read",
             true,
@@ -2198,6 +2204,22 @@ fn a_successor_homes_readers_observe_their_predecessor_once() {
             Box::new(|| {
                 let read = observe_store_if_here(&original, records, Some(hang_detector()), rows);
                 (matches!(read, Ok(Some(1))), format!("{read:?}"))
+            }),
+        ),
+        (
+            "account claims read",
+            true,
+            Box::new(|| {
+                let read = crate::accounts::claims::read(&original);
+                (read.is_ok(), format!("{read:?}"))
+            }),
+        ),
+        (
+            "recovery pending",
+            true,
+            Box::new(|| {
+                let read = crate::accounts::recovery::Recovery::at(original.clone()).pending();
+                (read.is_ok(), format!("{read:?}"))
             }),
         ),
     ];

@@ -335,3 +335,87 @@ fn a_peerless_admission_is_not_held_to_the_view_its_call_began_with() {
         .local_write(None, |_| Ok(()))
         .expect("so does a peerless batch");
 }
+
+/// A mesh read stands on the check its table store's open ran in its session (`Round::store`):
+/// reading the store's inventory, proofs or wires, however many, adds no check to opening it, and
+/// a summary checks each table's store once, as it opens. These reads checked the store again,
+/// and a wire read once for each id (2026-11-09).
+/// NEGATIVE CONTROL: any of `Replica`'s mesh reads through a checked accessor fails it.
+#[test]
+fn a_mesh_read_checks_its_store_once_as_it_opens() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let a = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], a.trust());
+    let catalog = directory.catalog_scope();
+    {
+        let session = Session::open(&a).unwrap();
+        directory
+            .open_application(&session, "mesh-ingest", "rows", 1)
+            .unwrap();
+    }
+    let descriptors = held(&lab, 0, catalog);
+    let (id, wire) = descriptors.first_key_value().unwrap();
+    let b = replica(&lab, 1);
+    b.mesh_ingest(
+        catalog.digest(),
+        Kind::Operation,
+        std::slice::from_ref(wire),
+    )
+    .unwrap();
+    let table = catalog.digest();
+    let cost = |read: &dyn Fn()| {
+        let (opens, checks) = crate::table::store::test_opens_and_checks();
+        read();
+        let (now_opens, now_checks) = crate::table::store::test_opens_and_checks();
+        (now_opens - opens, now_checks - checks)
+    };
+    let open = || {
+        assert!(b.mesh_wires(table, &[]).unwrap().is_empty());
+    };
+    let reads: [(&str, &dyn Fn()); 5] = [
+        ("operation inventory", &|| {
+            assert_eq!(
+                b.mesh_inventory(table).unwrap(),
+                Some(BTreeSet::from([*id]))
+            );
+        }),
+        ("operation wires", &|| {
+            assert_eq!(b.mesh_wires(table, &[*id, [3; 32], *id]).unwrap().len(), 2);
+        }),
+        ("proof inventory", &|| {
+            assert_eq!(b.mesh_proofs(table).unwrap(), Some(BTreeSet::new()));
+        }),
+        ("proof wires", &|| {
+            assert!(
+                b.mesh_proof_wires(table, &[[0; 81], [1; 81]])
+                    .unwrap()
+                    .is_empty()
+            );
+        }),
+        ("open alone", &open),
+    ];
+    // Each read once first: what a first read after the ingest settles is not this law's.
+    for (_, read) in &reads {
+        read();
+    }
+    let opened = cost(&open);
+    for (name, read) in &reads {
+        assert_eq!(
+            cost(*read),
+            opened,
+            "a mesh {name} read checks its store once"
+        );
+    }
+    let selection = cost(&|| {
+        b.mesh_tables().unwrap();
+    });
+    let (opens, checks) = cost(&|| {
+        assert!(!b.mesh_tables_summary().unwrap().is_empty());
+    });
+    assert!(opens > selection.0, "a summary opens each table's store");
+    assert_eq!(
+        checks - opens,
+        selection.1 - selection.0,
+        "a summary checks each table's store once, as it opens"
+    );
+}

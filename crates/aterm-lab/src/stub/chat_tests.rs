@@ -253,7 +253,7 @@ fn the_lab_key_selects_each_shared_chat_route_independently_of_the_body() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn served_on_loopback_it_answers_chat_completions_as_the_modes_say() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-chat-{}", std::process::id()));
+    let dir = crate::TestScratch::new("chat");
     std::fs::create_dir_all(dir.join("modes")).unwrap();
     let tool_file = dir.join("tool.json");
     let args = Args {
@@ -382,5 +382,4 @@ fn served_on_loopback_it_answers_chat_completions_as_the_modes_say() {
         post(&turn(&[PERSON, CALLED, RESULT])).body(),
     ));
     assert_eq!(delta_text(&ch), "Tool call done. Result: ran ok");
-    let _ = std::fs::remove_dir_all(&dir);
 }

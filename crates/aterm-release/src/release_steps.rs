@@ -6,6 +6,7 @@
 #[cfg(unix)]
 use aterm_uds::spawnfd::Tether as _;
 use aterm_uds::spawnfd::{Command, Stdio, command};
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,7 @@ use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
     CutState, EngineNow, EngineRows, Facts, PUBLISH_GATE_ENV, Prover, PublishGate, RELEASE_COMMAND,
-    Ran, Refusal, Reservation, Side, StageTarget, Step,
+    Ran, Refusal, Reservation, Side, StageTarget, Step, SupersedeResult,
 };
 
 #[path = "release_scanner_tools.rs"]
@@ -300,6 +301,12 @@ type StageFixturesRun = fn(
     Option<&BranchStop>,
 ) -> Result<String, Refusal>;
 
+fn public_release_exists(slug: &str, tag: &str) -> Result<bool, String> {
+    crate::publish::release_objects_by_tag(slug, tag)
+        .map(|objects| !objects.is_empty())
+        .map_err(|error| error.to_string())
+}
+
 /// The real backend.
 pub struct Real {
     prefreeze_claim: Option<aterm_capacity::Claim>,
@@ -352,6 +359,12 @@ pub struct Real {
     verbose: bool,
     origin_tags: String,
     source_origin: fn(&Path) -> Result<crate::github_remote::Remote, String>,
+    /// Typed staging-repository read. Tests replace only the transport result while exercising
+    /// the production retired-line selection and version judgment.
+    staging_file: fn(&str, &str, &str) -> Result<Vec<u8>, String>,
+    /// Typed public release-object read, separated from historical channel selection so tests
+    /// exercise every channel a retired line could have published to without network access.
+    release_exists: fn(&str, &str) -> Result<bool, String>,
     prefetched_origin: Option<crate::github_remote::FetchedOrigin>,
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
@@ -966,6 +979,8 @@ impl Real {
             verbose,
             origin_tags: String::new(),
             source_origin: crate::github_remote::Remote::origin,
+            staging_file: crate::github_remote::repository_file,
+            release_exists: public_release_exists,
             prefetched_origin: None,
             step: Step::Checks,
             argv: std::env::args_os().skip(1).collect(),
@@ -3923,11 +3938,20 @@ impl Real {
     ) -> Result<Vec<String>, String> {
         let ptr = format!("https://github.com/{slug}/releases/latest/download/aterm-appcast.toml");
         let want = format!("https://github.com/{slug}/releases/download/{tag}/aterm-appcast.toml");
-        let hop = aterm_update_core::head_no_redirect(&ptr)
-            .map_err(|e| format!("{ptr} could not be read: {e:?}"))?;
-        if let Some(problem) =
-            pointer_hop_problem(&ptr, &want, tag, hop.code, hop.location.as_deref())?
-        {
+        let (code, location) = settled_pointer_hop(
+            &want,
+            &mut || {
+                aterm_update_core::head_no_redirect(&ptr)
+                    .map(|hop| (hop.code, hop.location))
+                    .map_err(|e| format!("{ptr} could not be read: {e:?}"))
+            },
+            &mut |pause| {
+                crate::cut_timing::measure("after-cut pointer propagation wait", || {
+                    std::thread::sleep(pause);
+                });
+            },
+        )?;
+        if let Some(problem) = pointer_hop_problem(&ptr, &want, tag, code, location.as_deref())? {
             return Ok(vec![problem]);
         }
         let served = appcast_bytes(&want, atpkg::net::MANIFEST_CAP, self.step_children())
@@ -5848,6 +5872,27 @@ fn pointer_verdict(read: Result<Vec<String>, String>) -> Result<Vec<String>, Ref
     })
 }
 
+/// The latest pointer's first hop once GitHub agrees on it. Step 8's pointer gate already saw the
+/// pointer name this cut, yet another of GitHub's servers can still answer with the previous
+/// head for a while (0.190.0's after-cut read v0.189.0 a second after step 8 read v0.190.0). So a
+/// 302 elsewhere is read again within the cut's own propagation bound before it is a verdict;
+/// every other answer, a read that failed included, is final at once.
+fn settled_pointer_hop(
+    want: &str,
+    read: &mut dyn FnMut() -> Result<(u16, Option<String>), String>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<(u16, Option<String>), String> {
+    let mut hop = read()?;
+    for _ in 1..crate::publish::POINTER_PROBE_ATTEMPTS {
+        if hop.0 != 302 || hop.1.as_deref() == Some(want) {
+            break;
+        }
+        sleep(crate::publish::POINTER_PROBE_DELAY);
+        hop = read()?;
+    }
+    Ok(hop)
+}
+
 fn pointer_hop_problem(
     ptr: &str,
     want: &str,
@@ -5915,7 +5960,295 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
     )
 }
 
+#[derive(Debug)]
+enum SupersedeCheck {
+    Present(String),
+    Unavailable(Refusal),
+}
+
+const SUPERSEDE_REASON: &str =
+    "explicit --supersede: the unpublished line cannot finish with its own tooling";
+
+fn supersession_record(previous: Line, replacement: Line) -> crate::line::Supersession {
+    crate::line::Supersession {
+        previous,
+        replacement,
+        reason: SUPERSEDE_REASON.into(),
+    }
+}
+
+/// Classify one authoritative reread by the complete durable record. A different record carries
+/// its replacement so the clone can converge immediately rather than restoring a retired line.
+fn classify_supersession_reread(
+    requested: &crate::line::Supersession,
+    reread: Result<Option<crate::line::Supersession>, String>,
+    retry_absent: bool,
+) -> SupersedeResult {
+    match reread {
+        Ok(Some(record)) if record == *requested => {
+            SupersedeResult::Committed("the exact earlier supersession is durable".into())
+        }
+        Ok(Some(record)) => SupersedeResult::Refused {
+            why: "a different durable supersession won".into(),
+            retry: false,
+            winner: Some(record.replacement),
+        },
+        Ok(None) => SupersedeResult::Refused {
+            why: "an authoritative source read proved the earlier write absent".into(),
+            retry: retry_absent,
+            winner: None,
+        },
+        Err(why) => SupersedeResult::Unknown(why),
+    }
+}
+
+/// A stopped claim is not evidence that its source write is absent: another cutter may have
+/// adopted an aged claim and committed a supersession before the old holder observed the loss.
+/// Preserve the claim's own refusal only when the authoritative source still names no record.
+fn classify_claim_stop(
+    requested: &crate::line::Supersession,
+    why: String,
+    reread: Result<Option<crate::line::Supersession>, String>,
+) -> SupersedeResult {
+    match reread {
+        Ok(None) => SupersedeResult::Refused {
+            why,
+            retry: false,
+            winner: None,
+        },
+        reread => classify_supersession_reread(requested, reread, false),
+    }
+}
+
+/// Bind the public-surface scan to the exact source reread required after claim acquisition.
+/// Keeping this transition in one resolver prevents the scan's stale answer from becoming a
+/// rollback verdict on its own.
+fn settle_post_claim_public_state(
+    scanned: Result<(), SupersedeCheck>,
+    previous: &Line,
+    classify: impl FnOnce(String) -> SupersedeResult,
+) -> Result<(), SupersedeResult> {
+    scanned.map_err(|error| {
+        let refusal = error.refusal(Some(previous));
+        classify(format!("{} — {}", refusal.why, refusal.remedy))
+    })
+}
+
+fn staged_covers_version(staged: &str, requested: &str) -> Result<bool, SupersedeCheck> {
+    let numbers = |version: &str| {
+        version
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                SupersedeCheck::Unavailable(Refusal::new(
+                    error.to_string(),
+                    format!("retry the same {RELEASE_COMMAND} --commit ... --supersede command"),
+                ))
+            })
+    };
+    Ok(numbers(staged)? >= numbers(requested)?)
+}
+
+impl SupersedeCheck {
+    fn refusal(self, previous: Option<&Line>) -> Refusal {
+        match self {
+            Self::Present(why) => Refusal::new(
+                why,
+                previous.map_or_else(
+                    || {
+                        "resume the existing line, then carry its repair with ship release --fix"
+                            .into()
+                    },
+                    |line| crate::release::fix_remedy(line.head()),
+                ),
+            ),
+            Self::Unavailable(refusal) => refusal,
+        }
+    }
+}
+
+impl From<String> for SupersedeCheck {
+    fn from(why: String) -> Self {
+        Self::Unavailable(
+            Refusal::new(
+                why,
+                format!("retry the same {RELEASE_COMMAND} --commit ... --supersede command"),
+            )
+            .could_not_run(),
+        )
+    }
+}
+
+fn line_commits(line: &Line) -> impl Iterator<Item = &str> {
+    std::iter::once(line.base.as_str()).chain(line.hops.iter().map(|hop| hop.commit.as_str()))
+}
+
 impl Real {
+    /// Check every staging destination any tree on the retired line declared. A hop may change
+    /// publication policy before qualify stages it, so neither the base nor head alone bounds
+    /// this append-only public surface.
+    fn supersede_staging_state(
+        &mut self,
+        previous: &Line,
+        line: &Line,
+    ) -> Result<(), SupersedeCheck> {
+        let mut repositories = BTreeSet::new();
+        for commit in line_commits(previous) {
+            let config = self
+                .git_out(&["show", &format!("{commit}:publish/config.sh")])
+                .ok_or_else(|| {
+                    SupersedeCheck::from(format!(
+                        "cannot read {commit}'s staging remote declaration"
+                    ))
+                })?;
+            let staging = config
+                .lines()
+                .find_map(|row| {
+                    row.strip_prefix("STAGING_REMOTE_DEFAULT=\"")
+                        .and_then(|value| value.strip_suffix('"'))
+                })
+                .ok_or_else(|| {
+                    SupersedeCheck::from(format!("{commit} has no staging remote declaration"))
+                })?;
+            repositories.insert(
+                crate::publish::github_slug_from_remote_url(staging)
+                    .map_err(|error| SupersedeCheck::from(error.to_string()))?,
+            );
+        }
+        for staging in repositories {
+            let staged = (self.staging_file)(&staging, "main", "Cargo.toml")
+                .map_err(SupersedeCheck::from)?;
+            let staged = std::str::from_utf8(&staged)
+                .map_err(|error| SupersedeCheck::from(error.to_string()))?;
+            let version = crate::publish::workspace_version(staged)
+                .map_err(|error| SupersedeCheck::from(error.to_string()))?;
+            let staged = staged_covers_version(&version, &line.version)?;
+            crate::line::require_unpublished([false, false, false, false, staged])
+                .map_err(SupersedeCheck::Present)?;
+        }
+        Ok(())
+    }
+
+    /// Check every public release channel any tree on the retired line declared. Qualify and a
+    /// hop may have addressed different repositories before the line is retired.
+    fn supersede_release_state(&self, previous: &Line, tag: &str) -> Result<(), SupersedeCheck> {
+        let mut channels = BTreeSet::new();
+        for commit in line_commits(previous) {
+            let manifest = self
+                .git_out(&["show", &format!("{commit}:Cargo.toml")])
+                .ok_or_else(|| {
+                    SupersedeCheck::from(format!("cannot read {commit}'s release channel"))
+                })?;
+            channels.insert(
+                crate::publish::channel_slug(&manifest)
+                    .map_err(|error| SupersedeCheck::from(error.to_string()))?,
+            );
+        }
+        for channel in channels {
+            let released = (self.release_exists)(&channel, tag).map_err(SupersedeCheck::from)?;
+            crate::line::require_unpublished([false, false, false, released, false])
+                .map_err(SupersedeCheck::Present)?;
+        }
+        Ok(())
+    }
+
+    /// A source record is authoritative only if its replacement still verifies as a release
+    /// line in this fetched repository. Never hand an unproved winner to local HEAD or journals.
+    fn verify_supersede_result(&self, result: SupersedeResult) -> SupersedeResult {
+        let SupersedeResult::Refused {
+            why,
+            retry,
+            winner: Some(winner),
+        } = result
+        else {
+            return result;
+        };
+        match crate::line::verify(&self.git(), &winner) {
+            Ok(_) => SupersedeResult::Refused {
+                why,
+                retry,
+                winner: Some(winner),
+            },
+            Err(error) => SupersedeResult::Unknown(format!(
+                "the durable competing supersession names an invalid replacement: {error}"
+            )),
+        }
+    }
+
+    /// Resolve every stop after claim acquisition against source before the caller may restore
+    /// the retired local line. A slow public-surface scan can outlive an adopted claim too.
+    fn classify_after_claim_stop(
+        &mut self,
+        requested: &crate::line::Supersession,
+        why: String,
+    ) -> SupersedeResult {
+        self.prefetched_origin = None;
+        if let Err(refusal) = self.prefetch_source() {
+            return SupersedeResult::Unknown(format!(
+                "{why}; exact supersession reread unavailable: {} — {}",
+                refusal.why, refusal.remedy
+            ));
+        }
+        let reread = crate::line::supersession(&self.git(), &requested.replacement.version);
+        self.verify_supersede_result(classify_claim_stop(requested, why, reread))
+    }
+
+    fn supersede_public_state_after_staging(
+        &mut self,
+        previous: &Line,
+        line: &Line,
+    ) -> Result<(), SupersedeCheck> {
+        if self.origin_main.is_none() {
+            self.fetch_engine_origin()
+                .map_err(SupersedeCheck::Unavailable)?;
+        }
+        crate::line::verify(&self.git(), previous)
+            .map_err(|error| SupersedeCheck::from(error.to_string()))?;
+        let ledger = self
+            .git_out(&["show", "origin/main:RELEASES.ledger"])
+            .ok_or_else(|| {
+                SupersedeCheck::from("cannot read origin/main's release ledger".to_string())
+            })?;
+        let mappings = self
+            .engine_text("mappings.json")
+            .ok_or_else(|| SupersedeCheck::from("cannot read publication mappings".to_string()))?;
+        let _: aterm_json::Value = aterm_json::from_str(&mappings).map_err(|error| {
+            SupersedeCheck::from(format!("invalid publication mappings: {error}"))
+        })?;
+        let tag = format!("v{}", line.version);
+        let rows = self.engine_rows(Some(previous.head()));
+        let published = rows.has
+            || rows
+                .newest
+                .as_deref()
+                .is_some_and(|sha| self.version_at(sha).as_deref() == Some(line.version.as_str()))
+            || std::iter::once(previous.base.as_str())
+                .chain(previous.hops.iter().map(|hop| hop.commit.as_str()))
+                .any(|commit| self.engine_rows(Some(commit)).has);
+        let tagged = self
+            .origin_tag_now(&tag)
+            .map_err(SupersedeCheck::from)?
+            .is_some();
+        let ledgered = ledger
+            .lines()
+            .any(|row| row.split_whitespace().nth(1) == Some(line.version.as_str()))
+            || self
+                .cut_journal()
+                .is_some_and(|cut| cut.version == line.version);
+        crate::line::require_unpublished([tagged, ledgered, published, false, false])
+            .map_err(SupersedeCheck::Present)?;
+        self.supersede_release_state(previous, &tag)
+    }
+
+    fn supersede_public_state(
+        &mut self,
+        previous: &Line,
+        line: &Line,
+    ) -> Result<(), SupersedeCheck> {
+        self.supersede_staging_state(previous, line)?;
+        self.supersede_public_state_after_staging(previous, line)
+    }
     /// The head immediately before `commit` on this release's line. A base has none: content
     /// verdicts cross only a fix hop, never into a newly selected line.
     fn previous_line_head(&self, commit: &str) -> Option<String> {
@@ -6163,94 +6496,176 @@ impl Backend for Real {
             .map_err(|e| Refusal::new(e, "retry the current line read").could_not_run())
     }
 
-    fn supersede_line(&mut self, line: &Line) -> Result<String, String> {
-        self.fetch().map_err(|e| e.why)?;
-        let previous = crate::line_claim::existing(&self.repo, &line.version)?
-            .ok_or("no existing fleet line to supersede")?;
-        let mut claim = crate::line_claim::Claim::take(&self.repo, &previous, &self.logs, false)?;
-        // Claim acquisition may adopt a hop written after the read above.
-        let previous = claim.line.clone();
-        self.fetch().map_err(|e| e.why)?;
-        if crate::line::supersession(&self.git(), &line.version)?.is_some_and(|record| {
-            record.replacement.base == line.base && record.replacement.version == line.version
-        }) {
-            claim.audit()?;
-            self.fleet_line = Some(claim);
-            return Ok(format!("supersession already recorded for {}", line.base));
+    fn preflight_supersede(
+        &mut self,
+        line: &Line,
+        expected_previous: Option<&Line>,
+    ) -> Result<Line, Refusal> {
+        if let Some(expected) = expected_previous {
+            self.supersede_staging_state(expected, line)
+                .map_err(|error| error.refusal(Some(expected)))?;
         }
-        crate::line::verify(&self.git(), &previous).map_err(|e| e.to_string())?;
-        let ledger_text = self
-            .git_out(&["show", "origin/main:RELEASES.ledger"])
-            .ok_or("cannot read origin/main's release ledger")?;
-        let mappings = self
-            .engine_text("mappings.json")
-            .ok_or("cannot read the publication engine's mappings")?;
-        let _: aterm_json::Value = aterm_json::from_str(&mappings)
-            .map_err(|e| format!("invalid publication mappings: {e}"))?;
-        let tag = format!("v{}", line.version);
-        let rows = self.engine_rows(Some(previous.head()));
-        let published = rows.has
-            || rows
-                .newest
-                .as_deref()
-                .is_some_and(|sha| self.version_at(sha).as_deref() == Some(line.version.as_str()));
-        let tagged = self.origin_tag(&tag).is_some();
-        let ledger = ledger_text
-            .lines()
-            .any(|row| row.split_whitespace().nth(1) == Some(line.version.as_str()))
-            || self
-                .cut_journal()
-                .is_some_and(|cut| cut.version == line.version);
-        let published = published
-            || std::iter::once(previous.base.as_str())
-                .chain(previous.hops.iter().map(|hop| hop.commit.as_str()))
-                .any(|commit| self.engine_rows(Some(commit)).has);
-        crate::line::require_unpublished([tagged, ledger, published, false, false])?;
-        let public =
-            crate::publish::workspace_channel_slug(&self.repo).map_err(|e| e.to_string())?;
-        let released = !crate::publish::release_objects_by_tag(&public, &tag)
-            .map_err(|e| e.to_string())?
-            .is_empty();
-        crate::line::require_unpublished([false, false, false, released, false])?;
-        let config = self
-            .git_out(&["show", "origin/main:publish/config.sh"])
-            .ok_or("cannot read the staging remote declaration")?;
-        let staging = config
-            .lines()
-            .find_map(|row| {
-                row.strip_prefix("STAGING_REMOTE_DEFAULT=\"")
-                    .and_then(|value| value.strip_suffix('"'))
-            })
-            .ok_or("no staging remote declaration")?;
-        let staging =
-            crate::publish::github_slug_from_remote_url(staging).map_err(|e| e.to_string())?;
-        let staged = crate::github_remote::repository_file(&staging, "main", "Cargo.toml")?;
-        let staged = std::str::from_utf8(&staged).map_err(|e| e.to_string())?;
-        let staged_version =
-            crate::publish::workspace_version(staged).map_err(|e| e.to_string())?;
-        let numbers = |version: &str| {
-            version
-                .split('.')
-                .map(str::parse::<u64>)
-                .collect::<Result<Vec<_>, _>>()
+        self.prefetched_origin = None;
+        self.prefetch_source()?;
+        let previous = crate::line_claim::existing(&self.repo, &line.version)
+            .map_err(|why| Refusal::new(why, "retry the current fleet line read").could_not_run())?
+            .ok_or_else(|| {
+                Refusal::new(
+                    "no existing fleet line to supersede",
+                    "resume the existing line, or drop --supersede",
+                )
+            })?;
+        if expected_previous.is_some_and(|expected| *expected != previous) {
+            return Err(Refusal::new(
+                "the fleet line advanced after this clone's release journal",
+                "resume that line and carry the fix instead of superseding its new hop",
+            ));
+        }
+        if expected_previous.is_none() {
+            self.supersede_staging_state(&previous, line)
+                .map_err(|error| error.refusal(Some(&previous)))?;
+        }
+        if crate::line::supersession(&self.git(), &line.version)
+            .map_err(|why| Refusal::new(why, "retry the current line read").could_not_run())?
+            .is_some()
+        {
+            return Err(Refusal::new(
+                "the line already has a durable supersession",
+                "resume the current fleet line",
+            ));
+        }
+        self.origin_main = None;
+        self.supersede_public_state_after_staging(&previous, line)
+            .map_err(|error| error.refusal(Some(&previous)))?;
+        Ok(previous)
+    }
+
+    fn classify_supersede(&mut self, previous: &Line, line: &Line) -> SupersedeResult {
+        let requested = supersession_record(previous.clone(), line.clone());
+        self.prefetched_origin = None;
+        if let Err(refusal) = self.prefetch_source() {
+            return SupersedeResult::Unknown(format!("{} — {}", refusal.why, refusal.remedy));
+        }
+        self.verify_supersede_result(classify_supersession_reread(
+            &requested,
+            crate::line::supersession(&self.git(), &line.version),
+            true,
+        ))
+    }
+
+    fn supersede_line(&mut self, expected_previous: &Line, line: &Line) -> SupersedeResult {
+        let requested = supersession_record(expected_previous.clone(), line.clone());
+        let refused = |why: String| SupersedeResult::Refused {
+            why,
+            retry: false,
+            winner: None,
         };
-        let staged = numbers(&staged_version).map_err(|e| e.to_string())?
-            >= numbers(&line.version).map_err(|e| e.to_string())?;
-        crate::line::require_unpublished([false, false, false, false, staged])?;
-        claim.audit()?;
-        let record = crate::line::Supersession {
-            previous,
-            replacement: line.clone(),
-            reason: "explicit --supersede: the unpublished line cannot finish with its own tooling"
-                .into(),
+        self.prefetched_origin = None;
+        if let Err(error) = self.prefetch_source() {
+            return refused(error.why);
+        }
+        let previous = match crate::line_claim::existing(&self.repo, &line.version) {
+            Ok(Some(previous)) => previous,
+            Ok(None) => return refused("no existing fleet line to supersede".into()),
+            Err(why) => return refused(why),
         };
-        let origin = crate::github_remote::Remote::origin(&self.repo)?;
-        let merge = crate::line::supersede(&self.git(), &origin, &record)?;
-        claim.boundary(line, "commit", &self.times())?;
-        claim.audit()?;
+        let mut claim =
+            match crate::line_claim::Claim::take(&self.repo, &previous, &self.logs, false) {
+                Ok(claim) => claim,
+                Err(why) => return self.classify_after_claim_stop(&requested, why),
+            };
+        let previous = claim.line.clone();
+        self.prefetched_origin = None;
+        if let Err(error) = self.prefetch_source() {
+            return self.classify_after_claim_stop(&requested, error.why);
+        }
+        match crate::line::supersession(&self.git(), &line.version) {
+            Ok(Some(record)) => {
+                let result = self.verify_supersede_result(classify_supersession_reread(
+                    &requested,
+                    Ok(Some(record)),
+                    false,
+                ));
+                if matches!(result, SupersedeResult::Committed(_)) {
+                    self.fleet_line = Some(claim);
+                }
+                return result;
+            }
+            Ok(None) => {}
+            Err(why) => return self.classify_after_claim_stop(&requested, why),
+        }
+        if previous != *expected_previous {
+            return self.classify_after_claim_stop(
+                &requested,
+                "the fleet line advanced while the replacement took its claim".into(),
+            );
+        }
+        if let Err(why) = claim.audit() {
+            return self.classify_after_claim_stop(&requested, why);
+        }
+        self.origin_main = None;
+        let public_state = self.supersede_public_state(&previous, line);
+        if let Err(result) = settle_post_claim_public_state(public_state, &previous, |why| {
+            self.classify_after_claim_stop(&requested, why)
+        }) {
+            return result;
+        }
+        if let Err(why) = claim.audit() {
+            return self.classify_after_claim_stop(&requested, why);
+        }
+        let record = supersession_record(previous, line.clone());
+        let origin = match crate::github_remote::Remote::origin(&self.repo) {
+            Ok(origin) => origin,
+            Err(why) => return self.classify_after_claim_stop(&requested, why),
+        };
+        let recorded = match crate::line::supersede(&self.git(), &origin, &record) {
+            Ok(merge) => format!("recorded on main at {merge}"),
+            Err(write_error) => {
+                self.prefetched_origin = None;
+                if let Err(refusal) = self.prefetch_source() {
+                    return SupersedeResult::Unknown(format!(
+                        "{write_error}; exact reread unavailable: {} — {}",
+                        refusal.why, refusal.remedy
+                    ));
+                }
+                match self.verify_supersede_result(classify_supersession_reread(
+                    &record,
+                    crate::line::supersession(&self.git(), &line.version),
+                    false,
+                )) {
+                    SupersedeResult::Committed(_) => {
+                        "recorded on main (confirmed by an exact reread)".into()
+                    }
+                    SupersedeResult::Refused { why, retry, winner } => {
+                        return SupersedeResult::Refused {
+                            why: format!("{write_error}; {why}"),
+                            retry,
+                            winner,
+                        };
+                    }
+                    SupersedeResult::Unknown(read_error) => {
+                        return SupersedeResult::Unknown(format!(
+                            "{write_error}; exact reread failed: {read_error}"
+                        ));
+                    }
+                }
+            }
+        };
+        let mut warnings = Vec::new();
+        if let Err(why) = claim.boundary(line, "commit", &self.times()) {
+            warnings.push(format!("claim boundary will retry: {why}"));
+        }
+        if let Err(why) = claim.audit() {
+            warnings.push(format!("claim audit will retry: {why}"));
+        }
         self.fleet_line = Some(claim);
-        Ok(format!(
-            "SUPERSEDED v{} line {} (base {}) with {}: {}; recorded on main at {merge}",
+        let warnings = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", warnings.join("; "))
+        };
+        SupersedeResult::Committed(format!(
+            "SUPERSEDED v{} line {} (base {}) with {}: {}; {recorded}{warnings}",
             line.version,
             record.previous.head(),
             record.previous.base,
@@ -6547,46 +6962,20 @@ impl Backend for Real {
             )
             .could_not_run()
         };
-        // A dry run does not move the person's checkout to the fetched candidate.
-        // Only that case needs a private worktree; a real cut already runs at R.
-        let temporary = if self.off_tree(tip).is_some() {
-            let dir = aterm_tempfile::Builder::new()
-                .prefix("aterm-release-input-")
-                .suffix(".noindex")
-                .tempdir()
-                .map_err(|e| unavailable(e.to_string()))?;
-            let root = dir.path().join("input");
-            self.git()
-                .git(&[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    root.to_str()
-                        .ok_or_else(|| unavailable("non-UTF-8 scratch path".into()))?,
-                    tip,
-                ])
-                .and_then(|o| {
-                    if o.success() {
-                        Ok(o)
-                    } else {
-                        Err(crate::ledger::Error::new(o.stderr_utf8()))
-                    }
-                })
-                .map_err(|e| unavailable(e.to_string()))?;
-            Some((dir, root))
-        } else {
-            None
-        };
-        let root = temporary
-            .as_ref()
-            .map_or(self.repo.as_path(), |(_, root)| root.as_path());
+        // Both a dry preflight and its eventual cut use this one owned checkout. A temporary
+        // dry-run path followed by the release clone changes every compiler path input even
+        // when the package bytes are equal. Never reset or clean it: refuse unexpected edits.
+        let root = self.release.join("input-checkout.noindex");
+        let _checkout_claim = crate::input_record::claim(&self.release).map_err(unavailable)?;
+        crate::input_record::checkout(&self.git(), &root, tip).map_err(unavailable)?;
+        let root = root.as_path();
         let initialized = crate::ledger::GitCli::new(root).git(&[
             "submodule",
             "update",
             "--init",
             "vendor/astream",
         ]);
-        let result = (|| match initialized {
+        (|| match initialized {
             Ok(out) if out.success() => {
                 let input = aterm_verify::release_input::discover(
                     root,
@@ -6618,6 +7007,14 @@ impl Backend for Real {
                     .ok_or_else(|| unavailable("no signed scanner was acquired".into()))?;
                 scanner.validate().map_err(unavailable)?;
                 let input_tools = format!("{seal}\ngitleaks {}", scanner.tree_root());
+                let carry_context = crate::check_content::item_context(
+                    &crate::artifact::file_sha256(
+                        &std::env::current_exe().map_err(|e| unavailable(e.to_string()))?,
+                    )
+                    .map_err(unavailable)?,
+                    &input_tools,
+                );
+                child.args(["--carry-context", &carry_context]);
                 // The handoff filename is a capability for reading this already-bound seal.
                 // It differs between a dry run and a real run, without changing any input.
                 let mut identity_child = self.child(prover.bin.join("targo"), Some(prover));
@@ -6626,6 +7023,7 @@ impl Backend for Real {
                 }
                 identity_child
                     .args(["--unverified", "verify", "release-input", "--base", base])
+                    .args(["--carry-context", &carry_context])
                     .env("PUBLICATION_ENGINE", &self.engine)
                     .current_dir(root);
                 crate::input_record::detach_launcher(&mut identity_child);
@@ -6674,6 +7072,8 @@ impl Backend for Real {
                         crate::check_record::InputError::Unavailable(why) => unavailable(why),
                     })?;
                 if missing.is_empty() {
+                    crate::input_record::attempted(&records, base, &tree, &input_seal)
+                        .map_err(unavailable)?;
                     return Ok(format!(
                         "release input: reused 4 checks for tree {tree}; 0 checks run"
                     ));
@@ -6688,6 +7088,20 @@ impl Backend for Real {
                     .join(crate::check_record::seal_dir(&input_seal));
                 let events = evidence.join(format!("{run_id}.events.jsonl"));
                 let retained_log = evidence.join(format!("{run_id}.log"));
+                if missing.iter().any(|name| name == "lint") {
+                    let passed =
+                        crate::input_record::previous_lint(&records, base).map_err(unavailable)?;
+                    let proof_file = evidence.join(format!("{run_id}.lint.jsonl"));
+                    crate::durable::write_atomic_durable(
+                        &proof_file,
+                        aterm_verify::lint_content::encode_passed(&passed)
+                            .map_err(unavailable)?
+                            .as_bytes(),
+                        0o600,
+                    )
+                    .map_err(|e| unavailable(e.to_string()))?;
+                    child.arg("--passed-lint-packages").arg(proof_file);
+                }
                 crate::durable::write_atomic_durable(&events, b"", 0o600)
                     .map_err(|e| unavailable(e.to_string()))?;
                 child
@@ -6707,6 +7121,8 @@ impl Backend for Real {
                     content: None,
                 };
                 crate::check_record::begin_run(&records, &facts).map_err(unavailable)?;
+                crate::input_record::attempted(&records, base, &tree, &input_seal)
+                    .map_err(unavailable)?;
                 let (out, record) = self
                     .output_accounted(Step::Checks, &mut child)
                     .map_err(|e| unavailable(e.to_string()))?;
@@ -6773,19 +7189,7 @@ impl Backend for Real {
             }
             Ok(out) => Err(unavailable(out.stderr_utf8())),
             Err(why) => Err(unavailable(why.to_string())),
-        })();
-        if let Some((_, root)) = &temporary {
-            let removed =
-                self.git()
-                    .git(&["worktree", "remove", "--force", &root.to_string_lossy()]);
-            if !removed.is_ok_and(|out| out.success()) {
-                return Err(unavailable(format!(
-                    "cannot remove private input worktree {}",
-                    root.display()
-                )));
-            }
-        }
-        result
+        })()
     }
 
     fn branch_is_main(&mut self) -> bool {
@@ -9323,6 +9727,314 @@ pub(crate) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Dura
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_staged_supersession_refusal_names_the_fix_hop_remedy() {
+        let previous = super::Line::start("0.189.0", "0123456789abcdef0123456789abcdef01234567", 1);
+        let refusal = super::SupersedeCheck::Present(
+            "the line has a staged publication; cannot supersede".into(),
+        )
+        .refusal(Some(&previous));
+        assert_eq!(refusal.remedy, crate::release::fix_remedy(previous.head()));
+    }
+
+    #[test]
+    fn the_staging_classifier_refuses_the_same_or_newer_version() {
+        assert!(!super::staged_covers_version("0.188.0", "0.189.0").unwrap());
+        assert!(super::staged_covers_version("0.189.0", "0.189.0").unwrap());
+        assert!(super::staged_covers_version("0.190.0", "0.189.0").unwrap());
+        assert!(super::staged_covers_version("not-a-version", "0.189.0").is_err());
+    }
+
+    #[test]
+    fn exact_supersession_reread_uses_the_complete_record() {
+        use super::*;
+
+        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
+        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
+        let requested = supersession_record(previous.clone(), replacement.clone());
+        assert!(matches!(
+            classify_supersession_reread(&requested, Ok(Some(requested.clone())), true),
+            SupersedeResult::Committed(_)
+        ));
+
+        let mut different_reason = requested.clone();
+        different_reason.reason.push_str(" mutated");
+        assert!(matches!(
+            classify_supersession_reread(&requested, Ok(Some(different_reason)), true),
+            SupersedeResult::Refused {
+                retry: false,
+                winner: Some(line),
+                ..
+            } if line == replacement
+        ));
+        let mut different_previous = requested.clone();
+        different_previous.previous.started += 1;
+        assert!(matches!(
+            classify_supersession_reread(&requested, Ok(Some(different_previous)), true),
+            SupersedeResult::Refused {
+                winner: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_supersession_reread(&requested, Ok(None), true),
+            SupersedeResult::Refused {
+                retry: true,
+                winner: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_supersession_reread(&requested, Err("unreadable".into()), true),
+            SupersedeResult::Unknown(why) if why == "unreadable"
+        ));
+    }
+
+    /// A claim stop alone restores nothing. NEGATIVE CONTROLS: an exact record commits, a
+    /// different record returns its winner, and an unreadable source remains unknown; only a
+    /// proved-empty reread preserves the claim's original refusal.
+    #[test]
+    fn claim_stop_is_decided_by_the_exact_source_record() {
+        use super::*;
+
+        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
+        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
+        let requested = supersession_record(previous, replacement.clone());
+        assert!(matches!(
+            classify_claim_stop(
+                &requested,
+                "claim stopped".into(),
+                Ok(Some(requested.clone()))
+            ),
+            SupersedeResult::Committed(_)
+        ));
+        let mut competing = requested.clone();
+        competing.replacement = Line::start("0.189.0", &"3".repeat(40), 3);
+        assert!(matches!(
+            classify_claim_stop(
+                &requested,
+                "claim stopped".into(),
+                Ok(Some(competing.clone()))
+            ),
+            SupersedeResult::Refused {
+                winner: Some(line),
+                ..
+            } if line == competing.replacement
+        ));
+        assert!(matches!(
+            classify_claim_stop(&requested, "claim stopped".into(), Ok(None)),
+            SupersedeResult::Refused {
+                why,
+                winner: None,
+                ..
+            } if why == "claim stopped"
+        ));
+        assert!(matches!(
+            classify_claim_stop(&requested, "claim stopped".into(), Err("unreadable".into())),
+            SupersedeResult::Unknown(why) if why == "unreadable"
+        ));
+    }
+
+    /// A public-surface refusal can arrive after an aged claim was adopted elsewhere. NEGATIVE
+    /// CONTROL: the durable competing record wins over the stale scan result; treating that scan
+    /// as authoritative would return its refusal with no winner.
+    #[test]
+    fn public_state_stop_is_decided_by_the_competing_record() {
+        use super::*;
+
+        let previous = Line::start("0.189.0", &"1".repeat(40), 1);
+        let replacement = Line::start("0.189.0", &"2".repeat(40), 2);
+        let requested = supersession_record(previous.clone(), replacement);
+        let mut competing = requested.clone();
+        competing.replacement = Line::start("0.189.0", &"3".repeat(40), 3);
+        let result = settle_post_claim_public_state(
+            Err(SupersedeCheck::Present(
+                "the line has a staged publication; cannot supersede".into(),
+            )),
+            &previous,
+            |why| classify_claim_stop(&requested, why, Ok(Some(competing.clone()))),
+        )
+        .expect_err("the stale public-state stop is classified by the durable record");
+        assert!(matches!(
+            result,
+            SupersedeResult::Refused {
+                winner: Some(line),
+                retry: false,
+                ..
+            } if line == competing.replacement
+        ));
+    }
+
+    /// A competing record cannot move local state unless its replacement is itself a verified
+    /// release line. NEGATIVE CONTROL: the same structured winner with a nonexistent base is
+    /// classified as unknown instead of being handed to the transaction's adoption path.
+    #[test]
+    fn an_unverified_competing_supersession_is_not_a_winner() {
+        use super::*;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = GitCli::new(&repo);
+        crate::ledger::git_ok(&git, &["init", "-q"]).unwrap();
+        let real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        let invalid = Line::start("0.189.0", &"f".repeat(40), 1);
+        let classified = real.verify_supersede_result(SupersedeResult::Refused {
+            why: "a competing writer won".into(),
+            retry: false,
+            winner: Some(invalid),
+        });
+        assert!(matches!(classified, SupersedeResult::Unknown(_)));
+    }
+
+    fn supersede_staging_fixture(
+        slug: &str,
+        reference: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        assert_eq!(reference, "main");
+        assert_eq!(path, "Cargo.toml");
+        let version = match slug {
+            "fixture/retired-staging" => "0.188.0",
+            "fixture/retired-hop-staging" => "0.189.0",
+            "fixture/replacement-staging" => "0.188.0",
+            other => return Err(format!("unexpected staging repository {other}")),
+        };
+        Ok(format!("[workspace.package]\nversion = \"{version}\"\n").into_bytes())
+    }
+
+    /// Production preflight reads every retired-line staging declaration before any selection
+    /// write. NEGATIVE CONTROL: reading only either base, or `replacement.base`, sees only older
+    /// staged versions and cannot produce the required fix-hop remedy.
+    #[test]
+    fn production_supersede_preflight_reads_the_retired_lines_staging_repo() {
+        use super::*;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("publish")).unwrap();
+        let git = GitCli::new(&repo);
+        let run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
+        run(&["init", "-q"]);
+        let commit = || {
+            run(&["add", "."]);
+            run(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ]);
+            run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string()
+        };
+        std::fs::write(
+            repo.join("publish/config.sh"),
+            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/retired-staging.git\"\n",
+        )
+        .unwrap();
+        let retired = commit();
+        std::fs::write(
+            repo.join("publish/config.sh"),
+            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/retired-hop-staging.git\"\n",
+        )
+        .unwrap();
+        let retired_hop = commit();
+        std::fs::write(
+            repo.join("publish/config.sh"),
+            "STAGING_REMOTE_DEFAULT=\"https://github.com/fixture/replacement-staging.git\"\n",
+        )
+        .unwrap();
+        let replacement = commit();
+        let mut previous = Line::start("0.189.0", &retired, 1);
+        previous.hops.push(Hop {
+            commit: retired_hop,
+            carries: "fixture-fix".into(),
+            why: "changes staging policy".into(),
+            paths: vec!["publish/config.sh".into()],
+        });
+        let proposed = Line::start("0.189.0", &replacement, 2);
+        let head_before = run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string();
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.staging_file = supersede_staging_fixture;
+        let refusal = Backend::preflight_supersede(&mut real, &proposed, Some(&previous))
+            .expect_err("the retired line is already staged");
+        assert_eq!(refusal.remedy, crate::release::fix_remedy(previous.head()));
+        assert_eq!(
+            run(&["rev-parse", "HEAD"]).stdout_utf8().trim(),
+            head_before
+        );
+        assert!(!real.release.join(crate::release::SELECTION_FILE).exists());
+    }
+
+    fn supersede_release_fixture(slug: &str, tag: &str) -> Result<bool, String> {
+        assert_eq!(tag, "v0.189.0");
+        match slug {
+            "fixture/base-channel" | "fixture/replacement-channel" => Ok(false),
+            "fixture/hop-channel" => Ok(true),
+            other => Err(format!("unexpected release channel {other}")),
+        }
+    }
+
+    /// Every historical channel is checked. NEGATIVE CONTROL: checking only the base or current
+    /// checkout misses the release object addressed by the retired hop.
+    #[test]
+    fn supersede_checks_each_release_channel_declared_by_the_retired_line() {
+        use super::*;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = GitCli::new(&repo);
+        let run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
+        run(&["init", "-q"]);
+        let manifest = |channel: &str| {
+            format!(
+                "[workspace]\nmembers = []\n\
+                 [workspace.package]\nversion = \"0.189.0\"\n\
+                 repository = \"https://github.com/fixture/source\"\n\
+                 [workspace.metadata.aterm]\nupdate_channel = \"{channel}\"\n"
+            )
+        };
+        let commit = || {
+            run(&["add", "Cargo.toml"]);
+            run(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ]);
+            run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string()
+        };
+        std::fs::write(repo.join("Cargo.toml"), manifest("fixture/base-channel")).unwrap();
+        let base = commit();
+        std::fs::write(repo.join("Cargo.toml"), manifest("fixture/hop-channel")).unwrap();
+        let hop = commit();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            manifest("fixture/replacement-channel"),
+        )
+        .unwrap();
+        let _replacement = commit();
+        let mut previous = Line::start("0.189.0", &base, 1);
+        previous.hops.push(Hop {
+            commit: hop,
+            carries: "fixture-fix".into(),
+            why: "changes release channel".into(),
+            paths: vec!["Cargo.toml".into()],
+        });
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.release_exists = supersede_release_fixture;
+        assert!(matches!(
+            real.supersede_release_state(&previous, "v0.189.0"),
+            Err(SupersedeCheck::Present(_))
+        ));
+    }
+
     fn witnessed_fixture_wait(
         real: &super::Real,
         _candidate: &super::Candidate,
@@ -11841,6 +12553,50 @@ mod tests {
             pointer_verdict(Ok(vec!["404".into()])).expect("shape problems pass through"),
             ["404"]
         );
+    }
+
+    #[test]
+    fn a_302_elsewhere_is_read_again_until_github_agrees_and_nothing_else_is() {
+        let want = "https://x/v0.6.0";
+        let old = || Ok((302, Some("https://x/v0.5.0".to_string())));
+        let mut answers = vec![old(), old(), Ok((302, Some(want.to_string())))].into_iter();
+        let mut slept = 0;
+        assert_eq!(
+            settled_pointer_hop(want, &mut || answers.next().unwrap(), &mut |_| slept += 1),
+            Ok((302, Some(want.to_string()))),
+        );
+        assert_eq!(slept, 2, "two stale answers, two waits");
+        let (mut reads, mut slept) = (0, 0);
+        assert_eq!(
+            settled_pointer_hop(
+                want,
+                &mut || {
+                    reads += 1;
+                    old()
+                },
+                &mut |_| slept += 1,
+            ),
+            old(),
+            "a pointer that never agrees is still the verdict once the bound runs out",
+        );
+        assert_eq!(reads, crate::publish::POINTER_PROBE_ATTEMPTS);
+        assert_eq!(slept, crate::publish::POINTER_PROBE_ATTEMPTS - 1);
+        for once in [Ok((404, None)), Ok((503, None)), Err("timeout".to_string())] {
+            let mut reads = 0;
+            let first = once.clone();
+            assert_eq!(
+                settled_pointer_hop(
+                    want,
+                    &mut || {
+                        reads += 1;
+                        once.clone()
+                    },
+                    &mut |_| panic!("only a 302 elsewhere waits"),
+                ),
+                first,
+            );
+            assert_eq!(reads, 1);
+        }
     }
 
     #[test]

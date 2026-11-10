@@ -6,7 +6,12 @@
 
 use super::*;
 
-const MAX_PREPARED: usize = 64;
+#[path = "codex_assignment_prepare_cancel.rs"]
+pub(in crate::harness) mod cancel;
+#[path = "codex_assignment_target_install.rs"]
+pub(in crate::harness) mod install;
+
+pub(in crate::harness) const MAX_PREPARED: usize = 64;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,14 +65,14 @@ impl Body {
 /// claim or legacy refresh default can construct this evidence.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OAuth {
+pub(super) struct OAuth {
     issuer: String,
-    token_endpoint: String,
-    client: String,
+    pub(super) token_endpoint: String,
+    pub(super) client: String,
 }
 
 impl OAuth {
-    fn from_document(document: &[u8]) -> Result<Self, String> {
+    pub(super) fn from_document(document: &[u8]) -> Result<Self, String> {
         let value: aterm_json::Value =
             aterm_json::from_slice(document).map_err(|_| "assignment target document invalid")?;
         let provenance = value
@@ -136,11 +141,34 @@ pub(super) struct Record {
     source_authority: SourceAuthority,
     // None is a durable accepted intent, never a prepared-target proof.
     target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) commit_boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cancelled: bool,
 }
 
 impl Record {
+    pub(in crate::harness::codex_assignment) fn matches_ack(
+        &self,
+        ack: &super::target_ack::Observation,
+    ) -> bool {
+        self.body.operation == ack.operation
+            && self.commit_boundary.as_deref() == Some(ack.boundary.as_str())
+            && self.body.expected_assignment.checked_add(1) == Some(ack.assignment_generation)
+            && self.target.as_ref().is_some_and(|target| {
+                target.identity.account == ack.account
+                    && target.identity.user == ack.user
+                    && target.credential_floor <= ack.credential_generation
+            })
+    }
     fn valid(&self) -> bool {
         self.body.valid()
+            && (!self.cancelled || self.commit_boundary.is_none())
+            && self
+                .commit_boundary
+                .as_deref()
+                .is_none_or(|boundary| hex(boundary, 32))
+            && (self.commit_boundary.is_none() || self.target.is_some())
             && self.source_authority.valid(self.body.expected_assignment)
             && self.source.generation > 0
             && self.source.request.valid()
@@ -165,6 +193,41 @@ impl Record {
     }
 }
 
+pub(super) fn current_record_valid(book: &Book) -> bool {
+    let SourceAuthority::Assignment { operation } = &book.current.authority else {
+        return true;
+    };
+    book.prepared
+        .iter()
+        .find(|record| record.body.operation == *operation)
+        .is_none_or(|record| {
+            !record.cancelled
+                && record.commit_boundary == book.current.boundary
+                && record.body.expected_assignment == book.current.previous_generation
+                && record
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.binding == book.current.binding)
+        })
+}
+
+pub(super) fn pending_for_current(book: &Book) -> bool {
+    book.prepared.iter().any(|record| {
+        record.commit_boundary.is_some()
+            && record.body.expected_assignment == book.current.generation
+            && record.source == book.current.binding
+            && record.source_authority == book.current.authority
+    })
+}
+
+fn same_prepared(a: &Record, b: &Record) -> bool {
+    a.body == b.body
+        && a.source == b.source
+        && a.source_authority == b.source_authority
+        && a.target == b.target
+        && a.cancelled == b.cancelled
+}
+
 pub(super) fn records_valid(records: &[Record]) -> bool {
     records.len() <= MAX_PREPARED
         && records.iter().enumerate().all(|(index, record)| {
@@ -181,6 +244,9 @@ fn admitted<'a>(records: &'a [Record], body: &Body) -> Result<Option<&'a Record>
         .find(|record| record.body.operation == body.operation);
     if prior.is_some_and(|record| record.body != *body) {
         return Err("assignment operation body changed".into());
+    }
+    if prior.is_some_and(|record| record.cancelled) {
+        return Err("assignment operation cancelled".into());
     }
     if prior.is_none() && records.len() >= MAX_PREPARED {
         return Err("assignment preparation capacity unavailable".into());
@@ -202,9 +268,13 @@ pub(in crate::harness) struct PreparedAssignment<'a, 'grant> {
 pub(in crate::harness) struct PreparedTarget {
     record: Record,
     caller: Caller,
+    preview: Option<super::policy::PreparedPreview>,
 }
 
 impl PreparedTarget {
+    pub(in crate::harness) fn policy_preview(&self) -> Option<&super::policy::PreparedPreview> {
+        self.preview.as_ref()
+    }
     pub(in crate::harness) fn operation(&self) -> &str {
         &self.record.body.operation
     }
@@ -214,9 +284,62 @@ impl PreparedTarget {
     pub(in crate::harness) fn source(&self) -> &owner::GrantBinding {
         &self.record.source
     }
-    pub(in crate::harness) fn matches(&self, other: &Self) -> bool {
-        self.caller == other.caller && self.record == other.record
+    pub(in crate::harness) fn intent(&self) -> TargetIntent {
+        TargetIntent {
+            record: self.record.clone(),
+            caller: self.caller.clone(),
+        }
     }
+    pub(in crate::harness) fn matches_intent(&self, intent: &TargetIntent) -> bool {
+        self.caller == intent.caller && same_prepared(&self.record, &intent.record)
+    }
+    pub(in crate::harness) fn matches(&self, other: &Self) -> bool {
+        self.caller == other.caller
+            && same_prepared(&self.record, &other.record)
+            && self.preview == other.preview
+    }
+}
+
+/// Owned metadata snapshot for dropping registry guards before bounded I/O.
+/// It is not an admission, installation, source, or factory authority.
+pub(in crate::harness) struct TargetIntent {
+    record: Record,
+    caller: Caller,
+}
+impl TargetIntent {
+    pub(in crate::harness) fn operation(&self) -> &str {
+        &self.record.body.operation
+    }
+    pub(in crate::harness) fn assignment_generation(&self) -> Option<u64> {
+        self.record.body.expected_assignment.checked_add(1)
+    }
+    pub(in crate::harness) fn caller(&self) -> &Caller {
+        &self.caller
+    }
+    pub(in crate::harness) fn target_binding(&self) -> Option<&owner::GrantBinding> {
+        self.record.target.as_ref().map(|target| &target.binding)
+    }
+}
+
+pub(super) fn origin_namespace_matches(book: &Book, intent: &TargetIntent) -> Result<bool, String> {
+    let Some(record) = book
+        .prepared
+        .iter()
+        .find(|record| record.body.operation == intent.operation())
+    else {
+        return Ok(false);
+    };
+    // This is the already-admitted source A's namespace, not permission to
+    // prepare/install target B. A cancelled proposal must not strand A's
+    // actual work while its signed cancellation/retirement settles.
+    let mut expected = intent.record.clone();
+    expected.cancelled = record.cancelled;
+    Ok(same_prepared(record, &expected)
+        && record.commit_boundary.is_none()
+        && book.current.binding == record.source
+        && book.current.authority == record.source_authority
+        && book.current.generation == record.body.expected_assignment
+        && matches!(book.current.phase, Phase::Startup | Phase::Applied))
 }
 
 impl std::fmt::Debug for PreparedTarget {
@@ -236,17 +359,21 @@ pub(in crate::harness) fn reservation_metadata_fixture(
     // a live source/process and must never be counted as an admission test.
     PreparedTarget {
         caller,
+        preview: None,
         record: Record {
             body: Body {
                 operation: "1".repeat(32),
                 pool_revision: "2".repeat(64),
                 expected_assignment: 0,
-                account: None,
+                account: (source.request.label == target.request.label)
+                    .then(|| crate::harness::codex_enrollment::account_id(&target.request.label)),
             },
             source,
             source_authority: SourceAuthority::Startup {
                 nonce: "3".repeat(32),
             },
+            commit_boundary: None,
+            cancelled: false,
             target: Some(Target {
                 binding: target,
                 identity: super::super::codex_renewal::Identity::from_native("fixture", "fixture"),
@@ -266,7 +393,41 @@ impl<'grant> PreparedAssignment<'_, 'grant> {
         PreparedTarget {
             record: self.record.clone(),
             caller: self.source.caller().clone(),
+            preview: self.policy_preview().ok(),
         }
+    }
+    fn policy_preview(&self) -> Result<super::policy::PreparedPreview, String> {
+        let (_, _, source, _) = self.source.gate_source();
+        let source_policy = source
+            .provider_policy()
+            .ok_or("source policy unavailable")?;
+        let target_policy = super::policy::ProviderPolicy::capture(self.target)?;
+        if source_policy.binding() != target_policy.binding()
+            || source_policy.fedramp() != target_policy.fedramp()
+        {
+            return Err("assignment provider policy differs".into());
+        }
+        let binding_hash = super::super::codex_source_registry::immutable_binding_hash;
+        Ok(super::policy::PreparedPreview {
+            operation: self.record.body.operation.clone(),
+            pool_revision: self.record.body.pool_revision.clone(),
+            expected_assignment: self.record.body.expected_assignment,
+            target_ref: super::super::codex_enrollment::account_id(
+                &self.target.binding().request.label,
+            ),
+            auth_mode: "chatgpt",
+            account: self.target.identity().account.clone(),
+            user: self.target.identity().user.clone(),
+            source_grant: binding_hash(source.binding())
+                .map_err(|_| "source policy binding unavailable")?,
+            target_grant: binding_hash(self.target.binding())
+                .map_err(|_| "target policy binding unavailable")?,
+            source_provider: source_policy.binding().into(),
+            target_provider: target_policy.binding().into(),
+            source_fedramp: source_policy.fedramp(),
+            target_fedramp: target_policy.fedramp(),
+            target_refresh_endpoint: target_policy.endpoint().into(),
+        })
     }
     pub(super) fn operation(&self) -> &str {
         &self.record.body.operation
@@ -305,6 +466,9 @@ fn current(
 }
 
 fn publish(claimed: &mut Claimed, identity: &age::Identity) -> Result<(), String> {
+    if claimed.pending_install.is_some() {
+        return Err("assignment installation custody busy".into());
+    }
     if !claimed.book.valid(&claimed.book.caller) {
         return Err("assignment preparation book is invalid".into());
     }
@@ -378,10 +542,22 @@ pub(in crate::harness) fn with_prepared<R>(
         .ok_or("assignment identity unavailable")?;
     let prior = {
         let mut claimed = lease.try_lock().map_err(|_| "assignment custody busy")?;
+        if claimed.pending_install.is_some() {
+            return Err("assignment installation custody busy".into());
+        }
         if !current(env, &claimed.book, source, &body) {
             return Err("assignment source changed".into());
         }
         claimed.store.unchanged().map_err(str::to_owned)?;
+        if claimed.book.current.authority.native_intent() == Some(body.operation.as_str())
+            && !claimed
+                .book
+                .prepared
+                .iter()
+                .any(|record| record.body.operation == body.operation)
+        {
+            return Err("assignment operation already current".into());
+        }
         let prior = admitted(&claimed.book.prepared, &body)?.cloned();
         let retained = match prior {
             Some(prior) => prior,
@@ -390,10 +566,23 @@ pub(in crate::harness) fn with_prepared<R>(
                     body: body.clone(),
                     source: claimed.book.current.binding.clone(),
                     source_authority: claimed.book.current.authority.clone(),
+                    commit_boundary: None,
+                    cancelled: false,
                     target: None,
                 };
                 claimed.book.prepared.push(intent.clone());
-                claimed.book.schema = 3;
+                claimed.book.schema = if !claimed.book.acknowledged.is_empty() {
+                    5
+                } else if claimed
+                    .book
+                    .prepared
+                    .iter()
+                    .any(|record| record.commit_boundary.is_some())
+                {
+                    4
+                } else {
+                    3
+                };
                 intent
             }
         };
@@ -421,6 +610,9 @@ pub(in crate::harness) fn with_prepared<R>(
             // use. The initial book observation never remains locked while
             // acquiring credential custody.
             let mut claimed = lease.try_lock().map_err(|_| "assignment custody busy")?;
+            if claimed.pending_install.is_some() {
+                return Err("assignment installation custody busy".into());
+            }
             if !current(env, &claimed.book, source, &body) {
                 return Err("assignment source changed".into());
             }
@@ -487,7 +679,7 @@ mod tests {
     #[cfg(unix)]
     use aterm_secrets::client;
 
-    fn record() -> Record {
+    pub(super) fn record() -> Record {
         // Serialized data validation only; this never mints a native source or
         // PreparedAssignment, and contains no real credential or caller.
         let binding = |label: &str| {
@@ -507,7 +699,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn book(record: &Record) -> Book {
+    pub(super) fn book(record: &Record) -> Book {
         Book {
             schema: 2,
             caller: Caller {
@@ -535,6 +727,7 @@ mod tests {
                 phase: Phase::Startup,
             },
             prepared: Vec::new(),
+            acknowledged: Vec::new(),
         }
     }
 
@@ -564,7 +757,11 @@ mod tests {
         let mut book = book(&pending);
         book.schema = 3;
         book.prepared.push(pending.clone());
-        let mut claimed = Claimed { store, book };
+        let mut claimed = Claimed {
+            store,
+            book,
+            pending_install: None,
+        };
         publish(&mut claimed, &identity).unwrap();
         // Exact replay can settle an uncertain write acknowledgement without
         // creating a second target, provider request or operation identity.
@@ -696,6 +893,7 @@ mod tests {
                 phase: Phase::Startup,
             },
             prepared: Vec::new(),
+            acknowledged: Vec::new(),
         };
         assert!(book.valid(&caller));
         let legacy = aterm_json::to_vec(&book).unwrap();

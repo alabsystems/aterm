@@ -5,9 +5,14 @@
 //! This module grants no provider, process, credential or session assignment authority.
 
 use super::accounts::{self, Binding};
+#[path = "codex_catalogue_witness.rs"]
+mod catalogue_witness;
 #[path = "codex_owner_witness.rs"]
 mod owner_witness;
 use aterm_json::Value;
+pub(super) use catalogue_witness::{
+    CatalogueAnchorWriter, CataloguePhase, CatalogueRecordState, CatalogueWitness,
+};
 pub(super) use owner_witness::{OwnerAnchorWriter, OwnerAttempt, OwnerWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -111,10 +116,14 @@ struct Record {
     rejected: Option<RejectedIntent>,
     #[serde(default, skip_serializing_if = "is_false")]
     native_required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    catalogue_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_reference: Option<super::codex_grant_owner::GrantReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_witness: Option<OwnerWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalogue_witness: Option<CatalogueWitness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     row_publication: Option<super::codex_native_row::PublicationReceiptData>,
     status: Status,
@@ -227,6 +236,12 @@ impl RecoveryOwnership {
     }
 }
 impl Record {
+    fn catalogue_only_change(&self, old: &Self) -> bool {
+        let mut unchanged = self.clone();
+        unchanged.catalogue_witness = old.catalogue_witness.clone();
+        unchanged == *old
+    }
+
     fn native_retirement_claim_only(&self, old: &Self, owner: &RecoveryOwnership) -> bool {
         if old.status.phase != Phase::CancelRequested
             || self.status != old.status
@@ -320,7 +335,7 @@ impl DirectoryIdentity {
         }
     }
 
-    fn matches(&self, path: &std::path::Path) -> bool {
+    pub(super) fn matches(&self, path: &std::path::Path) -> bool {
         Self::capture(path).is_ok_and(|current| {
             self.ino == current.ino
                 && match (self.volume, current.volume) {
@@ -436,6 +451,7 @@ pub struct Operations(
     #[serde(skip)] BTreeMap<String, (Option<OwnerWitness>, OwnerWitness)>,
     #[serde(skip)] BTreeMap<String, RecoveryOwnership>,
     #[serde(skip)] std::collections::BTreeSet<String>,
+    #[serde(skip)] BTreeMap<String, (Option<CatalogueWitness>, CatalogueWitness)>,
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -529,15 +545,133 @@ impl Operations {
         Ok(data)
     }
 
-    #[cfg(all(test, unix))]
+    /// Canonical correlation data only; current credential use must verify the
+    /// actual issuer MAC and the present after-binding fingerprint.
     pub(super) fn row_publication(
         &self,
         binding: &super::codex_grant_owner::GrantBinding,
     ) -> Option<&super::codex_native_row::PublicationReceiptData> {
         self.0
             .get(&binding.request.id)
+            .filter(|_| self.authenticates_published_grant(binding))
             .and_then(|record| record.row_publication.as_ref())
             .filter(|data| data.binding() == binding)
+    }
+
+    pub(crate) fn has_catalogue_witness(&self) -> bool {
+        self.0
+            .values()
+            .any(|record| record.catalogue_required || record.catalogue_witness.is_some())
+    }
+
+    pub(super) fn catalogue_required_id(&self, id: &str) -> bool {
+        self.0
+            .get(id)
+            .is_some_and(|record| record.native_required && record.catalogue_required)
+    }
+
+    /// Dispatch metadata only; this cannot authorize a credential read.
+    pub(super) fn has_native_label(&self, label: &str) -> bool {
+        self.0.values().any(|record| {
+            record.native_required
+                && record
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.label == label)
+        })
+    }
+
+    pub(super) fn requires_global_catalogue(&self, request: &Request) -> Result<bool, String> {
+        self.lookup(request)?.ok_or("unknown catalogue operation")?;
+        Ok(self
+            .0
+            .get(&request.id)
+            .is_some_and(|record| record.native_required && record.catalogue_required))
+    }
+
+    pub(super) fn catalogue_witness(
+        &self,
+        request: &Request,
+    ) -> Result<Option<CatalogueWitness>, String> {
+        self.lookup(request)?.ok_or("unknown catalogue operation")?;
+        let record = self
+            .0
+            .get(&request.id)
+            .ok_or("unknown catalogue operation")?;
+        if !record.native_required || !record.catalogue_required || record.staging.is_none() {
+            return Err("catalogue source is not natively admitted".into());
+        }
+        Ok(record.catalogue_witness.clone())
+    }
+    pub(super) fn catalogue_staging(&self, request: &Request) -> Result<Staging, String> {
+        self.catalogue_witness(request)?;
+        self.0
+            .get(&request.id)
+            .and_then(|record| record.staging.clone())
+            .ok_or_else(|| "catalogue staging unavailable".into())
+    }
+    pub(super) fn catalogue_record_state(
+        &self,
+        request: &Request,
+    ) -> Result<CatalogueRecordState, String> {
+        self.catalogue_staging(request)?;
+        let record = self
+            .0
+            .get(&request.id)
+            .ok_or("catalogue record unavailable")?;
+        let published = if record.status.phase == Phase::Applied {
+            let binding = super::codex_grant_owner::GrantBinding {
+                request: request.clone(),
+                reference: record
+                    .grant_reference
+                    .clone()
+                    .ok_or("catalogue grant reference unavailable")?,
+                generation: record
+                    .status
+                    .generation
+                    .filter(|generation| *generation > 0)
+                    .ok_or("catalogue publication generation unavailable")?,
+            };
+            if !self.authenticates_published_grant(&binding) {
+                return Err("catalogue publication is uncertain".into());
+            }
+            Some(binding)
+        } else {
+            None
+        };
+        Ok(CatalogueRecordState {
+            witness: record.catalogue_witness.clone(),
+            reference: record.grant_reference.clone(),
+            published,
+            owner_witness: record.owner_witness.clone(),
+            publication: record.row_publication.clone(),
+        })
+    }
+
+    pub(super) fn cas_catalogue_witness(
+        &mut self,
+        transition: &super::codex_grant_owner::CatalogueTransition,
+    ) -> Result<(), String> {
+        let request = transition.request();
+        let expected = transition.expected();
+        let next = transition.next();
+        if !next.valid()
+            || self.catalogue_witness(request)?.as_ref() != expected
+            || self.staged(request)? != Some(transition.staging())
+            || !transition.valid()
+        {
+            return Err("catalogue anchor changed".into());
+        }
+        if expected == Some(next) {
+            return Ok(());
+        }
+        self.0
+            .get_mut(&request.id)
+            .ok_or("unknown catalogue operation")?
+            .catalogue_witness = Some(next.clone());
+        self.7
+            .insert(request.id.clone(), (expected.cloned(), next.clone()));
+        Ok(())
     }
 
     pub(crate) fn has_owner_witness(&self) -> bool {
@@ -576,6 +710,13 @@ impl Operations {
             || book.0.len() > MAX_OPERATIONS
             || book.0.iter().any(|(id, record)| {
                 record.intent().is_none_or(|intent| id != &intent.id)
+                    || (record.catalogue_required && !record.native_required)
+                    || record.catalogue_witness.as_ref().is_some_and(|witness| {
+                        !witness.valid()
+                            || !record.native_required
+                            || !record.catalogue_required
+                            || record.staging.is_none()
+                    })
                     || record.owner_witness.as_ref().is_some_and(|witness| {
                         !witness.valid()
                             || !record.native_required
@@ -735,8 +876,10 @@ impl Operations {
                 request: None,
                 rejected: Some(intent.clone()),
                 native_required: false,
+                catalogue_required: false,
                 grant_reference: None,
                 owner_witness: None,
+                catalogue_witness: None,
                 row_publication: None,
                 status: status.clone(),
                 staging: None,
@@ -771,8 +914,10 @@ impl Operations {
                 request: Some(request.clone()),
                 rejected: None,
                 native_required: false,
+                catalogue_required: false,
                 grant_reference: None,
                 owner_witness: None,
+                catalogue_witness: None,
                 row_publication: None,
                 staging: None,
                 retired: false,
@@ -790,9 +935,25 @@ impl Operations {
     pub(crate) fn admit_native(&mut self, request: &Request) -> Result<bool, String> {
         let fresh = self.admit(request)?;
         if fresh {
+            let record = self.0.get_mut(&request.id).expect("admitted");
+            record.native_required = true;
+            record.catalogue_required = true;
+        }
+        Ok(fresh)
+    }
+
+    /// Historical-format fixture only. Production never upgrades/downgrades
+    /// catalogue membership based on copied response bytes or file absence.
+    #[cfg(all(test, unix))]
+    pub(super) fn admit_historical_native_fixture(
+        &mut self,
+        request: &Request,
+    ) -> Result<bool, String> {
+        let fresh = self.admit(request)?;
+        if fresh {
             self.0
                 .get_mut(&request.id)
-                .expect("admitted")
+                .expect("admitted fixture")
                 .native_required = true;
         }
         Ok(fresh)
@@ -821,6 +982,34 @@ impl Operations {
                 Ok(())
             }
         }
+    }
+
+    /// Ordering metadata only. Every candidate must be authenticated again
+    /// under canonical owner custody before it can become a maintenance ticket.
+    pub(super) fn global_owner_candidates_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<super::codex_grant_owner::GrantBinding> {
+        self.0
+            .iter()
+            .filter_map(|(id, record)| {
+                if after.is_some_and(|after| id.as_str() <= after)
+                    || !record.catalogue_required
+                    || record.owner_witness.is_none()
+                {
+                    return None;
+                }
+                let binding = super::codex_grant_owner::GrantBinding {
+                    request: record.request.clone()?,
+                    reference: record.grant_reference.clone()?,
+                    generation: record.status.generation?,
+                };
+                self.authenticates_published_grant(&binding)
+                    .then_some(binding)
+            })
+            .take(limit)
+            .collect()
     }
 
     pub(super) fn authenticates_published_grant(
@@ -1559,6 +1748,7 @@ impl Operations {
                     new.request != old.request
                         || new.rejected != old.rejected
                         || new.native_required != old.native_required
+                        || new.catalogue_required != old.catalogue_required
                         || (new.grant_reference != old.grant_reference
                             && !(old.status.phase == Phase::Running
                                 && old.grant_reference.is_none()
@@ -1567,6 +1757,12 @@ impl Operations {
                                 && self.3.contains(id)))
                         || (new.row_publication != old.row_publication
                             && !(old.row_publication.is_none() && self.6.contains(id)))
+                        || (new.catalogue_witness != old.catalogue_witness
+                            && !self.7.get(id).is_some_and(|(expected, next)| {
+                                expected == &old.catalogue_witness
+                                    && new.catalogue_witness.as_ref() == Some(next)
+                                    && new.catalogue_only_change(old)
+                            }))
                         || (new.owner_witness != old.owner_witness
                             && !self.4.get(id).is_some_and(|(expected, next)| {
                                 expected == &old.owner_witness
@@ -1586,6 +1782,7 @@ impl Operations {
                             && new != old
                             && !self.4.contains_key(id)
                             && !self.6.contains(id)
+                            && !(self.7.contains_key(id) && new.catalogue_only_change(old))
                             && !self
                                 .5
                                 .get(id)
@@ -1802,6 +1999,20 @@ impl Operations {
                 return Err("native row publication has no transaction evidence".into());
             }
         }
+        for (id, (expected, next)) in &self.7 {
+            if !before.0.get(id).is_some_and(|old| {
+                old.native_required && old.staging.is_some() && &old.catalogue_witness == expected
+            }) || !self.0.get(id).is_some_and(|new| {
+                new.catalogue_witness.as_ref() == Some(next)
+                    && before
+                        .0
+                        .get(id)
+                        .is_some_and(|old| new.catalogue_only_change(old))
+            }) {
+                return Err("invalid catalogue witness mutation evidence".into());
+            }
+        }
+        self.7.clear();
         self.6.clear();
         self.4.clear();
         self.5.clear();
@@ -2028,6 +2239,54 @@ impl Work {
         };
         let result =
             super::cli::enroll_codex_operation_admitted(env, host, &self.request, Some(&admission));
+        drop(self.scope);
+        if result
+            .as_ref()
+            .is_ok_and(|status| matches!(status.phase, Phase::Running | Phase::CancelRequested))
+            && let Some(proof) = retired_for(
+                &self.request,
+                &self.admitted,
+                &self.recovery,
+                &operation,
+                cancellation.retired(),
+            )
+        {
+            return proof.finish(env);
+        }
+        result
+    }
+
+    /// Test host injection through the actual NativeContext/Admission doorway.
+    /// It consumes an existing counted Work; it creates no grant or Scope.
+    #[cfg(all(test, unix))]
+    pub(in crate::harness) fn run_native_with_host(
+        self,
+        env: &super::cli::Env,
+        host: &dyn super::cli::AccountsHost,
+    ) -> Result<Status, String> {
+        let cancellation = self.scope.cancellation();
+        let operation = self.scope.operation_identity();
+        let admission = Admission {
+            scope: &self.scope,
+            request: &self.request,
+            original: &self.admitted,
+            recovery: &self.recovery,
+        };
+        let retirement = std::sync::Mutex::new(None);
+        let context = NativeContext {
+            env,
+            runtime: &self.native,
+            scope: &self.scope,
+            retirement: &retirement,
+        };
+        let result = super::cli::enroll_codex_operation_custody(
+            env,
+            host,
+            &self.request,
+            Some(&admission),
+            Some(&context),
+        );
+        let _retirement = retirement.into_inner().unwrap();
         drop(self.scope);
         if result
             .as_ref()
@@ -2335,6 +2594,14 @@ pub fn cancel(env: &super::cli::Env, request: &Request) -> Result<Status, String
 mod row_fixture;
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use row_fixture::NativeRowRecoveryFixture;
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "codex_enrollment_source_proof_fixture.rs"]
+mod source_proof_fixture;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use source_proof_fixture::{
+    NativeSourceProofWorld, SOURCE_PROOF_TASK, SourceProofAdvance, SourceProofLaunch,
+    SourceProofSettlement,
+};
 
 #[cfg(test)]
 mod tests {
@@ -2606,6 +2873,9 @@ mod tests {
             "operation":request.id, "capability":"d".repeat(64), "issuance_digest":"e".repeat(64), "producer_mac":"f".repeat(64)
         })).unwrap();
         let record = before.0.get_mut(&request.id).unwrap();
+        // This control exercises the historical schema-nine owner boundary,
+        // before new native admissions required a global catalogue witness.
+        record.catalogue_required = false;
         record.grant_reference = Some(reference);
         record.status = Status {
             phase: Phase::Applied,
@@ -2635,6 +2905,10 @@ mod tests {
         let text = logins.to_json();
         let mut doc: Value = aterm_json::from_str(&text).unwrap();
         assert_eq!(doc["schema"].as_u64(), Some(9));
+        assert!(
+            !text.contains("\"rejected\""),
+            "old witness bytes stay exact"
+        );
         let decoded = accounts::Logins::from_json(&text, 1_800_000_000).unwrap();
         assert_eq!(
             decoded.enrollment.owner_witness(&binding).unwrap(),

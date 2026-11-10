@@ -23,7 +23,7 @@ pub(super) fn response(
     frame("member-use", &value).ok_or(registry::Error::Unavailable)
 }
 
-fn error(error: registry::Error) -> String {
+pub(super) fn error(error: registry::Error) -> String {
     match error {
         registry::Error::Denied => "ERR codex-auth denied\n".into(),
         registry::Error::Stale => "ERR codex-auth stale\n".into(),
@@ -34,7 +34,7 @@ fn error(error: registry::Error) -> String {
     }
 }
 
-fn cached(job: &Job) -> Option<Result<String, registry::Error>> {
+pub(super) fn cached(job: &Job) -> Option<Result<String, registry::Error>> {
     match &*job.progress.lock().unwrap_or_else(|p| p.into_inner()) {
         Progress::Complete(result) => Some(result.clone()),
         _ => None,
@@ -109,11 +109,7 @@ pub(super) fn serve_identified(
         Ok(connection) => connection,
         Err(why) => return error(why),
     };
-    let (job, _) = match jobs()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .admit(id, &caller, &request)
-    {
+    let (job, _) = match admit_job(id, &caller, &request) {
         Ok(value) => value,
         Err(AdmissionError::Changed) => return "ERR codex-auth request changed\n".into(),
         Err(AdmissionError::Stale) => return "ERR codex-auth stale\n".into(),

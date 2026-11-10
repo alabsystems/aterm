@@ -15,6 +15,27 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+#[path = "codex_source_census_control.rs"]
+mod census_control;
+#[path = "codex_prepared_policy_control.rs"]
+mod policy_control;
+pub(super) use policy_control::serve as serve_policy;
+#[path = "codex_source_context_control.rs"]
+mod context_control;
+#[path = "codex_source_derived_control.rs"]
+mod derived_control;
+#[path = "codex_source_plain_retirement_control.rs"]
+mod plain_retirement_control;
+#[path = "codex_source_ready_control.rs"]
+mod ready_control;
+#[path = "codex_source_rebind_control.rs"]
+mod rebind_control;
+#[path = "codex_source_resource_control.rs"]
+mod resource_control;
+#[path = "codex_source_retirement_control.rs"]
+mod retirement_control;
+#[path = "codex_source_target_control.rs"]
+mod target_control;
 #[path = "codex_source_use_control.rs"]
 mod use_control;
 
@@ -56,7 +77,57 @@ impl Sequence {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Action {
+    Peer,
+    Context(context_control::Action),
+    Rebind(rebind_control::Original),
+    Resource(resource_control::Action),
+    OpenDerived {
+        use_member: String,
+        use_operation: registry::UseNonce,
+        capability: String,
+    },
     Use(registry::UseAction),
+    Reserve(aterm_agent::harness::codex_assignment::protocol::Request),
+    Reservation,
+    TargetContext,
+    OpenTarget {
+        assignment: String,
+        context: String,
+    },
+    PreloadTarget {
+        assignment: String,
+        context: String,
+    },
+    TargetReady {
+        assignment: String,
+        context: String,
+        generation: u64,
+        registration: String,
+        report: ready_control::Report,
+    },
+    CloseTargetOpen {
+        open_operation: String,
+        assignment: String,
+        context: String,
+    },
+    Seal {
+        capability: String,
+    },
+    Install {
+        capability: String,
+        boundary: String,
+    },
+    Census {
+        capability: String,
+        cursor: Option<(String, String)>,
+    },
+    Quiesce {
+        capability: String,
+        registration: String,
+        generation: u64,
+        digest: String,
+        auth: Option<registry::AuthState>,
+    },
     Open,
     Preload,
     Ready {
@@ -83,12 +154,17 @@ enum Action {
     Retire {
         registration: Option<String>,
     },
+    RetireOwned {
+        preload_operation: String,
+        registration: Option<String>,
+    },
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Request {
     request: String,
     sequence: Sequence,
     operation: String,
+    preload_sequence: Option<registry::PreloadSequence>,
     member: Option<String>,
     action: Action,
 }
@@ -115,7 +191,48 @@ impl Request {
         if !hex(&operation, 32) {
             return None;
         }
-        let member = if action == "member-open" {
+        let preload_sequence = if matches!(
+            action,
+            "member-preload"
+                | "member-preload-rebound"
+                | "member-rebound-ready"
+                | "member-preload-use"
+                | "member-preload-use-resample"
+                | "member-preload-resample"
+                | "member-preload-target-resample"
+                | "member-ready-use"
+                | "member-reader-ready-use"
+                | "member-unavailable-use"
+                | "member-ready"
+                | "member-reader-ready"
+                | "member-unavailable"
+                | "member-preload-target"
+                | "member-ready-target"
+                | "member-reader-ready-target"
+                | "member-unavailable-target"
+                | "member-retire-owned"
+        ) {
+            Some(registry::PreloadSequence::parse(
+                fields.remove("preload_sequence")?,
+            )?)
+        } else {
+            None
+        };
+        let member = if action == "member-target-open-close" {
+            match fields.remove("member") {
+                Some(member) if hex(member, 32) => Some(member.into()),
+                Some(_) => return None,
+                None => None,
+            }
+        } else if matches!(
+            action,
+            "member-peer"
+                | "member-open"
+                | "member-open-derived"
+                | "member-target-context"
+                | "member-target-ack"
+                | "member-open-target"
+        ) {
             None
         } else {
             let member = fields.remove("member")?;
@@ -129,6 +246,158 @@ impl Request {
             hex(value, 32).then(|| value.to_owned())
         };
         let action = match action {
+            "member-peer" => Action::Peer,
+            "member-target-resource-ready" | "member-target-ack" => {
+                Action::Resource(resource_control::Action::parse(action, &mut fields)?)
+            }
+            "member-work-rebind" => Action::Rebind(rebind_control::Original::parse(&mut fields)?),
+            "member-open-derived" => {
+                let use_member = fields.remove("use_member")?;
+                let use_operation = registry::UseNonce::parse(fields.remove("use_operation")?)?;
+                let capability = fields.remove("capability")?;
+                if !hex(use_member, 32) || !hex(capability, 64) {
+                    return None;
+                }
+                Action::OpenDerived {
+                    use_member: use_member.into(),
+                    use_operation,
+                    capability: capability.into(),
+                }
+            }
+            "member-preload-rebound"
+            | "member-rebound-ready"
+            | "member-preload-use"
+            | "member-preload-use-resample"
+            | "member-preload-resample"
+            | "member-preload-target-resample"
+            | "member-ready-use"
+            | "member-reader-ready-use"
+            | "member-unavailable-use"
+            | "member-refresh-use" => {
+                Action::Context(context_control::Action::parse(action, &mut fields)?)
+            }
+            "member-ready-target" | "member-reader-ready-target" | "member-unavailable-target" => {
+                let assignment = fields.remove("assignment")?;
+                let context = fields.remove("context")?;
+                let generation = number(fields.remove("assignment_generation")?)?;
+                if !hex(assignment, 32) || !hex(context, 64) || generation == 0 {
+                    return None;
+                }
+                Action::TargetReady {
+                    assignment: assignment.into(),
+                    context: context.into(),
+                    generation,
+                    registration: registration(&mut fields)?,
+                    report: ready_control::Report::parse(action, &mut fields)?,
+                }
+            }
+            "member-target-open-close" => {
+                let open_operation = fields.remove("open_operation")?;
+                let assignment = fields.remove("assignment")?;
+                let context = fields.remove("context")?;
+                if !hex(open_operation, 32) || !hex(assignment, 32) || !hex(context, 64) {
+                    return None;
+                }
+                Action::CloseTargetOpen {
+                    open_operation: open_operation.into(),
+                    assignment: assignment.into(),
+                    context: context.into(),
+                }
+            }
+            "member-open-target" | "member-preload-target" => {
+                let assignment = fields.remove("assignment")?;
+                let context = fields.remove("context")?;
+                if !hex(assignment, 32) || !hex(context, 64) {
+                    return None;
+                }
+                if action == "member-open-target" {
+                    Action::OpenTarget {
+                        assignment: assignment.into(),
+                        context: context.into(),
+                    }
+                } else {
+                    Action::PreloadTarget {
+                        assignment: assignment.into(),
+                        context: context.into(),
+                    }
+                }
+            }
+            "member-target-context" => Action::TargetContext,
+            "member-seal" | "member-install" => {
+                let capability = fields.remove("capability")?;
+                if !hex(capability, 64) {
+                    return None;
+                }
+                if action == "member-seal" {
+                    Action::Seal {
+                        capability: capability.into(),
+                    }
+                } else {
+                    let boundary = fields.remove("boundary")?;
+                    if !hex(boundary, 32) {
+                        return None;
+                    }
+                    Action::Install {
+                        capability: capability.into(),
+                        boundary: boundary.into(),
+                    }
+                }
+            }
+            "member-reservation" => Action::Reservation,
+            "member-quiesce" => {
+                let capability = fields.remove("capability")?;
+                let registration = registration(&mut fields)?;
+                let generation = number(fields.remove("credential_generation")?)?;
+                let digest = fields.remove("digest")?;
+                if !hex(capability, 64) || !hex(digest, 64) || generation == 0 {
+                    return None;
+                }
+                let auth = match fields.remove("role")? {
+                    "reader" => None,
+                    "manager" => Some(registry::AuthState {
+                        generation: number(fields.remove("auth_generation")?)?,
+                        owner: number(fields.remove("owner_generation")?)?,
+                        source: number(fields.remove("source_generation")?)?,
+                        login: number(fields.remove("login_generation")?)?,
+                    }),
+                    _ => return None,
+                };
+                Action::Quiesce {
+                    capability: capability.into(),
+                    registration,
+                    generation,
+                    digest: digest.into(),
+                    auth,
+                }
+            }
+            "member-census" => {
+                let capability = fields.remove("capability")?;
+                if !hex(capability, 64) {
+                    return None;
+                }
+                let cursor = match (fields.remove("revision"), fields.remove("after")) {
+                    (None, None) => None,
+                    (Some(revision), Some(after)) if hex(revision, 64) && hex(after, 32) => {
+                        Some((revision.into(), after.into()))
+                    }
+                    _ => return None,
+                };
+                Action::Census {
+                    capability: capability.into(),
+                    cursor,
+                }
+            }
+            "member-reserve" => {
+                let pool_revision = fields.remove("pool_revision")?;
+                let expected_assignment = fields.remove("expected_assignment")?;
+                let selection = fields.remove("selection")?;
+                let prepared = aterm_agent::harness::codex_assignment::protocol::Request::parse(
+                    &format!(
+                        "assignment-prepare schema=1 operation={operation} pool_revision={pool_revision} expected_assignment={expected_assignment} selection={selection}"
+                    ),
+                )?;
+                Action::Reserve(prepared)
+            }
             "member-use-begin" | "member-use-close" => {
                 registry::UseNonce::parse(&operation)?;
                 let registration = registration(&mut fields)?;
@@ -206,16 +475,26 @@ impl Request {
                     _ => return None,
                 },
             },
-            "member-retire" => {
+            "member-retire" | "member-retire-owned" => {
                 let value = fields.remove("registration")?;
-                Action::Retire {
-                    registration: if value == "none" {
-                        None
-                    } else if hex(value, 32) {
-                        Some(value.into())
-                    } else {
+                let registration = if value == "none" {
+                    None
+                } else if hex(value, 32) {
+                    Some(value.into())
+                } else {
+                    return None;
+                };
+                if action == "member-retire-owned" {
+                    let preload_operation = fields.remove("preload_operation")?;
+                    if !hex(preload_operation, 32) {
                         return None;
-                    },
+                    }
+                    Action::RetireOwned {
+                        preload_operation: preload_operation.into(),
+                        registration,
+                    }
+                } else {
+                    Action::Retire { registration }
                 }
             }
             _ => return None,
@@ -224,19 +503,47 @@ impl Request {
             request,
             sequence,
             operation,
+            preload_sequence,
             member,
             action,
         })
     }
+    fn owned_preload_sequence(&self) -> Result<registry::PreloadSequence, registry::Error> {
+        self.preload_sequence.ok_or(registry::Error::Denied)
+    }
     fn cleanup(&self) -> bool {
+        // Target READY owns its original PRELOAD scope before scheduling; it
+        // uses bounded completion capacity, never ordinary work admission.
         matches!(
             &self.action,
-            Action::Use(registry::UseAction::End { .. } | registry::UseAction::Close { .. })
+            Action::Retire { .. }
+                | Action::Resource(_)
+                | Action::Context(context_control::Action::Ready { .. })
+                | Action::Use(registry::UseAction::End { .. } | registry::UseAction::Close { .. })
+                | Action::CloseTargetOpen { .. }
+                | Action::TargetReady { .. }
+                | Action::RetireOwned { .. }
         )
     }
     fn name(&self) -> &'static str {
         match self.action {
+            Action::Peer => "member-peer",
+            Action::Context(ref action) => action.name(),
+            Action::Rebind(_) => "member-work-rebind",
+            Action::Resource(ref action) => action.name(),
+            Action::OpenDerived { .. } => "member-open",
             Action::Use(_) => "member-use",
+            Action::Reserve(_) => "member-reserved",
+            Action::Reservation => "member-reserved",
+            Action::TargetContext => "member-target-context",
+            Action::TargetReady { ref report, .. } => report.name(),
+            Action::OpenTarget { .. } => "member-open-target",
+            Action::PreloadTarget { .. } => "member-preload-target",
+            Action::CloseTargetOpen { .. } => "member-target-open-close",
+            Action::Seal { .. } => "member-sealed",
+            Action::Install { .. } => "member-installed",
+            Action::Census { .. } => "member-census",
+            Action::Quiesce { .. } => "member-quiescent",
             Action::Open => "member-open",
             Action::Preload => "member-preload",
             Action::Ready { .. } => "member-ready",
@@ -244,6 +551,7 @@ impl Request {
             Action::Unavailable { .. } => "member-unavailable",
             Action::Unrelated { .. } => "member-unrelated",
             Action::Retire { .. } => "member-retire",
+            Action::RetireOwned { .. } => "member-retire-owned",
         }
     }
 }
@@ -315,6 +623,23 @@ fn envelope(
 ) -> aterm_json::Value {
     aterm_json::json!({"schema":1,"request":request.request,"operation":request.operation,"session":session(caller,epoch),"member":member})
 }
+fn completed_envelope(
+    request: &Request,
+    caller: &Caller,
+    epoch: &str,
+    member: Option<&str>,
+) -> aterm_json::Value {
+    let mut value = envelope(request, caller, epoch, member);
+    if let Some(sequence) = request.preload_sequence
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "preload_sequence".into(),
+            aterm_json::json!(sequence.encoded()),
+        );
+    }
+    value
+}
 fn frame(name: &str, value: &aterm_json::Value) -> Option<String> {
     let body = aterm_json::to_string(value).ok()?;
     let line = format!("OK codex-auth {name} {body}\n");
@@ -327,11 +652,125 @@ fn execute(
     request: &Request,
     caller: &Caller,
     epoch: &str,
+    scope: &account_work::Scope,
 ) -> Result<String, registry::Error> {
-    let mut value = envelope(request, caller, epoch, request.member.as_deref());
+    let mut value = completed_envelope(request, caller, epoch, request.member.as_deref());
     let member = request.member.as_deref().unwrap_or("");
     match &request.action {
-        Action::Use(_) => return Err(registry::Error::Denied),
+        Action::Peer
+        | Action::Context(_)
+        | Action::Rebind(_)
+        | Action::Resource(_)
+        | Action::Retire { .. }
+        | Action::OpenDerived { .. }
+        | Action::Use(_)
+        | Action::OpenTarget { .. }
+        | Action::PreloadTarget { .. }
+        | Action::CloseTargetOpen { .. }
+        | Action::TargetReady { .. }
+        | Action::RetireOwned { .. } => {
+            return Err(registry::Error::Denied);
+        }
+        Action::TargetContext => {
+            let installed = registry.installed_target(&peer, &request.operation, None)?;
+            let object = value.as_object_mut().ok_or(registry::Error::Unavailable)?;
+            object.insert("context".into(), aterm_json::json!(installed.context()?));
+            object.insert(
+                "assignment_generation".into(),
+                aterm_json::json!(installed.assignment_generation()?),
+            );
+            object.insert(
+                "target_ref".into(),
+                aterm_json::json!(installed.target_ref()?),
+            );
+        }
+        Action::Seal { capability } => {
+            let env = super::codex_account_env().map_err(|_| registry::Error::Unavailable)?;
+            let reservation = registry.resume_reservation(&peer, &request.operation, capability)?;
+            let sealed = reservation.seal(&env, &peer)?;
+            if !sealed.current() {
+                return Err(registry::Error::Stale);
+            }
+        }
+        Action::Install {
+            capability,
+            boundary,
+        } => {
+            let env = super::codex_account_env().map_err(|_| registry::Error::Unavailable)?;
+            let reservation = registry.resume_reservation(&peer, &request.operation, capability)?;
+            // Obtain the actual registry-owned exclusion again. A prior wire
+            // acknowledgement is correlation only and cannot stand in for it.
+            let sealed = reservation.seal(&env, &peer)?;
+            let installed = reservation.install_target(&env, &peer, &sealed, boundary)?;
+            let object = value.as_object_mut().ok_or(registry::Error::Unavailable)?;
+            object.insert("context".into(), aterm_json::json!(installed.context()?));
+            object.insert(
+                "assignment_generation".into(),
+                aterm_json::json!(installed.assignment_generation()?),
+            );
+            object.insert(
+                "target_ref".into(),
+                aterm_json::json!(installed.target_ref()?),
+            );
+        }
+        Action::Reservation => {
+            let reservation = registry
+                .reservation_for_peer(&peer)?
+                .ok_or(registry::Error::Unavailable)?;
+            if reservation.operation(&peer)? != request.operation {
+                return Err(registry::Error::Stale);
+            }
+            value
+                .as_object_mut()
+                .ok_or(registry::Error::Unavailable)?
+                .insert(
+                    "capability".into(),
+                    aterm_json::json!(reservation.capability(&peer)?),
+                );
+        }
+        Action::Quiesce {
+            capability,
+            registration,
+            generation,
+            digest,
+            auth,
+        } => {
+            let reservation = registry.resume_reservation(&peer, &request.operation, capability)?;
+            reservation.quiesce(
+                &peer,
+                connection,
+                registry::Quiescence {
+                    member,
+                    registration,
+                    credential_generation: *generation,
+                    digest,
+                    auth: *auth,
+                },
+            )?;
+        }
+        Action::Census { capability, cursor } => {
+            let reservation = registry.resume_reservation(&peer, &request.operation, capability)?;
+            let cursor = cursor
+                .as_ref()
+                .map(|(revision, after)| registry::CensusCursor { revision, after });
+            let page = reservation.census_page(&peer, cursor)?;
+            value
+                .as_object_mut()
+                .ok_or(registry::Error::Unavailable)?
+                .insert("census".into(), census_control::value(page));
+        }
+        Action::Reserve(prepared) => {
+            let env = super::codex_account_env().map_err(|_| registry::Error::Unavailable)?;
+            let source = registry.ready_source(&caller.caller, member)?;
+            let reservation = registry.reserve_prepared(&env, &source, prepared, scope)?;
+            value
+                .as_object_mut()
+                .ok_or(registry::Error::Unavailable)?
+                .insert(
+                    "capability".into(),
+                    aterm_json::json!(reservation.capability(&peer)?),
+                );
+        }
         Action::Open => {
             let allocation = registry.open_member(&peer, connection, &request.operation)?;
             value
@@ -341,8 +780,14 @@ fn execute(
         }
         Action::Preload => {
             let env = super::codex_account_env().map_err(|_| registry::Error::Unavailable)?;
-            let preload =
-                registry.preload_managed(&env, peer, member, &request.operation, connection)?;
+            let preload = registry.preload_managed(
+                &env,
+                peer,
+                member,
+                &request.operation,
+                connection,
+                request.owned_preload_sequence()?,
+            )?;
             value
                 .as_object_mut()
                 .ok_or(registry::Error::Unavailable)?
@@ -384,6 +829,7 @@ fn execute(
                     user: user.clone(),
                     auth: *auth,
                 },
+                request.owned_preload_sequence()?,
             )?;
             value
                 .as_object_mut()
@@ -411,6 +857,7 @@ fn execute(
                     account: account.clone(),
                     user: user.clone(),
                 },
+                request.owned_preload_sequence()?,
             )?;
             value
                 .as_object_mut()
@@ -427,6 +874,7 @@ fn execute(
                 registration,
                 connection,
                 registry::Ready::PolicyUnavailable,
+                request.owned_preload_sequence()?,
             )?;
             value
                 .as_object_mut()
@@ -440,9 +888,6 @@ fn execute(
                 .as_object_mut()
                 .ok_or(registry::Error::Unavailable)?
                 .insert("registration".into(), aterm_json::json!(registration));
-        }
-        Action::Retire { registration } => {
-            registry.retire_member(peer, connection, member, registration.as_deref())?
         }
     }
     frame(request.name(), &value).ok_or(registry::Error::Unavailable)
@@ -466,6 +911,15 @@ struct Job {
     progress: Mutex<Progress>,
     prepared_use: Mutex<Option<registry::UseCommand>>,
     use_accounted: AtomicBool,
+    prepared_target: Mutex<Option<registry::TargetConstruction>>,
+    prepared_target_cleanup: Mutex<Option<registry::TargetOpenCleanup>>,
+    prepared_ready: Mutex<Option<Box<registry::TargetReadyCommand>>>,
+    prepared_member_retirement: Mutex<Option<Box<registry::OwnedMemberRetirement>>>,
+    prepared_context: Mutex<Option<context_control::Command>>,
+    prepared_resource: Mutex<Option<resource_control::Command>>,
+    resource_accounted: AtomicBool,
+    context_accounted: AtomicBool,
+    target_accounted: AtomicBool,
 }
 impl Job {
     fn finish(&self, result: Result<String, registry::Error>) {
@@ -489,6 +943,7 @@ struct Jobs {
     connections: BTreeMap<u64, ConnectionJobs>,
     running: Arc<AtomicUsize>,
     cleanup_running: Arc<AtomicUsize>,
+    retiring: Vec<Arc<Job>>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum AdmissionError {
@@ -497,6 +952,117 @@ enum AdmissionError {
     Capacity,
 }
 impl Jobs {
+    /// Called only after the exact native member/PRELOAD fence was accepted.
+    /// Return all captures; their Drop must occur outside Jobs and State.
+    fn fence_member_preload(
+        &mut self,
+        caller: &Caller,
+        member: &str,
+        preload: &str,
+    ) -> (
+        Vec<registry::TargetConstruction>,
+        Vec<registry::TargetReadyCommand>,
+        Vec<context_control::Command>,
+    ) {
+        self.fence_member_preload_at(caller, member, preload, || {})
+    }
+    fn fence_member_preload_at(
+        &mut self,
+        caller: &Caller,
+        member: &str,
+        preload: &str,
+        before_context: impl Fn(),
+    ) -> (
+        Vec<registry::TargetConstruction>,
+        Vec<registry::TargetReadyCommand>,
+        Vec<context_control::Command>,
+    ) {
+        let mut contextual = Vec::new();
+        let mut targets = Vec::new();
+        let mut ready = Vec::new();
+        for connection in self.connections.values() {
+            for job in connection.active.values() {
+                if &job.caller != caller {
+                    continue;
+                }
+                let mut target = job
+                    .prepared_target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut completion = job.prepared_ready.lock().unwrap_or_else(|e| e.into_inner());
+                let captured_member = target
+                    .as_ref()
+                    .is_some_and(|command| command.member() == member);
+                let request_matches = job.request.member.as_deref() == Some(member)
+                    && job.request.operation == preload
+                    && matches!(
+                        &job.request.action,
+                        Action::Preload
+                            | Action::PreloadTarget { .. }
+                            | Action::Ready { .. }
+                            | Action::ReaderReady { .. }
+                            | Action::Unavailable { .. }
+                            | Action::TargetReady { .. }
+                            | Action::Context(_)
+                    );
+                if !captured_member && !request_matches {
+                    continue;
+                }
+                // Same ordering as contextual prepare: command custody before
+                // progress. Both remain locked through fencing/taking the capture.
+                before_context();
+                let mut contextual_command = job
+                    .prepared_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut progress = job.progress.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*progress, Progress::Waiting) {
+                    *progress = Progress::Complete(Err(registry::Error::Stale));
+                    if let Some(command) = target.take() {
+                        targets.push(command);
+                    }
+                    if let Some(command) = completion.take() {
+                        ready.push(*command);
+                    }
+                    if let Some(command) = contextual_command.take() {
+                        contextual.push(command);
+                    }
+                }
+            }
+        }
+        (targets, ready, contextual)
+    }
+    /// Only after native admits the exact release-only OPEN cleanup. Return
+    /// captures to the caller so their Drop runs outside Jobs and native State.
+    fn fence_target_open(
+        &mut self,
+        caller: &Caller,
+        open: &str,
+    ) -> Vec<registry::TargetConstruction> {
+        let mut released = Vec::new();
+        for connection in self.connections.values() {
+            for job in connection.active.values() {
+                if &job.caller != caller
+                    || job.request.operation != open
+                    || !matches!(job.request.action, Action::OpenTarget { .. })
+                {
+                    continue;
+                }
+                let mut command = job
+                    .prepared_target
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut progress = job.progress.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*progress, Progress::Waiting) {
+                    *progress = Progress::Complete(Err(registry::Error::Stale));
+                    if let Some(command) = command.take() {
+                        released.push(command);
+                    }
+                }
+            }
+        }
+        released
+    }
     fn reap(&mut self) {
         for connection in self.connections.values_mut() {
             let completed: Vec<_> = connection
@@ -516,19 +1082,56 @@ impl Jobs {
                 }
             }
             while connection.recent.len() > RECENT_PER_CONNECTION {
-                connection.recent.pop_front();
+                if let Some((_, job)) = connection.recent.pop_front() {
+                    self.retiring.push(job);
+                }
             }
         }
     }
     fn reserve(&self, job: Arc<Job>) -> (Arc<Job>, bool) {
-        if matches!(&job.request.action, Action::Use(_)) {
+        if matches!(
+            &job.request.action,
+            Action::Peer
+                | Action::Context(_)
+                | Action::Rebind(_)
+                | Action::Resource(_)
+                | Action::Retire { .. }
+                | Action::OpenDerived { .. }
+                | Action::Use(_)
+                | Action::OpenTarget { .. }
+                | Action::PreloadTarget { .. }
+                | Action::CloseTargetOpen { .. }
+                | Action::TargetReady { .. }
+                | Action::RetireOwned { .. }
+        ) {
             return (job, false);
         }
         self.reserve_ready(job)
     }
     fn reserve_ready(&self, job: Arc<Job>) -> (Arc<Job>, bool) {
+        if matches!(&job.request.action, Action::Resource(_))
+            && !job.resource_accounted.load(Ordering::Acquire)
+        {
+            return (job, false);
+        }
+        if matches!(&job.request.action, Action::Context(_))
+            && !job.context_accounted.load(Ordering::Acquire)
+        {
+            return (job, false);
+        }
         if matches!(&job.request.action, Action::Use(_))
             && !job.use_accounted.load(Ordering::Acquire)
+        {
+            return (job, false);
+        }
+        if matches!(
+            &job.request.action,
+            Action::OpenTarget { .. }
+                | Action::PreloadTarget { .. }
+                | Action::CloseTargetOpen { .. }
+                | Action::TargetReady { .. }
+                | Action::RetireOwned { .. }
+        ) && !job.target_accounted.load(Ordering::Acquire)
         {
             return (job, false);
         }
@@ -620,22 +1223,50 @@ impl Jobs {
             progress: Mutex::new(Progress::Waiting),
             prepared_use: Mutex::new(None),
             use_accounted: AtomicBool::new(false),
+            prepared_target: Mutex::new(None),
+            prepared_target_cleanup: Mutex::new(None),
+            prepared_ready: Mutex::new(None),
+            prepared_member_retirement: Mutex::new(None),
+            prepared_context: Mutex::new(None),
+            prepared_resource: Mutex::new(None),
+            resource_accounted: AtomicBool::new(false),
+            context_accounted: AtomicBool::new(false),
+            target_accounted: AtomicBool::new(false),
         });
         connection.active.insert(sequence.counter, Arc::clone(&job));
         Ok(self.reserve(job))
     }
-    fn closed(&mut self, id: u64) {
-        self.connections.remove(&id);
+    fn closed(&mut self, id: u64) -> Option<ConnectionJobs> {
+        self.connections.remove(&id)
     }
 }
 fn jobs() -> &'static Mutex<Jobs> {
     static JOBS: OnceLock<Mutex<Jobs>> = OnceLock::new();
     JOBS.get_or_init(Mutex::default)
 }
+
+fn admit_job(
+    id: u64,
+    caller: &Caller,
+    request: &Request,
+) -> Result<(Arc<Job>, bool), AdmissionError> {
+    let (result, retired) = {
+        let mut state = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let result = state.admit(id, caller, request);
+        let retired = std::mem::take(&mut state.retiring);
+        (result, retired)
+    };
+    drop(retired);
+    result
+}
 /// Called only after the real connection token has synchronously become false.
 /// Workers retain that original token and cannot reinsert transport state.
 pub(super) fn connection_closed(id: u64) {
-    jobs().lock().unwrap_or_else(|p| p.into_inner()).closed(id);
+    let (connection, retired) = {
+        let mut state = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        (state.closed(id), std::mem::take(&mut state.retiring))
+    };
+    drop((connection, retired));
 }
 
 pub(super) fn serve(
@@ -652,8 +1283,41 @@ pub(super) fn serve(
     let Some(id) = connection_id.filter(|id| *id != 0) else {
         return "ERR codex-auth denied\n".into();
     };
+    if matches!(&request.action, Action::Retire { .. }) {
+        return plain_retirement_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::Resource(_)) {
+        return resource_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::Rebind(_)) {
+        return rebind_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::Context(_)) {
+        return context_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::OpenDerived { .. }) {
+        return derived_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::Peer) {
+        return serve_peer(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::TargetReady { .. }) {
+        return ready_control::serve(ctx, request, registry, id);
+    }
+    if matches!(&request.action, Action::RetireOwned { .. }) {
+        return retirement_control::serve(ctx, request, registry, id);
+    }
     if matches!(&request.action, Action::Use(_)) {
         return use_control::serve(ctx, request, registry, id);
+    }
+    if matches!(
+        &request.action,
+        Action::OpenTarget { .. } | Action::PreloadTarget { .. }
+    ) {
+        return target_control::serve(ctx, master, request, registry, id);
+    }
+    if matches!(&request.action, Action::CloseTargetOpen { .. }) {
+        return target_control::serve_cleanup(ctx, request, registry, id);
     }
     let (caller, peer) = match claim(ctx, master, registry) {
         Ok(claimed) => claimed,
@@ -669,11 +1333,7 @@ pub(super) fn serve(
     let Ok(connection) = registry.connection(id) else {
         return UNAVAILABLE.into();
     };
-    let (job, start) = match jobs()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .admit(id, &caller, &request)
-    {
+    let (job, start) = match admit_job(id, &caller, &request) {
         Ok(admitted) => admitted,
         Err(AdmissionError::Changed) => return "ERR codex-auth request changed\n".into(),
         Err(AdmissionError::Stale) => return "ERR codex-auth stale\n".into(),
@@ -681,6 +1341,7 @@ pub(super) fn serve(
     };
     if start {
         if let Some(scope) = lifetime.enter() {
+            let reservation_scope = scope.clone();
             let worker = Arc::clone(&job);
             let registry = Arc::clone(registry);
             if std::thread::Builder::new()
@@ -694,6 +1355,7 @@ pub(super) fn serve(
                             &worker.request,
                             &worker.caller,
                             epoch,
+                            &reservation_scope,
                         )
                     }))
                     .unwrap_or(Err(registry::Error::Unavailable));
@@ -741,11 +1403,60 @@ pub(super) fn serve(
     }
 }
 
+/// Metadata on this exact authenticated transport, before the client may send
+/// its first ordinary OPEN. This creates no member, Scope, source or Ready.
+fn serve_peer(
+    ctx: &crate::SessionCtx,
+    request: Request,
+    registry: &registry::Registry,
+    id: u64,
+) -> String {
+    serve_peer_identified(request, registry, id, || identify(ctx))
+}
+fn serve_peer_identified(
+    request: Request,
+    registry: &registry::Registry,
+    id: u64,
+    identify_peer: impl Fn() -> Result<Caller, registry::Error>,
+) -> String {
+    let caller = match identify_peer() {
+        Ok(caller) => caller,
+        Err(why) => return use_control::error(why),
+    };
+    let Some(epoch) = host_epoch() else {
+        return UNAVAILABLE.into();
+    };
+    let connection = match registry.connection(id) {
+        Ok(connection) => connection,
+        Err(why) => return use_control::error(why),
+    };
+    let (job, _) = match admit_job(id, &caller, &request) {
+        Ok(job) => job,
+        Err(AdmissionError::Changed) => return "ERR codex-auth request changed\n".into(),
+        Err(AdmissionError::Stale) => return "ERR codex-auth stale\n".into(),
+        Err(AdmissionError::Capacity) => return UNAVAILABLE.into(),
+    };
+    if use_control::cached(&job).is_none() {
+        job.finish(
+            frame("member-peer", &envelope(&request, &caller, epoch, None))
+                .ok_or(registry::Error::Unavailable),
+        );
+    }
+    if !connection.is_live() || identify_peer().as_ref() != Ok(&caller) {
+        return use_control::error(registry::Error::Stale);
+    }
+    match use_control::cached(&job) {
+        Some(Ok(reply)) => reply,
+        Some(Err(why)) => use_control::error(why),
+        None => UNAVAILABLE.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     // Ledger metadata only: this does not construct a qualified source Peer.
-    fn caller() -> Caller {
+    pub(super) fn caller() -> Caller {
         let pid = std::process::id();
         let process = Process::observe(pid).unwrap();
         Caller {
@@ -764,6 +1475,344 @@ mod tests {
         ))
         .unwrap()
     }
+    #[test]
+    fn retirement_fence_never_holds_progress_while_waiting_for_context_preparation() {
+        let caller = caller();
+        let request = Request::parse(&format!(
+            "member-preload-use schema=1 request=1234567890abcdef0000000000000001 operation={} member={} preload_sequence=0123456789abcdef0000000000000001 use_member={} use_operation=11111111111111110000000000000001 capability={}",
+            "a".repeat(32),"b".repeat(32),"b".repeat(32),"c".repeat(64),
+        )).unwrap();
+        let mut jobs = Jobs::default();
+        let (job, _) = jobs.admit(9901, &caller, &request).unwrap();
+        let producer = job.prepared_context.lock().unwrap();
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let member = request.member.clone().unwrap();
+        let operation = request.operation.clone();
+        let fence = std::thread::spawn(move || {
+            let captures = jobs.fence_member_preload_at(&caller, &member, &operation, || {
+                arrived.send(()).unwrap();
+                resumed.recv().unwrap();
+            });
+            drop(captures);
+        });
+        arrival.recv().unwrap();
+        // This is the producer's actual lock order. A fence which took progress
+        // first would fail this assertion instead of hanging the test worker.
+        assert!(matches!(
+            *job.progress
+                .try_lock()
+                .expect("fence must not hold progress before acquiring context"),
+            Progress::Waiting
+        ));
+        resume.send(()).unwrap();
+        drop(producer);
+        fence.join().unwrap();
+        assert!(matches!(
+            *job.progress.lock().unwrap(),
+            Progress::Complete(Err(registry::Error::Stale))
+        ));
+    }
+    #[test]
+    fn peer_hello_is_metadata_only_on_actual_socket_even_after_app_drain() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _fd = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+        let _direct = crate::control::DirectPeer::enter();
+        let lifetime = account_work::Lifetime::default();
+        let registry = registry::Registry::for_app(&lifetime);
+        let drained = lifetime.pause().unwrap().wait();
+        let line = format!(
+            "member-peer schema=1 request=0123456789abcdef0000000000000001 operation={}",
+            "f".repeat(32)
+        );
+        let request = Request::parse(&line).unwrap();
+        for extra in [
+            format!(" member={}", "a".repeat(32)),
+            " source=1".into(),
+            " open_kind=ordinary".into(),
+        ] {
+            assert!(Request::parse(&format!("{line}{extra}")).is_none());
+        }
+        let id = u64::MAX - 88003;
+        let response = serve_peer_identified(request.clone(), &registry, id, || {
+            identify_for_session("source-peer-metadata")
+        });
+        let body = response.strip_prefix("OK codex-auth member-peer ").unwrap();
+        let value: aterm_json::Value = aterm_json::from_str(body.trim()).unwrap();
+        assert!(value["member"].is_null());
+        assert_eq!(
+            value["session"]["process_pid"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert!(hex(value["session"]["epoch"].as_str().unwrap(), 32));
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert!(lifetime.enter().is_none());
+        assert_eq!(
+            serve_peer_identified(request, &registry, id, || identify_for_session(
+                "source-peer-metadata"
+            )),
+            response
+        );
+        let changed = Request::parse(&line.replace(&"f".repeat(32), &"e".repeat(32))).unwrap();
+        assert_eq!(
+            serve_peer_identified(changed, &registry, id, || identify_for_session(
+                "source-peer-metadata"
+            )),
+            "ERR codex-auth request changed\n"
+        );
+        registry.connection_closed(id);
+        connection_closed(id);
+        drained.resume().unwrap();
+    }
+    fn target_ready_line(counter: u64) -> String {
+        format!(
+            "member-ready-target schema=1 preload_sequence=0123456789abcdef0000000000000001 request=1234567890abcdef{counter:016x} operation={} member={} assignment={} context={} assignment_generation=9 registration={} credential_generation=13 digest={} account={} user={} auth_generation=3 owner_generation=5 source_generation=7 login_generation=11",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+            "d".repeat(64),
+            "e".repeat(32),
+            "f".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64)
+        )
+    }
+    #[test]
+    fn target_ready_grammar_keeps_loaded_reader_unavailable_and_actual_generation_distinct() {
+        let manager = target_ready_line(1);
+        assert_eq!(
+            Request::parse(&manager).unwrap().name(),
+            "member-ready-target"
+        );
+        let auth = " auth_generation=3 owner_generation=5 source_generation=7 login_generation=11";
+        let reader = manager
+            .replace("member-ready-target", "member-reader-ready-target")
+            .replace(auth, "");
+        assert_eq!(
+            Request::parse(&reader).unwrap().name(),
+            "member-reader-ready-target"
+        );
+        let unavailable = format!(
+            "member-unavailable-target schema=1 preload_sequence=0123456789abcdef0000000000000001 request=1234567890abcdef0000000000000001 operation={} member={} assignment={} context={} assignment_generation=9 registration={}",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+            "d".repeat(64),
+            "e".repeat(32)
+        );
+        assert_eq!(
+            Request::parse(&unavailable).unwrap().name(),
+            "member-unavailable-target"
+        );
+        for invalid in [
+            manager.replace(" preload_sequence=0123456789abcdef0000000000000001", ""),
+            manager.replace(
+                "preload_sequence=0123456789abcdef0000000000000001",
+                "preload_sequence=0123456789abcdef0000000000000000",
+            ),
+            manager.replace(" assignment_generation=9", ""),
+            manager.replace("assignment_generation=9", "assignment_generation=0"),
+            manager.replace("assignment_generation=9", "assignment_generation=09"),
+            manager.replace("credential_generation=13", "credential_generation=0"),
+            manager.replace(auth, ""),
+            format!("{reader}{auth}"),
+            format!("{unavailable} credential_generation=13"),
+            format!("{manager} source_path=/tmp/auth.json"),
+        ] {
+            assert!(Request::parse(&invalid).is_none());
+        }
+    }
+    #[test]
+    fn owned_retirement_requires_exact_sequence_and_no_reader_has_no_sequence() {
+        let line = format!(
+            "member-retire-owned schema=1 request=1234567890abcdef0000000000000001 operation={} member={} preload_operation={} preload_sequence=0123456789abcdef0000000000000001 registration=none",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+        );
+        let parsed = Request::parse(&line).unwrap();
+        assert!(matches!(
+            &parsed.action,
+            Action::RetireOwned {
+                registration: None,
+                ..
+            }
+        ));
+        let caller = caller();
+        let response = completed_envelope(&parsed, &caller, "epoch", parsed.member.as_deref());
+        assert_eq!(
+            response["preload_sequence"].as_str(),
+            Some("0123456789abcdef0000000000000001")
+        );
+        for invalid in [
+            line.replace(" preload_sequence=0123456789abcdef0000000000000001", ""),
+            line.replace(
+                "preload_sequence=0123456789abcdef0000000000000001",
+                "preload_sequence=0123456789abcdef0000000000000000",
+            ),
+            format!("{line} context={}", "d".repeat(64)),
+        ] {
+            assert!(Request::parse(&invalid).is_none());
+        }
+        let unrelated = format!(
+            "member-unrelated schema=1 request=1234567890abcdef0000000000000002 operation={} member={} kind=api_key",
+            "a".repeat(32),
+            "b".repeat(32)
+        );
+        assert!(Request::parse(&unrelated).is_some());
+        assert!(
+            Request::parse(&format!(
+                "{unrelated} preload_sequence=0123456789abcdef0000000000000001"
+            ))
+            .is_none()
+        );
+    }
+    #[test]
+    fn accepted_member_fence_closes_only_matching_queued_readiness_and_never_running_work() {
+        // Queue-state control only. No native custody or positive source
+        // admission is constructed by these transport metadata fixtures.
+        let caller = caller();
+        let queued = Request::parse(&target_ready_line(1)).unwrap();
+        let running = Request::parse(&target_ready_line(2)).unwrap();
+        let other = Request::parse(&target_ready_line(3).replace(&"b".repeat(32), &"9".repeat(32)))
+            .unwrap();
+        let mut jobs = Jobs::default();
+        let (queued_job, _) = jobs.admit(1, &caller, &queued).unwrap();
+        let (running_job, _) = jobs.admit(1, &caller, &running).unwrap();
+        running_job.target_accounted.store(true, Ordering::Release);
+        assert!(jobs.reserve_ready(running_job.clone()).1);
+        let (other_job, _) = jobs.admit(1, &caller, &other).unwrap();
+        let released = jobs.fence_member_preload(
+            &caller,
+            queued.member.as_deref().unwrap(),
+            &queued.operation,
+        );
+        drop(released);
+        assert!(matches!(
+            *queued_job.progress.lock().unwrap(),
+            Progress::Complete(Err(registry::Error::Stale))
+        ));
+        assert!(matches!(
+            *running_job.progress.lock().unwrap(),
+            Progress::Running { .. }
+        ));
+        assert!(matches!(
+            *other_job.progress.lock().unwrap(),
+            Progress::Waiting
+        ));
+        running_job.finish(Err(registry::Error::Stale));
+    }
+    #[test]
+    fn target_ready_cannot_queue_before_actual_native_capture() {
+        let caller = caller();
+        let request = Request::parse(&target_ready_line(1)).unwrap();
+        let mut jobs = Jobs::default();
+        let (job, started) = jobs.admit(1, &caller, &request).unwrap();
+        assert!(!started);
+        assert!(!jobs.reserve_ready(job).1);
+        assert_eq!(jobs.cleanup_running.load(Ordering::Acquire), 0);
+        assert_eq!(jobs.running.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn target_ready_negative_uses_actual_socket_identity_without_enter_or_foreground() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _fd = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+        let _direct = crate::control::DirectPeer::enter();
+        let lifetime = account_work::Lifetime::default();
+        let registry = Arc::new(registry::Registry::for_app(&lifetime));
+        let drained = lifetime.pause().unwrap().wait();
+        assert!(lifetime.enter().is_none());
+        let id = u64::MAX - 88002;
+        let line = ready_control::serve_identified(
+            Request::parse(&target_ready_line(1)).unwrap(),
+            &registry,
+            id,
+            || identify_for_session("source-ready-kernel-negative"),
+        );
+        // No native target/SDK image was admitted. Exact native Stale, rather
+        // than foreground/enter refusal, proves only this negative boundary.
+        assert_eq!(line, "ERR codex-auth stale\n");
+        registry.connection_closed(id);
+        connection_closed(id);
+        drained.resume().unwrap();
+    }
+
+    #[test]
+    fn quiescence_preserves_the_distinction_between_reader_and_manager() {
+        let reader = format!(
+            "member-quiesce schema=1 request=1234567890abcdef0000000000000001 operation={} member={} capability={} registration={} credential_generation=1 digest={} role=reader",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(64),
+            "d".repeat(32),
+            "e".repeat(64),
+        );
+        assert!(matches!(
+            Request::parse(&reader).unwrap().action,
+            Action::Quiesce { auth: None, .. }
+        ));
+        let generations =
+            " auth_generation=1 owner_generation=2 source_generation=3 login_generation=4";
+        let manager = reader.replace("role=reader", "role=manager");
+        assert!(Request::parse(&manager).is_none());
+        assert!(Request::parse(&format!("{reader}{generations}")).is_none());
+        assert!(matches!(
+            Request::parse(&format!("{manager}{generations}"))
+                .unwrap()
+                .action,
+            Action::Quiesce { auth: Some(_), .. }
+        ));
+        assert!(
+            Request::parse(&reader.replace("credential_generation=1", "credential_generation=0"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn census_cursor_is_complete_and_cannot_supply_source_authority() {
+        let line = format!(
+            "member-census schema=1 request=1234567890abcdef0000000000000001 operation={} member={} capability={}",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(64),
+        );
+        assert!(Request::parse(&line).is_some());
+        let revision = format!(" revision={}", "d".repeat(64));
+        let after = format!(" after={}", "e".repeat(32));
+        assert!(Request::parse(&format!("{line}{revision}{after}")).is_some());
+        for changed in [
+            format!("{line}{revision}"),
+            format!("{line}{after}"),
+            format!("{line} source_path=/tmp/auth.json"),
+            line.replace(&"c".repeat(64), &"c".repeat(63)),
+        ] {
+            assert!(Request::parse(&changed).is_none());
+        }
+    }
+
+    #[test]
+    fn reservation_uses_closed_assignment_fields_and_requires_loaded_member_identity() {
+        let line = format!(
+            "member-reserve schema=1 request=1234567890abcdef0000000000000001 operation={} member={} pool_revision={} expected_assignment=0 selection=auto",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(64),
+        );
+        let request = Request::parse(&line).unwrap();
+        assert!(matches!(request.action, Action::Reserve(_)));
+        for changed in [
+            line.replace("expected_assignment=0", "expected_assignment=00"),
+            line.replace("selection=auto", "selection=unknown"),
+            line.replace(&format!(" member={}", "b".repeat(32)), ""),
+            format!("{line} source_path=/tmp/auth.json"),
+            format!("{line} selection=auto"),
+        ] {
+            assert!(Request::parse(&changed).is_none());
+        }
+    }
+
     #[test]
     fn completed_requests_do_not_exhaust_worker_capacity_and_evicted_ids_never_execute() {
         let caller = caller();
@@ -835,7 +1884,7 @@ mod tests {
         let first = first.unwrap();
         first.finish(Ok("fixture".into()));
         assert!(jobs.admit(1, &caller, &request(257)).unwrap().1);
-        jobs.closed(1);
+        drop(jobs.closed(1));
         first.finish(Ok("late".into()));
         assert!(jobs.connections.is_empty());
         assert!(jobs.admit(2, &caller, &request(1)).unwrap().1);
@@ -850,7 +1899,7 @@ mod tests {
             assert!(start);
             workers.push(job);
         }
-        jobs.closed(1);
+        drop(jobs.closed(1));
         let (next, start) = jobs.admit(2, &caller, &request(1)).unwrap();
         assert!(!start);
         assert_eq!(jobs.running.load(Ordering::Acquire), MAX_RUNNING);
@@ -899,7 +1948,7 @@ mod tests {
             assert!(Request::parse(&format!("member-open {base}{suffix}")).is_none());
         }
         let ready = format!(
-            "member-ready {base} member={} registration={} credential_generation=3 digest={} account={} user={} auth_generation=7 owner_generation=11 source_generation=13 login_generation=17",
+            "member-ready {base} preload_sequence=0123456789abcdef0000000000000001 member={} registration={} credential_generation=3 digest={} account={} user={} auth_generation=7 owner_generation=11 source_generation=13 login_generation=17",
             "c".repeat(32),
             "d".repeat(32),
             "e".repeat(64),
@@ -923,7 +1972,7 @@ mod tests {
     #[test]
     fn direct_reader_ready_never_invents_or_accepts_manager_counters() {
         let reader = format!(
-            "member-reader-ready schema=1 request={} operation={} member={} registration={} credential_generation=3 digest={} account={} user={}",
+            "member-reader-ready schema=1 preload_sequence=0123456789abcdef0000000000000001 request={} operation={} member={} registration={} credential_generation=3 digest={} account={} user={}",
             "a".repeat(32),
             "b".repeat(32),
             "c".repeat(32),

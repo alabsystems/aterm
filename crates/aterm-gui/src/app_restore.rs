@@ -918,11 +918,12 @@ impl App {
         &self,
         tab: &crate::tab_model::Tab,
     ) -> Option<restore::NativeTabRestore> {
-        let leaves = tab.root.leaves();
-        if leaves.len() != 1 || tab.focus != leaves[0] {
+        let crate::tab_model::SplitTree::Leaf(view) = tab.root else {
+            return None;
+        };
+        if tab.focus != view {
             return None;
         }
-        let view = leaves[0];
         if self.view_is_private(view) {
             return None;
         }
@@ -2892,7 +2893,7 @@ impl App {
                 .and_then(|ws| ws.layouts.first().map(pane::PaneTree::focus))
             && let Some(tree) = self.restore_build_tree(wid, &layout0, Some(keep))
         {
-            for session in tree.sessions() {
+            tree.visit_sessions(&mut |session| {
                 let known = self
                     .view_store
                     .iter()
@@ -2902,7 +2903,7 @@ impl App {
                         .insert_terminal(session)
                         .expect("restored split view identity space");
                 }
-            }
+            });
             if let Some(ws) = self.windows.get_mut(&wid)
                 && let Some(slot) = ws.layouts.first_mut()
             {
@@ -3205,25 +3206,29 @@ impl App {
         })?;
         let reusable = if retain_terminal {
             old_tabs.iter().find_map(|tab| {
-                tab.root.leaves().into_iter().find_map(|view| {
-                    let crate::tab_model::View::Terminal(terminal) =
-                        self.view_store.get(view).copied()?
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(crate::tab_model::View::Terminal(terminal)) =
+                        self.view_store.get(view).copied()
                     else {
-                        return None;
+                        return false;
                     };
-                    self.pool
-                        .get(terminal.session)
-                        .is_some()
-                        .then_some((view, terminal.session))
-                })
+                    if self.pool.get(terminal.session).is_some() {
+                        found = Some((view, terminal.session));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                found
             })
         } else {
             None
         };
         for tab in old_tabs {
-            for view in tab.root.leaves() {
+            tab.root.visit(&mut |&view| {
                 if reusable.is_some_and(|(kept, _)| kept == view) {
-                    continue;
+                    return;
                 }
                 let terminal = self
                     .view_store
@@ -3234,7 +3239,7 @@ impl App {
                 if let Some(session) = terminal {
                     self.teardown_session(session);
                 }
-            }
+            });
         }
         reusable
     }
@@ -3277,16 +3282,17 @@ impl App {
         .ok_or_else(|| "restored tab has no presentation".to_string())?;
         let pane_layout = self.restored_terminal_pane_layout(&root, focus);
         let pane_tree = pane_layout.and_then(|layout| {
-            let sessions = root
-                .leaves()
-                .into_iter()
-                .filter_map(|view| {
-                    self.view_store
-                        .get(view)
-                        .copied()
-                        .and_then(crate::tab_model::View::terminal_session)
-                })
-                .collect::<Vec<_>>();
+            let mut sessions = Vec::with_capacity(root.len());
+            root.visit(&mut |&view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                {
+                    sessions.push(session);
+                }
+            });
             let mut tree = pane::PaneTree::rebuild(&layout, &sessions)?;
             if record.zoomed {
                 tree.toggle_zoom();
@@ -4606,13 +4612,12 @@ impl App {
                 Some(tab)
             })
             .ok_or_else(|| "native staging tab disappeared".to_string())?;
-        let views = tab.root.leaves();
-        let [view] = views.as_slice() else {
+        let crate::tab_model::SplitTree::Leaf(view) = tab.root else {
             self.remove_tab_views(&tab);
             self.resync_after_restore_candidate(wid);
             return Err("native staging tab was not a single leaf".to_string());
         };
-        let staged = (*view, tab.presentation, tab.id);
+        let staged = (view, tab.presentation, tab.id);
         self.resync_after_restore_candidate(wid);
         Ok(staged)
     }

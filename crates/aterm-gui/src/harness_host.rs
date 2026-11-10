@@ -1778,7 +1778,8 @@ impl NoReset {
     }
 }
 
-const RESET_LONG_WALL_S: i64 = 24 * 3600;
+// Spend an offered reset when the natural reset is at least twelve hours away.
+const RESET_LONG_WALL_S: i64 = 12 * 3600;
 
 const RESET_ENTER_MARGIN_S: i64 = 120;
 
@@ -1787,7 +1788,7 @@ const RESET_LINE_WINDOW_S: i64 = accounts::RESET_CLAIM_S + RESET_ENTER_MARGIN_S;
 /// Whether a wall qualifies for a reset at `now`, and whether it is a long one.
 fn reset_qualifies(until: i64, day_start: Option<i64>, now: i64) -> Option<bool> {
     const DAY_S: i64 = 24 * 3600;
-    if until.saturating_sub(now) > RESET_LONG_WALL_S {
+    if until.saturating_sub(now) >= RESET_LONG_WALL_S {
         return Some(true);
     }
     day_start
@@ -2082,7 +2083,7 @@ impl AdviceRequest {
         advice: Option<AccountAdvice>,
         point: AccountPoint,
     ) -> Option<AccountAdvice> {
-        self.publish_progress(kept, advice, point, None)
+        self.publish_scoped(kept, advice, point, None, false)
     }
 
     fn matches_context(&self, k: &Kept) -> bool {
@@ -2118,12 +2119,13 @@ impl AdviceRequest {
             project = "harness_host::tests::account_advice::queue_transition"
         )
     )]
-    fn publish_progress(
+    fn publish_scoped(
         self,
         kept: &Mutex<Kept>,
         advice: Option<AccountAdvice>,
         point: AccountPoint,
         progress: Option<progress::BoundProgress>,
+        scoped: bool,
     ) -> Option<AccountAdvice> {
         with_kept_of(kept, |k| {
             if !self.turn.owns_publication(k) || !self.matches_context(k) {
@@ -2137,7 +2139,7 @@ impl AdviceRequest {
             {
                 return None;
             }
-            let advice = advice.filter(|_| self.snap.is_some());
+            let advice = advice.filter(|_| self.snap.is_some() || scoped);
             if Arc::ptr_eq(&self.turn.progress_policy, &k.account.progress_policy) {
                 k.account.progress = progress;
             }
@@ -2699,6 +2701,8 @@ type DiskFreeFn =
 /// A word [`DiskFreeFn`] is handed: why a session may not be asked, or what holds its line.
 type AskWord = Option<&'static str>;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
+type ScopedFn = dyn Fn(&str) -> Option<crate::harness_claim::Scoped> + Send + Sync;
+type ScopedAccountFn = dyn Fn(&str, &str, &accounts_pool::LoginEnv) -> bool + Send + Sync;
 type ObserveSnapshotFn = dyn Fn(&Snapshot) + Send + Sync;
 /// The occupancy facts board as session `sid`'s host reads it ([`Acts::occupancy`]).
 type OccupancyFn =
@@ -3015,9 +3019,26 @@ type CodexColdFn = dyn Fn(&Snapshot, &ColdUse) -> Result<Option<Snapshot>, Strin
 #[derive(Debug, Default)]
 pub(crate) struct ColdUse {
     read: AtomicBool,
+    inflight: AtomicBool,
+}
+
+struct ColdRead<'a>(&'a ColdUse);
+
+impl Drop for ColdRead<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ColdUse {
+    fn begin_read(&self) -> Option<ColdRead<'_>> {
+        self.inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        let guard = ColdRead(self);
+        (!self.has_read()).then_some(guard)
+    }
+
     /// Whether an attempt of this relaunch has read a provider.
     pub(crate) fn has_read(&self) -> bool {
         self.read.load(Ordering::SeqCst)
@@ -3030,11 +3051,13 @@ impl ColdUse {
 }
 
 /// `inner`, noting on `used` that an attempt reached a read ([`codex_cold_attempt`]).
+#[cfg(test)]
 struct NotedRead<'a> {
     inner: aterm_agent::harness::accounts_pool::ReadUsage<'a>,
     used: &'a ColdUse,
 }
 
+#[cfg(test)]
 impl aterm_agent::harness::accounts_pool::UsageReader for NotedRead<'_> {
     fn read_observed_on(
         &self,
@@ -3670,6 +3693,8 @@ pub(crate) struct Acts {
     pub(crate) point_read: Duration,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
+    /// The session's live contract-v3 claim, including its kernel proof.
+    pub(crate) scoped: Arc<ScopedFn>,
     /// One look at an agent that left.
     pub(crate) exit_look: Arc<ExitLookFn>,
     /// The kernel's word that the agent ended, waited for at most the time given.
@@ -3785,6 +3810,8 @@ pub(crate) struct Acts {
     pub(crate) tap_born: Arc<TapBornFn>,
     /// The label of the account move whose restart signalled the agent (`relaunch::account_restart`: the restart's own record, in flight or just stopped).
     pub(crate) account_restart: Arc<AccountRestartFn>,
+    /// Publish a typed account-home move to the scoped external harness.
+    pub(crate) scoped_account: Arc<ScopedAccountFn>,
     /// Whether the agent's own background work holds its restart in place
     /// ([`relaunch::background_holds`], the relaunch's own test): an account move asks it before it
     /// takes its row ([`WorkerIdle::account_move`]).
@@ -5097,12 +5124,157 @@ impl WorkerIdle {
         self.pool_advice_for(cli, supervisor, point)
     }
 
+    fn scoped_kimi(&self) -> bool {
+        self.agent.name() == "kimi" && (self.hooks.acts.scoped)(&self.sid).is_some()
+    }
+
+    fn scoped_pool_plan(
+        &self,
+        point: AccountPoint,
+    ) -> Option<(
+        accounts_pool::SessionPlan<accounts_pool::LoginEnv>,
+        AccountSeat,
+    )> {
+        let scoped = (self.hooks.acts.scoped)(&self.sid)?;
+        if !scoped
+            .claim
+            .scopes
+            .contains(aterm_agent::harness::contract::Scope::Relaunch)
+            || restart_stamp::kernel_start(scoped.proven.pid).as_deref()
+                != Some(scoped.proven.start.as_str())
+        {
+            return None;
+        }
+        let args = atpkg::caller_shell::process_args(scoped.proven.pid)?;
+        if (self.hooks.acts.scoped)(&self.sid).as_ref() != Some(&scoped) {
+            return None;
+        }
+        let seat = (self.hooks.acts.account_seat)()?;
+        let config_dir = seat.roster.as_deref()?.parent()?;
+        let pool_seat = accounts_pool::Seat {
+            config_dir,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
+        };
+        let pairs: Vec<(&str, &str)> = args
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+        let at = match point {
+            AccountPoint::TurnEnd => accounts::Point::TurnEnd,
+            AccountPoint::Wall {
+                kind: aterm_phase::WallKind::Auth,
+            } => accounts::Point::LostLogin { seen: seat.now },
+            AccountPoint::LoginEnded => accounts::Point::LoginEnded,
+            AccountPoint::Wall { .. } => accounts::Point::Wall {
+                window: accounts::UNNAMED_WINDOW.to_string(),
+                at: Some(seat.now),
+            },
+        };
+        let mode = self.switches.pool_controls(accounts::Cli::Kimi).mode;
+        let plan = accounts_pool::session_login_plan(
+            &pool_seat,
+            &accounts_pool::Session {
+                cli: accounts::Cli::Kimi,
+                sid: &self.sid,
+                supervisor: accounts::Supervisor::Aterm,
+                env: &pairs,
+                sample: None,
+                point: at,
+                mode,
+                relaunch: relaunch::PoolRelaunch {
+                    dialect: upgrade::Dialect::Zsh,
+                    cd: None,
+                    exe: Path::new(&args.exec_path),
+                    flags: &[],
+                    resume: None,
+                    home: None,
+                },
+            },
+            |note| {
+                if (self.hooks.acts.scoped)(&self.sid).as_ref() == Some(&scoped) {
+                    note.record();
+                }
+            },
+        );
+        Some((plan, seat))
+    }
+
+    fn scoped_pool_advice(&self, point: AccountPoint) -> Option<AccountAdvice> {
+        let (planned, seat) = self.scoped_pool_plan(point)?;
+        if let accounts::Advice::Move { to, yields, .. } = planned.advice() {
+            aterm_log::info!("harness @{}: scoped account advice: move to {to}", self.sid);
+            let clock = Instant::now();
+            let yields = yields.map(|until| {
+                let secs = u64::try_from(until.saturating_sub(seat.now)).unwrap_or(0);
+                clock + Duration::from_secs(secs)
+            });
+            return Some(AccountAdvice::Move {
+                to: to.clone(),
+                yields,
+            });
+        }
+        let roster = accounts_pool::Seat {
+            config_dir: seat.roster.as_deref()?.parent()?,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
+        }
+        .bound_roster(accounts::Cli::Kimi)
+        .ok()?;
+        let (state, _) = accounts_pool::Seat {
+            config_dir: seat.roster.as_deref()?.parent()?,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
+        }
+        .store(accounts::Cli::Kimi)
+        .load(seat.now)
+        .ok()?;
+        let enrolled = accounts::enrolled_for(accounts::Cli::Kimi, &roster);
+        let opening = accounts::next_opening(&roster, &state, &enrolled, seat.now);
+        account_advice_of(
+            planned.advice(),
+            None,
+            &state,
+            opening,
+            point.at_wall(),
+            seat.now,
+            Instant::now(),
+        )
+    }
+
+    fn scoped_pool_move(&self, why: &Restart, to: &str, point: AccountPoint) -> RestartAnswer {
+        const CHANGED: &str = "wait:account-changed";
+        let Some((planned, seat)) = self.scoped_pool_plan(point) else {
+            return RestartAnswer::unread(CHANGED);
+        };
+        if !matches!(planned.advice(), accounts::Advice::Move { to: next, .. } if next == to) {
+            return RestartAnswer::unread(CHANGED);
+        }
+        let Some(env) = planned.commit(seat.now).line else {
+            return RestartAnswer::unread(CHANGED);
+        };
+        if env.label != to {
+            return RestartAnswer::unread(CHANGED);
+        }
+        if !(self.hooks.acts.scoped_account)(&self.sid, why.word(), &env) {
+            return RestartAnswer::unread("failed:scoped-account-event");
+        }
+        RestartAnswer::unread("relaunched:scoped-account")
+    }
+
     fn pool_advice_for(
         &self,
         cli: accounts::Cli,
         supervisor: accounts::Supervisor,
         point: AccountPoint,
     ) -> Option<AccountAdvice> {
+        if cli == accounts::Cli::Kimi && (self.hooks.acts.scoped)(&self.sid).is_some() {
+            return self.scoped_pool_advice(point);
+        }
         let seat = (self.hooks.acts.account_seat)()?;
         let config_dir = seat.roster.as_deref()?.parent()?;
         let pool_seat = accounts_pool::Seat {
@@ -5757,6 +5929,15 @@ impl IdleHost for WorkerIdle {
         self.points.withheld(guard, crate::upgrade_host::now_s());
     }
 
+    fn scoped_restart(&self, why: &Restart) -> bool {
+        matches!(why, Restart::Account { .. }) && self.scoped_kimi()
+    }
+
+    /// Whether a built-in lane or a scoped Kimi harness can restart this agent, and `[harness] relaunch` allows it.
+    fn can_restart(&self) -> bool {
+        (self.relaunch_lane() || self.scoped_kimi()) && self.switches.relaunch()
+    }
+
     /// The restart in place its loop asks for ([`Restart`]), as `ask` ([`RestartAsk`], which the
     /// relaunch's claim keeps), answered with the relaunch's step and its claim
     /// ([`RestartAnswer`], said once by the relaunch, [`relaunch::Restarted::claim`]); the
@@ -5766,7 +5947,10 @@ impl IdleHost for WorkerIdle {
             .restart_left
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
-        if !self.can_restart() || self.beside() || self.native_stands_down() {
+        let scoped_account = matches!(why, Restart::Account { .. }) && self.scoped_kimi();
+        if (!scoped_account && !self.can_restart())
+            || (!scoped_account && (self.beside() || self.native_stands_down()))
+        {
             return None;
         }
         if let Restart::Account { to, at } = why {
@@ -5796,11 +5980,6 @@ impl IdleHost for WorkerIdle {
         note_upgrade_act();
         self.reread_after_act(Instant::now());
         Some(answer)
-    }
-
-    /// Whether the restart in place is written for this agent (`lanes::lanes`: Claude Code's alone) and `[harness] relaunch` (read live) allows it.
-    fn can_restart(&self) -> bool {
-        self.relaunch_lane() && self.switches.relaunch()
     }
 
     /// The owner took the relaunch away ([`IdleHost::relaunch_off`]).
@@ -6463,9 +6642,11 @@ impl IdleHost for WorkerIdle {
         let advice = self.account_advice(point, owed, &mut judged);
         let progress =
             self.read_account_progress(&request, point, advice.as_ref(), judged.as_mut());
-        let advice = request.publish_progress(&self.kept, advice, point, progress);
+        let scoped = self.scoped_kimi();
+        let scoped_advice = scoped.then(|| advice.clone()).flatten();
+        let advice = request.publish_scoped(&self.kept, advice, point, progress, scoped);
         (self.hooks.note)(HostNote::AccountProgress);
-        advice
+        scoped_advice.or(advice)
     }
 
     #[cfg_attr(
@@ -6671,6 +6852,9 @@ impl IdleHost for WorkerIdle {
 
     /// The renewable login the session runs on ([`IdleHost::login_label`]).
     fn login_label(&self) -> Option<String> {
+        if self.scoped_kimi() {
+            return self.scoped_renewal().map(|(label, _)| label);
+        }
         self.renewable_look().map(|(_, _, label)| label)
     }
 
@@ -6688,6 +6872,9 @@ impl IdleHost for WorkerIdle {
 
     /// Whether the session's process holds a login a renewal replaced ([`IdleHost::login_superseded`]).
     fn login_superseded(&self) -> bool {
+        if self.scoped_kimi() {
+            return self.scoped_renewal().is_some_and(|(_, replaced)| replaced);
+        }
         self.renewable_look()
             .is_some_and(|(roster, look, _)| renewable_own(&roster, &look).is_none())
     }
@@ -7099,6 +7286,39 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
 }
 
 impl WorkerIdle {
+    /// The scoped Kimi session's renewable row and whether its bound credential home changed.
+    fn scoped_renewal(&self) -> Option<(String, bool)> {
+        if !self.switches.pool_controls(accounts::Cli::Kimi).logins {
+            return None;
+        }
+        let scoped = (self.hooks.acts.scoped)(&self.sid)?;
+        if restart_stamp::kernel_start(scoped.proven.pid).as_deref()
+            != Some(scoped.proven.start.as_str())
+        {
+            return None;
+        }
+        let args = atpkg::caller_shell::process_args(scoped.proven.pid)?;
+        let who = accounts::ProcessLogin::of_env_for(
+            accounts::Cli::Kimi,
+            args.env.iter().filter_map(|entry| entry.split_once('=')),
+        );
+        if !who.route.on_account() {
+            return None;
+        }
+        let seat = (self.hooks.acts.account_seat)()?;
+        let roster = accounts_pool::Seat {
+            config_dir: seat.roster.as_deref()?.parent()?,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
+        }
+        .bound_roster(accounts::Cli::Kimi)
+        .ok()?;
+        let label = who.me(&roster).label()?.to_string();
+        let row = roster.row(&label).filter(|row| row.email.is_some())?;
+        Some((label, row.dir.as_deref() != who.login.as_deref()))
+    }
+
     /// The session on a renewable login ([`IdleHost::login_label`], [`IdleHost::login_superseded`]).
     fn renewable_look(&self) -> Option<(accounts::Roster, AccountLook, String)> {
         if !self.switches.logins() || !accounts_for(self.agent) {
@@ -8280,6 +8500,9 @@ impl WorkerIdle {
 
     /// The session's own usage wall for its account, as the loop's limit episode opens ([`IdleHost::limited`]).
     fn account_wall(&self) -> &'static str {
+        if self.scoped_kimi() {
+            return "scoped";
+        }
         if !accounts_for(self.agent) {
             return "unasked";
         }
@@ -9658,14 +9881,23 @@ impl WorkerIdle {
         const CHANGED: &str = "wait:account-changed";
         const STATE: &str = "wait:account-state";
         let hooks = &self.hooks;
+        let scoped = self.scoped_kimi();
         let at_wall = at == AccountAt::Wall;
         let advised = with_kept_of(&self.kept, |k| advised_for(k, to, at_wall));
-        let controls = self.switches.account_controls();
+        let controls = if scoped {
+            self.switches.pool_controls(accounts::Cli::Kimi)
+        } else {
+            self.switches.account_controls()
+        };
         let renewable = || {
-            controls.logins
-                && (self.hooks.acts.account_seat)()
-                    .and_then(|seat| account_roster(&seat))
-                    .is_some_and(|roster| renewable_listed(&roster))
+            if scoped {
+                controls.logins
+            } else {
+                controls.logins
+                    && (self.hooks.acts.account_seat)()
+                        .and_then(|seat| account_roster(&seat))
+                        .is_some_and(|roster| renewable_listed(&roster))
+            }
         };
         if controls.mode == accounts::Mode::Off && !renewable() {
             return RestartAnswer::unread("refused:accounts-off");
@@ -9715,6 +9947,9 @@ impl WorkerIdle {
         {
             self.park.store(true, Ordering::SeqCst);
             return RestartAnswer::unread("adopted");
+        }
+        if scoped {
+            return self.scoped_pool_move(why, to, advised.point);
         }
         let Some((seat, roster, look)) = self.account_ctx() else {
             return RestartAnswer::unread(CHANGED);
@@ -15471,6 +15706,8 @@ struct HostState {
     was_off: std::collections::HashSet<String>,
     startups: Startups,
     off_notes: HashMap<String, OffNote>,
+    /// Each supervised Claude Code agent's crash-witness renewal ([`renew_crash_witnesses`]).
+    witnesses: HashMap<String, WitnessRenewal>,
 }
 
 impl HostState {
@@ -15492,6 +15729,7 @@ impl HostState {
             was_off: std::collections::HashSet::new(),
             startups: Startups::held_after(held_deadline()),
             off_notes: HashMap::new(),
+            witnesses: HashMap::new(),
         }
     }
 }
@@ -15924,6 +16162,12 @@ fn host_pass(
         &off,
         hooks,
     );
+    let witness_at = if active {
+        renew_crash_witnesses(&mut host.witnesses, &host.workers, Instant::now(), hooks)
+    } else {
+        host.witnesses.clear();
+        None
+    };
     let restored: Vec<String> = shared
         .restored
         .lock()
@@ -15945,6 +16189,7 @@ fn host_pass(
         view_at,
         watch_at,
         disk_at,
+        witness_at,
         startup_at,
         fault_at,
         activation_at,
@@ -16006,6 +16251,102 @@ fn disk_roster(
         }
     }
     roster
+}
+
+/// How often the host renews the passive crash witness of each supervised Claude Code agent
+/// ([`renew_crash_witnesses`]), well inside the time the window's host keeps one from its last
+/// refresh ([`crate::native_observe::LIFETIME_US`]). A landing snapshot renews it too, but an
+/// idle agent's snapshot does not move: one only landings renewed lapsed after half an hour of
+/// quiet, and an exit after that (an asked restart, a crash) could never prove the death its
+/// native relaunch cites, so the agent was not brought back (2026-11-06).
+pub(crate) const WITNESS_RENEW: Duration = Duration::from_secs(5 * 60);
+
+const _: () = assert!(
+    WITNESS_RENEW.as_secs() * 1_000_000 * 3 <= crate::native_observe::LIFETIME_US,
+    "a witness outlives at least two missed renewals"
+);
+
+/// One supervised agent's witness renewal ([`HostState::witnesses`]).
+struct WitnessRenewal {
+    /// When it is next due.
+    due: Instant,
+    /// Whether its last renewal's thread is still out.
+    out: Arc<AtomicBool>,
+}
+
+/// Renew each due supervised Claude Code agent's passive crash witness off the host's thread,
+/// one renewal out per tab at a time, every [`WITNESS_RENEW`] from its worker's first pass: the
+/// agent the host's published snapshot names, through the act a landing snapshot runs
+/// ([`Acts::observe_snapshot`]), whose observer refreshes or registers only that exact live
+/// vendor and shell. The next time a renewal is due.
+fn renew_crash_witnesses(
+    witnesses: &mut HashMap<String, WitnessRenewal>,
+    workers: &Workers,
+    now: Instant,
+    hooks: &Hooks,
+) -> Option<Instant> {
+    let renews = |worker: &Worker| match worker.agent {
+        Program::Claude => {
+            !worker.stop.load(Ordering::SeqCst)
+                && !worker.revoked.load(Ordering::SeqCst)
+                && !worker.done.load(Ordering::SeqCst)
+        }
+        Program::Codex
+        | Program::Agy
+        | Program::Muse
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
+    };
+    witnesses.retain(|sid, _| workers.0.get(sid).is_some_and(renews));
+    let mut next: Option<Instant> = None;
+    for (sid, worker) in &workers.0 {
+        if !renews(worker) {
+            continue;
+        }
+        let renewal = witnesses
+            .entry(sid.clone())
+            .or_insert_with(|| WitnessRenewal {
+                due: now,
+                out: Arc::default(),
+            });
+        // A renewal still out at its next due time (a host that took minutes to answer) is
+        // left to end alone; the one after it comes a whole period later.
+        if renewal.due <= now {
+            renewal.due = now + WITNESS_RENEW;
+            if let Some(snap) = (!renewal.out.load(Ordering::SeqCst))
+                .then(|| published_snapshot(sid))
+                .flatten()
+                .filter(|snap| matches!(snap.run, relaunch::AgentRun::Claude))
+            {
+                renewal.out.store(true, Ordering::SeqCst);
+                let out = Arc::clone(&renewal.out);
+                let observe = Arc::clone(&hooks.acts.observe_snapshot);
+                let spawned = std::thread::Builder::new()
+                    .name(format!("{THREAD_PREFIX}witness"))
+                    .spawn(move || {
+                        /// The renewal is over as its thread returns or unwinds.
+                        struct Over(Arc<AtomicBool>);
+                        impl Drop for Over {
+                            fn drop(&mut self) {
+                                self.0.store(false, Ordering::SeqCst);
+                            }
+                        }
+                        let _over = Over(out);
+                        observe(&snap);
+                    });
+                if let Err(e) = spawned {
+                    renewal.out.store(false, Ordering::SeqCst);
+                    aterm_log::warn!(
+                        "harness @{sid}: no thread for its crash-witness renewal ({e}); it is \
+                         tried again at its next due time"
+                    );
+                }
+            }
+        }
+        next = Some(next.map_or(renewal.due, |at| at.min(renewal.due)));
+    }
+    next
 }
 
 /// The disk watch's timer.
@@ -19012,6 +19353,56 @@ pub(crate) fn offered_now(store: &Store, sid: &str) -> Option<bool> {
     crate::restart_act::offered(&ctx, leader, crate::metrics::now_us()).map(|offer| offer.promised)
 }
 
+fn scoped_now(store: &Store, sid: &str) -> Option<crate::harness_claim::Scoped> {
+    store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .and_then(|h| {
+            h.ctx
+                .meta
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .live_scoped(crate::metrics::now_us())
+                .cloned()
+        })
+}
+
+fn scoped_account_now(
+    store: &Store,
+    sid: &str,
+    cause: &str,
+    env: &accounts_pool::LoginEnv,
+) -> bool {
+    let Some(ctx) = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx))
+    else {
+        return false;
+    };
+    let Some(before) = scoped_now(store, sid) else {
+        return false;
+    };
+    if !crate::restart_act::record_scoped_account(&ctx, cause, env) {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if scoped_now(store, sid).is_some_and(|current| {
+            current.proven == before.proven
+                && current.claim.login.as_deref() == Some(env.label.as_str())
+        }) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// [`Acts::self_idle`], live.
 fn self_idle_now(store: &Store, sid: &str, pid: u32, start: &str) -> bool {
     let ctx = store
@@ -19389,6 +19780,9 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let exit_home = home.clone();
     let limit_home = home.clone();
     let account_home = home.clone();
+    let codex_usage_lifetime = account_work.clone();
+    let codex_usage_sink =
+        Mutex::new(crate::native_usage_retention::NativeUsageSink::start(&account_work).ok());
     let upkeep = live_accounts_upkeep(account_work);
     let wall_upkeep = upkeep.clone();
     let screen_wall_store = store.clone();
@@ -19403,6 +19797,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let overlap_store = store.clone();
     let limit_read: Mutex<HashMap<String, (Instant, Option<u64>)>> = Mutex::default();
     let fg_store = store.clone();
+    let scoped_store = store.clone();
     let holds_store = store.clone();
     let launch_store = store.clone();
     let carry_store = store.clone();
@@ -19603,6 +19998,10 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                 .find(|l| l.starts_with("OK"))
                 .map(str::to_string)
         }),
+        scoped: {
+            let store = scoped_store.clone();
+            Arc::new(move |sid| scoped_now(&store, sid))
+        },
         exit_look: Arc::new(move |sid, snap| match &snap.run {
             relaunch::AgentRun::Codex(_) => None,
             relaunch::AgentRun::Muse(_) => {
@@ -19884,6 +20283,10 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         account_restart: Arc::new(move |sid, pid| {
             o19(sid, 0).and_then(|o| relaunch::account_restart(&o, pid))
         }),
+        scoped_account: {
+            let store = scoped_store.clone();
+            Arc::new(move |sid, cause, env| scoped_account_now(&store, sid, cause, env))
+        },
         background: Arc::new(relaunch::background_holds),
         account_made: Arc::new(|sid, to, at| {
             let made = aterm_types::dirs::state_dir()
@@ -19930,7 +20333,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                 home,
                 now,
             };
-            codex_cold_live(&seat, snap, used)
+            codex_cold_live(&seat, snap, used, &codex_usage_lifetime, &codex_usage_sink)
         }),
         hold: Arc::new(move |sid, until| {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
@@ -22775,17 +23178,47 @@ fn codex_cold_live(
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
     snap: &Snapshot,
     used: &ColdUse,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+    sink: &Mutex<Option<crate::native_usage_retention::NativeUsageSink>>,
 ) -> Result<Option<Snapshot>, String> {
-    codex_cold_attempt(
-        seat,
-        snap,
-        used,
-        &aterm_agent::harness::accounts_pool::LiveUsage,
-    )
+    if used.has_read() {
+        return codex_cold_at(seat, snap, &aterm_agent::harness::accounts_pool::NoUsage);
+    }
+    let _read = used
+        .begin_read()
+        .ok_or("cold quota read already active or used")?;
+    let scope = lifetime.enter().ok_or("cold quota admission paused")?;
+    let sink = {
+        let mut owned = sink.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_none() {
+            *owned = Some(
+                crate::native_usage_retention::NativeUsageSink::start(lifetime)
+                    .map_err(|_| "cold quota recovery unavailable")?,
+            );
+        }
+        owned
+            .as_ref()
+            .ok_or("cold quota recovery unavailable")?
+            .clone()
+    };
+    let env = crate::native_act::codex_account_env()
+        .map_err(|_| "cold quota account environment unavailable")?;
+    let note_read = || used.note_read();
+    let reader = crate::native_usage_retention::LiveNativeUsage {
+        env: &env,
+        sink: &sink,
+        scope: &scope,
+        source: None,
+        read_started: Some(&note_read),
+    };
+    // Capacity refusal has not reached a read. Preserve the cold relaunch's
+    // provider allowance until the backend reaches its first HTTP contact.
+    codex_cold_at(seat, snap, &reader)
 }
 
 /// [`codex_cold_at`] for one attempt of a relaunch: `read` reads until an attempt has read, and after
 /// that no attempt contacts a provider ([`ColdUse`]).
+#[cfg(test)]
 fn codex_cold_attempt(
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
     snap: &Snapshot,
@@ -27982,6 +28415,7 @@ impl Acts {
             point_read: INERT_POINT_READ,
             follow: Arc::new(|_, _| Foreground::Shell),
             status: Arc::new(|_| None),
+            scoped: Arc::new(|_| None),
             exit_look: Arc::new(|_, _| None),
             exited: Arc::new(|_, _| true),
             asked: Arc::new(|_, _| None),
@@ -28032,6 +28466,7 @@ impl Acts {
             login_pin: Arc::new(|_, _, _| aterm_agent::supervise::policy::login::LoginPin::Picker),
             tap_born: Arc::new(|_| None),
             account_restart: Arc::new(|_, _| None),
+            scoped_account: Arc::new(|_, _, _| false),
             background: Arc::new(|_| false),
             account_made: Arc::new(|_, _, _| {}),
             account_cold: Arc::new(|_, _, _| Ok(relaunch::ColdAdmission::Immediate(None))),

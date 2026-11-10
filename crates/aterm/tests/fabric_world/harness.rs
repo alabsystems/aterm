@@ -309,8 +309,10 @@ pub fn kept<S: std::os::fd::AsFd>(socket: S) -> S {
 /// A directory of its own under the short `/tmp` (a socket path's limit is 104 bytes) for a
 /// stub's or a broker's socket, removed when dropped, a test that panics included.
 pub fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let short = &tag[..tag.floor_char_boundary(8)];
     aterm_tempfile::Builder::new()
-        .prefix(&format!("atl-{tag}-"))
+        .prefix(&format!("atl-{short}-"))
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("the socket's dir")
 }
@@ -1052,6 +1054,7 @@ impl World {
             dir: Some(
                 aterm_tempfile::Builder::new()
                     .prefix("atl-")
+                    .suffix(".noindex")
                     .tempdir_in("/tmp")
                     .expect("exclusive world scratch"),
             ),
@@ -1755,6 +1758,7 @@ impl Hold {
     pub fn new(tag: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("atl-{tag}-hold-"))
+            .suffix(".noindex")
             .tempdir()
             .expect("exclusive hold directory");
         Hold(dir)
@@ -2105,6 +2109,7 @@ impl Fleet {
     pub fn boot_arm(_tag: &str, opts: OpenOptions, retained: bool) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("a5-")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("exclusive fleet scratch");
         let tmp = scratch.path().to_path_buf();

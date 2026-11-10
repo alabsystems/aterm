@@ -181,12 +181,10 @@ pub(crate) fn entries(askers: Vec<Asker>) -> Vec<Entry> {
                 &asker.code,
                 CAUSE,
                 &what,
-                Why::OnlyYou(Reason::new(format!(
-                    "only a person lets a Mac into ALab, and this one shows code {}",
-                    asker.code
-                ))),
+                Why::OnlyYou(Reason::new("only a person lets a Mac into ALab")),
                 Then::step(&asker.then),
             )
+            .more(format!("Join code: {}", asker.code))
             .log_line(format!(
                 "members: a Mac calling itself {} asks to join ALab (code {})",
                 asker.name, asker.code

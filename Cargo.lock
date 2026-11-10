@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.191.0"
+version = "0.192.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1110,6 +1110,7 @@ dependencies = [
  "aterm-regex",
  "aterm-render",
  "aterm-secrets",
+ "aterm-serde",
  "aterm-spec",
  "aterm-stamp",
  "aterm-sysprobe",

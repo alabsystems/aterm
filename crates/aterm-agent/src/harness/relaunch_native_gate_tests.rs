@@ -1115,6 +1115,110 @@ fn a_lapsed_prepare_ends_a_crash_record_bound_or_not() {
     }
 }
 
+#[test]
+fn a_cold_restart_retired_without_a_grant_can_plan_again() {
+    for (held, bound) in [(false, false), (false, true), (true, false), (true, true)] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let mut st = lapsable_crash(bound);
+        st.native_retired_unissued = held;
+        if held {
+            save(&opts, SESSION, &st);
+            st = load(&opts, SESSION).expect("the held record reloads");
+        }
+        let (mut client, worker) = endpoint_with(|line| {
+            if line.contains(" native-act prepare ") || line.contains(" native-act query ") {
+                "OK native-act state=retired reason=no-exec-grant\n".into()
+            } else {
+                lapsed_host(line)
+            }
+        });
+        let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+        assert_eq!(result.step, super::super::native_restart::WAIT_LAPSED);
+        assert!(st.native_prepare.is_empty() && st.native.is_none());
+        assert!(!st.native_retired_unissued);
+        assert_eq!(st.phase, upgrade::Phase::Failed("native-lapsed".into()));
+        let saved = load(&opts, SESSION).expect("the lapsed record is saved");
+        assert!(!saved.native_retired_unissued && saved.native_prepare.is_empty());
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert!(!seen.iter().any(|line| {
+            line.contains(" native-act signal ") || line.contains(" native-act resume ")
+        }));
+    }
+}
+
+#[test]
+fn cold_retirement_save_requires_the_exact_writer_and_transition() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut st = lapsable_crash(true);
+    st.native_retired_unissued = true;
+    save(&opts, SESSION, &st);
+    let mut st = load(&opts, SESSION).unwrap();
+    let stale = st.clone();
+    let (mut client, worker) = endpoint_with(|line| {
+        assert!(line.contains(" native-act prepare "), "{line}");
+        "OK native-act state=retired reason=no-exec-grant\n".into()
+    });
+    assert_eq!(
+        super::super::native_restart::recover(&opts, SESSION, &mut client, TAB, &mut st),
+        Ok(super::super::native_restart::Recovery::Lapsed)
+    );
+    let copied = st.clone();
+    let reloaded = St::from_json(&st.to_json()).unwrap();
+    for other in [&copied, &reloaded] {
+        assert!(save_checked(&opts, SESSION, other).is_err());
+    }
+    let phase = st.phase.clone();
+    st.phase = upgrade::Phase::Failed("unrelated-transition".into());
+    assert!(save_checked(&opts, SESSION, &st).is_err());
+    st.phase = phase;
+    let fault = aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported);
+    assert!(save_checked(&opts, SESSION, &st).is_err());
+    drop(fault);
+    save_checked(&opts, SESSION, &st).unwrap();
+    let saved = load(&opts, SESSION).unwrap();
+    assert!(!saved.native_retired_unissued && saved.native_prepare.is_empty());
+    assert!(save_checked(&opts, SESSION, &stale).is_err());
+    drop(client);
+    assert_eq!(prepares(&worker.join().unwrap()), 1);
+}
+
+#[test]
+fn a_cold_retirement_hold_requires_fresh_proof_and_no_account_successor() {
+    for case in ["unknown", "unavailable", "account"] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let mut st = lapsable_crash(true);
+        st.native_retired_unissued = true;
+        if case == "account" {
+            st.native_account_candidate = Some(
+                super::super::native_account_handoff::Pending::read(&aterm_json::Value::Null),
+            );
+        }
+        let before = st.clone();
+        let (mut client, worker) = endpoint_with(move |line| {
+            assert_ne!(case, "account", "account debt makes no request: {line}");
+            assert!(line.contains(" native-act prepare "), "{line}");
+            if case == "unknown" {
+                "OK native-act state=unknown\n".into()
+            } else {
+                "ERR unavailable\n".into()
+            }
+        });
+        let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+        assert_eq!(
+            result.step,
+            super::super::native_restart::WAIT_RETIRED_UNISSUED
+        );
+        assert_eq!(st, before);
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(seen.is_empty(), case == "account");
+    }
+}
+
 /// KI-1107-2's held lanes: a record whose host ended with a cold relaunch in flight kept only its
 /// prepare (the reply lost); its expired stop sent it to the fresh lane, whose crash plan met that
 /// prepare unresolved on every pass. The fresh lane now replays it first, and the later host's
@@ -1123,10 +1227,22 @@ fn a_lapsed_prepare_ends_a_crash_record_bound_or_not() {
 /// relaunch with no native act at all.
 #[test]
 fn a_lapsed_prepare_frees_a_host_ended_record_for_its_fresh_relaunch() {
+    host_ended_replans_after_no_grant(false);
+}
+
+#[test]
+fn a_retired_cold_prepare_frees_a_host_ended_record_for_its_fresh_relaunch() {
+    host_ended_replans_after_no_grant(true);
+}
+
+fn host_ended_replans_after_no_grant(retired: bool) {
     let world = aterm_tempfile::tempdir().unwrap();
     let opts = options(world.path());
     let mut st = lapsable_crash(false);
     st.stop("stale-exit", now_s());
+    st.native_retired_unissued = retired;
+    save(&opts, SESSION, &st);
+    let st = load(&opts, SESSION).unwrap();
     let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
         .spawn()
         .unwrap();
@@ -1148,7 +1264,13 @@ fn a_lapsed_prepare_frees_a_host_ended_record_for_its_fresh_relaunch() {
         (snap, plan)
     };
     let (snap, plan) = input(&st);
-    let (client, worker) = endpoint_with(lapsed_host);
+    let (client, worker) = endpoint_with(move |line| {
+        if retired && line.contains(" native-act prepare ") {
+            "OK native-act state=retired reason=no-exec-grant\n".into()
+        } else {
+            lapsed_host(line)
+        }
+    });
     let result = launch_after_exit(
         &opts,
         &snap,
