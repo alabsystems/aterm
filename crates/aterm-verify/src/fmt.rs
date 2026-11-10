@@ -420,7 +420,7 @@ fn sweep(ctx: &Ctx, bin: &Path, groups: &[(String, Vec<String>)], write: bool) -
         files: groups.iter().map(|(_, f)| f.len()).sum(),
         ..Sweep::default()
     });
-    let workers = ctx.cores().max(1) as usize;
+    let workers = ctx.parallelism().max(1) as usize;
     let canonical_root = std::fs::canonicalize(&ctx.root).ok();
     std::thread::scope(|scope| {
         for _ in 0..workers.min(jobs.len()) {

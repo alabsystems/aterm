@@ -6985,7 +6985,7 @@ fn end_allows_the_wake_watchs_recheck_beside_writes_only() {
 
 #[test]
 fn end_reads_the_wake_watchs_counts_from_the_metrics_reply() {
-    const REPLY: &str = "OK schema=1 n_present=0 sync_armed=0 sync_rel_end=0 sync_rel_timeout=0 sync_holding=0 perf_reduced=0 shed_transitions=0 wake_heals=0 output_wake_late=0 output_wake_reposts=0 redraw_attempts=0 event_wakes=108 timer_wakes=14 deadline_owner=session_status deadline_arms_by_owner=wake_heal:1/0,session_status:26/0,presence:81/0 deadline_fires_by_owner=session_status:14 past_arms=0 wakes_by_variant=ReadSessionStatus:60,Output:32,HostNote:1,Vitals:1 fg_rss_mb=-";
+    const REPLY: &str = "OK schema=1 n_present=0 sync_armed=0 sync_rel_end=0 sync_rel_timeout=0 sync_holding=0 perf_reduced=0 shed_transitions=0 wake_heals=0 output_wake_late=0 output_wake_reposts=0 redraw_attempts=0 event_wakes=108 timer_wakes=14 deadline_owner=session_status deadline_arms_by_owner=wake_heal:1/0,session_status:26/0,presence:81/0 deadline_fires_by_owner=session_status:14 past_arms=0 wakes_by_variant=ReadSessionStatus:60,Output:32,HostNote:1,Vitals:1 fg_footprint_mb=-";
     let n = surfaces::Window {
         front: Some((
             T0,

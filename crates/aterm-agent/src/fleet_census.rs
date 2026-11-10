@@ -2129,8 +2129,6 @@ pub fn note_fold_gate(
 
 #[cfg(unix)]
 fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Option<&Path>) -> bool {
-    use aterm_net::fleet_member::read_admitted_pushed_facts;
-
     let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
     let mut log_keys = None;
     let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
@@ -2153,20 +2151,19 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
         ..
     } = listed_book(state_dir, &mut roster, log_keys.as_deref());
 
-    let all_facts_count = aterm_net::fleet_member::read_pushed_facts(state_dir).len();
-    let admitted_facts = read_admitted_pushed_facts(
+    let admitted = aterm_net::fleet_member::all_pushed_facts_admitted(
         state_dir,
         &raw_peers,
         &roster.deny_nodes,
         log_keys.as_deref(),
     );
-    aterm_net::fleet_member::prune_pushed_facts(
-        state_dir,
-        &raw_peers,
-        &roster.deny_nodes,
-        log_keys.as_deref(),
-    );
-    if admitted_facts.len() != all_facts_count {
+    if !admitted {
+        aterm_net::fleet_member::prune_pushed_facts(
+            state_dir,
+            &raw_peers,
+            &roster.deny_nodes,
+            log_keys.as_deref(),
+        );
         return false;
     }
 

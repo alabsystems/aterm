@@ -160,7 +160,7 @@ impl Collector {
         let proof: Proof = aterm_json::from_str(&data).map_err(|e| e.to_string())?;
         if !aterm_codec::hex::is_lower(&proof.key, 64)
             || proof.item.is_empty()
-            || !["fmt", "census", "export-scan", "lint"].contains(&proof.check.as_str())
+            || !["fmt", "census", "export-scan"].contains(&proof.check.as_str())
         {
             return Err("input item footer disagrees with proof".into());
         }
@@ -173,7 +173,7 @@ pub fn read(text: &str) -> Result<Vec<Proof>, String> {
     if proofs.iter().any(|p| {
         !aterm_codec::hex::is_lower(&p.key, 64)
             || p.item.is_empty()
-            || !["fmt", "census", "export-scan", "lint"].contains(&p.check.as_str())
+            || !["fmt", "census", "export-scan"].contains(&p.check.as_str())
     }) {
         return Err("invalid source-check input proof".into());
     }
@@ -252,16 +252,5 @@ mod tests {
         ctx.carry_context = Some("a".repeat(64));
         std::fs::write(dir.path().join("source.rs"), "two").unwrap();
         assert!(!proof.reusable(&ctx));
-        let native = Proof::new(
-            &ctx,
-            "lint",
-            "package",
-            vec![("compiler-unit".into(), "unit".into(), "a".repeat(64))],
-        )
-        .unwrap();
-        assert!(
-            !native.reusable(&ctx),
-            "compiler receipts must go through current Cargo freshness validation"
-        );
     }
 }

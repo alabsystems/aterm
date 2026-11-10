@@ -600,7 +600,7 @@ fn each_guard_in_hand_holds_the_due_line_once() {
                 word: "stalled",
                 bytes: Some(3),
                 wait_ms: Some(90_000),
-                rss_mb: None,
+                footprint_mb: None,
             });
         }),
         ("limit", "limit-episode", |s, on| {

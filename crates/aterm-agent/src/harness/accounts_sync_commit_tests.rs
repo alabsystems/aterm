@@ -34,6 +34,7 @@ impl Bed {
         let events = note_auth(&mut state, "new", Auth::SignedOut, NOW);
         advance_renewal_generations(&before, &mut logins, &events).unwrap();
         let plan = Plan {
+            login_dirs: Vec::new(),
             fleet: None,
             source_policy: None,
             outbox: None,
@@ -140,12 +141,18 @@ fn oversized_stored_receipt_refuses_before_auxiliary_effects() {
         },
         plan,
         &[],
+        None,
         || {
             invoked.set(true);
             Ok(())
         },
     );
-    assert!(result.unwrap_err().contains("receipt exceeds its limit"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("receipt exceeds its limit")
+    );
     assert!(
         !invoked.get(),
         "an oversized envelope must refuse before auxiliary publication"
@@ -214,13 +221,15 @@ fn stale_before_images_never_publish_a_new_pending_receipt() {
                 edit();
             }
             let called = std::cell::Cell::new(false);
-            let result = bed.store.publish_plan_scoped(&held, scope, plan, &[], || {
-                called.set(true);
-                if during_auxiliary {
-                    edit();
-                }
-                Ok(())
-            });
+            let result = bed
+                .store
+                .publish_plan_scoped(&held, scope, plan, &[], None, || {
+                    called.set(true);
+                    if during_auxiliary {
+                        edit();
+                    }
+                    Ok(())
+                });
             assert!(
                 result.is_err(),
                 "{role:?}, auxiliary={during_auxiliary}, matches_after={matches_after}"
@@ -279,20 +288,20 @@ fn scoped_state_publications_refuse_missing_witnessed_images() {
                 0 => bed
                     .store
                     .transact_roster_held(&held, NOW, &mut None, target(), false),
-                1 => bed.store.transact_roster_state_held(
-                    &held,
-                    NOW,
-                    &mut None,
-                    target(),
-                    (false, edit),
-                ),
-                2 => bed.store.transact_fleet_state_policy_held(
-                    &held,
-                    NOW,
-                    &mut None,
-                    (&bed.path, "account = []\n"),
-                    (false, edit),
-                ),
+                1 => bed
+                    .store
+                    .transact_roster_state_held(&held, NOW, &mut None, target(), (false, edit))
+                    .map_err(SyncError::into_message),
+                2 => bed
+                    .store
+                    .transact_fleet_state_policy_held(
+                        &held,
+                        NOW,
+                        &mut None,
+                        (&bed.path, "account = []\n"),
+                        (false, |state| edit(state).map_err(SyncError::from)),
+                    )
+                    .map_err(SyncError::into_message),
                 _ => unreachable!(),
             };
             assert!(
@@ -588,7 +597,7 @@ fn sync_commit_blocks_direct_ledger_append_and_recovers_without_source_data() {
     let held = bed.store.acquire().unwrap();
     assert_eq!(
         bed.store.recover_sync_within(&[], &bed.path).unwrap_err(),
-        LOCK_HELD
+        SyncError::retry(Retry::Busy, LOCK_HELD)
     );
     assert_eq!(bed.files(), before);
     drop(held);

@@ -107,7 +107,14 @@ mod tests {
         assert_eq!(enriched.tabs, Some(2));
         assert_eq!(enriched.ai_clis, Some(2));
         assert_eq!(enriched.active_ai, Some(1));
-        assert!(enriched.vitals.contains("CPU 12%"));
+        assert!(
+            enriched
+                .vitals
+                .starts_with("CPU 18c \u{b7} load 2.50/3.00/4.00"),
+            "{}",
+            enriched.vitals
+        );
+        assert!(enriched.vitals.contains("(75% \u{b7} 256 GiB free)"));
         assert_eq!(
             tabs.len(),
             2,

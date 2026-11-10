@@ -51,7 +51,9 @@ pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
         ),
         (
             "available_bytes",
-            s.avail.map_or_else(|| Jv::why("not_sampled"), Jv::u),
+            s.mem
+                .as_ref()
+                .map_or_else(|| Jv::why("not_sampled"), |m| Jv::u(m.sample.available)),
         ),
         (
             "pressure",
@@ -80,9 +82,10 @@ pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> String {
             )
         },
     );
-    let available = s
-        .avail
-        .map_or_else(|| "unavailable(not_sampled)".to_owned(), crate::words::mem);
+    let available = s.mem.as_ref().map_or_else(
+        || "unavailable(not_sampled)".to_owned(),
+        |m| crate::words::mem(m.sample.available),
+    );
     let pressure = s
         .mem
         .as_ref()

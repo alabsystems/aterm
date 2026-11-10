@@ -394,7 +394,9 @@ pub(in crate::harness) fn adopt(
     let mut grant = authority.prepare(&row)?;
     work_current()?;
     let (target, mode) = roster_target(roster_path)?;
-    store.recover_sync_within(&accounts::LOCK_LADDER, &target)?;
+    store
+        .recover_sync_within(&accounts::LOCK_LADDER, &target)
+        .map_err(SyncError::into_message)?;
     let before = accounts::roster_text(&target)?;
     let raw = Roster::parse_for(cli, before.as_deref().unwrap_or(""))?;
     let (logins, _) = store.load_logins(env.now)?;

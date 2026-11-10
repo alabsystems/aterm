@@ -983,8 +983,8 @@ fn volume_reads_use_only_complete_local_mount_roots() {
     };
     let expected = aterm_sysprobe::VolumeReading {
         total: 100,
-        free: 70,
-        available: 60,
+        free: 60,
+        reserved: 10,
         mount: PathBuf::from("/System/Volumes/Data"),
         fs: "apfs".to_owned(),
     };
@@ -1171,6 +1171,51 @@ fn mem_sample_keeps_every_class_and_its_ram_classes_sum_to_total() {
         assert!(live.exact && live.stored.is_some(), "{live:?}");
         assert!(live.in_vm() <= live.total, "{live:?}");
         assert_eq!(live.in_vm() + live.not_in_vm(), live.total);
+    }
+}
+
+/// ONE MEMORY USED AND ONE AVAILABLE: the model's figures are the reader's
+/// (`aterm_sysprobe::MemoryDetail::used` and `::available`), on a Mac's reading and on a Linux one
+/// whose shared memory the sample folds into its app class. NEGATIVE CONTROL: the Linux sample's
+/// app class without the shared memory would read used 1 GiB short, and free plus the file cache
+/// (the deck's old available) is not the reader's available.
+#[test]
+fn the_samples_used_and_available_are_the_readers() {
+    let mac = this_macs_memory();
+    let mac = aterm_sysprobe::MemoryDetail {
+        available: 9 << 30,
+        ..mac
+    };
+    let m = mem_sample(mac);
+    assert_eq!(m.used(), mac.used());
+    assert_eq!(m.available, mac.available);
+    assert_ne!(
+        m.available,
+        m.free + m.cached,
+        "not free plus the file cache"
+    );
+    let linux = aterm_sysprobe::MemoryDetail {
+        total: 32 << 30,
+        available: 18 << 30,
+        free: 2 << 30,
+        app: 9 << 30,
+        shared: Some(1 << 30),
+        wired: 1 << 30,
+        compressed: Some(1 << 30),
+        file_backed: 11 << 30,
+        ..aterm_sysprobe::MemoryDetail::default()
+    };
+    let l = mem_sample(linux);
+    assert_eq!(l.used(), linux.used());
+    assert_eq!(l.used(), 12 << 30);
+    assert_eq!(l.available, 18 << 30);
+    let unshared = MemSample { app: 9 << 30, ..l };
+    assert_ne!(unshared.used(), linux.used(), "shared memory is used");
+    #[cfg(target_os = "macos")]
+    {
+        let live = aterm_sysprobe::memory_detail().expect("macOS reads its VM");
+        assert_eq!(mem_sample(live).used(), live.used());
+        assert_eq!(mem_sample(live).available, live.available);
     }
 }
 
@@ -2058,7 +2103,7 @@ impl Source for Fills {
             volume: Some(VolumeSample {
                 total: FREE_SIZE,
                 free: 7_000,
-                available: 7_000,
+                reserved: 0,
                 mount: FREE_MOUNT.into(),
             }),
             ..Sample::default()
@@ -2758,7 +2803,7 @@ fn the_disk_row_with_the_harness_off() {
             volume: Some(VolumeSample {
                 total: 2_000 * GB,
                 free: available,
-                available,
+                reserved: 0,
                 mount: "/System/Volumes/Data".into(),
             }),
             disk: Some(off.clone()),

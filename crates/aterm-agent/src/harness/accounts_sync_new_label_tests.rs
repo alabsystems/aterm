@@ -154,6 +154,8 @@ fn seed(case: i64, store: &accounts::Store, label: &str) {
             });
         }
         12 | 13 | 14 | 15 | 23 => {
+            // Case 23 already has the requested roster but corrupt local state.
+            // Directory repair still needs a valid receipt, so it must refuse.
             store.ensure().unwrap();
             let file = match case {
                 12 | 23 => store.state_file(),
@@ -418,13 +420,15 @@ fn additive_sync_conforms_to_new_label_admission() {
     bad.insert("case", 2);
     bad.insert("accepted", 1);
     assert!(!model.check_invariant("NoUnexpectedAdmission", &bad));
+    bad.insert("case", 23);
+    assert!(!model.check_invariant("NoUnexpectedAdmission", &bad));
 }
 
 #[test]
 fn each_additive_provider_obeys_admission_and_releases_recovery() {
     for cli in OTHER_CLIS {
         for case in 1..=32 {
-            let good = case == 1 || matches!(case, 19..=25 | 27..=29 | 32);
+            let good = case == 1 || matches!(case, 19..=22 | 24..=25 | 27..=29 | 32);
             let publishes = matches!(case, 1 | 20 | 21 | 24 | 28 | 32);
             assert_eq!(
                 sync_case(case, cli),

@@ -16,6 +16,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::time::Instant;
 
+pub mod activity;
 pub mod blockio;
 #[cfg(target_os = "macos")]
 mod blockio_macos;
@@ -408,7 +409,9 @@ pub fn group_memory(pid: u32) -> Option<GroupMemory> {
     }
 }
 
-/// What one member of a process group has used since it started ([`group_usage`]).
+/// What one process has used since it started, as a member of a tree: one definition, which a
+/// group's read ([`group_usage`]) and a sweep's row ([`activity::member`]) both give, since the
+/// group's read is that of the row its usage record makes; 0 for each figure unread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemberUsage {
     /// Its pid.
@@ -416,12 +419,16 @@ pub struct MemberUsage {
     /// When it started (macOS `ri_proc_start_abstime`, Mach absolute ticks): with [`Self::pid`],
     /// which process this is, so a pid taken anew reads as another member.
     pub start: u64,
-    /// User plus system CPU time, ns.
+    /// Its own user plus system CPU time, ns ([`ProcessReading::cpu_ns`]), not its reaped
+    /// children's: summed over a tree's members, a child read before its reap would count again
+    /// in its parent's figure (twice more under `P_NOCLDWAIT`), and the reap itself runs the
+    /// parent, so its own time grows anyway.
     pub cpu_ns: u64,
     /// Time its threads were runnable, on a core or waiting for one, ns (`ri_runnable_time`).
     pub runnable_ns: u64,
-    /// Bytes it read from storage, wrote to storage, and wrote through any descriptor
-    /// (`ri_diskio_bytesread + ri_diskio_byteswritten + ri_logical_writes`, saturating).
+    /// Bytes it read from storage and wrote to storage (macOS
+    /// `ri_diskio_bytesread + ri_diskio_byteswritten`, saturating). Not its logical writes: a
+    /// `write(2)` runs on its CPU time, which counts it already.
     pub io_bytes: u64,
     /// Its physical footprint now, bytes (`ri_phys_footprint`): the memory it holds, the pages
     /// the kernel compressed or swapped out included, so the memory it would have resident again.
@@ -501,139 +508,13 @@ pub fn physical_memory_mib() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = read_bounded(Path::new("/proc/meminfo"))?;
-        let m = linux::meminfo(&text)?;
-        (m.total_kib >= 1024).then_some(m.total_kib / 1024)
+        let total_kib = linux::mem_total_kib(&text)?;
+        (total_kib >= 1024).then_some(total_kib / 1024)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
-}
-
-/// The machine's memory now ([`machine_memory`]), MiB.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MachineMemory {
-    /// Available: free, inactive and purgeable pages — memory the kernel can hand out without paging anything out ([`available_mib_of`]).
-    pub available_mib: u64,
-    /// In use, as Activity Monitor's `Memory Used` counts it ([`used_mib_of`]).
-    pub used_mib: u64,
-}
-
-impl MachineMemory {
-    /// Return `available_mib.saturating_add(used_mib)`.
-    #[inline]
-    #[must_use]
-    pub const fn total_estimated_mib(self) -> u64 {
-        self.available_mib.saturating_add(self.used_mib)
-    }
-
-    /// Encode this `MachineMemory` reading into 16 little-endian bytes (`available_mib`, `used_mib`).
-    #[inline]
-    #[must_use]
-    pub const fn encode_le(self) -> [u8; 16] {
-        [
-            self.available_mib as u8,
-            (self.available_mib >> 8) as u8,
-            (self.available_mib >> 16) as u8,
-            (self.available_mib >> 24) as u8,
-            (self.available_mib >> 32) as u8,
-            (self.available_mib >> 40) as u8,
-            (self.available_mib >> 48) as u8,
-            (self.available_mib >> 56) as u8,
-            self.used_mib as u8,
-            (self.used_mib >> 8) as u8,
-            (self.used_mib >> 16) as u8,
-            (self.used_mib >> 24) as u8,
-            (self.used_mib >> 32) as u8,
-            (self.used_mib >> 40) as u8,
-            (self.used_mib >> 48) as u8,
-            (self.used_mib >> 56) as u8,
-        ]
-    }
-
-    /// Decode 16 little-endian bytes into a `MachineMemory` reading.
-    #[inline]
-    #[must_use]
-    pub const fn decode_le(bytes: [u8; 16]) -> Self {
-        let available_mib = (bytes[0] as u64)
-            | ((bytes[1] as u64) << 8)
-            | ((bytes[2] as u64) << 16)
-            | ((bytes[3] as u64) << 24)
-            | ((bytes[4] as u64) << 32)
-            | ((bytes[5] as u64) << 40)
-            | ((bytes[6] as u64) << 48)
-            | ((bytes[7] as u64) << 56);
-        let used_mib = (bytes[8] as u64)
-            | ((bytes[9] as u64) << 8)
-            | ((bytes[10] as u64) << 16)
-            | ((bytes[11] as u64) << 24)
-            | ((bytes[12] as u64) << 32)
-            | ((bytes[13] as u64) << 40)
-            | ((bytes[14] as u64) << 48)
-            | ((bytes[15] as u64) << 56);
-        Self {
-            available_mib,
-            used_mib,
-        }
-    }
-}
-
-/// The machine's memory available and in use now (`HOST_VM_INFO64` on macOS, `/proc/meminfo` on Linux), `None` where unknown.
-#[must_use]
-pub fn machine_memory() -> Option<MachineMemory> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::machine_memory()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let text = read_bounded(Path::new("/proc/meminfo"))?;
-        let m = linux::meminfo(&text)?;
-        let total_mib = m.total_kib / 1024;
-        let available_mib = (m.available_kib / 1024).min(total_mib);
-        let used_mib = m.total_kib.saturating_sub(m.available_kib) / 1024;
-        Some(MachineMemory {
-            available_mib,
-            used_mib,
-        })
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
-/// Cap a MiB reading at `physical_mib` when the host's physical memory is known.
-#[cfg(any(target_os = "macos", test))]
-#[inline]
-#[must_use]
-pub(crate) const fn clamp_physical_mib(mib: u64, physical_mib: Option<u64>) -> u64 {
-    match physical_mib {
-        Some(p) if p < mib => p,
-        _ => mib,
-    }
-}
-
-/// Memory available, MiB: free plus inactive plus purgeable pages, from `HOST_VM_INFO64` (`free_count` already holds the speculative pages, which `vm_stat` prints apart).
-#[inline]
-#[must_use]
-pub const fn available_mib_of(
-    free: u64,
-    inactive: u64,
-    purgeable: u64,
-    page_bytes: u64,
-    physical_mib: Option<u64>,
-) -> Option<u64> {
-    if page_bytes == 0 {
-        return None;
-    }
-    let pages = free.saturating_add(inactive).saturating_add(purgeable);
-    let mib = pages.saturating_mul(page_bytes) >> 20;
-    let clamped = match physical_mib {
-        Some(p) if p < mib => p,
-        _ => mib,
-    };
-    Some(clamped)
 }
 
 /// The kernel's memory pressure level now (`kern.memorystatus_vm_pressure_level`, one `sysctl`), `None` where unknown (every platform but macOS).
@@ -805,31 +686,6 @@ pub(crate) fn utf8_prefix(bytes: &[u8]) -> &str {
     match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
-    }
-}
-
-/// Memory in use, MiB, as Activity Monitor's `Memory Used` counts it: app memory (internal pages less purgeable ones) plus wired plus the pages the compressor occupies, from `HOST_VM_INFO64`.
-#[inline]
-#[must_use]
-pub const fn used_mib_of(
-    internal: u64,
-    purgeable: u64,
-    wired: u64,
-    compressor: u64,
-    page_bytes: u64,
-) -> Option<u32> {
-    if page_bytes == 0 {
-        return None;
-    }
-    let pages = internal
-        .saturating_sub(purgeable)
-        .saturating_add(wired)
-        .saturating_add(compressor);
-    let mib = pages.saturating_mul(page_bytes) >> 20;
-    if mib <= (u32::MAX as u64) {
-        Some(mib as u32)
-    } else {
-        None
     }
 }
 

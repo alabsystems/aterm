@@ -4,7 +4,9 @@
 //! [`end_group`] and [`linger`] over a scripted kernel: the group a tethered leader leads ends
 //! whole, whoever of it the watcher saw, and a group that empties by itself gets no signal.
 
-use super::{GroupControl, GroupEnded, KILL_ROUNDS, UNWATCHED_RECHECK, Woke, end_group, linger};
+use super::{
+    GroupControl, GroupEnded, KILL_ROUNDS, Member, UNWATCHED_RECHECK, Woke, end_group, linger,
+};
 use std::time::{Duration, Instant};
 
 const SIGTERM: i32 = 15;
@@ -48,6 +50,8 @@ struct World {
     naps: usize,
     clock: Instant,
     unlisted: bool,
+    /// This live member's individual group read is unavailable, even in a whole listing.
+    unread: Option<i32>,
     signals: Vec<(i32, i32)>,
     /// The script time at which the parent exits, if it does.
     parent_leaves: Option<usize>,
@@ -64,6 +68,7 @@ impl World {
             naps: 0,
             clock: Instant::now(),
             unlisted: false,
+            unread: None,
             signals: Vec::new(),
             parent_leaves: None,
             waits: Vec::new(),
@@ -90,8 +95,12 @@ impl World {
 }
 
 impl GroupControl for World {
-    fn group_of(&mut self, pid: i32) -> Option<i32> {
-        self.here().find(|p| p.pid == pid).map(|p| p.pgid)
+    fn member(&mut self, pid: i32) -> Member {
+        match self.here().find(|p| p.pid == pid) {
+            Some(_) if self.unread == Some(pid) => Member::Unread,
+            Some(process) => Member::Group(process.pgid),
+            None => Member::Gone,
+        }
     }
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
         (!self.unlisted).then(|| {
@@ -306,4 +315,23 @@ fn a_leader_that_exits_first_leaves_its_group_watched() {
     let mut world = World::new(vec![]);
     assert!(!linger(LEADER, &mut world));
     assert!(world.waits.is_empty());
+
+    // A whole PID listing cannot turn an unread live member into an empty group.
+    let mut world = World::new(vec![ours(5001, KILL)]);
+    world.unread = Some(5001);
+    world.parent_leaves = Some(1);
+    assert_eq!(world.listing(LEADER), Some((vec![5001, ANCHOR], true)));
+    assert!(
+        linger(LEADER, &mut world),
+        "the unread member keeps its group watched until the parent goes"
+    );
+    assert_eq!(world.waits, vec![(vec![], Some(UNWATCHED_RECHECK))]);
+    let out = end_group(LEADER, Duration::from_millis(100), &mut world);
+    assert_eq!(out, ended(true, true, true));
+    assert!(world.left().is_empty(), "left {:?}", world.left());
+    assert_eq!(
+        world.signals,
+        [(LEADER, SIGTERM), (LEADER, SIGKILL)],
+        "the anchored group still ends despite its unread individual member"
+    );
 }

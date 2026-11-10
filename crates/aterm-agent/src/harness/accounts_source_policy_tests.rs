@@ -82,13 +82,16 @@ fn retirement_requires_the_matching_store_writer_before_editing() {
             fleet: None,
         };
         let result = if state {
-            second.store.transact_roster_state_held(
-                &held,
-                NOW,
-                &mut None,
-                target(),
-                (true, |_| panic!("foreign writer reached state edit")),
-            )
+            second
+                .store
+                .transact_roster_state_held(
+                    &held,
+                    NOW,
+                    &mut None,
+                    target(),
+                    (true, |_| panic!("foreign writer reached state edit")),
+                )
+                .map_err(SyncError::into_message)
         } else {
             second
                 .store
@@ -177,16 +180,18 @@ impl Bed {
                 self.store
                     .transact_roster_held(&held, NOW, &mut None, target, true)
             } else {
-                self.store.transact_roster_state_held(
-                    &held,
-                    NOW,
-                    &mut None,
-                    target,
-                    (true, |state| {
-                        state.swarm_label = Some("m17".into());
-                        Ok(Vec::new())
-                    }),
-                )
+                self.store
+                    .transact_roster_state_held(
+                        &held,
+                        NOW,
+                        &mut None,
+                        target,
+                        (true, |state| {
+                            state.swarm_label = Some("m17".into());
+                            Ok(Vec::new())
+                        }),
+                    )
+                    .map_err(SyncError::into_message)
             }
             .map(|_| ())
         } else if mode == 3 {
@@ -202,6 +207,7 @@ impl Bed {
                     }),
                 )
                 .map(|_| ())
+                .map_err(SyncError::into_message)
         } else {
             self.store
                 .transact_sync_policy_held(
@@ -388,6 +394,7 @@ fn malformed_policy_cannot_be_overwritten_or_clear_retirement() {
     };
     let bed = Bed::new();
     let mut plan = Plan {
+        login_dirs: Vec::new(),
         roster_path: None,
         roster_mode: None,
         local_logins: false,

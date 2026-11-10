@@ -743,8 +743,8 @@ mod tests {
         machine.set_procs(Some(Procs::of(vec![Proc {
             pid: vm.id(),
             ppid: 1,
+            charged: 14 << 30,
             footprint: 14 << 30,
-            whole: 14 << 30,
             written: 0,
             cpu_ns: 0,
             runnable_ns: 0,

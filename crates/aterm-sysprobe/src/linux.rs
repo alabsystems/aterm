@@ -30,15 +30,6 @@ fn whole_lines(text: &str) -> impl Iterator<Item = &str> {
     text[..end].lines()
 }
 
-/// `/proc/meminfo`'s two facts, KiB.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemInfo {
-    /// `MemTotal`.
-    pub total_kib: u64,
-    /// `MemAvailable`.
-    pub available_kib: u64,
-}
-
 /// The value of a `Key:   123 kB` / `key 123` line.
 fn keyed(text: &str, key: &str) -> Option<u64> {
     whole_lines(text).find_map(|l| {
@@ -50,13 +41,11 @@ fn keyed(text: &str, key: &str) -> Option<u64> {
     })
 }
 
-/// `MemTotal` and `MemAvailable` from `/proc/meminfo`.
+/// `MemTotal` from `/proc/meminfo`, KiB: the machine's physical memory. Its available memory is
+/// [`memory_detail`]'s (`MemAvailable`), which nothing here reads.
 #[must_use]
-pub fn meminfo(text: &str) -> Option<MemInfo> {
-    Some(MemInfo {
-        total_kib: keyed(text, "MemTotal")?,
-        available_kib: keyed(text, "MemAvailable")?,
-    })
+pub fn mem_total_kib(text: &str) -> Option<u64> {
+    keyed(text, "MemTotal")
 }
 
 /// `pswpin + pswpout` from `/proc/vmstat` (pages).
@@ -237,7 +226,9 @@ pub fn cpulist(text: &str) -> Option<Vec<u16>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-/// [`MemoryDetail`] from `/proc/meminfo` (KiB × 1024).
+/// [`MemoryDetail`] from `/proc/meminfo` (KiB × 1024): `None` without `MemTotal`, `MemFree` or
+/// `MemAvailable` (the kernel's own estimate of what it can hand out without swapping, which
+/// [`MemoryDetail::available`] is here, held to `MemTotal`).
 #[must_use]
 pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
     let bytes = |key: &str| keyed(text, key).map(|k| k.saturating_mul(1024));
@@ -248,6 +239,7 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
     };
     let total = bytes("MemTotal")?;
     let free = bytes("MemFree")?;
+    let available = bytes("MemAvailable")?.min(total);
     let shared = bytes("Shmem");
     let (slab, reclaimable) = match bytes("SUnreclaim") {
         Some(unreclaimable) => (unreclaimable, bytes("SReclaimable").unwrap_or(0)),
@@ -264,6 +256,7 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
     };
     Some(MemoryDetail {
         total,
+        available,
         free,
         speculative: None,
         active: bytes("Active"),
@@ -284,7 +277,7 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
         commit,
         pressure: None,
         counters: None,
-        kernel_available_pct: None,
+        memorystatus_level_pct: None,
         exact: false,
     })
 }
@@ -1708,6 +1701,26 @@ impl Root {
             .or_else(|| readings.iter().position(|r| !asleep(r)))
             .unwrap_or(0);
         (pick < readings.len()).then(|| readings.swap_remove(pick))
+    }
+
+    /// Process `pid`'s footprint (`procs::footprint` on Linux): [`status_footprint`] of its
+    /// `status`, read whole up to [`STATUS_CAP`].
+    ///
+    /// # Errors
+    /// `InvalidData` where the file is past [`STATUS_CAP`]; `NotFound` where it is unreadable or
+    /// names no anonymous memory (a kernel thread).
+    pub fn footprint(&self, pid: u32) -> std::io::Result<u64> {
+        match self.status_memory(pid) {
+            Some(Some((footprint, _))) => Ok(footprint),
+            Some(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process status exceeds the bounded reader",
+            )),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "process status is unreadable or names no anonymous memory",
+            )),
+        }
     }
 
     /// Process `pid`'s footprint and resident anonymous pages from its `status`

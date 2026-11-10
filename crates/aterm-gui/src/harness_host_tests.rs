@@ -29996,7 +29996,7 @@ impl RealAgent {
             since_unix: None,
             bytes: 1,
             stopped: false,
-            rss_mb: None,
+            footprint_mb: None,
             restart: crate::input_stall::Restart {
                 leader: Some(self.pid),
                 ..crate::input_stall::Restart::default()

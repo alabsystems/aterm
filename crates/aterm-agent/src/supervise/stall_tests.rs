@@ -73,7 +73,8 @@ fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
     assert_eq!(frozen.len(), 1, "{journal:#?}");
     assert!(
-        frozen[0].ends_with(" input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=OK"),
+        frozen[0]
+            .ends_with(" input=stalled wait_ms=161000 bytes=1 footprint_mb=39731 attention=OK"),
         "{}",
         frozen[0]
     );
@@ -335,7 +336,10 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
 
 #[test]
 fn a_host_that_does_not_measure_input_is_probed_on_no_step() {
-    for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
+    for input in [
+        "",
+        "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-",
+    ] {
         let mut m = box_that_sits();
         m.input = input;
         let (lines, code, journal) = watch_journaled(&mut m, "stall-none");
@@ -517,8 +521,9 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
         let frozen: Vec<&String> = journal.iter().filter(|l| l.starts_with("FROZEN")).collect();
         assert_eq!(frozen.len(), 1, "{tag}: {journal:#?}");
         assert!(
-            frozen[0]
-                .ends_with(" input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=none"),
+            frozen[0].ends_with(
+                " input=stalled wait_ms=161000 bytes=1 footprint_mb=39731 attention=none"
+            ),
             "{tag}: {}",
             frozen[0]
         );
@@ -608,7 +613,10 @@ fn a_wait_that_never_read_status_probes_and_holds() {
 
 #[test]
 fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
-    for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
+    for input in [
+        "",
+        "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-",
+    ] {
         let mut m = Mock::new(vec![busy_screen(), question_screen()]);
         m.vanish_after = Some(4);
         m.input = input;
@@ -642,7 +650,8 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
 
 const RESTART: &str = "restart pid=4242 if-stalled quiet=120";
 
-const INPUT_STALLED_LONG: &str = "input=stalled input_bytes=1 input_wait_ms=660000 fg_rss_mb=39731";
+const INPUT_STALLED_LONG: &str =
+    "input=stalled input_bytes=1 input_wait_ms=660000 fg_footprint_mb=39731";
 
 /// A host that relaunches an agent the stall's remedy ends, or not (field 0), keeps what it was
 /// told for a person (field 1), and offers field 2 as what follows the end
@@ -771,7 +780,7 @@ fn with_stall_term_off_a_worker_frozen_past_the_bound_is_warned_about_and_left_r
         .collect();
     assert_eq!(warned.len(), 1, "once an episode: {lines:#?}");
     assert!(
-        warned[0].contains(" input=stalled wait_ms=660000 rss_mb=39731 ended=no "),
+        warned[0].contains(" input=stalled wait_ms=660000 footprint_mb=39731 ended=no "),
         "{}",
         warned[0]
     );
@@ -816,7 +825,7 @@ fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
     assert_eq!(said.len(), 1, "{lines:#?}");
     assert!(
         said[0].contains(
-            " input=stalled wait_ms=660000 rss_mb=39731 reply=OK restarting pid 4242 cause=stall"
+            " input=stalled wait_ms=660000 footprint_mb=39731 reply=OK restarting pid 4242 cause=stall"
         ),
         "{}",
         said[0]
@@ -830,9 +839,9 @@ fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
 
 fn input_stopped(aged: bool) -> &'static str {
     if aged {
-        "input=stopped input_bytes=1 input_wait_ms=660000 fg_rss_mb=-"
+        "input=stopped input_bytes=1 input_wait_ms=660000 fg_footprint_mb=-"
     } else {
-        "input=stopped input_bytes=1 input_wait_ms=161000 fg_rss_mb=-"
+        "input=stopped input_bytes=1 input_wait_ms=161000 fg_footprint_mb=-"
     }
 }
 

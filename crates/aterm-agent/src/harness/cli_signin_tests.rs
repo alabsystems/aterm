@@ -13,6 +13,70 @@ use std::time::Duration;
 use super::*;
 use crate::harness::login_drive::{self, Approval, Approver, Drove, Handoff, Request};
 
+#[test]
+fn adding_a_native_account_requires_receipt_admission_before_any_directory_or_row() {
+    use crate::harness::alab_roster::{
+        self, Lab, LabAccount, ReceiptGuard, SourceGuard, SourceSnapshot, TestSourceOverride,
+    };
+    struct Refuse;
+    impl SourceGuard for Refuse {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn same_source(&self, _: &dyn SourceGuard) -> bool {
+            true
+        }
+        fn with_admitted(
+            &self,
+            _: Box<dyn FnOnce() -> Result<(), crate::harness::account_sync_error::SyncError> + '_>,
+        ) -> Result<(), crate::harness::account_sync_error::SyncError> {
+            Err("native add admission refused".into())
+        }
+    }
+    let tmp = tmp_dir("native-add-receipt");
+    let env = env_at(&tmp);
+    let store = env.accounts_store();
+    let machine = alab_roster::test_machine("m16");
+    let _source = TestSourceOverride::new(SourceSnapshot::Present(std::sync::Arc::new(Lab {
+        me: Some(machine.clone()),
+        accounts: vec![LabAccount {
+            pk: "ac-native-add".into(),
+            cli: Cli::Claude,
+            vendor: Default::default(),
+            label: "native".into(),
+            legacy_label: None,
+            email: "native@example.test".into(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred: vec![(machine, Some(1))],
+        }],
+        ..Lab::default()
+    })))
+    .with_guard(ReceiptGuard::new(Refuse));
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = run_accounts_add(
+        Cli::Claude,
+        &env,
+        &accounts::Row {
+            label: "native".into(),
+            ..Default::default()
+        },
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(result, ExitCode::FAILURE);
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("native add admission refused")
+    );
+    assert!(!env.accounts_roster_for(Cli::Claude).unwrap().exists());
+    assert!(!store.login_dir("native").unwrap().exists());
+    assert!(!store.sync_needs_recovery());
+}
+
 /// What the stand-in host runs for a sign-in.
 enum Script {
     /// The Kimi stand-in, its `.stand-in` script (`<transcript> <exit>`).

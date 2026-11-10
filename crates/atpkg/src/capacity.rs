@@ -272,8 +272,8 @@ fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse
             .iter()
             .filter_map(|p| t.get(p))
             .fold(TreeUse::default(), |sum, u| TreeUse {
+                charged: sum.charged.saturating_add(u.charged),
                 footprint: sum.footprint.saturating_add(u.footprint),
-                whole: sum.whole.saturating_add(u.whole),
                 written: sum.written.saturating_add(u.written),
             })
     })
@@ -290,7 +290,7 @@ fn overrun<'o>(c: &Record, overruns: &'o HashMap<u32, Overrun>) -> Option<&'o Ov
 
 /// What a tree holds, as a claim's line says it ([`whole`]).
 fn holds(u: TreeUse) -> String {
-    whole(u.whole, u.footprint)
+    whole(u.footprint, u.charged)
 }
 
 /// Current accounting and lifetime policy, not a new observation of closure.
@@ -551,11 +551,11 @@ fn json_of(
                         "granted_cores".to_owned(),
                         Value::from(c.held.map(|h| h.cores)),
                     );
+                    m.insert("tree_held".to_owned(), Value::from(used.map(|u| u.charged)));
                     m.insert(
-                        "tree_held".to_owned(),
+                        "tree_whole".to_owned(),
                         Value::from(used.map(|u| u.footprint)),
                     );
-                    m.insert("tree_whole".to_owned(), Value::from(used.map(|u| u.whole)));
                     m.insert(
                         "credit".to_owned(),
                         Value::Array(c.credit.iter().map(|p| Value::from(*p)).collect()),
@@ -563,11 +563,11 @@ fn json_of(
                     let vm = credited(c, trees);
                     m.insert(
                         "credited_held".to_owned(),
-                        Value::from(vm.map(|u| u.footprint)),
+                        Value::from(vm.map(|u| u.charged)),
                     );
                     m.insert(
                         "credited_whole".to_owned(),
-                        Value::from(vm.map(|u| u.whole)),
+                        Value::from(vm.map(|u| u.footprint)),
                     );
                     m.insert(
                         "past_claims".to_owned(),

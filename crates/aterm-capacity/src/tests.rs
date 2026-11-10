@@ -2014,8 +2014,8 @@ fn a_holders_own_use_is_not_reserved_twice() {
         vec![Other {
             record: &a,
             used: TreeUse {
+                charged: footprint,
                 footprint,
-                whole: footprint,
                 written: 0,
             },
             credited: TreeUse::default(),
@@ -2050,8 +2050,8 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
     m.set_procs(Some(Procs::of(vec![Proc {
         pid: std::process::id(),
         ppid: 1,
+        charged: 20 * GIB,
         footprint: 20 * GIB,
-        whole: 20 * GIB,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -2089,8 +2089,8 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
     let p = |pid, ppid, gib: u64| Proc {
         pid,
         ppid,
+        charged: gib * GIB,
         footprint: gib * GIB,
-        whole: gib * GIB,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -2102,10 +2102,10 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
         p(103, 100, 3),
     ]);
     let trees = procs.trees(&[100, 101]);
-    assert_eq!(trees[&100].footprint, 5 * GIB, "P and its own child");
-    assert_eq!(trees[&101].footprint, 19 * GIB, "Q and its child");
+    assert_eq!(trees[&100].charged, 5 * GIB, "P and its own child");
+    assert_eq!(trees[&101].charged, 19 * GIB, "Q and its child");
     assert_eq!(
-        procs.tree(100).footprint,
+        procs.tree(100).charged,
         24 * GIB,
         "with Q no claimant, P's tree holds all of it"
     );
@@ -2160,8 +2160,8 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -2254,8 +2254,8 @@ fn a_holders_child_is_admitted_beside_its_ancestors_claim() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -2293,8 +2293,8 @@ fn a_tree_sums_its_descendants() {
     let p = |pid, ppid, mib: u64| Proc {
         pid,
         ppid,
+        charged: mib << 20,
         footprint: mib << 20,
-        whole: mib << 20,
         written: mib,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -2311,8 +2311,8 @@ fn a_tree_sums_its_descendants() {
     assert_eq!(
         procs.tree(10),
         TreeUse {
+            charged: 15 << 20,
             footprint: 15 << 20,
-            whole: 15 << 20,
             written: 15
         }
     );
@@ -2343,8 +2343,8 @@ fn disk_is_held_above_the_floor() {
     let other = |rec, written| Other {
         record: rec,
         used: TreeUse {
+            charged: 0,
             footprint: 0,
-            whole: 0,
             written,
         },
         credited: TreeUse::default(),
@@ -2647,16 +2647,16 @@ fn the_listed_reservations_are_what_a_later_look_holds_its_need_to() {
         (
             10,
             TreeUse {
+                charged: 4 * GIB,
                 footprint: 4 * GIB,
-                whole: 4 * GIB,
                 written: 5 * GIB,
             },
         ),
         (
             30,
             TreeUse {
+                charged: 2 * GIB,
                 footprint: 2 * GIB,
-                whole: 2 * GIB,
                 written: GIB,
             },
         ),
@@ -4439,8 +4439,8 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
     m.set_procs(Some(Procs::of(vec![Proc {
         pid: VM,
         ppid: 1,
+        charged: 14 * GIB,
         footprint: 14 * GIB,
-        whole: 14 * GIB,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -5088,8 +5088,8 @@ fn retained_custody_reserves_the_whole_peak_despite_unrelated_pid_use_and_writes
         trees.insert(
             pid,
             TreeUse {
+                charged: u64::MAX,
                 footprint: u64::MAX,
-                whole: u64::MAX,
                 written: u64::MAX,
             },
         );
@@ -6094,22 +6094,21 @@ fn a_meter_says_what_its_run_wrote() {
     );
 }
 
-/// A RUN'S END WALKS NOTHING ONCE A SAMPLE COMPLETED: the meter's first look reads 30 GiB and its
-/// second is a long walk still under way when the run ends; the end halts it, discards what it
-/// had counted (99 GiB here, a figure no complete look read) and measures nothing more, so the
-/// run took the 30 GiB the completed sample read, after two looks in all. NEGATIVE CONTROLS: with
-/// the halted walk's count kept, the run peaks at 99 GiB; with a last look at the end whatever
-/// completed (the meter before A4), it makes a third.
+/// Writes after the last completed sample count at the end too. The interrupted sample's
+/// partial result is discarded. Negative controls: omitting the final look loses the last
+/// 10 GiB; accepting the interrupted look invents a 99 GiB peak.
 #[test]
-fn a_meter_halted_after_a_completed_sample_walks_nothing_more() {
+fn a_meter_counts_writes_after_its_last_completed_sample() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
     let theirs = std::sync::Arc::clone(&calls);
     let meter = crate::Meter::start_with(
         10 * GIB,
         Box::new(move |stopped| {
-            if theirs.fetch_add(1, Ordering::SeqCst) != 1 {
-                return 30 * GIB;
+            match theirs.fetch_add(1, Ordering::SeqCst) {
+                0 => return 30 * GIB,
+                1 => {}
+                _ => return 40 * GIB,
             }
             while !stopped() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -6123,8 +6122,8 @@ fn a_meter_halted_after_a_completed_sample_walks_nothing_more() {
         (calls.load(Ordering::SeqCst) >= 2).then_some(())
     });
     let run = meter.finish();
-    assert_eq!((run.peak, run.grew), (30 * GIB, 20 * GIB));
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "no look after the halt");
+    assert_eq!((run.peak, run.grew), (40 * GIB, 30 * GIB));
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "one complete final look");
 }
 
 /// A METER RESTS AT LEAST NINE TIMES AS LONG AS ITS LAST WALK TOOK ([`crate::footprint::RESTS`]),
@@ -6411,8 +6410,8 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
         Other {
             record: r,
             used: TreeUse {
+                charged: f * GIB,
                 footprint: f * GIB,
-                whole: f * GIB,
                 written: 0,
             },
             credited: TreeUse::default(),
@@ -6462,57 +6461,28 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
     }
 }
 
-/// CLAIMABLE: the room a claim has on a Mac is the free pages (speculative included), the
-/// inactive pages file-backed ones could fill, the purgeable ones, and what compressing the
-/// anonymous rest of the inactive queue frees at the compressor's ratio. At the look of
-/// 2026-10-29 03:48 on this 24 GiB Mac (0.09 GiB free, 9.92 GiB inactive, 2.62 GiB file-backed,
-/// 1.51 GiB stored in 0.64 GiB of compressor), about 6.9 GiB: 2.7 dropped or free, 4.2 by
-/// compressing 7.3. With nothing in the compressor no ratio is read, and the anonymous pages
-/// count for nothing; the room is never more than the machine. NEGATIVE CONTROL: counting every
-/// inactive page reads 10.0 GiB, and counting none of the anonymous ones 2.7.
+/// A JOB'S MEMORY MARGIN ([`Reading::memory_margin`]) is an eighth of the machine's available
+/// memory, held between 256 MiB and 8 GiB, and the floor where nothing available is read: 2 GiB
+/// on 16 GiB available, the floor on 1 GiB, the ceiling on 128 GiB. NEGATIVE CONTROL: the margin
+/// follows what is available, never physical memory, so a 48 GiB Mac with 16 GiB available keeps
+/// 2 GiB, not 6.
 #[test]
-fn the_room_a_claim_has_is_what_dropping_and_compressing_inactive_pages_frees() {
-    let hundredths = |h: u64| h * GIB / 100;
-    let detail = aterm_sysprobe::MemoryDetail {
-        total: 24 * GIB,
-        free: hundredths(9),
-        speculative: Some(0),
-        inactive: Some(hundredths(992)),
-        file_backed: hundredths(262),
-        purgeable: Some(0),
-        compressed: Some(hundredths(64)),
-        stored: Some(hundredths(151)),
-        ..aterm_sysprobe::MemoryDetail::default()
-    };
-    let room = crate::claimable(&detail).expect("a Mac's page queues");
-    let tenths = |b: u64| (b * 10 + GIB / 2) / GIB;
-    assert_eq!(tenths(room), 69, "{room}");
-    assert_ne!(tenths(room), 100, "every inactive page");
-    assert_ne!(tenths(room), 27, "no anonymous page");
-    let empty = aterm_sysprobe::MemoryDetail {
-        compressed: Some(0),
-        stored: Some(0),
-        ..detail
-    };
+fn a_jobs_memory_margin_is_an_eighth_of_what_is_available() {
+    assert_eq!(Reading::of_gib(48, 16, 8).memory_margin(), 2 * GIB);
+    assert_ne!(Reading::of_gib(48, 16, 8).memory_margin(), 6 * GIB);
     assert_eq!(
-        crate::claimable(&empty).map(tenths),
-        Some(27),
-        "no ratio read"
+        Reading::of_gib(48, 1, 8).memory_margin(),
+        crate::MEMORY_MARGIN_FLOOR
     );
-    let huge = aterm_sysprobe::MemoryDetail {
-        free: 30 * GIB,
-        ..detail
-    };
     assert_eq!(
-        crate::claimable(&huge),
-        Some(24 * GIB),
-        "capped at the machine"
+        Reading::of_gib(256, 128, 8).memory_margin(),
+        crate::MEMORY_MARGIN_CEILING
     );
-    let linux = aterm_sysprobe::MemoryDetail {
-        purgeable: None,
-        ..detail
+    let unread = Reading {
+        available: None,
+        ..Reading::of_gib(48, 16, 8)
     };
-    assert_eq!(crate::claimable(&linux), None, "no Mac page queues");
+    assert_eq!(unread.memory_margin(), crate::MEMORY_MARGIN_FLOOR);
 }
 
 /// WHAT A WAIT WAS FOR ([`crate::Claim::waited_for`]): a 20 GiB claim that waited behind a 30
@@ -7247,8 +7217,8 @@ fn the_ledger_refines_the_qualify_memory_model_and_its_sure_leads_go_first() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -7441,8 +7411,8 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
     let p = |pid, ppid, footprint| Proc {
         pid,
         ppid,
+        charged: footprint,
         footprint,
-        whole: footprint,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,

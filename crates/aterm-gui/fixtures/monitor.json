@@ -14,8 +14,8 @@
     ]
   },
   "configured": [
-    { "uuid": "alias-cache", "name": "m32", "address": "m32.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_busy_pct\":12,\"cpu_cores\":18},\"sessions\":[{\"instance_pid\":71,\"local_id\":2,\"sid\":\"offline-example\",\"program\":\"codex\",\"agent\":\"busy\",\"task\":\"Offline monitor example\"}]}" } },
-    { "uuid": "canonical-cache", "name": "m100", "address": "m100.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_busy_pct\":12,\"cpu_cores\":18},\"sessions\":[{\"instance_pid\":72,\"local_id\":3,\"sid\":\"offline-second\",\"program\":\"claude\",\"agent\":\"idle\",\"task\":\"Second cached monitor observation\"}]}" } },
+    { "uuid": "alias-cache", "name": "m32", "address": "m32.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_cores\":18,\"load_avg_100\":[250,300,400],\"disk_total_bytes\":1099511627776,\"disk_free_bytes\":274877906944},\"sessions\":[{\"instance_pid\":71,\"local_id\":2,\"sid\":\"offline-example\",\"program\":\"codex\",\"agent\":\"busy\",\"task\":\"Offline monitor example\"}]}" } },
+    { "uuid": "canonical-cache", "name": "m100", "address": "m100.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_cores\":18,\"load_avg_100\":[250,300,400],\"disk_total_bytes\":1099511627776,\"disk_free_bytes\":274877906944},\"sessions\":[{\"instance_pid\":72,\"local_id\":3,\"sid\":\"offline-second\",\"program\":\"claude\",\"agent\":\"idle\",\"task\":\"Second cached monitor observation\"}]}" } },
     { "uuid": "repeat-cache", "name": "m32", "address": "m32.local", "state": { "last_seen": 1793320000, "hello": "{\"sessions\":[{\"instance_pid\":71,\"local_id\":2,\"sid\":\"offline-example\",\"program\":\"codex\",\"agent\":\"busy\",\"task\":\"Offline monitor example\"}]}" } },
     { "uuid": "zero-cache", "name": "m102", "address": "m102.local", "state": { "last_seen": 1793320000, "hello": "{\"sessions\":[]}" } }
   ]

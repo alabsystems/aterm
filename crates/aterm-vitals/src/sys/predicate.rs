@@ -1092,9 +1092,12 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
                 Reading::Num((cores - l[1]).max(0.0))
             }
         }
-        Metric::Avail => s.avail.map_or(Reading::Unavailable("unsupported"), |b| {
-            Reading::Num(b as f64)
-        }),
+        Metric::Avail => s
+            .mem
+            .as_ref()
+            .map_or(Reading::Unavailable("unsupported"), |m| {
+                Reading::Num(m.sample.available as f64)
+            }),
         Metric::Slots => match s.slots {
             None => Reading::Unavailable(SlotsUnread::NotSampled.word()),
             Some(_) if s.slots_age_ms.is_some_and(|a| a > SLOTS_FRESH_MS) => Reading::Warming,
@@ -2261,7 +2264,13 @@ mod tests {
                 ..CpuView::default()
             }),
             load,
-            avail,
+            mem: avail.map(|available| MemView {
+                sample: MemSample {
+                    available,
+                    ..MemSample::default()
+                },
+                ..MemView::default()
+            }),
             slots,
             ..Snapshot::default()
         }

@@ -247,25 +247,15 @@ pub(crate) fn group_usage(pgid: u32) -> Option<Vec<crate::MemberUsage>> {
     let n = unsafe { proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), bytes) };
     let n = usize::try_from(n).ok()? / std::mem::size_of::<c_int>();
     let (numer, denom) = crate::procs::imp::timebase();
-    let ns = |ticks: u64| crate::procs::ticks_to_ns(ticks, numer, denom);
     Some(
         pids.iter()
             .take(n.min(crate::MAX_GROUP_PIDS))
             .filter(|m| **m > 0)
             .filter_map(|&m| {
-                let u = crate::procs::imp::rusage(m)?.ri;
-                Some(crate::MemberUsage {
-                    pid: m.unsigned_abs(),
-                    start: u.ri_proc_start_abstime,
-                    cpu_ns: ns(u.ri_user_time.saturating_add(u.ri_system_time)),
-                    runnable_ns: ns(u.ri_runnable_time),
-                    io_bytes: u
-                        .ri_diskio_bytesread
-                        .saturating_add(u.ri_diskio_byteswritten)
-                        .saturating_add(u.ri_logical_writes),
-                    footprint: u.ri_phys_footprint,
-                    peak_footprint: u.ri_lifetime_max_phys_footprint,
-                })
+                let usage = crate::procs::imp::rusage(m)?;
+                let row =
+                    crate::procs::imp::usage_row(m.unsigned_abs(), Some(&usage), numer, denom);
+                Some(crate::activity::member(&row))
             })
             .collect(),
     )
@@ -422,31 +412,6 @@ fn vm_statistics() -> Option<libc::vm_statistics64> {
         )
     };
     (kr == 0).then_some(vm)
-}
-
-/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by `vm.pagesize` and capped at physical memory when known.
-pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
-    let page_bytes = vm_pagesize()?;
-    let vm = vm_statistics()?;
-    let physical = physical_memory_mib();
-    let available_mib = crate::available_mib_of(
-        u64::from(vm.free_count),
-        u64::from(vm.inactive_count),
-        u64::from(vm.purgeable_count),
-        page_bytes,
-        physical,
-    )?;
-    let used_mib = crate::used_mib_of(
-        u64::from(vm.internal_page_count),
-        u64::from(vm.purgeable_count),
-        u64::from(vm.wire_count),
-        u64::from(vm.compressor_page_count),
-        page_bytes,
-    )?;
-    Some(crate::MachineMemory {
-        available_mib,
-        used_mib: crate::clamp_physical_mib(u64::from(used_mib), physical),
-    })
 }
 
 /// [`crate::swapped_kib`] on macOS.
@@ -920,7 +885,7 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
         swap_usage(),
         memory_pressure(),
     );
-    detail.kernel_available_pct = sysctl_int(c"kern.memorystatus_level")
+    detail.memorystatus_level_pct = sysctl_int(c"kern.memorystatus_level")
         .and_then(|v| u8::try_from(v).ok())
         .filter(|v| *v <= 100);
     Some(detail)

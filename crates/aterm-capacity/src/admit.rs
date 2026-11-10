@@ -792,8 +792,8 @@ pub(crate) fn others<'r>(
                     && taken.insert(*pid)
                     && let Some(u) = trees.get(pid)
                 {
+                    credited.charged = credited.charged.saturating_add(u.charged);
                     credited.footprint = credited.footprint.saturating_add(u.footprint);
-                    credited.whole = credited.whole.saturating_add(u.whole);
                     credited.written = credited.written.saturating_add(u.written);
                 }
             }
@@ -868,10 +868,10 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
         }
         let own = ahead[i].credited;
         let claims = record.need.mem_now();
-        let mem = claims - claims.min(own.footprint);
+        let mem = claims - claims.min(own.charged);
         let left = credit.entry(record.pid).or_default();
-        let mem_taken = mem.min(left.footprint);
-        left.footprint -= mem_taken;
+        let mem_taken = mem.min(left.charged);
+        left.charged -= mem_taken;
         let disk_left = match record.wrote {
             Some(wrote) => disk - disk.min(wrote),
             None => {
@@ -913,8 +913,8 @@ fn released(o: &Other<'_>, alone_in_tree: bool) -> [u64; 2] {
     let total = if o.record.accounting == crate::Accounting::Holder {
         let tree =
             o.credited
-                .footprint
-                .saturating_add(if alone_in_tree { o.used.footprint } else { 0 });
+                .charged
+                .saturating_add(if alone_in_tree { o.used.charged } else { 0 });
         claims.max(tree)
     } else {
         claims
@@ -1467,7 +1467,7 @@ fn sure_leads(
         }
         let (mut back, mut owed) = (0u64, 0u64);
         for (pid, (claimed, parent)) in holders {
-            let used = trees.get(&pid).map_or(0, |t| t.footprint);
+            let used = trees.get(&pid).map_or(0, |t| t.charged);
             if parent {
                 owed = owed.saturating_add(claimed.saturating_sub(used));
             } else {

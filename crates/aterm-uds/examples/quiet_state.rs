@@ -64,8 +64,10 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The instrument reads unix file events and private files; elsewhere it has nothing to run.
 #[cfg(not(unix))]
-fn main() {
-    eprintln!("quiet_state: the file-event instrument runs on unix only");
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the quiet-state file-event instrument requires Unix",
+    ))
 }

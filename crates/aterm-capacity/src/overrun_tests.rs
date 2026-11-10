@@ -86,8 +86,8 @@ fn a_waiters_line_names_a_holder_over_its_claim_through_compressed_pages() {
         true,
     )];
     let over = tree(31, 9);
-    assert_eq!(over[&RUN].footprint, 9 * GIB + (100 << 20));
-    assert_eq!(over[&RUN].whole, 31 * GIB + (100 << 20));
+    assert_eq!(over[&RUN].charged, 9 * GIB + (100 << 20));
+    assert_eq!(over[&RUN].footprint, 31 * GIB + (100 << 20));
     let line = waiters_line(&run, &over);
     assert!(
         line.contains(
@@ -117,8 +117,8 @@ fn a_holder_of_several_claims_is_reckoned_against_them_all() {
     let trees = HashMap::from([(
         RUN,
         TreeUse {
-            footprint: 12 * GIB,
-            whole: 20 * GIB,
+            charged: 12 * GIB,
+            footprint: 20 * GIB,
             written: 0,
         },
     )]);
@@ -169,8 +169,8 @@ fn an_overrun_names_what_is_compressed_only_where_there_is_some() {
         let trees = HashMap::from([(
             RUN,
             TreeUse {
-                footprint: counted,
-                whole,
+                charged: counted,
+                footprint: whole,
                 written: 0,
             },
         )]);

@@ -759,16 +759,16 @@ fn spell_corrections(input: &str, dictionary: &[String]) -> Vec<String> {
     } else {
         0.77
     };
-    let mut words: Vec<&String> = dictionary
+    let words: Vec<&String> = dictionary
         .iter()
         .filter(|w| jaro_winkler(&normalize(w), &normalized) >= threshold)
         .filter(|w| w.as_str() != input)
         .collect();
-    words.sort_by(|a, b| {
-        jaro_winkler(a, &normalized)
-            .partial_cmp(&jaro_winkler(b, &normalized))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // The gem sorts ascending (CRuby's uniform introsort,
+    // ties in its exact permutation) then reverses.
+    let keys: Vec<f64> = words.iter().map(|w| jaro_winkler(w, &normalized)).collect();
+    let perm = commands::ruby_uniform_sort_permutation(&keys);
+    let mut words: Vec<&String> = perm.iter().map(|&i| words[i]).collect();
     words.reverse();
     let lev_threshold = (normalized.chars().count() as f64 * 0.25).ceil() as usize;
     let mut corrections: Vec<&String> = words
@@ -962,7 +962,7 @@ fn named_arg_types(cmd: &str) -> String {
         "install" | "reinstall" | "fetch" | "cat" | "log" | "deps" | "info" | "home"
         | "homepage" | "missing" | "outdated" | "cleanup" | "unpack" => &["formula", "cask"],
         "uninstall" | "remove" | "rm" | "link" | "ln" | "unlink" | "list" | "ls" | "upgrade"
-        | "tab" | "migrate" => &["installed formula", "installed cask"],
+        | "tab" | "migrate" | "pin" | "unpin" => &["installed formula", "installed cask"],
         "search" | "-S" => &["text or regex"],
         "desc" => &["formula", "cask", "text or regex"],
         "uses" | "dependents" | "options" | "gist-logs" => &["formula"],
@@ -2445,7 +2445,7 @@ fn native_args(
         "source" => (&[], 0, usize::MAX, true),
         "pin" | "unpin" => (
             &["--formula", "--formulae", "--cask", "--casks"],
-            0,
+            1,
             usize::MAX,
             true,
         ),
@@ -4707,12 +4707,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "cleanup" => cmd_cleanup(prefix, &api, rest),
         "autoremove" => cmd_autoremove(prefix, &api, rest),
         "pin" => {
-            if operands(rest).is_empty() {
-                eprintln!(
-                    "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
-                );
-                return ExitCode::from(1);
-            }
+            // Admission enforces brew's min-1 named args.
             let want_cask = has_flag(rest, "--cask", "");
             let want_formula = has_flag(rest, "--formula", "");
             each_name(rest, |n| {
@@ -5602,9 +5597,7 @@ mod admission_tests {
             ("fetch", vec!["--cask", "homebrew/cask/firefox"]),
             ("--cellar", vec!["wget"]),
             ("--cellar", vec!["homebrew/core/wget"]),
-            ("pin", vec![]),
             ("pin", vec!["wget", "curl"]),
-            ("unpin", vec![]),
             ("unpin", vec!["wget", "curl"]),
             ("uninstall", vec!["--force", "wget"]),
             ("uninstall", vec!["-f", "wget"]),
@@ -6622,6 +6615,15 @@ mod admission_tests {
                 == "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
         ));
         assert!(native_args("unpin", &argv(&["--formula", "acl"])).is_ok());
+        // brew pin/unpin declare min-1 installed named args;
+        // bare invocation is the help-plus-Invalid-usage error.
+        for c in ["pin", "unpin"] {
+            assert!(matches!(
+                native_args(c, &argv(&[])),
+                Err(InstallError::Failed(m)) if m
+                    == "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
+            ));
+        }
         assert_eq!(
             failed("link", &["--formula", "--cask", "acl"]),
             "Error: Invalid usage: Options --formula and --cask are mutually exclusive."

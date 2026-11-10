@@ -20,7 +20,7 @@
 //! - [`names_this_mac`]: where it holds, the harness reads no sheet: the upkeep's triggers
 //!   ([`sync_due`], [`fleet_digest`]), the mailbox labels ([`mailbox_labels`]) and the mail
 //!   routes ([`mail_targets`], [`mailbox_of`]) come from the lab.
-//! - [`migrate`]: once this Mac's registry inventory has equalled a peer's ([`Lab::settled`]),
+//! - Native label migration: once this Mac's registry inventory has equalled a peer's ([`Lab::settled`]),
 //!   each row whose account the lab calls by another label takes that label, its login
 //!   directory pinned where it is, its records moved with it ([`accounts::move_accounts`]) in one
 //!   crash-safe commit (the sync receipt, `accounts_sync_commit.rs`).
@@ -31,10 +31,15 @@
 //!   journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
 //!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
 
+use super::account_sync_error::SyncError;
 use super::accounts::{self, Class, Cli, Roster, Row, Store, Vendor};
 use super::accounts_sync::{self, FleetAccount, FleetRoster};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+
+#[path = "alab_capture.rs"]
+mod capture;
+pub use capture::{ReceiptGuard, SourceCapture, SourceGuard};
 
 /// The source word a sync names the lab by (`aterm harness accounts sync alab`), and the
 /// [`FleetRoster::source`] of the fleet it reads.
@@ -344,6 +349,17 @@ pub enum SourceSnapshot {
 }
 
 impl SourceSnapshot {
+    #[must_use]
+    pub fn same_observation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Present(a), Self::Present(b)) => Arc::ptr_eq(a, b) || a == b,
+            (Self::Pending, Self::Pending)
+            | (Self::Absent, Self::Absent)
+            | (Self::Disabled, Self::Disabled) => true,
+            _ => false,
+        }
+    }
+
     /// The admitted retained projection, if any.
     #[must_use]
     pub fn lab(&self) -> Option<Arc<Lab>> {
@@ -414,6 +430,17 @@ pub trait Source: Send + Sync {
     /// source-selection decision from the returned snapshot.
     fn snapshot(&self) -> SourceSnapshot;
 
+    /// Capture receipt admission with the exact observation being selected.
+    /// Sources that only observe cannot authorize native writes.
+    fn capture(&self) -> SourceCapture {
+        SourceCapture::observed(self.snapshot())
+    }
+
+    /// Apply the requesting caller's subscription policy in addition to the host's.
+    fn capture_for(&self, _config: &Path) -> SourceCapture {
+        self.capture()
+    }
+
     /// The registry's live mailboxes with a live login, as last projected; empty where no lab
     /// is held.
     fn mail(&self) -> Vec<LabMailbox> {
@@ -464,6 +491,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static REVEALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static OVERRIDE: std::cell::RefCell<Option<SourceSnapshot>> = const { std::cell::RefCell::new(None) };
+    static GUARD_OVERRIDE: std::cell::RefCell<Option<ReceiptGuard>> = const { std::cell::RefCell::new(None) };
     static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TURNED_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -534,6 +562,42 @@ pub fn snapshot() -> SourceSnapshot {
         .map_or(SourceSnapshot::Absent, |source| source.snapshot())
 }
 
+/// Capture one source revision for planning and later local receipt admission.
+#[must_use]
+pub fn capture() -> SourceCapture {
+    #[cfg(test)]
+    {
+        if TURNED_OFF.with(std::cell::Cell::get) || PENDING.with(std::cell::Cell::get) {
+            return SourceCapture::observed(snapshot());
+        }
+        if let Some(source) = OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return SourceCapture::guarded(
+                source.clone(),
+                GUARD_OVERRIDE
+                    .with(|cell| cell.borrow().clone())
+                    .unwrap_or_else(|| ReceiptGuard::new(capture::TestGuard(source))),
+            );
+        }
+    }
+    INSTALLED.get().map_or_else(
+        || SourceCapture::observed(SourceSnapshot::Absent),
+        |source| source.capture(),
+    )
+}
+
+/// Capture a source under both host policy and the requesting configuration.
+#[must_use]
+pub fn capture_for(config: &Path) -> SourceCapture {
+    #[cfg(test)]
+    if OVERRIDE.with(|cell| cell.borrow().is_some()) || TURNED_OFF.get() || PENDING.get() {
+        return capture();
+    }
+    INSTALLED.get().map_or_else(
+        || SourceCapture::observed(SourceSnapshot::Absent),
+        |source| source.capture_for(config),
+    )
+}
+
 /// The lab as this process holds it now.
 #[must_use]
 pub fn current() -> Option<Arc<Lab>> {
@@ -549,12 +613,20 @@ pub(crate) fn with_lab<T>(lab: Lab, f: impl FnOnce() -> T) -> T {
 
 /// A controlled source refresh in a test, restored even when an assertion unwinds.
 #[cfg(test)]
-pub(crate) struct TestSourceOverride(Option<SourceSnapshot>);
+pub(crate) struct TestSourceOverride(Option<SourceSnapshot>, Option<ReceiptGuard>);
 
 #[cfg(test)]
 impl TestSourceOverride {
     pub(crate) fn new(source: SourceSnapshot) -> Self {
-        Self(OVERRIDE.with(|cell| cell.replace(Some(source))))
+        Self(
+            OVERRIDE.with(|cell| cell.replace(Some(source))),
+            GUARD_OVERRIDE.with(|cell| cell.take()),
+        )
+    }
+
+    pub(crate) fn with_guard(self, guard: ReceiptGuard) -> Self {
+        GUARD_OVERRIDE.with(|cell| cell.replace(Some(guard)));
+        self
     }
 
     pub(crate) fn set(&self, source: SourceSnapshot) {
@@ -566,6 +638,7 @@ impl TestSourceOverride {
 impl Drop for TestSourceOverride {
     fn drop(&mut self) {
         OVERRIDE.with(|cell| *cell.borrow_mut() = self.0.take());
+        GUARD_OVERRIDE.with(|cell| *cell.borrow_mut() = self.1.take());
     }
 }
 
@@ -696,8 +769,8 @@ pub(crate) fn reveals() -> usize {
 }
 
 /// The `alab` fleet of `cli` for this Mac ([`SOURCE`]): every account it prefers that may join,
-/// smaller rank first, each under the label `existing` already gives it (a row is renamed only
-/// by [`migrate`], never by a sync), else the lab's. `None` where the lab names no machine for
+/// smaller rank first, each under the label `existing` already gives it until a source-admitted
+/// label migration, else the lab's. `None` where the lab names no machine for
 /// this Mac. Every row has this Mac alone as its machine and [`Class::Preferred`]; a row this Mac
 /// has that the fleet does not list stays, by [`retain`]. Every other account of `cli` the lab
 /// knows that may join is in [`FleetRoster::known`] under its lab label, so the default login's account is
@@ -854,12 +927,27 @@ pub(super) fn chosen_from(
     named: Option<&str>,
     config: Option<&Path>,
 ) -> Result<Option<FleetRoster>, String> {
+    chosen_captured(
+        source,
+        cli,
+        roster_path,
+        named,
+        config.and_then(accounts_sync::source_key).is_some(),
+    )
+}
+
+pub(super) fn chosen_captured(
+    source: &SourceSnapshot,
+    cli: Cli,
+    roster_path: Option<&Path>,
+    named: Option<&str>,
+    has_key: bool,
+) -> Result<Option<FleetRoster>, String> {
     let named = named.map(str::trim).filter(|s| !s.is_empty());
     if named.is_some_and(|named| named != SOURCE) {
         return Ok(None);
     }
-    if named.is_none() && cli == Cli::Claude && config.and_then(accounts_sync::source_key).is_some()
-    {
+    if named.is_none() && cli == Cli::Claude && has_key {
         return Ok(None);
     }
     let existing = roster_path.and_then(|path| Roster::load_for(cli, path).ok());
@@ -907,6 +995,10 @@ pub(super) fn chosen_from(
 /// Several accounts have that name (a label is unique only as a finding), or the account may
 /// not be signed in (paused, broken, banned or retired), so a sign-in nobody may try is never
 /// set up.
+pub fn asked_row(cli: Cli, name: &str) -> Option<Result<Row, String>> {
+    asked_row_from(&snapshot(), cli, name)
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -915,8 +1007,12 @@ pub(super) fn chosen_from(
         project = "aterm_agent::harness::alab_roster::assignment_tests::order_transition"
     )
 )]
-pub fn asked_row(cli: Cli, name: &str) -> Option<Result<Row, String>> {
-    let lab = current()?;
+pub(super) fn asked_row_from(
+    source: &SourceSnapshot,
+    cli: Cli,
+    name: &str,
+) -> Option<Result<Row, String>> {
+    let lab = source.lab()?;
     lab.me.as_ref()?;
     let name = name.trim();
     let mut found = lab.of(cli).filter(|account| {
@@ -1205,7 +1301,7 @@ pub(super) fn order_rows(
 )]
 pub fn alab_preference_environment() {}
 
-/// What [`migrate`] did.
+/// Changes produced by a source-admitted label migration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Migrated {
     /// `(old label, new label)` for each row renamed.
@@ -1268,14 +1364,7 @@ pub fn renames(lab: &Lab, cli: Cli, roster: &Roster, retained: impl Fn(&str) -> 
 /// The writer lock is held past `ladder`, an interrupted commit cannot be completed, the roster
 /// or the store cannot be read, or the moves are refused (a destination label still holds
 /// records): nothing is written.
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "FleetMachineAssignment",
-        action = "Migrate",
-        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
-    )
-)]
+#[cfg(test)]
 pub fn migrate(
     lab: &Lab,
     cli: Cli,
@@ -1291,10 +1380,19 @@ pub fn migrate(
         .acquire_within(ladder)
         .map_err(|why| format!("{}: {why}", store.dir.display()))?
         .ok_or_else(|| format!("{} at {}", accounts::LOCK_HELD, store.dir.display()))?;
-    migrate_held(lab, cli, store, &held, roster_path, now, false)
+    migrate_held(lab, cli, store, &held, roster_path, now, (false, None))
+        .map_err(SyncError::into_message)
 }
 
 /// Apply native label migration while the caller retains this store's writer.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Migrate",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
+    )
+)]
 pub(super) fn migrate_held(
     lab: &Lab,
     cli: Cli,
@@ -1302,8 +1400,8 @@ pub(super) fn migrate_held(
     held: &accounts::Lock,
     roster_path: &Path,
     now: i64,
-    retire: bool,
-) -> Result<Migrated, String> {
+    (retire, source): (bool, Option<&ReceiptGuard>),
+) -> Result<Migrated, SyncError> {
     if !lab.settled {
         return Ok(Migrated::default());
     }
@@ -1334,17 +1432,20 @@ pub(super) fn migrate_held(
         .iter()
         .map(|(from, to)| (from.as_str(), to.as_str()))
         .collect();
-    store.transact_sync_policy_held(
+    store.transact_sync_source_held(
         held,
         now,
         &mut None,
-        accounts::SyncTarget {
-            fleet: None,
-            path: &write_to,
-            before: Some(text),
-            after: Some(&after),
-            mode: keep_mode,
-        },
+        (
+            accounts::SyncTarget {
+                fleet: None,
+                path: &write_to,
+                before: Some(text),
+                after: Some(&after),
+                mode: keep_mode,
+            },
+            source,
+        ),
         (retire, |state, logins| {
             accounts::move_accounts(state, logins, &pairs)?;
             Ok(Vec::new())
@@ -1430,7 +1531,7 @@ pub fn mail_targets(email: &str) -> Vec<String> {
 
 /// Each `(cli, label, login address)` the mailbox config maps a `<label>` password, mailbox
 /// password or TOTP seed through, from the lab this process holds where it names this Mac: every
-/// account's lab label, and its legacy label where that differs, since [`migrate`] renamed a row
+/// account's lab label, and its legacy label where that differs, since native migration renames a row
 /// only from its legacy label ([`renames`]) and the secrets kept that name. Empty where no lab
 /// names this Mac, which then reads its sheet and fleet files as it always did.
 #[must_use]
@@ -1642,6 +1743,38 @@ pub fn mailbox_labels() -> Vec<(Cli, String, String)> {
     )
 )]
 pub fn fleet_assignment_environment() {}
+
+/// Exercise the production source-to-receipt boundary from the host's native
+/// registry fixture. The caller supplies an isolated store and roster.
+///
+/// # Errors
+/// The writer, source, original images or durable publication are unavailable.
+#[cfg(any(test, debug_assertions))]
+pub fn test_publish_source_roster(
+    store: &Store,
+    path: &Path,
+    after: &str,
+    source: &ReceiptGuard,
+) -> Result<bool, String> {
+    let held = store.acquire().map_err(|error| error.to_string())?;
+    let before = accounts::roster_text(path)?;
+    store
+        .transact_roster_admitted_held(
+            &held,
+            1,
+            &mut None,
+            accounts::SyncTarget {
+                path,
+                before: before.as_deref(),
+                after: Some(after),
+                mode: None,
+                fleet: None,
+            },
+            false,
+            Some(source),
+        )
+        .map_err(SyncError::into_message)
+}
 
 #[cfg(test)]
 #[path = "alab_roster_tests.rs"]

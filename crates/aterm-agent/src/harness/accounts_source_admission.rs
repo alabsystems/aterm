@@ -4,16 +4,60 @@
 //! The source observation retained by an automatic account sync.
 
 use super::*;
-use crate::harness::alab_roster::SourceSnapshot;
-use std::sync::Arc;
+use crate::harness::alab_roster::{ReceiptGuard, SourceCapture};
 
 pub(super) struct AutomaticSource {
     config: PathBuf,
     config_image: Option<String>,
-    observation: SourceSnapshot,
+    observation: SourceCapture,
     policy: Option<accounts::source_policy::Snapshot>,
     retire_legacy: bool,
     selection: Option<SelectionObservation>,
+    receipt: Option<ReceiptGuard>,
+}
+
+struct LocalReceiptGuard {
+    source: ReceiptGuard,
+    config: PathBuf,
+    image: Option<String>,
+    policy: Option<accounts::source_policy::Snapshot>,
+}
+
+impl crate::harness::alab_roster::SourceGuard for LocalReceiptGuard {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn same_source(&self, other: &dyn crate::harness::alab_roster::SourceGuard) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            self.source == other.source
+                && self.config == other.config
+                && self.image == other.image
+                && self.policy == other.policy
+        })
+    }
+    fn with_admitted(
+        &self,
+        save: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
+    ) -> Result<(), SyncError> {
+        self.source.with_admitted(|| {
+            // Local reads only: re-entering global source capture here would
+            // recursively acquire the native registry's admission locks.
+            if read_config(&self.config).map_err(|why| SyncError::retry(Retry::Unavailable, why))?
+                != self.image
+            {
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    "account configuration changed before receipt admission",
+                ));
+            }
+            if let Some(policy) = &self.policy {
+                policy
+                    .check_current()
+                    .map_err(|why| SyncError::retry(Retry::Changed, why))?;
+            }
+            save()
+        })
+    }
 }
 
 struct SelectionObservation {
@@ -25,31 +69,33 @@ struct SelectionObservation {
 }
 
 impl AutomaticSource {
-    pub(super) fn capture(config: &Path) -> Result<Self, String> {
+    pub(super) fn capture(config: &Path) -> Result<Self, SyncError> {
         Self::capture_inner(config, true)
     }
 
-    pub(super) fn capture_requested(config: &Path) -> Result<Self, String> {
+    pub(super) fn capture_requested(config: &Path) -> Result<Self, SyncError> {
         Self::capture_inner(config, false)
     }
 
-    fn capture_inner(config: &Path, automatic: bool) -> Result<Self, String> {
+    fn capture_inner(config: &Path, automatic: bool) -> Result<Self, SyncError> {
         let config_image = read_config(config)?;
         let policy = crate::supervise::config::SupervisorConfig::from_aterm_toml(
             config_image.as_deref().unwrap_or(""),
         )
         .0;
         if automatic && (!policy.enabled || policy.accounts == accounts::Mode::Off) {
-            return Err(ACCOUNTS_SYNC_OFF.to_owned());
+            return Err(ACCOUNTS_SYNC_OFF.into());
         }
-        let captured = Self {
+        let mut captured = Self {
             config: config.to_path_buf(),
             config_image,
-            observation: crate::harness::alab_roster::snapshot(),
+            observation: crate::harness::alab_roster::capture_for(config),
             policy: None,
             retire_legacy: false,
             selection: None,
+            receipt: None,
         };
+        captured.retain_receipt_guard();
         captured.validate()?;
         Ok(captured)
     }
@@ -62,9 +108,11 @@ impl AutomaticSource {
             project = "aterm_agent::harness::accounts_sync::source_admission::tests::resolve"
         )
     )]
-    pub(super) fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), SyncError> {
         if let Some(policy) = &self.policy {
-            policy.check_current()?;
+            policy
+                .check_current()
+                .map_err(|why| SyncError::retry(Retry::Changed, why))?;
             if let Some(observation) = &self.selection
                 && source_selection::select_observed(
                     observation.home.as_deref(),
@@ -72,9 +120,14 @@ impl AutomaticSource {
                     Some(&observation.roster),
                     observation.scope,
                     policy,
-                )? != observation.selected
+                )
+                .map_err(|why| SyncError::retry(Retry::Changed, why))?
+                    != observation.selected
             {
-                return Err("automatic account source precedence changed after capture".into());
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    "automatic account source precedence changed after capture",
+                ));
             }
             if let Some(observation) = &self.selection
                 && observation
@@ -82,16 +135,23 @@ impl AutomaticSource {
                     .retires_legacy(observation.home.as_deref(), observation.config.as_deref())
                     != self.retire_legacy
             {
-                return Err("automatic account source assignment changed after capture".into());
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    "automatic account source assignment changed after capture",
+                ));
             }
         }
-        if read_config(&self.config)? != self.config_image
-            || !same_observation(&self.observation, &crate::harness::alab_roster::snapshot())
+        if read_config(&self.config).map_err(|why| SyncError::retry(Retry::Unavailable, why))?
+            != self.config_image
+            || !self
+                .observation
+                .same_source(&crate::harness::alab_roster::capture_for(&self.config))
         {
-            return Err(
+            return Err(SyncError::retry(
+                Retry::Changed,
                 "automatic account source changed after capture; no new sync was admitted"
                     .to_owned(),
-            );
+            ));
         }
         Ok(())
     }
@@ -103,11 +163,41 @@ impl AutomaticSource {
     ) -> Self {
         self.policy = Some(policy);
         self.retire_legacy = retire_legacy;
+        self.retain_receipt_guard();
         self
     }
 
     pub(super) fn retires_legacy(&self) -> bool {
         self.retire_legacy
+    }
+
+    pub(super) fn native_guard(&self) -> Result<&ReceiptGuard, SyncError> {
+        self.receipt.as_ref().ok_or_else(|| {
+            SyncError::retry(
+                Retry::Unavailable,
+                "native account source has no receipt admission",
+            )
+        })
+    }
+
+    pub(super) fn named_account(&self, cli: Cli, name: &str) -> Result<Option<Row>, String> {
+        self.validate().map_err(SyncError::into_message)?;
+        if self.observation.snapshot().pending() {
+            return Err("the native account source is unavailable; no account was added".into());
+        }
+        super::super::alab_roster::asked_row_from(self.observation.snapshot(), cli, name)
+            .transpose()
+    }
+
+    fn retain_receipt_guard(&mut self) {
+        self.receipt = self.observation.native_guard().ok().map(|source| {
+            ReceiptGuard::new(LocalReceiptGuard {
+                source: source.clone(),
+                config: self.config.clone(),
+                image: self.config_image.clone(),
+                policy: self.policy.clone(),
+            })
+        });
     }
 
     pub(super) fn owns_local_projection(&self, path: &Path) -> bool {
@@ -144,15 +234,25 @@ impl AutomaticSource {
         cli: Cli,
         roster: &Path,
         named: Option<&str>,
-    ) -> Result<Option<FleetRoster>, String> {
+    ) -> Result<Option<FleetRoster>, SyncError> {
         self.validate()?;
-        super::super::alab_roster::chosen_from(
-            &self.observation,
+        super::super::alab_roster::chosen_captured(
+            self.observation.snapshot(),
             cli,
             Some(roster),
             named,
-            Some(&self.config),
+            self.config_image
+                .as_deref()
+                .and_then(super::source_key_text)
+                .is_some(),
         )
+        .map_err(|why| {
+            if self.observation.snapshot().pending() {
+                SyncError::retry(Retry::Unavailable, why)
+            } else {
+                why.into()
+            }
+        })
     }
 }
 
@@ -167,19 +267,10 @@ fn read_config(config: &Path) -> Result<Option<String>, String> {
     Ok(text)
 }
 
-fn same_observation(a: &SourceSnapshot, b: &SourceSnapshot) -> bool {
-    match (a, b) {
-        (SourceSnapshot::Present(a), SourceSnapshot::Present(b)) => Arc::ptr_eq(a, b) || a == b,
-        (SourceSnapshot::Absent, SourceSnapshot::Absent)
-        | (SourceSnapshot::Disabled, SourceSnapshot::Disabled)
-        | (SourceSnapshot::Pending, SourceSnapshot::Pending) => true,
-        _ => false,
-    }
-}
-
 /// An automatic candidate is a location, never an explicit source override.
 pub(super) enum SourceRequest<'a> {
     Requested(Option<&'a str>),
+    RequestedNative(&'a AutomaticSource),
     Automatic {
         candidate: Option<&'a str>,
         admission: &'a AutomaticSource,
@@ -190,6 +281,7 @@ impl<'a> SourceRequest<'a> {
     pub(super) fn candidate(&self) -> Option<&'a str> {
         match self {
             Self::Requested(source) => *source,
+            Self::RequestedNative(_) => Some(super::super::alab_roster::SOURCE),
             Self::Automatic { candidate, .. } => *candidate,
         }
     }
@@ -197,11 +289,11 @@ impl<'a> SourceRequest<'a> {
     pub(super) fn admission(&self) -> Option<&AutomaticSource> {
         match self {
             Self::Requested(_) => None,
-            Self::Automatic { admission, .. } => Some(admission),
+            Self::RequestedNative(admission) | Self::Automatic { admission, .. } => Some(admission),
         }
     }
 
-    pub(super) fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), SyncError> {
         self.admission().map_or(Ok(()), AutomaticSource::validate)
     }
 
@@ -218,19 +310,17 @@ impl<'a> SourceRequest<'a> {
         cli: Cli,
         roster: &Path,
         config: Option<&Path>,
-    ) -> Result<Option<FleetRoster>, String> {
+    ) -> Result<Option<FleetRoster>, SyncError> {
         self.validate()?;
         match self {
             Self::Requested(source) => {
                 super::super::alab_roster::chosen(cli, Some(roster), *source, config)
+                    .map_err(Into::into)
             }
-            Self::Automatic { admission, .. } => super::super::alab_roster::chosen_from(
-                &admission.observation,
-                cli,
-                Some(roster),
-                None,
-                config,
-            ),
+            Self::RequestedNative(admission) => {
+                admission.chosen(cli, roster, Some(super::super::alab_roster::SOURCE))
+            }
+            Self::Automatic { admission, .. } => admission.chosen(cli, roster, None),
         }
     }
 }

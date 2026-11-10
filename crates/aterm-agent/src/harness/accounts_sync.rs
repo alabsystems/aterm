@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use aterm_json::{Map, Value};
 
+use super::account_sync_error::{Retry, SyncError};
 use super::accounts::{self, Class, Cli, Roster, Row};
 use super::accounts_step::Step;
 use super::cli::{ACCOUNTS_OWN_LABEL, Env};
@@ -3384,7 +3385,11 @@ fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> Result<bool, String> {
 
 pub(super) fn source_key(config: &Path) -> Option<String> {
     let text = super::ai_pool::read_bounded_text(config, 2 * 1024 * 1024)?;
-    let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
+    source_key_text(&text)
+}
+
+pub(super) fn source_key_text(text: &str) -> Option<String> {
+    let table: aterm_toml::Table = aterm_toml::from_str(text).ok()?;
     table
         .get(SOURCE_TABLE)?
         .as_table()?
@@ -5199,22 +5204,26 @@ struct FleetSnapshot {
     publish: Publish,
 }
 
-fn validate_fleet_snapshots(snapshots: &[FleetSnapshot]) -> Result<(), String> {
+fn validate_fleet_snapshots(snapshots: &[FleetSnapshot]) -> Result<(), SyncError> {
     for expected in snapshots {
         let current = match read_local_source_text(&expected.path) {
             Ok(text) => Some(text.into_bytes()),
             Err(why) if why.kind() == io::ErrorKind::NotFound => None,
             Err(why) => {
-                return Err(format!(
-                    "could not check captured fleet at {}: {why}; nothing was synced",
-                    expected.path.display()
+                return Err(SyncError::retry(
+                    Retry::Unavailable,
+                    format!(
+                        "could not check captured fleet at {}: {why}; nothing was synced",
+                        expected.path.display()
+                    ),
                 ));
             }
         };
         if current != expected.bytes {
-            return Err(
+            return Err(SyncError::retry(
+                Retry::Changed,
                 "fleet accounts changed after init discovery; nothing was synced".to_owned(),
-            );
+            ));
         }
     }
     Ok(())
@@ -5985,6 +5994,7 @@ fn persist_accounts_sync(
         now,
         (ladder, fleet_snapshots, None),
     )
+    .map_err(SyncError::into_message)
 }
 
 #[cfg_attr(
@@ -6027,23 +6037,41 @@ fn persist_accounts_sync_with_pool(
     standing_walls: &BTreeMap<String, upgrade::StandingWall>,
     now: i64,
     (ladder, fleet_snapshots, admission): (&[Duration], &[FleetSnapshot], Option<&AutomaticSource>),
-) -> Result<SyncedAccounts, String> {
+) -> Result<SyncedAccounts, SyncError> {
     let held = store
         .acquire_within(ladder)
         .map_err(|why| format!("{}: {why}", store.dir.display()))?
         .ok_or_else(|| {
-            format!(
-                "{} at {} after {} ms: another `aterm harness accounts` or a window's \
+            SyncError::retry(
+                Retry::Busy,
+                format!(
+                    "{} at {} after {} ms: another `aterm harness accounts` or a window's \
                  supervisor holds it; nothing was synced, so run the sync again",
-                accounts::LOCK_HELD,
-                store.dir.display(),
-                ladder.iter().sum::<Duration>().as_millis()
+                    accounts::LOCK_HELD,
+                    store.dir.display(),
+                    ladder.iter().sum::<Duration>().as_millis()
+                ),
             )
         })?;
     let recovered = store.recover_sync_held(&held, roster_path)?;
     if let Some(admission) = admission {
         admission.validate()?;
     }
+    let receipt_source = if fleet.alab.is_some() {
+        if fleet_snapshots
+            .iter()
+            .any(|snapshot| matches!(snapshot.publish, Publish::Fleet))
+        {
+            return Err("native account publication cannot write auxiliary fleet sources".into());
+        }
+        Some(
+            admission
+                .ok_or("native account source was not captured")?
+                .native_guard()?,
+        )
+    } else {
+        None
+    };
     let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
     let fleet_path = roster_path
         .parent()
@@ -6147,7 +6175,7 @@ fn persist_accounts_sync_with_pool(
     // A lab that prefers nothing here and knows no default login leaves an empty roster as it is.
     if roster.rows.is_empty() && fleet.alab.is_some() {
         let retired = if admission.is_some_and(AutomaticSource::retires_legacy) {
-            store.retire_source_held(&held, now)?
+            store.retire_source_admitted_held(&held, now, receipt_source)?
         } else {
             false
         };
@@ -6166,7 +6194,8 @@ fn persist_accounts_sync_with_pool(
                 fleet.source
             ),
             &fleet.conflicts_for(Some(machine)),
-        ));
+        )
+        .into());
     }
     // A default login's state follows its account to its new label, whether or not the old
     // label is reused, and a row whose label it takes over moves to the label the source gives
@@ -6261,7 +6290,7 @@ fn persist_accounts_sync_with_pool(
             return Err(format!(
                 "sync auxiliary destination {} overlaps the account store or roster; no new sync was published",
                 path.display()
-            ));
+            ).into());
         }
     }
     let fleet_toml = fleet.to_toml_for(Some(opt_in));
@@ -6362,6 +6391,11 @@ fn persist_accounts_sync_with_pool(
     let roster_held = accounts::roster_text(&write_to)?;
     let fleet_held = super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024);
     let mut changed = recovered
+        || roster.rows.iter().any(|row| {
+            row.dir.as_deref().map(Path::new).is_some_and(|path| {
+                path.parent() == Some(store.logins_dir().as_path()) && !path.exists()
+            })
+        })
         || (admission.is_some_and(AutomaticSource::retires_legacy)
             && !store.source_policy()?.retired())
         || roster_held.as_deref() != Some(roster_toml.as_str())
@@ -6378,13 +6412,13 @@ fn persist_accounts_sync_with_pool(
     // The login directories under the store that moved rows leave and nothing names any longer.
     let left_dirs = std::cell::Cell::new(Vec::<PathBuf>::new());
     let events = store
-        .transact_sync_policy_held(&held, now, &mut note, accounts::SyncTarget {
+        .transact_sync_source_held(&held, now, &mut note, (accounts::SyncTarget {
             fleet: fleet.alab.is_none().then_some((roster_path, fleet_toml.as_str())),
             path: &write_to,
             before: roster_held.as_deref(),
             after: Some(&roster_toml),
             mode: keep_mode,
-        }, (admission.is_some_and(AutomaticSource::retires_legacy), |state, logins| {
+        }, receipt_source), (admission.is_some_and(AutomaticSource::retires_legacy), |state, logins| {
             if let Some(admission) = admission {
                 admission.validate()?;
             }
@@ -6460,7 +6494,7 @@ fn persist_accounts_sync_with_pool(
                 if let Some(dir) = row.dir.as_deref()
                     && let Some(owner) = accounts::retained_directory_owner(logins, &roster.rows, &row.label, dir)?
                 {
-                    return Err(format!("cannot use `{}`: its login directory is retained by `{owner}`; choose an unused label; nothing was written", row.label));
+                    return Err(format!("cannot use `{}`: its login directory is retained by `{owner}`; choose an unused label; nothing was written", row.label).into());
                 }
             }
             let mut events = Vec::new();
@@ -6614,17 +6648,10 @@ fn persist_accounts_sync_with_pool(
             state_changed = (&*state, &*logins) != (&before.0, &before.1);
             Ok(events)
         }), || {
-            publishing = true;
+            publishing = fleet_snapshots.iter().any(|snapshot| matches!(snapshot.publish, Publish::Fleet));
             #[cfg(test)]
             if DIRECTORY_CLEANUP_MUTANT.get() == 1 {
                 cleanup_vacated_login_dirs(left_dirs.take());
-            }
-            for row in &roster.rows {
-                if let Some(dir) = &row.dir {
-                    aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
-                        .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(Path::new(dir)))
-                        .map_err(|why| format!("could not create {dir}: {why}"))?;
-                }
             }
             for expected in fleet_snapshots {
                 match expected.publish {
@@ -6636,7 +6663,7 @@ fn persist_accounts_sync_with_pool(
             }
             Ok(())
         })
-        .map_err(|why| {
+        .map_err(|why| why.context(|why| {
             if publishing {
                 format!(
                     "sync publication did not complete: {why}; any pending local commit is \
@@ -6646,7 +6673,7 @@ fn persist_accounts_sync_with_pool(
             } else {
                 format!("sync refused before roster publication: {why}")
             }
-        })?;
+        }))?;
     // Only the completed receipt makes these directories unreferenced. An
     // interrupted replay keeps them for the old roster and for recovery.
     cleanup_vacated_login_dirs(left_dirs.take());
@@ -6703,6 +6730,41 @@ struct SyncHow<'a> {
     /// ([`heal_default_login_now`]); `None` makes none.
     heal: Option<fn(&Path) -> super::cli::LoginCheck>,
     allow_empty_pool: bool,
+}
+
+/// A named native account is an explicit selection; automatic source-key
+/// precedence does not apply, but caller policy and retained state still do.
+pub(super) fn capture_native_named_account(
+    env: &Env,
+    cli: Cli,
+    name: &str,
+) -> Result<Option<(Row, super::alab_roster::ReceiptGuard)>, String> {
+    let store = env
+        .accounts_store_for(cli)
+        .ok_or_else(|| super::cli::no_home_for(cli))?;
+    let config = env
+        .config
+        .clone()
+        .or_else(|| {
+            env.accounts_roster_for(cli)
+                .map(|path| config_beside(&path))
+        })
+        .ok_or("no account configuration is known")?;
+    let captured = AutomaticSource::capture_requested(&config)
+        .map_err(SyncError::into_message)?
+        .with_policy(store.source_policy()?, false);
+    captured
+        .named_account(cli, name)?
+        .map(|row| {
+            Ok((
+                row,
+                captured
+                    .native_guard()
+                    .map_err(SyncError::into_message)?
+                    .clone(),
+            ))
+        })
+        .transpose()
 }
 
 fn run_accounts_sync_with(
@@ -6806,8 +6868,27 @@ fn sync_accounts_with(
     source: Option<&str>,
     machine_override: Option<&str>,
     how: &SyncHow<'_>,
-) -> Result<SyncReport, String> {
+) -> Result<SyncReport, SyncError> {
     let source = source.map(str::trim).filter(|source| !source.is_empty());
+    if source == Some(super::alab_roster::SOURCE) {
+        let env = source_env(env)?;
+        let roster = env
+            .accounts_roster()
+            .ok_or("no account roster location is known")?;
+        let store = env.accounts_store();
+        let recovered = store.recover_sync_within(how.ladder, &roster)?;
+        let config = env.config.clone().unwrap_or_else(|| config_beside(&roster));
+        let admission =
+            AutomaticSource::capture_requested(&config)?.with_policy(store.source_policy()?, false);
+        let mut report = sync_accounts_request(
+            &env,
+            SourceRequest::RequestedNative(&admission),
+            machine_override,
+            how,
+        )?;
+        report.publication.changed |= recovered;
+        return Ok(report);
+    }
     if source.is_some() {
         return sync_accounts_request(env, SourceRequest::Requested(source), machine_override, how);
     }
@@ -6862,7 +6943,7 @@ fn sync_accounts_request(
     request: SourceRequest<'_>,
     machine_override: Option<&str>,
     how: &SyncHow<'_>,
-) -> Result<SyncReport, String> {
+) -> Result<SyncReport, SyncError> {
     let normalized = source_env(env)?;
     let env = &normalized;
     let roster_path = env
@@ -6937,7 +7018,7 @@ fn sync_accounts_request(
         let held = store
             .acquire_within(how.ladder)
             .map_err(|why| why.to_string())?
-            .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+            .ok_or_else(|| SyncError::retry(Retry::Busy, accounts::LOCK_HELD))?;
         store.recover_sync_held(&held, &roster_path)?;
         request.validate()?;
         validate_fleet_snapshots(&snapshots)?;
@@ -6961,10 +7042,10 @@ fn sync_accounts_request(
                         request.validate()?;
                         validate_fleet_snapshots(&snapshots)?;
                         if accounts::roster_text(&roster_path)?.is_some() {
-                            return Err(
-                                "account roster appeared after empty-pool planning; sync again"
-                                    .into(),
-                            );
+                            return Err(SyncError::retry(
+                                Retry::Changed,
+                                "account roster appeared after empty-pool planning; sync again",
+                            ));
                         }
                         let target_label = Some(ctx.identity.primary.clone());
                         if state.swarm_label != target_label
@@ -6979,7 +7060,7 @@ fn sync_accounts_request(
                     },
                 ),
             )
-            .map_err(|why| format!("could not update account state: {why}"))?;
+            .map_err(|why| why.context(|why| format!("could not update account state: {why}")))?;
         drop(held);
         return read_sync_report(
             env,
@@ -6998,7 +7079,8 @@ fn sync_accounts_request(
                 clashes: Vec::new(),
             },
             None,
-        );
+        )
+        .map_err(Into::into);
     }
 
     // The walls a transcript shows go to the rows the sync publishes, the rows a conflict
@@ -7554,11 +7636,12 @@ enum SyncScheduleChange {
     Key(Option<LocalSourceAttempt>, Option<LocalSourceAttempt>),
 }
 
-/// Only observations installed by this operation can be restored on cancellation.
+/// Only observations installed by this operation can be restored on retry or cancellation.
 struct SyncScheduleClaim<'a> {
     rediscovery: &'a std::sync::Mutex<Rediscovery>,
     scope: Option<&'a super::account_work::Scope>,
     changes: Vec<SyncScheduleChange>,
+    retry: bool,
 }
 
 impl<'a> SyncScheduleClaim<'a> {
@@ -7570,15 +7653,23 @@ impl<'a> SyncScheduleClaim<'a> {
             rediscovery,
             scope,
             changes: Vec::new(),
+            retry: false,
         }
+    }
+
+    fn outcome<T>(&mut self, result: &Result<T, SyncError>) {
+        self.retry |= result
+            .as_ref()
+            .is_err_and(|why| why.retry_reason().is_some());
     }
 }
 
 impl Drop for SyncScheduleClaim<'_> {
     fn drop(&mut self) {
-        if !self
-            .scope
-            .is_some_and(super::account_work::Scope::cancelled)
+        if !self.retry
+            && !self
+                .scope
+                .is_some_and(super::account_work::Scope::cancelled)
         {
             return;
         }
@@ -7608,13 +7699,45 @@ struct SyncCooldownClaim<'a> {
     scope: Option<&'a super::account_work::Scope>,
     before: Option<Instant>,
     own: Instant,
+    retry: bool,
+}
+
+impl<'a> SyncCooldownClaim<'a> {
+    fn take(
+        held: &'a std::sync::Mutex<Option<Instant>>,
+        scope: Option<&'a super::account_work::Scope>,
+    ) -> Option<Self> {
+        let mut guard = held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some_and(|last| last.elapsed() < Duration::from_secs(600)) {
+            return None;
+        }
+        let before = *guard;
+        let own = Instant::now();
+        *guard = Some(own);
+        Some(Self {
+            held,
+            scope,
+            before,
+            own,
+            retry: false,
+        })
+    }
+
+    fn outcome<T>(&mut self, result: &Result<T, SyncError>) {
+        self.retry |= result
+            .as_ref()
+            .is_err_and(|why| why.retry_reason().is_some());
+    }
 }
 
 impl Drop for SyncCooldownClaim<'_> {
     fn drop(&mut self) {
-        if self
-            .scope
-            .is_some_and(super::account_work::Scope::cancelled)
+        if self.retry
+            || self
+                .scope
+                .is_some_and(super::account_work::Scope::cancelled)
         {
             let mut held = self
                 .held
@@ -7645,14 +7768,14 @@ struct FailedSync {
     at: Instant,
     /// Why, which the next failure is logged against ([`note_sync_result`]).
     why: String,
-    /// Whether it holds a sync of the same inputs back: not where another process held the
-    /// accounts lock, which says nothing of what the sync read.
+    /// Whether this rejected input holds another attempt back. Transient source or
+    /// custody failures establish no verdict about the captured input.
     holds: bool,
 }
 
 impl FailedSync {
     /// Whether it holds back a sync that would read `inputs` now: one of the same inputs, within
-    /// [`REDISCOVER_EVERY`] of this attempt, where its failure was not the lock's.
+    /// [`REDISCOVER_EVERY`] of this attempt, where its failure rejected the input.
     fn holds_back(&self, inputs: &[u8; 32]) -> bool {
         self.holds && self.inputs == *inputs && self.at.elapsed() < REDISCOVER_EVERY
     }
@@ -7661,10 +7784,18 @@ impl FailedSync {
 /// Keeps what a periodic caller's sync of `inputs` did in `failed` ([`periodic_sync`]), and
 /// returns whether its failure is news, which a caller logs: one of other inputs or for another
 /// reason than the last failure's. A sync that succeeds forgets the last failure.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSyncRetry",
+        action = "Finish",
+        project = "aterm_agent::harness::accounts_sync::retry_tests::retry_transition"
+    )
+)]
 fn note_sync_result(
     failed: &mut Option<FailedSync>,
     inputs: [u8; 32],
-    result: Result<(), &str>,
+    result: Result<(), &SyncError>,
 ) -> bool {
     let Err(why) = result else {
         *failed = None;
@@ -7672,12 +7803,12 @@ fn note_sync_result(
     };
     let news = failed
         .as_ref()
-        .is_none_or(|last| last.inputs != inputs || last.why != why);
+        .is_none_or(|last| last.inputs != inputs || last.why != why.to_string());
     *failed = Some(FailedSync {
         inputs,
         at: Instant::now(),
-        why: why.to_owned(),
-        holds: !why.contains(accounts::LOCK_HELD),
+        why: why.to_string(),
+        holds: why.retry_reason().is_none(),
     });
     news
 }
@@ -8634,9 +8765,12 @@ fn upkeep_claude(
             fx.rediscovery,
             &mut scheduling,
         )
-        && let Some((Err(why), true)) = periodic_sync(home, state_dir, (roster_path, now), fx)
+        && let Some((synced, news)) = periodic_sync(home, state_dir, (roster_path, now), fx)
     {
-        (fx.log)(&format!("accounts sync: {why}"));
+        scheduling.outcome(&synced);
+        if news && let Err(why) = synced {
+            (fx.log)(&format!("accounts sync: {why}"));
+        }
     }
     if fx
         .scope
@@ -9108,7 +9242,7 @@ fn sync_called_for_recording(
 /// waits [`REDISCOVER_EVERY`] from that attempt, so a sheet that names no account of this
 /// machine is not read again at every upkeep, while changed inputs (an edited sheet, a roster or
 /// fleet file written since, another default login or `[fleet] machine`) are read at once. A
-/// failure because another process held the accounts lock holds nothing back, and the recovery
+/// retryable source or custody failure holds nothing back, and the recovery
 /// of a pending local commit is never held. Returns what the sync did and whether its failure is
 /// news ([`note_sync_result`]), which a caller logs; none while it waits.
 fn periodic_sync(
@@ -9116,7 +9250,7 @@ fn periodic_sync(
     state_dir: &Path,
     (roster_path, now): (&Path, i64),
     fx: &UpkeepEffects<'_>,
-) -> Option<(Result<InitSynced, String>, bool)> {
+) -> Option<(Result<InitSynced, SyncError>, bool)> {
     if fx
         .scope
         .as_ref()
@@ -9152,7 +9286,7 @@ fn periodic_sync(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .failed,
         inputs,
-        synced.as_ref().map(|_| ()).map_err(String::as_str),
+        synced.as_ref().map(|_| ()),
     );
     Some((synced, news))
 }
@@ -9374,6 +9508,21 @@ fn schedule_local_source(
 #[doc(hidden)]
 pub fn account_source_refresh_environment() {}
 
+/// The source outcome and concurrent scheduler activity are environment inputs.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSyncRetry",
+    action = "Scenario",
+    reason = "The source supplies a successful, rejected or retryable result."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSyncRetry",
+    action = "Supersede",
+    reason = "Another operation can install newer scheduling claims before completion."
+)]
+pub fn account_sync_retry_environment() {}
+
 fn config_beside(roster: &Path) -> PathBuf {
     roster
         .parent()
@@ -9396,33 +9545,27 @@ fn sync_if_missing(
     {
         return false;
     }
+    let store = accounts::Store::at(state_dir);
+    if store.sync_needs_recovery()
+        && store
+            .recover_sync_within(&sync_lock_ladder(), roster_path)
+            .is_err()
+    {
+        return false;
+    }
     if roster_path.exists() {
         return true;
     }
     if AutomaticSource::capture(config).is_err() {
         return false;
     }
-    let _cooldown = {
-        let mut guard = fx
-            .sync_cooldown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_some_and(|last| last.elapsed() < Duration::from_secs(600)) {
-            return false;
-        }
-        let before = *guard;
-        let own = Instant::now();
-        *guard = Some(own);
-        SyncCooldownClaim {
-            held: fx.sync_cooldown,
-            scope: fx.scope.as_ref(),
-            before,
-            own,
-        }
+    let Some(mut cooldown) = SyncCooldownClaim::take(fx.sync_cooldown, fx.scope.as_ref()) else {
+        return false;
     };
     // Missing-roster upkeep uses the same automatic capture and source selection as init.
     // A source-less manual request deliberately has a narrower set of inputs.
-    let _ = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
+    let synced = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
+    cooldown.outcome(&synced);
     roster_path.exists()
 }
 
@@ -9822,6 +9965,7 @@ pub fn sync_accounts_for_init(
 ) -> Result<(String, usize, usize, usize), String> {
     sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, &fetch_source_text)
         .map(|synced| (synced.machine, synced.rows, synced.enrolled, synced.fleet))
+        .map_err(SyncError::into_message)
 }
 
 /// What a sync from init made of this machine's roster ([`sync_accounts_for_init_with`]).
@@ -9849,11 +9993,14 @@ fn sync_accounts_for_init_with(
     now: i64,
     before_sync: impl FnOnce(),
     fetch_uncaptured: &Fetch<'_>,
-) -> Result<InitSynced, String> {
+) -> Result<InitSynced, SyncError> {
     let config_path = config_beside(roster_path);
-    let automatic = AutomaticSource::capture(&config_path)?;
+    if accounts_sync_off(Some(&config_path)) {
+        return Err(ACCOUNTS_SYNC_OFF.into());
+    }
     let recovered_commit =
         accounts::Store::at(state_dir).recover_sync_within(&sync_lock_ladder(), roster_path)?;
+    let automatic = AutomaticSource::capture(&config_path)?;
     let env = Env {
         state: state_dir.to_path_buf(),
         aterm_state: state_dir
@@ -9915,7 +10062,7 @@ fn sync_accounts_for_init_with(
         let held = store
             .acquire_within(&sync_lock_ladder())
             .map_err(|why| why.to_string())?
-            .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+            .ok_or_else(|| SyncError::retry(Retry::Busy, accounts::LOCK_HELD))?;
         let recovered = store.recover_sync_held(&held, roster_path)?;
         automatic.validate()?;
         if init_accounts_assignment_from(&env, &selected.origin())?
@@ -9924,10 +10071,18 @@ fn sync_accounts_for_init_with(
                 fleet_accounts,
             })
         {
-            return Err("account assignment changed after capture; sync again".into());
+            return Err(SyncError::retry(
+                Retry::Changed,
+                "account assignment changed after capture; sync again",
+            ));
         }
         let retired = if automatic.retires_legacy() {
-            store.retire_source_held(&held, now)?
+            let source = if native.is_some() {
+                Some(automatic.native_guard()?)
+            } else {
+                None
+            };
+            store.retire_source_admitted_held(&held, now, source)?
         } else {
             false
         };
@@ -10182,28 +10337,34 @@ fn resync_with(
     if accounts_sync_off(Some(&config)) {
         return Resync::default();
     }
-    let missing = claude_roster_missing(home, state_dir, roster_path, now) && {
-        let mut last = fx
-            .sync_cooldown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
-        if due {
-            *last = Some(Instant::now());
-        }
-        due
-    };
+    let mut cooldown = claude_roster_missing(home, state_dir, roster_path, now)
+        .then(|| SyncCooldownClaim::take(fx.sync_cooldown, fx.scope.as_ref()))
+        .flatten();
+    let missing = cooldown.is_some();
+    let mut scheduling = SyncScheduleClaim::new(fx.rediscovery, fx.scope.as_ref());
     let mut done = Resync::default();
-    if (missing || sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery))
+    if (missing
+        || sync_called_for_recording(
+            home,
+            state_dir,
+            (roster_path, &config),
+            now,
+            fx.rediscovery,
+            &mut scheduling,
+        ))
         && let Some((synced, _)) = periodic_sync(home, state_dir, (roster_path, now), fx)
     {
+        scheduling.outcome(&synced);
+        if let Some(cooldown) = &mut cooldown {
+            cooldown.outcome(&synced);
+        }
         done.synced = true;
         match synced {
             Ok(synced) => {
                 done.changed = synced.changed;
                 done.to_sign_in = synced.to_sign_in;
             }
-            Err(why) => done.failed = Some(why),
+            Err(why) => done.failed = Some(why.into_message()),
         }
     }
     for (cli, synced) in sync_cli_accounts_with(home, state_dir, roster_path, now, fx.fetch) {
@@ -10921,11 +11082,12 @@ fn load_cli_fleet_source(
 
 /// A local source snapshot for missing default-login metadata. Keep complete pool bytes:
 /// projecting only warm rows would lose cold-account holds and policy-only changes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(super) struct CodexCompletionSource {
     pub fleet: Option<CliFleet>,
     pub held_by: Option<String>,
     pool_text: Option<String>,
+    pub(super) guard: Option<super::alab_roster::ReceiptGuard>,
 }
 
 /// Read only native local source files; no network or source publication is permitted.
@@ -10952,8 +11114,11 @@ pub(super) fn codex_completion_source(
         (None, None),
         false,
         &no_network,
-    )?;
-    let loaded = captured.load(Cli::Codex, &roster)?;
+    )
+    .map_err(SyncError::into_message)?;
+    let loaded = captured
+        .load(Cli::Codex, &roster)
+        .map_err(SyncError::into_message)?;
     let pool_text = loaded.as_ref().and_then(|_| captured.pool_text());
     let mut held_by = None;
     if let Some(raw) = pool_text {
@@ -10976,11 +11141,17 @@ pub(super) fn codex_completion_source(
             }
         });
     }
-    captured.validate(Cli::Codex, &source_env)?;
+    captured
+        .validate(Cli::Codex, &source_env)
+        .map_err(SyncError::into_message)?;
     Ok(CodexCompletionSource {
         fleet: loaded.map(|(fleet, _, _)| fleet),
         held_by,
         pool_text: pool_text.map(str::to_owned),
+        guard: captured
+            .receipt_guard()
+            .map_err(SyncError::into_message)?
+            .cloned(),
     })
 }
 
@@ -11012,6 +11183,7 @@ fn sync_cli_with(
     reads: (&Fetch<'_>, &[Duration]),
 ) -> Result<CliSync, String> {
     sync_cli_with_replan(cli, paths, source, false, now, reads, || {})
+        .map_err(SyncError::into_message)
 }
 
 fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
@@ -11079,7 +11251,7 @@ fn sync_cli_with_replan(
     now: i64,
     (fetch, ladder): (&Fetch<'_>, &[Duration]),
     after_unlock: impl FnOnce(),
-) -> Result<CliSync, String> {
+) -> Result<CliSync, SyncError> {
     let env = quiet_env(home, state_dir, config, now);
     sync_cli_in_env(
         cli,
@@ -11100,8 +11272,11 @@ fn sync_cli_in_env(
     now: i64,
     (env, fetch, ladder): (&Env, &Fetch<'_>, &[Duration]),
     after_unlock: impl FnOnce(),
-) -> Result<CliSync, String> {
+) -> Result<CliSync, SyncError> {
     let product = cli.connector().product;
+    if automatic && accounts_sync_off(env.config.as_deref()) {
+        return Err(ACCOUNTS_SYNC_OFF.into());
+    }
     let roster_path = accounts::roster_beside_for(config, cli)
         .ok_or_else(|| format!("{} has no directory", config.display()))?;
     let named = source.is_some_and(|s| !s.trim().is_empty());
@@ -11125,7 +11300,8 @@ fn sync_cli_in_env(
     // Read-only absence and non-membership need no writer or new store directory.
     // Replacement retirement is a write, including an empty native/pool assignment.
     let Some((observed, _, observed_machine)) = captured.load(cli, &roster_path)? else {
-        return sync_without_source(cli, (env, &store), &roster_path, ladder, now);
+        return sync_without_source(cli, (env, &store), &roster_path, ladder, now)
+            .map_err(Into::into);
     };
     if by_default
         && let Err(instead) = by_default_admits(&store, &observed, observed_machine, now)?
@@ -11138,12 +11314,12 @@ fn sync_cli_in_env(
             .acquire_within(ladder)
             .map_err(|why| format!("{}: {why}", store.dir.display()))?
             .ok_or_else(|| {
-                format!(
+                SyncError::retry(Retry::Busy, format!(
                     "{} at {}: another `aterm harness accounts` or a window holds it; nothing was \
                  synced, so run the sync again",
                     accounts::LOCK_HELD,
                     store.dir.display()
-                )
+                ))
             })
     };
     let mut lock = take_writer()?;
@@ -11173,16 +11349,17 @@ fn sync_cli_in_env(
         recovered_commit |= captured.migrate(cli, env, &store, &lock, &roster_path)?;
         let Some((fleet, pool_ctx, machine)) = captured.load(cli, &roster_path)? else {
             drop(lock);
-            return sync_without_source(cli, (env, &store), &roster_path, ladder, now);
+            return sync_without_source(cli, (env, &store), &roster_path, ladder, now)
+                .map_err(Into::into);
         };
-        let retire = captured.retires();
+        let retire = captured.needs_retirement();
         let machine = if !named && !roster_path.is_file() {
             match by_default_admits(&store, &fleet, machine, now)? {
                 Ok(machine) => machine,
                 Err(instead) => {
                     captured.validate(cli, env)?;
                     if retire && !matches!(instead, CliSync::Left { .. }) {
-                        store.retire_source_held(&lock, now)?;
+                        store.retire_source_admitted_held(&lock, now, captured.receipt_guard()?)?;
                     }
                     return Ok(instead);
                 }
@@ -11207,7 +11384,8 @@ fn sync_cli_in_env(
                     fleet.roster.source
                 ),
                 &fleet.roster.conflicts_for(Some(&machine)),
-            ));
+            )
+            .into());
         }
         let held: Vec<String> = fleet
             .held
@@ -11326,19 +11504,19 @@ fn sync_cli_in_env(
                         .signin_now()
                         .map_err(|why| format!("{}: {why}", store.shared_dir().display()))?
                         .ok_or_else(|| {
-                            format!("{}; no new account rows were synced", accounts::SIGNIN_HELD)
+                            SyncError::retry(
+                                Retry::Busy,
+                                format!(
+                                    "{}; no new account rows were synced",
+                                    accounts::SIGNIN_HELD
+                                ),
+                            )
                         })?,
                 );
                 lock = take_writer()?;
                 continue;
             }
             store.check_new_rows(&rows, &existing, now)?;
-            aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
-                .map_err(|why| format!("{}: {why}", store.logins_dir().display()))?;
-            for dir in rows.iter().filter_map(|row| row.dir.as_deref()) {
-                aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
-                    .map_err(|why| format!("could not create {dir}: {why}"))?;
-            }
             next_image = Some(text);
             total = merged_existing.len() + rows.len();
             merged_existing.extend(rows);
@@ -11393,10 +11571,17 @@ fn sync_cli_in_env(
                     Ok(Vec::new())
                 }),
             )?
-        } else if roster_wrote || retire {
-            store.transact_roster_held(&lock, now, &mut None, target, retire)?
         } else {
-            false
+            // The receipt also owns missing login directories. Equal roster
+            // bytes alone do not establish that materialization is complete.
+            store.transact_roster_admitted_held(
+                &lock,
+                now,
+                &mut None,
+                target,
+                retire,
+                captured.receipt_guard()?,
+            )?
         };
         let rows_changed = RowChanges::between(&existing.rows, &merged_existing);
         let prefers_none = lab_fleet && mine.is_empty();
@@ -11884,6 +12069,9 @@ fn reassign_codex_default(
     lab: Option<(&super::alab_roster::Lab, &super::alab_roster::MachineKey)>,
     before_publish: impl FnOnce(),
 ) -> Result<Option<(Roster, String)>, String> {
+    store
+        .recover_sync_within(ladder, configured)
+        .map_err(SyncError::into_message)?;
     let (target, mode) = super::cli::roster_target(configured)?;
     if target != path {
         return Err("the configured roster target changed before Codex reassignment".into());
@@ -11908,6 +12096,7 @@ fn reassign_codex_default(
         .acquire_within(ladder)
         .map_err(|e| e.to_string())?
         .ok_or(accounts::LOCK_HELD)?;
+    store.recover_sync_held(&held, configured)?;
     let _auth = super::codex_app_login::AuthLock::try_take(&asked.home.join("auth.json"))
         .map_err(|e| e.to_string())?
         .ok_or("the default Codex login is being changed")?;
@@ -11973,64 +12162,69 @@ fn reassign_codex_default(
         super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())
     };
     recheck()?;
-    store.transact_sync_held(
-        &held,
-        env.now,
-        &mut None,
-        accounts::SyncTarget {
-            fleet: None,
-            path,
-            before: Some(&text),
-            after: Some(&next_text),
-            mode,
-        },
-        |current, bindings| {
-            if *current != state || *bindings != logins {
-                return Err("account custody changed before Codex reassignment".into());
-            }
-            recheck()?;
-            for label in [&from.label, &to.label] {
-                bindings.pending_sign_in_invalidations.insert(label.clone());
-            }
-            if independent.is_none() {
-                let mut was = bindings
-                    .get(&from.label)
-                    .map(|binding| binding.was.clone())
-                    .unwrap_or_default();
-                was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
-                was.truncate(accounts::MAX_LEFT - 1);
-                was.push(None);
+    store
+        .transact_sync_source_held(
+            &held,
+            env.now,
+            &mut None,
+            (
+                accounts::SyncTarget {
+                    fleet: None,
+                    path,
+                    before: Some(&text),
+                    after: Some(&next_text),
+                    mode,
+                },
+                policy.guard.as_ref(),
+            ),
+            (false, |current, bindings| {
+                if *current != state || *bindings != logins {
+                    return Err("account custody changed before Codex reassignment".into());
+                }
+                recheck()?;
+                for label in [&from.label, &to.label] {
+                    bindings.pending_sign_in_invalidations.insert(label.clone());
+                }
+                if independent.is_none() {
+                    let mut was = bindings
+                        .get(&from.label)
+                        .map(|binding| binding.was.clone())
+                        .unwrap_or_default();
+                    was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
+                    was.truncate(accounts::MAX_LEFT - 1);
+                    was.push(None);
+                    bindings.labels.insert(
+                        from.label.clone(),
+                        accounts::Binding {
+                            dir: Some(directory.clone()),
+                            was,
+                            ..accounts::Binding::default()
+                        },
+                    );
+                } else if let Some(binding) = bindings.labels.get_mut(&from.label) {
+                    binding.was.retain(Option::is_some);
+                    binding.was.truncate(accounts::MAX_LEFT - 1);
+                    binding.was.push(None);
+                }
+                let previous = bindings.get(&to.label).cloned().unwrap_or_default();
+                let mut was = previous.was;
+                if let Some(directory) = previous.dir.or_else(|| to.dir.clone()) {
+                    was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
+                    was.truncate(accounts::MAX_LEFT - 1);
+                    was.push(Some(directory));
+                }
                 bindings.labels.insert(
-                    from.label.clone(),
+                    to.label.clone(),
                     accounts::Binding {
-                        dir: Some(directory.clone()),
                         was,
                         ..accounts::Binding::default()
                     },
                 );
-            } else if let Some(binding) = bindings.labels.get_mut(&from.label) {
-                binding.was.retain(Option::is_some);
-                binding.was.truncate(accounts::MAX_LEFT - 1);
-                binding.was.push(None);
-            }
-            let previous = bindings.get(&to.label).cloned().unwrap_or_default();
-            let mut was = previous.was;
-            if let Some(directory) = previous.dir.or_else(|| to.dir.clone()) {
-                was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
-                was.truncate(accounts::MAX_LEFT - 1);
-                was.push(Some(directory));
-            }
-            bindings.labels.insert(
-                to.label.clone(),
-                accounts::Binding {
-                    was,
-                    ..accounts::Binding::default()
-                },
-            );
-            Ok(Vec::new())
-        },
-        || Ok(()),
-    )?;
+                Ok(Vec::new())
+            }),
+            || Ok(()),
+        )
+        .map_err(SyncError::into_message)?;
     Ok(Some((updated, to.label.clone())))
 }
 
@@ -12674,7 +12868,7 @@ fn sync_cli_accounts_with(
                 (fetch, &ladder),
                 || {},
             )
-            .and_then(default_refusal_fails);
+            .and_then(|synced| default_refusal_fails(synced).map_err(SyncError::from));
             let synced = if cli == Cli::Codex && synced.is_ok() {
                 let env = quiet_env(home, state_dir, &config, now);
                 super::cli::default_completion::complete(
@@ -12682,11 +12876,12 @@ fn sync_cli_accounts_with(
                     None,
                     super::codex_app_login::read_account_email,
                 )
+                .map_err(SyncError::from)
                 .and(synced)
             } else {
                 synced
             };
-            (cli, synced)
+            (cli, synced.map_err(SyncError::into_message))
         })
         .collect()
 }
@@ -12806,7 +13001,11 @@ fn upkeep_pools(
         let mut has_roster = path.is_file();
         if syncs && (syncs_by_default(cli) || has_roster) {
             let by_default = (!has_roster).then(|| cli_sync_inputs(cli, home, state_dir, &config));
-            if !by_default.is_some_and(|inputs| default_sync_holds(fx.rediscovery, cli, &inputs)) {
+            let recovering = accounts::Store::at_for(state_dir, cli, home).sync_needs_recovery();
+            if recovering
+                || !by_default
+                    .is_some_and(|inputs| default_sync_holds(fx.rediscovery, cli, &inputs))
+            {
                 let synced = sync_cli_with_replan(
                     cli,
                     (home, state_dir, &config),
@@ -12964,15 +13163,15 @@ fn default_sync_holds(
 }
 
 /// Whether a default sync's outcome stands for what it read ([`default_sync_holds`]): it took
-/// no rows, or failed, but not because another process held the pool's or the sign-in lock,
-/// which says nothing of what it read.
-fn default_sync_settled(synced: &Result<CliSync, String>) -> bool {
+/// no rows, or rejected its input. A retryable source or custody failure says nothing about
+/// the usability of the input and does not settle it.
+fn default_sync_settled(synced: &Result<CliSync, SyncError>) -> bool {
     match synced {
         Ok(CliSync::Synced(_) | CliSync::NoSourceDefaultLogin(_)) => false,
         Ok(CliSync::Off | CliSync::Left { .. } | CliSync::NoSource | CliSync::Unlisted { .. }) => {
             true
         }
-        Err(why) => !why.contains(accounts::LOCK_HELD) && !why.contains(accounts::SIGNIN_HELD),
+        Err(why) => why.retry_reason().is_none(),
     }
 }
 
@@ -17350,7 +17549,7 @@ fn resume_pending_pin_for(
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
     if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
-        return Some(RenewalDispatch::store_refusal(&why));
+        return Some(RenewalDispatch::store_refusal(&why.to_string()));
     }
     let request = match store.load(now) {
         Ok((state, _)) => state.pending_pin?,
@@ -17887,7 +18086,7 @@ fn renew_requested_pin_for(
         return RenewalDispatch::Fenced;
     }
     if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
-        return RenewalDispatch::store_refusal(&why);
+        return RenewalDispatch::store_refusal(&why.to_string());
     }
     match store.load(now) {
         Ok((state, _))
@@ -23712,7 +23911,12 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 },
                 &fetch_source_text,
             );
-            assert!(result.unwrap_err().contains("changed after init discovery"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed after init discovery")
+            );
             assert_eq!(snapshot(), newer.unwrap());
         }
     }
@@ -27928,6 +28132,10 @@ mod resync_tests;
 #[cfg(test)]
 #[path = "accounts_source_refresh_tests.rs"]
 mod source_refresh_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 #[path = "accounts_source_path_tests.rs"]

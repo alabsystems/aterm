@@ -45,7 +45,7 @@ impl Bed {
             }),
         );
         CUT.with(|held| held.set(None));
-        result
+        result.map_err(SyncError::into_message)
     }
 
     fn publish_full(&self, cut: Option<usize>) -> Result<(), String> {

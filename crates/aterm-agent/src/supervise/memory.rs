@@ -81,7 +81,14 @@ impl MemoryCeiling {
         }
     }
 
-    /// The ceiling in MiB on a machine with `physical_mib` of memory and `available_mib` of it.
+    /// The ceiling in MiB on a machine with `physical_mib` of memory and `available_mib` of it,
+    /// the memory `sys mem` calls available ([`AgentMemory::available_mib`]). That figure counts an idle
+    /// anonymous page only by what compressing it frees; until 2026-11-06 the ceiling read free
+    /// plus every inactive page plus purgeable, which counts anonymous pages the kernel gives back
+    /// only by compressing or swapping them, so `Auto` is lower now by half the difference. The
+    /// shares were left as they were: on a 24 GiB Mac at one look the old figure read 10.0 GiB and
+    /// a ceiling of 8.0 GiB, the honest one 6.9 GiB and 6.4 GiB, and a ceiling that moves with
+    /// what the machine can hand out without paging is the one the warning means.
     #[must_use]
     pub fn ceiling_mib(self, physical_mib: Option<u64>, available_mib: Option<u64>) -> Option<u64> {
         match self {
@@ -133,9 +140,12 @@ pub struct AgentMemory {
     pub footprint_mib: u64,
     /// The machine's physical memory, MiB; `None`: unknown.
     pub physical_mib: Option<u64>,
-    /// The machine's memory available now — free, inactive and purgeable pages — MiB; `None`.
+    /// The machine's memory available now, what the kernel can hand out without paging
+    /// (`aterm_sysprobe::MemoryDetail::available`, the figure `sys mem` prints), MiB; `None`:
+    /// unknown.
     pub available_mib: Option<u64>,
-    /// The machine's memory in use (Activity Monitor's `Memory Used`), MiB; `None`: unknown.
+    /// The machine's memory in use (`aterm_sysprobe::MemoryDetail::used`, Activity Monitor's
+    /// `Memory Used`), MiB; `None`: unknown.
     pub used_mib: Option<u64>,
     /// The kernel's memory pressure; `None`: unknown.
     pub pressure: Option<Pressure>,
@@ -393,6 +403,45 @@ mod tests {
             MemoryCeiling::Off.ceiling_mib(Some(128 * GIB), Some(0)),
             None
         );
+    }
+
+    /// THE AUTOMATIC CEILING READS THE MEMORY `sys mem` CALLS AVAILABLE
+    /// (`aterm_sysprobe::MemoryDetail::available`, as the host's `Acts::memory` hands it on): at
+    /// the look on a 24 GiB Mac of 2026-10-29 (0.09 GiB free, 9.92 GiB inactive of which 2.62
+    /// file-backed, nothing purgeable; 6.9 GiB available by the reader's rule) the ceiling is an
+    /// eighth of the Mac, 3 GiB, and half of 6.9 GiB. NEGATIVE CONTROL: free plus every inactive
+    /// page plus purgeable, what the ceiling read until 2026-11-06, reads 10.0 GiB and a ceiling
+    /// of 8.0 GiB.
+    #[test]
+    fn the_automatic_ceiling_reads_the_machines_available_memory() {
+        const MIB: u64 = 1 << 20;
+        let hundredths = |h: u64| h * GIB * MIB / 100;
+        let d = aterm_sysprobe::MemoryDetail {
+            total: 24 * GIB * MIB,
+            available: hundredths(690),
+            free: hundredths(9),
+            inactive: Some(hundredths(992)),
+            file_backed: hundredths(262),
+            purgeable: Some(0),
+            ..aterm_sysprobe::MemoryDetail::default()
+        };
+        let available = d.available / MIB;
+        let physical = Some(d.total / MIB);
+        let ceiling = MemoryCeiling::Auto.ceiling_mib(physical, Some(available));
+        assert_eq!(ceiling, Some(3 * GIB + available / 2));
+        assert_eq!(
+            ceiling.map(|c| c * 10 / GIB),
+            Some(64),
+            "6.4 GiB: {ceiling:?}"
+        );
+        let every_inactive = (d.free + d.inactive.unwrap_or(0) + d.purgeable.unwrap_or(0)) / MIB;
+        let before = MemoryCeiling::Auto.ceiling_mib(physical, Some(every_inactive));
+        assert_eq!(
+            before.map(|c| c * 10 / GIB),
+            Some(80),
+            "8.0 GiB: {before:?}"
+        );
+        assert_ne!(ceiling, before);
     }
 
     /// A reading of `gib_x10` tenths of a GiB on a `phys` GiB Mac with

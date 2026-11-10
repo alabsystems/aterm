@@ -421,6 +421,7 @@ fn a_pathless_writer_does_not_recover_roster_bound_authority() {
             schema: 1,
             id: "a".repeat(32),
             plan: Some(Plan {
+                login_dirs: Vec::new(),
                 source_policy: None,
                 outbox: None,
                 fleet: None,
@@ -604,6 +605,7 @@ fn recovery_chooses_the_scope_current_after_acquiring_the_lock() {
                 let path = root.path().join("roster.toml");
                 std::fs::write(&path, "").unwrap();
                 let make_plan = |bound: bool| Plan {
+                    login_dirs: Vec::new(),
                     source_policy: None,
                     outbox: None,
                     fleet: None,
@@ -657,7 +659,7 @@ fn recovery_chooses_the_scope_current_after_acquiring_the_lock() {
                     });
                 assert!(interleaved);
                 if final_scope == 2 && !caller_path {
-                    assert!(result.unwrap_err().contains("roster path"));
+                    assert!(result.unwrap_err().to_string().contains("roster path"));
                 } else {
                     assert_eq!(result.unwrap(), final_scope > 0);
                     assert!(!store.sync_needs_recovery());

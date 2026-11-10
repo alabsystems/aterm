@@ -411,18 +411,21 @@ impl Owner {
         let wait = match pending.waiter.take() {
             Some(wait) => wait,
             None => {
+                // The margin is an eighth of the machine's available memory, the one
+                // figure admission itself reads (`Reading::memory_margin`).
+                let reading = machine.read(None);
                 let need = Need::new(format!(
                     "resource-run: {}",
                     pending.submission.request.label
                 ))
                 .mem(pending.submission.request.memory_bytes)
-                .margin(aterm_capacity::build_cpu::default_memory_reserve());
+                .margin(reading.memory_margin());
                 // Its row is owed from its ask, its refusal as an impossible head included.
                 let owed = Owed::of(&self.ledger, &need);
                 // Low-level Waiter polling deliberately does not apply the
                 // high-level admission wrapper's permanent-impossibility check.
                 // Refuse an impossible head before it can block every later job.
-                let entered = match aterm_capacity::never(&need, &machine.read(None)) {
+                let entered = match aterm_capacity::never(&need, &reading) {
                     Some(reason) => Err(aterm_capacity::Error::Never(reason)),
                     None => Waiter::enter_cohort(&self.ledger, machine, need)
                         .map_err(aterm_capacity::Error::Ledger),

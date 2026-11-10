@@ -250,7 +250,7 @@ pub enum ScopeLine {
     Global {
         /// Home's pool (`container:disk3`).
         pool: Option<String>,
-        /// Total − available.
+        /// The volume's size less its free space (`aterm_sysprobe::VolumeReading::used`).
         used: Option<u64>,
         /// The volume's size.
         total: Option<u64>,

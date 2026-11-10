@@ -37,7 +37,7 @@ pub fn account_sync_new_labels_model() -> Model {
                     else if case == 20 {if Buggy == 20 {0} else {1}}
                     else if case == 21 {if Buggy == 21 {0} else {1}}
                     else if case == 22 {if Buggy == 22 {0} else {1}}
-                    else if case == 23 {if Buggy == 23 {0} else {1}}
+                    else if case == 23 {if Buggy == 23 {1} else {0}}
                     else if case == 24 {if Buggy == 24 {0} else {1}}
                     else if case == 25 {if Buggy == 25 {0} else {1}}
                     else if case == 26 {if Buggy == 26 {1} else {0}}
@@ -53,9 +53,10 @@ pub fn account_sync_new_labels_model() -> Model {
                     else if Buggy == 34 {1} else {0};
             }
             invariant NoUnexpectedAdmission: accepted == 0 || case == 1
-                || (case > 18 && 26 > case) || (case > 26 && 30 > case) || case == 32;
+                || (case > 18 && 26 > case && (23 > case || case > 23))
+                || (case > 26 && 30 > case) || case == 32;
             invariant NewRowsAdmitted: phase == 0 || accepted == 1 || (case > 1 && 19 > case)
-                || case == 26 || case == 30 || case == 31;
+                || case == 23 || case == 26 || case == 30 || case == 31;
             invariant RefusalPreservesRoster: accepted == 1 || published == 0;
             invariant NoopPreserved: case == 1 || case == 20 || case == 21 || case == 24
                 || case == 28 || case == 32 || published == 0;

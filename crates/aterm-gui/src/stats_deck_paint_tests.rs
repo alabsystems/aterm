@@ -448,7 +448,7 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     s.volume = Some(VolumeSample {
         total,
         free: avail,
-        available: avail,
+        reserved: 0,
         mount: "/".into(),
     });
     let watch = DiskFacts {

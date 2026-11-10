@@ -75,16 +75,33 @@ impl View {
         binding: &Binding,
         held: &reservation::HeldReservation,
     ) -> io::Result<()> {
-        let expected = receipt(key, prepare, binding)?;
-        let old = self.entries.get(&expected.operation).ok_or_else(invalid)?;
-        if old.receipt != expected
-            || old.legacy_custody != key.digest(b"legacy-custody\0", held.custody.as_bytes())
-            || old.legacy_sequence != held.acknowledgement.sequence()
-            || old.legacy_time != held.acknowledgement.recorded_ms()
+        let observed = self.legacy_origin(key, prepare, binding, &held.custody)?;
+        if observed.sequence != held.acknowledgement.sequence()
+            || observed.recorded_ms != held.acknowledgement.recorded_ms()
         {
             return Err(invalid());
         }
         Ok(())
+    }
+
+    pub(super) fn legacy_origin(
+        &self,
+        key: &Key,
+        prepare: &Prepare,
+        binding: &Binding,
+        custody: &str,
+    ) -> io::Result<Observed> {
+        let expected = receipt(key, prepare, binding)?;
+        let old = self.entries.get(&expected.operation).ok_or_else(invalid)?;
+        if old.receipt != expected
+            || old.legacy_custody != key.digest(b"legacy-custody\0", custody.as_bytes())
+        {
+            return Err(invalid());
+        }
+        Ok(Observed {
+            sequence: old.legacy_sequence,
+            recorded_ms: old.legacy_time,
+        })
     }
 
     pub(super) fn ingest_record(

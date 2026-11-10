@@ -155,8 +155,7 @@ fn sample(
             .as_ref()
             .and_then(|(_, before)| ticks.as_ref().and_then(|after| busy(before, after)))
     };
-    let available_memory_bytes = aterm_sysprobe::machine_memory()
-        .and_then(|memory| memory.available_mib.checked_mul(1 << 20));
+    let available_memory_bytes = aterm_sysprobe::memory_detail().map(|memory| memory.available);
     let pressure = pressure(aterm_sysprobe::memory_pressure());
     let thermal = aterm_sysprobe::process_thermal()
         .map(|reading| match reading.state {

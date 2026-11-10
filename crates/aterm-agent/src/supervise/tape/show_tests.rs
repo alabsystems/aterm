@@ -439,7 +439,7 @@ fn a_write_is_timed_from_its_decision_apart_from_the_programs_draw() {
         ),
         read_at(
             &["@s-1", "status"],
-            "OK sid=4 input=pending input_bytes=565 input_wait_ms=10004 fg_rss_mb=-\n",
+            "OK sid=4 input=pending input_bytes=565 input_wait_ms=10004 fg_footprint_mb=-\n",
             P + 10_080,
         ),
         read_at(
@@ -461,7 +461,7 @@ fn a_write_is_timed_from_its_decision_apart_from_the_programs_draw() {
         screen_at(LAND_WORDS, 1096, P + 25_410),
         read_at(
             &["@s-1", "status"],
-            "OK sid=4 input=pending input_bytes=1 input_wait_ms=30500 fg_rss_mb=-\n",
+            "OK sid=4 input=pending input_bytes=1 input_wait_ms=30500 fg_footprint_mb=-\n",
             P + 25_420,
         ),
         duty_act(&enter, "OK skipped changed\n", P + 25_430),
@@ -477,7 +477,7 @@ fn a_write_is_timed_from_its_decision_apart_from_the_programs_draw() {
         decided(None, 1301, "WaitUntil"),
         read_at(
             &["@s-1", "status"],
-            "OK sid=4 input=pending input_bytes=3 input_wait_ms=900 fg_rss_mb=-\n",
+            "OK sid=4 input=pending input_bytes=3 input_wait_ms=900 fg_footprint_mb=-\n",
             P + 41_000,
         ),
         screen_at("", 1301, P + 41_500),
@@ -559,7 +559,7 @@ fn a_line_drawn_late_is_the_programs_only_while_aterm_watched_for_it() {
             ),
             read_at(
                 &["@s-1", "status"],
-                "OK sid=4 input=pending input_bytes=565 input_wait_ms=10001 fg_rss_mb=-\n",
+                "OK sid=4 input=pending input_bytes=565 input_wait_ms=10001 fg_footprint_mb=-\n",
                 P + 10_010,
             ),
             screen_at("", 891, P + 60_010),

@@ -33,7 +33,7 @@ pub(super) const KILL_ROUNDS: Duration = Duration::from_secs(5);
 const PAUSE: Duration = Duration::from_millis(20);
 
 /// How long [`linger`] waits before it reads the group again when no exit can wake it: the
-/// listing did not read, or a member's exit could not be watched.
+/// listing or a member did not read, or a member's exit could not be watched.
 pub(super) const UNWATCHED_RECHECK: Duration = Duration::from_secs(1);
 
 /// What woke [`GroupControl::wait`].
@@ -45,11 +45,21 @@ pub(super) enum Woke {
     Other,
 }
 
+/// One listed process's state, keeping an unavailable read distinct from an ended process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Member {
+    /// A live process whose current group was read.
+    Group(i32),
+    /// The process is absent or has exited.
+    Gone,
+    /// Its live group or ended state could not be established.
+    Unread,
+}
+
 /// What [`end_group`] and [`linger`] read and do: the kernel, or a test's script.
 pub(super) trait GroupControl {
-    /// `pid`'s process group as it reads now: `None` when gone, a zombie, another user's, or
-    /// unread.
-    fn group_of(&mut self, pid: i32) -> Option<i32>;
+    /// `pid`'s known live group, proven end, or unavailable reading.
+    fn member(&mut self, pid: i32) -> Member;
     /// The pids of group `pgid`'s members, and whether the listing is whole; `None` when unread.
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)>;
     /// `sig` to every member of group `pgid` (`kill(-pgid, sig)`).
@@ -77,11 +87,11 @@ pub(super) struct GroupEnded {
 /// The live members of a group as one read finds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Live {
-    /// A whole listing found none (the anchor, a zombie, reads as none).
+    /// A whole listing proved no live member (the anchor is known exited).
     Empty,
     /// These read live in the group (a listing that was not whole may hold more).
     Members(Vec<i32>),
-    /// The listing did not read, or was not whole and found none.
+    /// No live member read, but the listing or an individual member remained unknown.
     Unknown,
 }
 
@@ -90,14 +100,21 @@ fn live(control: &mut impl GroupControl, pgid: i32) -> Live {
     let Some((pids, whole)) = control.listing(pgid) else {
         return Live::Unknown;
     };
-    let members: Vec<i32> = pids
-        .into_iter()
-        .filter(|&pid| control.group_of(pid) == Some(pgid))
-        .collect();
-    match (members.is_empty(), whole) {
-        (true, true) => Live::Empty,
-        (true, false) => Live::Unknown,
-        (false, _) => Live::Members(members),
+    let mut members = Vec::new();
+    let mut unread = !whole;
+    for pid in pids {
+        match control.member(pid) {
+            Member::Group(group) if group == pgid => members.push(pid),
+            Member::Group(_) | Member::Gone => {}
+            Member::Unread => unread = true,
+        }
+    }
+    if !members.is_empty() {
+        Live::Members(members)
+    } else if unread {
+        Live::Unknown
+    } else {
+        Live::Empty
     }
 }
 
@@ -150,8 +167,8 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
 /// there: `false` once a whole listing finds no live member (the group has nothing left to end),
 /// `true` once the parent exits or execs first, when the caller ends the group ([`end_group`]).
 /// Each read follows a wake: a listed member's exit, or [`UNWATCHED_RECHECK`] when the listing
-/// did not read. A member forked after a listing is in the next one, since its parent, a listed
-/// member, has not exited while that one waits, or has and woke it.
+/// or a member did not read. A member forked after a listing is in the next one, since its
+/// parent, a listed member, has not exited while that one waits, or has and woke it.
 pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
     loop {
         let woke = match live(control, pgid) {
@@ -178,8 +195,15 @@ pub(super) struct GroupLive {
 
 #[cfg(target_vendor = "apple")]
 impl GroupControl for GroupLive {
-    fn group_of(&mut self, pid: i32) -> Option<i32> {
-        crate::process::read_lineage(pid).and_then(|lineage| i32::try_from(lineage.pgid).ok())
+    fn member(&mut self, pid: i32) -> Member {
+        use crate::process::{ProcessPresence, process_presence, read_lineage};
+        if let Some(lineage) = read_lineage(pid) {
+            return i32::try_from(lineage.pgid).map_or(Member::Unread, Member::Group);
+        }
+        match process_presence(pid) {
+            ProcessPresence::Absent | ProcessPresence::Exited => Member::Gone,
+            ProcessPresence::Present | ProcessPresence::Unknown => Member::Unread,
+        }
     }
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
         crate::process::group_members(u32::try_from(pgid).ok()?)

@@ -231,7 +231,14 @@ fn group_requests_keep_full_custody_and_require_the_original_unreaped_birth() {
     );
     assert!(!unrelated.child.exited().unwrap());
     unrelated.end();
-    claim.finish_cohort().unwrap();
+    let group = u32::try_from(leader.launched.cohort.group()).unwrap();
+    if let Err(error) = claim.finish_cohort() {
+        panic!(
+            "{error} (group {group}: {:?}, members: {:?})",
+            aterm_uds::process::group_presence(group),
+            aterm_uds::process::group_members(group),
+        );
+    }
     drop(claim);
     assert!(fixture.ledger.list().unwrap().is_empty());
 }

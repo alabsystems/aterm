@@ -428,6 +428,13 @@ impl Commit {
 pub struct MemoryDetail {
     /// Total physical memory in bytes.
     pub total: u64,
+    /// AVAILABLE MEMORY, bytes: what the kernel can hand out now without paging anything out,
+    /// never more than [`Self::total`]. The one figure every caller calls available (`sys mem`,
+    /// `await sys avail`, the capacity ledger's admission, the agents' memory ceiling). macOS
+    /// keeps no such figure of its own, so its reader counts it from the page queues (what
+    /// dropping file-backed and purgeable pages and compressing idle anonymous ones frees);
+    /// Linux's is `MemAvailable`, Windows' `ullAvailPhys`.
+    pub available: u64,
     /// Immediately free memory in bytes (`free - speculative` on macOS, `MemFree` on Linux).
     pub free: u64,
     /// Speculative read-ahead pages in bytes (macOS only).
@@ -462,8 +469,24 @@ pub struct MemoryDetail {
     pub exact: bool,
     /// Cumulative VM event counters from the same sample, if available.
     pub counters: Option<VmCounters>,
-    /// Kernel-reported available memory percentage (`kern.memorystatus_level` on macOS).
-    pub kernel_available_pct: Option<u8>,
+    /// macOS's `kern.memorystatus_level`, the percentage `memory_pressure` prints as "free":
+    /// the kernel's own figure, which counts the active queue too, so not [`Self::available`].
+    /// `None` off macOS.
+    pub memorystatus_level_pct: Option<u8>,
+}
+
+impl MemoryDetail {
+    /// MEMORY USED, bytes, as Activity Monitor's `Memory Used` counts it: the processes' anonymous
+    /// memory ([`Self::app`]) and shared memory ([`Self::shared`], Linux), the wired pages and
+    /// what the compressor occupies, never more than [`Self::total`].
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.app
+            .saturating_add(self.shared.unwrap_or(0))
+            .saturating_add(self.wired)
+            .saturating_add(self.compressed.unwrap_or(0))
+            .min(self.total)
+    }
 }
 
 /// Cumulative VM paging and compressor counters since boot.
@@ -503,6 +526,49 @@ pub(crate) struct VmPages {
     pub pageins: u64,
 }
 
+/// THE MEMORY A MAC CAN HAND OUT NOW WITHOUT PAGING, bytes ([`MemoryDetail::available`]), from
+/// one read of its page queues `d`. It counts
+/// - the free pages, the speculative ones included;
+/// - the inactive pages as far as the file-backed pages outside the speculative queue could fill
+///   the inactive queue: the kernel drops a file-backed page and reads it back from its file when
+///   it is touched. The file-backed count (`external_page_count`) holds the speculative pages too,
+///   which the free pages already counted, so they are taken out of it first;
+/// - the purgeable pages, which their owners let the kernel drop;
+/// - of the anonymous inactive pages the rest of that queue holds, what compressing them frees at
+///   the ratio the compressor holds now (`1 - occupied / stored`): the kernel compresses an idle
+///   anonymous page before it swaps anything. With nothing in the compressor no ratio is read,
+///   and they count for nothing;
+///
+/// and never more than physical memory (where `d.total` is read). Not the kernel's
+/// `kern.memorystatus_level` ([`MemoryDetail::memorystatus_level_pct`]), which counts the active
+/// queue too: on a 24 GiB Mac on 2026-10-29 it read 78% while the free, active, inactive and
+/// speculative pages were 77% of memory, and it read 85% beside 12.5 GB of swap the night
+/// before. Not every inactive page either: an anonymous one is given back only by compressing or
+/// swapping it. At one look that night (85% by `memory_pressure`, pressure normal, 0.09 GiB free,
+/// 9.92 GiB inactive, 2.62 GiB file-backed, the compressor holding 1.51 GiB in 0.64), this reads
+/// about 6.9 GiB, every inactive page 10.0, and the file-backed ones alone 2.7.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn mac_available(d: &MemoryDetail) -> u64 {
+    let inactive = d.inactive.unwrap_or(0);
+    let speculative = d.speculative.unwrap_or(0);
+    let free = d.free.saturating_add(speculative);
+    let dropped = inactive.min(d.file_backed.saturating_sub(speculative));
+    let anonymous = inactive - dropped;
+    let compressed = match (d.compressed, d.stored) {
+        (Some(occupied), Some(stored)) if stored > 0 && occupied < stored => {
+            let freed = u128::from(anonymous) * u128::from(stored - occupied) / u128::from(stored);
+            u64::try_from(freed).unwrap_or(anonymous)
+        }
+        _ => 0,
+    };
+    let room = free
+        .saturating_add(dropped)
+        .saturating_add(d.purgeable.unwrap_or(0))
+        .saturating_add(compressed);
+    if d.total > 0 { room.min(d.total) } else { room }
+}
+
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn memory_detail_of(
     p: &VmPages,
@@ -513,8 +579,9 @@ pub(crate) fn memory_detail_of(
 ) -> MemoryDetail {
     let b = |pages: u64| pages.saturating_mul(page_bytes);
     let (swap_used, swap_total) = swap.unwrap_or((0, 0));
-    MemoryDetail {
+    let mut detail = MemoryDetail {
         total,
+        available: 0,
         free: b(p.free.saturating_sub(p.speculative)),
         speculative: Some(b(p.speculative)),
         active: Some(b(p.active)),
@@ -539,8 +606,10 @@ pub(crate) fn memory_detail_of(
             pageins: p.pageins,
             page_bytes,
         }),
-        kernel_available_pct: None,
-    }
+        memorystatus_level_pct: None,
+    };
+    detail.available = mac_available(&detail);
+    detail
 }
 
 /// CPU brand and OS version strings.
@@ -784,14 +853,26 @@ pub fn gpu_clients() -> Option<GpuClients> {
 pub struct VolumeReading {
     /// Its size in bytes.
     pub total: u64,
-    /// Bytes free (`f_bfree`), at most `total`.
+    /// FREE SPACE, bytes: what an unprivileged writer may still write (`f_bavail`; Windows'
+    /// `FreeBytesAvailableToCaller`), never more than the free blocks nor `total`. The one figure
+    /// every caller calls free (`await sys free`, `disk_free_mb`, the disk watch, `sys disk`).
     pub free: u64,
-    /// Bytes available to an unprivileged writer (`f_bavail`), capped at `free`.
-    pub available: u64,
+    /// RESERVED, bytes: free blocks the volume keeps back from unprivileged writers (`f_bfree`
+    /// less `f_bavail`: an ext4 root reserve; 0 on APFS), so never in [`Self::free`].
+    pub reserved: u64,
     /// Where it is mounted.
     pub mount: PathBuf,
     /// Its file system type (`apfs`, `ext4`).
     pub fs: String,
+}
+
+impl VolumeReading {
+    /// USED, bytes: the size less what is free ([`Self::free`]), so the blocks the volume
+    /// reserves ([`Self::reserved`]) count as used.
+    #[must_use]
+    pub const fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
 }
 
 #[cfg(any(
@@ -810,12 +891,12 @@ pub(crate) fn volume_of(
     fs: String,
 ) -> VolumeReading {
     let total = blocks.saturating_mul(block_bytes);
-    let free = bfree.saturating_mul(block_bytes).min(total);
-    let available = bavail.saturating_mul(block_bytes).min(free);
+    let blocks_free = bfree.saturating_mul(block_bytes).min(total);
+    let free = bavail.saturating_mul(block_bytes).min(blocks_free);
     VolumeReading {
         total,
         free,
-        available,
+        reserved: blocks_free - free,
         mount,
         fs,
     }

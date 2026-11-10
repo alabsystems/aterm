@@ -8124,7 +8124,7 @@ mod input_stall_tests {
             since_unix: None,
             bytes: 1,
             stopped,
-            rss_mb: Some(39_731),
+            footprint_mb: Some(39_731),
             restart: crate::input_stall::Restart::default(),
             act: None,
         }

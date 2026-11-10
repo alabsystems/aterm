@@ -315,15 +315,16 @@ pub(crate) fn fg_stopped(master: i32) -> bool {
     }
 }
 
-/// The PTY `master`'s foreground group leader's resident set, in MiB, or `None` when unknown.
-pub(crate) fn fg_rss_mb(master: i32) -> Option<u64> {
+/// The PTY `master`'s foreground group leader's footprint ([`aterm_sysprobe::procs::footprint`]),
+/// in MiB, or `None` when unknown.
+pub(crate) fn fg_footprint_mb(master: i32) -> Option<u64> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let pgrp = crate::quit_safety::foreground_pgrp(master);
-        if pgrp <= 0 {
-            return None;
-        }
-        pid_rss_mb(pgrp)
+        let leader = u32::try_from(pgrp).ok().filter(|p| *p > 0)?;
+        aterm_sysprobe::procs::footprint(leader)
+            .ok()
+            .map(|bytes| bytes >> 20)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -363,12 +364,6 @@ pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {
         return None;
     }
     Some(info.pbi_status == SSTOP)
-}
-
-/// `pid`'s resident set in MiB from `proc_pidinfo(PROC_PIDTASKINFO)`, read only when the kernel wrote exactly one whole record.
-#[cfg(target_os = "macos")]
-pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
-    pid_task_info(pid).map(|info| info.pti_resident_size / (1024 * 1024))
 }
 
 /// `pid`'s total CPU time, user plus system, in nanoseconds.
@@ -432,19 +427,6 @@ pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
-    let tail = linux_proc_stat_after_comm(pid)?;
-    let rss_pages: u64 = tail.split_whitespace().nth(21)?.parse().ok()?;
-    static PAGE_SIZE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let page_size = (*PAGE_SIZE.get_or_init(|| {
-        // SAFETY: `sysconf(_SC_PAGESIZE)` is a thread-safe POSIX query.
-        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        u64::try_from(v).ok().filter(|&b| b > 0)
-    }))?;
-    Some(rss_pages.saturating_mul(page_size) / (1024 * 1024))
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
     static CLK_TCK: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
     let hz = (*CLK_TCK.get_or_init(|| {
@@ -501,31 +483,12 @@ pub(crate) fn held_leader(
             .is_some_and(held)
 }
 
-/// How contended this machine's CPUs are now.
+/// How contended this machine's CPUs are now: the worse of its 1- and 5-minute load averages
+/// ([`aterm_sysprobe::load_average`]) over its logical cores ([`aterm_sysprobe::cpu_layout`]).
 pub(crate) fn machine_contention() -> Contention {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
-        }
-        let mut load = [0f64; 2];
-        // SAFETY: `load` is a writable 2-element `f64` array passed to `getloadavg`.
-        let n = unsafe { getloadavg(load.as_mut_ptr(), 2) };
-        if n < 1 {
-            return Contention::default();
-        }
-        let worst = if n >= 2 {
-            load[0].max(load[1])
-        } else {
-            load[0]
-        };
-        let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
-        Contention::of_load(worst, cpus)
-    }
-    #[cfg(not(unix))]
-    {
-        Contention::default()
-    }
+    aterm_sysprobe::load_average().map_or_else(Contention::default, |[one, five, _]| {
+        Contention::of_load(one.max(five), aterm_sysprobe::cpu_layout().logical_cores())
+    })
 }
 
 /// Grace period after sending a restart signal before reporting a stall.
@@ -610,7 +573,7 @@ pub(crate) struct InputStallFact {
     pub(crate) since_unix: Option<i64>,
     pub(crate) bytes: usize,
     pub(crate) stopped: bool,
-    pub(crate) rss_mb: Option<u64>,
+    pub(crate) footprint_mb: Option<u64>,
     pub(crate) restart: Restart,
     pub(crate) act: Option<StallAct>,
 }
@@ -656,7 +619,7 @@ impl InputWatches {
         backlog: Option<&InputBacklog>,
         stopped: bool,
         activity: Activity,
-        rss: impl FnOnce() -> Option<u64>,
+        footprint: impl FnOnce() -> Option<u64>,
         now: Instant,
     ) -> (Transition, Option<Instant>) {
         let prior = self.watches.remove(&id);
@@ -752,7 +715,7 @@ impl InputWatches {
                     since_unix: None,
                     bytes: backlog.map_or(0, InputBacklog::unread),
                     stopped: word == InputWord::Stopped,
-                    rss_mb: rss(),
+                    footprint_mb: footprint(),
                     restart: Restart {
                         leader,
                         discards: activity.discards,
@@ -926,15 +889,15 @@ pub(crate) fn watch_input(sink: &SinkWriter, wake: impl Fn() + Send + Sync + 'st
 pub(crate) fn status_fields(
     backlog: Option<&InputBacklog>,
     word: InputWord,
-    rss_mb: Option<u64>,
+    footprint_mb: Option<u64>,
 ) -> String {
     let dash = || "-".to_string();
     format!(
-        "input={} input_bytes={} input_wait_ms={} fg_rss_mb={}",
+        "input={} input_bytes={} input_wait_ms={} fg_footprint_mb={}",
         word.as_str(),
         backlog.map_or_else(dash, |b| b.unread().to_string()),
         backlog.map_or_else(dash, |b| b.wait.as_millis().to_string()),
-        rss_mb.map_or_else(dash, |mb| mb.to_string()),
+        footprint_mb.map_or_else(dash, |mb| mb.to_string()),
     )
 }
 
@@ -967,10 +930,10 @@ pub(crate) fn status_input(
             }
         }
     };
-    let rss = matches!(word, InputWord::Stalled | InputWord::Stopped)
-        .then(|| fg_rss_mb(sink.master()))
+    let footprint = matches!(word, InputWord::Stalled | InputWord::Stopped)
+        .then(|| fg_footprint_mb(sink.master()))
         .flatten();
-    status_fields(backlog.as_ref(), word, rss)
+    status_fields(backlog.as_ref(), word, footprint)
 }
 
 /// The local wall-clock `HH:MM` of the Unix second `since_unix`, under the zone's offset from UTC.
@@ -1006,32 +969,34 @@ pub(crate) fn attention_text(
              signal cont"
         );
     }
-    let rss = fact.rss_mb.map(|mb| {
+    let footprint = fact.footprint_mb.map(|mb| {
         if mb < 1024 {
-            // A small program reads `rss 1 MB`, never `rss 0.0 GB`.
-            return format!("rss {mb} MB");
+            // A small program reads `footprint 1 MB`, never `footprint 0.0 GB`.
+            return format!("footprint {mb} MB");
         }
         let tenths = (mb * 10 + 512) / 1024;
-        format!("rss {}.{} GB", tenths / 10, tenths % 10)
+        format!("footprint {}.{} GB", tenths / 10, tenths % 10)
     });
     let explicit = fact.act.as_ref().map(|act| act.cmd.as_str());
-    let head = |rss: Option<&str>| {
+    let head = |footprint: Option<&str>| {
         if fact.restart.survived {
-            let rss = rss.map_or_else(String::new, |rss| format!(" ({rss})"));
+            let footprint =
+                footprint.map_or_else(String::new, |footprint| format!(" ({footprint})"));
             let remedy = explicit.map_or_else(
                 || format!("end it: aterm ctl @{sid} signal kill"),
                 |cmd| format!("restart it: {cmd}"),
             );
             format!(
-                "{prog} is still running after its restart signal, not reading input {when}{rss} \
+                "{prog} is still running after its restart signal, not reading input {when}{footprint} \
                  \u{2014} {remedy}"
             )
         } else {
-            let rss = rss.map_or_else(String::new, |rss| format!(", {rss}"));
+            let footprint =
+                footprint.map_or_else(String::new, |footprint| format!(", {footprint}"));
             let cmd =
                 explicit.map_or_else(|| format!("aterm ctl @{sid} signal term"), str::to_string);
             format!(
-                "{prog} is frozen: not reading input {when} ({} B queued{rss}) \u{2014} restart \
+                "{prog} is frozen: not reading input {when} ({} B queued{footprint}) \u{2014} restart \
                  it: {cmd}",
                 fact.bytes
             )
@@ -1045,12 +1010,12 @@ pub(crate) fn attention_text(
             .map(|cmd| format!(", then {cmd}"))
             .collect(),
     };
-    [rss.as_deref(), None]
+    [footprint.as_deref(), None]
         .into_iter()
-        .flat_map(|rss| tails.iter().map(move |tail| (rss, tail)))
-        .map(|(rss, tail)| format!("{}{tail}", head(rss)))
+        .flat_map(|footprint| tails.iter().map(move |tail| (footprint, tail)))
+        .map(|(footprint, tail)| format!("{}{tail}", head(footprint)))
         .find(|text| text.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX)
-        .unwrap_or_else(|| head(rss.as_deref()))
+        .unwrap_or_else(|| head(footprint.as_deref()))
 }
 
 /// What follows the restart of the stalled program in session `tl` ([`attention_text`]'s `<after>`).
@@ -1226,7 +1191,7 @@ impl crate::App {
                 backlog.as_ref(),
                 stopped,
                 activity,
-                || fg_rss_mb(master),
+                || fg_footprint_mb(master),
                 now,
             );
             let fact = match transition {
@@ -1351,7 +1316,7 @@ pub(crate) mod tests {
             since_unix: None,
             bytes: 1,
             stopped: false,
-            rss_mb: None,
+            footprint_mb: None,
             restart: Restart::default(),
             act: None,
         }
@@ -1871,7 +1836,7 @@ pub(crate) mod tests {
         };
         assert_eq!(stall.word, InputWord::Stalled);
         assert!(!stall.stopped);
-        assert_eq!((stall.since, stall.rss_mb), (stop.since, Some(7)));
+        assert_eq!((stall.since, stall.footprint_mb), (stop.since, Some(7)));
     }
 
     #[test]
@@ -1967,7 +1932,7 @@ pub(crate) mod tests {
             Some(&reading(0, 0, 0)),
             false,
             after_drop(1, None, t1),
-            || panic!("rss is read at entry only"),
+            || panic!("footprint is read at entry only"),
             t1,
         );
         assert_eq!((t, next), (Transition::None, Some(t1 + RESTART_GRACE)));
@@ -2077,7 +2042,7 @@ pub(crate) mod tests {
             Some(&reading(0, 0, 0)),
             false,
             after(1, 0, t1),
-            || panic!("rss is read at entry only"),
+            || panic!("footprint is read at entry only"),
             t1,
         );
         assert_eq!((t, next), (Transition::None, Some(t1 + RECHECK)));
@@ -2253,7 +2218,7 @@ pub(crate) mod tests {
             panic!("{t:?}")
         };
         assert_eq!(fact.since, t3 - Duration::from_secs(12));
-        assert_eq!(fact.rss_mb, Some(9));
+        assert_eq!(fact.footprint_mb, Some(9));
         assert_eq!(
             fact.restart,
             Restart {
@@ -2523,7 +2488,7 @@ pub(crate) mod tests {
     fn status_fields_print_the_reading() {
         assert_eq!(
             status_fields(None, InputWord::Unmeasured, None),
-            "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"
+            "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-"
         );
         let stalled = InputBacklog {
             spilled: Some(2),
@@ -2531,7 +2496,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             status_fields(Some(&stalled), InputWord::Stalled, Some(39_731)),
-            "input=stalled input_bytes=3 input_wait_ms=161000 fg_rss_mb=39731"
+            "input=stalled input_bytes=3 input_wait_ms=161000 fg_footprint_mb=39731"
         );
     }
 
@@ -2633,7 +2598,7 @@ pub(crate) mod tests {
     #[test]
     fn attention_text_keeps_the_whole_remedy_under_the_keyed_cap() {
         let fact = InputStallFact {
-            rss_mb: Some(39_731),
+            footprint_mb: Some(39_731),
             ..stalled(Instant::now())
         };
         let survived = InputStallFact {
@@ -2645,7 +2610,7 @@ pub(crate) mod tests {
             ..fact.clone()
         };
         let plain = InputStallFact {
-            rss_mb: None,
+            footprint_mb: None,
             ..fact.clone()
         };
         let stopped = InputStallFact {
@@ -2663,7 +2628,7 @@ pub(crate) mod tests {
                 format!("@{sid} signal term, then {bare}"),
             ),
             (
-                "rss dropped",
+                "footprint dropped",
                 &survived,
                 Some("14:02"),
                 format!("@{sid} signal kill, then {bare}"),
@@ -3070,7 +3035,7 @@ pub(crate) mod tests {
     fn the_menu_row_is_keyed_by_episode() {
         let now = Instant::now();
         let fact = InputStallFact {
-            rss_mb: Some(39_731),
+            footprint_mb: Some(39_731),
             ..stalled(now.checked_sub(Duration::from_secs(95)).unwrap_or(now))
         };
         let sid = "s-b7cf523445a1b0d8658e";
@@ -3191,7 +3156,7 @@ pub(crate) mod tests {
         assert_eq!(app.session_status.next_input_wake(), None);
         let record = app.session_status_record(77).expect("live session");
         assert!(
-            record.contains(" input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=- disk="),
+            record.contains(" input=clear input_bytes=0 input_wait_ms=0 fg_footprint_mb=- disk="),
             "{record}"
         );
         aterm_pty::close_fd(master);
@@ -3690,7 +3655,7 @@ pub(crate) mod tests {
                 sink.input_backlog().as_ref(),
                 false,
                 on_leader(burned),
-                || panic!("the RSS is read at entry only"),
+                || panic!("the footprint is read at entry only"),
                 later,
             );
             let Transition::Updated(fact) = t else {

@@ -37,6 +37,7 @@
 use crate::exit;
 use aterm_types::land_trailer::{Checked, Row, Stated};
 use aterm_uds::spawnfd::Command;
+use aterm_uds::spawnfd::Tether as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -1255,7 +1256,9 @@ fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
     Judged::from_events(&text, code, began.elapsed().as_secs())
 }
 
-fn judgment_command(
+/// Build the checkout's nested verification command, owned by the calling land process.
+/// Its private group and parent-death tether also bound the bootstrap's descendants on Darwin.
+pub fn judgment_command(
     targo: &Path,
     root: &Path,
     base: &str,
@@ -1264,6 +1267,11 @@ fn judgment_command(
     build_dir: Option<&str>,
 ) -> Command {
     let mut cmd = aterm_uds::spawnfd::command(targo);
+    // The bootstrap and nested verifier belong to this land attempt, even when land
+    // dies without unwinding. Darwin's tether anchors this private group until it drains.
+    cmd.tether();
+    #[cfg(unix)]
+    cmd.process_group(0);
     if let Some(value) = build_dir {
         cmd.args(["--config", value]);
     }

@@ -29,6 +29,12 @@ impl Api {
         }
     }
 
+    /// The prefix this client serves (tap discovery for
+    /// suggestion dictionaries).
+    pub(super) fn prefix(&self) -> &Prefix {
+        &self.prefix
+    }
+
     /// A cache-read-only client: fetches parse in memory and nothing is created on disk.
     #[must_use]
     pub const fn read_only(prefix: Prefix) -> Api {

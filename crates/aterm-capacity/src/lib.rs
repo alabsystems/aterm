@@ -134,6 +134,7 @@ mod cohort_journal;
 pub mod cohort_namespace;
 pub mod floor;
 pub mod footprint;
+pub mod host_vitals;
 pub mod ledger;
 pub mod machine_footprint;
 pub mod overrun;
@@ -176,7 +177,8 @@ pub use overrun::{Overrun, overruns};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
 pub use reading::{
-    Live, Machine, Proc, Procs, Reading, TreeUse, Volume, between, claimable, cores, read_volume,
+    Live, MEMORY_MARGIN_CEILING, MEMORY_MARGIN_FLOOR, Machine, Proc, Procs, Reading, TreeUse,
+    Volume, between, cores, read_volume,
 };
 
 /// This account's home as the account database has it, whatever `$HOME` says.

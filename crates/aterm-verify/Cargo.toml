@@ -27,6 +27,11 @@ path = "src/lib.rs"
 name = "contract"
 path = "tests/contract.rs"
 
+[[test]]
+name = "land_lifetime"
+path = "tests/land_lifetime.rs"
+harness = false
+
 [[bench]]
 name = "journal_push_admission"
 harness = false

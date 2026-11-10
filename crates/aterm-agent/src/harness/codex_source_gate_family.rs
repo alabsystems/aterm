@@ -564,6 +564,19 @@ mod tests {
             live: true.into(),
         }
     }
+
+    fn released_family(source: &Fixture) -> FamilyExclusive<'_> {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the family lock after its last descriptor closes",
+            || match FamilyExclusive::acquire(FamilySource::Fixture(source)) {
+                Ok(guard) => Some(guard),
+                Err(BUSY) => None,
+                Err(error) => panic!("family lock unavailable after release: {error}"),
+            },
+        )
+    }
+
     #[test]
     fn borrowed_family_reenters_without_relocking_and_other_grants_remain_live() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -572,8 +585,15 @@ mod tests {
         let b = fixture(home.path(), "grant-b", 1);
         let work = FamilyWork::acquire(FamilySource::Fixture(&a)).unwrap();
         assert!(FamilyExclusive::acquire(FamilySource::Fixture(&alias)).is_err());
+        let retained = work.held.file.try_clone().unwrap();
         drop(work);
-        let exclusive = FamilyExclusive::acquire(FamilySource::Fixture(&a)).unwrap();
+        assert_eq!(
+            FamilyExclusive::acquire(FamilySource::Fixture(&a)).err(),
+            Some(BUSY),
+            "a second descriptor retains the shared lock after its guard drops"
+        );
+        drop(retained);
+        let exclusive = released_family(&a);
         assert!(FamilyWork::acquire(FamilySource::Fixture(&alias)).is_err());
         let first = exclusive.borrow().unwrap();
         let second = exclusive.borrow().unwrap();
@@ -610,7 +630,7 @@ mod tests {
         drop(work);
         assert!(FamilyExclusive::acquire(FamilySource::Fixture(&source)).is_err());
         drop(held);
-        FamilyExclusive::acquire(FamilySource::Fixture(&source)).unwrap();
+        let _exclusive = released_family(&source);
     }
 
     #[test]
@@ -754,7 +774,7 @@ mod tests {
         assert!(FamilyExclusive::acquire(FamilySource::Fixture(&b)).is_err());
         current_b.borrowed().unwrap();
         drop(current_b);
-        FamilyExclusive::acquire(FamilySource::Fixture(&b)).unwrap();
+        let _exclusive = released_family(&b);
     }
 
     #[test]

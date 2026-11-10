@@ -1344,7 +1344,20 @@ fn work_status(
     table: &aterm_sysprobe::volumes::Table,
     reads: &Reads<'_>,
 ) -> Option<(String, Option<String>)> {
-    let excludes = (!own_excludes(root, reads))
+    work_status_in(root, table, None, None, reads)
+}
+
+/// [`work_status`] with `own_excludes_known` and `index_source` supplied where the caller has
+/// already read the repository's local configuration and verified its `.git` directory.
+fn work_status_in(
+    root: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+    own_excludes_known: Option<bool>,
+    index_source: Option<&Path>,
+    reads: &Reads<'_>,
+) -> Option<(String, Option<String>)> {
+    let has_own = own_excludes_known.unwrap_or_else(|| own_excludes(root, reads));
+    let excludes = (!has_own)
         .then(|| global_excludes(root, table, reads))
         .flatten()
         .and_then(|p| p.to_str().map(|p| format!("core.excludesFile={p}")));
@@ -1366,11 +1379,13 @@ fn work_status(
         )
     };
     #[cfg(unix)]
-    let private = private_index(root, reads).and_then(|copy| {
+    let private = private_index_at(root, index_source, reads).and_then(|copy| {
         #[cfg(test)]
         index_seam::before_status(&copy.path);
         read(Some(&copy.path)).filter(|_| copy.stands())
     });
+    #[cfg(not(unix))]
+    let _ = index_source;
     #[cfg(not(unix))]
     let private = None;
     #[cfg(all(test, unix))]
@@ -1439,8 +1454,13 @@ fn private_index_folder() -> Option<PathBuf> {
 /// `None`, the repository's own index read as before, where the index cannot be found, read,
 /// copied or refreshed, changes during its read, exhausts the existing read deadline, or the
 /// cache folder or copy is not private.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
+    private_index_at(root, None, reads)
+}
+
+#[cfg(unix)]
+fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Option<PrivateIndex> {
     use std::io::{Read as _, Write as _};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -1463,8 +1483,13 @@ fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     };
-    let named = git(root, &["rev-parse", "--git-path", "index"], reads)?;
-    let source = root.join(named.trim_end_matches(['\n', '\r']));
+    let source = match source {
+        Some(source) => source.to_path_buf(),
+        None => {
+            let named = git(root, &["rev-parse", "--git-path", "index"], reads)?;
+            root.join(named.trim_end_matches(['\n', '\r']))
+        }
+    };
     let mut file = std::fs::File::open(&source).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file()

@@ -886,7 +886,8 @@ pub fn write_private_flushed(
     flush: aterm_durable::Flush,
 ) -> io::Result<()> {
     one_component_io(name)?;
-    check_private_dir(dir)?;
+    check_private_dir(dir)
+        .map_err(|error| crate::atomic_file::write_error("check private directory", dir, error))?;
     crate::atomic_file::write_entry_flushed(&dir.join(name), bytes, 0o600, flush)
 }
 

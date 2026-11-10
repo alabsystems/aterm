@@ -1246,6 +1246,10 @@ mod tests {
         });
         assert!(matches!(result, Err(OwnerRefreshError::Unavailable)));
         assert!(!entered, "exchange contention must precede owner work");
+        let retained = file.try_clone().unwrap();
+        // Release this test-owned probe explicitly: a forked child's duplicate
+        // must not keep our deliberate blocker held until its exec.
+        file.unlock().unwrap();
         drop(file);
         with_refresh_work(&fixture.env, |work| {
             work.current().unwrap();
@@ -1253,6 +1257,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        drop(retained);
         assert!(exchange_is_exclusive(&exchange_file(&fixture.env)));
     }
 

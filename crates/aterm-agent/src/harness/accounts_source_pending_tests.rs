@@ -106,7 +106,11 @@ fn empty_pool_checks_the_captured_source_before_publishing() {
         assert!(called.get());
         if changed {
             let error = result.unwrap_err();
-            assert!(error.contains("changed after init discovery"), "{error}");
+            assert_eq!(error.retry_reason(), Some(Retry::Changed));
+            assert!(
+                error.to_string().contains("changed after init discovery"),
+                "{error}"
+            );
             assert_eq!(
                 images(),
                 before,
@@ -176,7 +180,10 @@ fn automatic_configured_fetch_rechecks_admission_before_publication() {
         let error = sync_accounts_for_init_with(&bed.home, &bed.state, &roster, NOW, || {}, &fetch)
             .unwrap_err();
         assert!(fetched.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(error.contains("changed after capture"), "{error}");
+        assert!(
+            error.to_string().contains("changed after capture"),
+            "{error}"
+        );
         assert_eq!(image(), before);
     }
 }
@@ -221,7 +228,10 @@ fn captured_legacy_source_refuses_a_new_registry_decision() {
             &|_, _| panic!("captured input must not fetch another source"),
         );
         let error = result.unwrap_err();
-        assert!(error.contains("changed after capture"), "{error}");
+        assert!(
+            error.to_string().contains("changed after capture"),
+            "{error}"
+        );
         assert_eq!(
             image(),
             before,
@@ -348,7 +358,7 @@ fn pending_registry_does_not_promote_an_automatic_file_into_an_explicit_source()
             &|_, _| panic!("a pending source fetched a fallback"),
         );
         assert_eq!(
-            result.unwrap_err(),
+            result.unwrap_err().to_string(),
             expected,
             "the selector's error must survive init"
         );

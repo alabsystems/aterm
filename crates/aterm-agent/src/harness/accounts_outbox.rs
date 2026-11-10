@@ -213,7 +213,8 @@ impl Store {
         self.recover_state_records()?;
         let receipt = self.sync_read_receipt()?;
         let (_, queue) = self.outbox_unfenced()?;
-        self.check_sync_read_receipt(&receipt)?;
+        self.check_sync_read_receipt(&receipt)
+            .map_err(crate::harness::account_sync_error::SyncError::into_message)?;
         Ok(queue.entries)
     }
 }

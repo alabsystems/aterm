@@ -24,6 +24,20 @@ pub(super) struct ProviderSource {
 }
 
 impl ProviderSource {
+    pub(super) fn receipt_guard(
+        &self,
+    ) -> Result<Option<&super::super::alab_roster::ReceiptGuard>, SyncError> {
+        if matches!(self.selected, Selected::Native) {
+            self.admission
+                .as_ref()
+                .ok_or("native source observation is missing")?
+                .native_guard()
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -64,7 +78,7 @@ impl ProviderSource {
         (named, machine_override): (Option<&str>, Option<&str>),
         automatic: bool,
         fetch: &Fetch<'_>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SyncError> {
         let home = env.home.as_deref().ok_or("no home directory")?;
         let config = env.config.as_deref().ok_or("no configuration path")?;
         let named = named.map(str::trim).filter(|name| !name.is_empty());
@@ -174,7 +188,7 @@ impl ProviderSource {
             project = "aterm_agent::harness::accounts_sync::provider_source::tests::transition"
         )
     )]
-    pub(super) fn validate(&self, cli: Cli, env: &Env) -> Result<(), String> {
+    pub(super) fn validate(&self, cli: Cli, env: &Env) -> Result<(), SyncError> {
         #[cfg(test)]
         if SKIP_REVALIDATION.get() {
             return Ok(());
@@ -182,7 +196,9 @@ impl ProviderSource {
         if let Some(admission) = &self.admission {
             admission.validate()?;
         } else {
-            self.policy.check_current()?;
+            self.policy
+                .check_current()
+                .map_err(|why| SyncError::retry(Retry::Changed, why))?;
         }
         let home = env.home.as_deref().ok_or("no home directory")?;
         if self.retire_legacy
@@ -196,8 +212,14 @@ impl ProviderSource {
         }
         let path = match &self.selected {
             Selected::Local(selected) => {
-                if Self::local(cli, home, &self.policy)? != *selected {
-                    return Err("provider source precedence changed after capture".into());
+                if Self::local(cli, home, &self.policy)
+                    .map_err(|why| SyncError::retry(Retry::Changed, why))?
+                    != *selected
+                {
+                    return Err(SyncError::retry(
+                        Retry::Changed,
+                        "provider source precedence changed after capture",
+                    ));
                 }
                 selected.as_ref().map(|s| (s.path.as_path(), false))
             }
@@ -210,10 +232,14 @@ impl ProviderSource {
             } else {
                 astream_sys::Links::Refuse
             };
-            let current = read_local_source_text_with(path, links)
-                .map_err(|why| format!("{}: {why}", path.display()))?;
+            let current = read_local_source_text_with(path, links).map_err(|why| {
+                SyncError::retry(Retry::Unavailable, format!("{}: {why}", path.display()))
+            })?;
             if Some(current.as_str()) != self.raw.as_deref() {
-                return Err("provider source bytes changed after capture".into());
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    "provider source bytes changed after capture",
+                ));
             }
         }
         if let Some(identity) = &self.pool_identity {
@@ -223,12 +249,18 @@ impl ProviderSource {
                 self.machine_override.as_deref(),
             )? != identity
             {
-                return Err("provider machine identity changed after capture".into());
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    "provider machine identity changed after capture",
+                ));
             }
         } else if !matches!(self.selected, Selected::Native)
             && machine_for(env.config.as_deref(), self.machine_override.as_deref()) != self.machine
         {
-            return Err("provider machine identity changed after capture".into());
+            return Err(SyncError::retry(
+                Retry::Changed,
+                "provider machine identity changed after capture",
+            ));
         }
         if matches!(self.selected, Selected::Explicit(_))
             && !self.is_pool()
@@ -265,7 +297,7 @@ impl ProviderSource {
         store: &accounts::Store,
         held: &accounts::Lock,
         roster: &Path,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SyncError> {
         if matches!(self.selected, Selected::Native)
             && let Some(lab) = self
                 .admission
@@ -281,7 +313,7 @@ impl ProviderSource {
                 held,
                 roster,
                 env.now,
-                self.named.is_none(),
+                (self.named.is_none(), self.receipt_guard()?),
             )?;
             if !migrated.moved.is_empty() {
                 // This writer just committed its own monotonic retirement with migration.
@@ -297,14 +329,19 @@ impl ProviderSource {
         Ok(false)
     }
 
-    pub(super) fn load(&self, cli: Cli, roster: &Path) -> Result<Option<LoadedFleet>, String> {
+    pub(super) fn load(&self, cli: Cli, roster: &Path) -> Result<Option<LoadedFleet>, SyncError> {
         if matches!(self.selected, Selected::Native) {
             let fleet = self
                 .admission
                 .as_ref()
                 .ok_or("native source observation is missing")?
                 .chosen(cli, roster, self.named.as_deref())?
-                .ok_or("native provider source changed after capture")?;
+                .ok_or_else(|| {
+                    SyncError::retry(
+                        Retry::Changed,
+                        "native provider source changed after capture",
+                    )
+                })?;
             let machine = fleet.alab.as_ref().map(|me| me.key.as_str().to_owned());
             return Ok(Some((
                 CliFleet {
@@ -344,10 +381,6 @@ impl ProviderSource {
             None,
             self.machine.clone(),
         )))
-    }
-
-    pub(super) fn retires(&self) -> bool {
-        self.retire_legacy
     }
 
     pub(super) fn needs_retirement(&self) -> bool {

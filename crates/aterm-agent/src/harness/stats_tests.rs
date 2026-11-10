@@ -466,17 +466,17 @@ fn the_folds_words_are_the_writers_consts() {
 const ENDS: &str = "
     # A stall's hold takes the point's badge down on its FROZEN line alone.
     1000 s-1 ESCALATED seq=10 attention=OK mail=OK 7 off=91
-    3000 s-1 FROZEN seq=11 input=stalled wait_ms=161000 bytes=1 rss_mb=39731 attention=OK mail=OK 8 off=92
+    3000 s-1 FROZEN seq=11 input=stalled wait_ms=161000 bytes=1 footprint_mb=39731 attention=OK mail=OK 8 off=92
     9000 s-1 EXIT session gone
     # The entry carries a limit's badge, which stands under the hold: kept,
     # and the wait goes on to the limit's own clear.
     10000 s-2 ESCALATED seq=20 attention=OK mail=OK
-    11000 s-2 FROZEN seq=21 input=stalled wait_ms=161000 bytes=1 rss_mb=- attention=kept mail=OK
+    11000 s-2 FROZEN seq=21 input=stalled wait_ms=161000 bytes=1 footprint_mb=- attention=kept mail=OK
     14000 s-2 CLEARED seq=22 attention=OK answered after a busy spell
     # Behind another supervisor the hold touches nothing: the adopted
     # badge's wait goes on to its clear.
     20000 s-3 ADOPTED seq=30 attention=claude needs approval: rm -rf x (not read-only)
-    21000 s-3 FROZEN seq=31 input=stalled wait_ms=- bytes=- rss_mb=- attention=skipped: another supervisor (gui:9) answers this session mail=skipped: another supervisor (gui:9) answers this session
+    21000 s-3 FROZEN seq=31 input=stalled wait_ms=- bytes=- footprint_mb=- attention=skipped: another supervisor (gui:9) answers this session mail=skipped: another supervisor (gui:9) answers this session
     25000 s-3 CLEARED seq=32 box attention=OK
     # The turn-end policy's badge at the loop's end: its CLEARED line, then
     # the end.
@@ -550,7 +550,7 @@ fn the_frozen_line_is_read_with_the_writers_consts() {
             1,
             Some("s-1"),
             &format!(
-                "{FROZEN} seq=4 input=stalled wait_ms=161000 bytes=1 rss_mb=39731 {attention} \
+                "{FROZEN} seq=4 input=stalled wait_ms=161000 bytes=1 footprint_mb=39731 {attention} \
                  mail=OK 8 off=92"
             ),
             None,

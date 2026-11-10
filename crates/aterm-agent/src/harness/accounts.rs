@@ -4,6 +4,7 @@
 //! AI CLI account roster admission, usage/wall tracking, rotation advice, and state store: Claude
 //! Code's pool, and one per pooled CLI ([`Cli`]) through the same parser, store and advice.
 
+use super::account_sync_error::SyncError;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -12217,7 +12218,8 @@ impl Store {
     pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
         let result = self.logins_as_stored(now);
-        self.check_sync_read_receipt(&receipt)?;
+        self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)?;
         result
     }
 
@@ -12267,6 +12269,7 @@ impl Store {
     /// writer, different recovery target, conflicting image, or failed durable publication.
     pub fn recover_records(&self, roster_path: &Path) -> Result<bool, String> {
         self.recover_sync_within(self.ladder, roster_path)
+            .map_err(SyncError::into_message)
     }
 
     /// Completes an admitted state or local-login publication at fixed paths in this store.
@@ -12418,6 +12421,7 @@ impl Store {
             ));
         }
         self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)
             .map_err(RosterReadError::Records)?;
         Ok(AccountRecords {
             raw_roster: raw,
@@ -12523,6 +12527,7 @@ impl Store {
             })
         })();
         self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)
             .map_err(RosterReadError::Records)?;
         result.map(|records| (recovered, records))
     }
@@ -12565,6 +12570,7 @@ impl Store {
                 .map_err(RosterReadError::Records)
         })();
         self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)
             .map_err(RosterReadError::Records)?;
         result
     }
@@ -12737,7 +12743,8 @@ impl Store {
     pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
         let receipt = self.sync_read_receipt()?;
         let (state, note, _) = self.state_as_stored(now)?;
-        self.check_sync_read_receipt(&receipt)?;
+        self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)?;
         Ok((state, note))
     }
 
@@ -13026,6 +13033,7 @@ impl Store {
         let decoded = decode(super::cli::tail_lines(&self.ledger_path(), max)?);
         after_read();
         self.check_sync_read_receipt(&receipt)
+            .map_err(SyncError::into_message)
             .map_err(io::Error::other)?;
         decoded
     }

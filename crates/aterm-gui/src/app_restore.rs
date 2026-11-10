@@ -2915,14 +2915,14 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| !ws.layouts.is_empty());
-        let mut tabs = terminal_layouts.iter().cloned();
+        let mut tabs = terminal_layouts.iter();
         if let Some(layout0) = tabs.next()
             && layout0.leaf_count() > 1
             && let Some(keep) = self
                 .windows
                 .get(&wid)
                 .and_then(|ws| ws.layouts.first().map(pane::PaneTree::focus))
-            && let Some(tree) = self.restore_build_tree(wid, &layout0, Some(keep))
+            && let Some(tree) = self.restore_build_tree(wid, layout0, Some(keep))
         {
             tree.visit_sessions(&mut |session| {
                 let known = self
@@ -2944,7 +2944,7 @@ impl App {
             debug_assert!(synced);
         }
         for layout in tabs {
-            let Some(tree) = self.restore_build_tree(wid, &layout, None) else {
+            let Some(tree) = self.restore_build_tree(wid, layout, None) else {
                 crate::logging::stderr_line!(
                     "aterm-gui: session restore: could not respawn a tab; keeping what restored"
                 );

@@ -2347,7 +2347,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              agent_since_ms agent_gen agent_fp wait wait_gib wait_ahead composer program_state \
              program_state_ms \
              last_act auth token os_appearance theme_side reported_scheme scheme_from bg_dark \
-             session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
+             session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_footprint_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check \
              program_check_stranded left syspolicyd syspolicyd_workers syspolicyd_full_ms \
              syspolicyd_pid syspolicyd_up_ms service_mem \

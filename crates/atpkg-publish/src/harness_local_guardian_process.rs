@@ -236,7 +236,7 @@ struct Usage {
 
 fn budget_reason(usage: Usage, memory_mib: u64, vm_mib: u64) -> Option<&'static str> {
     if usage.memory > memory_mib << 20 {
-        Some("local worker group exceeded its resident/footprint memory budget")
+        Some("local worker group exceeded its footprint memory budget")
     } else if usage.virtual_max > vm_mib << 20 {
         Some("a local worker process exceeded its virtual-memory ceiling")
     } else {
@@ -357,7 +357,7 @@ fn memory(pid: i32) -> Option<Usage> {
             .and_then(|kib| kib.checked_mul(1024))
     };
     Some(Usage {
-        memory: field("VmRSS:")?.saturating_add(field("VmSwap:")?),
+        memory: aterm_sysprobe::procs::footprint(u32::try_from(pid).ok()?).ok()?,
         virtual_max: field("VmSize:")?,
     })
 }

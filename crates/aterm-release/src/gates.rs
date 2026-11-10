@@ -1820,35 +1820,6 @@ pub fn harness_versions_gate_at(
     }
 }
 
-/// The harness versions question for a `--bump` that has not run yet (a dry run asks it of
-/// `commit`, main's tip before the bump): the version commit writes every bump the window owes
-/// ([`crate::harness_versions::apply`]), so what is owed is said, never refused.
-///
-/// # Errors
-/// As [`harness_versions_base`], or git cannot diff the window.
-pub fn harness_versions_bump_writes_at(
-    git: &dyn GitRunner,
-    origin: &dyn crate::ledger::Origin,
-    commit: &str,
-    version: &str,
-) -> Result<String> {
-    let Some((release, released)) = harness_versions_base(git, origin, commit, version)? else {
-        return Ok("harness versions: no earlier public release to compare".to_string());
-    };
-    let owed = crate::harness_versions::owed_between(git, &released, commit)?;
-    if owed.is_empty() {
-        return crate::harness_versions::gate(git, (&release, &released), commit);
-    }
-    let names: Vec<String> = owed
-        .iter()
-        .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
-        .collect();
-    Ok(format!(
-        "harness versions since v{release}: the bump commit writes {}",
-        names.join(", ")
-    ))
-}
-
 /// The public release that opened release `version`'s harness window, and its commit, as
 /// `commit`'s ledger and origin's tags name them; `None` where none precedes `version`.
 ///

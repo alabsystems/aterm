@@ -194,13 +194,13 @@ mod tests {
         assert_eq!(default.test_thread_override(), Some(6));
         assert_eq!(default.test_threads_within(4), 4, "within a smaller grant");
         let unmanaged = make(None, None);
-        assert_eq!(unmanaged.test_share(), unmanaged.cores());
+        assert_eq!(unmanaged.test_share(), unmanaged.parallelism());
         assert_eq!(unmanaged.test_thread_override(), None);
         assert!(pins(&unmanaged).is_empty());
     }
 
     #[test]
-    fn unmanaged_requests_share_host_cores_without_treating_build_jobs_as_a_grant() {
+    fn unmanaged_requests_share_the_process_parallelism_without_treating_build_jobs_as_a_grant() {
         use std::{num::NonZeroU32, path::PathBuf};
         for build_jobs in [None, Some("1"), Some("4294967295")] {
             let ctx = crate::Ctx::new(
@@ -214,18 +214,18 @@ mod tests {
             );
             assert_eq!(
                 (ctx.test_share(), ctx.test_threads()),
-                (ctx.cores(), ctx.cores())
+                (ctx.parallelism(), ctx.parallelism())
             );
             let huge = ctx.with_test_threads(NonZeroU32::new(u32::MAX));
-            assert_eq!(huge.test_threads(), huge.cores());
-            assert_eq!(huge.test_thread_override(), Some(huge.cores()));
+            assert_eq!(huge.test_threads(), huge.parallelism());
+            assert_eq!(huge.test_thread_override(), Some(huge.parallelism()));
             assert_eq!(
                 huge.child_env_add
                     .iter()
                     .filter(|(key, _)| key == "RUST_TEST_THREADS")
                     .map(|(_, value)| value.to_str().unwrap())
                     .collect::<Vec<_>>(),
-                [huge.cores().to_string()]
+                [huge.parallelism().to_string()]
             );
         }
     }

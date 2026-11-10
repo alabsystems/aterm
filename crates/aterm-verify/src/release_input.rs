@@ -5,14 +5,15 @@
 //! delta from a base, not every ancestor of their tree: main imported at the base stays owed.
 
 use crate::{Ctx, EnvSnapshot, Show, checks::Check};
-use aterm_types::land_trailer::Stated;
+use aterm_types::land_trailer::{Checked, Stated};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
-/// The inexpensive source checks; lint is limited to the unchecked paths' dependency cone.
-pub const CHECKS: [Check; 4] = [Check::ExportScan, Check::Fmt, Check::Census, Check::Lint];
-const NAMES: [&str; 4] = ["export-scan", "fmt", "census", "lint"];
+/// Early source readers. Qualification lints the whole release tree before publication;
+/// running its compiler passes here too only repeats that work.
+pub const CHECKS: [Check; 3] = [Check::ExportScan, Check::Fmt, Check::Census];
+const NAMES: [&str; 3] = ["export-scan", "fmt", "census"];
 
 #[derive(Debug)]
 struct Commit {
@@ -41,10 +42,6 @@ impl Input {
 }
 
 fn git(root: &Path, path: &OsStr, args: &[&str]) -> Result<String, String> {
-    git_read(root, path, args, false)
-}
-
-fn git_read(root: &Path, path: &OsStr, args: &[&str], grep: bool) -> Result<String, String> {
     let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     command
         .current_dir(root)
@@ -62,7 +59,7 @@ fn git_read(root: &Path, path: &OsStr, args: &[&str], grep: bool) -> Result<Stri
         aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
     )
     .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    if !out.status.success() && !(grep && out.status.code() == Some(1)) {
+    if !out.status.success() {
         return Err(format!(
             "git {}: {}",
             args.join(" "),
@@ -85,14 +82,19 @@ fn ancestors(nodes: &BTreeMap<String, Commit>, start: &str) -> BTreeSet<String> 
     seen
 }
 
-fn unchecked(
+struct Coverage {
+    commits: BTreeSet<String>,
+    judgments: Vec<Checked>,
+}
+
+fn coverage(
     root: &Path,
     path: &OsStr,
     nodes: &BTreeMap<String, Commit>,
     composed: &BTreeSet<String>,
-    empty_lint: &BTreeSet<(String, String)>,
-) -> Vec<String> {
+) -> Coverage {
     let mut covered = BTreeSet::new();
+    let mut judgments = Vec::new();
     for (landing, commit) in nodes {
         let Some(receipt) = &commit.receipt else {
             continue;
@@ -124,14 +126,10 @@ fn unchecked(
         let mut valid = false;
         for checked in &receipt.checked {
             if !NAMES.iter().all(|name| {
-                checked.rows.iter().any(|r| {
-                    r.check == *name
-                        && (r.word == "ok"
-                            || (*name == "lint"
-                                && r.word == "skip"
-                                && empty_lint
-                                    .contains(&(checked.base.clone(), checked.tree.clone()))))
-                })
+                checked
+                    .rows
+                    .iter()
+                    .any(|r| r.check == *name && r.word == "ok")
             }) {
                 continue;
             }
@@ -158,128 +156,63 @@ fn unchecked(
                 continue;
             }
             covered.extend(judged.difference(&ancestors(nodes, &checked.base)).cloned());
+            judgments.push(checked.clone());
             valid |= receipt.checked.last() == Some(checked);
         }
         if valid {
             covered.insert(landing.clone());
         }
     }
-    nodes
-        .keys()
-        .filter(|id| !covered.contains(*id))
-        .cloned()
-        .collect()
+    Coverage {
+        commits: covered,
+        judgments,
+    }
 }
 
-/// A skip alone is not a pass: a missing Tippy also produces one. Prove the empty
-/// selection from immutable trees, conservatively treating every manifest as a member.
-/// Use the cone selector's ownership, replan, tested-file and shared-input rules.
-fn lint_has_no_inputs(root: &Path, path: &OsStr, base: &str, tree: &str) -> Result<bool, String> {
-    let changed = git(
-        root,
-        path,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            base,
-            tree,
-            "--",
-        ],
-    )?;
-    let changed: Vec<_> = changed
+/// A later landing can judge an earlier unchecked file again. Credit only paths in its
+/// actual judged delta whose complete Git entry (content, mode and presence) still agrees
+/// with the candidate. A path name alone cannot authorize an edit after that judgment.
+fn remaining_paths(
+    root: &Path,
+    path: &OsStr,
+    tip: &str,
+    mut paths: BTreeSet<String>,
+    judgments: &[Checked],
+) -> Result<BTreeSet<String>, String> {
+    let diff = |a: &str, b: &str| -> Result<BTreeSet<String>, String> {
+        Ok(git(
+            root,
+            path,
+            &[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                "-z",
+                a,
+                b,
+                "--",
+            ],
+        )?
         .split('\0')
         .filter(|p| !p.is_empty())
         .map(str::to_owned)
-        .collect();
-    let listed = git(root, path, &["ls-tree", "-r", "-z", tree])?;
-    let mut manifests = crate::changed::Manifests::new();
-    let mut entries = Vec::new();
-    for entry in listed.split('\0').filter(|p| !p.is_empty()) {
-        let Some((kind, file)) = entry.split_once('\t') else {
-            return Ok(false);
-        };
-        if (kind.starts_with("160000 ")
-            && changed
-                .iter()
-                .any(|p| p == file || p.starts_with(&format!("{file}/"))))
-            || (kind.starts_with("120000 ") && file.ends_with(".rs"))
-        {
-            return Ok(false);
-        }
-        if let Some(dir) = file.strip_suffix("/Cargo.toml") {
-            manifests.insert(dir);
-            entries.push(crate::changed::Member {
-                name: dir.into(),
-                dir: dir.into(),
-                has_lib: true,
-            });
-        }
-    }
-    if entries.is_empty() {
-        return Ok(false);
-    }
-    // A root package owns root inputs too; the normal workspace ownership walk
-    // intentionally stops before the root. Such a workspace needs its real lint.
-    let root_manifest = git(root, path, &["show", &format!("{tree}:Cargo.toml")])?;
-    let manifest: aterm_toml::Table = match aterm_toml::from_str(&root_manifest) {
-        Ok(table) => table,
-        Err(_) => return Ok(false),
+        .collect())
     };
-    if manifest.get("package").is_some() {
-        return Ok(false);
-    }
-    let members = crate::changed::Members::new(entries);
-    let (seeds, replan) = crate::changed::seeds(&changed, &manifests, &members);
-    if !seeds.is_empty()
-        || replan.is_some()
-        || changed
-            .iter()
-            .any(|p| crate::changed::tested_by(p).next().is_some())
-    {
-        return Ok(false);
-    }
-    let shared = git_read(
-        root,
-        path,
-        &[
-            "grep",
-            "--no-textconv",
-            "--full-name",
-            "-n",
-            "-z",
-            "-F",
-            "-e",
-            "../",
-            tree,
-            "--",
-            "*.rs",
-        ],
-        true,
-    )?;
-    let changed: BTreeSet<_> = changed.iter().map(|p| root.join(p)).collect();
-    for line in shared.lines() {
-        let fields: Vec<_> = line.splitn(3, '\0').collect();
-        if fields.len() != 3 {
-            return Ok(false);
+    for checked in judgments {
+        if paths.is_empty() {
+            break;
         }
-        let Some(source) = fields[0].strip_prefix(&format!("{tree}:")) else {
-            return Ok(false);
-        };
-        let Some(member) = crate::changed::owning_member(source, &manifests, &members) else {
+        let judged = diff(&checked.base, &checked.tree)?;
+        if judged.is_disjoint(&paths) {
             continue;
-        };
-        if crate::changed::shares_changed_input(
-            &root.join(source),
-            fields[2],
-            &root.join(member),
-            &changed,
-        ) {
-            return Ok(false);
         }
+        let changed = diff(&checked.tree, tip)?;
+        paths.retain(|p| !judged.contains(p) || changed.contains(p));
     }
-    Ok(true)
+    Ok(paths)
 }
 
 /// Read Git's actual landing trailers and union only the unjudged commits' changed paths.
@@ -313,23 +246,10 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
         );
     }
     let mut composed = BTreeSet::new();
-    let mut empty_lint = BTreeSet::new();
     for (id, commit) in &nodes {
         let Some(receipt) = &commit.receipt else {
             continue;
         };
-        for checked in &receipt.checked {
-            let key = (checked.base.clone(), checked.tree.clone());
-            if checked
-                .rows
-                .iter()
-                .any(|r| r.check == "lint" && r.word == "skip")
-                && !empty_lint.contains(&key)
-                && lint_has_no_inputs(root, path, &checked.base, &checked.tree).unwrap_or(false)
-            {
-                empty_lint.insert(key);
-            }
-        }
         let (Some(onto), Some(checked), [parent, main]) = (
             &receipt.composed_onto,
             receipt.checked.last(),
@@ -344,7 +264,12 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
             composed.insert(id.clone());
         }
     }
-    let commits = unchecked(root, path, &nodes, &composed, &empty_lint);
+    let covered = coverage(root, path, &nodes, &composed);
+    let commits: Vec<_> = nodes
+        .keys()
+        .filter(|id| !covered.commits.contains(*id))
+        .cloned()
+        .collect();
     let mut paths = BTreeSet::new();
     for commit in &commits {
         let parents = &nodes[commit].parents;
@@ -362,7 +287,9 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
     }
     Ok(Input {
         commits,
-        paths: paths.into_iter().collect(),
+        paths: remaining_paths(root, path, tip, paths, &covered.judgments)?
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -394,6 +321,12 @@ fn judge_with_inputs(
     log: &mut (dyn std::io::Write + Send),
     carry: InputCarry,
 ) -> Result<String, (bool, String)> {
+    if checks.iter().any(|check| !CHECKS.contains(check)) {
+        return Err((
+            false,
+            "release-input runs only source readers; lint belongs to qualification".into(),
+        ));
+    }
     let began = std::time::Instant::now();
     let env = EnvSnapshot::capture();
     let input = discover(root, &env.path, base, tip).map_err(|why| (false, why))?;
@@ -415,22 +348,10 @@ fn judge_with_inputs(
     .map_err(|e| (false, e.to_string()))?;
     let tools = crate::preflight(&env, root).map_err(|why| (false, why))?;
     let scratch = aterm_tempfile::tempdir().map_err(|e| (false, e.to_string()))?;
-    let selecting = std::time::Instant::now();
-    let selection =
-        // The paths are the unreceipted commits', which no one tree precedes: a revert of a
-        // receipted change compares equal to `base`.
-        crate::changed::resolve_paths(root, &tools, &env.path, base, input.paths.clone(), None);
-    let (scope, cone) = crate::changed::cone(base, &selection);
-    writeln!(
-        log,
-        "release input selection: {:.3}s; {cone}",
-        selecting.elapsed().as_secs_f64()
-    )
-    .map_err(|e| (false, e.to_string()))?;
     let (_leases, _) = crate::hold_toolchain(&env, &tools, root);
     let mut ctx = Ctx::new_with_tools(
         root.to_path_buf(),
-        scope,
+        crate::Scope::workspace(),
         env,
         scratch.path().to_path_buf(),
         tools,
@@ -446,9 +367,7 @@ fn judge_with_inputs(
     let mut unavailable = Vec::new();
     for check in checks.iter().copied() {
         let name = check.name();
-        if (check == Check::Fmt && ctx.tools.trustfmt.is_none())
-            || (check == Check::Lint && ctx.tools.tippy.is_none())
-        {
+        if check == Check::Fmt && ctx.tools.trustfmt.is_none() {
             unavailable.push(format!("{name}: its Trust driver is unavailable"));
             continue;
         }
@@ -459,7 +378,7 @@ fn judge_with_inputs(
             &mut output,
             log,
             &Show {
-                cone: Some(&cone),
+                cone: None,
                 log: None,
             },
         )
@@ -581,6 +500,35 @@ mod tests {
     use super::*;
     use aterm_types::land_trailer::{Checked, Row};
 
+    /// Replay immutable release history without entering publication or touching its host.
+    #[test]
+    #[ignore = "measurement over the caller's repository history"]
+    fn replay_release_selection() {
+        let root = aterm_tempfile::manifest_dir().join("../..");
+        let base = std::env::var("ATERM_REPLAY_BASE").unwrap();
+        let tip = std::env::var("ATERM_REPLAY_TIP").unwrap();
+        let began = std::time::Instant::now();
+        let input = discover(
+            &root,
+            &std::env::var_os("PATH").unwrap_or_default(),
+            &base,
+            &tip,
+        )
+        .unwrap();
+        println!(
+            "selection: {} commits, {} paths, {:.3}s",
+            input.commits.len(),
+            input.paths.len(),
+            began.elapsed().as_secs_f64()
+        );
+        for commit in input.commits {
+            println!("commit {commit}");
+        }
+        for path in input.paths {
+            println!("path {path}");
+        }
+    }
+
     struct Repo(aterm_tempfile::TempDir);
     impl Repo {
         fn new() -> Self {
@@ -670,6 +618,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn early_readers_cannot_dispatch_qualification_lint() {
+        let r = Repo::new();
+        let base = r.git(&["rev-parse", "HEAD"]);
+        let error = judge(
+            r.0.path(),
+            &base,
+            &base,
+            &[Check::Lint],
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(!error.0);
+        assert!(error.1.contains("qualification"));
+        assert_eq!(
+            run_cli(
+                &["--base".into(), base, "--checks".into(), "lint".into()],
+                r.0.path()
+            ),
+            crate::exit::USAGE
+        );
+    }
+
     /// The very same tree is owed without its real landing trailer, and covered with it.
     /// An earlier unchecked main commit stays owed: the receipt's base is not its cone.
     #[test]
@@ -724,6 +696,34 @@ mod tests {
         ]);
         r.git(&["update-ref", "HEAD", &bad]);
         assert_eq!(r.input(&released).paths, before.paths);
+    }
+
+    /// A checked edit to an earlier unchecked path covers its resulting entry, including
+    /// deletion. Subsequent content or mode changes are still owed.
+    #[test]
+    fn later_judgment_covers_entries_but_never_later_edits() {
+        let r = Repo::new();
+        let released = r.git(&["rev-parse", "HEAD"]);
+        r.write("reviewed", "unchecked\n");
+        r.write("deleted", "unchecked\n");
+        r.write("other", "unchecked\n");
+        let base = r.commit("unchecked main");
+        r.write("reviewed", "checked\n");
+        std::fs::remove_file(r.0.path().join("deleted")).unwrap();
+        let topic = r.commit("repair and judge");
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+        let receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+        r.landing(&tree, &topic, &base, &receipt);
+        assert_eq!(r.input(&released).paths, ["other"]);
+        r.write("reviewed", "later unchecked\n");
+        r.commit("later edit");
+        assert_eq!(r.input(&released).paths, ["other", "reviewed"]);
+        r.write("reviewed", "checked\n");
+        r.commit("restore checked bytes");
+        assert_eq!(r.input(&released).paths, ["other"]);
+        r.git(&["update-index", "--chmod=+x", "reviewed"]);
+        r.git(&["commit", "-qm", "unchecked mode"]);
+        assert_eq!(r.input(&released).paths, ["other", "reviewed"]);
     }
 
     /// A merge's new resolution is its own input even when both parents were judged.
@@ -925,53 +925,6 @@ mod tests {
         assert!(r.input(&base).paths.contains(&"branch".into()));
     }
 
-    /// Trust an empty lint skip, never a missing compiler's skip over actual source
-    /// or a document read by source. All evidence comes from the named tree.
-    #[test]
-    fn empty_lint_skip_is_proven_from_the_checked_tree() {
-        let r = Repo::new();
-        std::fs::create_dir_all(r.0.path().join("crates/member/src")).unwrap();
-        r.write("Cargo.toml", "[workspace]\nmembers=['crates/member']\n");
-        r.write(
-            "crates/member/Cargo.toml",
-            "[package]\nname='member'\nversion='0.0.0'\n",
-        );
-        r.write("crates/member/src/lib.rs", "pub fn value() {}\n");
-        let base = r.commit("workspace");
-        let land = |base: &str| {
-            let branch = r.git(&["rev-parse", "HEAD"]);
-            let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
-            let mut receipt = Stated::of_trailers(&r.receipt(base)).unwrap();
-            receipt.checked[0]
-                .rows
-                .iter_mut()
-                .find(|r| r.check == "lint")
-                .unwrap()
-                .word = "skip".into();
-            r.landing(&tree, &branch, base, &receipt)
-        };
-        r.write("REPORT.md", "documentation\n");
-        r.commit("document");
-        land(&base);
-        assert!(r.input(&base).commits.is_empty());
-        r.git(&["checkout", "--detach", &base]);
-        r.write("crates/member/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
-        let source = r.commit("source without lint");
-        land(&base);
-        assert!(r.input(&base).commits.contains(&source));
-        r.git(&["checkout", "--detach", &base]);
-        r.write("REPORT.md", "included\n");
-        r.write(
-            "crates/member/src/lib.rs",
-            "pub const REPORT: &str = include_str!(\"../../../REPORT.md\");\n",
-        );
-        let reader = r.commit("source reads report");
-        r.write("REPORT.md", "unlinted input\n");
-        let input = r.commit("change shared input");
-        land(&reader);
-        assert!(r.input(&reader).commits.contains(&input));
-    }
-
     /// An existing ancestor tree is no more authority than a nonexistent forged tree:
     /// without a valid composition it cannot hide even that ancestor's branch delta.
     #[test]
@@ -1052,212 +1005,5 @@ mod tests {
             input.commits.len(),
             input.paths.len()
         );
-    }
-
-    /// The release uses the actual lint stage: raw accept is a red, and removing the call
-    /// makes the same target green. No socket is opened or accepted by this fixture.
-    #[test]
-    fn banned_accept_is_found_by_the_preflight_lint() {
-        let r = Repo::new();
-        let source = aterm_tempfile::manifest_dir().join("../..");
-        for name in ["trust.lock", "rust-toolchain.toml", "clippy.toml"] {
-            std::fs::copy(source.join(name), r.0.path().join(name)).unwrap();
-        }
-        r.write("Cargo.toml", "[package]\nname = \"input-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n");
-        std::fs::create_dir(r.0.path().join("src")).unwrap();
-        r.write(
-            "src/lib.rs",
-            "pub fn call(listener: &std::net::TcpListener) { let _ = listener.accept(); }\n",
-        );
-        let env = EnvSnapshot::capture();
-        let tools = crate::preflight(&env, &source).unwrap();
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let ctx = Ctx::new_with_tools(
-            r.0.path().to_path_buf(),
-            crate::Scope::crate_only("input-fixture"),
-            env,
-            scratch.path().to_path_buf(),
-            tools,
-        )
-        .with_checks(&[Check::Lint]);
-        let stage = crate::plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == crate::plan::StageId::Tippy)
-            .unwrap();
-        let start = std::time::Instant::now();
-        let red = crate::stages::run_stage(&ctx, &stage);
-        assert!(
-            red.outcomes().any(
-                |(o, _)| o == crate::ladder::Outcome::Fail(crate::ladder::Severity::GateFailed)
-            ),
-            "{}",
-            red.render()
-        );
-        assert!(red.render().contains("accept"), "{}", red.render());
-        r.write("src/lib.rs", "pub fn call() -> u8 { 1 }\n");
-        let green = crate::stages::run_stage(&ctx, &stage);
-        assert!(
-            green
-                .outcomes()
-                .all(|(o, _)| o == crate::ladder::Outcome::Ok),
-            "{}",
-            green.render()
-        );
-        println!(
-            "release-input lint fixture: red_and_clean_s={:.3}",
-            start.elapsed().as_secs_f64()
-        );
-    }
-
-    /// Run the production preflight and Tippy scheduler across a moved tip and a product bump.
-    /// The dependent must run when its dependency changes; an unrelated package must carry.
-    #[test]
-    fn preflight_package_receipts_follow_dependency_content_across_a_bump() {
-        let r = Repo::new();
-        let base = r.git(&["rev-parse", "HEAD"]);
-        let source = aterm_tempfile::manifest_dir().join("../..");
-        r.write(".gitignore", "/target/\n");
-        for name in ["trust.lock", "rust-toolchain.toml"] {
-            std::fs::copy(source.join(name), r.0.path().join(name)).unwrap();
-        }
-        r.write("Cargo.toml", "[workspace]\nmembers=['a','b','c','aterm']\nresolver='2'\n[workspace.package]\nversion='1.0.0'\n");
-        for name in ["a", "b", "c", "aterm"] {
-            std::fs::create_dir_all(r.0.path().join(name).join("src")).unwrap();
-            r.write(&format!("{name}/Cargo.toml"), &format!(
-                "[package]\nname='{name}'\n{}\nedition='2024'\n\
-                 [package.metadata.aterm.lint-inputs]\nbounded=true\ncontent-only=true\nread-only=true\n\
-                 paths=[]\nworkspace-paths=[]\ntools=[]\nvolatile-environment=[]\n{}",
-                if name == "aterm" { "version.workspace=true" } else { "version='0.0.0'" },
-                if name == "a" { "[dependencies]\nb={path='../b'}\n" } else { "" }
-            ));
-            r.write(
-                &format!("{name}/src/lib.rs"),
-                "pub fn value() -> u8 { 1 }\n",
-            );
-        }
-        let env = EnvSnapshot::capture();
-        let tools = crate::preflight(&env, &source).unwrap();
-        let lockfile = || {
-            let mut command = aterm_uds::spawnfd::command(&tools.targo);
-            command
-                .current_dir(r.0.path())
-                .args(["generate-lockfile", "--offline"]);
-            aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
-                .unwrap()
-        };
-        let output = lockfile();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let first = r.commit("dry tip");
-        let logs = aterm_tempfile::tempdir().unwrap();
-        let run = |tip: &str, previous: Option<Vec<crate::input_content::Proof>>, name: &str| {
-            let events = logs.path().join(format!("{name}.events"));
-            let mut output = Vec::new();
-            let start = std::time::Instant::now();
-            let result = judge_with_inputs(
-                r.0.path(),
-                &base,
-                tip,
-                &[Check::Lint],
-                Some(crate::event_log::EventLog::open(&events).unwrap()),
-                &mut output,
-                InputCarry {
-                    context: Some("ab".repeat(32)),
-                    items: previous.unwrap_or_default(),
-                },
-            );
-            assert!(
-                result.is_ok(),
-                "{result:?}\n{}",
-                String::from_utf8_lossy(&output)
-            );
-            let mut passed = Vec::new();
-            let mut ran = BTreeSet::new();
-            let mut items = crate::input_content::Collector::default();
-            for line in std::fs::read_to_string(events).unwrap().lines() {
-                let Some(text) = line.strip_prefix("verify-event: ") else {
-                    continue;
-                };
-                let row: aterm_json::Value = aterm_json::from_str(text).unwrap();
-                let Some(proof) = items.observe(&row).unwrap() else {
-                    continue;
-                };
-                if proof.check != "lint" {
-                    continue;
-                }
-                let spec = proof
-                    .item
-                    .split('#')
-                    .next()
-                    .unwrap()
-                    .rsplit('/')
-                    .next()
-                    .unwrap()
-                    .to_owned();
-                if row["carried"].as_bool() != Some(true) {
-                    ran.insert(spec);
-                }
-                passed.push(proof);
-            }
-            let wall = start.elapsed().as_secs_f64();
-            println!(
-                "preflight package pair {name}: wall_s={:.3}, ran={ran:?}",
-                wall
-            );
-            assert_eq!(passed.len(), 4);
-            (passed, ran, wall)
-        };
-        let (prior, ran, _) = run(&first, None, "dry");
-        assert_eq!(ran.len(), 4);
-        r.write("b/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
-        let moved = r.commit("change dependency");
-        let (prior, ran, _) = run(&moved, Some(prior), "moved");
-        assert_eq!(ran, BTreeSet::from(["a".into(), "b".into()]));
-        r.write("Cargo.toml", "[workspace]\nmembers=['a','b','c','aterm']\nresolver='2'\n[workspace.package]\nversion='1.1.0'\n");
-        let output = lockfile();
-        assert!(output.status.success());
-        let bumped = r.commit("bump product version");
-        let (_, ran, _) = run(&bumped, Some(prior), "bump");
-        assert_eq!(
-            ran,
-            BTreeSet::from(["a".into(), "aterm".into(), "b".into(), "c".into()]),
-            "Tippy records the workspace manifest as an input of every compiler unit"
-        );
-        // ABBA uses the actual old preflight path (no package context) as its negative
-        // control. The recorded walls are measurements, never latency assertions.
-        for (take, carry) in [false, true, true, false].into_iter().enumerate() {
-            let mut previous = None;
-            let mut walls = Vec::new();
-            let mut counts = Vec::new();
-            for (phase, tip) in [("dry", &first), ("real", &bumped)] {
-                r.git(&["checkout", "--detach", tip]);
-                if carry {
-                    let (passed, ran, wall) = run(tip, previous, &format!("abba-{take}-{phase}"));
-                    previous = Some(passed);
-                    walls.push(wall);
-                    counts.push(ran.len());
-                } else {
-                    let start = std::time::Instant::now();
-                    let mut output = Vec::new();
-                    let result = judge(r.0.path(), &base, tip, &[Check::Lint], None, &mut output);
-                    assert!(
-                        result.is_ok(),
-                        "{result:?}\n{}",
-                        String::from_utf8_lossy(&output)
-                    );
-                    walls.push(start.elapsed().as_secs_f64());
-                    counts.push(4);
-                }
-            }
-            println!(
-                "preflight ABBA {take} carry={carry}: dry_s={:.3} real_s={:.3} pair_s={:.3} packages={counts:?}",
-                walls[0],
-                walls[1],
-                walls.iter().sum::<f64>()
-            );
-        }
     }
 }

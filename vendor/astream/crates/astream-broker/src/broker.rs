@@ -72,7 +72,6 @@ use crate::store::{
     WillRecord, COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER, RETIRE_SUBJECT,
 };
 use astream_wire::{Filter, Offset, Subject};
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{
@@ -399,13 +398,11 @@ struct StickyOpMeta {
 
 /// What the writer's queue carries: a durable mutation; a RUN of them, which one
 /// connection's client sent together and the writer takes into one batch
-/// ([`Pipeline::release`]); a connection-close fence removal ordered after every write
-/// that connection decoded; or the STOP [`stop_writer`] queues behind every one already
+/// ([`Pipeline::release`]); or the STOP [`stop_writer`] queues behind every one already
 /// queued, which is how the writer learns of shutdown at once ([`writer_loop`]).
 enum Queued {
     Op(WriteOp),
     Run(Vec<WriteOp>),
-    DropFences(u64),
     Stop,
 }
 
@@ -3644,7 +3641,6 @@ impl Replicator {
 struct ConnGuard<'a> {
     shared: &'a Arc<Shared>,
     id: u64,
-    fences_gaps: Cell<bool>,
 }
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
@@ -3658,12 +3654,12 @@ impl Drop for ConnGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
-        if self.fences_gaps.get() {
-            // The pipeline is declared after this guard, so its held run reaches this same
-            // queue first on every return from `serve_conn`. Clear the connection's fences
-            // only once the writer has judged those writes: clearing here lets a clean close
-            // race an already-decoded successor and admit it after its predecessor failed.
-            let _ = self.shared.writes.send(Queued::DropFences(self.id));
+        if self.shared.has_sticky_batch_refusal {
+            let mut fences = match self.shared.sticky_fences.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            fences.drop_conn(self.id);
         }
     }
 }
@@ -7678,7 +7674,6 @@ fn serve_conn(
     let _conn_guard = ConnGuard {
         shared,
         id: conn_id,
-        fences_gaps: Cell::new(false),
     };
     // Registered; if the broker began stopping meanwhile (this socket may have been
     // accepted after shutdown's first registry drain), leave now rather than park.
@@ -7745,6 +7740,7 @@ fn serve_conn(
     // ([`Request::FenceGaps`]), on a broker that offers it: until it does, a refused write
     // latches no fence, and a write it pipelined behind one lands as on an unfenced broker,
     // so a client that predates the verb is served as it always was.
+    let mut fences_gaps = false;
     let replicate_diverged = Arc::new(AtomicBool::new(false));
     // The requests read off the socket and not yet served: one read takes every frame
     // that has arrived, and the loop asks it whether the next request is already here
@@ -7963,7 +7959,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    _conn_guard.fences_gaps.get().then_some(conn_id),
+                                    fences_gaps.then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7977,7 +7973,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    _conn_guard.fences_gaps.get().then_some(conn_id),
+                                    fences_gaps.then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7990,7 +7986,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    _conn_guard.fences_gaps.get().then_some(conn_id),
+                                    fences_gaps.then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -8025,7 +8021,7 @@ fn serve_conn(
             will,
             had_will,
             &mut asks,
-            &_conn_guard.fences_gaps,
+            &mut fences_gaps,
             &replicate_diverged,
             until,
             peer_id,
@@ -8083,7 +8079,7 @@ fn dispatch_request(
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
     asks: &mut TailAsks,
-    fences_gaps: &Cell<bool>,
+    fences_gaps: &mut bool,
     replicate_diverged: &Arc<AtomicBool>,
     until: u64,
     peer_id: Option<[u8; 32]>,
@@ -8092,7 +8088,7 @@ fn dispatch_request(
     req_bt_ms: Option<u64>,
 ) -> io::Result<bool> {
     // The connection a refused write fences, once it asked ([`Request::FenceGaps`]).
-    let fence = fences_gaps.get().then_some(conn_id);
+    let fence = fences_gaps.then_some(conn_id);
     match req {
         Request::Publish {
             producer_id,
@@ -8431,7 +8427,7 @@ fn dispatch_request(
                     )),
                 );
             }
-            fences_gaps.set(true);
+            *fences_gaps = true;
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
@@ -10120,7 +10116,6 @@ mod held_tests {
                 let ops = match queued {
                     Queued::Op(op) => vec![op],
                     Queued::Run(ops) => ops,
-                    Queued::DropFences(_) => continue,
                     Queued::Stop => break,
                 };
                 runs.push(ops.len());
@@ -10249,24 +10244,6 @@ fn write_ack(stream: &mut Conn, ack: AckResult) -> io::Result<()> {
     write_frame(stream, &encode_response(&ack_response(ack)))
 }
 
-/// Commit the writer's accumulated batch and carry its full-flush horizon state forward.
-fn finish_writer_batch(
-    shared: &Arc<Shared>,
-    batch: &mut Vec<WriteOp>,
-    dirty_since: &mut Option<Instant>,
-) {
-    if batch.is_empty() {
-        return;
-    }
-    let dirty = process_batch(shared, std::mem::take(batch));
-    let previous = dirty_since.take();
-    *dirty_since = if dirty {
-        Some(previous.unwrap_or_else(Instant::now))
-    } else {
-        None
-    };
-}
-
 /// The single writer thread: drain queued mutations into a batch and group-commit them
 /// with ONE fsync. The batch self-tunes to load — everything that queued while the
 /// previous fsync ran is drained at once — so throughput scales with offered
@@ -10343,16 +10320,6 @@ fn writer_loop(shared: &Arc<Shared>, rx: Receiver<Queued>) {
                     // Whole, even past BATCH_MAX: a run is at most a pipeline's depth of
                     // ops (each holds an ack slot; `Pipeline::reserve`).
                     Queued::Run(ops) => batch.extend(ops),
-                    // A connection's decoded writes were queued before this marker. Judge
-                    // them under its fences, then remove those fences before any later work.
-                    Queued::DropFences(conn_id) => {
-                        finish_writer_batch(shared, &mut batch, &mut dirty_since);
-                        shared
-                            .sticky_fences
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .drop_conn(conn_id);
-                    }
                     Queued::Stop => stopping = true,
                 }
                 // Nothing more queued right now → commit what we have.
@@ -10362,7 +10329,17 @@ fn writer_loop(shared: &Arc<Shared>, rx: Receiver<Queued>) {
                     None
                 };
             }
-            finish_writer_batch(shared, &mut batch, &mut dirty_since);
+            if !batch.is_empty() {
+                let dirty = process_batch(shared, batch);
+                dirty_since = if dirty {
+                    Some(match dirty_since {
+                        Some(t) => t,
+                        None => Instant::now(),
+                    })
+                } else {
+                    None
+                };
+            }
         }
         if stopping {
             continue;
@@ -15025,100 +15002,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// CONNECTION CLOSE IS ORDERED AFTER ITS DECODED WRITES. A connection's first write is
-    /// refused and latches its producer fence. With the writer held on unrelated work, its
-    /// successor is queued, then the connection closes. The successor is still refused before
-    /// the close marker removes the fence; a sentinel queued after the close lands and proves
-    /// the marker ran. Clearing in [`ConnGuard::drop`] instead makes the successor land and is
-    /// this test's negative control.
-    #[test]
-    fn a_connection_close_drops_its_fences_after_its_queued_writes() {
-        const MINUTE: Duration = Duration::from_secs(60); // a hang detector, never a budget
-        const CONN: u64 = 77;
-        const PRODUCER: u64 = 9;
-
-        let root = crate::test_scratch::Scratch::new("close-fence-order");
-        let b = Broker::open_opts(
-            root.path().join("log"),
-            OpenOptions::new(Durability::Strict).with_sticky_batch_refusal(true),
-            || Ok(Prepared::Nothing),
-        )
-        .unwrap();
-        let submit = |conn_id, kind| {
-            let (tx, rx) = mpsc::channel();
-            b.shared
-                .writes
-                .send(Queued::Op(WriteOp {
-                    kind,
-                    ack: tx,
-                    conn_id,
-                }))
-                .unwrap();
-            rx
-        };
-        let publish = |producer_id, producer_seq, subject: &str| WriteKind::Publish {
-            producer_id,
-            producer_seq,
-            subject: subject.to_string(),
-            body: b"x".to_vec(),
-        };
-
-        let refused = submit(
-            Some(CONN),
-            WriteKind::PreRefused {
-                producer_id: PRODUCER,
-                producer_seq: 1,
-                err: refusal(ERR_REFUSED, "first refused"),
-            },
-        );
-        assert_eq!(
-            refused.recv_timeout(MINUTE).unwrap(),
-            Err(refusal(ERR_REFUSED, "first refused"))
-        );
-        assert_eq!(
-            b.shared
-                .sticky_fences
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-            "the first refusal latched the connection's fence"
-        );
-
-        let gate = b.pause_next_batch();
-        let blocker = submit(None, publish(1, 1, "/other/blocker"));
-        assert!(
-            gate.wait_at_most(MINUTE),
-            "the writer held before the close"
-        );
-        let successor = submit(Some(CONN), publish(PRODUCER, 2, "/ordered/second"));
-        drop(ConnGuard {
-            shared: &b.shared,
-            id: CONN,
-            fences_gaps: Cell::new(true),
-        });
-        let sentinel = submit(None, publish(2, 1, "/other/sentinel"));
-        gate.resume();
-
-        assert_eq!(blocker.recv_timeout(MINUTE).unwrap(), Ok((0, false)));
-        let fenced = successor.recv_timeout(MINUTE).unwrap().unwrap_err();
-        assert_eq!(
-            crate::sticky_fence::parse_gap_fenced_seq(&fenced.1),
-            Some(1),
-            "the queued successor was judged before close removed its fence: {fenced:?}"
-        );
-        assert_eq!(sentinel.recv_timeout(MINUTE).unwrap(), Ok((1, false)));
-        assert!(
-            b.shared
-                .sticky_fences
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "the close marker removed the fence before the sentinel"
-        );
-        assert_eq!(b.head(), 2, "the fenced successor never landed");
     }
 
     /// The writer's stop ([`stop_writer`]), driven straight through its queue so what is

@@ -57,6 +57,33 @@ impl Flush {
         }
     }
 
+    /// Finish a write, naming the failed system call while retaining its error as a source.
+    /// # Errors
+    /// The flush's error, with the operation that failed.
+    pub fn file_diagnosed(self, file: &File) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        seam::note(self);
+        let full = |file: &File| {
+            let operation = if cfg!(target_vendor = "apple") && !durable_flushes_are_plain() {
+                "F_FULLFSYNC"
+            } else if cfg!(windows) {
+                "FlushFileBuffers"
+            } else {
+                "fsync"
+            };
+            primitive::full(file).map_err(|error| operation_error(operation, error))
+        };
+        #[cfg(target_vendor = "apple")]
+        if self.is_ordered() {
+            return match astream_sys::barrier_sync(file) {
+                Ok(()) => Ok(()),
+                Err(error) if astream_sys::barrier_refused(&error) => full(file),
+                Err(error) => Err(operation_error("F_BARRIERFSYNC", error)),
+            };
+        }
+        full(file)
+    }
+
     /// Finish a directory-entry change in `dir` with this flush. Windows has no flush of a
     /// directory (one opens as no file to flush: `Access is denied`, os error 5) and NTFS
     /// commits a directory's entries through its own log, so there the flush is only noted.
@@ -65,6 +92,26 @@ impl Flush {
     /// The directory could not be opened, or the flush's own error.
     #[inline]
     pub fn dir(self, dir: &Path) -> io::Result<()> {
+        self.dir_using(dir, |file| self.file(file), |error| error)
+    }
+
+    /// [`Self::dir`] with the failed open or flush operation retained in its error.
+    /// # Errors
+    /// The directory open or flush failed.
+    pub fn dir_diagnosed(self, dir: &Path) -> io::Result<()> {
+        self.dir_using(
+            dir,
+            |file| self.file_diagnosed(file),
+            |error| operation_error("open directory", error),
+        )
+    }
+
+    fn dir_using(
+        self,
+        dir: &Path,
+        flush: impl FnOnce(&File) -> io::Result<()>,
+        open_error: impl FnOnce(io::Error) -> io::Error,
+    ) -> io::Result<()> {
         #[cfg(any(test, debug_assertions, feature = "test-support"))]
         if let Some(failed) = seam::dir_failure() {
             seam::note(self);
@@ -85,11 +132,12 @@ impl Flush {
             std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(NONBLOCK_FLAG)
-                .open(dir)?
+                .open(dir)
+                .map_err(open_error)?
         };
         #[cfg(not(unix))]
-        let opened = File::open(dir)?;
-        self.file(&opened)
+        let opened = File::open(dir).map_err(open_error)?;
+        flush(&opened)
     }
 
     /// [`Flush::dir`] for a writer that goes on where the directory's entries cannot be
@@ -112,6 +160,28 @@ impl Flush {
         } else {
             Self::Durable
         }
+    }
+}
+
+#[derive(Debug)]
+struct OperationError {
+    operation: &'static str,
+    error: io::Error,
+}
+
+fn operation_error(operation: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), OperationError { operation, error })
+}
+
+impl std::fmt::Display for OperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.error)
+    }
+}
+
+impl std::error::Error for OperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -603,6 +673,30 @@ mod tests {
             .prefix("aterm-durable-")
             .tempdir()
             .expect("a scratch directory")
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn diagnosed_flush_keeps_the_failed_system_call_and_errno() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for flush in [Flush::Durable, Flush::Ordered] {
+            let plain = flush.file(&null).unwrap_err();
+            let diagnosed = flush.file_diagnosed(&null).unwrap_err();
+            let failure = diagnosed
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<super::OperationError>()
+                .unwrap();
+            assert_eq!(failure.operation, "F_FULLFSYNC");
+            assert_eq!(failure.error.raw_os_error(), plain.raw_os_error());
+            assert!(failure.error.raw_os_error().is_some());
+        }
+        let dir = scratch();
+        let file = std::fs::File::create(dir.path().join("file")).unwrap();
+        for flush in [Flush::Durable, Flush::Ordered] {
+            flush.file_diagnosed(&file).unwrap();
+            flush.dir_diagnosed(dir.path()).unwrap();
+        }
     }
 
     /// The seam's numbers are this platform's own: [`seam::EIO`] is a failed flush and

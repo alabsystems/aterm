@@ -24,10 +24,10 @@ fn snapshot(load: Option<[f64; 3]>, pressure: Pressure, slots: Option<SlotsView>
             ..CpuView::default()
         }),
         load,
-        avail: Some(96 << 30),
         mem: Some(MemView {
             sample: MemSample {
                 pressure,
+                available: 96 << 30,
                 ..MemSample::default()
             },
             ..MemView::default()
@@ -353,7 +353,9 @@ fn the_machine_terms_are_judged_at_each_look() {
         assert_eq!(read_at_look(&j, "a").room, room, "{pressure:?}");
     }
     let mut low = at(NOW + 1, THREE_ONE_FREE, Pressure::Normal, None, None);
-    low.avail = Some((8 << 30) - 1);
+    if let Some(m) = low.mem.as_mut() {
+        m.sample.available = (8 << 30) - 1;
+    }
     step(&mut j, &low, NOW + 1, &[]);
     assert_eq!(read_at_look(&j, "a").room, Some(false));
 }
@@ -1040,10 +1042,10 @@ fn reread(
     avail_gib: u64,
     age_ms: Option<u64>,
 ) {
-    let snap = Snapshot {
-        avail: Some(avail_gib << 30),
-        ..at(landed_ms, slots, Pressure::Normal, age_ms, None)
-    };
+    let mut snap = at(landed_ms, slots, Pressure::Normal, age_ms, None);
+    if let Some(m) = snap.mem.as_mut() {
+        m.sample.available = avail_gib << 30;
+    }
     j.sample(
         board_of(&snap, Some(landed_ms), Some(Level::Ok), now_ms),
         Some(&snap),

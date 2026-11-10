@@ -40,6 +40,7 @@ fn manual(desk: &Desk, source: Option<&str>, fetch: &Fetch<'_>) -> Result<SyncRe
             allow_empty_pool: false,
         },
     )
+    .map_err(SyncError::into_message)
 }
 
 #[test]
@@ -89,6 +90,7 @@ fn automatic_local_source_bytes_are_rechecked_before_publication() {
         let why = if init {
             sync_accounts_for_init_with(&desk.home, &desk.state, &desk.roster(), NOW, || {}, &fetch)
                 .unwrap_err()
+                .to_string()
         } else {
             manual(&desk, None, &fetch).err().expect("source changed")
         };
@@ -545,7 +547,12 @@ fn a_source_retired_after_capture_cannot_publish_old_rows() {
         },
         &fetch_source_text,
     );
-    assert!(result.unwrap_err().contains("source policy changed"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("source policy changed")
+    );
     assert!(!desk.roster().exists());
     assert_eq!(fs::read_to_string(copy).unwrap(), text);
 }
@@ -966,20 +973,21 @@ fn a_failing_sync_waits_for_its_inputs_to_change() {
 #[test]
 fn a_held_lock_holds_no_retry_back_and_a_new_reason_is_news() {
     let (inputs, other) = ([1; 32], [2; 32]);
-    let held = format!("{} at /state after 8000 ms", accounts::LOCK_HELD);
-    let refused = "no active Claude accounts found for machine `m27` in ai-accounts.csv";
-    let mut failed = None;
-    assert!(
-        note_sync_result(&mut failed, inputs, Err(held.as_str())),
-        "CONTROL"
+    let held = SyncError::retry(
+        Retry::Busy,
+        format!("{} at /state after 8000 ms", accounts::LOCK_HELD),
     );
+    let refused =
+        SyncError::from("no active Claude accounts found for machine `m27` in ai-accounts.csv");
+    let mut failed = None;
+    assert!(note_sync_result(&mut failed, inputs, Err(&held)), "CONTROL");
     assert!(!failed.as_ref().unwrap().holds_back(&inputs), "the lock's");
-    assert!(!note_sync_result(&mut failed, inputs, Err(held.as_str())));
-    assert!(note_sync_result(&mut failed, inputs, Err(refused)), "news");
+    assert!(!note_sync_result(&mut failed, inputs, Err(&held)));
+    assert!(note_sync_result(&mut failed, inputs, Err(&refused)), "news");
     assert!(failed.as_ref().unwrap().holds_back(&inputs));
     assert!(!failed.as_ref().unwrap().holds_back(&other));
-    assert!(!note_sync_result(&mut failed, inputs, Err(refused)));
-    assert!(note_sync_result(&mut failed, other, Err(refused)));
+    assert!(!note_sync_result(&mut failed, inputs, Err(&refused)));
+    assert!(note_sync_result(&mut failed, other, Err(&refused)));
     assert!(!note_sync_result(&mut failed, other, Ok(())));
     assert_eq!(failed, None);
 }

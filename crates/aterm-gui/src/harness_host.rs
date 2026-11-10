@@ -24917,12 +24917,12 @@ fn account_signed_out(
 /// The production [`Acts::memory`].
 pub(crate) fn agent_memory(pid: u32) -> Option<AgentMemory> {
     let group = aterm_sysprobe::group_memory(pid)?;
-    let machine = aterm_sysprobe::machine_memory();
+    let machine = aterm_sysprobe::memory_detail();
     Some(AgentMemory {
         footprint_mib: group.footprint_mib,
         physical_mib: aterm_sysprobe::physical_memory_mib(),
-        available_mib: machine.map(|m| m.available_mib),
-        used_mib: machine.map(|m| m.used_mib),
+        available_mib: machine.map(|m| m.available >> 20),
+        used_mib: machine.map(|m| m.used() >> 20),
         pressure: aterm_sysprobe::memory_pressure().map(pressure_word),
         swap_kib_s: machine_swap_rate(),
         largest_other_mib: None,

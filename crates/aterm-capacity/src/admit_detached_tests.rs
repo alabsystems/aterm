@@ -87,15 +87,15 @@ fn reused_holder_and_credit_pids_cannot_discount_detached_memory() {
         Proc {
             pid: OWNER,
             ppid: 1,
+            charged: 2 * GIB,
             footprint: 2 * GIB,
-            whole: 2 * GIB,
             ..Proc::default()
         },
         Proc {
             pid: CREDIT,
             ppid: 1,
+            charged: 2 * GIB,
             footprint: 2 * GIB,
-            whole: 2 * GIB,
             ..Proc::default()
         },
         Proc {
@@ -154,15 +154,15 @@ fn whole_cohort_reservation_keeps_its_existing_conservative_accounting() {
         Proc {
             pid: OWNER,
             ppid: 1,
+            charged: 2 * GIB,
             footprint: 2 * GIB,
-            whole: 2 * GIB,
             ..Proc::default()
         },
         Proc {
             pid: CREDIT,
             ppid: 1,
+            charged: 2 * GIB,
             footprint: 2 * GIB,
-            whole: 2 * GIB,
             ..Proc::default()
         },
         Proc {

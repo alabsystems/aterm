@@ -18,8 +18,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{
-    Diagnostics, Reads, git, git_lossy, git_offline_answer, is_head, main_ref, unattended_dir,
-    work_status,
+    Diagnostics, Reads, git, git_lossy, git_offline_answer, is_head, unattended_dir, work_status_in,
 };
 
 /// The most checkouts one read lists ([`HomeRepos::cut`] counts those past it).
@@ -145,6 +144,15 @@ fn read_home_in(
     limit: Duration,
     held: &dyn Fn() -> bool,
 ) -> Option<HomeRepos> {
+    read_home_in_counted(home, table, limit, held).map(|(repos, _)| repos)
+}
+
+fn read_home_in_counted(
+    home: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+    limit: Duration,
+    held: &dyn Fn() -> bool,
+) -> Option<(HomeRepos, u32)> {
     let local = |dir: &Path| {
         aterm_sysprobe::volumes::mount_of(dir, table).is_some_and(|m| m.local && !m.automounted)
     };
@@ -181,23 +189,30 @@ fn read_home_in(
     names.sort_unstable();
     let cut = names.len().saturating_sub(HOME_REPOS_MAX);
     names.truncate(HOME_REPOS_MAX);
+    let mut starts = 0_u32;
     // A git that cannot run reads every origin as none: the read could not tell a clone.
     if !names.is_empty() {
         let reads = reads(home, limit, held)?;
         git(home, &["--version"], &reads)?;
+        starts = starts.saturating_add(reads.starts.get());
     }
     let mut repos = Vec::new();
     for name in &names {
-        repos.extend(read_one(home, name, table, limit, held)?);
+        let (repo, one_starts) = read_one(home, name, table, limit, held)?;
+        starts = starts.saturating_add(one_starts);
+        repos.extend(repo);
     }
-    Some(HomeRepos {
-        read_ms: aterm_time::unix_millis().unwrap_or(0),
-        repos,
-        cut,
-    })
+    Some((
+        HomeRepos {
+            read_ms: aterm_time::unix_millis().unwrap_or(0),
+            repos,
+            cut,
+        },
+        starts,
+    ))
 }
 
-/// The checkout `<home>/<name>` ([`read_home`]): `Some(None)` where it is no clone of
+/// The checkout `<home>/<name>` ([`read_home`]): `Some((None, starts))` where it is no clone of
 /// `github.com/<owner>/<name>`, and `None` where the read cannot say whether the home holds it:
 /// its folder did not resolve as one the probe reads ([`unattended_dir`]: [`read_home`] already
 /// left out those it never enters, so this one changed under the read or could not be resolved),
@@ -208,43 +223,41 @@ fn read_one(
     table: &aterm_sysprobe::volumes::Table,
     limit: Duration,
     held: &dyn Fn() -> bool,
-) -> Option<Option<HomeRepo>> {
+) -> Option<(Option<HomeRepo>, u32)> {
     let reads = reads(home, limit, held)?;
     let path = home.join(name);
     let root = unattended_dir(&path, Some(home), table)?;
-    let origin = git(&root, &["config", "--get", "remote.origin.url"], &reads);
-    if reads.cut.get() {
-        return None;
-    }
+    let (origin, own_excludes) = local_config(&root, &reads)?;
     let Some(origin) = origin
         .as_deref()
         .and_then(github_repo)
         .filter(|(_, named)| named.eq_ignore_ascii_case(name))
     else {
-        return Some(None);
+        return Some((None, reads.starts.get()));
     };
-    let head = git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"], &reads)
-        .map(|h| h.trim().to_ascii_lowercase())
-        .filter(|h| is_head(h));
-    let branch = git_lossy(
+    let symbolic = git_lossy(
         &root,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
         &reads,
         Diagnostics::Permit,
     )
     .map(|b| b.trim().to_string())
-    .filter(|b| !b.is_empty() && !b.contains('`') && !b.to_ascii_lowercase().contains(FLEET_CODE));
-    let main = main_ref(&root, &reads);
-    let main_head = main
+    .filter(|b| !b.is_empty());
+    let head_ref = symbolic
         .as_deref()
-        .filter(|full| full.starts_with("refs/"))
-        .and_then(|full| {
-            git_offline_answer(&root, &["rev-parse", "--verify", "--quiet", full], &reads)
-        })
-        .map(|h| h.trim().to_ascii_lowercase())
-        .filter(|h| is_head(h));
-    let behind = match (&head, main.as_deref()) {
-        (Some(_), Some(full)) => git_offline_answer(
+        .filter(|b| !b.contains(['*', '?', '[', '\u{FFFD}']))
+        .map(|b| format!("refs/heads/{b}"));
+    let (mut head, main, main_head) = home_refs(&root, head_ref.as_deref(), &reads);
+    if head_ref.is_none() {
+        head = git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"], &reads)
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| is_head(h));
+    }
+    let branch =
+        symbolic.filter(|b| !b.contains('`') && !b.to_ascii_lowercase().contains(FLEET_CODE));
+    let behind = match (&head, main.as_deref(), &main_head) {
+        (Some(h), Some(_), Some(mh)) if h == mh => Some(0),
+        (Some(_), Some(full), _) => git_offline_answer(
             &root,
             &["rev-list", "--count", &format!("HEAD..{full}")],
             &reads,
@@ -252,30 +265,133 @@ fn read_one(
         .and_then(|n| crate::parse_uint::<u32>(n.trim())),
         _ => None,
     };
-    let dirty = work_status(&root, table, &reads).map(|(status, _)| {
+    let git_dir = root.join(".git");
+    let dirty = work_status_in(
+        &root,
+        table,
+        Some(own_excludes),
+        Some(&git_dir.join("index")),
+        &reads,
+    )
+    .map(|(status, _)| {
         status
             .split('\0')
             .any(|entry| entry.len() > 3 && !entry.starts_with("!!"))
     });
-    Some(Some(HomeRepo {
-        name: name.to_owned(),
-        fetched_ms: fetched_ms(
-            &root.join(".git"),
-            main.as_deref(),
-            main_head.as_deref(),
-            origin,
-        ),
-        path,
-        head,
-        branch,
-        main_ref: main.map(|full| {
-            full.strip_prefix("refs/remotes/")
-                .unwrap_or(&full)
-                .to_owned()
+    Some((
+        Some(HomeRepo {
+            name: name.to_owned(),
+            fetched_ms: fetched_ms(&git_dir, main.as_deref(), main_head.as_deref(), origin),
+            path,
+            head,
+            branch,
+            main_ref: main.map(|full| {
+                full.strip_prefix("refs/remotes/")
+                    .unwrap_or(&full)
+                    .to_owned()
+            }),
+            behind,
+            dirty,
         }),
-        behind,
-        dirty,
-    }))
+        reads.starts.get(),
+    ))
+}
+
+/// Read `remote.origin.url` and whether the repository's own configuration sets a non-empty
+/// `core.excludesFile` in a single `git config` call. Returns `None` when the read was cut.
+fn local_config(root: &Path, reads: &Reads<'_>) -> Option<(Option<String>, bool)> {
+    let out = git(
+        root,
+        &[
+            "config",
+            "--includes",
+            "--null",
+            "--get-regexp",
+            "^(remote\\.origin\\.url|core\\.excludesfile)$",
+        ],
+        reads,
+    );
+    if reads.cut.get() {
+        return None;
+    }
+    let mut origin = None;
+    let mut own_excludes = false;
+    for entry in out.as_deref().unwrap_or_default().split('\0') {
+        let Some((key, value)) = entry.split_once('\n') else {
+            continue;
+        };
+        match key {
+            "remote.origin.url" => origin = Some(value.to_owned()),
+            "core.excludesfile" if !value.trim().is_empty() => own_excludes = true,
+            _ => {}
+        }
+    }
+    Some((origin, own_excludes))
+}
+
+/// Resolve `HEAD` (when `head_ref` names a `refs/heads/<branch>` pattern without glob characters)
+/// and `origin`'s default remote-tracking ref (`refs/remotes/origin/HEAD`, `origin/main`, or
+/// `origin/master`) together with its commit SHA in a single offline `for-each-ref` read.
+fn home_refs(
+    root: &Path,
+    head_ref: Option<&str>,
+    reads: &Reads<'_>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut args = vec![
+        "for-each-ref",
+        "--format=%(refname)%09%(symref)%09%(objecttype)%09%(objectname)%09%(*objecttype)%09%(*objectname)",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+    ];
+    if let Some(head_ref) = head_ref {
+        args.push(head_ref);
+    }
+    let Some(listed) = git_offline_answer(root, &args, reads) else {
+        return (None, None, None);
+    };
+    let commit_of = |kind: &str, oid: &str, peeled_kind: &str, peeled_oid: &str| {
+        let sha = if kind == "commit" {
+            oid
+        } else if peeled_kind == "commit" {
+            peeled_oid
+        } else {
+            return None;
+        };
+        let sha = sha.trim().to_ascii_lowercase();
+        is_head(&sha).then_some(sha)
+    };
+    let mut head = None;
+    let mut origin_head = None;
+    let mut origin_main = None;
+    let mut origin_master = None;
+    for line in listed.lines() {
+        let parts: Vec<&str> = line.splitn(6, '\t').collect();
+        let &[refname, symref, kind, oid, peeled_kind, peeled_oid] = parts.as_slice() else {
+            continue;
+        };
+        let commit = commit_of(kind, oid, peeled_kind, peeled_oid);
+        if head_ref.is_some_and(|want| refname == want) {
+            head = commit.clone();
+        }
+        match refname {
+            "refs/remotes/origin/HEAD" if symref.starts_with("refs/remotes/") => {
+                origin_head = commit.map(|sha| (symref.to_owned(), sha));
+            }
+            "refs/remotes/origin/main" => {
+                origin_main = commit.map(|sha| (refname.to_owned(), sha));
+            }
+            "refs/remotes/origin/master" => {
+                origin_master = commit.map(|sha| (refname.to_owned(), sha));
+            }
+            _ => {}
+        }
+    }
+    let (main, main_head) = origin_head
+        .or(origin_main)
+        .or(origin_master)
+        .map_or((None, None), |(full, sha)| (Some(full), Some(sha)));
+    (head, main, main_head)
 }
 
 /// One checkout's reads under `home`, each with `limit` from the end of the one before it, none

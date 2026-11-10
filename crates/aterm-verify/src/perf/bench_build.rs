@@ -517,8 +517,7 @@ pub(crate) fn load_average() -> String {
 }
 
 pub(crate) fn cpus() -> String {
-    let logical = std::thread::available_parallelism()
-        .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
+    let logical = aterm_capacity::cores();
     match arena::stdout_of(
         crate::exec::check_command(aterm_uds::os_path!("sysctl"))
             .args(["-n", "hw.perflevel0.physicalcpu"]),

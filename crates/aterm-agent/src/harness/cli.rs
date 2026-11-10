@@ -6,6 +6,7 @@
 //! its report (`docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8), and `upgrade`, the one verb
 //! that acts on a live session ([`super::upgrade_drive`]).
 
+use super::account_sync_error::SyncError;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
@@ -9354,7 +9355,7 @@ fn accounts_refusal(path: &Path, why: &str) -> String {
 }
 
 /// Why `cli`'s store cannot be opened: another CLI's logins live under the owner's home ([`Env::accounts_store_for`]).
-fn no_home_for(cli: Cli) -> String {
+pub(super) fn no_home_for(cli: Cli) -> String {
     format!(
         "no home directory is known ($HOME is unset or relative), so {}'s logins have no place \
          (~/.aterm/logins/{})",
@@ -12799,16 +12800,28 @@ fn run_accounts_add(
 ) -> ExitCode {
     // A name the lab knows, given with no address, is that account asked for by name (§0): it
     // joins this roster under the lab's label, and no preference is written.
-    let from_lab = match (asked.email.is_none() && asked.identity_email.is_none())
-        .then(|| super::alab_roster::asked_row(cli, &asked.label))
-        .flatten()
+    if let (Some(path), Some(store)) = (env.accounts_roster_for(cli), env.accounts_store_for(cli))
+        && store.sync_needs_recovery()
+        && let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, &path)
     {
-        None => None,
-        Some(Ok(row)) => Some(accounts::Row {
-            browser: asked.browser.clone().or(row.browser.clone()),
-            ..row
-        }),
-        Some(Err(why)) => {
+        let _ = writeln!(err, "aterm harness accounts add: {why}");
+        return ExitCode::FAILURE;
+    }
+    let captured = if asked.email.is_none() && asked.identity_email.is_none() {
+        super::accounts_sync::capture_native_named_account(env, cli, &asked.label)
+    } else {
+        Ok(None)
+    };
+    let (from_lab, guard) = match captured {
+        Ok(None) => (None, None),
+        Ok(Some((row, guard))) => (
+            Some(accounts::Row {
+                browser: asked.browser.clone().or(row.browser.clone()),
+                ..row
+            }),
+            Some(guard),
+        ),
+        Err(why) => {
             let _ = writeln!(
                 err,
                 "aterm harness accounts add: {why}; nothing was written"
@@ -12819,9 +12832,16 @@ fn run_accounts_add(
     let asked = from_lab.as_ref().unwrap_or(asked);
     let (label, class) = (asked.label.as_str(), asked.class);
     let _ends = WindowEnds::hold();
-    match accounts_add(cli, env, asked, &|| !window_end_noted(), &mut |position| {
-        let _ = writeln!(out, "{}: {}", asked.label, signin_queue_words(position));
-    }) {
+    match accounts_add_admitted(
+        cli,
+        env,
+        asked,
+        &|| !window_end_noted(),
+        &mut |position| {
+            let _ = writeln!(out, "{}: {}", asked.label, signin_queue_words(position));
+        },
+        guard.as_ref(),
+    ) {
         Ok(added) => {
             if added.listed_own {
                 let _ = writeln!(
@@ -12858,9 +12878,6 @@ fn run_accounts_add(
                      as it is: a login made under this name before is this account's again"
                 );
             }
-            if let Some(why) = &added.unwoken {
-                let _ = writeln!(err, "aterm harness accounts add: {why}");
-            }
             let _ = writeln!(
                 out,
                 "run: {}",
@@ -12882,8 +12899,6 @@ struct Added {
     dir_held_files: bool,
     /// The fleet files the row was listed in too, so the next sync keeps it.
     fleets: Vec<PathBuf>,
-    /// Why a running aterm was not woken for the new row ([`wake_for_roster`]), if it was not.
-    unwoken: Option<String>,
 }
 
 fn file_mode(path: &Path) -> Option<u32> {
@@ -12927,12 +12942,13 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
         project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
     )
 )]
-fn accounts_add(
+fn accounts_add_admitted(
     cli: Cli,
     env: &Env,
     asked: &accounts::Row,
     current: &dyn Fn() -> bool,
     queued: &mut dyn FnMut(accounts::SigninPosition),
+    source: Option<&super::alab_roster::ReceiptGuard>,
 ) -> Result<Added, String> {
     let label = asked.label.as_str();
     if let Some(why) = accounts::label_refusal(label) {
@@ -12972,8 +12988,10 @@ fn accounts_add(
         .acquire_bounded()
         .map_err(|e| format!("{}: {e}", store.dir.display()))?
         .ok_or_else(|| accounts::LOCK_HELD.to_string())?;
+    store.recover_sync_held(&_held, &path)?;
     let (write_to, keep_mode) = roster_target(&path)?;
-    let existing = accounts::roster_text(&write_to)?.unwrap_or_default();
+    let before = accounts::roster_text(&write_to)?;
+    let existing = before.clone().unwrap_or_default();
     let roster = Roster::parse_for(cli, &existing).map_err(|why| {
         format!(
             "the roster at {} is REFUSED: {why}; nothing was written",
@@ -13011,7 +13029,11 @@ fn accounts_add(
         dir: Some(dir_text.to_owned()),
         ..asked.clone()
     };
-    let fleets = fleet_rows_for_write(cli, env, &path, &asked)?;
+    let fleets = if source.is_some() {
+        Vec::new()
+    } else {
+        fleet_rows_for_write(cli, env, &path, &asked)?
+    };
     let rows = if listed_own {
         vec![own, asked]
     } else {
@@ -13030,48 +13052,44 @@ fn accounts_add(
         }
     })?;
     let dir_held_files = accounts::login_made(&dir);
-    aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
-        .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(&dir))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
     // The fleet first: a fleet that lists the row and a roster that does not yet is mended by
     // the next sync, never the other way round.
-    write_fleet_rows(&fleets).map_err(|why| {
-        format!(
-            "{why}; the roster is unchanged (the login directory {} was made)",
-            dir.display()
+    store
+        .transact_roster_prepared_held(
+            &_held,
+            env.now,
+            &mut None,
+            accounts::SyncTarget {
+                path: &write_to,
+                before: before.as_deref(),
+                after: Some(&text),
+                mode: keep_mode,
+                fleet: None,
+            },
+            false,
+            (source, || {
+                write_fleet_rows(&fleets).map_err(|why| format!("{why}; the roster is unchanged"))
+            }),
         )
-    })?;
-    super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode).map_err(|e| {
-        format!(
-            "{}: {e}; the roster is unchanged (the login directory {} was made)",
-            write_to.display(),
-            dir.display()
-        )
-    })?;
-    let unwoken = wake_for_roster(&store);
+        .map_err(SyncError::into_message)?;
     Ok(Added {
         roster: path,
         dir,
         listed_own,
         dir_held_files,
         fleets: fleets.into_iter().map(|(fleet, _)| fleet).collect(),
-        unwoken,
     })
 }
 
-/// Wakes a running aterm's host for the roster this command has just written, as a sync wakes
-/// it ([`accounts::Store::touch_wake`]): a session waiting on a login hears of the new row at
-/// once, instead of at the host's next look at the roster's bytes, up to a minute later (which
-/// is how a row written by hand still reaches it). `Some(why)` when the marker could not be
-/// written: the roster stands, and that look still finds the row.
-fn wake_for_roster(store: &accounts::Store) -> Option<String> {
-    store.touch_wake().err().map(|why| {
-        format!(
-            "the roster is written, but the wake marker {} could not be replaced ({why}): a running \
-             aterm finds the new row at its next look, within a minute",
-            store.wake_path().display()
-        )
-    })
+#[cfg(test)]
+fn accounts_add(
+    cli: Cli,
+    env: &Env,
+    asked: &accounts::Row,
+    current: &dyn Fn() -> bool,
+    queued: &mut dyn FnMut(accounts::SigninPosition),
+) -> Result<Added, String> {
+    accounts_add_admitted(cli, env, asked, current, queued, None)
 }
 
 /// Take the sign-in lock before the writer lock, as a managed renewal does.
@@ -13203,7 +13221,7 @@ fn signin_records_ready(
 ) -> bool {
     match store
         .recover_sync_within(&accounts::LOCK_LADDER, roster)
-        .and_then(|_| store.check_signin_state(now))
+        .and_then(|_| store.check_signin_state(now).map_err(Into::into))
     {
         Ok(()) => true,
         Err(why) => {
@@ -13988,7 +14006,7 @@ fn run_accounts_adopt(
     err: &mut dyn Write,
 ) -> ExitCode {
     let _ends = WindowEnds::hold();
-    let done = (|| -> Result<(PathBuf, Option<String>), String> {
+    let done = (|| -> Result<PathBuf, String> {
         let path = env.accounts_roster_for(cli).ok_or_else(|| {
             format!(
                 "no config directory is known, so there is no {} to write; name one with \
@@ -14050,7 +14068,10 @@ fn run_accounts_adopt(
             .acquire_bounded()
             .map_err(|e| format!("{}: {e}", store.dir.display()))?
             .ok_or_else(|| accounts::LOCK_HELD.to_string())?;
-        let existing = accounts::roster_text(&path)?.unwrap_or_default();
+        store.recover_sync_held(&_held, &path)?;
+        let (write_to, keep_mode) = roster_target(&path)?;
+        let before = accounts::roster_text(&write_to)?;
+        let existing = before.clone().unwrap_or_default();
         let roster = Roster::parse_for(cli, &existing).map_err(|why| {
             format!(
                 "the roster at {} is REFUSED: {why}; nothing was written",
@@ -14075,26 +14096,24 @@ fn run_accounts_adopt(
         let text = accounts::append_rows_for(cli, &existing, std::slice::from_ref(row))?;
         let fleets = fleet_rows_for_write(cli, env, &path, row)?;
         check_native()?;
-        let (write_to, keep_mode) = roster_target(&path)?;
-        write_fleet_rows(&fleets).map_err(|why| {
-            format!("{why}; the local roster is unchanged; any source files already written are retained for sync")
-        })?;
-        check_native()?;
-        super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
-            .map_err(|e| format!("{}: {e}; the roster is unchanged", write_to.display()))?;
-        Ok((path, wake_for_roster(&store)))
+        store.transact_roster_prepared_held(&_held, env.now, &mut None, accounts::SyncTarget {
+            path: &write_to, before: before.as_deref(), after: Some(&text), mode: keep_mode, fleet: None,
+        }, false, (None, || {
+            write_fleet_rows(&fleets).map_err(|why| {
+                format!("{why}; the local roster is unchanged; any source files already written are retained for sync")
+            })?;
+            check_native()
+        })).map_err(SyncError::into_message)?;
+        Ok(path)
     })();
     match done {
-        Ok((path, unwoken)) => {
+        Ok(path) => {
             let _ = writeln!(
                 out,
                 "listed `{}` (preferred): this machine's own login, in {}",
                 row.label,
                 path.display()
             );
-            if let Some(why) = unwoken {
-                let _ = writeln!(err, "aterm harness accounts adopt-default: {why}");
-            }
             if cli == Cli::Claude {
                 let _ = writeln!(
                     out,

@@ -9,7 +9,7 @@
 //! M4 Pro, a Trust lane check held a 16 GiB claim while its trustc's footprint was 33 GB, 25 GiB
 //! of it compressed; `aterm pkg capacity` said its holder's tree held 9.3 GiB, and each of the 26
 //! claims waiting behind it that it held 6.7 GiB of memory. What a tree holds whole
-//! ([`TreeUse::whole`]) is reckoned here against what its holder claimed, and both lines that
+//! ([`TreeUse::footprint`]) is reckoned here against what its holder claimed, and both lines that
 //! name a held claim say where it is past it: a waiter's ([`crate::Holder`]) and `aterm pkg
 //! capacity`'s. No reservation changes.
 
@@ -31,9 +31,9 @@ pub const TENTH: u64 = GIB / 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Overrun {
     /// What its tree, with the processes its held claims are credited with, holds whole,
-    /// compressed and swapped pages included ([`TreeUse::whole`]).
+    /// compressed and swapped pages included ([`TreeUse::footprint`]).
     pub holds: u64,
-    /// What of [`Self::holds`] its claims' reservations count ([`TreeUse::footprint`]).
+    /// What of [`Self::holds`] its claims' reservations count ([`TreeUse::charged`]).
     pub counted: u64,
     /// The memory its held claims claim now ([`crate::Need::mem_now`]: a stepped claim's step),
     /// summed.
@@ -107,15 +107,15 @@ pub(crate) fn overruns_of(others: &[Other<'_>]) -> HashMap<u32, Overrun> {
             && o.record.need.mem > 0
     }) {
         let sum = out.entry(o.record.pid).or_insert(Overrun {
-            holds: o.used.whole.max(o.used.footprint),
-            counted: o.used.footprint,
+            holds: o.used.footprint.max(o.used.charged),
+            counted: o.used.charged,
             claimed: 0,
             claims: 0,
         });
         sum.holds = sum
             .holds
-            .saturating_add(o.credited.whole.max(o.credited.footprint));
-        sum.counted = sum.counted.saturating_add(o.credited.footprint);
+            .saturating_add(o.credited.footprint.max(o.credited.charged));
+        sum.counted = sum.counted.saturating_add(o.credited.charged);
         sum.claimed = sum.claimed.saturating_add(o.record.need.mem_now());
         sum.claims += 1;
     }

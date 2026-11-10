@@ -2411,17 +2411,6 @@ pub fn resident_size(pid: i32) -> Option<u64> {
     rusage(pid).map(|info| info.ri_resident_size)
 }
 
-/// The CPU time `pid` (> 1) has used, user and system together, in the kernel's own units
-/// (`ri_user_time` plus `ri_system_time`): a count that grows while the process runs, read
-/// only for its growth.
-#[must_use]
-pub fn cpu_used(pid: i32) -> Option<u64> {
-    if pid <= 1 {
-        return None;
-    }
-    rusage(pid).map(|info| info.ri_user_time.saturating_add(info.ri_system_time))
-}
-
 struct WholeMap {
     addr: *mut libc::c_void,
     len: usize,

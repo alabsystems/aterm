@@ -80,7 +80,7 @@ fn refused_empty_pool_fleet_publication_preserves_account_state() {
     .err()
     .expect("a directory cannot be published as the fleet file");
     assert!(
-        error.contains("fleet") || error.contains("regular"),
+        error.to_string().contains("fleet") || error.to_string().contains("regular"),
         "{error}"
     );
     assert_eq!(
@@ -1278,6 +1278,59 @@ fn a_notes_x_names_no_vendor_so_x_banned_drops_every_pool() {
         [1, 0, 1],
         "CONTROL: a note naming Grok Build drops its membership alone"
     );
+}
+
+#[test]
+fn provider_sync_recovers_missing_login_directories_with_unchanged_roster_bytes() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+
+    let _source = TestSourceOverride::new(SourceSnapshot::Absent);
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi, Cli::Agy] {
+        let bed = Bed::new("provider-directory-recovery");
+        bed.keep_roster(cli);
+        let region = if cli == Cli::Kimi {
+            "region='global'\n"
+        } else {
+            ""
+        };
+        bed.secret(
+            &cli_fleet_file(cli),
+            &format!(
+                "[[account]]\nlabel='repair'\nemail='repair@example.test'\nmachines=['m16']\n{region}"
+            ),
+        );
+        assert!(matches!(bed.sync(cli, None).unwrap(), CliSync::Synced(_)));
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        let directory = store.login_dir("repair").unwrap();
+        let roster = fs::read(bed.roster(cli)).unwrap();
+        let secrets = Bed::tree(&bed.secrets());
+        // Only this fixture's empty directory is removed; all account images remain.
+        fs::remove_dir(&directory).unwrap();
+        accounts::SYNC_COMMIT_CUT.with(|cut| cut.set(Some(0)));
+        let interrupted = bed.sync(cli, None);
+        accounts::SYNC_COMMIT_CUT.with(|cut| cut.set(None));
+        assert!(
+            interrupted.unwrap_err().contains("injected interruption"),
+            "{cli:?}: missing directory bypassed receipt publication"
+        );
+        assert!(!directory.exists());
+        assert!(store.sync_needs_recovery());
+        assert_eq!(fs::read(bed.roster(cli)).unwrap(), roster);
+        let CliSync::Synced(recovered) = bed.sync(cli, None).unwrap() else {
+            panic!("{cli:?}: recovery did not return a synced roster");
+        };
+        assert!(recovered.changed);
+        assert!(directory.is_dir());
+        assert!(!store.sync_needs_recovery());
+        assert_eq!(fs::read(bed.roster(cli)).unwrap(), roster);
+        assert_eq!(Bed::tree(&bed.secrets()), secrets);
+        let before_noop = Bed::tree(bed._dir.path());
+        let CliSync::Synced(unchanged) = bed.sync(cli, None).unwrap() else {
+            panic!("{cli:?}: repeated sync did not return a synced roster");
+        };
+        assert!(!unchanged.changed);
+        assert_eq!(Bed::tree(bed._dir.path()), before_noop);
+    }
 }
 
 /// A CLI'S SYNC writes its roster beside `aterm.toml` (`accounts-kimi.toml`) and its logins'

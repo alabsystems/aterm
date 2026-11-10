@@ -411,6 +411,10 @@ pub struct MemSample {
     pub cached: u64,
     /// Free memory in bytes (speculative pages excluded on macOS).
     pub free: u64,
+    /// Available memory in bytes: what the kernel can hand out now without paging, as the OS
+    /// reader counts it (`aterm_sysprobe::MemoryDetail::available`). Not a VM class: it overlaps
+    /// [`Self::free`], [`Self::cached`] and, on a Mac, what compressing idle anonymous pages frees.
+    pub available: u64,
     /// Swap in use.
     pub swap_used: u64,
     /// Swap allocated.
@@ -419,8 +423,9 @@ pub struct MemSample {
     pub pressure: Pressure,
     /// The VM's counters, where read.
     pub counters: Option<MemCounters>,
-    /// Kernel-reported available memory percentage (`kern.memorystatus_level` on macOS).
-    pub kernel_available_pct: Option<u8>,
+    /// macOS's `kern.memorystatus_level` percentage (`aterm_sysprobe::MemoryDetail::memorystatus_level_pct`):
+    /// the kernel's own figure, which counts the active queue too, so not [`Self::available`].
+    pub memorystatus_level_pct: Option<u8>,
     /// The commit charge against its limit, where the OS keeps one.
     pub commit: Option<CommitSample>,
     /// The classes partition the memory the VM manages (macOS), so [`Self::not_in_vm`] is the
@@ -482,27 +487,14 @@ impl MemSample {
         self.total.saturating_sub(self.in_vm())
     }
 
-    /// Memory in use (`app + wired + compressed`), capped at `total`.
+    /// Memory in use (`app + wired + compressed`), capped at `total`: the reader's
+    /// `aterm_sysprobe::MemoryDetail::used`, whose shared memory [`Self::app`] holds.
     #[must_use]
     pub fn used(&self) -> u64 {
         self.app
             .saturating_add(self.wired)
             .saturating_add(self.compressed.unwrap_or(0))
             .min(self.total)
-    }
-
-    /// Free memory plus reclaimable file cache, bounded by the physical bytes not in use.
-    /// Sparse samples that omit both classes leave this unread; unclassified bytes are excluded.
-    #[must_use]
-    pub fn available(&self) -> Option<u64> {
-        if self.total == 0 || (self.free == 0 && self.cached == 0 && self.used() < self.total) {
-            return None;
-        }
-        Some(
-            self.free
-                .saturating_add(self.cached)
-                .min(self.total.saturating_sub(self.used())),
-        )
     }
 }
 
@@ -530,25 +522,26 @@ pub struct GpuSample {
     pub unified: bool,
 }
 
-/// The volume a path lives on, bytes.
+/// The volume a path lives on, bytes (`aterm_sysprobe::VolumeReading`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VolumeSample {
     /// Capacity.
     pub total: u64,
-    /// Free blocks.
+    /// Free: what this user may still write (`f_bavail`).
     pub free: u64,
-    /// Free to this user (what a write can use).
-    pub available: u64,
+    /// Free blocks the volume keeps back from this user (`f_bfree − f_bavail`, an ext4 root
+    /// reserve), never in [`Self::free`].
+    pub reserved: u64,
     /// Where it is mounted.
     pub mount: String,
 }
 
 impl VolumeSample {
-    /// Bytes used: capacity less what this user could still write, so free blocks the volume
-    /// reserves from this user count as used, as the Disk row's % does.
+    /// Bytes used: capacity less what this user could still write ([`Self::free`]), so free
+    /// blocks the volume reserves from this user count as used, as the Disk row's % does.
     #[must_use]
     pub fn used(&self) -> u64 {
-        self.total.saturating_sub(self.available)
+        self.total.saturating_sub(self.free)
     }
 }
 
@@ -2376,8 +2369,6 @@ pub struct Snapshot {
     pub ane: Option<Result<AneSample, AneCheck>>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
-    /// Immediately available memory in bytes (free + inactive + purgeable), set by the host.
-    pub avail: Option<u64>,
     /// Build-slot occupancy, set by the host after [`Vitals::absorb`].
     pub slots: Option<SlotsView>,
     /// Age of [`Self::slots`] in ms relative to this snapshot (`None` if sampled together).
@@ -3858,7 +3849,6 @@ impl Vitals {
             thermal: s.thermal,
             ane: s.ane,
             load: s.load,
-            avail: None,
             slots: None,
             slots_age_ms: None,
             slot_tabs: None,
@@ -4446,7 +4436,7 @@ impl Rows {
         let vol = s.volume.as_ref().filter(|v| v.total > 0);
         if let Some(v) = vol {
             self.caps[Disk.index()] = Some(v.total as f64);
-            self.free.note_on(&v.mount, v.total, t, v.available);
+            self.free.note_on(&v.mount, v.total, t, v.free);
         }
         self.rings[Disk.index()].push(t, vol.map(|v| v.used() as f64), false);
         if let Some(v) = vol {
@@ -4461,8 +4451,8 @@ impl Rows {
             let filling_for = self.filling_since.map_or(0, |t| {
                 i64::try_from(stamp.mono_ms.saturating_sub(t)).unwrap_or(i64::MAX)
             });
-            let ttf = history::time_to_full(v.available, facts.disk_rates.rate60, filling_for);
-            facts.filling = history::filling(v.available, &facts.disk_rates, ttf);
+            let ttf = history::time_to_full(v.free, facts.disk_rates.rate60, filling_for);
+            facts.filling = history::filling(v.free, &facts.disk_rates, ttf);
         }
 
         let (rx, tx, net) = self.absorb_links(s, stamp, &mut facts);
@@ -6219,40 +6209,11 @@ mod tests {
             ..MemSample::default()
         };
         assert_eq!(m.used(), 10);
-        assert_eq!(m.available(), Some(0));
         let unread = MemSample {
             compressed: None,
             ..m
         };
         assert_eq!(unread.used(), 9);
-        assert_eq!(
-            unread.available(),
-            None,
-            "sparse samples do not report free or cache"
-        );
-        let known = MemSample {
-            total: 100,
-            app: 30,
-            wired: 10,
-            compressed: Some(10),
-            free: 5,
-            cached: 15,
-            ..MemSample::default()
-        };
-        assert_eq!(
-            known.available(),
-            Some(20),
-            "the unclassified remainder is excluded"
-        );
-        let overlapping = MemSample {
-            free: u64::MAX,
-            ..known
-        };
-        assert_eq!(
-            overlapping.available(),
-            Some(50),
-            "available cannot overlap used bytes"
-        );
         assert_eq!(gib(1 << 30), 1.0);
     }
 
@@ -6328,7 +6289,7 @@ mod tests {
             volume: Some(VolumeSample {
                 total: 2_000_000_000_000,
                 free: 1_000_000_000_000,
-                available: 1_000_000_000_000,
+                reserved: 0,
                 mount: "/".into(),
             }),
             procs: Some(vec![
@@ -8222,7 +8183,7 @@ mod tests {
             volume: Some(VolumeSample {
                 total: 2_000_000_000_000,
                 free: available,
-                available,
+                reserved: 0,
                 mount: "/".into(),
             }),
             disk: facts,

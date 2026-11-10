@@ -532,8 +532,8 @@ fn proc(pid: u32, ppid: u32) -> Proc {
     Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,

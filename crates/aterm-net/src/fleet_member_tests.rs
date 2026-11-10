@@ -12705,3 +12705,73 @@ fn reasons_typed_by_producer() {
         "a refusal is not a silence"
     );
 }
+
+#[test]
+fn header_only_pushed_facts_admission_and_batched_slice_pruning_match_full_admission() {
+    let state = State::new("header-only-admitted");
+    let n1 = node_of(0x81);
+    let n2 = node_of(0x82);
+    let k1 = identity(&n1, 0x81).key();
+    let k2 = identity(&n2, 0x82).key();
+    let p1 = Peer {
+        key: Some(k1),
+        ..joined(0x81, "m81.local", [10, 0, 0, 81], 7100)
+    };
+    let p2 = Peer {
+        key: Some(k2),
+        ..joined(0x82, "m82.local", [10, 0, 0, 82], 7100)
+    };
+
+    store_pushed_facts_with_key(state.dir(), &n1, Some(k1), "survey 81\n").unwrap();
+    store_pushed_facts_with_key(state.dir(), &n2, Some(k2), "survey 82\n").unwrap();
+
+    let peers = vec![p1.clone(), p2.clone()];
+    assert!(all_pushed_facts_admitted(state.dir(), &peers, &[], None));
+
+    // Negative control 1: denied node makes `all_pushed_facts_admitted` false without touching payload.
+    assert!(!all_pushed_facts_admitted(
+        state.dir(),
+        &peers,
+        std::slice::from_ref(&n2),
+        None
+    ));
+
+    // Negative control 2: held-out key in `MemberKeys` makes `all_pushed_facts_admitted` false.
+    let held_out: MemberKeys = [(k2, Standing::Out("revoked".to_owned()))]
+        .into_iter()
+        .collect();
+    assert!(!all_pushed_facts_admitted(
+        state.dir(),
+        &peers,
+        &[],
+        Some(&held_out)
+    ));
+
+    // Negative control 3: unreadable log admits nothing.
+    let unread = MemberKeys::unreadable("log unreadable");
+    assert!(!all_pushed_facts_admitted(
+        state.dir(),
+        &peers,
+        &[],
+        Some(&unread)
+    ));
+
+    // Batched `prune_pushed_facts_peer_slices` across multiple slices removes the held-out peer's
+    // cached facts in a single pass, after which `all_pushed_facts_admitted` is true again.
+    let slice_a = std::slice::from_ref(&p1);
+    let slice_b = std::slice::from_ref(&p2);
+    prune_pushed_facts_peer_slices(state.dir(), &[slice_a, slice_b], &[], Some(&held_out));
+    assert!(all_pushed_facts_admitted(
+        state.dir(),
+        &peers,
+        &[],
+        Some(&held_out)
+    ));
+    assert_eq!(
+        read_admitted_pushed_facts(state.dir(), &peers, &[], Some(&held_out))
+            .into_iter()
+            .map(|r| r.node)
+            .collect::<Vec<_>>(),
+        vec![n1]
+    );
+}

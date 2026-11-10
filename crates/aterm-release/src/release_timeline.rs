@@ -6,7 +6,7 @@
 //! events in `transcript.log`, step 4's `qualify-branch` events there (each branch's start, its
 //! staging push and its end, and the log it wrote), and in every step log the
 //! `step-child-finished` record of each
-//! child (`wait4`'s CPU and peak), verify's `stage-started`/`stage-finished`, the slices'
+//! child (sampled descendant CPU, starvation and peak), verify's `stage-started`/`stage-finished`, the slices'
 //! `build-child-finished`, `compile-finished`, the inputs seal's `inputs`, verify's `disk`
 //! record and the publish step's `publish-line` arrivals. An image continued through the
 //! in-place exec counts the preceding image's seal calls and walks with its own. The legacy
@@ -46,12 +46,12 @@ struct QualifyRow {
     execution_s: Option<u64>,
 }
 
-/// One `step-child-finished` record: the log it was in, when the child ended, and what `wait4`
-/// booked for it.
+/// One `step-child-finished` record: its log, end and observed resources.
 struct ChildRow {
     log: String,
     ended_at_unix_ms: Option<u64>,
     cpu_s: Option<f64>,
+    starved_s: Option<f64>,
     peak_bytes: Option<u64>,
 }
 
@@ -85,6 +85,7 @@ impl QualifyRow {
 #[derive(Default)]
 struct ChildTotals {
     cpu_s: Option<f64>,
+    starved_s: Option<f64>,
     peak_bytes: Option<u64>,
     children: u64,
 }
@@ -199,6 +200,7 @@ impl Timeline {
                 };
                 totals.children += 1;
                 add_f(&mut totals.cpu_s, event["child_cpu"]["observed_s"].as_f64());
+                add_f(&mut totals.starved_s, event["starved_s"].as_f64());
                 if let Some(peak) = event["peak_bytes"].as_u64() {
                     totals.peak_bytes = Some(totals.peak_bytes.map_or(peak, |p| p.max(peak)));
                 }
@@ -207,6 +209,7 @@ impl Timeline {
                         log: log.to_owned(),
                         ended_at_unix_ms: event["ended_at_unix_ms"].as_u64(),
                         cpu_s: event["child_cpu"]["observed_s"].as_f64(),
+                        starved_s: event["starved_s"].as_f64(),
                         peak_bytes: event["peak_bytes"].as_u64(),
                     });
                 }
@@ -420,6 +423,7 @@ impl Timeline {
             let total = &mut totals[index];
             total.children += 1;
             add_f(&mut total.cpu_s, child.cpu_s);
+            add_f(&mut total.starved_s, child.starved_s);
             if let Some(peak) = child.peak_bytes {
                 total.peak_bytes = Some(total.peak_bytes.map_or(peak, |old| old.max(peak)));
             }
@@ -433,7 +437,7 @@ impl Timeline {
                     "started_at_unix_s": row.started_at_unix_s,
                     "push_began_at_unix_s": row.push_began_at_unix_s,
                     "ended_at_unix_s": row.ended_at_unix_s, "execution_s": row.execution_s,
-                    "cpu_s": totals.cpu_s, "peak_bytes": totals.peak_bytes,
+                    "cpu_s": totals.cpu_s, "starved_s": totals.starved_s, "peak_bytes": totals.peak_bytes,
                     "children": totals.children,
                 })
             })
@@ -688,6 +692,10 @@ impl Timeline {
                     (
                         "cpu_s".to_owned(),
                         aterm_json::Value::from(children.and_then(|c| c.cpu_s)),
+                    ),
+                    (
+                        "starved_s".to_owned(),
+                        aterm_json::Value::from(children.and_then(|c| c.starved_s)),
                     ),
                     (
                         "peak_bytes".to_owned(),
@@ -1179,7 +1187,8 @@ mod tests {
                 "release-event: {}\n",
                 aterm_json::json!({"schema": 1, "event": "step-child-finished",
                     "step": "qualify", "exit_code": 0, "ended_at_unix_ms": ended_ms,
-                    "child_cpu": {"observed_s": cpu}, "peak_bytes": (cpu as u64) << 20})
+                    "child_cpu": {"observed_s": cpu}, "starved_s": cpu / 10.0,
+                    "peak_bytes": (cpu as u64) << 20})
             )
         };
         let transcript = [
@@ -1221,8 +1230,10 @@ mod tests {
         assert_eq!(row("build", 0)["outcome"].as_str(), Some("stopped"));
         assert_eq!(row("build", 0)["execution_s"].as_u64(), Some(591));
         assert_eq!(row("build", 0)["cpu_s"].as_f64(), Some(320.0), "{value}");
+        assert_eq!(row("build", 0)["starved_s"].as_f64(), Some(32.0), "{value}");
         assert_eq!(row("build", 0)["peak_bytes"].as_u64(), Some(300 << 20));
         assert_eq!(row("build", 1)["cpu_s"].as_f64(), Some(50.0), "{value}");
+        assert_eq!(row("build", 1)["starved_s"].as_f64(), Some(5.0), "{value}");
         assert_eq!(
             row("export", 0)["push_began_at_unix_s"].as_u64(),
             Some(1300)

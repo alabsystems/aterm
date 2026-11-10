@@ -7,6 +7,47 @@ use super::*;
 use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
 use aterm_spec::interp::State;
 
+#[test]
+fn pending_default_provider_receipt_bypasses_an_identical_input_hold() {
+    let _source = TestSourceOverride::new(SourceSnapshot::Absent);
+    let bed = Bed::new("default-recovery-hold");
+    bed.secret(
+        &cli_fleet_file(Cli::Codex),
+        "[[account]]\nlabel='new'\nemail='new@example.test'\nmachines=['m16']\n",
+    );
+    let store = accounts::Store::at_for(&bed.state, Cli::Codex, &bed.home);
+    accounts::SYNC_COMMIT_CUT.with(|cut| cut.set(Some(0)));
+    let interrupted = bed.sync(Cli::Codex, None);
+    accounts::SYNC_COMMIT_CUT.with(|cut| cut.set(None));
+    assert!(interrupted.is_err());
+    assert!(store.sync_needs_recovery());
+    assert!(!bed.roster(Cli::Codex).exists());
+    let inputs = cli_sync_inputs(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml());
+    let rediscovery = std::sync::Mutex::new(Rediscovery {
+        default_held: BTreeMap::from([(Cli::Codex, (inputs, Instant::now()))]),
+        ..Rediscovery::default()
+    });
+    assert!(default_sync_holds(&rediscovery, Cli::Codex, &inputs));
+    let cooldown = std::sync::Mutex::new(None);
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let fx = super::super::login_tests::upkeep_effects(
+        &read_named,
+        &spawn,
+        &cooldown,
+        &rediscovery,
+        &guard,
+    );
+    upkeep_pools(
+        &bed.home,
+        &bed.state,
+        (&bed.roster(Cli::Claude), NOW, UpkeepStep::Sync),
+        &fx,
+    );
+    assert!(!store.sync_needs_recovery());
+    assert!(bed.rows(Cli::Codex).iter().any(|row| row.label == "new"));
+}
+
 pub(crate) fn transition(state: &State, action: &str) -> State {
     transition_with_early_roster(state, action, false)
 }

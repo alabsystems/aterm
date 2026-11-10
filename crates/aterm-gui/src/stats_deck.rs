@@ -4871,7 +4871,7 @@ pub(crate) mod tests {
             volume: Some(VolumeSample {
                 total: 2_000_000_000_000,
                 free: 1_810_000_000_000,
-                available: 1_810_000_000_000,
+                reserved: 0,
                 mount: "/".into(),
             }),
             procs: Some(vec![
@@ -5316,8 +5316,8 @@ pub(crate) mod tests {
         memory_view.capacity = Some((128_u64 << 30) as f64);
         snap.volume = Some(VolumeSample {
             total: 8_000_000_000_000,
-            free: 400_000_000_000,
-            available: 240_000_000_000,
+            free: 240_000_000_000,
+            reserved: 160_000_000_000,
             mount: "/".into(),
         });
         let disk_view = &mut snap.resources[Resource::Disk.index()];
@@ -6273,7 +6273,7 @@ pub(crate) mod tests {
         assert_eq!(disk.value, Some(98.0));
         assert_eq!(
             disk.words,
-            "Disk 98 percent of capacity: 1.96 terabytes used, 41.0 gigabytes available, 2.00 \
+            "Disk 98 percent of capacity: 1.96 terabytes used, 41.0 gigabytes free, 2.00 \
              terabytes total. aterm writes 410 megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
              41 gigabytes free. aterm freed 12 gigabytes today. Used grew 12 gigabytes in the \

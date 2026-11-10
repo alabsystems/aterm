@@ -62,7 +62,7 @@ pub(crate) struct FactsBoard {
     pub(crate) load1_x100: Option<u32>,
     /// The 5-minute load average, times 100.
     pub(crate) load5_x100: Option<u32>,
-    /// Memory available without paging (`build-slot`'s figure), MiB.
+    /// Memory available without paging (`aterm_sysprobe::MemoryDetail::available`), MiB.
     pub(crate) avail_mib: Option<u64>,
     /// The kernel's memory pressure; `None` where unread.
     pub(crate) pressure: Option<Pressure>,
@@ -97,7 +97,7 @@ pub(crate) fn board_of(
         cores: snap.total_cores().and_then(|c| u16::try_from(c).ok()),
         load1_x100: snap.load.and_then(|l| x100(l[0])),
         load5_x100: snap.load.and_then(|l| x100(l[1])),
-        avail_mib: snap.avail.map(|b| b >> 20),
+        avail_mib: snap.mem.as_ref().map(|m| m.sample.available >> 20),
         pressure: snap
             .mem
             .as_ref()
@@ -184,7 +184,6 @@ fn judged_snapshot(snap: &Snapshot) -> Snapshot {
     let stale_ms = u64::try_from(STALE_AFTER.as_millis()).unwrap_or(u64::MAX);
     Snapshot {
         at_ns: snap.at_ns,
-        avail: snap.avail,
         mem: snap.mem.clone(),
         slots: snap.slots,
         slots_age_ms: snap.slots_age_ms.filter(|age| *age > stale_ms),

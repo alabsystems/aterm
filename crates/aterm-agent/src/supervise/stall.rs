@@ -17,8 +17,8 @@ pub(super) struct WorkerStall {
     pub(super) bytes: Option<u64>,
     /// `input_wait_ms=`: a lower bound on the oldest unread byte's wait.
     pub(super) wait_ms: Option<u64>,
-    /// `fg_rss_mb=`: the foreground program's resident size.
-    pub(super) rss_mb: Option<u64>,
+    /// `fg_footprint_mb=`: the foreground program's memory footprint.
+    pub(super) footprint_mb: Option<u64>,
 }
 
 /// What one `status` read said of the worker's input and session state.
@@ -53,7 +53,7 @@ pub(super) fn worker_stall(status_stdout: &str) -> Option<WorkerStall> {
         word,
         bytes: num("input_bytes"),
         wait_ms: num("input_wait_ms"),
-        rss_mb: num("fg_rss_mb"),
+        footprint_mb: num("fg_footprint_mb"),
     })
 }
 
@@ -71,14 +71,14 @@ fn wait_text(ms: u64) -> String {
     }
 }
 
-/// A resident size as the server's attention says one: `rss 312 MB` under a
-/// GiB, else tenths of a GiB (39731 MiB reads `rss 38.8 GB`).
-fn rss_text(mb: u64) -> String {
+/// A footprint as the server's attention says one: `footprint 312 MB` under a
+/// GiB, else tenths of a GiB (39731 MiB reads `footprint 38.8 GB`).
+fn footprint_text(mb: u64) -> String {
     if mb < 1024 {
-        return format!("rss {mb} MB");
+        return format!("footprint {mb} MB");
     }
     let tenths = (u128::from(mb) * 10 + 512) / 1024;
-    format!("rss {}.{} GB", tenths / 10, tenths % 10)
+    format!("footprint {}.{} GB", tenths / 10, tenths % 10)
 }
 
 /// Whether `restart unavailable` is a transient hand refusal (`halted`, `driver-lease`, `driver-turn`).
@@ -102,8 +102,8 @@ pub(super) fn reply_line(r: &CtlReply) -> String {
 }
 
 /// What the frozen warning says of a stall after its word: how long
-/// the input has waited, then what is queued and the resident size —
-/// ` for 2m41s (1 B queued, rss 38.8 GB)`, each part only where the reply
+/// the input has waited, then what is queued and the footprint —
+/// ` for 2m41s (1 B queued, footprint 38.8 GB)`, each part only where the reply
 /// measured it.
 fn stall_facts(stall: &WorkerStall) -> String {
     let waited = stall
@@ -113,7 +113,7 @@ fn stall_facts(stall: &WorkerStall) -> String {
         .bytes
         .map(|n| format!("{n} B queued"))
         .into_iter()
-        .chain(stall.rss_mb.map(rss_text))
+        .chain(stall.footprint_mb.map(footprint_text))
         .collect();
     if facts.is_empty() {
         waited
@@ -299,11 +299,11 @@ impl<C: Ctl> Session<'_, C> {
         };
         let dash = || "-".to_string();
         review.note(&format!(
-            "{FROZEN} seq={seq} input={} wait_ms={} bytes={} rss_mb={} {attention}",
+            "{FROZEN} seq={seq} input={} wait_ms={} bytes={} footprint_mb={} {attention}",
             stall.word,
             stall.wait_ms.map_or_else(dash, |v| v.to_string()),
             stall.bytes.map_or_else(dash, |v| v.to_string()),
-            stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+            stall.footprint_mb.map_or_else(dash, |v| v.to_string()),
         ));
         self.stalled = Some(stall);
         if let Some(host) = &self.stall_host {
@@ -401,7 +401,7 @@ impl<C: Ctl> Session<'_, C> {
         let dash = || "-".to_string();
         review
             .say(&format!(
-                "{} seq={seq} input={} wait_ms={} rss_mb={} reply={reply}",
+                "{} seq={seq} input={} wait_ms={} footprint_mb={} reply={reply}",
                 if r.ok() {
                     "RESTARTED"
                 } else {
@@ -409,7 +409,7 @@ impl<C: Ctl> Session<'_, C> {
                 },
                 stall.word,
                 stall.wait_ms.map_or_else(dash, |v| v.to_string()),
-                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+                stall.footprint_mb.map_or_else(dash, |v| v.to_string()),
             ))
             .map_err(Fail::Hard)?;
         Ok(())
@@ -437,10 +437,10 @@ impl<C: Ctl> Session<'_, C> {
         let dash = || "-".to_string();
         review
             .say(&format!(
-                "STALL-WARNED seq={seq} input={} wait_ms={} rss_mb={} ended=no {why}",
+                "STALL-WARNED seq={seq} input={} wait_ms={} footprint_mb={} ended=no {why}",
                 stall.word,
                 stall.wait_ms.map_or_else(dash, |v| v.to_string()),
-                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+                stall.footprint_mb.map_or_else(dash, |v| v.to_string()),
             ))
             .map_err(Fail::Hard)
     }
@@ -465,10 +465,10 @@ impl<C: Ctl> Session<'_, C> {
         let dash = || "-".to_string();
         review
             .say(&format!(
-                "SIGNALLED seq={seq} signal={sig} input={} wait_ms={} rss_mb={} reply={reply}",
+                "SIGNALLED seq={seq} signal={sig} input={} wait_ms={} footprint_mb={} reply={reply}",
                 stall.word,
                 stall.wait_ms.map_or_else(dash, |v| v.to_string()),
-                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+                stall.footprint_mb.map_or_else(dash, |v| v.to_string()),
             ))
             .map_err(Fail::Hard)?;
         Ok(())
@@ -578,7 +578,7 @@ mod tests {
     /// A stalled reading, as `status` spells it.
     const STALLED: &str = "OK schema=1 sid=s-1 hold=0 fabric=connected program=claude \
                            agent=wall:unresponsive integration=- input=stalled input_bytes=1 \
-                           input_wait_ms=161000 fg_rss_mb=39731 supervisor=aterm-harness@1 \
+                           input_wait_ms=161000 fg_footprint_mb=39731 supervisor=aterm-harness@1 \
                            seq=9 hash=0\n";
 
     #[test]
@@ -589,17 +589,20 @@ mod tests {
                 word: "stalled",
                 bytes: Some(1),
                 wait_ms: Some(161_000),
-                rss_mb: Some(39_731),
+                footprint_mb: Some(39_731),
             })
         );
-        let stopped = "OK input=stopped input_bytes=3 input_wait_ms=41000 fg_rss_mb=-\n";
+        let stopped = "OK input=stopped input_bytes=3 input_wait_ms=41000 fg_footprint_mb=-\n";
         let s = worker_stall(stopped).expect("stopped is a stall");
-        assert_eq!((s.word, s.bytes, s.rss_mb), ("stopped", Some(3), None));
+        assert_eq!(
+            (s.word, s.bytes, s.footprint_mb),
+            ("stopped", Some(3), None)
+        );
         for line in [
-            "OK input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=-\n",
-            "OK input=pending input_bytes=1 input_wait_ms=1500 fg_rss_mb=-\n",
-            "OK input=typeahead input_bytes=4 input_wait_ms=30000 fg_rss_mb=-\n",
-            "OK input=- input_bytes=- input_wait_ms=- fg_rss_mb=-\n",
+            "OK input=clear input_bytes=0 input_wait_ms=0 fg_footprint_mb=-\n",
+            "OK input=pending input_bytes=1 input_wait_ms=1500 fg_footprint_mb=-\n",
+            "OK input=typeahead input_bytes=4 input_wait_ms=30000 fg_footprint_mb=-\n",
+            "OK input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-\n",
             "OK schema=1 hold=0 fabric=absent program=claude\n",
             "",
         ] {
@@ -616,20 +619,23 @@ mod tests {
     #[test]
     fn the_stall_facts_name_the_wait_the_backlog_and_the_size() {
         let s = worker_stall(STALLED).expect("stall");
-        assert_eq!(stall_facts(&s), " for 2m41s (1 B queued, rss 38.8 GB)");
+        assert_eq!(
+            stall_facts(&s),
+            " for 2m41s (1 B queued, footprint 38.8 GB)"
+        );
         let small = WorkerStall {
-            rss_mb: Some(12),
+            footprint_mb: Some(12),
             wait_ms: None,
             ..s.clone()
         };
-        assert_eq!(stall_facts(&small), " (1 B queued, rss 12 MB)");
+        assert_eq!(stall_facts(&small), " (1 B queued, footprint 12 MB)");
         let bare = WorkerStall {
             bytes: None,
-            rss_mb: None,
+            footprint_mb: None,
             wait_ms: Some(41_000),
             ..s
         };
         assert_eq!(stall_facts(&bare), " for 41s");
-        assert_eq!(rss_text(u64::MAX), "rss 18014398509481984.0 GB");
+        assert_eq!(footprint_text(u64::MAX), "footprint 18014398509481984.0 GB");
     }
 }

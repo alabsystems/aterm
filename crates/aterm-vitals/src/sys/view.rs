@@ -1415,8 +1415,8 @@ fn mem_class_words(m: &crate::model::MemView, exact: bool) -> String {
         words::memory_space_line(&m.sample),
         m.sample.pressure.word()
     );
-    if let Some(k) = m.sample.kernel_available_pct {
-        t.push_str(&format!(" (kernel: {k}% available)"));
+    if let Some(k) = m.sample.memorystatus_level_pct {
+        t.push_str(&format!(" (memorystatus_level {k}%)"));
     }
     t.push_str(" · ");
     t.push_str(&mem_sum_words(m, exact));
@@ -1775,10 +1775,10 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         words::memory_space_line(&m.sample),
         m.sample.pressure.word()
     );
-    if let Some(k) = m.sample.kernel_available_pct {
-        head.push_str(&format!(" (kernel: {k}% available)"));
+    if let Some(k) = m.sample.memorystatus_level_pct {
+        head.push_str(&format!(" (memorystatus_level {k}%)"));
     }
-    head.push_str(" · available is free + reclaimable file cache");
+    head.push_str(" · available is what the kernel can hand out without paging");
     let exact = exact_partition(ctx);
     head.push_str(&format!(
         " · thrashing: {thrash} · {}",
@@ -2001,7 +2001,7 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         let volume = crate::model::VolumeSample {
             total: v.total,
             free: v.free,
-            available: v.available,
+            reserved: v.reserved,
             mount: v.mount.clone(),
         };
         lines.push(line(
@@ -2180,11 +2180,11 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         Some(v) => lines.push(line(
             "volume",
             format!(
-                "volume mount={} fs={} free_bytes={} available_bytes={} total_bytes={} level={} slope_bps={} purgeable_bytes={}",
+                "volume mount={} fs={} free_bytes={} reserved_bytes={} total_bytes={} level={} slope_bps={} purgeable_bytes={}",
                 pct(&v.mount),
                 pct(&v.fs),
                 v.free,
-                v.available,
+                v.reserved,
                 v.total,
                 v.level.as_deref().map_or_else(|| unavailable("not_sampled"), str::to_owned),
                 unavailable("not_sampled"),
@@ -2646,12 +2646,8 @@ fn global_json(s: &Snapshot) -> Jv {
     if let Some(m) = s.mem.as_ref() {
         o.set("mem_pressure", Jv::s(m.sample.pressure.word()));
         o.set("mem_used_bytes", Jv::u(m.sample.used()));
-        o.set(
-            "mem_available_bytes",
-            Jv::known_or(m.sample.available(), "not_reported"),
-        );
+        o.set("mem_available_bytes", Jv::u(m.sample.available));
         o.set("mem_total_bytes", Jv::u(m.sample.total));
-        o.set("mem_available_basis", Jv::s("free_plus_reclaimable_cache"));
         o.set("swap_used_bytes", Jv::u(m.sample.swap_used));
     } else {
         o.set("mem_pressure", Jv::why("unsupported"));
@@ -2663,17 +2659,13 @@ fn global_json(s: &Snapshot) -> Jv {
             "disk_used_bytes",
             s.volume.as_ref().map(crate::model::VolumeSample::used),
         ),
-        (
-            "disk_available_bytes",
-            s.volume.as_ref().map(|v| v.available.min(v.total)),
-        ),
         ("disk_total_bytes", s.volume.as_ref().map(|v| v.total)),
     ] {
         o.set(name, Jv::known_or(value, "not_sampled"));
     }
     o.set(
         "disk_free_bytes",
-        Jv::known_or(s.volume.as_ref().map(|v| v.available), "not_sampled"),
+        Jv::known_or(s.volume.as_ref().map(|v| v.free), "not_sampled"),
     );
     o.set(
         "disk_write_bytes_per_s",
@@ -3315,9 +3307,9 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                     },
                 ),
                 (
-                    "kernel_available_pm",
+                    "memorystatus_level_pm",
                     Jv::known_or(
-                        m.sample.kernel_available_pct.map(|p| u64::from(p) * 10),
+                        m.sample.memorystatus_level_pct.map(|p| u64::from(p) * 10),
                         "unsupported",
                     ),
                 ),
@@ -3785,7 +3777,7 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                 ("mount", Jv::s(v.mount.clone())),
                 ("fs", Jv::s(v.fs.clone())),
                 ("free_bytes", Jv::u(v.free)),
-                ("available_bytes", Jv::u(v.available)),
+                ("reserved_bytes", Jv::u(v.reserved)),
                 ("total_bytes", Jv::u(v.total)),
                 ("slope_bytes_per_s", Jv::why("not_sampled")),
                 ("eta_full_s", Jv::why("not_sampled")),

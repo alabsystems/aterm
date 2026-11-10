@@ -13,27 +13,17 @@ pub use aterm_uds::host::raise_open_files;
 #[cfg(all(unix, debug_assertions))]
 pub use aterm_uds::host::{held_probe, sh_held, sh_held_any};
 
-/// Returns a description of CPU oversubscription on this host, if any.
+/// Returns a description of CPU oversubscription on this host, if any: the worse of its 1- and
+/// 5-minute load averages (`aterm_sysprobe::load_average`) past its logical cores
+/// (`aterm_sysprobe::cpu_layout`); `None` where either is unread.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn oversubscribed() -> Option<String> {
-    unsafe extern "C" {
-        /// `<stdlib.h>`; declared here, as `aterm-gui` does: aterm-libc does
-        /// not export it.
-        fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
-    }
-    let mut load = [0f64; 2];
-    // SAFETY: `load` is a live, writable array of two doubles, and
-    // `getloadavg` writes at most the count it is given.
-    let n = unsafe { getloadavg(load.as_mut_ptr(), 2) };
-    let worst = match n {
-        2.. => load[0].max(load[1]),
-        1 => load[0],
-        _ => return None,
-    };
-    let cpus = std::thread::available_parallelism().ok()?.get();
-    (worst.is_finite() && worst > cpus as f64).then(|| format!("load {worst:.1} over {cpus} CPUs"))
+    let [one, five, _] = aterm_sysprobe::load_average()?;
+    let worst = one.max(five);
+    let cores = aterm_sysprobe::cpu_layout().logical_cores();
+    (cores > 0 && worst > cores as f64).then(|| format!("load {worst:.1} over {cores} CPUs"))
 }
 
 /// Returns the environment variable naming `shell` for live tests ([`Tool::var`]).

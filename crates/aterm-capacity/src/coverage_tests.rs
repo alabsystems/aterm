@@ -39,8 +39,8 @@ fn line() -> Procs {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -113,8 +113,8 @@ fn a_held_claim_covers_and_frees_what_it_credits() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -206,8 +206,8 @@ fn the_cover_marker_reads_its_holders_claims_and_the_ledger_answers_without_it()
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
@@ -261,8 +261,8 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
         Proc {
             pid: build,
             ppid: me,
+            charged: 0,
             footprint: 0,
-            whole: 0,
             written: 0,
             cpu_ns: 0,
             runnable_ns: 0,
@@ -270,8 +270,8 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
         Proc {
             pid: me,
             ppid: 1,
+            charged: 0,
             footprint: 0,
-            whole: 0,
             written: 0,
             cpu_ns: 0,
             runnable_ns: 0,
@@ -317,8 +317,8 @@ fn a_marker_names_one_claim_of_its_holder() {
         Proc {
             pid: build,
             ppid: me,
+            charged: 0,
             footprint: 0,
-            whole: 0,
             written: 0,
             cpu_ns: 0,
             runnable_ns: 0,
@@ -326,8 +326,8 @@ fn a_marker_names_one_claim_of_its_holder() {
         Proc {
             pid: me,
             ppid: 1,
+            charged: 0,
             footprint: 0,
-            whole: 0,
             written: 0,
             cpu_ns: 0,
             runnable_ns: 0,
@@ -408,8 +408,8 @@ fn a_disk_claim_covers_only_the_run_its_marker_names() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        charged: 0,
         footprint: 0,
-        whole: 0,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,

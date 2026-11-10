@@ -3010,6 +3010,43 @@ fn run_planned_observed(
             None => (never_run(), Duration::ZERO),
         })
         .unzip();
+    // The stage also owns Cargo's recording pass and discovery/probe children. Its CPU is
+    // not the sum of dispatched binary rows alone. Preserve that distinction, and an unread
+    // or overlapping sample, rather than allocating setup CPU to tests that did not use it.
+    let mut binary_ns = 0_u64;
+    let mut binary_reads = 0_u64;
+    let mut binary_unread = 0_u64;
+    for run in ran.iter().flatten() {
+        if let Some(usage) = run.run.usage {
+            if let Ok(ns) = u64::try_from(usage.cpu.as_nanos()) {
+                binary_ns = binary_ns.saturating_add(ns);
+                binary_reads += 1;
+            } else {
+                binary_unread += 1;
+            }
+        } else {
+            binary_unread += 1;
+        }
+    }
+    let stage_ns = crate::memory::current()
+        .and_then(|meter| meter.observed_cpu())
+        .map(|cpu| cpu.nanoseconds);
+    let other_ns = stage_ns.and_then(|stage| stage.checked_sub(binary_ns));
+    emit(
+        ctx,
+        &format!(
+            "verify-event: {}",
+            aterm_json::json!({
+                "schema": 1, "event": "test-cpu-accounted",
+            "observed_binary_cpu_s": (binary_reads > 0 || binary_unread == 0).then_some(binary_ns as f64 / 1e9),
+                "binary_reads": binary_reads, "binary_unread": binary_unread,
+                "observed_stage_cpu_s": stage_ns.map(|ns| ns as f64 / 1e9),
+                "other_observed_child_cpu_s": other_ns.map(|ns| ns as f64 / 1e9),
+                "reconciled": stage_ns.map(|_| binary_unread == 0 && other_ns.is_some()),
+                "scope": "dispatch binaries plus other observed stage children; sampled lower bounds",
+            })
+        ),
+    );
     // What the binaries' memory claim was, what a release's resume carried and what hashing the
     // executables cost, how the binaries used their charges and whether their history was kept,
     // in a halted run's report as in a whole one's.

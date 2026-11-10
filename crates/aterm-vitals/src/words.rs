@@ -1093,7 +1093,7 @@ fn disk_free(snap: &Snapshot) -> Option<u64> {
     snap.volume
         .as_ref()
         .filter(|v| v.total > 0)
-        .map(|v| v.available)
+        .map(|v| v.free)
         .or_else(|| Some((view.capacity? - view.now?).max(0.0) as u64))
 }
 
@@ -1913,14 +1913,14 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
 }
 
 /// A volume's space as the Disk lens's first line says it: used (its size less what this user
-/// could still write, [`VolumeSample::used`]), available and total, each in a readable decimal
-/// unit (`2.34 TB used · 1.66 TB available · 4.00 TB total`).
+/// could still write, [`VolumeSample::used`]), free ([`VolumeSample::free`]) and total, each in a
+/// readable decimal unit (`2.34 TB used · 1.66 TB free · 4.00 TB total`).
 #[must_use]
 pub fn disk_space_line(v: &VolumeSample) -> String {
     format!(
-        "{} used · {} available · {} total",
+        "{} used · {} free · {} total",
         bytes_dec(v.used()),
-        bytes_dec(v.available.min(v.total)),
+        bytes_dec(v.free.min(v.total)),
         bytes_dec(v.total)
     )
 }
@@ -1930,21 +1930,19 @@ pub fn disk_space_line(v: &VolumeSample) -> String {
 /// ([`disk_space_line`]); the lens and speech say them after it.
 #[must_use]
 pub fn disk_reserved(v: &VolumeSample) -> Option<String> {
-    let reserved = v.free.saturating_sub(v.available);
+    let reserved = v.reserved;
     (v.total > 0 && reserved > 0 && u128::from(reserved) * 100 >= u128::from(v.total))
         .then(|| format!("{} reserved", bytes_lone(reserved)))
 }
 
-/// Format used, available (free plus reclaimable file cache) and total physical memory.
+/// Format used, available (what the kernel can hand out without paging,
+/// [`MemSample::available`]) and total physical memory.
 #[must_use]
 pub fn memory_space_line(m: &MemSample) -> String {
-    let available = m.available().map_or_else(
-        || "available not reported".into(),
-        |bytes| format!("{} GiB available", gib_figure(bytes)),
-    );
     format!(
-        "{} GiB used · {available} · {} GiB total",
+        "{} GiB used · {} GiB available · {} GiB total",
         gib_figure(m.used()),
+        gib_figure(m.available),
         gib_total(m.total)
     )
 }
@@ -2075,9 +2073,9 @@ fn capacity_words(res: Resource, view: &ResourceView) -> &'static str {
 }
 
 /// Memory's and Disk's exact figures as their lens's first line says them, which speech and ⌘C
-/// say too: used, available and total ([`memory_space_line`], [`disk_space_line`]), with a
-/// volume's reserved blocks where it keeps 1 % or more ([`disk_reserved`]); `None` for the other
-/// rows and an unread sample.
+/// say too: used, available (memory) or free (disk) and total ([`memory_space_line`],
+/// [`disk_space_line`]), with a volume's reserved blocks where it keeps 1 % or more
+/// ([`disk_reserved`]); `None` for the other rows and an unread sample.
 #[must_use]
 pub fn space_line(res: Resource, snap: &Snapshot) -> Option<String> {
     match res {
@@ -3029,7 +3027,7 @@ mod tests {
             volume: Some(VolumeSample {
                 total: 2_000_000_000_000,
                 free: 1_810_000_000_000,
-                available: 1_810_000_000_000,
+                reserved: 0,
                 mount: "/".into(),
             }),
             aterm: Some(ScopeView {
@@ -3189,7 +3187,7 @@ mod tests {
         s.volume = Some(VolumeSample {
             total,
             free: available,
-            available,
+            reserved: 0,
             mount: "/".into(),
         });
         s.facts.filling = Some(Filling {
@@ -3621,19 +3619,19 @@ mod tests {
         assert_eq!(rate_mb_lone(5.1e6), "5.1 MB/s");
         assert_eq!(rate_mb_lone(9.96e6), "10 MB/s");
         assert_eq!(rate_mb_lone(410e6), "410 MB/s");
-        let vol = |total: u64, available: u64| VolumeSample {
+        let vol = |total: u64, free: u64| VolumeSample {
             total,
-            free: available,
-            available,
+            free,
+            reserved: 0,
             mount: "/".into(),
         };
         assert_eq!(
             disk_space_line(&vol(2_000_000_000_000, 890_000_000_000)),
-            "1.11 TB used · 890 GB available · 2.00 TB total"
+            "1.11 TB used · 890 GB free · 2.00 TB total"
         );
         assert_eq!(
             disk_space_line(&vol(2_000_000_000_000, 44_800_000_000)),
-            "1.96 TB used · 44.8 GB available · 2.00 TB total"
+            "1.96 TB used · 44.8 GB free · 2.00 TB total"
         );
         assert_eq!(
             amount_forms(
@@ -4681,7 +4679,7 @@ mod tests {
 
         assert_eq!(
             row_sentence(Resource::Disk, &disk_trouble(), &[2], &MAC),
-            "Disk 98 percent of capacity: 1.96 terabytes used, 44.8 gigabytes available, 2.00 \
+            "Disk 98 percent of capacity: 1.96 terabytes used, 44.8 gigabytes free, 2.00 \
              terabytes total. aterm writes 38 megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
              45 gigabytes free. 2 sessions stuck on a full disk. aterm freed 41 gigabytes \
@@ -4780,7 +4778,7 @@ mod tests {
         let mut s = disk_trouble();
         s.facts.filling = None;
         s.facts.disk = Some(watch(DiskLevel::Ok));
-        s.volume.as_mut().expect("volume").available = 885_000_000_000;
+        s.volume.as_mut().expect("volume").free = 885_000_000_000;
         s.facts.disk_rates.rate60 = Some(885e9 / (2.0 * 86_400.0));
         assert_eq!(
             disk_wrong(&s, &MAC).as_deref(),
@@ -4789,7 +4787,7 @@ mod tests {
                  stuck on a full disk."
             )
         );
-        s.volume.as_mut().expect("volume").available = 41_200_000_000;
+        s.volume.as_mut().expect("volume").free = 41_200_000_000;
         s.facts.disk = Some(watch(DiskLevel::Low));
         assert_eq!(
             disk_wrong(&s, &MAC).as_deref(),
@@ -5187,13 +5185,13 @@ mod tests {
         assert_eq!(dst_loc.clock(at_pdt_ms, now_pst_ms), "00:30");
     }
 
-    /// A volume that keeps 160 GB of its free blocks from this user: 8 TB, 400 GB free,
-    /// 240 GB of it available.
+    /// A volume that keeps 160 GB of its free blocks from this user: 8 TB, 400 GB of free
+    /// blocks, 240 GB of them free to this user and 160 GB reserved.
     fn reserving_volume() -> VolumeSample {
         VolumeSample {
             total: 8_000_000_000_000,
-            free: 400_000_000_000,
-            available: 240_000_000_000,
+            free: 240_000_000_000,
+            reserved: 160_000_000_000,
             mount: "/".into(),
         }
     }
@@ -5202,13 +5200,16 @@ mod tests {
     /// (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §3): the row's run and Details, the lens's
     /// first line, the legend's totals and speech say `used` and never `unavailable`, and the
     /// lens and speech add the blocks the volume keeps back where they are 1 % of it or more.
-    /// CONTROL: this volume's free figure differs from its available one, so a word that took
-    /// used as size less free (`7.60 TB`) would show here.
+    /// CONTROL: this volume reserves blocks, so a word that took used as size less every free
+    /// block (`7.60 TB`) would show here.
     #[test]
-    fn every_disk_word_says_used_for_total_less_available() {
+    fn every_disk_word_says_used_for_total_less_free() {
         let volume = reserving_volume();
-        let occupied = bytes_dec(volume.total - volume.free);
-        assert_eq!(occupied, "7.60 TB", "CONTROL: size less free differs");
+        let occupied = bytes_dec(volume.total - volume.free - volume.reserved);
+        assert_eq!(
+            occupied, "7.60 TB",
+            "CONTROL: size less the free blocks differs"
+        );
         let mut s = Snapshot {
             seq: 1,
             volume: Some(volume.clone()),
@@ -5217,16 +5218,11 @@ mod tests {
         let view = row(7.76e12, 8e12);
         s.resources[Resource::Disk.index()] = view.clone();
         let line = disk_space_line(&volume);
-        assert_eq!(
-            line,
-            "7.76 TB used \u{b7} 240 GB available \u{b7} 8.00 TB total"
-        );
+        assert_eq!(line, "7.76 TB used \u{b7} 240 GB free \u{b7} 8.00 TB total");
         assert_eq!(disk_reserved(&volume).as_deref(), Some("160 GB reserved"));
         assert_eq!(
             space_line(Resource::Disk, &s).as_deref(),
-            Some(
-                "7.76 TB used \u{b7} 240 GB available \u{b7} 8.00 TB total \u{b7} 160 GB reserved"
-            )
+            Some("7.76 TB used \u{b7} 240 GB free \u{b7} 8.00 TB total \u{b7} 160 GB reserved")
         );
         let mut words: Vec<String> = Vec::new();
         for ladder in [Ladder::Det, Ladder::Cols] {
@@ -5249,23 +5245,24 @@ mod tests {
         words.push(spoken);
         for w in &words {
             assert!(!w.contains("unavailable"), "{w:?}");
-            assert!(!w.contains("7.60"), "size less free: {w:?}");
+            assert!(!w.contains("7.60"), "size less the free blocks: {w:?}");
         }
         // Blocks kept back under 1 % of the volume, or none, go unsaid.
-        for free in [240_000_000_000, 300_000_000_000] {
+        for reserved in [0, 60_000_000_000] {
             let v = VolumeSample {
-                free,
+                reserved,
                 ..reserving_volume()
             };
-            assert_eq!(disk_reserved(&v), None, "{free}");
+            assert_eq!(disk_reserved(&v), None, "{reserved}");
         }
     }
 
-    /// Memory's first line keeps available distinct from total: free plus reclaimable cache,
-    /// bounded by what is not in use, never the unclassified rest, and `not reported` where a
-    /// sparse sample reads neither class; an unread view says no figure rather than zero.
+    /// Memory's first line says the reader's available figure ([`MemSample::available`]), apart
+    /// from total; an unread view says no figure rather than zero. NEGATIVE CONTROL: the classes
+    /// do not make it, so free plus the file cache (32 GiB here) is not what it says once the
+    /// reader's figure is 20 GiB.
     #[test]
-    fn memory_words_keep_available_distinct_from_total_and_unread_from_zero() {
+    fn memory_words_say_the_readers_available_and_unread_is_not_zero() {
         let mut s = Snapshot {
             mem: Some(MemView {
                 sample: MemSample {
@@ -5274,6 +5271,7 @@ mod tests {
                     wired: 12 << 30,
                     compressed: Some(4 << 30),
                     cached: 24 << 30,
+                    available: 32 << 30,
                     free: 8 << 30,
                     ..MemSample::default()
                 },
@@ -5290,22 +5288,10 @@ mod tests {
             unread.is_empty(),
             "unread capacity must not become zero: {unread:?}"
         );
-        let m = &mut s.mem.as_mut().unwrap().sample;
-        m.app = 64 << 30;
-        m.cached = 16 << 30;
+        s.mem.as_mut().unwrap().sample.available = 20 << 30;
         let line = space_line(Resource::Memory, &s).unwrap_or_default();
-        assert!(
-            line.contains("24.0 GiB available"),
-            "unclassified remainder is not available: {line}"
-        );
-        let sample = &mut s.mem.as_mut().unwrap().sample;
-        sample.free = 0;
-        sample.cached = 0;
-        let sparse = memory_space_line(&s.mem.as_ref().unwrap().sample);
-        assert!(
-            sparse.contains("available not reported"),
-            "sparse memory classes must not become invented free bytes: {sparse}"
-        );
+        assert!(line.contains("20.0 GiB available"), "{line}");
+        assert!(!line.contains("32.0 GiB available"), "{line}");
     }
 
     /// The legend's totals say memory and disk as used of total where read, longest first,
@@ -5326,7 +5312,7 @@ mod tests {
             volume: Some(VolumeSample {
                 total: 4_000_000_000_000,
                 free: 1_660_000_000_000,
-                available: 1_660_000_000_000,
+                reserved: 0,
                 mount: "/".into(),
             }),
             ..Snapshot::default()
@@ -5365,7 +5351,7 @@ mod tests {
         // Another reading of the same machine: other words, the same templates.
         let before: Vec<String> = forms.iter().map(|t| t.widest.clone()).collect();
         s.mem.as_mut().unwrap().sample.app = 3 << 30;
-        s.volume.as_mut().unwrap().available = 3_990_000_000_000;
+        s.volume.as_mut().unwrap().free = 3_990_000_000_000;
         let after = machine_totals(&s);
         assert_eq!(
             after[0].said,
@@ -5385,7 +5371,7 @@ mod tests {
         s.volume = Some(VolumeSample {
             total: 994_000_000_000,
             free: 482_000_000_000,
-            available: 482_000_000_000,
+            reserved: 0,
             mount: "/".into(),
         });
         s.resources[Resource::Disk.index()].capacity = Some(994e9);

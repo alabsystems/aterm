@@ -277,13 +277,18 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
         );
     }
     // Neither the roster and its fleet source nor the wake marker a written row replaces
-    // (`wake_for_roster`, which tells a running host of the row) carries authority; a refusal
+    // (the receipt tells a running host of the row) carries authority; a refusal
     // leaves every file as it was, the marker too (above).
     let wake = store.wake_path();
     let authority = |files: BTreeMap<PathBuf, Vec<u8>>| {
         files
             .into_iter()
-            .filter(|(file, _)| file != &path && file != &fleet && file != &wake)
+            .filter(|(file, _)| {
+                file != &path
+                    && file != &fleet
+                    && file != &wake
+                    && !store.is_sync_receipt_file(file)
+            })
             .collect::<BTreeMap<_, _>>()
     };
     let authority_changed = authority(after) != authority(before);

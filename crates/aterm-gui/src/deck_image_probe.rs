@@ -15,8 +15,9 @@
 //! (`now-vitals-strip.json`, read from schema 1 into today's rings) and peaks
 //! (`now-vitals-peaks.json`) restored as a launch restores them, then three readings of the
 //! `sys --json` overview the desk printed nearest the strip's last write (`now-sys.jsonl`:
-//! per-cluster busy, memory classes from `now-sys-mem.txt`, swap, the volume, network rates, load
-//! and processes) absorbed one second apart, so the latest reading sits on the recorded hour.
+//! per-cluster busy, memory classes from `now-sys-mem.txt`, available memory, swap, the volume,
+//! network rates, load and processes) absorbed one second apart, so the latest reading sits on the
+//! recorded hour.
 //!
 //! [`DeckImageRig::call`] times a whole call as the app would serve it: the frame on the calling
 //! thread (the bench sets it to the main thread's QoS, [`as_main_thread`]), the raster handed to
@@ -288,10 +289,10 @@ fn ns(d: std::time::Duration) -> u64 {
 const GIB: f64 = 1_073_741_824.0;
 
 /// The recorded memory classes at 10:57 (`now/now-sys-mem.txt`), GiB: app, wired, compressed,
-/// cache, free; swap used of total, MiB; the kernel's available share.
+/// cache, free; swap used of total, MiB; the kernel's `memorystatus_level`.
 const MEM_GIB: [f64; 5] = [4.86, 3.38, 4.07, 4.80, 14.08];
 const SWAP_MIB: (f64, f64) = (181.0, 1024.0);
-const KERNEL_AVAILABLE_PCT: u8 = 74;
+const MEMORYSTATUS_LEVEL_PCT: u8 = 74;
 /// The desk's process limits (§6.1: 720 of 8000).
 const PROCS_MAX: u64 = 8000;
 
@@ -553,6 +554,10 @@ fn reading(overview: &Value, last: i64, k: u64) -> Result<Sample, String> {
         .collect();
     let gib = |v: f64| (v * GIB) as u64;
     let total = n("/global/mem_total_bytes")? as u64;
+    // The recording's build named the volume's f_bavail `disk_available_bytes` and its f_bfree
+    // `disk_free_bytes`; free is f_bavail, and reserved what f_bfree holds beyond it.
+    let writable = n("/global/disk_available_bytes")? as u64;
+    let free_blocks = n("/global/disk_free_bytes")? as u64;
     let mem = MemSample {
         total,
         app: gib(MEM_GIB[0]),
@@ -562,8 +567,9 @@ fn reading(overview: &Value, last: i64, k: u64) -> Result<Sample, String> {
         free: gib(MEM_GIB[4]),
         swap_used: (SWAP_MIB.0 * 1_048_576.0) as u64,
         swap_total: (SWAP_MIB.1 * 1_048_576.0) as u64,
+        available: n("/global/mem_available_bytes")? as u64,
         pressure: Pressure::Normal,
-        kernel_available_pct: Some(KERNEL_AVAILABLE_PCT),
+        memorystatus_level_pct: Some(MEMORYSTATUS_LEVEL_PCT),
         ..MemSample::default()
     };
     let secs = k as f64;
@@ -598,8 +604,8 @@ fn reading(overview: &Value, last: i64, k: u64) -> Result<Sample, String> {
         }),
         volume: Some(VolumeSample {
             total: n("/global/disk_total_bytes")? as u64,
-            free: n("/global/disk_free_bytes")? as u64,
-            available: n("/global/disk_available_bytes")? as u64,
+            free: writable,
+            reserved: free_blocks.saturating_sub(writable),
             mount: "/".into(),
         }),
         self_pid: std::process::id(),

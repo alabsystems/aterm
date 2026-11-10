@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use aterm_agent::harness::stats::HarnessStats;
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_capacity::host_vitals::HostVitals;
 
 use crate::App;
 use crate::autopilot::{AutopilotView, HarnessPosture};
@@ -182,8 +183,7 @@ pub(crate) struct FleetSlot(std::sync::atomic::AtomicU8);
 
 impl FleetSlot {
     const FLEET: u8 = 1;
-    const LOCAL_VITALS: u8 = 2;
-    const TAKEN: u8 = 4;
+    const TAKEN: u8 = 2;
 
     /// A slot asking `ask`.
     #[must_use]
@@ -192,7 +192,7 @@ impl FleetSlot {
     }
 
     fn bits(ask: FleetAsk) -> u8 {
-        u8::from(ask.fleet) * Self::FLEET + u8::from(ask.local_vitals) * Self::LOCAL_VITALS
+        u8::from(ask.fleet) * Self::FLEET
     }
 
     /// The reading, done with the ledgers: what it is asked now, closed to every later raise.
@@ -202,7 +202,6 @@ impl FleetSlot {
             .fetch_or(Self::TAKEN, std::sync::atomic::Ordering::AcqRel);
         FleetAsk {
             fleet: bits & Self::FLEET != 0,
-            local_vitals: bits & Self::LOCAL_VITALS != 0,
         }
     }
 
@@ -215,11 +214,10 @@ impl FleetSlot {
     }
 }
 
-/// WHAT A READING ASKS OF THE FLEET ([`read_harness_stats`]): Settings ▸ Harness shows none of it, so its readings never wait on it (the post-landing check's perf-1: every Harness reading slept 30 ms and spawned `/usr/sbin/sysctl` twice for this Mac's vitals, and dialled the sibling sockets and the LAN, for a page that never draws them).
+/// WHAT A READING ASKS OF THE FLEET ([`read_harness_stats`]): Settings ▸ Harness shows none of it, so its readings never wait on it (the post-landing check's perf-1: every Harness reading dialled the sibling sockets and the LAN for a page that never draws them). This Mac's own vitals are never the reading's: they are `VitalsHost`'s Snapshot's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FleetAsk {
     pub(crate) fleet: bool,
-    pub(crate) local_vitals: bool,
 }
 
 /// WHAT OF THE FLEET THIS aterm MAY READ, decided once from what it is: an aterm of its account's
@@ -2625,7 +2623,7 @@ impl App {
                         Some(mem) => format!(
                             "CPU {cpu_pct:.0}% ({:.2}c) \u{b7} RAM {}",
                             tv.scope.cores.level,
-                            human_bytes_gui(mem)
+                            HostVitals::human_bytes(mem)
                         ),
                         None => format!("CPU {cpu_pct:.0}% ({:.2}c)", tv.scope.cores.level),
                     }
@@ -2673,30 +2671,16 @@ impl App {
         let local_instances = 1 + sibling_instances.len();
         let local_ai_clis = ai_cli_count(local_tabs.iter().chain(sibling_tabs.iter()));
         let local_active_ai = active_ai_count(local_tabs.iter().chain(sibling_tabs.iter()));
-        let live_local_vitals = self
-            .vitals
-            .snapshot
-            .as_deref()
-            .map(format_local_snapshot_vitals);
-        let (self_display_name, self_address, self_os_version, self_status, self_vitals) =
-            match local_meta {
-                Some(m) => (
-                    m.name,
-                    m.address,
-                    m.os_version,
-                    m.status,
-                    live_local_vitals
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or(m.vitals),
-                ),
-                None => (
-                    format!("{local_comp_name} (this Mac)"),
-                    "local".to_string(),
-                    Some(std::env::consts::OS.to_string()),
-                    "online".to_string(),
-                    live_local_vitals.unwrap_or_default(),
-                ),
-            };
+        let self_vitals = local_machine_vitals(self.vitals.snapshot.as_deref());
+        let (self_display_name, self_address, self_os_version, self_status) = match local_meta {
+            Some(m) => (m.name, m.address, m.os_version, m.status),
+            None => (
+                format!("{local_comp_name} (this Mac)"),
+                "local".to_string(),
+                Some(std::env::consts::OS.to_string()),
+                "online".to_string(),
+            ),
+        };
         let mut computers = vec![TabComputer {
             id: "local".to_string(),
             name: self_display_name,
@@ -3175,12 +3159,10 @@ impl App {
         }
     }
 
-    /// What a reading begun now asks of the fleet ([`FleetAsk`]): the fleet only while a Tab Control / Fleet Monitor page is shown, and this Mac's vitals on the reading's thread only where `VitalsHost` has no snapshot for that page yet.
+    /// What a reading begun now asks of the fleet ([`FleetAsk`]): the fleet only while a Tab Control / Fleet Monitor page is shown.
     pub(crate) fn fleet_ask(&self) -> FleetAsk {
-        let fleet = self.tabs_page_shown();
         FleetAsk {
-            fleet,
-            local_vitals: fleet && self.vitals.snapshot.is_none(),
+            fleet: self.tabs_page_shown(),
         }
     }
 }
@@ -3701,7 +3683,7 @@ fn collect_fleet_and_sibling_tabs(
         return (Vec::new(), Vec::new(), Vec::new(), None);
     }
     let sibling_tabs = collect_sibling_aterm_tabs();
-    let (remote_computers, remote_tabs, lan_waits) = collect_remote_machines_tabs(ask.local_vitals);
+    let (remote_computers, remote_tabs, lan_waits) = collect_remote_machines_tabs();
     (sibling_tabs, remote_computers, remote_tabs, lan_waits)
 }
 
@@ -3903,7 +3885,7 @@ fn enrich_sibling_tab_vitals(aterm_pid: u32, pid_rows: &mut [(u64, TabSpreadshee
         let target_pid = direct_shells.get(idx).copied().unwrap_or(aterm_pid);
         let (mem, _cpu_ns) = subtree_mem_and_cpu(target_pid);
         if mem > 0 {
-            row.vitals = format!("RAM {}", human_bytes_gui(mem));
+            row.vitals = format!("RAM {}", HostVitals::human_bytes(mem));
         }
     }
 }
@@ -4201,9 +4183,7 @@ fn try_load_monitor_swarm_census()
     None
 }
 
-fn collect_remote_machines_tabs(
-    local_vitals: bool,
-) -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>, Option<String>) {
+fn collect_remote_machines_tabs() -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>, Option<String>) {
     let custom_names = load_custom_host_names();
     let census_loaded = try_load_monitor_swarm_census();
     let in_swarm_census = census_loaded.is_some();
@@ -4245,13 +4225,12 @@ fn collect_remote_machines_tabs(
                 &custom_names,
                 &known_swarm_names,
                 in_swarm_census,
-                local_vitals,
             );
         },
     );
     #[cfg(not(target_os = "macos"))]
     let lan_waits = {
-        let _ = (local_vitals, in_swarm_census);
+        let _ = in_swarm_census;
         None
     };
     (computers, tabs, lan_waits)
@@ -4528,7 +4507,8 @@ fn cached_configured_computer(
     let vitals = hello_json
         .as_ref()
         .and_then(|h| h.get("vitals"))
-        .map(|v| format_hello_vitals_json(&uuid, v))
+        .and_then(|v| aterm_json::from_value::<HostVitals>(v.clone()).ok())
+        .and_then(|v| v.summary())
         .unwrap_or_default();
     let mut computer = TabComputer {
         id: uuid,
@@ -4621,50 +4601,6 @@ fn merge_cached_computer(
     }
 }
 
-fn bar_8_gui(pct: u8) -> String {
-    let filled = ((u16::from(pct.min(100)) * 8 + 50) / 100) as usize;
-    let mut s = String::with_capacity(30);
-    s.push('\u{2595}');
-    for i in 0..8 {
-        s.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
-    }
-    s.push('\u{258f}');
-    s
-}
-
-fn human_bytes_gui(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if bytes == 0 {
-        "0 MiB".to_string()
-    } else if b >= TIB {
-        format!("{:.2} TiB", b / TIB)
-    } else if b >= 100.0 * GIB {
-        format!("{:.0} GiB", b / GIB)
-    } else if b >= GIB {
-        format!("{:.1} GiB", b / GIB)
-    } else {
-        format!("{:.0} MiB", (b / MIB).max(1.0))
-    }
-}
-
-fn format_uptime_gui(secs: u64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let mins = (secs % 3_600) / 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {mins}m")
-    } else if mins > 0 {
-        format!("{mins}m")
-    } else {
-        format!("{secs}s")
-    }
-}
-
 fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
     sparkline(host_key, Some(sample_pct))
 }
@@ -4727,58 +4663,42 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
         };
         parts.push(format_cpu_vitals_gui("local/cpu", pct, &cl_str));
     }
-    if let Some(gpu) = snap
+    if let Some(machine) = snapshot_host_vitals(snap).summary() {
+        parts.push(machine);
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// What the engine's Snapshot says of this Mac in a hello's figures ([`HostVitals`]), so its row
+/// reads as every other Mac's ([`HostVitals::summary`]): the GPU (its hardware facts where read,
+/// else the GPU view's sample), memory and the home volume. Its CPU is left out: this Mac's row
+/// shows the Snapshot's own busy share and clusters, which a hello does not carry.
+fn snapshot_host_vitals(snap: &aterm_vitals::model::Snapshot) -> HostVitals {
+    let gpu = snap
         .facts
         .gpu
         .as_ref()
-        .or_else(|| snap.gpu.as_ref().map(|view| &view.sample))
-        && let Some(text) = format_gpu_vitals_gui(
-            gpu.name.as_deref(),
-            gpu.cores.map(u64::from),
-            gpu.device_pct.map(u64::from),
-        )
-    {
-        parts.push(text);
+        .or_else(|| snap.gpu.as_ref().map(|view| &view.sample));
+    let mem = snap.mem.as_ref().map(|view| &view.sample);
+    let volume = snap.volume.as_ref();
+    HostVitals {
+        gpu_name: gpu.and_then(|g| g.name.clone()),
+        gpu_cores: gpu.and_then(|g| g.cores).map(u32::from),
+        gpu_busy_pct: gpu.and_then(|g| g.device_pct),
+        mem_total_bytes: mem.map(|m| m.total),
+        mem_available_bytes: mem.map(|m| m.available),
+        mem_used_bytes: mem.map(aterm_vitals::model::MemSample::used),
+        mem_wired_bytes: mem.map(|m| m.wired),
+        mem_compressed_bytes: mem.and_then(|m| m.compressed),
+        swap_used_bytes: mem.map(|m| m.swap_used),
+        mem_pressure: mem
+            .map(|m| m.pressure)
+            .filter(|p| *p != aterm_vitals::model::Pressure::Unknown)
+            .map(|p| p.word().to_owned()),
+        disk_total_bytes: volume.map(|v| v.total),
+        disk_free_bytes: volume.map(|v| v.free),
+        ..HostVitals::default()
     }
-    if let Some(mem) = &snap.mem {
-        let used = mem.sample.used();
-        let total = mem.sample.total;
-        let pct = ((used.saturating_mul(100)) / total.max(1)).min(100) as u8;
-        let pressure = match mem.sample.pressure {
-            aterm_vitals::model::Pressure::Normal => "normal",
-            aterm_vitals::model::Pressure::Warn => "warn",
-            aterm_vitals::model::Pressure::Critical => "critical",
-            aterm_vitals::model::Pressure::Unknown => "pressure unknown",
-        };
-        let mut extra = vec![
-            pressure.to_string(),
-            format!("wired {}", human_bytes_gui(mem.sample.wired)),
-        ];
-        if let Some(c) = mem.sample.compressed {
-            extra.push(format!("comp {}", human_bytes_gui(c)));
-        }
-        if mem.sample.swap_used > 0 {
-            extra.push(format!("swap {}", human_bytes_gui(mem.sample.swap_used)));
-        }
-        parts.push(format!(
-            "RAM {}/{} ({pct}% {} \u{b7} {})",
-            human_bytes_gui(used),
-            human_bytes_gui(total),
-            bar_8_gui(pct),
-            extra.join(" \u{b7} ")
-        ));
-    }
-    if let Some(vol) = &snap.volume {
-        let used = vol.used();
-        let pct = ((used.saturating_mul(100)) / vol.total.max(1)).min(100) as u8;
-        parts.push(format!(
-            "Disk {}/{} ({pct}% \u{b7} {} free)",
-            human_bytes_gui(used),
-            human_bytes_gui(vol.total),
-            human_bytes_gui(vol.available)
-        ));
-    }
-    parts.join(" \u{b7} ")
 }
 
 /// A measured CPU percentage adds one sparkline sample; an unread one adds none.
@@ -4787,283 +4707,24 @@ fn format_cpu_vitals_gui(host_key: &str, pct: Option<u8>, meta: &str) -> String 
         Some(pct) => {
             let pct = pct.min(100);
             let spark = push_sparkline_sample(host_key, pct);
-            format!("CPU {pct}% {} {spark} ({meta})", bar_8_gui(pct))
+            format!("CPU {pct}% {} {spark} ({meta})", HostVitals::bar_8(pct))
         }
         None => format!("CPU unavailable ({meta})"),
     }
 }
 
-/// The share only where both figures were read and the capacity is positive.
-fn used_percent_gui(used: Option<u64>, total: Option<u64>) -> Option<u8> {
-    let total = total.filter(|total| *total > 0)?;
-    Some((u128::from(used?) * 100 / u128::from(total)).min(100) as u8)
+/// What this Mac's row on Tab Control says of its machine: the engine's Snapshot
+/// ([`format_local_snapshot_vitals`]), or [`LOCAL_VITALS_READING`] until `VitalsHost` has taken
+/// its first; nothing else samples this Mac for it.
+fn local_machine_vitals(snapshot: Option<&aterm_vitals::model::Snapshot>) -> String {
+    snapshot.map_or_else(
+        || LOCAL_VITALS_READING.to_string(),
+        format_local_snapshot_vitals,
+    )
 }
 
-fn observed_bytes_gui(bytes: Option<u64>) -> String {
-    bytes.map_or_else(|| "unknown".to_string(), human_bytes_gui)
-}
-
-/// Keep each memory figure's absence distinct from a measured zero.
-fn format_memory_usage_gui(used: Option<u64>, total: Option<u64>) -> Option<String> {
-    if used.is_none() && total.is_none() {
-        return None;
-    }
-    let share = used_percent_gui(used, total)
-        .map(|pct| format!(" ({pct}% {})", bar_8_gui(pct)))
-        .unwrap_or_default();
-    Some(format!(
-        "RAM {}/{}{share}",
-        observed_bytes_gui(used),
-        observed_bytes_gui(total)
-    ))
-}
-
-/// Keep used, total and available independent: one unread figure says nothing about the others.
-fn format_disk_usage_gui(
-    used: Option<u64>,
-    total: Option<u64>,
-    available: Option<u64>,
-) -> Option<String> {
-    if used.is_none() && total.is_none() && available.is_none() {
-        return None;
-    }
-    let share = used_percent_gui(used, total)
-        .map(|pct| format!("{pct}% \u{b7} "))
-        .unwrap_or_default();
-    Some(format!(
-        "Disk {}/{} ({share}{} free)",
-        observed_bytes_gui(used),
-        observed_bytes_gui(total),
-        observed_bytes_gui(available)
-    ))
-}
-
-/// Hardware identity, capacity and utilization are independently measured.
-fn format_gpu_vitals_gui(
-    name: Option<&str>,
-    cores: Option<u64>,
-    pct: Option<u64>,
-) -> Option<String> {
-    let name = name.filter(|name| !name.is_empty());
-    if name.is_none() && cores.is_none() && pct.is_none() {
-        return None;
-    }
-    let usage = pct
-        .map(|pct| format!("{}% {} ", pct.min(100), bar_8_gui(pct.min(100) as u8)))
-        .unwrap_or_default();
-    let mut meta = Vec::new();
-    if let Some(name) = name {
-        meta.push(name.to_string());
-    }
-    if let Some(cores) = cores {
-        meta.push(format!("{cores}c"));
-    }
-    Some(if meta.is_empty() {
-        format!("GPU {}", usage.trim_end())
-    } else {
-        format!("GPU {usage}({})", meta.join(" "))
-    })
-}
-
-fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
-    let cores = v.get("cpu_cores").and_then(|x| x.as_u64());
-    let cpu_pct = v
-        .get("cpu_busy_pct")
-        .and_then(|x| x.as_u64())
-        .map(|x| x.min(100) as u8);
-    let load = v
-        .get("load_avg_100")
-        .and_then(|x| x.as_array())
-        .and_then(|arr| {
-            Some([
-                arr.first()?.as_u64()? as u32,
-                arr.get(1)?.as_u64()? as u32,
-                arr.get(2)?.as_u64()? as u32,
-            ])
-        });
-    let mut parts = Vec::new();
-    if cpu_pct.is_some() || cores.is_some() || load.is_some() {
-        let load_str = load.map_or_else(String::new, |[l1, l5, l15]| {
-            format!(
-                " \u{b7} load {:.2}/{:.2}/{:.2}",
-                f64::from(l1) / 100.0,
-                f64::from(l5) / 100.0,
-                f64::from(l15) / 100.0
-            )
-        });
-        let capacity = cores.map_or_else(|| "cores unknown".to_string(), |n| format!("{n}c"));
-        parts.push(format_cpu_vitals_gui(
-            &format!("{host_id}/cpu"),
-            cpu_pct,
-            &format!("{capacity}{load_str}"),
-        ));
-    }
-    let gpu_name = v
-        .get("gpu_name")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty());
-    let gpu_cores = v.get("gpu_cores").and_then(|x| x.as_u64());
-    let gpu_pct = v.get("gpu_busy_pct").and_then(|x| x.as_u64());
-    if let Some(gpu) = format_gpu_vitals_gui(gpu_name, gpu_cores, gpu_pct) {
-        parts.push(gpu);
-    }
-    let mem_tot = v.get("mem_total_bytes").and_then(|x| x.as_u64());
-    let mem_used = v.get("mem_used_bytes").and_then(|x| x.as_u64());
-    if let Some(memory) = format_memory_usage_gui(mem_used, mem_tot) {
-        parts.push(memory);
-    }
-    let disk_tot = v.get("disk_total_bytes").and_then(|x| x.as_u64());
-    let disk_used = v.get("disk_used_bytes").and_then(|x| x.as_u64());
-    let disk_avail = v.get("disk_avail_bytes").and_then(|x| x.as_u64());
-    if let Some(disk) = format_disk_usage_gui(disk_used, disk_tot, disk_avail) {
-        parts.push(disk);
-    }
-    if let Some(up) = v
-        .get("uptime_secs")
-        .and_then(|x| x.as_u64())
-        .filter(|u| *u > 0)
-    {
-        parts.push(format!("up {}", format_uptime_gui(up)));
-    }
-    parts.join(" \u{b7} ")
-}
-
-#[cfg(target_os = "macos")]
-fn sample_local_vitals_fallback() -> String {
-    let layout = aterm_sysprobe::cpu_layout();
-    let total_cores = layout.logical_cores() as u32;
-    let mut probe = aterm_sysprobe::Probe::new();
-    let t1 = probe.core_ticks();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let t2 = probe.core_ticks();
-    let cpu_pct = match (t1, t2) {
-        (Some(a), Some(b)) if !a.is_empty() && a.len() == b.len() => {
-            let mut busy_sum = 0u64;
-            let mut tot_sum = 0u64;
-            for (x, y) in a.iter().zip(b.iter()) {
-                busy_sum = busy_sum.saturating_add(y.busy().saturating_sub(x.busy()));
-                tot_sum = tot_sum.saturating_add(y.total().saturating_sub(x.total()));
-            }
-            busy_sum
-                .saturating_mul(100)
-                .checked_div(tot_sum)
-                .map(|pct| pct.min(100) as u8)
-        }
-        _ => None,
-    };
-    let load_str = run_cmd_stdout_bounded("/usr/sbin/sysctl", &["-n", "vm.loadavg"], 60)
-        .and_then(|s| parse_loadavg_gui(&s))
-        .map(|[l1, l5, l15]| {
-            format!(
-                "load {:.2}/{:.2}/{:.2}",
-                f64::from(l1) / 100.0,
-                f64::from(l5) / 100.0,
-                f64::from(l15) / 100.0
-            )
-        });
-    let mut parts = Vec::new();
-    let cl_names: Vec<String> = layout
-        .clusters
-        .iter()
-        .map(|c| format!("{}:{}c", c.name, c.logical.len()))
-        .collect();
-    let cpu_meta = match (cl_names.is_empty(), load_str) {
-        (false, Some(ld)) => {
-            format!("{}c [{}] \u{b7} {ld}", total_cores, cl_names.join(" "))
-        }
-        (false, None) => format!("{}c [{}]", total_cores, cl_names.join(" ")),
-        (true, Some(ld)) if total_cores > 0 => format!("{total_cores}c \u{b7} {ld}"),
-        (true, Some(ld)) => format!("cores unknown \u{b7} {ld}"),
-        (true, None) if total_cores > 0 => format!("{total_cores}c"),
-        (true, None) => "cores unknown".to_string(),
-    };
-    parts.push(format_cpu_vitals_gui("local/cpu", cpu_pct, &cpu_meta));
-
-    if let Some(g) = aterm_sysprobe::gpu() {
-        let gname = match (g.name.as_deref(), g.cores) {
-            (Some(n), Some(c)) if !n.is_empty() && c > 0 => format!("{n} {c}c"),
-            (Some(n), _) if !n.is_empty() => n.to_string(),
-            _ => "GPU".to_string(),
-        };
-        let gpct = g
-            .device_pct
-            .or((g.unread == Some(aterm_sysprobe::Why::Asleep)).then_some(0));
-        match gpct {
-            Some(p) => {
-                let p = p.min(100);
-                parts.push(format!("GPU {p}% {} ({gname})", bar_8_gui(p)));
-            }
-            None => parts.push(format!(
-                "GPU unavailable({}) ({gname})",
-                g.unread.unwrap_or(aterm_sysprobe::Why::Unsupported)
-            )),
-        }
-    }
-    if let Some(m) = aterm_sysprobe::memory_detail() {
-        let used = m
-            .app
-            .saturating_add(m.shared.unwrap_or(0))
-            .saturating_add(m.wired)
-            .saturating_add(m.compressed.unwrap_or(0))
-            .min(m.total);
-        let mpct = ((used.saturating_mul(100)) / m.total.max(1)).min(100) as u8;
-        let press = match m.pressure {
-            Some(aterm_sysprobe::MemoryLevel::Normal) => "normal",
-            Some(aterm_sysprobe::MemoryLevel::Warn) => "warn",
-            Some(aterm_sysprobe::MemoryLevel::Critical) => "critical",
-            None => "pressure unknown",
-        };
-        let mut extra = vec![
-            press.to_string(),
-            format!("wired {}", human_bytes_gui(m.wired)),
-        ];
-        if let Some(c) = m.compressed {
-            extra.push(format!("comp {}", human_bytes_gui(c)));
-        }
-        if m.swap_used > 0 {
-            extra.push(format!("swap {}", human_bytes_gui(m.swap_used)));
-        }
-        parts.push(format!(
-            "RAM {}/{} ({mpct}% {} \u{b7} {})",
-            human_bytes_gui(used),
-            human_bytes_gui(m.total),
-            bar_8_gui(mpct),
-            extra.join(" \u{b7} ")
-        ));
-    }
-    if let Some(v) = aterm_types::dirs::home_dir().and_then(|home| aterm_sysprobe::volume(&home)) {
-        let used = v.total.saturating_sub(v.free);
-        let dpct = ((used.saturating_mul(100)) / v.total.max(1)).min(100) as u8;
-        parts.push(format!(
-            "Disk {}/{} ({dpct}% \u{b7} {} free)",
-            human_bytes_gui(used),
-            human_bytes_gui(v.total),
-            human_bytes_gui(v.available)
-        ));
-    }
-    if let Some(boottime) = run_cmd_stdout_bounded("/usr/sbin/sysctl", &["-n", "kern.boottime"], 60)
-        .and_then(|s| boot_secs(&s))
-    {
-        let now_s = (unix_ms_now() / 1000).max(0) as u64;
-        if now_s > boottime {
-            parts.push(format!("up {}", format_uptime_gui(now_s - boottime)));
-        }
-    }
-    parts.join(" \u{b7} ")
-}
-
-/// The boot time, unix seconds, `sysctl -n kern.boottime` says in `text` (`{ sec = …, usec = … }
-/// …`), past the space after its `=`.
-#[cfg(target_os = "macos")]
-fn boot_secs(text: &str) -> Option<u64> {
-    text.split_once("sec =")?
-        .1
-        .trim_start()
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse::<u64>()
-        .ok()
-}
+/// This Mac's vitals line before the engine's first Snapshot.
+const LOCAL_VITALS_READING: &str = "reading";
 
 #[cfg(target_os = "macos")]
 fn run_cmd_stdout_bounded(prog: &str, args: &[&str], wait_ms: u64) -> Option<String> {
@@ -5087,18 +4748,6 @@ fn run_cmd_stdout_bounded(prog: &str, args: &[&str], wait_ms: u64) -> Option<Str
     let _ = done_tx.send(());
     let _ = watcher.join();
     (!out.trim().is_empty()).then_some(out)
-}
-
-#[cfg(target_os = "macos")]
-fn parse_loadavg_gui(text: &str) -> Option<[u32; 3]> {
-    let mut vals = text
-        .split(|c: char| c.is_whitespace() || matches!(c, '{' | '}'))
-        .filter(|tok| !tok.is_empty())
-        .filter_map(|tok| tok.parse::<f64>().ok());
-    let l1 = (vals.next()?.max(0.0) * 100.0).round() as u32;
-    let l5 = (vals.next()?.max(0.0) * 100.0).round() as u32;
-    let l15 = (vals.next()?.max(0.0) * 100.0).round() as u32;
-    Some([l1, l5, l15])
 }
 
 /// What the broker's Bonjour request `events` hears within `wait`, each event given to `heard`
@@ -5486,7 +5135,6 @@ fn discover_bonjour_lan_computers(
     custom_names: &std::collections::BTreeMap<String, String>,
     known_swarm_names: &std::collections::BTreeMap<String, String>,
     in_swarm_census: bool,
-    local_vitals: bool,
 ) {
     let (lan_names, sftp_names, rfb_names, resolved_map) = cached_bonjour_browse();
 
@@ -5545,11 +5193,7 @@ fn discover_bonjour_lan_computers(
             "{local_hw} \u{b7} {local_os_str} \u{b7} {local_ssh_str} \u{b7} advertised services: {local_services}"
         )),
         status: "online (local)".to_string(),
-        vitals: if local_vitals {
-            sample_local_vitals_fallback()
-        } else {
-            String::new()
-        },
+        vitals: String::new(),
         instances: None,
         tabs: None,
         ai_clis: None,

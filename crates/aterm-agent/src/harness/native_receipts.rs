@@ -39,7 +39,7 @@ pub use reservation::{RecipientReservation, reserve_recipient_operation};
 mod recipient_custody;
 pub use recipient_custody::{
     BoundRecipientCustody, RecipientCustody, RecipientWriter, bind_recipient_custody,
-    enroll_recipient_custody, open_recipient_writer,
+    close_recipient_reservation, enroll_recipient_custody, open_recipient_writer,
 };
 #[cfg(any(test, debug_assertions))]
 #[path = "native_receipts_replay_bench.rs"]

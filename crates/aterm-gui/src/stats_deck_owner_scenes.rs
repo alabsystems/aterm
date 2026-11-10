@@ -478,7 +478,7 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
     s.volume = Some(VolumeSample {
         total,
         free: avail,
-        available: avail,
+        reserved: 0,
         mount: "/".into(),
     });
     f.disk = Some(DiskFacts {

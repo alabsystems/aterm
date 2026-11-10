@@ -126,7 +126,7 @@ pub fn scope_of(ctx: &Ctx) -> String {
         scope.push_str(" --cell ");
         scope.push_str(&cells.join(","));
     }
-    scope
+    format!("{scope} --no-incremental")
 }
 
 /// What a run builds as the machine's record keeps it (`atpkg::admit_disk::Machinewide`), in the
@@ -191,7 +191,7 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
     }
     words.sort_unstable();
     words.dedup();
-    let work = words.join(" ");
+    let mut work = words.join(" ");
     let crates =
         (building.iter().any(|c| c.reads(&ctx.scope)) && !ctx.scope.is_workspace()).then(|| {
             let mut crates = ctx.scope.crates().to_vec();
@@ -199,6 +199,9 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
             crates.dedup();
             crates
         });
+    // Older, incremental runs still bound this smaller layout. The reverse must
+    // never happen: these observations omit compiler state those runs would write.
+    work.push_str(" --no-incremental");
     atpkg::admit_disk::Selection { work, crates }
 }
 
@@ -510,6 +513,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nonincremental_observations_cannot_bound_incremental_runs() {
+        let ctx = Ctx::new(
+            PathBuf::from("/w/aterm"),
+            crate::Scope::crate_only("a"),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp/x"),
+        )
+        .with_checks(&[Check::Lint, Check::Test, Check::Doc]);
+        let lean = selection_of(&ctx);
+        let mut old = lean.clone();
+        old.work = old.work.replace(" --no-incremental", "");
+        assert!(
+            old.holds(&lean),
+            "the old larger layout remains an upper bound"
+        );
+        assert!(
+            !lean.holds(&old),
+            "negative control: fewer bytes cannot bound the old layout"
+        );
+        let mut records = aterm_capacity::MachineFootprints::default();
+        let wrote = |bytes| atpkg::admit_disk::Footprint {
+            peak: bytes,
+            grew: bytes,
+            at_ms: 1,
+            dirs: Some(1),
+            scope: None,
+        };
+        records.push(old.clone(), wrote(49 * GIB));
+        assert_eq!(records.cover(&lean, 0, COLD_BYTES).unwrap().bytes, 49 * GIB);
+        records.push(lean.clone(), wrote(8 * GIB));
+        assert_eq!(records.cover(&lean, 0, COLD_BYTES).unwrap().bytes, 8 * GIB);
+        assert_eq!(records.cover(&old, 0, COLD_BYTES).unwrap().bytes, 49 * GIB);
+    }
+
+    #[test]
     fn only_a_planned_compiler_claims_build_disk() {
         let measure = || {
             Ctx::new(
@@ -722,20 +760,26 @@ mod tests {
             crate::Scope::packages(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
         };
         let narrow = at(p(&["b", "a"]), &[Check::Test, Check::Lint]);
-        assert_eq!(narrow, "lint test -p a -p b");
+        assert_eq!(narrow, "lint test -p a -p b --no-incremental");
         assert_eq!(
             at(p(&["a", "b"]), &[Check::Fmt, Check::Lint, Check::Test]),
             narrow
         );
         assert_eq!(
             at(crate::Scope::workspace(), &[Check::Lint, Check::Test]),
-            "lint test --workspace"
+            "lint test --workspace --no-incremental"
         );
         assert_ne!(at(p(&["a"]), &[Check::Lint, Check::Test]), narrow);
         assert_ne!(at(p(&["a", "b"]), &[Check::Lint]), narrow);
         // `-p` narrows `cells`, so its growth is no claim on the whole graph's run.
-        assert_eq!(at(p(&["a"]), &[Check::Cells]), "cells -p a");
-        assert_eq!(at(crate::Scope::workspace(), &[Check::Cells]), "cells");
+        assert_eq!(
+            at(p(&["a"]), &[Check::Cells]),
+            "cells -p a --no-incremental"
+        );
+        assert_eq!(
+            at(crate::Scope::workspace(), &[Check::Cells]),
+            "cells --no-incremental"
+        );
         let cells = |chosen: Vec<String>| {
             scope_of(
                 &Ctx::new(
@@ -759,7 +803,7 @@ mod tests {
             .with_checks(&[Check::Lint]),
         )
         .expect("lint builds");
-        assert_eq!(run.scope, "lint -p a");
+        assert_eq!(run.scope, "lint -p a --no-incremental");
     }
 
     /// A RUN'S SELECTION IN THE MACHINE'S RECORD is its building checks, sorted, each that builds
@@ -783,7 +827,7 @@ mod tests {
             crate::Scope::packages(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
         };
         let sel = |work: &str, crates: Option<&[&str]>| atpkg::admit_disk::Selection {
-            work: work.to_owned(),
+            work: format!("{work} --no-incremental"),
             crates: crates.map(|c| c.iter().map(|n| (*n).to_owned()).collect()),
         };
         let narrow = selection_of(&at(p(&["b", "a"]), &[Check::Test, Check::Lint, Check::Fmt]));
@@ -856,7 +900,7 @@ mod tests {
         // measures, so it is not in the work: a run with it and one without write the same.
         let dev = at(p(&["a"]), &crate::checks::DEV);
         assert_eq!(selection_of(&dev), sel("doc lint test", Some(&["a"])));
-        assert_eq!(scope_of(&dev), "doc lint test -p a");
+        assert_eq!(scope_of(&dev), "doc lint test -p a --no-incremental");
         assert!(
             run_of(&at(
                 p(&["a"]),
@@ -885,7 +929,7 @@ mod tests {
         };
         let asked = selection_of(&at(&crate::checks::DEV));
         let kept = |work: &str| atpkg::admit_disk::Selection {
-            work: work.to_owned(),
+            work: format!("{work} --no-incremental"),
             crates: Some(vec!["a".to_owned(), "b".to_owned()]),
         };
         let wrote = |gib: u64| atpkg::admit_disk::Footprint {
@@ -937,7 +981,7 @@ mod tests {
         };
         let app = || Some(crate::MeasureArtifact::unnamed("/release/aterm.app"));
         let sel = |work: &str| atpkg::admit_disk::Selection {
-            work: work.to_owned(),
+            work: format!("{work} --no-incremental"),
             crates: None,
         };
         let whole = crate::Scope::workspace;

@@ -950,7 +950,9 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 #[must_use]
 pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
     let mut args = aterm_toolchain::build_cache::with_test_graph(&args);
-    let mut cmd = Cmd::new(&ctx.tools.targo);
+    // Cargo's completed units remain reusable without retaining a second copy of
+    // each unit's compiler state in every native verification lane.
+    let mut cmd = Cmd::new(&ctx.tools.targo).env("CARGO_INCREMENTAL", "0");
     if let Some(value) = &ctx.main_build_dir {
         args.splice(0..0, ["--config".to_owned(), value.clone()]);
         if aterm_toolchain::build_cache::loses_config(
@@ -2024,6 +2026,7 @@ fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
         Cmd::new(bin)
     };
     cmd.args(args)
+        .env("CARGO_INCREMENTAL", "0")
         .env("PATH", path)
         .env(
             "CARGO_TARGET_DIR",
@@ -2039,73 +2042,12 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
-    if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
-        preflight_lint(ctx, r, &bin);
-    } else if ctx.release {
+    if ctx.release {
         tippy_release_content(ctx, r, &bin, &borrowed);
     } else {
         let scope = ctx.scope.clone();
         let _ = tippy_scope(ctx, r, &bin, &scope, &borrowed);
     }
-}
-
-fn preflight_lint(ctx: &Ctx, r: &mut Report, bin: &std::path::Path) {
-    let mut packages = crate::preflight_lint::Packages::default();
-    let commands = preflight_lint_commands(ctx, bin);
-    for (label, command) in commands {
-        let Compile {
-            mut run,
-            stdout,
-            line,
-            events,
-        } = run_compile(ctx, step_of(r), &label, &command);
-        for event in events {
-            r.raw(event);
-        }
-        if let Ok(stdout) = &stdout {
-            packages.observe(ctx, stdout);
-            rejoin(&mut run, crate::compile_account::human(stdout));
-        }
-        r.raw(run.output.as_str());
-        r.raw(line);
-        r.decide_child(&run, &label);
-        if !run.ok {
-            crate::red_now(ctx, crate::checks::Check::Lint, r);
-            return;
-        }
-    }
-    packages.finish(ctx, r);
-}
-
-fn preflight_lint_commands(ctx: &Ctx, bin: &std::path::Path) -> Vec<(String, Cmd)> {
-    lint_invocations(&ctx.scope, &gated_lint_features(&ctx.root))
-        .into_iter()
-        .map(|pass| {
-            let mut args = pass.args;
-            args.insert(0, "--unverified".into());
-            // Cargo validates freshness here; preserve ordinary scheduling instead of
-            // freezing the command shape used by manually bounded release receipts.
-            let mut command =
-                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
-            let removed: std::collections::BTreeSet<_> = std::env::vars_os()
-                .map(|(name, _)| name)
-                .chain(ctx.exec_env().add_env.iter().map(|(name, _)| name.clone()))
-                .chain(command.envs.iter().map(|(name, _)| name.clone()))
-                .filter(|name| {
-                    name.to_str()
-                        .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
-                })
-                .collect();
-            command.envs.retain(|(name, _)| !removed.contains(name));
-            for name in removed {
-                command = command.remove_env(name);
-            }
-            (
-                format!("preflight tippy {} -D warnings", pass.label),
-                command,
-            )
-        })
-        .collect()
 }
 
 fn tippy_scope(
@@ -5802,6 +5744,24 @@ mod tests {
     }
 
     #[test]
+    fn native_builds_keep_units_without_incremental_state() {
+        let c = ctx(Scope::crate_only("a"));
+        let main = main_targo(&c, test_compile_args(&c.scope));
+        let lint = tippy_cmd(&c, std::path::Path::new("tippy"), tippy_args(&c.scope));
+        for command in [main, lint] {
+            assert!(
+                command
+                    .envs
+                    .iter()
+                    .any(|(k, v)| k == "CARGO_INCREMENTAL" && v == "0")
+            );
+        }
+        // Negative control: this policy belongs to verification, not arbitrary
+        // commands or the caller's ordinary iterative builds.
+        assert!(Cmd::new("targo").envs.is_empty());
+    }
+
+    #[test]
     fn a_borrowed_lint_driver_runs_under_its_own_build_and_says_so() {
         use crate::toolchain::TIPPY;
         let env_of = |cmd: &Cmd, key: &str| {
@@ -5836,36 +5796,6 @@ mod tests {
         let cmd = tippy_cmd(&c, &own, tippy_args(&c.scope));
         assert_eq!(env_of(&cmd, "TRUST_STAGE2_BIN"), None);
         assert_eq!(crate::fmt::borrowed_suffix(&c, TIPPY), "");
-    }
-
-    #[test]
-    fn preflight_lint_keeps_the_selection_its_resource_claim_covers() {
-        let mut c = ctx(Scope::crate_only("a"));
-        c.child_env_add.push((
-            "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT".into(),
-            "outer".into(),
-        ));
-        let commands = preflight_lint_commands(&c, std::path::Path::new("tippy"));
-        assert_eq!(commands.len(), 1);
-        assert!(commands[0].1.demoted);
-        assert!(
-            commands[0]
-                .1
-                .remove_envs
-                .iter()
-                .any(|name| name == "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
-        );
-        assert!(
-            commands[0]
-                .1
-                .args
-                .windows(2)
-                .any(|args| args == ["-p", "a"])
-        );
-        assert!(!commands[0].1.args.iter().any(|arg| arg == "--workspace"));
-        let all = ctx(Scope::workspace());
-        let commands = preflight_lint_commands(&all, std::path::Path::new("tippy"));
-        assert!(commands[0].1.args.iter().any(|arg| arg == "--workspace"));
     }
 
     #[test]

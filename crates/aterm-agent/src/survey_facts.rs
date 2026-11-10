@@ -279,9 +279,6 @@ impl SwarmSurveyFacts {
     /// heartbeat, reads them as an aterm that says nothing of them.
     #[must_use]
     pub fn header_tokens(&self, content: bool) -> String {
-        let headroom = live_cpu_headroom_pct()
-            .map(|pct| format!(" cpu_headroom={pct}"))
-            .unwrap_or_default();
         let home = if content {
             let repos = self.repos.as_ref();
             format!(
@@ -296,7 +293,7 @@ impl SwarmSurveyFacts {
             String::new()
         };
         format!(
-            " label={} window={} window_last={} ssh_host_key={}{headroom}{home} accounts={} \
+            " label={} window={} window_last={} ssh_host_key={}{home} accounts={} \
              accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}",
             word_token(self.label.as_deref()),
             u8::from(self.window),
@@ -309,21 +306,6 @@ impl SwarmSurveyFacts {
             opt_i64_token(self.moves.and_then(|m| m.last)),
             u8::from(self.roster_unread),
         )
-    }
-
-    /// Extract optional `cpu_headroom=<0..=100>` from a `survey` wire reply's `instance` line.
-    #[must_use]
-    pub fn parse_cpu_headroom_pct(reply: &str) -> Option<u32> {
-        for raw in reply.lines() {
-            let line = raw.trim_end_matches('\r');
-            if line.starts_with("instance ") {
-                let fields = parse_fields(line);
-                return field_raw(&fields, "cpu_headroom")
-                    .and_then(crate::parse_uint::<u32>)
-                    .map(|pct| pct.min(100));
-            }
-        }
-        None
     }
 
     /// Take the home's checkouts as its latest read found them ([`repo_home::latest`]), so facts a
@@ -1039,33 +1021,6 @@ fn parse_openssh_pubkey_sha256(text: &str) -> Option<String> {
     let digest = aterm_digest::Sha256::digest(&decoded);
     let encoded = aterm_codec::base64::encode(&digest).ok()?;
     Some(format!("SHA256:{}", encoded.trim_end_matches('=')))
-}
-
-#[cfg(unix)]
-fn live_cpu_headroom_pct() -> Option<u32> {
-    let cores = std::thread::available_parallelism().ok()?.get();
-    if cores == 0 {
-        return None;
-    }
-    unsafe extern "C" {
-        fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
-    }
-    let mut load = [0.0f64; 1];
-    // SAFETY: `load.as_mut_ptr()` points to a valid initialized 1-element `f64` array and we pass
-    // `1` as the element count to POSIX `getloadavg`.
-    let n = unsafe { getloadavg(load.as_mut_ptr(), 1) };
-    if n < 1 || !load[0].is_finite() || load[0] < 0.0 {
-        return None;
-    }
-    let busy_ratio = (load[0] / (cores as f64)).clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let headroom = ((1.0 - busy_ratio) * 100.0).round() as u32;
-    Some(headroom.min(100))
-}
-
-#[cfg(not(unix))]
-fn live_cpu_headroom_pct() -> Option<u32> {
-    None
 }
 
 #[cfg(test)]
@@ -2003,10 +1958,6 @@ mod tests {
                 .roster_unread
         );
         drop(writer);
-        assert_eq!(
-            SwarmSurveyFacts::parse_cpu_headroom_pct("instance cpu_headroom=+50\n"),
-            None
-        );
         let parsed = SwarmSurveyFacts::from_survey_reply(
             "OK 1\ninstance version=0.148.0 sessions=0 window=0 window_last=- label=- ssh_host_key=- accounts_unread=claude,%20codex%20,\n",
         )

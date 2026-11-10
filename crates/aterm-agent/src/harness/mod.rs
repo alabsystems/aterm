@@ -16,6 +16,7 @@ pub mod account_catalog;
 pub mod account_progress;
 pub mod account_series;
 pub mod account_stats;
+pub mod account_sync_error;
 pub mod account_work;
 
 pub mod accounts;

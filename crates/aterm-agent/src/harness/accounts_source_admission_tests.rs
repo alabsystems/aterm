@@ -2,8 +2,51 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::harness::alab_roster::{Lab, TestSourceOverride, test_machine};
+use crate::harness::alab_roster::{Lab, SourceSnapshot, TestSourceOverride, test_machine};
 use aterm_spec::interp::State;
+use std::sync::Arc;
+
+#[test]
+fn receipt_checks_local_config_and_retirement_after_planning() {
+    for change in 0..3 {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("aterm.toml");
+        let store = accounts::Store::at(&root.path().join("state"));
+        let _registry = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
+            me: Some(test_machine("m16")),
+            ..Lab::default()
+        })));
+        let captured = AutomaticSource::capture(&config)
+            .unwrap()
+            .with_policy(store.source_policy().unwrap(), false);
+        if change == 1 {
+            let held = store.acquire().unwrap();
+            store.retire_source_held(&held, 1).unwrap();
+        } else if change == 0 {
+            std::fs::write(&config, "[fleet]\nmachine='m17'\n").unwrap();
+        } else {
+            std::fs::write(&config, "[fleet\n").unwrap();
+        }
+        let mut saved = false;
+        assert_eq!(
+            captured
+                .native_guard()
+                .unwrap()
+                .with_admitted(|| {
+                    saved = true;
+                    Ok(())
+                })
+                .unwrap_err()
+                .retry_reason(),
+            Some(if change == 2 {
+                Retry::Unavailable
+            } else {
+                Retry::Changed
+            })
+        );
+        assert!(!saved);
+    }
+}
 
 #[test]
 fn policy_and_source_precedence_are_rechecked_after_capture() {
@@ -40,7 +83,10 @@ fn policy_and_source_precedence_are_rechecked_after_capture() {
             )
             .unwrap();
         }
-        assert!(captured.validate().is_err());
+        assert_eq!(
+            captured.validate().unwrap_err().retry_reason(),
+            Some(Retry::Changed)
+        );
     }
 }
 

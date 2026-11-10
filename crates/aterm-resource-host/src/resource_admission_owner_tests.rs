@@ -567,10 +567,11 @@ fn queue_owned(
         attempt,
     };
     owner.journal.create(&binding).unwrap();
-    let machine = Fixed::new(Reading::of_gib(64, 60, 2));
+    let reading = Reading::of_gib(64, 60, 2);
     let need = Need::new("resource-run: actual private owner fixture")
         .mem(MEMORY)
-        .margin(aterm_capacity::build_cpu::default_memory_reserve());
+        .margin(reading.memory_margin());
+    let machine = Fixed::new(reading);
     // Run the real private memory admission AFTER host journal preparation. Do not
     // admit around a backend-layout refusal or replace its authority with observations.
     let claim = match Waiter::enter_cohort(&owner.ledger, &machine, need)

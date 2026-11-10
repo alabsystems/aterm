@@ -930,7 +930,7 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
         Case {
             tag: "unread",
             words: "held:draft",
-            set: |m| m.input = "input=pending input_bytes=3 input_wait_ms=10 fg_rss_mb=-",
+            set: |m| m.input = "input=pending input_bytes=3 input_wait_ms=10 fg_footprint_mb=-",
             ..CASE
         },
         Case {
@@ -985,7 +985,7 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
                     word: "stalled",
                     bytes: Some(3),
                     wait_ms: Some(90_000),
-                    rss_mb: None,
+                    footprint_mb: None,
                 });
             },
             ..CASE
@@ -1130,7 +1130,7 @@ fn without_its_guards_the_door_would_type() {
         (
             "draft",
             Fault::DoorIgnoresDraft,
-            |m| m.input = "input=pending input_bytes=3 input_wait_ms=10 fg_rss_mb=-",
+            |m| m.input = "input=pending input_bytes=3 input_wait_ms=10 fg_footprint_mb=-",
             |_| {},
         ),
         (

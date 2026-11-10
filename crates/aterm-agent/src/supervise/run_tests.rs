@@ -818,9 +818,10 @@ impl ResetWorld {
 
 const PARKED: Duration = Duration::from_secs(10);
 
-const INPUT_CLEAR: &str = "input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=-";
-const INPUT_KEY_UNREAD: &str = "input=pending input_bytes=1 input_wait_ms=0 fg_rss_mb=-";
-const INPUT_STALLED: &str = "input=stalled input_bytes=1 input_wait_ms=161000 fg_rss_mb=39731";
+const INPUT_CLEAR: &str = "input=clear input_bytes=0 input_wait_ms=0 fg_footprint_mb=-";
+const INPUT_KEY_UNREAD: &str = "input=pending input_bytes=1 input_wait_ms=0 fg_footprint_mb=-";
+const INPUT_STALLED: &str =
+    "input=stalled input_bytes=1 input_wait_ms=161000 fg_footprint_mb=39731";
 
 fn ok(stdout: &str) -> CtlReply {
     CtlReply {
@@ -1507,7 +1508,7 @@ impl Mock {
         }
         let input = match waited {
             Some(since) => format!(
-                " input=pending input_bytes=1 input_wait_ms={} fg_rss_mb=-",
+                " input=pending input_bytes=1 input_wait_ms={} fg_footprint_mb=-",
                 since.as_millis()
             ),
             None if self.input.is_empty() => String::new(),

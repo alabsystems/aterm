@@ -70,7 +70,6 @@ pub mod memory;
 pub mod own_tests;
 pub mod perf;
 pub mod plan;
-mod preflight_lint;
 #[cfg(unix)]
 pub mod provision;
 pub mod release_input;
@@ -970,9 +969,11 @@ impl Ctx {
         self.target_dir.join("verify")
     }
 
-    /// The machine's parallelism.
+    /// This process's parallelism (`available_parallelism`: the cores it may run on, which an
+    /// affinity mask or a cgroup quota narrows), at least one: what bounds the run's own direct
+    /// concurrency. The machine's cores are [`aterm_capacity::cores`].
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn parallelism(&self) -> u32 {
         std::thread::available_parallelism()
             .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
     }
@@ -985,15 +986,15 @@ impl Ctx {
 
     /// The CPU share the test binaries are charged from ([`test_workers::share`]): the release's
     /// pool's slots where a pool was adopted, the admitted share where a slot is held
-    /// ([`test_workers::admitted_share`]), else the host's cores. A context inspected before
-    /// [`run_with`] refuses malformed admission data (or a pool named and not adopted) still
-    /// names no unbounded share: one core. `--test-cores` caps this request without granting
-    /// capacity; the execution stage can receive less from admission.
+    /// ([`test_workers::admitted_share`]), else this process's parallelism ([`Ctx::parallelism`]).
+    /// A context inspected before [`run_with`] refuses malformed admission data (or a pool named
+    /// and not adopted) still names no unbounded share: one core. `--test-cores` caps this
+    /// request without granting capacity; the execution stage can receive less from admission.
     #[must_use]
     pub fn test_share(&self) -> u32 {
         let available = match test_workers::share(&self.env, self.pool.as_ref()) {
             Ok(test_workers::Share::Pool(slots)) => slots,
-            Ok(test_workers::Share::Claim(share)) => share.unwrap_or_else(|| self.cores()),
+            Ok(test_workers::Share::Claim(share)) => share.unwrap_or_else(|| self.parallelism()),
             Err(_) => 1,
         }
         .max(1);
@@ -1916,7 +1917,7 @@ impl ResourceClaim {
 fn background_cores(ctx: &Ctx) -> Option<u32> {
     ctx.background.then(|| {
         ctx.build_jobs_ceiling()
-            .unwrap_or_else(|| ctx.cores())
+            .unwrap_or_else(|| ctx.parallelism())
             .max(1)
     })
 }

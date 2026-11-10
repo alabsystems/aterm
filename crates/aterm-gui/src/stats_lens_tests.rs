@@ -64,7 +64,7 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     let mut r = Rng(3);
     let bucket_ms = FREE_BUCKET_S * 1000;
     let now_k = now.div_euclid(bucket_ms);
-    let avail = s.volume.as_ref().map_or(0, |v| v.available) as f64 / 1e9;
+    let avail = s.volume.as_ref().map_or(0, |v| v.free) as f64 / 1e9;
     let shift = avail - 885.0;
     let mut v = 906.0;
     for j in 0..144_i64 {
@@ -1692,15 +1692,15 @@ fn the_lens_first_line_says_used_available_and_total() {
     memory.sample.compressed = Some(4 * (1_u64 << 30));
     memory.sample.cached = 24 * (1_u64 << 30);
     memory.sample.free = 8 * (1_u64 << 30);
+    memory.sample.available = 32 * (1_u64 << 30);
     snap.volume = Some(VolumeSample {
         total: 4_000_000_000_000,
-        free: 1_700_000_000_000,
-        available: 1_660_000_000_000,
+        free: 1_660_000_000_000,
+        reserved: 40_000_000_000,
         mount: "/".into(),
     });
     let mem_line = "96.0 GiB used \u{b7} 32.0 GiB available \u{b7} 128 GiB total";
-    let disk_line =
-        "2.34 TB used \u{b7} 1.66 TB available \u{b7} 4.00 TB total \u{b7} 40 GB reserved";
+    let disk_line = "2.34 TB used \u{b7} 1.66 TB free \u{b7} 4.00 TB total \u{b7} 40 GB reserved";
 
     let doc = memory_doc(two_columns(&snap, &m));
     assert!(doc.keeps_first, "capacity must survive a short panel");
@@ -1754,7 +1754,7 @@ fn the_lens_first_line_says_used_available_and_total() {
         ),
         (
             Instrument::Disk,
-            "2.34 terabytes used, 1.66 terabytes available, 4.00 terabytes total, 40 gigabytes \
+            "2.34 terabytes used, 1.66 terabytes free, 4.00 terabytes total, 40 gigabytes \
              reserved",
         ),
         (
@@ -1767,11 +1767,11 @@ fn the_lens_first_line_says_used_available_and_total() {
     }
 
     // CONTROL: 39 GB kept back of 4 TB is under 1 %; an unread in-use figure goes unsaid.
-    snap.volume.as_mut().expect("volume").free = 1_699_000_000_000;
+    snap.volume.as_mut().expect("volume").reserved = 39_000_000_000;
     let doc = disk_doc(two_columns(&snap, &m));
     assert_eq!(
         doc.sections[0].words[0],
-        "2.34 TB used \u{b7} 1.66 TB available \u{b7} 4.00 TB total"
+        "2.34 TB used \u{b7} 1.66 TB free \u{b7} 4.00 TB total"
     );
     drop(doc);
     snap.facts.gpu.as_mut().expect("fixture GPU").in_use_bytes = None;

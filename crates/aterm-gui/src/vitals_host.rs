@@ -2945,8 +2945,6 @@ impl Reader {
     }
 
     fn set_occupancy_facts(&mut self, snap: &mut Snapshot) -> aterm_sysprobe::slots::SlotsRead {
-        snap.avail =
-            aterm_sysprobe::machine_memory().map(|m| m.available_mib.saturating_mul(1 << 20));
         let machine = aterm_sysprobe::slots::Machine {
             load5: snap.load.map(|l| l[1]),
             ncpu: snap.total_cores(),
@@ -3201,7 +3199,7 @@ impl Reader {
             volume: volume.map(|v| VolumeSample {
                 total: v.total,
                 free: v.free,
-                available: v.available,
+                reserved: v.reserved,
                 mount: v.mount.display().to_string(),
             }),
             procs: None,
@@ -3351,6 +3349,7 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
         // them twice (A1 §4.3, amended by R4).
         cached: m.file_backed.saturating_add(m.purgeable.unwrap_or(0)),
         free: m.free,
+        available: m.available,
         swap_used: m.swap_used,
         swap_total: m.swap_total,
         pressure: match m.pressure {
@@ -3372,7 +3371,7 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
             pageins: c.pageins,
             page_bytes: c.page_bytes,
         }),
-        kernel_available_pct: m.kernel_available_pct,
+        memorystatus_level_pct: m.memorystatus_level_pct,
         exact: m.exact,
     }
 }

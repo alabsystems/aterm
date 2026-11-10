@@ -91,10 +91,9 @@ pub(crate) const PAGE: Page = Page {
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
                      s|-> ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> \
                      moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1>[ \
-                     drive=1]` header (`drive=1`: a fleet reader this machine lets drive it; \
-                     `cpu_headroom=<0..100>` after `ssh_host_key=` where the load can be read: \
-                     100 less the 1-minute load average per core, in percent; at `content`, \
-                     `home= home_free_mb= repos= repos_at= repos_cut=` before `accounts=`: the \
+                     drive=1]` header (`drive=1`: a fleet reader this machine lets drive it; at \
+                     `content`, `home= home_free_mb= repos= repos_at= repos_cut=` before \
+                     `accounts=`: the \
                      home, its volume's free space, and how many checkouts the last read of it \
                      found, when, and how many it left out; `roster_unread=1` where this Mac's \
                      label could not be read), one `session` row per \

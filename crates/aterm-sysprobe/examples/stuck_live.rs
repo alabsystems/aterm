@@ -288,22 +288,8 @@ impl Host {
 }
 
 fn stretch_milli() -> u32 {
-    #[cfg(target_os = "macos")]
-    let text = command("/usr/sbin/sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    #[cfg(not(target_os = "macos"))]
-    let text = std::fs::read_to_string("/proc/loadavg").ok();
-    let loads: Vec<f64> = text
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|w| w.parse().ok())
-        .take(2)
-        .collect();
-    let worst = loads.iter().copied().fold(0.0_f64, f64::max);
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let worst = aterm_sysprobe::load_average().map_or(0.0, |[one, five, _]| one.max(five));
+    let cpus = aterm_sysprobe::cpu_layout().logical_cores().max(1);
     let per_cpu_milli = worst / cpus as f64 * 1000.0;
     if per_cpu_milli.is_finite() {
         (per_cpu_milli as u32).clamp(1000, 10_000)

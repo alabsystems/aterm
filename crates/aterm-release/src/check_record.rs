@@ -2186,6 +2186,45 @@ mod tests {
     }
 
     #[test]
+    fn source_preflight_success_cannot_satisfy_qualification_lint() {
+        let f = Fixture::new();
+        let asked: Vec<_> = aterm_verify::release_input::CHECKS
+            .into_iter()
+            .map(|check| check.name().to_owned())
+            .collect();
+        let mut facts = f.facts("source-only", "");
+        facts.executable = None;
+        facts.asked = &asked;
+        begin_run(&f.root, &facts).unwrap();
+        let events = RunEvents {
+            finished: asked.iter().map(|name| finished(name, OK)).collect(),
+            ..RunEvents::default()
+        };
+        write_run(
+            &f.root,
+            &facts,
+            RunEnd {
+                exit: 0,
+                log_sha256: "",
+                events: Ok(&events),
+            },
+        )
+        .unwrap();
+        assert!(input_missing(&f.root, TREE, facts.seal).unwrap().is_empty());
+        let qualification = f.judge(facts.seal, None);
+        assert!(
+            qualification
+                .run(Half::Tree)
+                .checks
+                .iter()
+                .any(|check| check == "lint"),
+            "{}",
+            qualification.line()
+        );
+        assert!(!qualification.complete());
+    }
+
+    #[test]
     fn input_records_resume_only_missing_and_never_reroll_red() {
         let f = Fixture::new();
         let asked: Vec<_> = aterm_verify::release_input::CHECKS
@@ -2224,7 +2263,7 @@ mod tests {
         // A real red is retained even if a later run supplies all-green events.
         begin_run(&f.root, &facts).unwrap();
         let red = RunEvents {
-            finished: vec![finished("lint", FAIL)],
+            finished: vec![finished("fmt", FAIL)],
             ..RunEvents::default()
         };
         write_run(
@@ -2296,7 +2335,7 @@ mod tests {
         let f = Fixture::new();
         let mut events = all_ok();
         let good = aterm_verify::input_content::Proof {
-            check: "lint".into(),
+            check: "fmt".into(),
             item: "good".into(),
             key: u(1),
             inputs: Vec::new(),
@@ -2337,7 +2376,7 @@ mod tests {
                 .is_empty()
         );
         let red = RunEvents {
-            finished: vec![finished("lint", FAIL)],
+            finished: vec![finished("fmt", FAIL)],
             input_items: vec![good],
             ..RunEvents::default()
         };

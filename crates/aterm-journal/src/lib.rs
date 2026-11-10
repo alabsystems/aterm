@@ -582,7 +582,7 @@ impl Log {
         // below finds nothing to cover and skips: there the checkpoint is flushed in full
         // itself. On an Ordered log it takes barriers, ordered behind the record's.
         let ordered = self.served_ordered();
-        if self
+        if let Err(error) = self
             .checkpoint
             .extend(
                 &self.dir,
@@ -593,12 +593,12 @@ impl Log {
                 self.checkpoint
                     .save(&self.dir, &self.layout, self.checkpoint_flush(ordered))
             })
-            .is_err()
         {
             self.poisoned = true;
-            return Err(io::Error::other(
-                "uncertain journal checkpoint: reopen and retry exact bytes",
-            ));
+            return Err(io::Error::other(CheckpointFailure {
+                path: self.dir.join(&self.layout.checkpoint),
+                error,
+            }));
         }
         #[cfg(test)]
         tests::append_step(tests::Step::Checkpointed, self.log.flush_counts());
@@ -1247,10 +1247,59 @@ fn lock_error(error: std::fs::TryLockError) -> io::Error {
 fn stage_error(layout: &Layout, stage: &str, error: io::Error) -> io::Error {
     // `name` passed the bounded ASCII journal-layout validation before this
     // diagnostic is formed. No record, anchor or application payload is read.
-    io::Error::new(
-        error.kind(),
-        format!("journal {} {stage}: {error}", layout.name),
-    )
+    context_error(format!("journal {} {stage}", layout.name), error)
+}
+
+#[derive(Debug)]
+struct ContextError {
+    context: String,
+    error: io::Error,
+}
+
+fn context_error(context: String, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), ContextError { context, error })
+}
+
+fn private_error(error: PrivateFileError) -> io::Error {
+    match error {
+        PrivateFileError::Io(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
+impl std::fmt::Display for ContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.error)
+    }
+}
+
+impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Debug)]
+struct CheckpointFailure {
+    path: PathBuf,
+    error: io::Error,
+}
+
+impl std::fmt::Display for CheckpointFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "uncertain journal checkpoint {}: {}; reopen and retry exact bytes",
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for CheckpointFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// Digest of the exact acknowledged physical prefix. Kept incrementally in
@@ -1278,7 +1327,7 @@ impl Checkpoint {
                         .try_into()
                         .map_err(|_| io::Error::other("invalid journal checkpoint"))?,
                 );
-                let metadata = checkpoint.extend_in(&judged, layout, length)?;
+                let metadata = checkpoint.extend_in(dir, &judged, layout, length)?;
                 if checkpoint.hash.clone().finalize() != bytes[8..] {
                     return Err(io::Error::other(
                         "acknowledged journal history changed; preserve it for authenticated repair",
@@ -1303,19 +1352,28 @@ impl Checkpoint {
         }
     }
     fn extend(&mut self, dir: &Path, layout: &Layout, length: u64) -> io::Result<()> {
-        let judged = private_file::JudgedDir::judge(dir)
-            .map_err(|_| io::Error::other("journal is not private"))?;
-        self.extend_in(&judged, layout, length).map(|_| ())
+        let judged = private_file::JudgedDir::judge(dir).map_err(|error| {
+            context_error(
+                format!("judge directory {}", dir.display()),
+                private_error(error),
+            )
+        })?;
+        self.extend_in(dir, &judged, layout, length).map(|_| ())
     }
     fn extend_in(
         &mut self,
+        dir: &Path,
         judged: &private_file::JudgedDir<'_>,
         layout: &Layout,
         length: u64,
     ) -> io::Result<std::fs::Metadata> {
-        let (mut file, metadata) = judged
-            .open(&layout.astream)
-            .map_err(|_| io::Error::other("journal is not private"))?;
+        let path = dir.join(&layout.astream);
+        let (mut file, metadata) = judged.open(&layout.astream).map_err(|error| {
+            context_error(
+                format!("open private {}", path.display()),
+                private_error(error),
+            )
+        })?;
         if length < self.length
             || length > layout.limits.bytes as u64
             || metadata.len() < length
@@ -1329,13 +1387,15 @@ impl Checkpoint {
                 "journal lost acknowledged bytes or exceeded its capacity",
             ));
         }
-        file.seek(SeekFrom::Start(self.length))?;
+        file.seek(SeekFrom::Start(self.length))
+            .map_err(|error| context_error(format!("seek {}", path.display()), error))?;
         let mut remaining = length - self.length;
         let mut buffer = [0; 8192];
         while remaining != 0 {
             let count = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| io::Error::other("journal checkpoint length overflow"))?;
-            file.read_exact(&mut buffer[..count])?;
+            file.read_exact(&mut buffer[..count])
+                .map_err(|error| context_error(format!("read {}", path.display()), error))?;
             self.hash.update(&buffer[..count]);
             remaining -= count as u64;
         }

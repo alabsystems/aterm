@@ -418,6 +418,7 @@ pub fn memory_detail_of(
     let (swap_used, swap_total) = swap_pages.map_or((0, 0), |(u, t)| (pages(u), pages(t)));
     Some(MemoryDetail {
         total,
+        available,
         free: available - cache,
         speculative: None,
         active: None,
@@ -435,7 +436,7 @@ pub fn memory_detail_of(
         commit: Some(commit),
         exact: false,
         counters: None,
-        kernel_available_pct: None,
+        memorystatus_level_pct: None,
     })
 }
 

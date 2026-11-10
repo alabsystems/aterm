@@ -424,7 +424,8 @@ pub(crate) struct Clamped {
     pub(crate) tab_clamped: bool,
 }
 
-/// [`Clamped`] of `used` (total − available of home's volume) and the two scopes' bytes.
+/// [`Clamped`] of `used` (home's volume's total less its free, `VolumeReading::used`) and the two
+/// scopes' bytes.
 pub(crate) fn clamp(used: Option<u64>, aterm: u64, tab: u64) -> Clamped {
     let a = used.map_or(aterm, |u| aterm.min(u));
     Clamped {

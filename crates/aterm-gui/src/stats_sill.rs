@@ -239,10 +239,10 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     }
 
     if let Some(v) = snap.volume.as_ref() {
-        let low = v.total > 0 && (v.available as f64) < v.total as f64 * 0.1;
+        let low = v.total > 0 && (v.free as f64) < v.total as f64 * 0.1;
         if fold.disk && disk_w > 0.0 {
             let (ly, lh) = rows[0];
-            let used = v.total.saturating_sub(v.available);
+            let used = v.used();
             let level = if v.total > 0 {
                 used as f32 / v.total as f32
             } else {

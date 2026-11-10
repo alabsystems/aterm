@@ -20,6 +20,7 @@ mod models_recipient_custody;
 mod models_recipient_delivery;
 mod models_recipient_journal;
 mod models_recipient_reservation;
+mod models_reservation_closure;
 mod models_self_claim_fact;
 mod models_sources;
 mod models_usage_wall;

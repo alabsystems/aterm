@@ -81,6 +81,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             stored: Some(3 << 30),
             cached: 8 << 30,
             free: 9 << 30,
+            available: 12 << 30,
             swap_used: 1 << 30,
             swap_total: 2 << 30,
             pressure: Pressure::Normal,
@@ -92,7 +93,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
                 pageins: k * 10,
                 page_bytes: 16_384,
             }),
-            kernel_available_pct: Some(61),
+            memorystatus_level_pct: Some(61),
             commit: None,
             exact: true,
         }),
@@ -108,8 +109,8 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
         }),
         volume: Some(VolumeSample {
             total: 1_000_000_000_000,
-            free: 400_000_000_000,
-            available: 380_000_000_000,
+            free: 380_000_000_000,
+            reserved: 20_000_000_000,
             mount: "/System/Volumes/Data".into(),
         }),
         procs: Some(procs),
@@ -192,8 +193,8 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
     let mut s = snapshot();
     s.volume = Some(VolumeSample {
         total: 8_000_000_000_000,
-        free: 400_000_000_000,
-        available: 240_000_000_000,
+        free: 240_000_000_000,
+        reserved: 160_000_000_000,
         mount: "/".into(),
     });
     let w = world();
@@ -202,9 +203,9 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
         let text = all_text(&render_text(&query(view, false), &c));
         for figure in [
             "7.76 TB used",
-            "240 GB available",
+            "240 GB free",
             "8.00 TB total",
-            "17.0 GiB available",
+            "12.0 GiB available",
             "32 GiB total",
         ] {
             assert!(text.contains(figure), "{view:?} lacks {figure}: {text}");
@@ -212,17 +213,22 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
     }
     let json = global_json(&s);
     // Used is the total less what this user can still write: the 160 GB the volume keeps
-    // back from them counts as used, so used and available add up to the total.
+    // back from them counts as used, so used and free add up to the total.
     assert_eq!(json.get("disk_used_bytes"), Some(&Jv::u(7_760_000_000_000)));
+    assert_eq!(json.get("disk_free_bytes"), Some(&Jv::u(240_000_000_000)));
     assert_eq!(
         json.get("disk_available_bytes"),
-        Some(&Jv::u(240_000_000_000))
+        None,
+        "free is the one name"
     );
     assert_eq!(
         json.get("disk_total_bytes"),
         Some(&Jv::u(8_000_000_000_000))
     );
-    assert_eq!(json.get("mem_available_bytes"), Some(&Jv::u(17 << 30)));
+    // Available is the reader's own figure, never free plus the file cache (17 GiB here).
+    assert_eq!(json.get("mem_available_bytes"), Some(&Jv::u(12 << 30)));
+    assert_ne!(json.get("mem_available_bytes"), Some(&Jv::u(17 << 30)));
+    assert_eq!(json.get("mem_available_basis"), None);
     assert_eq!(json.get("mem_total_bytes"), Some(&Jv::u(32 << 30)));
     assert_eq!(c2(f32::INFINITY), "0.00c");
     assert_eq!(gpu_pm(f32::INFINITY), 0);
@@ -527,8 +533,8 @@ fn world() -> World {
             mount: "/System/Volumes/Data".into(),
             fs: "apfs".into(),
             total: 1_000_000_000_000,
-            free: 400_000_000_000,
-            available: 380_000_000_000,
+            free: 380_000_000_000,
+            reserved: 20_000_000_000,
             level: Some("ok".into()),
         },
         roots: vec![Root {
@@ -1326,6 +1332,12 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     let j = render_json(&query(View::Disk, true), &c);
     assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
     let d = j.get("disk").expect("disk");
+    // The volume says free (what this user may write) and the reserve apart, under one name
+    // each: this world's volume has 400 GB of free blocks, 20 GB of them kept back.
+    let volume = d.get("volume").expect("volume");
+    assert_eq!(volume.get("free_bytes"), Some(&Jv::u(380_000_000_000)));
+    assert_eq!(volume.get("reserved_bytes"), Some(&Jv::u(20_000_000_000)));
+    assert_eq!(volume.get("available_bytes"), None);
     assert_eq!(
         d.get("exclusive_bytes"),
         Some(&Jv::at_least(9_150_000_000, "walking"))
@@ -1901,7 +1913,10 @@ fn jobs_capacity_keeps_machine_and_slot_ages_and_unknowns_separate() {
     use crate::model::{SlotsUnread, SlotsView};
     let mut s = snapshot_with_jobs();
     s.jobs_age_ms = 10_000;
-    s.avail = Some(77 << 30);
+    s.mem
+        .get_or_insert_with(crate::model::MemView::default)
+        .sample
+        .available = 77 << 30;
     s.slots_age_ms = Some(60_000);
     s.slots = Some(SlotsView::Read {
         n: 5,
@@ -1930,7 +1945,7 @@ fn jobs_capacity_keeps_machine_and_slot_ages_and_unknowns_separate() {
     // Even when the job engine has not sampled, missing machine counters are not zero.
     s.jobs = None;
     s.cpu = None;
-    s.avail = None;
+    s.mem = None;
     s.slots = Some(SlotsView::Unread(SlotsUnread::Refused));
     let c = ctx(&w, Some(&s), false, true);
     let j = render_json(&query(View::Jobs, true), &c);

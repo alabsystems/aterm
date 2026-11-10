@@ -270,8 +270,8 @@ fn a_reservation_is_the_need_less_what_is_written() {
     vm.credit = vec![52_100];
     let claims = [claim(41_000, 1, 20 * GIB, DATA, true), far, wrote, vm];
     let use_of = |footprint: u64, written: u64| TreeUse {
+        charged: footprint,
         footprint,
-        whole: footprint,
         written,
     };
     let trees = HashMap::from([
@@ -343,8 +343,8 @@ fn a_held_claim_over_its_claim_through_compressed_pages_is_named_so() {
         mem(18_050, 4, 16, true),
     ];
     let use_of = |counted: u64, whole: u64| TreeUse {
-        footprint: counted * GIB,
-        whole: whole * GIB,
+        charged: counted * GIB,
+        footprint: whole * GIB,
         written: 0,
     };
     let trees = HashMap::from([
@@ -414,16 +414,16 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
         (
             original.pid,
             TreeUse {
+                charged: 2 * GIB,
                 footprint: 2 * GIB,
-                whole: 2 * GIB,
                 written: 0,
             },
         ),
         (
             original.credit[0],
             TreeUse {
+                charged: 6 * GIB,
                 footprint: 6 * GIB,
-                whole: 6 * GIB,
                 written: 0,
             },
         ),

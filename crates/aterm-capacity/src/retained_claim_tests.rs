@@ -206,8 +206,8 @@ fn owner_crash(pending: bool) {
         Proc {
             pid: original_pid,
             ppid: 1,
+            charged: 2 * crate::floor::GIB,
             footprint: 2 * crate::floor::GIB,
-            whole: 2 * crate::floor::GIB,
             ..Proc::default()
         },
         Proc {
@@ -349,8 +349,8 @@ fn original_memory_survives_guard_drop_and_numeric_pid_credit_until_final_close(
     machine.set_procs(Some(Procs::of(vec![Proc {
         pid: original_record.pid,
         ppid: 1,
+        charged: 2 * crate::floor::GIB,
         footprint: 2 * crate::floor::GIB,
-        whole: 2 * crate::floor::GIB,
         ..Proc::default()
     }])));
     let listed = ledger.list().unwrap();

@@ -65,67 +65,93 @@ pub(crate) struct LinkHover {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caption {
     pub(crate) text: String,
-    /// The whole host, in characters.
+    /// The visible host run, in characters.
     pub(crate) host: Range<usize>,
+    /// Original host shape, retained when elision drops its opening bracket.
+    shape: HostShape,
+}
+
+/// A bracketed authority is one identity; its dots never separate DNS labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostShape {
+    Labels,
+    Bracketed,
 }
 
 impl Caption {
     /// The emphasized run.
     pub(crate) fn emphasis(&self) -> Range<usize> {
-        let chars: Vec<char> = self.text.chars().collect();
-        emphasis_span(&chars, &self.host)
+        match self.shape {
+            HostShape::Labels => emphasis_span(&self.text, &self.host),
+            HostShape::Bracketed => self.host.clone(),
+        }
     }
 
     /// The text of a run, in characters (see [`Caption`]).
-    pub(crate) fn slice(&self, run: &Range<usize>) -> String {
-        self.text.chars().skip(run.start).take(run.len()).collect()
+    pub(crate) fn slice(&self, run: &Range<usize>) -> &str {
+        char_slice(&self.text, run)
     }
 
     /// The whole host's text, which the elision tests measure.
     #[cfg(test)]
-    pub(crate) fn host_text(&self) -> String {
+    pub(crate) fn host_text(&self) -> &str {
         self.slice(&self.host)
     }
 
     /// The emphasized run's text.
     #[cfg(test)]
-    pub(crate) fn emphasis_text(&self) -> String {
+    pub(crate) fn emphasis_text(&self) -> &str {
         self.slice(&self.emphasis())
     }
 }
 
+/// Borrow a character-indexed run, clamping it as `chars().skip().take()` does.
+fn char_slice<'a>(text: &'a str, run: &Range<usize>) -> &'a str {
+    if run.is_empty() {
+        return "";
+    }
+    if text.is_ascii() {
+        let from = run.start.min(text.len());
+        let kept = run.len().min(text.len() - from);
+        return &text[from..from + kept];
+    }
+    let from = text
+        .char_indices()
+        .nth(run.start)
+        .map_or(text.len(), |(at, _)| at);
+    let to = text[from..]
+        .char_indices()
+        .nth(run.len())
+        .map_or(text.len(), |(at, _)| from + at);
+    &text[from..to]
+}
+
 /// The run of the host a hurried reader should land on: the site's own labels, never the
 /// padding in front of them.
-fn emphasis_span(chars: &[char], host: &Range<usize>) -> Range<usize> {
-    let Some(slice) = chars.get(host.start..host.end) else {
-        return host.clone();
-    };
-    if slice
-        .iter()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ':' | '[' | ']'))
-    {
+fn emphasis_span(text: &str, host: &Range<usize>) -> Range<usize> {
+    if host.is_empty() {
         return host.clone();
     }
-    let mut dots: Vec<usize> = slice
-        .iter()
-        .enumerate()
-        .filter(|(_, ch)| **ch == '.')
-        .map(|(i, _)| i)
-        .collect();
-    if dots.last() == Some(&slice.len().saturating_sub(1)) {
-        dots.pop();
+    let mut dots = [0; 3];
+    let mut n = 0;
+    let mut width = 0;
+    let mut numeric = true;
+    for (at, ch) in char_slice(text, host).chars().enumerate() {
+        width = at + 1;
+        numeric &= ch.is_ascii_digit() || matches!(ch, '.' | ':' | '[' | ']');
+        // Exclude the one trailing dot. Only the last three other separators
+        // can affect this rule, regardless of how many padding labels precede them.
+        if ch == '.' && width < host.len() {
+            dots = [dots[1], dots[2], at];
+            n += 1;
+        }
     }
-    let Some(&last) = dots.last() else {
-        // one label: the whole thing names the site
-        return host.clone();
-    };
-    let n = dots.len();
-    if n < 2 {
+    if width != host.len() || numeric || n < 2 {
         return host.clone();
     }
-    let second_last_len = last - dots[n - 2] - 1;
+    let second_last_len = dots[2] - dots[1] - 1;
     let keep = if second_last_len <= 3 { 3 } else { 2 };
-    let start = if n >= keep { dots[n - keep] + 1 } else { 0 };
+    let start = if n >= keep { dots[3 - keep] + 1 } else { 0 };
     host.start + start..host.end
 }
 
@@ -203,6 +229,12 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
         read -= 1;
     }
     let span = host_span(&raw[..read]);
+    let shape = if raw[span.clone()].starts_with('[') {
+        HostShape::Bracketed
+    } else {
+        HostShape::Labels
+    };
+    let finish = |text, host| Caption { text, host, shape };
     let known = !span.is_empty() && (span.end < read || read == raw.len());
     let width = |text: &str| text.chars().map(safe_width).sum::<usize>();
     let host_start = width(&raw[..span.start]);
@@ -213,17 +245,11 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
         .map_or(raw.len(), |(at, _)| at);
     let head = safe_form(&raw[..head_end]);
     if head_end == raw.len() && head.len() <= max_cells {
-        return Caption { text: head, host };
+        return finish(head, host);
     }
     match max_cells {
-        0 => Caption {
-            text: String::new(),
-            host: 0..0,
-        },
-        1 => Caption {
-            text: ELLIPSIS.to_string(),
-            host: 0..0,
-        },
+        0 => finish(String::new(), 0..0),
+        1 => finish(ELLIPSIS.to_string(), 0..0),
         max if !known => {
             let mut text = raw[..read]
                 .split_once(':')
@@ -237,12 +263,12 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
                 })
                 .map_or(String::new(), |scheme| format!("{scheme}:"));
             text.push(ELLIPSIS);
-            Caption { text, host: 0..0 }
+            finish(text, 0..0)
         }
         max if host.end < max => {
             let mut text = head[..max - 1].to_string();
             text.push(ELLIPSIS);
-            Caption { text, host }
+            finish(text, host)
         }
         max => {
             let after_host = span.end < raw.len();
@@ -264,7 +290,7 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
                 text.push(ELLIPSIS);
             }
             let host = 1 + host.start.max(start) - start..1 + keep;
-            Caption { text, host }
+            finish(text, host)
         }
     }
 }
@@ -308,7 +334,7 @@ pub(crate) fn caption_row(
             &mut row,
             cols,
             url_col + emphasis.start,
-            &cap.slice(&emphasis),
+            cap.slice(&emphasis),
             c.value,
             c.bar_bg,
             true,
@@ -332,24 +358,52 @@ const OPENS_IN_ATERM_TRACKED: &str = "ctrl+alt+click opens in aterm:";
 
 /// A file citation's name laid out for `max_cells`.
 pub(crate) fn path_caption(shown: &str, max_cells: usize) -> (String, Range<usize>) {
-    let safe = safe_form(shown);
-    let chars: Vec<char> = safe.chars().collect();
-    let text: Vec<char> = if chars.len() <= max_cells {
-        chars
-    } else if max_cells == 0 {
-        Vec::new()
-    } else {
-        let keep = max_cells - 1;
-        std::iter::once(ELLIPSIS)
-            .chain(chars[chars.len() - keep..].iter().copied())
-            .collect()
+    if max_cells == 0 {
+        return (String::new(), 0..0);
+    }
+    // Each printable ASCII byte survives; every other UTF-8 byte becomes %XX.
+    // Read only enough of the tail to decide whether it fits, including one
+    // byte beyond the budget. Bytes let a clipped tail retain even part of an
+    // escape, exactly as truncating the complete safe form does.
+    let mut from = shown.len();
+    let mut width = 0;
+    for &byte in shown.as_bytes().iter().rev() {
+        from -= 1;
+        width += if byte.is_ascii_graphic() { 1 } else { 3 };
+        if width > max_cells {
+            break;
+        }
+    }
+    let clipped = width > max_cells;
+    let kept = if clipped { max_cells - 1 } else { width };
+    let mut skip = width - kept;
+    let mut text = String::with_capacity(kept + if clipped { ELLIPSIS.len_utf8() } else { 0 });
+    if clipped {
+        text.push(ELLIPSIS);
+    }
+    let mut emit = |ch| {
+        if skip > 0 {
+            skip -= 1;
+        } else {
+            text.push(ch);
+        }
     };
+    for &byte in &shown.as_bytes()[from..] {
+        if byte.is_ascii_graphic() {
+            emit(char::from(byte));
+        } else {
+            emit('%');
+            emit(HEX[usize::from(byte >> 4)]);
+            emit(HEX[usize::from(byte & 0x0f)]);
+        }
+    }
     let name_start = text
-        .iter()
-        .rposition(|ch| *ch == '/')
-        .map_or(0, |at| at + 1)
-        .max(usize::from(text.first() == Some(&ELLIPSIS)));
-    (text.iter().collect(), name_start..text.len())
+        .chars()
+        .enumerate()
+        .filter_map(|(at, ch)| (ch == '/').then_some(at + 1))
+        .last()
+        .unwrap_or(usize::from(clipped));
+    (text, name_start..kept + usize::from(clipped))
 }
 
 /// PURE row builder for a file citation (`crate::path_link`).
@@ -385,16 +439,13 @@ pub(crate) fn path_caption_row(
     }
     write_str(&mut row, cols, name_col, &text, c.label, c.bar_bg, false);
     if !emphasis.is_empty() {
-        let run: String = text
-            .chars()
-            .skip(emphasis.start)
-            .take(emphasis.len())
-            .collect();
+        // The emphasized suffix is safe-form ASCII; a leading elision is excluded.
+        let run = &text[text.len() - emphasis.len()..];
         write_str(
             &mut row,
             cols,
             name_col + emphasis.start,
-            &run,
+            run,
             c.value,
             c.bar_bg,
             true,
@@ -405,6 +456,18 @@ pub(crate) fn path_caption_row(
     }
     Some(row)
 }
+
+#[cfg(test)]
+mod path_caption_tests;
+
+#[cfg(test)]
+mod caption_test_support;
+
+#[cfg(test)]
+mod url_caption_tests;
+
+#[cfg(test)]
+mod literal_caption_tests;
 
 #[cfg(test)]
 mod tests {

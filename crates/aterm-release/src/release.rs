@@ -1571,6 +1571,8 @@ pub trait Backend {
     }
 
     fn sync(&mut self) -> Result<String, Refusal>;
+    /// Construct an unreferenced bump commit without moving source refs or journaling.
+    fn preview_bump(&mut self, c: &Candidate, prover: &Prover) -> Result<String, Refusal>;
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal>;
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal>;
     /// Rewind only a clean, structurally proved, locally generated line to its newest source
@@ -3691,9 +3693,7 @@ impl Run<'_> {
         }
         let candidate = self.commit_r();
         let version = self.version();
-        if self.dry && self.cand.as_ref().is_some_and(|c| c.bump_from.is_some()) {
-            self.say("        release-input: COULD NOT RUN for R — the bump tree is not constructed; no base-tree verdict is substituted");
-        } else if let Some(previous) = self.prev_release(&candidate, &version)
+        if let Some(previous) = self.prev_release(&candidate, &version)
             && let Some(base) = self.b.origin_tag(&format!("v{previous}"))
             && let Some(prover) = self.prover.clone()
         {
@@ -4216,6 +4216,14 @@ impl Run<'_> {
             self.halted(Refusal::new(why, "restore the locked Trust toolchain").could_not_run())
         })?);
         let mut candidate = self.cand.clone().ok_or(Halt::Said(1))?;
+        if candidate.bump_from.is_some() {
+            let prover = self.prover.clone().ok_or(Halt::Said(1))?;
+            candidate.commit = self
+                .b
+                .preview_bump(&candidate, &prover)
+                .map_err(|r| self.halted(r))?;
+            self.cand = Some(candidate.clone());
+        }
         if !candidate.carry.is_empty() {
             let mut line = self.journal.as_ref().ok_or(Halt::Said(1))?.line();
             let (hops, _) = self
@@ -4722,7 +4730,10 @@ impl Run<'_> {
             return Ok(());
         }
 
-        if !self.b.is_ancestor(&cand.commit, &tip) && !self.pending_line_heads(&cand.commit) {
+        if !self.b.is_ancestor(&cand.commit, &tip)
+            && !self.pending_line_heads(&cand.commit)
+            && !(self.dry && cand.bump_from.is_some())
+        {
             self.cand = Some(cand.clone());
             let hop = self.heads_a_hop(&cand.commit);
             return self.refuse_hard(
@@ -5097,9 +5108,10 @@ impl Run<'_> {
                     "would commit `release: {} — the version and the lockfile move together` on \
                      {} (pub-bump-edit, then exact path-version lockfile rewrites and locked \
                      offline metadata validation; with the harness versions its window \
-                     owes, `ship harness-bump`'s writes) and push it to main",
+                     owes, `ship harness-bump`'s writes) and push it to main; private bump {} judged at step 1",
                     cand.version,
-                    short(&self.tip)
+                    short(&self.tip),
+                    short(&cand.commit)
                 ),
                 None if !cand.carry.is_empty() => format!(
                     "would record the planned head {} on main and move this clone to it; \
@@ -5399,7 +5411,7 @@ impl Run<'_> {
         };
         if self.dry && (c.bump_from.is_some() || !c.carry.is_empty()) {
             let pending = if c.bump_from.is_some() {
-                "the bump commit is not made yet"
+                "the private bump has no release records yet"
             } else {
                 "the planned head has no release records yet"
             };
@@ -6252,14 +6264,6 @@ impl Run<'_> {
     }
 
     fn commit_gates(&mut self, c: &Candidate) -> Result<String, Halt> {
-        if self.dry && c.bump_from.is_some() {
-            self.refuse(Refusal::new(
-                "R-tree commit preflight COULD NOT RUN: --bump has not constructed the version, \
-                 lockfile and harness-version edits; the frozen base cutter cannot give a verdict on that future tree",
-                "run without --dry-run to construct the bump before R's commit preflight",
-            ).could_not_run())?;
-            return Ok("R-tree commit preflight unavailable until the bump is constructed".into());
-        }
         // The tree is immutable, but advertised tags and engine readiness can change
         // between launches. Refresh the evidence before any compile on every run.
         let found = self.b.commit_gates(c, self.dry);

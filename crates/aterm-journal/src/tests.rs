@@ -118,6 +118,57 @@ fn partial_loss_or_wrong_anchor_cannot_reset_history() {
     }
 }
 #[test]
+fn checkpoint_io_failure_keeps_cause_and_fences_the_writer() {
+    for errno in [libc::EIO, libc::ENOSPC] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut log = open(dir.path());
+        let fault = aterm_durable::seam::FailingDirs::with(errno);
+        let error = log.append("app/1", vec![2]).unwrap_err();
+        drop(fault);
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::Other,
+            "the outcome remains uncertain"
+        );
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("uncertain journal checkpoint"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("flush directory"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&dir.path().display().to_string()),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("os error {errno}")),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("reopen and retry exact bytes"),
+            "{diagnostic}"
+        );
+        let failure = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CheckpointFailure>()
+            .unwrap();
+        assert!(std::error::Error::source(failure).is_some());
+        assert_eq!(
+            failure.error.kind(),
+            io::Error::from_raw_os_error(errno).kind()
+        );
+        assert!(log.is_poisoned());
+        assert!(log.read_range(Offset::ZERO, 1).is_err());
+        assert!(log.append("app/1", vec![3]).is_err());
+        drop(log);
+        let mut reopened = open(dir.path());
+        assert_eq!(reopened.read_range(Offset::ZERO, 8).unwrap().len(), 1);
+        reopened.append("app/1", vec![3]).unwrap();
+    }
+}
+
+#[test]
 fn checkpoint_failure_fences_reads_and_writes_until_exact_retry() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let mut log = open(dir.path());

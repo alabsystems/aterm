@@ -85,6 +85,197 @@ fn native_account(label: &str, email: &str, slot: u64) -> crate::harness::alab_r
     }
 }
 
+struct RefuseReceipt(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[test]
+fn admitted_receipt_recovers_before_a_new_source_is_available() {
+    for entry in 0..4 {
+        let bed = Bed::new();
+        let cli = if entry < 2 { Cli::Claude } else { Cli::Codex };
+        let store = bed.store(cli);
+        let path = bed.roster(cli);
+        let text = "# previously admitted\n";
+        {
+            let held = store.acquire().unwrap();
+            accounts::SYNC_COMMIT_CUT.set(Some(0));
+            let result = store.transact_roster_held(
+                &held,
+                1,
+                &mut None,
+                accounts::SyncTarget {
+                    path: &path,
+                    before: None,
+                    after: Some(text),
+                    mode: None,
+                    fleet: None,
+                },
+                false,
+            );
+            accounts::SYNC_COMMIT_CUT.set(None);
+            assert!(result.is_err());
+        }
+        assert!(store.sync_needs_recovery());
+        let _source = TestSourceOverride::new(SourceSnapshot::Pending);
+        let how = SyncHow {
+            fetch: &fetch_source_text,
+            ladder: &[],
+            fleet_snapshots: &[],
+            heal: None,
+            allow_empty_pool: true,
+        };
+        let _ = match entry {
+            0 => sync_accounts_for_init_with(
+                &bed.home,
+                &bed.state,
+                &path,
+                2,
+                || {},
+                &fetch_source_text,
+            )
+            .map(|_| ())
+            .map_err(SyncError::into_message),
+            1 => sync_accounts_with(&bed.env(), Some("alab"), None, &how)
+                .map(|_| ())
+                .map_err(SyncError::into_message),
+            2 => sync_cli_with(
+                cli,
+                (&bed.home, &bed.state, &bed.config),
+                (None, None),
+                2,
+                (&fetch_source_text, &[]),
+            )
+            .map(|_| ()),
+            _ => crate::harness::cli::default_completion::complete(&bed.env(), None, |_| None)
+                .map(|_| ()),
+        };
+        assert!(!store.sync_needs_recovery(), "entry={entry}");
+        assert_eq!(fs::read_to_string(path).unwrap(), text, "entry={entry}");
+    }
+}
+
+impl crate::harness::alab_roster::SourceGuard for RefuseReceipt {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn same_source(&self, _: &dyn crate::harness::alab_roster::SourceGuard) -> bool {
+        false
+    }
+    fn with_admitted(
+        &self,
+        _: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
+    ) -> Result<(), SyncError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SyncError::retry(
+            Retry::Changed,
+            "refused at native receipt boundary",
+        ))
+    }
+}
+
+#[test]
+fn native_producers_reach_the_receipt_guard_without_publishing_first() {
+    for route in 0..8 {
+        let bed = Bed::new();
+        let cli = if route < 4 { Cli::Claude } else { Cli::Codex };
+        let store = bed.store(cli);
+        let mut state = accounts::State::default();
+        if route == 6 {
+            state
+                .accounts
+                .insert("legacy".into(), accounts::Account::default());
+        }
+        store.save(&state).unwrap();
+        let mut account = native_account(
+            if route == 7 { "main" } else { "native" },
+            "native@example.test",
+            1,
+        );
+        account.cli = cli;
+        if route == 6 {
+            account.legacy_label = Some("legacy".into());
+        }
+        let empty = route == 3 || route == 5;
+        let lab = Lab {
+            me: Some(test_machine("m16")),
+            settled: route == 6,
+            accounts: if empty { Vec::new() } else { vec![account] },
+            ..Lab::default()
+        };
+        if route == 6 || route == 7 {
+            let row = Row {
+                label: if route == 6 { "legacy" } else { "main" }.into(),
+                email: (route == 6).then(|| "native@example.test".into()),
+                class: accounts::Class::Preferred,
+                ..Row::default()
+            };
+            fs::write(
+                bed.roster(cli),
+                accounts::append_rows_for(cli, "", &[row]).unwrap(),
+            )
+            .unwrap();
+        }
+        if route == 7 {
+            fs::create_dir_all(bed.home.join(".codex")).unwrap();
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _source = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(lab))).with_guard(
+            crate::harness::alab_roster::ReceiptGuard::new(RefuseReceipt(calls.clone())),
+        );
+        let before = bed.images(cli);
+        let how = SyncHow {
+            fetch: &fetch_source_text,
+            ladder: &[],
+            fleet_snapshots: &[],
+            heal: None,
+            allow_empty_pool: true,
+        };
+        let result = match route {
+            0 | 1 | 3 => sync_accounts_with(&bed.env(), (route == 1).then_some("alab"), None, &how)
+                .map(|_| ())
+                .map_err(SyncError::into_message),
+            2 => sync_accounts_for_init_with(
+                &bed.home,
+                &bed.state,
+                &bed.roster(cli),
+                1,
+                || {},
+                &fetch_source_text,
+            )
+            .map(|_| ())
+            .map_err(SyncError::into_message),
+            7 => crate::harness::cli::default_completion::complete(&bed.env(), None, |_| {
+                Some("native@example.test".into())
+            })
+            .map(|_| ()),
+            _ => sync_cli_with(
+                cli,
+                (&bed.home, &bed.state, &bed.config),
+                (None, None),
+                1,
+                (&fetch_source_text, &[]),
+            )
+            .map(|_| ()),
+        };
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|why| why.contains("refused at native receipt boundary")),
+            "route={route}: {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "route={route}"
+        );
+        assert_eq!(bed.images(cli), before, "route={route}");
+        assert!(!store.sync_needs_recovery(), "route={route}");
+        assert!(
+            !store.login_dir("native").unwrap().exists(),
+            "route={route}"
+        );
+    }
+}
+
 #[test]
 fn completion_uses_the_native_source_and_refuses_pending_registry_state() {
     let bed = Bed::new();

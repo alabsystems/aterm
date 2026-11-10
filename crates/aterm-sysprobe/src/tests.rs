@@ -23,12 +23,17 @@ pswpout 3400
 pgalloc_dma 0
 ";
 
+/// The physical memory is `MemTotal`, read whether or not the text has a `MemAvailable` (the
+/// available memory is `memory_detail`'s). NEGATIVE CONTROL: a text with no `MemTotal` reads none.
 #[test]
-fn meminfo_gives_the_total_and_the_available() {
-    let m = linux::meminfo(MEMINFO).unwrap();
-    assert_eq!(m.total_kib, 16_318_756);
-    assert_eq!(m.available_kib, 4_079_689);
-    assert_eq!(linux::meminfo("MemTotal: 10 kB\n"), None);
+fn meminfo_gives_the_total() {
+    assert_eq!(linux::mem_total_kib(MEMINFO), Some(16_318_756));
+    assert_eq!(
+        linux::mem_total_kib("MemTotal: 10 kB\n"),
+        Some(10),
+        "no MemAvailable"
+    );
+    assert_eq!(linux::mem_total_kib("MemFree: 812344 kB\n"), None);
 }
 
 #[test]
@@ -132,48 +137,122 @@ fn kernel_pressure_levels_map_to_memory_levels() {
     assert!(MemoryLevel::Critical.is_critical());
 }
 
+/// MEMORY USED ([`MemoryDetail::used`]) is the processes' anonymous and shared memory, the wired
+/// pages and what the compressor occupies, never past physical memory: a Linux reading's shared
+/// memory counts, a Mac's (none) adds nothing. NEGATIVE CONTROL: free, file-backed, purgeable and
+/// speculative pages never count, so raising them leaves it where it was.
 #[test]
-fn memory_in_use_is_counted_from_the_vm_pages() {
-    let page = 16_384;
-    let used = used_mib_of(358_721, 4_509, 118_941, 46_669, page).unwrap();
-    assert_eq!(used, (358_721 - 4_509 + 118_941 + 46_669) * 16 / 1024);
-    assert!((7_000..9_000).contains(&used), "{used} MiB");
-    assert_eq!(used_mib_of(1, 0, 0, 0, 0), None);
+fn memory_used_is_app_shared_wired_and_compressed() {
+    let d = MemoryDetail {
+        total: 100,
+        app: 20,
+        shared: Some(5),
+        wired: 10,
+        compressed: Some(7),
+        ..MemoryDetail::default()
+    };
+    assert_eq!(d.used(), 42);
+    let mac = MemoryDetail { shared: None, ..d };
+    assert_eq!(mac.used(), 37, "no shared class");
+    let cached = MemoryDetail {
+        free: 50,
+        file_backed: 30,
+        purgeable: Some(9),
+        speculative: Some(3),
+        available: 90,
+        ..d
+    };
     assert_eq!(
-        used_mib_of(1, 5, 0, 0, page),
-        Some(0),
-        "purgeable past internal"
+        cached.used(),
+        d.used(),
+        "what can be handed out is not used"
     );
-    assert_eq!(
-        used_mib_of(u64::MAX, 0, u64::MAX, u64::MAX, page),
-        None,
-        "page-class sums saturate and MiB past u32::MAX returns None"
-    );
-    let max_pages = (u64::from(u32::MAX) << 20) / page;
-    assert_eq!(used_mib_of(max_pages, 0, 0, 0, page), Some(u32::MAX));
-    assert_eq!(used_mib_of(max_pages + 64, 0, 0, 0, page), None);
-    assert_eq!(
-        crate::clamp_physical_mib(96 * 1024, Some(64 * 1024)),
-        64 * 1024
-    );
-    assert_eq!(
-        crate::clamp_physical_mib(48 * 1024, Some(64 * 1024)),
-        48 * 1024
-    );
-    assert_eq!(crate::clamp_physical_mib(96 * 1024, None), 96 * 1024);
+    let over = MemoryDetail { app: u64::MAX, ..d };
+    assert_eq!(over.used(), 100, "held to physical memory");
 }
 
+/// AVAILABLE ON A MAC ([`MemoryDetail::available`]) is the free pages (speculative included),
+/// the inactive pages the file-backed ones outside the speculative queue could fill, the
+/// purgeable ones, and what compressing the
+/// anonymous rest of the inactive queue frees at the compressor's ratio. At the look of
+/// 2026-10-29 03:48 on a 24 GiB Mac (0.09 GiB free, 9.92 GiB inactive, 2.62 GiB file-backed,
+/// 1.51 GiB stored in 0.64 GiB of compressor), about 6.9 GiB: 2.7 dropped or free, 4.2 by
+/// compressing 7.3. With nothing in the compressor no ratio is read, and the anonymous pages
+/// count for nothing; it is never more than the machine. NEGATIVE CONTROL: counting every
+/// inactive page reads 10.0 GiB, and counting none of the anonymous ones 2.7.
 #[test]
-fn memory_available_is_free_inactive_and_purgeable_pages() {
-    let page = 16_384;
-    let got = available_mib_of(100_000, 200_000, 4_000, page, None).unwrap();
-    assert_eq!(got, (100_000 + 200_000 + 4_000) * 16 / 1024);
-    assert_eq!(available_mib_of(1, 1, 1, 0, None), None);
+fn available_on_a_mac_is_what_dropping_and_compressing_inactive_pages_frees() {
+    const GIB: u64 = 1 << 30;
+    let hundredths = |h: u64| h * GIB / 100;
+    let detail = MemoryDetail {
+        total: 24 * GIB,
+        free: hundredths(9),
+        speculative: Some(0),
+        inactive: Some(hundredths(992)),
+        file_backed: hundredths(262),
+        purgeable: Some(0),
+        compressed: Some(hundredths(64)),
+        stored: Some(hundredths(151)),
+        ..MemoryDetail::default()
+    };
+    let room = machine::mac_available(&detail);
+    let tenths = |b: u64| (b * 10 + GIB / 2) / GIB;
+    assert_eq!(tenths(room), 69, "{room}");
+    assert_ne!(tenths(room), 100, "every inactive page");
+    assert_ne!(tenths(room), 27, "no anonymous page");
+    let empty = MemoryDetail {
+        compressed: Some(0),
+        stored: Some(0),
+        ..detail
+    };
+    assert_eq!(tenths(machine::mac_available(&empty)), 27, "no ratio read");
+    let huge = MemoryDetail {
+        free: 30 * GIB,
+        ..detail
+    };
     assert_eq!(
-        available_mib_of(8_000_000, 8_000_000, 0, page, Some(128 * 1024)),
-        Some(128 * 1024),
+        machine::mac_available(&huge),
+        24 * GIB,
         "capped at the machine"
     );
+}
+
+/// The macOS reader sets [`MemoryDetail::available`] from the page queues it read, by the one
+/// rule ([`machine::mac_available`]): 16 KiB pages, 2 000 free of them 500 speculative, 6 000
+/// inactive, 2 500 file-backed of which the same 500 speculative (`external_page_count` holds
+/// them), 300 purgeable, and the compressor holding 4 000 pages in 1 000 (a ratio of 3/4), so
+/// 2 000 + 2 000 + 300 + 4 000 · 3/4 = 7 300 pages. NEGATIVE CONTROLS: free plus inactive plus
+/// purgeable, what `Snapshot.avail` counted, reads 8 300, and the speculative pages counted twice,
+/// once free and once file-backed, 2 000 + 2 500 + 300 + 3 500 · 3/4 = 7 425.
+#[test]
+fn the_mac_reader_sets_available_from_its_page_queues() {
+    let page = 16_384;
+    let p = machine::VmPages {
+        free: 2_000,
+        speculative: 500,
+        inactive: 6_000,
+        external: 2_500,
+        purgeable: 300,
+        compressor: 1_000,
+        stored: 4_000,
+        ..machine::VmPages::default()
+    };
+    let m = machine::memory_detail_of(&p, page, 1 << 34, None, None);
+    let pages = 2_000 + 2_000 + 300 + 4_000 * 3 / 4;
+    assert_eq!(m.available, pages * page);
+    assert_eq!(m.available, machine::mac_available(&m));
+    assert_ne!(
+        m.available,
+        (2_000 + 6_000 + 300) * page,
+        "every inactive page"
+    );
+    assert_ne!(
+        m.available,
+        (2_000 + 2_500 + 300 + 3_500 * 3 / 4) * page,
+        "the speculative pages counted twice"
+    );
+    let small = machine::memory_detail_of(&p, page, 1 << 20, None, None);
+    assert_eq!(small.available, 1 << 20, "never past physical memory");
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -438,12 +517,180 @@ fn the_machines_memory_and_pressure_are_read_on_this_host() {
     let mib = crate::physical_memory_mib().expect("hw.memsize");
     assert!(mib >= 4 * 1024, "{mib} MiB");
     assert!(crate::memory_pressure().is_some());
-    let now = crate::machine_memory().expect("HOST_VM_INFO64");
-    assert!(now.available_mib <= mib, "{now:?} of {mib} MiB");
-    assert!(
-        now.used_mib > 0 && now.used_mib <= mib,
-        "{now:?} of {mib} MiB"
+    let now = crate::memory_detail().expect("HOST_VM_INFO64");
+    assert!(now.available <= now.total, "{now:?}");
+    assert!(now.used() > 0 && now.used() <= now.total, "{now:?}");
+    assert_eq!(now.total >> 20, mib, "{now:?}");
+}
+
+/// ONE PROCESS'S FOOTPRINT ([`procs::footprint`]) is its physical footprint, not its resident
+/// size: this process maps 256 MiB of a file and touches every page, which makes them resident
+/// (`ri_resident_size`) and leaves its footprint where it was, file-backed pages being no part of
+/// it. Each figure is read before and after, and their growths are compared, so what other tests
+/// allocate meanwhile, which both count, cancels. NEGATIVE CONTROL: a reader that answered the
+/// resident size grows with it (no gap), and one that answered the larger of the two
+/// (`max(footprint, resident)`, resource-host's old charge) grows with it too, the gap then being
+/// only what of this process the kernel had compressed, far below 128 MiB.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_processs_footprint_leaves_out_the_file_pages_it_maps() {
+    const LEN: usize = 256 << 20;
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let path = dir.path().join("mapped.noindex");
+    std::fs::File::create(&path)
+        .and_then(|f| f.set_len(LEN as u64))
+        .expect("a sparse 256 MiB");
+    let file = std::fs::File::open(&path).expect("the file to map, open for reading");
+    let own = std::process::id();
+    let read = || {
+        let footprint = procs::footprint(own).expect("this process's footprint");
+        let resident = procs::imp::rusage(own.cast_signed())
+            .expect("this process's usage")
+            .ri
+            .ri_resident_size;
+        (footprint.cast_signed(), resident.cast_signed())
+    };
+    let before = read();
+    // SAFETY: a fresh read-only private mapping of `LEN` bytes of an open file of that length;
+    // nothing else holds the address, and it is unmapped below.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            0,
+        )
+    };
+    assert_ne!(
+        addr,
+        libc::MAP_FAILED,
+        "{}",
+        std::io::Error::last_os_error()
     );
+    let mut seen = 0u8;
+    for at in (0..LEN).step_by(4096) {
+        // SAFETY: `at` < `LEN`, inside the readable mapping.
+        seen ^= unsafe { std::ptr::read_volatile(addr.cast::<u8>().add(at)) };
+    }
+    let after = read();
+    // SAFETY: the mapping made above, of `LEN` bytes, unmapped once; nothing reads it after.
+    unsafe { libc::munmap(addr, LEN) };
+    assert_eq!(seen, 0, "a hole reads as zeros");
+    let grew = |i: usize| {
+        if i == 0 {
+            after.0 - before.0
+        } else {
+            after.1 - before.1
+        }
+    };
+    let half = i64::try_from(LEN / 2).expect("128 MiB");
+    assert!(
+        grew(1) >= half,
+        "the mapped pages are resident: {before:?} -> {after:?}"
+    );
+    assert!(
+        grew(1) - grew(0) >= half,
+        "the footprint leaves them out: {before:?} -> {after:?}"
+    );
+}
+
+/// ONE MEMBER, TWO READERS: a group's read ([`crate::group_usage`], verify's stage meter and
+/// aterm-lab's starting child) and a sweep's row ([`crate::activity::member`]) read a process
+/// into the same [`crate::MemberUsage`], so a tree is idle to one exactly when it is to the
+/// other. The process is a shell in a group of its own that ran a busy child,
+/// reaped it, wrote to a file and stopped itself; stopped, it moves no counter, so the two
+/// readers' members must be equal. NEGATIVE CONTROL: it holds its reaped child's CPU time and
+/// its logical writes, so a reader that counted either (the sweep's member, and the group's,
+/// before 2026-11-06) would read another member.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_group_and_a_sweep_read_one_member_the_same() {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    struct Reap(aterm_uds::spawnfd::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let written = dir.path().join("written.noindex");
+    let script = "/bin/sh -c 'i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done'; \
+                  printf 0123456789abcdef > \"$0\"; kill -STOP $$";
+    let child = Reap(
+        aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&written)
+            .process_group(0)
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("a shell in a group of its own"),
+    );
+    let pid = child.0.id();
+    let group = || {
+        let members = crate::group_usage(pid).expect("the shell's own group");
+        assert_eq!(members.len(), 1, "{members:?}");
+        members[0]
+    };
+    let state = || {
+        let mut cmd = aterm_uds::spawnfd::command("/bin/ps");
+        cmd.args(["-o", "stat=", "-p", &pid.to_string()]);
+        aterm_uds::deadline::output_within(&mut cmd, HANG_DETECTOR)
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    while !state().starts_with('T') {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never stopped: {}",
+            state()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let first = group();
+    let sweep = crate::processes().expect("a sweep");
+    let row = sweep
+        .procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("the sweep holds the shell");
+    let then = group();
+    assert_eq!(first, then, "a stopped process moves no counter");
+    assert_eq!(crate::activity::member(row), first, "{row:?}");
+    let (_, read) = crate::activity::between(&crate::activity::Members::new(), [first]);
+    let (used, _) = crate::activity::between(&read, [crate::activity::member(row)]);
+    assert!(used.idle(), "idle to both readers: {used:?}");
+    assert!(
+        row.child_cpu_ns.is_some_and(|ns| ns > 0),
+        "the control: its reaped child's CPU time is read, and left out: {row:?}"
+    );
+    let logical = procs::imp::rusage(pid.cast_signed())
+        .expect("the shell's usage")
+        .ri
+        .ri_logical_writes;
+    assert!(
+        logical > 0,
+        "the control: its logical writes are read, and left out: {first:?}"
+    );
+}
+
+/// ONE PROCESS'S FOOTPRINT ([`procs::footprint`]) reads on this host for this process, and
+/// refuses pid 0, pid 1 and a pid past `i32::MAX` as invalid input before asking the kernel.
+#[test]
+fn a_processs_footprint_reads_here_and_refuses_an_invalid_pid() {
+    let kind = |pid| procs::footprint(pid).map_err(|e| e.kind()).err();
+    for pid in [0, 1, u32::MAX] {
+        assert_eq!(kind(pid), Some(std::io::ErrorKind::InvalidInput), "{pid}");
+    }
+    if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+        let own = procs::footprint(std::process::id()).expect("this process's footprint");
+        assert!(own > 0, "{own}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -870,6 +1117,13 @@ Committed_AS:   19000000 kB
     let k = |kib: u64| kib * 1024;
     let m = linux::memory_detail(FULL).expect("a meminfo");
     assert_eq!((m.total, m.free), (k(16_318_756), k(812_344)));
+    assert_eq!(m.available, k(4_079_689), "the kernel's MemAvailable");
+    assert_ne!(
+        m.available,
+        m.free + m.file_backed,
+        "not free plus the page cache"
+    );
+    assert_eq!(m.used(), k(8_400_000 + 500_000 + 230_000 + 100_000));
     assert_eq!(m.app, k(8_400_000));
     assert_eq!(m.shared, Some(k(500_000)));
     assert_eq!(m.wired, k(150_000 + 20_000 + 60_000));
@@ -907,17 +1161,28 @@ Committed_AS:   19000000 kB
         k(3_310_000 + 204_800),
         "no Shmem: nothing taken out"
     );
-    let halves = "MemTotal: 100 kB\nMemFree: 10 kB\nSReclaimable: 3 kB\nSUnreclaim: 4 kB\n";
+    let halves = "MemTotal: 100 kB\nMemFree: 10 kB\nMemAvailable: 20 kB\nSReclaimable: 3 kB\nSUnreclaim: 4 kB\n";
     assert_eq!(
         linux::memory_detail(halves).map(|m| (m.wired, m.file_backed)),
         Some((k(4), k(3)))
     );
-    let whole = "MemTotal: 100 kB\nMemFree: 10 kB\nSlab: 9 kB\n";
+    let whole = "MemTotal: 100 kB\nMemFree: 10 kB\nMemAvailable: 20 kB\nSlab: 9 kB\n";
     assert_eq!(
         linux::memory_detail(whole).map(|m| (m.wired, m.file_backed)),
         Some((k(9), 0))
     );
+    let over = "MemTotal: 100 kB\nMemFree: 10 kB\nMemAvailable: 120 kB\n";
+    assert_eq!(
+        linux::memory_detail(over).map(|m| m.available),
+        Some(k(100)),
+        "held to MemTotal"
+    );
     assert_eq!(linux::memory_detail("MemTotal: 10 kB\n"), None);
+    assert_eq!(
+        linux::memory_detail("MemTotal: 10 kB\nMemFree: 1 kB\n"),
+        None,
+        "no MemAvailable"
+    );
 }
 
 fn level(name: &str, logical: u16, l2_mib: u64) -> machine::Level {
@@ -1202,19 +1467,32 @@ fn a_utilization_figure_is_held_to_a_percent() {
     }
 }
 
+/// A VOLUME'S FIGURES, ONE NAME EACH: free is what an unprivileged writer may still write
+/// (`f_bavail`), reserved the free blocks kept back from it (`f_bfree − f_bavail`), used the size
+/// less free. An ext4 volume of 1 000 blocks with 400 free blocks and 300 of them writable reads
+/// 300 blocks free, 100 reserved and 700 used. NEGATIVE CONTROL: its free figure is never the free
+/// blocks (400), so a reading whose two counts differ shows each under its one name; with none
+/// reserved (APFS) free is the free blocks and used the rest.
 #[test]
-fn a_volumes_figures_are_held_in_order() {
-    let r = machine::volume_of(1000, 400, 300, 4096, "/".into(), "apfs".into());
+fn a_volumes_free_is_what_a_writer_may_write_and_reserved_the_rest() {
+    let r = machine::volume_of(1000, 400, 300, 4096, "/".into(), "ext4".into());
     assert_eq!(
-        (r.total, r.free, r.available),
-        (4_096_000, 1_638_400, 1_228_800)
+        (r.total, r.free, r.reserved, r.used()),
+        (4_096_000, 1_228_800, 409_600, 2_867_200)
+    );
+    assert_ne!(r.free, 400 * 4096, "not the free blocks");
+    assert_eq!(r.used() + r.free, r.total);
+    let apfs = machine::volume_of(1000, 400, 400, 4096, "/".into(), "apfs".into());
+    assert_eq!(
+        (apfs.free, apfs.reserved, apfs.used()),
+        (1_638_400, 0, 2_457_600)
     );
     let odd = machine::volume_of(10, 20, 30, 1, "/x".into(), "x".into());
-    assert_eq!((odd.total, odd.free, odd.available), (10, 10, 10));
+    assert_eq!((odd.total, odd.free, odd.reserved), (10, 10, 0));
     let huge = machine::volume_of(u64::MAX, u64::MAX, 1, 2, "/".into(), "x".into());
     assert_eq!(
-        (huge.total, huge.free, huge.available),
-        (u64::MAX, u64::MAX, 2)
+        (huge.total, huge.free, huge.reserved),
+        (u64::MAX, 2, u64::MAX - 2)
     );
 }
 
@@ -1668,7 +1946,7 @@ fn nvml_reads_the_nvidia_card_on_this_host() {
 fn the_root_volume_reads_on_this_host() {
     let r = crate::volume(Path::new("/")).expect("the root volume");
     assert!(
-        r.total > 0 && r.total >= r.free && r.free >= r.available,
+        r.total > 0 && r.total >= r.free.saturating_add(r.reserved),
         "{r:?}"
     );
     assert_eq!(r.mount, Path::new("/"), "{r:?}");
@@ -2214,7 +2492,7 @@ fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() 
 
     let root = crate::volume(Path::new("/")).expect("root volume space");
     assert!(
-        root.total > 0 && root.total >= root.available && root.total >= root.free,
+        root.total > 0 && root.total >= root.free && root.total >= root.reserved,
         "{root:?}"
     );
 
@@ -2265,11 +2543,10 @@ fn the_os_major_version_is_the_leading_number() {
     assert_eq!(words(None).os_major(), None);
 }
 
-/// NEGATIVE CONTROL: distinct byte values at every offset catch field swaps (`pgid` vs `measured`
-/// or `available_mib` vs `used_mib`) and shift typos, and `total_estimated_mib` saturates at
-/// `u64::MAX` instead of wrapping.
+/// NEGATIVE CONTROL: distinct byte values at every offset catch field swaps (`pgid` vs `measured`)
+/// and shift typos.
 #[test]
-fn group_and_machine_memory_wire_roundtrip_and_saturating_total() {
+fn group_memory_wire_roundtrips() {
     let distinct_group = GroupMemory {
         pgid: 0x0403_0201,
         measured: 0x0807_0605,
@@ -2298,30 +2575,6 @@ fn group_and_machine_memory_wire_roundtrip_and_saturating_total() {
     ] {
         assert_eq!(GroupMemory::decode_le(boundary.encode_le()), boundary);
     }
-
-    let distinct_machine = MachineMemory {
-        available_mib: 0x0807_0605_0403_0201,
-        used_mib: 0x100f_0e0d_0c0b_0a09,
-    };
-    let machine_bytes = distinct_machine.encode_le();
-    assert_eq!(
-        machine_bytes,
-        [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10,
-        ]
-    );
-    assert_eq!(MachineMemory::decode_le(machine_bytes), distinct_machine);
-    assert_eq!(
-        distinct_machine.total_estimated_mib(),
-        0x0807_0605_0403_0201u64 + 0x100f_0e0d_0c0b_0a09u64
-    );
-    let saturated = MachineMemory {
-        available_mib: u64::MAX - 10,
-        used_mib: 100,
-    };
-    assert_eq!(saturated.total_estimated_mib(), u64::MAX);
-    assert_eq!(MachineMemory::decode_le(saturated.encode_le()), saturated);
 }
 
 /// macOS names `kern.hv_vmm_present` on every Mac aterm runs on, so the read answers there: 0 on

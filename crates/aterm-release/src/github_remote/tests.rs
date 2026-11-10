@@ -379,6 +379,12 @@ fn native_origin_refresh_records_only_main_and_preserves_annotated_tag_peels() {
         &["push", "-q", bare.to_str().unwrap(), "main", "--tags"],
     );
     let advertised = git(&bare, &["show-ref"]);
+    let refs_before = git(&target, &["show-ref"]);
+    let observed = remote.observe_origin().unwrap();
+    assert_eq!(observed.main, new);
+    assert_eq!(git(&target, &["show-ref"]), refs_before);
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), old);
+    assert_eq!(git(&target, &["cat-file", "-t", &new]), "commit");
     let fetched = remote.fetch_origin().unwrap();
     assert_eq!(fetched.main, new);
     let tags = parse_tags(&fetched.tags).unwrap();

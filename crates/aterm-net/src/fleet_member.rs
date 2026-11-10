@@ -4804,11 +4804,10 @@ pub fn heartbeat_members_while(
     if ended.is_set() {
         return Ok(Vec::new());
     }
-    prune_pushed_facts(state_dir, &peers, denied_nodes, log);
+    prune_pushed_facts_peer_slices(state_dir, &[&peers, &issuer_copies], denied_nodes, log);
     if ended.is_set() {
         return Ok(Vec::new());
     }
-    prune_pushed_facts(state_dir, &issuer_copies, denied_nodes, log);
     let keys = Keyring::read(state_dir);
     let own = me.node();
     // A key the log names no way is judged by the book, as with no log ([`MemberKeys`]).
@@ -5054,12 +5053,18 @@ pub fn heartbeat_members_while(
                         .key
                         .is_some_and(|key| log.is_some_and(|log| log.holds_out(&key)))
                 });
+                let fetched_slices: Vec<&[Peer]> = answered
+                    .iter()
+                    .filter_map(|(_, fetched, _)| Some(fetched.as_ref()?.peers.as_slice()))
+                    .collect();
+                if !fetched_slices.is_empty() {
+                    prune_pushed_facts_peer_slices(state_dir, &fetched_slices, denied_nodes, log);
+                }
+                let copies = copied_keys(state_dir, book);
                 for (done, fetched, proved_key) in &mut answered {
-                    let copies = copied_keys(state_dir, book);
                     let fetched = fetched
                         .as_ref()
                         .map_or(&[][..], |book| book.peers.as_slice());
-                    prune_pushed_facts(state_dir, fetched, denied_nodes, log);
                     let fetched: Vec<Peer> = fetched
                         .iter()
                         .filter(|entry| {
@@ -9212,9 +9217,20 @@ pub fn prune_pushed_facts(
     denied_nodes: &[String],
     log: Option<&MemberKeys>,
 ) {
-    prune_pushed_facts_using(
+    prune_pushed_facts_peer_slices(state_dir, &[peers], denied_nodes, log);
+}
+
+/// [`prune_pushed_facts`] across multiple peer slices in a single lock acquisition and directory
+/// pass over `<state_dir>/swarm-facts/`.
+pub fn prune_pushed_facts_peer_slices(
+    state_dir: &Path,
+    peer_slices: &[&[Peer]],
+    denied_nodes: &[String],
+    log: Option<&MemberKeys>,
+) {
+    prune_pushed_facts_slices_using(
         state_dir,
-        peers,
+        peer_slices,
         denied_nodes,
         log,
         Duration::from_secs(2),
@@ -9222,6 +9238,7 @@ pub fn prune_pushed_facts(
     );
 }
 
+#[cfg(test)]
 fn prune_pushed_facts_using(
     state_dir: &Path,
     peers: &[Peer],
@@ -9230,7 +9247,21 @@ fn prune_pushed_facts_using(
     within: Duration,
     held: impl FnMut(),
 ) {
+    prune_pushed_facts_slices_using(state_dir, &[peers], denied_nodes, log, within, held);
+}
+
+fn prune_pushed_facts_slices_using(
+    state_dir: &Path,
+    peer_slices: &[&[Peer]],
+    denied_nodes: &[String],
+    log: Option<&MemberKeys>,
+    within: Duration,
+    held: impl FnMut(),
+) {
     let log = log.filter(|log| log.unread().is_none());
+    if denied_nodes.is_empty() && !log.is_some_and(|l| !l.out().is_empty()) {
+        return;
+    }
     let dir = state_dir.join(SWARM_FACTS_DIR);
     let Ok(_lock) = pushed_facts_lock(&dir, within, held) else {
         return;
@@ -9244,23 +9275,25 @@ fn prune_pushed_facts_using(
             remove_node_facts(&node);
         }
     }
-    for peer in peers {
-        let is_denied = peer
-            .node
-            .as_deref()
-            .is_some_and(|n| crate::fleet::is_denied_node(n, denied_nodes))
-            || peer
+    for peers in peer_slices {
+        for peer in *peers {
+            let is_denied = peer
+                .node
+                .as_deref()
+                .is_some_and(|n| crate::fleet::is_denied_node(n, denied_nodes))
+                || peer
+                    .key
+                    .as_ref()
+                    .is_some_and(|k| crate::fleet::is_denied_key(k, denied_nodes));
+            let is_held_out = peer
                 .key
-                .as_ref()
-                .is_some_and(|k| crate::fleet::is_denied_key(k, denied_nodes));
-        let is_held_out = peer
-            .key
-            .is_some_and(|k| log.is_some_and(|l| l.holds_out(&k)));
-        if (is_denied || is_held_out)
-            && let Some(node) = peer.node.as_deref()
-            && is_node_id(node)
-        {
-            remove_node_facts(node);
+                .is_some_and(|k| log.is_some_and(|l| l.holds_out(&k)));
+            if (is_denied || is_held_out)
+                && let Some(node) = peer.node.as_deref()
+                && is_node_id(node)
+            {
+                remove_node_facts(node);
+            }
         }
     }
     let keyring = Keyring::read(state_dir);
@@ -9287,6 +9320,42 @@ fn prune_pushed_facts_using(
             remove_node_facts(&node);
         }
     }
+}
+
+/// Whether every cached record in `<state_dir>/swarm-facts/` is admitted under `peers`,
+/// `denied_nodes`, and `log`, judged from each record's key header ([`pushed_facts_key_at`])
+/// without reading full survey payloads.
+#[must_use]
+pub fn all_pushed_facts_admitted(
+    state_dir: &Path,
+    peers: &[Peer],
+    denied_nodes: &[String],
+    log: Option<&MemberKeys>,
+) -> bool {
+    let dir = state_dir.join(SWARM_FACTS_DIR);
+    let Ok(nodes) = pushed_facts_nodes(&dir) else {
+        return true;
+    };
+    let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(&dir) else {
+        return true;
+    };
+    let keyring = Keyring::read(state_dir);
+    let key_denied = |key: &NodeKey| {
+        crate::fleet::is_denied_key(key, denied_nodes) || log.is_some_and(|log| log.holds_out(key))
+    };
+    nodes.into_iter().all(|node| {
+        let Some(key) = pushed_facts_key_at(&judged, &node) else {
+            return true;
+        };
+        !crate::fleet::is_denied_node(&node, denied_nodes)
+            && !peers.iter().any(|peer| {
+                peer.node.as_deref() == Some(&node) && peer.key.as_ref().is_some_and(key_denied)
+            })
+            && !key
+                .or_else(|| keyring.bound(&node))
+                .as_ref()
+                .is_some_and(key_denied)
+    })
 }
 
 /// Read private C16 survey-facts payloads, each within [`REPLY_MAX`], from atomic records or,

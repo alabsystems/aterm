@@ -33,6 +33,7 @@ use aterm_agent::machine_name::RegistryNameRead;
 use aterm_agent::{
     ai::connector::{Flow, Region},
     harness::{
+        account_sync_error::{Retry, SyncError},
         accounts::{Cli, Vendor},
         alab_roster::{
             self, Lab, LabAccount, LabMailbox, MachineRef, Part, Placements, SourceSnapshot,
@@ -468,12 +469,16 @@ impl CachedSource for Inventory {
 /// a cached source. This reads configuration only, never vault or table storage.
 fn cache_policy(config: &Path) -> Result<Policy, SourceSnapshot> {
     let document = policy_document(config).map_err(|()| SourceSnapshot::Pending)?;
-    match roster_policy_value(&document) {
+    cache_policy_value(&document)
+}
+
+fn cache_policy_value(document: &aterm_toml::Value) -> Result<Policy, SourceSnapshot> {
+    match roster_policy_value(document) {
         LocalRosterPolicy::Unavailable => return Err(SourceSnapshot::Pending),
         LocalRosterPolicy::Disabled => return Err(SourceSnapshot::Disabled),
         LocalRosterPolicy::Enabled => {}
     }
-    let policy = Policy::from_value(&document).map_err(|_| SourceSnapshot::Pending)?;
+    let policy = Policy::from_value(document).map_err(|_| SourceSnapshot::Pending)?;
     if policy.enabled {
         Ok(policy)
     } else {
@@ -490,6 +495,11 @@ impl<S: CachedSource> Cache<S> {
 
     /// Keep the policy decision and the source of the returned lab in one observation.
     /// A retained token grants no write authority; native admission must validate it again.
+    fn capture(&self) -> (SourceSnapshot, Option<Projected<S>>) {
+        let (snapshot, projected, _) = self.capture_with_image();
+        (snapshot, projected)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -498,12 +508,19 @@ impl<S: CachedSource> Cache<S> {
             project = "aterm::alab_view::source_model_tests::project"
         )
     )]
-    fn capture(&self) -> (SourceSnapshot, Option<Projected<S>>) {
+    fn capture_with_image(&self) -> (SourceSnapshot, Option<Projected<S>>, Option<String>) {
         let held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match cache_policy(&self.config) {
+        let image = match aterm_types::dirs::read_aterm_config_text(&self.config) {
+            Ok(image) => image,
+            Err(_) => return (SourceSnapshot::Pending, None, None),
+        };
+        let policy = aterm_toml::from_str::<aterm_toml::Value>(image.as_deref().unwrap_or(""))
+            .map_err(|_| SourceSnapshot::Pending)
+            .and_then(|document| cache_policy_value(&document));
+        let (snapshot, projected) = match policy {
             Err(observation) => (observation, None),
             Ok(policy) => match &held.projected {
                 Some(projected) if !projected.source.included_by(&policy) => {
@@ -516,7 +533,8 @@ impl<S: CachedSource> Cache<S> {
                 None if held.pending => (SourceSnapshot::Pending, None),
                 None => (SourceSnapshot::Absent, None),
             },
-        }
+        };
+        (snapshot, projected, image)
     }
 
     /// Serialize complete reads and install the projection with its source in one step.
@@ -556,6 +574,20 @@ impl<S: CachedSource> Cache<S> {
 }
 
 impl Cache {
+    fn lab_for_source(&self, source: &SourceRead) -> Arc<Lab> {
+        let settled = self
+            .settled
+            .as_ref()
+            .is_some_and(|dir| settled_in(dir, &source.table()));
+        let mail = lab_mail(source.mailboxes());
+        let toml = mailbox_logins(source.addresses(), &mailbox_names(&self.paths));
+        Arc::new(harness_lab(
+            source.view(),
+            settled,
+            &logins_of(&mail, &toml),
+        ))
+    }
+
     fn refresh(&self) {
         self.refresh_with(|| {
             let Some(source) = Registry::at(self.paths.clone())
@@ -564,17 +596,7 @@ impl Cache {
             else {
                 return Ok(None);
             };
-            let settled = self
-                .settled
-                .as_ref()
-                .is_some_and(|dir| settled_in(dir, &source.table()));
-            let mail = lab_mail(source.mailboxes());
-            let toml = mailbox_logins(source.addresses(), &mailbox_names(&self.paths));
-            let lab = Arc::new(harness_lab(
-                source.view(),
-                settled,
-                &logins_of(&mail, &toml),
-            ));
+            let lab = self.lab_for_source(&source);
             Ok(Some(Projected { lab, source }))
         });
     }
@@ -606,15 +628,132 @@ impl Cache {
     }
 }
 
+struct NativeReceiptGuard {
+    cache: &'static Cache,
+    source: SourceRead,
+    lab: Arc<Lab>,
+    config_image: Option<String>,
+    caller_config: PathBuf,
+    caller_image: Option<String>,
+}
+
+impl alab_roster::SourceGuard for NativeReceiptGuard {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn same_source(&self, other: &dyn alab_roster::SourceGuard) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            std::ptr::eq(self.cache, other.cache)
+                && self.source.revision() == other.source.revision()
+                && self.lab == other.lab
+                && self.config_image == other.config_image
+                && self.caller_config == other.caller_config
+                && self.caller_image == other.caller_image
+        })
+    }
+
+    fn with_admitted(
+        &self,
+        save: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
+    ) -> Result<(), SyncError> {
+        let entered = std::cell::Cell::new(false);
+        let result = Registry::at(self.cache.paths.clone()).with_admitted_source(
+            &self.cache.config,
+            Some(self.source.revision()),
+            |current| {
+                let config = aterm_types::dirs::read_aterm_config_text(&self.cache.config);
+                let caller = aterm_types::dirs::read_aterm_config_text(&self.caller_config);
+                let caller_permitted = caller.as_ref().ok()
+                    .and_then(|image| aterm_toml::from_str::<aterm_toml::Value>(image.as_deref().unwrap_or("")).ok())
+                    .and_then(|document| cache_policy_value(&document).ok())
+                    .is_some_and(|policy| current.included_by(&policy));
+                let permitted = config.as_ref().ok()
+                    .and_then(|image| aterm_toml::from_str::<aterm_toml::Value>(image.as_deref().unwrap_or("")).ok())
+                    .and_then(|document| cache_policy_value(&document).ok())
+                    .is_some_and(|policy| current.included_by(&policy));
+                if config.as_ref().ok() != Some(&self.config_image)
+                    || caller.as_ref().ok() != Some(&self.caller_image)
+                    || !caller_permitted
+                    || !permitted
+                    || self.cache.lab_for_source(current) != self.lab
+                {
+                    return Ok(Err(SyncError::retry(Retry::Changed, "native account source or local policy changed before receipt admission")));
+                }
+                entered.set(true);
+                Ok(save())
+            },
+        ).map_err(|why| SyncError::retry(Retry::Unavailable, why.to_string())).and_then(|result| result);
+        // A refusal before the save asks for a new observation without discarding
+        // retained history or invalidating a newer entry installed meanwhile.
+        if result.is_err() && !entered.get() {
+            let mut held = self
+                .cache
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if held.projected.as_ref().is_some_and(|held| {
+                held.source.revision() == self.source.revision()
+                    && Arc::ptr_eq(&held.lab, &self.lab)
+            }) {
+                held.looked = None;
+            }
+        }
+        result
+    }
+}
+
 impl alab_roster::Source for &'static Cache {
     fn snapshot(&self) -> SourceSnapshot {
         self.refresh_if_due();
         self.projection()
     }
 
+    fn capture(&self) -> alab_roster::SourceCapture {
+        self.capture_for(&self.config)
+    }
+
+    fn capture_for(&self, caller_config: &Path) -> alab_roster::SourceCapture {
+        self.refresh_if_due();
+        let (snapshot, projected, config_image) = self.capture_with_image();
+        let caller_image = if caller_config == self.config.as_path() {
+            config_image.clone()
+        } else {
+            let Ok(image) = aterm_types::dirs::read_aterm_config_text(caller_config) else {
+                return alab_roster::SourceCapture::observed(SourceSnapshot::Pending);
+            };
+            image
+        };
+        let policy =
+            aterm_toml::from_str::<aterm_toml::Value>(caller_image.as_deref().unwrap_or(""))
+                .map_err(|_| SourceSnapshot::Pending)
+                .and_then(|document| cache_policy_value(&document));
+        let policy = match policy {
+            Err(snapshot) => return alab_roster::SourceCapture::observed(snapshot),
+            Ok(policy) => policy,
+        };
+        let Some(projected) = projected else {
+            return alab_roster::SourceCapture::observed(snapshot);
+        };
+        if !projected.source.included_by(&policy) {
+            return alab_roster::SourceCapture::observed(SourceSnapshot::Disabled);
+        }
+        alab_roster::SourceCapture::guarded(
+            snapshot,
+            alab_roster::ReceiptGuard::new(NativeReceiptGuard {
+                cache: self,
+                source: projected.source,
+                lab: projected.lab,
+                config_image,
+                caller_config: caller_config.to_path_buf(),
+                caller_image,
+            }),
+        )
+    }
+
     fn mail(&self) -> Vec<LabMailbox> {
         self.refresh_if_due();
-        self.capture()
+        Cache::capture(self)
             .1
             .map(|projected| lab_mail(projected.source.mailboxes()))
             .unwrap_or_default()
@@ -1374,6 +1513,150 @@ mod tests {
         assert!(
             !cache.capture().1.unwrap().lab.settled,
             "a different table's settlement cannot attach to this source"
+        );
+    }
+
+    #[test]
+    fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save() {
+        use aterm_db::typed::cell;
+        use aterm_secrets::commons::roster::Role;
+
+        for change in 0..5 {
+            let fixture = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+            let paths = &fixture.paths[0];
+            let registry = Registry::at(paths.clone());
+            let table = registry.open().unwrap();
+            let config = paths.home.join("aterm.toml");
+            aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+            let settled = paths.home.join("settlement");
+            aterm_uds::private_file::create_private_dir(&settled).unwrap();
+            let write_settlement = |digest: &[u8]| {
+                aterm_uds::atomic_file::write(
+                    &settled.join("settled"),
+                    aterm_codec::hex::encode_lower(digest).as_bytes(),
+                    0o600,
+                )
+                .unwrap()
+            };
+            write_settlement(&table.digest());
+            let cache: &'static Cache = Box::leak(Box::new(Cache {
+                paths: paths.clone(),
+                config: config.clone(),
+                settled: Some(settled.clone()),
+                held: Mutex::new(Held {
+                    projected: None,
+                    looked: None,
+                    pending: true,
+                }),
+                refreshing: Mutex::new(()),
+                refresher: OnceLock::new(),
+            }));
+            cache.refresh();
+            let captured = alab_roster::Source::capture(&cache);
+            let source = captured.native_guard().unwrap();
+            let old_lab = captured.snapshot().lab().unwrap();
+            match change {
+                1 | 4 => {
+                    registry
+                        .write(vec![vec![
+                            cell::change(
+                                &aterm_db::alab::registry::MODEL,
+                                cell::CellKey {
+                                    pk: "invisible-model",
+                                    col: "row",
+                                    elem: None,
+                                },
+                                &cell::CellValue::automatic(1, aterm_json::json!("live")),
+                            )
+                            .unwrap(),
+                        ]])
+                        .unwrap();
+                    assert_eq!(
+                        cache.lab_for_source(&registry.observe_source(&config).unwrap().unwrap()),
+                        old_lab
+                    );
+                    if change == 4 {
+                        cache.refresh();
+                    }
+                }
+                2 => aterm_uds::atomic_file::write(&config, b"[alab]\nroster = false\n", 0o600)
+                    .unwrap(),
+                3 => write_settlement(&[0; 32]),
+                _ => {}
+            }
+            let store = aterm_agent::harness::accounts::Store::at(&paths.home.join("account-test"));
+            let roster = paths.home.join("accounts.toml");
+            let result =
+                alab_roster::test_publish_source_roster(&store, &roster, "# admitted\n", source);
+            assert_eq!(result.is_ok(), change == 0, "change={change}: {result:?}");
+            assert_eq!(roster.exists(), change == 0);
+            assert_eq!(store.dir.join("sync-commit.json").exists(), change == 0);
+            assert_eq!(
+                cache.held.lock().unwrap().looked.is_some(),
+                change == 0 || change == 4,
+                "only the rejected cached revision is invalidated"
+            );
+            if change == 0 {
+                let caller = paths.home.join("caller.toml");
+                let excluded = format!(
+                    "[commons]\nexclude_tables = [\"{}\"]\n",
+                    aterm_codec::hex::encode_lower(&table.digest())
+                );
+                for policy in [
+                    "[alab]\nroster = false\n",
+                    "[commons]\nenabled = false\n",
+                    excluded.as_str(),
+                ] {
+                    aterm_uds::atomic_file::write(&caller, policy.as_bytes(), 0o600).unwrap();
+                    let blocked = alab_roster::Source::capture_for(&cache, &caller);
+                    assert!(blocked.snapshot().disabled());
+                    assert!(blocked.native_guard().is_err());
+                }
+                aterm_uds::atomic_file::write(&caller, b"", 0o600).unwrap();
+                let allowed = alab_roster::Source::capture_for(&cache, &caller);
+                aterm_uds::atomic_file::write(&caller, excluded.as_bytes(), 0o600).unwrap();
+                assert!(
+                    alab_roster::test_publish_source_roster(
+                        &store,
+                        &roster,
+                        "# refused\n",
+                        allowed.native_guard().unwrap()
+                    )
+                    .is_err()
+                );
+                assert_eq!(std::fs::read_to_string(&roster).unwrap(), "# admitted\n");
+            }
+        }
+    }
+
+    #[test]
+    fn caller_policy_is_observed_even_without_a_host_projection() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("aterm.toml");
+        let caller = root.path().join("caller.toml");
+        let cache: &'static Cache = Box::leak(Box::new(Cache {
+            paths: Paths::for_home(root.path()),
+            config,
+            settled: None,
+            held: Mutex::new(Held {
+                projected: None,
+                looked: Some(Instant::now()),
+                pending: false,
+            }),
+            refreshing: Mutex::new(()),
+            refresher: OnceLock::new(),
+        }));
+        aterm_uds::atomic_file::write(&caller, b"[alab]\nroster=false\n", 0o600).unwrap();
+        assert!(
+            alab_roster::Source::capture_for(&cache, &caller)
+                .snapshot()
+                .disabled()
+        );
+        aterm_uds::atomic_file::write(&caller, b"[alab", 0o600).unwrap();
+        assert!(
+            alab_roster::Source::capture_for(&cache, &caller)
+                .snapshot()
+                .pending()
         );
     }
 

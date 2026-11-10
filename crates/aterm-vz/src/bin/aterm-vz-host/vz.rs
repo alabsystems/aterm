@@ -756,9 +756,9 @@ impl Machine for Vz {
                 "NOT RUN — VZVirtualMachine.isSupported is false: this Mac cannot run a VM".into(),
             );
         }
-        let host_cpus = std::thread::available_parallelism()
-            .map_err(|e| format!("this host's logical cores: {e}"))?
-            .get();
+        let host_cpus = Some(aterm_sysprobe::cpu_layout().logical_cores())
+            .filter(|n| *n > 0)
+            .ok_or("this host's logical cores (hw.logicalcpu) could not be read")?;
         let host_memory = aterm_sysprobe::physical_memory_mib()
             .ok_or("this host's memory (hw.memsize) could not be read")?;
         Ok(Limits {

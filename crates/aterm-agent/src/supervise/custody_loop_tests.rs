@@ -2348,12 +2348,12 @@ fn a_dialogs_answer_only_after_the_held_line_is_known_read() {
         for (input, first_goes, input_by_write) in [
             (INPUT_CLEAR, true, vec![]),
             (
-                "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-",
                 false,
                 vec![
                     (
                         ECHO_HANG + Duration::from_secs(100),
-                        "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                        "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-",
                     ),
                     (Duration::MAX, INPUT_CLEAR),
                 ],
@@ -2382,7 +2382,7 @@ fn a_dialogs_answer_only_after_the_held_line_is_known_read() {
                     (Duration::from_secs(30), INPUT_CLEAR),
                     (
                         ECHO_HANG + Duration::from_secs(100),
-                        "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                        "input=- input_bytes=- input_wait_ms=- fg_footprint_mb=-",
                     ),
                     (Duration::MAX, INPUT_CLEAR),
                 ],

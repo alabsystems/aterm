@@ -588,7 +588,7 @@ const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|ate
   broad) reads unavailable(<why>), never zero.
 
 LINES
-  space    the volume: used · available · total (decimal units)
+  space    the volume: used · free · total (decimal units)
   disk     the scope's roots, their exclusive size and growth, and its processes' writes:
            storage writes they issued (a floor), not disk growth
   root     n= kinds=<why it is a root: cwd, repo, build, writes, scratch, …> [tab=]
@@ -604,9 +604,10 @@ LINES
            to see a small root's folders, raise top= (64 at most)
   writer   pid= exe= write_bps= kind=disk_io
   program  exe= n= scope= write_bytes_per_h= covered_s=: who wrote most over covered_s
-  volume   mount= fs= free_bytes= available_bytes= total_bytes= level= slope_bps=
-           purgeable_bytes=; level= is `status disk=`'s word; slope_bps= and purgeable_bytes=
-           (and JSON's eta_full_s) read unavailable(not_sampled) in this build
+  volume   mount= fs= free_bytes= reserved_bytes= total_bytes= level= slope_bps=
+           purgeable_bytes=; free_bytes= is what this user may write, reserved_bytes= the free
+           blocks kept from it (0 on APFS); level= is `status disk=`'s word; slope_bps= and
+           purgeable_bytes= (and JSON's eta_full_s) read unavailable(not_sampled) in this build
   summary  folders past 100,000 entries, the roots no walk measures, and whether a walk is
            still under way (sizes are then lower bounds)
   withheld=<n> counts the writer and program rows outside this tab, which are the owner's.
@@ -781,10 +782,10 @@ fn machine_body() -> String {
         Some(v) => {
             let _ = writeln!(
                 s,
-                "  your home's volume ({}, {}): {} available of {}",
+                "  your home's volume ({}, {}): {} free of {}",
                 v.mount.display(),
                 v.fs,
-                words::bytes_dec(v.available),
+                words::bytes_dec(v.free),
                 words::bytes_dec(v.total)
             );
         }

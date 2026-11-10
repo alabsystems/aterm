@@ -23,19 +23,6 @@ authors = ["Andrew Yates"]
 # log lock); the toolchain itself is Trust (rust-toolchain.toml).
 rust-version = "1.89"
 
-[workspace.metadata.atpkg]
-# Ship the two public CLIs, not the workspace's evidence or fixture binaries.
-expose = ["asb", "aspump"]
-# Keep the CLI's optional security transports available without compiling the
-# embedding-only `astream-broker/stream` interface or unrelated workspace tools.
-build-args = [
-    "--locked",
-    "-p", "astream-broker", "-p", "astream-pump",
-    "--bin", "asb", "--bin", "aspump",
-    "--features",
-    "astream-broker/identity,astream-broker/relay,astream-broker/anti-rollback,astream-pump/cap,astream-pump/aead",
-]
-
 [workspace.dependencies]
 astream-wire = { path = "crates/astream-wire", version = "0.2.0" }
 astream-digest = { path = "crates/astream-digest", version = "0.2.0" }

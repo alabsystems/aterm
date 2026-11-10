@@ -40,6 +40,7 @@ use crate::envelope::{self, Action, ArtifactRef, Disrupt, Envelope, Exec, Signin
 use crate::model::{Effect, HostReport, ItemReport, Mode, Outcome, Read};
 use crate::port::{Cmd, Ran, System};
 use crate::protocol::{Hello, Line};
+use aterm_capacity::host_vitals::HostVitals;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -828,7 +829,7 @@ fn print_host_tabs_rows(
     os_display: &str,
     services_display: &str,
     why_not: Option<&str>,
-    vitals: Option<&crate::protocol::HostVitals>,
+    vitals: Option<&HostVitals>,
     inventory: Option<&crate::protocol::SessionSnapshot>,
 ) {
     let extent = session_extent(inventory);
@@ -1250,9 +1251,9 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 .collect();
             let (model_id, osxvers) = device_info(&strings);
             let (ipv4, ssh_banner, rtt_us) = resolve_ipv4_banner_and_rtt(&dot_local, port);
-            let vitals = ssh_banner.is_some().then(|| crate::protocol::HostVitals {
+            let vitals = ssh_banner.is_some().then(|| HostVitals {
                 rtt_us,
-                ..crate::protocol::HostVitals::default()
+                ..HostVitals::default()
             });
             let has_sftp = sftp_instances.iter().any(|s| s.name == inst.name);
             let has_rfb = rfb_instances.iter().any(|s| s.name == inst.name);
@@ -6591,15 +6592,13 @@ mod tests {
         assert_eq!(banner(b"SSH-2.0-\xff\r\n", false), None);
         assert_eq!(banner(b"SSH-2.0-observed_peer\r\n", true), None);
 
-        let summary = crate::protocol::HostVitals {
+        let summary = HostVitals {
             gpu_name: Some("NVIDIA GB10".into()),
-            gpu_temp_c: Some(45),
             rtt_us: Some(2_100),
             ..Default::default()
         }
         .format_summary_line();
         assert!(summary.contains("NVIDIA GB10"), "{summary}");
-        assert!(summary.contains("45°C"), "{summary}");
         assert!(summary.contains("RTT 2.1 ms"), "{summary}");
 
         assert_eq!(

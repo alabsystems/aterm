@@ -230,141 +230,61 @@ pub fn parse_statm_resident(text: &str) -> Option<u64> {
     crate::parse_uint(text.split_whitespace().nth(1)?)
 }
 
-/// One PID's conservative memory bytes: macOS's larger physical footprint/resident figure,
-/// or Linux's full resident plus swapped memory. No process-table sweep is performed.
-/// Callers must separately bracket this observation with stable same-UID native identity;
-/// this read alone provides no ownership, lifetime or control authority.
+/// ONE PROCESS'S MEMORY, bytes: its footprint, as the sweep reads it for every process
+/// ([`ProcessReading::footprint`]): macOS `ri_phys_footprint` (the pages it holds, those the
+/// kernel compressed or swapped out included), Linux `RssAnon + VmSwap` (its anonymous pages in
+/// memory and swapped; file-backed pages it maps are not its own), Windows its private commit.
+/// No process-table sweep runs on macOS or Linux. Callers bracket this observation with a stable
+/// native identity of their own: this read alone proves no ownership or lifetime.
 ///
 /// # Errors
-/// The PID is invalid, native usage/status is unavailable, the bounded status read is
-/// incomplete or malformed, arithmetic overflows, or this platform has no reader.
-pub fn pid_memory_bytes(pid: u32) -> std::io::Result<u64> {
+/// `InvalidInput` for pid 0 or 1 or past `i32::MAX`; `InvalidData` for a Linux `status` past the
+/// bounded reader's [`crate::linux::STATUS_CAP`]; `NotFound` where the process or its figure
+/// cannot be read (it is gone, another user's, or a kernel thread with no anonymous memory); the
+/// kernel's own error where it refused; `Unsupported` where this platform has no reader.
+pub fn footprint(pid: u32) -> std::io::Result<u64> {
     let pid = i32::try_from(pid)
         .ok()
         .filter(|pid| *pid > 1)
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "memory read requires a valid PID above one",
+                "a footprint read requires a valid pid above one",
             )
         })?;
     #[cfg(target_os = "macos")]
     {
         let usage = imp::rusage_result(pid).map_err(std::io::Error::from_raw_os_error)?;
-        Ok(usage.ri.ri_phys_footprint.max(usage.ri.ri_resident_size))
+        Ok(usage.ri.ri_phys_footprint)
     }
     #[cfg(target_os = "linux")]
     {
-        let mut bytes = [0u8; crate::READ_CAP];
-        let (length, truncated) = crate::read_into(
-            std::path::Path::new(&format!("/proc/{pid}/status")),
-            &mut bytes,
-        )
-        .map_err(std::io::Error::from)?;
-        if truncated {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "process status exceeds the bounded memory reader",
-            ));
-        }
-        let text = std::str::from_utf8(&bytes[..length]).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "process status is not UTF-8",
-            )
-        })?;
-        status_resident_swap_bytes(text)
+        crate::linux::Root::system().footprint(pid.unsigned_abs())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let pid = pid.unsigned_abs();
+        crate::win::processes()
+            .and_then(|sweep| sweep.procs.into_iter().find(|p| p.pid == pid))
+            .and_then(|p| p.footprint)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the process table holds no footprint for this pid",
+                )
+            })
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         let _ = pid;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "no native PID memory reader on this platform",
+            "no native footprint reader on this platform",
         ))
-    }
-}
-
-// The sweep's RssAnon-based status_memory intentionally has different semantics: this
-// explicit-PID read includes file-backed resident pages, requires swap coverage and refuses
-// saturation. Keep the stricter field/units/overflow checks beside its maintained reader.
-#[cfg(any(test, target_os = "linux"))]
-fn status_resident_swap_bytes(text: &str) -> std::io::Result<u64> {
-    let malformed = || {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "process status lacks exact resident/swap memory coverage",
-        )
-    };
-    if !text.ends_with('\n') {
-        return Err(malformed());
-    }
-    let mut resident = None;
-    let mut swap = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let slot = match key {
-            "VmRSS" => &mut resident,
-            "VmSwap" => &mut swap,
-            _ => continue,
-        };
-        if slot.is_some() {
-            return Err(malformed());
-        }
-        let mut fields = value.split_whitespace();
-        let bytes = fields
-            .next()
-            .and_then(crate::parse_uint::<u64>)
-            .and_then(|kib| kib.checked_mul(1024))
-            .ok_or_else(malformed)?;
-        if fields.next() != Some("kB") || fields.next().is_some() {
-            return Err(malformed());
-        }
-        *slot = Some(bytes);
-    }
-    resident
-        .ok_or_else(malformed)?
-        .checked_add(swap.ok_or_else(malformed)?)
-        .ok_or_else(malformed)
-}
-
-#[cfg(test)]
-mod pid_memory_tests {
-    use super::status_resident_swap_bytes;
-
-    #[test]
-    fn pid_memory_status_requires_full_resident_and_swap_not_anon_or_missing_zero() {
-        assert_eq!(
-            status_resident_swap_bytes("RssAnon: 1 kB\nVmRSS: 7 kB\nVmSwap: 3 kB\n").unwrap(),
-            10 * 1024
-        );
-        assert_eq!(
-            status_resident_swap_bytes("VmRSS: 0 kB\nVmSwap: 0 kB\n").unwrap(),
-            0
-        );
-        for text in [
-            "RssAnon: 1 kB\nVmSwap: 0 kB\n",
-            "VmRSS: 7 kB\n",
-            "VmRSS: 7 kB\nVmSwap: 0 kB",
-            "VmRSS: 7 MB\nVmSwap: 0 kB\n",
-            "VmRSS: 7 kB extra\nVmSwap: 0 kB\n",
-            "VmRSS: 7 kB\nVmRSS: 7 kB\nVmSwap: 0 kB\n",
-        ] {
-            assert!(status_resident_swap_bytes(text).is_err(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn pid_memory_status_rejects_field_and_total_overflow() {
-        assert!(
-            status_resident_swap_bytes("VmRSS: 18446744073709551615 kB\nVmSwap: 0 kB\n").is_err()
-        );
-        let almost = u64::MAX / 1024;
-        assert!(
-            status_resident_swap_bytes(&format!("VmRSS: {almost} kB\nVmSwap: 1 kB\n")).is_err()
-        );
     }
 }
 
@@ -679,6 +599,34 @@ pub(crate) mod imp {
         )
     }
 
+    /// The figures of process `pid`'s row that its usage record `usage` gives (`None`: each
+    /// unread), at the timebase `numer/denom`: its start, its own and its reaped children's CPU
+    /// time, its footprint and resident size, its disk reads and writes, its energy, its runnable
+    /// time and its peak footprint; every other field is the default. A sweep's live row takes
+    /// them, and a group's read ([`crate::group_usage`]) reads each member as
+    /// [`crate::activity::member`] of them, so a member's use has one definition.
+    pub(crate) fn usage_row(
+        pid: u32,
+        usage: Option<&Usage>,
+        numer: u32,
+        denom: u32,
+    ) -> ProcessReading {
+        ProcessReading {
+            pid,
+            start: usage.map(|u| u.ri.ri_proc_start_abstime),
+            cpu_ns: usage.map(|u| cpu_of(&u.ri, numer, denom)),
+            child_cpu_ns: usage.map(|u| child_cpu_of(&u.ri, numer, denom)),
+            footprint: usage.map(|u| u.ri.ri_phys_footprint),
+            resident: usage.map(|u| u.ri.ri_resident_size),
+            disk_read: usage.map(|u| u.ri.ri_diskio_bytesread),
+            disk_written: usage.map(|u| u.ri.ri_diskio_byteswritten),
+            energy_nj: usage.and_then(Usage::energy_nj),
+            runnable_ns: usage.map(|u| ticks_to_ns(u.ri.ri_runnable_time, numer, denom)),
+            peak_footprint: usage.map(|u| u.ri.ri_lifetime_max_phys_footprint),
+            ..ProcessReading::default()
+        }
+    }
+
     pub(super) fn processes(
         opts: SweepOpts,
         ids: &mut crate::coalitions::CoalitionIds,
@@ -755,16 +703,7 @@ pub(crate) mod imp {
             let name = super::whole_name(&info.comm[..end], SHORT_COMM_CUT, longer_names(pid));
             procs.push(ProcessReading {
                 scheduling: Some(scheduling),
-                pid: pid as u32,
-                start: usage.map(|u| u.ri.ri_proc_start_abstime),
                 ppid: info.ppid,
-                cpu_ns: usage.map(|u| cpu_of(&u.ri, numer, denom)),
-                child_cpu_ns: usage.map(|u| child_cpu_of(&u.ri, numer, denom)),
-                footprint: usage.map(|u| u.ri.ri_phys_footprint),
-                resident: usage.map(|u| u.ri.ri_resident_size),
-                disk_read: usage.map(|u| u.ri.ri_diskio_bytesread),
-                disk_written: usage.map(|u| u.ri.ri_diskio_byteswritten),
-                energy_nj: usage.and_then(|u| u.energy_nj()),
                 name,
                 pgid: info.pgid,
                 uid: Some(info.uid),
@@ -773,14 +712,13 @@ pub(crate) mod imp {
                 sid: u32::try_from(sid).unwrap_or(0),
                 has_tty: Some(info.flags & PROC_FLAG_CONTROLT != 0),
                 exec: Some(info.flags & PROC_FLAG_EXEC != 0),
-                runnable_ns: usage.map(|u| ticks_to_ns(u.ri.ri_runnable_time, numer, denom)),
                 cores: split,
-                peak_footprint: usage.map(|u| u.ri.ri_lifetime_max_phys_footprint),
                 read_at,
                 coalition,
                 version,
                 birth_ms: None,
                 reaps_unwaited: None,
+                ..usage_row(pid as u32, usage.as_ref(), numer, denom)
             });
         }
         procs.reverse();

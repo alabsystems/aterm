@@ -255,6 +255,7 @@ impl crate::site::Launch for StepChildren {
             child,
             Box::new(Forwarded {
                 _running: running,
+                meter: None,
                 note,
             }),
         ))
@@ -450,7 +451,7 @@ impl crate::release::PendingSign for PreparingSign {
 
     fn finish(mut self: Box<Self>) -> Ran {
         let mut child = self.child.take().expect("one packaging child");
-        let waited = wait_accounted(&mut child);
+        let waited = wait_accounted(&mut child, &mut self._forwarded);
         let code = waited
             .as_ref()
             .map_or(-1, |(status, _)| status.code().unwrap_or(-1));
@@ -471,7 +472,7 @@ impl Drop for PreparingSign {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             self.stop.fire();
-            let _ = wait_accounted(&mut child);
+            let _ = wait_accounted(&mut child, &mut self._forwarded);
         }
     }
 }
@@ -1017,6 +1018,7 @@ fn owns_process(me: u32, pid: u32, parent: &std::collections::BTreeMap<i32, i32>
 
 struct Forwarded {
     _running: interrupt::Running,
+    meter: Option<aterm_verify::exec::UsageMeter>,
     note: Option<PathBuf>,
 }
 
@@ -1295,10 +1297,12 @@ impl Real {
             None => interrupt::Running::enter(group),
         };
         let note = self.note_child(step, child.id());
+        let meter = Some(aterm_verify::exec::UsageMeter::start(child.id()));
         Ok((
             child,
             Forwarded {
                 _running: running,
+                meter,
                 note,
             },
         ))
@@ -1315,7 +1319,7 @@ impl Real {
     }
 
     /// [`Real::output_forwarded`] for a child of `step` that does a step's work, with the
-    /// `step-child-finished` record of what `wait4` booked for it ([`step_child_event`]).
+    /// `step-child-finished` record of its sampled descendants ([`step_child_event`]).
     fn output_accounted(
         &self,
         step: Step,
@@ -1334,7 +1338,7 @@ impl Real {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started_at_unix_ms = now_ms();
-        let (mut child, forwarded) =
+        let (mut child, mut forwarded) =
             self.spawn_stoppable(step, cmd, stop.map(|stop| (stop, interrupt::SIGTERM)))?;
         let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
             std::thread::spawn(move || {
@@ -1347,7 +1351,7 @@ impl Real {
         };
         let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
         let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
-        let waited = wait_accounted(&mut child);
+        let waited = wait_accounted(&mut child, &mut forwarded);
         let ended_at_unix_ms = now_ms();
         drop(forwarded);
         let (status, usage) = waited?;
@@ -1771,7 +1775,7 @@ impl Real {
         let started_at_unix_ms = now_ms();
         let spawned = self.spawn_stoppable(step, cmd, stop);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let (mut child, forwarded) = match spawned {
+        let (mut child, mut forwarded) = match spawned {
             Ok(spawned) => spawned,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 return Ran {
@@ -1844,7 +1848,7 @@ impl Real {
                 cancel: cancel_writer,
             })
         });
-        let waited = wait_accounted(&mut child);
+        let waited = wait_accounted(&mut child, &mut forwarded);
         let ended_at_unix_ms = now_ms();
         let code = waited
             .as_ref()
@@ -4677,18 +4681,18 @@ impl Arrivals {
     }
 }
 
-/// Wait for a step's child and keep what `wait4` books for it: CPU of the child and of every
-/// descendant reaped down its tree (verify's stages and the engine's children run in groups and
-/// sessions of their own, which a group read of the child would miss), and the largest process's
-/// resident peak. `None` usage where the host keeps no accounting; the status either way.
+/// Wait ownership stays here. The observer started at spawn samples descendants across their
+/// groups and sessions, using verify's CPU, starvation and simultaneous-footprint accounting.
 fn wait_accounted(
     child: &mut aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<aterm_uds::spawnfd::Rusage>)> {
-    match child.wait_with_rusage() {
-        Ok(usage) => Ok((usage.status, Some(usage))),
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok((child.wait()?, None)),
-        Err(e) => Err(e),
-    }
+    forwarded: &mut Forwarded,
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    Option<aterm_verify::exec::TreeUsage>,
+)> {
+    let status = child.wait()?;
+    let usage = forwarded.meter.take().and_then(|meter| meter.finish());
+    Ok((status, usage))
 }
 
 /// Cargo's artifact units, including build-script executables, counted once per reported
@@ -4725,7 +4729,7 @@ fn frozen_build_event(package: &str, profile: &str, layout: Option<&str>, output
 }
 
 /// The `step-child-finished` record a step's child leaves in its step log: when it ran, how it
-/// exited and what `wait4` booked for it. Planning data for `release status`, never a verdict,
+/// exited and what its descendants were observed using. Planning data, never a verdict,
 /// so it carries no `outcome` (a retried child's exit is not the run's first red).
 fn step_child_event(
     step: Step,
@@ -4733,7 +4737,7 @@ fn step_child_event(
     started_at_unix_ms: Option<u64>,
     ended_at_unix_ms: Option<u64>,
     exit_code: i32,
-    usage: Option<aterm_uds::spawnfd::Rusage>,
+    usage: Option<aterm_verify::exec::TreeUsage>,
 ) -> String {
     let mut program = Path::new(cmd.get_program())
         .file_name()
@@ -4746,17 +4750,13 @@ fn step_child_event(
     }
     let child_cpu = usage.map_or(aterm_json::Value::Null, |u| {
         aterm_json::Value::Object(aterm_json::Map::from([
-            (
-                "scope".to_string(),
-                "reaped-child-and-waited-descendants".into(),
-            ),
+            ("scope".to_string(), "sampled-descendant-processes".into()),
             ("observed_s".to_string(), u.cpu.as_secs_f64().into()),
-            ("user_s".to_string(), u.user.as_secs_f64().into()),
-            ("system_s".to_string(), u.system.as_secs_f64().into()),
+            ("processes".to_string(), (u.processes as u64).into()),
         ]))
     });
     let peak_bytes = usage
-        .map(|u| u.maxrss)
+        .map(|u| u.peak_bytes)
         .filter(|b| *b > 0)
         .map_or(aterm_json::Value::Null, Into::into);
     format!(
@@ -4776,6 +4776,14 @@ fn step_child_event(
             ),
             ("exit_code".to_string(), exit_code.into()),
             ("child_cpu".to_string(), child_cpu),
+            (
+                "starved_s".to_string(),
+                aterm_json::json!(usage.map(|u| u.starved.as_secs_f64()))
+            ),
+            (
+                "runnable_s".to_string(),
+                aterm_json::json!(usage.map(|u| u.runnable.as_secs_f64()))
+            ),
             ("peak_bytes".to_string(), peak_bytes),
         ]))
     )
@@ -6726,6 +6734,205 @@ impl Real {
 }
 
 impl Real {
+    /// Apply exactly the edits owned by a release bump, before either commit writer runs.
+    fn edit_bump(
+        &mut self,
+        from: &str,
+        to: &str,
+        prover: &Prover,
+        origin: &dyn crate::ledger::Origin,
+    ) -> Result<(String, Vec<String>), Refusal> {
+        let edit = self.engine.join("bin/pub-bump-edit");
+        if !edit.is_file() {
+            return Err(Refusal::new(
+                format!(
+                    "the release's engine {} has no bin/pub-bump-edit at its origin's main",
+                    self.engine.display()
+                ),
+                format!(
+                    "land bin/pub-bump-edit on the engine's main, then {RELEASE_COMMAND} again \
+                     (its sync step brings the release's engine to it)"
+                ),
+            ));
+        }
+        let undo = |s: &mut Self| {
+            let _ = s.git().git(&["checkout", "-q", "--", "."]);
+        };
+        let mut cmd = self.scrubbed(&edit);
+        cmd.arg(&self.repo).args([to, from]).current_dir(&self.repo);
+        let edit_timing =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-version-edit");
+        if self.logged(Step::Commit, &mut cmd).code != 0 {
+            return Err(Refusal::new(
+                "bin/pub-bump-edit could not find the version line",
+                "read Cargo.toml's [workspace.package]",
+            ));
+        }
+        drop(edit_timing);
+        // A nested workspace (a recorder run read-only in the Linux lane)
+        // locks aterm's path crates at the workspace's version too: each
+        // moves with the root, or its `--locked` run fails until relocked.
+        let nested = self.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]);
+        let lock_timing =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-lockfiles");
+        let followed = match bump_nested_locks(&self.repo, nested, from, to) {
+            Ok(followed) => followed,
+            Err(why) => {
+                undo(self);
+                return Err(Refusal::new(why, "read the commit step's log"));
+            }
+        };
+        if let Err(why) = self.validate_bumped_locks(prover, &followed) {
+            undo(self);
+            return Err(Refusal::new(
+                why,
+                "read the commit step's log; the bump is undone",
+            ));
+        }
+        drop(lock_timing);
+        let inspected = [
+            &["diff", "--name-only", "-z", "HEAD"][..],
+            &["ls-files", "--others", "--exclude-standard", "-z"][..],
+        ]
+        .iter()
+        .map(|args| self.git_paths(args))
+        .collect::<Result<Vec<_>, _>>();
+        let inspected = match inspected {
+            Ok(inspected) => inspected,
+            Err(why) => {
+                undo(self);
+                return Err(Refusal::new(why, "read the commit step's log"));
+            }
+        };
+        let moved: Vec<String> = inspected
+            .into_iter()
+            .flatten()
+            .filter(|p| p != "Cargo.toml" && p != "Cargo.lock" && !followed.contains(p))
+            .collect();
+        let Some(diff) = self.git_out(&["diff", "-U0"]) else {
+            undo(self);
+            return Err(Refusal::new(
+                "could not inspect the bump's diff; the bump is undone",
+                "read the commit step's log",
+            ));
+        };
+        let stray = diff.lines().any(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+                && !l.contains("version")
+        });
+        if !moved.is_empty() || stray {
+            undo(self);
+            return Err(Refusal::new(
+                "the bump moved more than version lines; it is undone",
+                "bump by hand and read the diff",
+            )
+            .detail(moved));
+        }
+        // The bump opens a release window, so it also carries the harness versions the
+        // window owes (`ship harness-bump`'s writes), after the version-only check above
+        // judged the edit's own changes.
+        let harness_timing =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-harness-versions");
+        let owed = match crate::harness_versions::apply(&self.repo, origin) {
+            Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
+            Err(e) => {
+                undo(self);
+                return Err(Refusal::new(
+                    format!("the harness versions could not be bumped ({e}); the bump is undone"),
+                    "read the commit step's log",
+                ));
+            }
+        };
+        drop(harness_timing);
+        let msg = if owed.is_empty() {
+            format!("release: {to} — the version and the lockfile move together")
+        } else {
+            let names: Vec<String> = owed
+                .iter()
+                .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+                .collect();
+            format!(
+                "release: {to} — the version, the lockfile and the harness versions move \
+             together ({})",
+                names.join(", ")
+            )
+        };
+        let mut declared = vec!["Cargo.toml".into(), "Cargo.lock".into()];
+        declared.extend(followed);
+        declared.extend(crate::harness_versions::written(&owed));
+        Ok((msg, declared))
+    }
+
+    fn preview_bump_from_origin(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        origin: &dyn crate::ledger::Origin,
+    ) -> Result<String, Refusal> {
+        let (root, _claim) = self
+            .candidate_checkout(&c.commit)
+            .map_err(|why| cut_refusal("private bump checkout", &why))?;
+        let root = root
+            .canonicalize()
+            .map_err(|e| cut_refusal("private bump path", &e.to_string()))?;
+        let original = std::mem::replace(&mut self.repo, root);
+        let result = (|| {
+            let (message, paths) = self.edit_bump(
+                c.bump_from.as_deref().expect("pending bump"),
+                &c.version,
+                prover,
+                origin,
+            )?;
+            let git = self.git();
+            let mut add = vec!["add", "--"];
+            add.extend(paths.iter().map(String::as_str));
+            crate::ledger::git_ok(&git, &add)
+                .map_err(|e| cut_refusal("private bump index", &e.to_string()))?;
+            let tree = crate::ledger::git_ok(&git, &["write-tree"])
+                .map_err(|e| cut_refusal("private bump tree", &e.to_string()))?
+                .stdout_utf8();
+            let date = crate::ledger::git_ok(&git, &["show", "-s", "--format=%ct", &c.commit])
+                .map_err(|e| cut_refusal("private bump date", &e.to_string()))?
+                .stdout_utf8();
+            let date = format!("{} +0000", date.trim());
+            let out = git
+                .git_env(
+                    &["commit-tree", tree.trim(), "-p", &c.commit, "-m", &message],
+                    &[
+                        ("GIT_AUTHOR_NAME", "Release preview"),
+                        ("GIT_AUTHOR_EMAIL", "preview@localhost"),
+                        ("GIT_COMMITTER_NAME", "Release preview"),
+                        ("GIT_COMMITTER_EMAIL", "preview@localhost"),
+                        ("GIT_AUTHOR_DATE", &date),
+                        ("GIT_COMMITTER_DATE", &date),
+                    ],
+                )
+                .map_err(|e| cut_refusal("private bump commit", &e.to_string()))?;
+            if !out.success() {
+                return Err(cut_refusal("private bump commit", &out.stderr_utf8()));
+            }
+            Ok(out.stdout_utf8().trim().to_owned())
+        })();
+        // Only our private, claimed checkout was edited. Restore its index as well as files,
+        // including when an editor/validator refused part way through.
+        let cleaned = crate::ledger::git_ok(
+            &self.git(),
+            &[
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                ".",
+            ],
+        );
+        self.repo = original;
+        cleaned.map_err(|why| cut_refusal("private bump cleanup", &why.to_string()))?;
+        result
+    }
+
     /// The stable R-tree checkout shared by dry commit gates and release-input. Its lock
     /// spans each reader, so another invocation cannot change the tree under that reader.
     fn candidate_checkout(
@@ -6782,14 +6989,8 @@ impl Real {
                 "harness versions",
                 crate::cut_timing::measure("commit-gate harness versions", || {
                     with_origin(&|origin| {
-                        if dry && c.bump_from.is_some() {
-                            crate::gates::harness_versions_bump_writes_at(
-                                &git, origin, commit, version,
-                            )
-                        } else {
-                            crate::gates::harness_versions_gate_at(&git, origin, commit, version)
-                        }
-                        .map(|_| ())
+                        crate::gates::harness_versions_gate_at(&git, origin, commit, version)
+                            .map(|_| ())
                     })
                 }),
             ),
@@ -7547,9 +7748,18 @@ impl Backend for Real {
     fn fetch(&mut self) -> Result<String, Refusal> {
         let prefetched = self.prefetched_origin.take();
         let source_origin = self.source_origin;
+        let dry = self.scratch_logs;
         self.fetch_origins(|repo| {
             prefetched.map_or_else(
-                || source_origin(repo).and_then(|remote| remote.fetch_origin()),
+                || {
+                    source_origin(repo).and_then(|remote| {
+                        if dry {
+                            remote.observe_origin()
+                        } else {
+                            remote.fetch_origin()
+                        }
+                    })
+                },
                 Ok,
             )
         })
@@ -7695,7 +7905,8 @@ impl Backend for Real {
                     crate::input_record::attempted(&records, base, &tree, &input_seal)
                         .map_err(unavailable)?;
                     return Ok(format!(
-                        "release input: reused 4 checks for tree {tree}; 0 checks run"
+                        "release input: reused {} checks for tree {tree}; 0 checks run",
+                        aterm_verify::release_input::CHECKS.len()
                     ));
                 }
                 let run_id = self
@@ -8176,6 +8387,12 @@ impl Backend for Real {
         ))
     }
 
+    fn preview_bump(&mut self, c: &Candidate, prover: &Prover) -> Result<String, Refusal> {
+        let origin = crate::publish::native_origin(&self.repo)
+            .map_err(|e| cut_refusal("private bump origin", &e.to_string()))?;
+        self.preview_bump_from_origin(c, prover, &origin)
+    }
+
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal> {
         let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "version-bump");
         let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
@@ -8185,19 +8402,6 @@ impl Backend for Real {
             )
             .detail([why.to_string()])
         })?;
-        let edit = self.engine.join("bin/pub-bump-edit");
-        if !edit.is_file() {
-            return Err(Refusal::new(
-                format!(
-                    "the release's engine {} has no bin/pub-bump-edit at its origin's main",
-                    self.engine.display()
-                ),
-                format!(
-                    "land bin/pub-bump-edit on the engine's main, then {RELEASE_COMMAND} again \
-                     (its sync step brings the release's engine to it)"
-                ),
-            ));
-        }
         let undo = |s: &mut Self| {
             let _ = s.git().git(&["checkout", "-q", "--", "."]);
         };
@@ -8231,117 +8435,11 @@ impl Backend for Real {
                         ),
                     ));
                 }
-                let mut cmd = self.scrubbed(&edit);
-                cmd.arg(&self.repo).args([to, &cur]).current_dir(&self.repo);
-                let edit_timing =
-                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-version-edit");
-                if self.logged(Step::Commit, &mut cmd).code != 0 {
-                    return Err(Refusal::new(
-                        "bin/pub-bump-edit could not find the version line",
-                        "read Cargo.toml's [workspace.package]",
-                    ));
-                }
-                drop(edit_timing);
-                // A nested workspace (a recorder run read-only in the Linux lane)
-                // locks aterm's path crates at the workspace's version too: each
-                // moves with the root, or its `--locked` run fails until relocked.
-                let nested =
-                    self.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]);
-                let lock_timing =
-                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-lockfiles");
-                let followed = match bump_nested_locks(&self.repo, nested, from, to) {
-                    Ok(followed) => followed,
-                    Err(why) => {
-                        undo(self);
-                        return Err(Refusal::new(why, "read the commit step's log"));
-                    }
-                };
-                if let Err(why) = self.validate_bumped_locks(prover, &followed) {
-                    undo(self);
-                    return Err(Refusal::new(
-                        why,
-                        "read the commit step's log; the bump is undone",
-                    ));
-                }
-                drop(lock_timing);
-                let inspected = [
-                    &["diff", "--name-only", "-z", "HEAD"][..],
-                    &["ls-files", "--others", "--exclude-standard", "-z"][..],
-                ]
-                .iter()
-                .map(|args| self.git_paths(args))
-                .collect::<Result<Vec<_>, _>>();
-                let inspected = match inspected {
-                    Ok(inspected) => inspected,
-                    Err(why) => {
-                        undo(self);
-                        return Err(Refusal::new(why, "read the commit step's log"));
-                    }
-                };
-                let moved: Vec<String> = inspected
-                    .into_iter()
-                    .flatten()
-                    .filter(|p| p != "Cargo.toml" && p != "Cargo.lock" && !followed.contains(p))
-                    .collect();
-                let Some(diff) = self.git_out(&["diff", "-U0"]) else {
-                    undo(self);
-                    return Err(Refusal::new(
-                        "could not inspect the bump's diff; the bump is undone",
-                        "read the commit step's log",
-                    ));
-                };
-                let stray = diff.lines().any(|l| {
-                    (l.starts_with('+') || l.starts_with('-'))
-                        && !l.starts_with("+++")
-                        && !l.starts_with("---")
-                        && !l.contains("version")
-                });
-                if !moved.is_empty() || stray {
-                    undo(self);
-                    return Err(Refusal::new(
-                        "the bump moved more than version lines; it is undone",
-                        "bump by hand and read the diff",
-                    )
-                    .detail(moved));
-                }
-                // The bump opens a release window, so it also carries the harness versions the
-                // window owes (`ship harness-bump`'s writes), after the version-only check above
-                // judged the edit's own changes.
-                let harness_timing = crate::cut_timing::Timer::start(
-                    &self.step_log(self.step),
-                    "bump-harness-versions",
-                );
-                let owed = match crate::harness_versions::apply(&self.repo, &origin) {
-                    Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
-                    Err(e) => {
-                        undo(self);
-                        return Err(Refusal::new(
-                            format!(
-                                "the harness versions could not be bumped ({e}); the bump is undone"
-                            ),
-                            "read the commit step's log",
-                        ));
-                    }
-                };
-                drop(harness_timing);
-                let msg = if owed.is_empty() {
-                    format!("release: {to} — the version and the lockfile move together")
-                } else {
-                    let names: Vec<String> = owed
-                        .iter()
-                        .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
-                        .collect();
-                    format!(
-                        "release: {to} — the version, the lockfile and the harness versions move \
-                     together ({})",
-                        names.join(", ")
-                    )
-                };
+                let (msg, declared) = self.edit_bump(from, to, prover, &origin)?;
                 let mut commit = local_git()?;
                 commit
-                    .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
-                    .args(&followed)
-                    .args(crate::harness_versions::written(&owed))
+                    .args(["commit", "-q", "-m", &msg, "--"])
+                    .args(&declared)
                     .current_dir(&self.repo);
                 let commit_timing =
                     crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
@@ -8354,9 +8452,6 @@ impl Backend for Real {
                 }
                 drop(commit_timing);
                 let bumped = self.head();
-                let mut declared = vec!["Cargo.toml".into(), "Cargo.lock".into()];
-                declared.extend(followed);
-                declared.extend(crate::harness_versions::written(&owed));
                 crate::bump_claim::record(&self.git(), &journal, &msg, declared)
                     .map_err(|why| cut_refusal("bump custody journal", &why))?;
                 Ok(bumped)
@@ -13016,6 +13111,7 @@ mod tests {
         let child = command.spawn().unwrap();
         let forwarded = Forwarded {
             _running: interrupt::Running::enter(child.id()),
+            meter: None,
             note: None,
         };
         let expected = "a".repeat(40);
@@ -13083,6 +13179,7 @@ mod tests {
             assert_eq!(&line, b"ready\n");
             let forwarded = Forwarded {
                 _running: interrupt::Running::enter(child.id()),
+                meter: None,
                 note: None,
             };
             if warming {
@@ -16962,7 +17059,7 @@ not json
     }
 
     /// Each step child leaves one `step-child-finished` record after its output: its exit, when
-    /// it ran, and the CPU `wait4` booked for it and the descendants it reaped (here a
+    /// it ran, and the CPU sampled in its descendants (here a
     /// grandchild that did all the work), with no `outcome`, so a child's exit is never a red.
     #[cfg(unix)]
     #[test]
@@ -16994,18 +17091,15 @@ not json
             event["started_at_unix_ms"].as_u64() <= event["ended_at_unix_ms"].as_u64(),
             "{event}"
         );
-        let cpu = event["child_cpu"]["observed_s"]
-            .as_f64()
-            .expect("wait4 CPU");
-        assert!(cpu > 0.0, "{event}");
-        let user = event["child_cpu"]["user_s"]
-            .as_f64()
-            .expect("wait4 user CPU");
-        let system = event["child_cpu"]["system_s"]
-            .as_f64()
-            .expect("wait4 system CPU");
-        assert!(user > 0.0 && system >= 0.0, "{event}");
-        assert!((cpu - user - system).abs() < 1e-9, "{event}");
+        if !event["child_cpu"].is_null() {
+            assert_eq!(
+                event["child_cpu"]["scope"].as_str(),
+                Some("sampled-descendant-processes")
+            );
+            assert!(event["starved_s"].as_f64().is_some(), "{event}");
+        } else {
+            assert!(event["starved_s"].is_null(), "{event}");
+        }
         assert!(
             event["program"].as_str().unwrap().starts_with("sh -c"),
             "{event}"
@@ -17034,18 +17128,15 @@ not json
         assert_eq!(event["step"].as_str(), Some("qualify"), "{event}");
         assert_eq!(event["exit_code"].as_u64(), Some(4), "{event}");
         assert!(event.get("outcome").is_none(), "{event}");
-        let cpu = event["child_cpu"]["observed_s"]
-            .as_f64()
-            .expect("wait4 CPU");
-        assert!(cpu > 0.0, "{event}");
-        let user = event["child_cpu"]["user_s"]
-            .as_f64()
-            .expect("wait4 user CPU");
-        let system = event["child_cpu"]["system_s"]
-            .as_f64()
-            .expect("wait4 system CPU");
-        assert!(user > 0.0 && system >= 0.0, "{event}");
-        assert!((cpu - user - system).abs() < 1e-9, "{event}");
+        if !event["child_cpu"].is_null() {
+            assert_eq!(
+                event["child_cpu"]["scope"].as_str(),
+                Some("sampled-descendant-processes")
+            );
+            assert!(event["starved_s"].as_f64().is_some(), "{event}");
+        } else {
+            assert!(event["starved_s"].is_null(), "{event}");
+        }
     }
 
     /// The publish step's lines are stamped as they arrive, in a side log, even when they are

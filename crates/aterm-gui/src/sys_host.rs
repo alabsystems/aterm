@@ -935,9 +935,7 @@ pub(crate) fn disk_roots(ask: &DiskAsk<'_>, cwds: &[PaneCwd]) -> (Vec<Root>, Opt
     } else {
         None
     };
-    let used = volume
-        .as_ref()
-        .map(|v| (v.total.saturating_sub(v.available), v.total));
+    let used = volume.as_ref().map(|v| (v.used(), v.total));
     let (roots, totals) = disk_view(&board, &reports, ask, cwds, used, now);
     (roots, Some(totals))
 }
@@ -1378,7 +1376,7 @@ fn volume_facts(path: &std::path::Path) -> Option<VolumeFacts> {
         fs: reading.fs,
         total: reading.total,
         free: reading.free,
-        available: reading.available,
+        reserved: reading.reserved,
         level,
     })
 }

@@ -235,10 +235,10 @@ pub struct VolumeFacts {
     pub fs: String,
     /// Capacity, bytes.
     pub total: u64,
-    /// Free blocks, bytes.
+    /// Free: what this user may still write, bytes (`f_bavail`).
     pub free: u64,
-    /// Free to this user, bytes.
-    pub available: u64,
+    /// Free blocks the volume keeps back from this user, bytes (`f_bfree − f_bavail`).
+    pub reserved: u64,
     /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), when measured.
     pub level: Option<String>,
 }

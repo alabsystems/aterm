@@ -2396,8 +2396,9 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     );
 }
 
-const INPUT_PENDING: &str = "input=pending input_bytes=293 input_wait_ms=2473 fg_rss_mb=-";
-const INPUT_TYPEAHEAD: &str = "input=typeahead input_bytes=293 input_wait_ms=2473 fg_rss_mb=-";
+const INPUT_PENDING: &str = "input=pending input_bytes=293 input_wait_ms=2473 fg_footprint_mb=-";
+const INPUT_TYPEAHEAD: &str =
+    "input=typeahead input_bytes=293 input_wait_ms=2473 fg_footprint_mb=-";
 
 #[test]
 fn nothing_is_typed_behind_input_the_worker_has_not_read() {

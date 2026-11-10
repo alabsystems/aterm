@@ -213,6 +213,9 @@ fn memory_detail_maps_the_windows_classes() {
     assert_eq!(m.wired, GIB);
     assert_eq!(m.app, 9 * GIB);
     assert_eq!(m.app + m.wired + m.file_backed + m.free, m.total);
+    assert_eq!(m.available, status.avail_phys, "Windows' ullAvailPhys");
+    assert_ne!(m.available, m.free, "not the free pages alone");
+    assert_eq!(m.used(), m.app + m.wired);
     assert_eq!((m.swap_used, m.swap_total), (GIB / 2, 2 * GIB));
     assert_eq!(
         m.commit,

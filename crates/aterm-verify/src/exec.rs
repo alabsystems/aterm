@@ -3,7 +3,8 @@
 
 //! Running the stages' children.
 
-use aterm_uds::spawnfd::{Child, Command, Stdio};
+use aterm_sysprobe::activity::Used;
+use aterm_uds::spawnfd::{Child, Command, Stdio, Tether as _};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -12,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+#[path = "exec_account.rs"]
+mod account;
+pub use account::UsageMeter;
 
 /// Where the child's output goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +193,7 @@ impl Cmd {
     /// Count this child's waits for admission or a lock as work ([`Cmd::waits_count`]): a test
     /// run's, whose tests wait on their own scratch locks and ledgers, so a test stuck in one is a
     /// hang its ceiling still ends. Its waits for a core are still left out, as any child's are,
-    /// until [`NO_PROGRESS_HANG`] passes with no progress.
+    /// until its tree has been idle for [`IDLE_HANG`].
     #[must_use]
     pub fn counting_waits(mut self) -> Self {
         self.finalized_receipt = None;
@@ -398,7 +403,8 @@ pub trait Host: Sync + std::fmt::Debug {
     /// How long since a person last touched this machine's keyboard or mouse
     /// ([`aterm_sysprobe::hid_idle`]); `None` where unread.
     fn idle(&self) -> Option<Duration>;
-    /// How many cores a child's tree can run on at once.
+    /// The machine's logical cores ([`aterm_capacity::cores`]): how many cores a child's tree can
+    /// run on at once.
     fn cores(&self) -> u32;
     /// The wall clock members' starts and the syspolicyd's are read on, µs since the epoch
     /// ([`aterm_sysprobe::jobs::now_us`], the default).
@@ -456,8 +462,7 @@ impl Host for LiveHost {
     }
 
     fn cores(&self) -> u32 {
-        std::thread::available_parallelism()
-            .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+        aterm_capacity::cores()
     }
 
     #[cfg(target_os = "macos")]
@@ -1658,56 +1663,22 @@ fn meter_due(begun: Instant, last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.saturating_duration_since(t) >= every)
 }
 
-/// How long a child's tree may go with no CPU time and no I/O before a span it spent waiting for a
-/// core counts as work again: a tree that gets no core at all for this long is a hang its ceiling
-/// ends, as a stopped one is.
-const NO_PROGRESS_HANG: Duration = Duration::from_secs(10);
+/// How long a child's tree may stay idle ([`aterm_sysprobe::activity::Used::idle`]: no CPU time
+/// and no I/O) before a span it spent waiting for a core counts as work again: a tree that gets no
+/// core at all for this long is a hang its ceiling ends, as a stopped one is.
+const IDLE_HANG: Duration = Duration::from_secs(10);
 
 /// How far back a child's clock judges its tree's wait for a core ([`CoreWaitSpan`]). The kernel
 /// books a thread's runnable and CPU time only when the thread next gets a core or leaves one, so
 /// the wait of a starved tree shows in a later read than the window it fell in: a utility-tier busy
 /// loop's runnable time read every 25 ms on this Mac on 2026-10-27 stayed flat in 61-66% of the
 /// reads and then grew in lumps of up to 925 ms. A tree that gets no core for longer than this is a
-/// hang ([`NO_PROGRESS_HANG`]).
+/// hang ([`IDLE_HANG`]).
 const CORE_WAIT_SPAN: Duration = Duration::from_secs(10);
 
 /// A child's tree's wait for a core longer than this is said as the child ends
 /// ([`Clock::starved_line`]).
 const STARVED_SAID: Duration = Duration::from_secs(60);
-
-/// What a child's tree used between two reads of it ([`used_between`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Used {
-    /// CPU time, every thread's.
-    cpu: Duration,
-    /// Time runnable, on a core or waiting for one, every thread's.
-    runnable: Duration,
-    /// Bytes read and written ([`aterm_sysprobe::MemberUsage::io_bytes`]).
-    io: u64,
-}
-
-/// What `now`'s members used since `before`'s read of them: each member both found, by pid and
-/// start, by the growth of its counters; one only `now` found, by all of them (it started since).
-/// A member gone since takes what it used after `before` with it. Also `now`'s members, keyed for
-/// the next read.
-fn used_between(
-    before: &BTreeMap<(u32, u64), aterm_sysprobe::MemberUsage>,
-    now: Vec<aterm_sysprobe::MemberUsage>,
-) -> (Used, BTreeMap<(u32, u64), aterm_sysprobe::MemberUsage>) {
-    let mut used = Used::default();
-    let mut seen = BTreeMap::new();
-    for m in now {
-        let was = before.get(&(m.pid, m.start));
-        let grew = |pick: fn(&aterm_sysprobe::MemberUsage) -> u64| {
-            pick(&m).saturating_sub(was.map_or(0, pick))
-        };
-        used.cpu += Duration::from_nanos(grew(|u| u.cpu_ns));
-        used.runnable += Duration::from_nanos(grew(|u| u.runnable_ns));
-        used.io = used.io.saturating_add(grew(|u| u.io_bytes));
-        seen.insert((m.pid, m.start), m);
-    }
-    (used, seen)
-}
 
 /// The part of a window of `wall` that a tree which used `used` in it spent waiting for a core,
 /// on a machine of `cores`: the window less the share of its demand it got, where its demand is
@@ -1729,7 +1700,7 @@ fn core_wait(wall: Duration, used: Used, cores: u32) -> Duration {
 struct TreeRead {
     /// The wall time since the read before.
     wall: Duration,
-    /// What the tree used in that time ([`used_between`]).
+    /// What the tree used in that time ([`aterm_sysprobe::activity::between`]).
     used: Used,
     /// The work the clock counted in that time.
     worked: Duration,
@@ -1803,8 +1774,8 @@ impl CoreWaitSpan {
         moved
     }
 
-    /// Forget every read: a tree that made no progress for [`NO_PROGRESS_HANG`] spent that time in
-    /// a hang, which no later read's lump may book as a wait for a core.
+    /// Forget every read: a tree idle for [`IDLE_HANG`] spent that time in a hang, which no later
+    /// read's lump may book as a wait for a core.
     fn clear(&mut self) {
         self.reads.clear();
     }
@@ -1818,11 +1789,11 @@ struct Usage<'a> {
     cores: u32,
     /// When it last read, and each member that read found.
     read_at: Instant,
-    seen: BTreeMap<(u32, u64), aterm_sysprobe::MemberUsage>,
+    seen: aterm_sysprobe::activity::Members,
     /// The work counted since that read.
     worked: Duration,
-    /// When a read last found CPU time or I/O ([`NO_PROGRESS_HANG`]).
-    progressed_at: Instant,
+    /// When a read last found the tree active, not idle ([`IDLE_HANG`]).
+    active_at: Instant,
     /// The reads its wait for a core is judged on.
     span: CoreWaitSpan,
 }
@@ -1889,8 +1860,8 @@ impl Own {
 /// A child's clock (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT): the time it
 /// worked, which its ceiling bounds, apart from the time a wait of its tree for admission or a
 /// lock was marked in `marks` ([`aterm_toolchain::waits`]), which only its holders bound, and the
-/// time its tree waited for a core ([`core_wait`]), which the tree's own progress bounds
-/// ([`NO_PROGRESS_HANG`]). A wait's liveness is its own: its holder named once a minute, and a
+/// time its tree waited for a core ([`core_wait`]), which the tree's own idleness bounds
+/// ([`IDLE_HANG`]). A wait's liveness is its own: its holder named once a minute, and a
 /// dead holder lets its lock go; a live holder whose processes make no progress for its waiter's
 /// bound is named stuck in the mark, and the child is then ended ([`Clock::stuck`]), its holder
 /// left alone (CW-WAIT-UNBOUNDED). Each span counts as the last look found it; a read of the tree
@@ -1961,7 +1932,7 @@ impl<'a> Clock<'a> {
                 read_at: now,
                 seen: BTreeMap::new(),
                 worked: Duration::ZERO,
-                progressed_at: now,
+                active_at: now,
                 span: CoreWaitSpan::default(),
             }),
             tree: None,
@@ -2069,7 +2040,7 @@ impl<'a> Clock<'a> {
     /// ([`Clock::own`]), and move to
     /// [`Clock::starved`] the part of its work that the reads of its span show it spent waiting
     /// for a core and have not moved yet
-    /// ([`CoreWaitSpan::book`]), unless it has made no progress for [`NO_PROGRESS_HANG`]: then the
+    /// ([`CoreWaitSpan::book`]), unless it has been idle for [`IDLE_HANG`]: then the
     /// span is forgotten and nothing moves. A host with no reading ends the reads.
     fn read_usage(&mut self) {
         let Some(u) = &mut self.usage else {
@@ -2089,12 +2060,12 @@ impl<'a> Clock<'a> {
         if let Some(own) = self.own {
             own.book(u.pgid, &members);
         }
-        let (used, seen) = used_between(&u.seen, members);
+        let (used, seen) = aterm_sysprobe::activity::between(&u.seen, members);
         u.seen = seen;
-        if !used.cpu.is_zero() || used.io > 0 {
-            u.progressed_at = now;
+        if !used.idle() {
+            u.active_at = now;
         }
-        if now.saturating_duration_since(u.progressed_at) >= NO_PROGRESS_HANG {
+        if now.saturating_duration_since(u.active_at) >= IDLE_HANG {
             u.span.clear();
             return;
         }
@@ -2448,6 +2419,8 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
         native(cmd.program.as_os_str())
     };
     c.args(&cmd.args).stdin(Stdio::null());
+    // Stages lead separate groups, so each needs its own parent-death tie too.
+    c.tether();
     #[cfg(unix)]
     {
         c.process_group(0);
@@ -4116,6 +4089,64 @@ mod tests {
                 ("TRAIL_LAWS_FULL".into(), "1".into())
             ]
         );
+    }
+
+    /// THE MACHINE'S CORES time a child's tree: the live host's count is `aterm_capacity::cores`,
+    /// sysprobe's logical cores, not this process's parallelism (`Ctx::parallelism`), which an
+    /// affinity mask or a cgroup quota narrows. The layout reads on macOS and Linux, so the count
+    /// is the machine's and not the floor of one that stands in for an unread layout. NEGATIVE
+    /// CONTROL, on Linux: a thread narrowed to one core of a machine of more reads a parallelism of
+    /// one and the live host's count unchanged, so a count read from the parallelism fails. macOS
+    /// has no affinity that narrows it, so there the two counts agree and only the first half
+    /// discriminates.
+    #[test]
+    fn the_live_hosts_cores_are_the_machines_logical_cores() {
+        let logical = aterm_sysprobe::cpu_layout().logical_cores();
+        let machine = u32::try_from(logical).unwrap_or(u32::MAX).max(1);
+        assert_eq!(LiveHost.cores(), machine);
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(logical > 0, "the layout reads on this host");
+        }
+        #[cfg(target_os = "linux")]
+        if logical > 1 {
+            let (parallelism, cores) = std::thread::spawn(|| {
+                unsafe extern "C" {
+                    /// `<sched.h>`; aterm-libc does not export it. `mask` is a `cpu_set_t`.
+                    fn sched_getaffinity(pid: i32, size: usize, mask: *mut [u64; 16]) -> i32;
+                    /// `<sched.h>`.
+                    fn sched_setaffinity(pid: i32, size: usize, mask: *const [u64; 16]) -> i32;
+                }
+                let mut allowed = [0u64; 16];
+                // SAFETY: `allowed` is a writable 1024-bit `cpu_set_t` of the size passed; pid 0
+                // is this thread.
+                let rc = unsafe {
+                    sched_getaffinity(0, std::mem::size_of_val(&allowed), &raw mut allowed)
+                };
+                assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+                let word = allowed
+                    .iter()
+                    .position(|w| *w != 0)
+                    .expect("an allowed core");
+                let mut one = [0u64; 16];
+                one[word] = 1 << allowed[word].trailing_zeros();
+                // SAFETY: `one` is a readable `cpu_set_t` of the size passed, naming one core
+                // this thread may run on; pid 0 narrows this thread alone.
+                let rc =
+                    unsafe { sched_setaffinity(0, std::mem::size_of_val(&one), &raw const one) };
+                assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+                (
+                    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+                    LiveHost.cores(),
+                )
+            })
+            .join()
+            .expect("the narrowed thread");
+            assert_eq!(parallelism, 1, "the thread is narrowed to one core");
+            assert_eq!(
+                cores, machine,
+                "the live host still reads the machine's cores"
+            );
+        }
     }
 
     /// A command-local removal wins over the run's inherited additions, while an explicit value
@@ -6952,8 +6983,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A tree runnable all the time but given no core at all makes no progress: after
-    /// `NO_PROGRESS_HANG` its time counts as work again, so a 1 s ceiling ends it, naming the time
+    /// A tree runnable all the time but given no core at all stays idle: after
+    /// `IDLE_HANG` its time counts as work again, so a 1 s ceiling ends it, naming the time
     /// it waited for a core before that apart. Negative control: with no such bound the ceiling
     /// never ends it, and the hang detector fails the test.
     #[cfg(unix)]
@@ -6986,7 +7017,7 @@ mod tests {
     /// ceiling ends it as a hang; and a busy-looping child, whatever share of the cores it gets,
     /// still ends at its ceiling of work. Negative controls: a clock that counts all of a tree's
     /// runnable time as waiting never ends the busy one; one that counts a window its tree was
-    /// runnable for none of as a wait ends the stopped one only at `NO_PROGRESS_HANG`, and with
+    /// runnable for none of as a wait ends the stopped one only at `IDLE_HANG`, and with
     /// that bound gone too never ends it (the arithmetic test fails on the first alone); the hang
     /// detector fails each that never ends.
     #[cfg(unix)]
@@ -7019,8 +7050,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The arithmetic of a window: what a tree used, read twice, and the part of the window it
-    /// waited for a core. Negative controls are the cases each rule decides.
+    /// The arithmetic of a window: the part of a window a tree that used `used` in it waited for a
+    /// core. Negative controls are the cases each rule decides.
     #[test]
     fn a_window_waits_for_a_core_only_while_its_tree_is_runnable_and_not_running() {
         let ms = Duration::from_millis;
@@ -7058,36 +7089,6 @@ mod tests {
         waits(used(0, 0), Duration::ZERO);
         // Running all it was runnable: no wait.
         waits(used(1000, 1000), Duration::ZERO);
-
-        let member =
-            |pid: u32, start: u64, cpu: u64, runnable: u64, io: u64| aterm_sysprobe::MemberUsage {
-                pid,
-                start,
-                cpu_ns: cpu,
-                runnable_ns: runnable,
-                io_bytes: io,
-                ..aterm_sysprobe::MemberUsage::default()
-            };
-        let (first, seen) = used_between(&BTreeMap::new(), vec![member(7, 1, 10, 30, 5)]);
-        assert_eq!(
-            first,
-            Used {
-                cpu: Duration::from_nanos(10),
-                runnable: Duration::from_nanos(30),
-                io: 5
-            },
-            "a new member counts whole"
-        );
-        let (next, _) = used_between(&seen, vec![member(7, 1, 25, 70, 5), member(7, 2, 4, 6, 0)]);
-        assert_eq!(
-            next,
-            Used {
-                cpu: Duration::from_nanos(15 + 4),
-                runnable: Duration::from_nanos(40 + 6),
-                io: 0
-            },
-            "a member by its growth, and a pid taken anew (another start) whole"
-        );
     }
 
     /// A test binary is hung only after both progress generations stay fixed for the complete
@@ -7759,7 +7760,7 @@ mod tests {
     /// - Four threads given 5% that then stop: the reads with nothing booked move nothing, though
     ///   the span's share alone would call them starved; a booking after them moves their wait.
     /// - What the span's reads moved never passes the work counted in them, nor the clock's work;
-    ///   and once forgotten (no progress for `NO_PROGRESS_HANG`), a lump moves at most its own
+    ///   and once forgotten (idle for `IDLE_HANG`), a lump moves at most its own
     ///   read's work.
     #[test]
     fn a_span_of_reads_moves_a_wait_the_kernel_books_late() {

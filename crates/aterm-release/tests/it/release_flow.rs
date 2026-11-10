@@ -96,8 +96,11 @@ fn hop_of(fix: &str) -> String {
 }
 
 type ExecJudge = Box<dyn FnMut(&str) -> Result<(), Refusal> + Send>;
+type BumpPreview = Box<dyn FnMut(&Candidate) -> Result<String, Refusal> + Send>;
 
 struct World {
+    preview_bump_judge: Option<BumpPreview>,
+    private_bump: Option<(String, String)>,
     preview_own: bool,
     gate_repo: Option<PathBuf>,
     gate_revision: bool,
@@ -344,6 +347,8 @@ impl World {
         let mut origin_tags = BTreeMap::new();
         origin_tags.insert("v0.5.0".into(), OLD.into());
         Self {
+            preview_bump_judge: None,
+            private_bump: None,
             preview_own: false,
             gate_repo: None,
             gate_revision: false,
@@ -1549,6 +1554,11 @@ impl Backend for World {
         self.versions.get(&full).cloned()
     }
     fn is_ancestor(&mut self, a: &str, b: &str) -> bool {
+        if let Some((commit, parent)) = self.private_bump.clone()
+            && b == commit
+        {
+            return a == b || self.is_ancestor(a, &parent);
+        }
         if (b == "origin/main" || b == self.tip()) && self.unrecorded_hops.contains(a) {
             return false;
         }
@@ -1739,6 +1749,16 @@ impl Backend for World {
     fn sync(&mut self) -> Result<String, Refusal> {
         self.calls.push("sync".into());
         Ok("engine synced".into())
+    }
+    fn preview_bump(&mut self, c: &Candidate, _prover: &Prover) -> Result<String, Refusal> {
+        self.calls.push("preview-bump".into());
+        let made = match self.preview_bump_judge.as_mut() {
+            Some(judge) => judge(c)?,
+            None => BUMP.into(),
+        };
+        self.versions.insert(made.clone(), c.version.clone());
+        self.private_bump = Some((made.clone(), c.commit.clone()));
+        Ok(made)
     }
     fn bump(&mut self, _from: &str, to: &str, _prover: &Prover) -> Result<String, Refusal> {
         self.calls.push("bump".into());
@@ -3008,9 +3028,15 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             ) && !c.starts_with("ls-remote")
         })
         .collect();
+    let expected_branches = [
+        "build",
+        "stage --dry-run",
+        "stage-fixtures",
+        "verify --tree",
+    ];
     let graph = order
         .iter()
-        .position(|c| matches!(*c, "verify --tree" | "build" | "stage"))
+        .position(|c| expected_branches.contains(c))
         .expect("the graph ran");
     let at = |order: &[&str], call: &str| order.iter().position(|c| *c == call);
     assert!(
@@ -3019,17 +3045,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     );
     let mut branches: Vec<&str> = order.drain(graph..graph + 4).collect();
     branches.sort_unstable();
-    assert_eq!(
-        branches,
-        [
-            "build",
-            "stage --dry-run",
-            "stage-fixtures",
-            "verify --tree"
-        ],
-        "{:?}",
-        w.calls
-    );
+    assert_eq!(branches, expected_branches, "{:?}", w.calls);
     // Step 7's two sides run at once: their calls come in their threads' order.
     let seven = order
         .iter()
@@ -3358,7 +3374,7 @@ fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own(
         dry_run: true,
         ..bump()
     });
-    assert_eq!(code, 3, "{last}");
+    assert_eq!(code, 0, "{last}");
     assert!(claims(&w).is_empty(), "{:?}", w.calls);
     assert!(
         w.out.iter().any(|l| l.contains("disk: would claim 30 GiB"))
@@ -3632,8 +3648,10 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
         dry_run: true,
         ..bump()
     });
-    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
-    assert!(last.contains("cannot judge every step") && !last.contains("would refuse"));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.contains("would go ahead") && !last.contains("would refuse"));
+    assert_eq!(w.count("preview-bump"), 1);
+    assert_eq!(w.count("commit-gates-dry"), 1);
     assert!(w.journal().is_none(), "a dry run writes no journal");
     assert!(!w.release_dir().join(RUNNING_FILE).exists());
     for call in [
@@ -8673,4 +8691,97 @@ fn structured_stage_events_include_source_log_and_separate_waiting_from_executio
         let passed = branch(name, "passed").unwrap_or_else(|| panic!("{name}: {events:#?}"));
         assert!(passed["seconds"].as_u64().is_some(), "{passed:?}");
     }
+}
+
+/// The production private editor feeds step 1, including its lock and harness edits.
+/// Negative control: today's unconstructed-bump branch exits 3 instead of either verdict.
+#[cfg(unix)]
+#[test]
+fn bump_dry_run_judges_the_private_tree_without_changing_refs_or_journals() {
+    use crate::ledger::{GitCli, git_ok};
+    for red in [false, true] {
+        let mut fixture = crate::release_steps::dry_tools_tests::BumpFixture::new(red);
+        let git = GitCli::new(&fixture.repo);
+        let read = |args: &[&str]| git_ok(&git, args).unwrap().stdout_utf8();
+        let before = (
+            read(&["show-ref"]),
+            read(&["rev-parse", "HEAD"]),
+            read(&["status", "--porcelain=v1"]),
+        );
+        let mut world = World::new();
+        let sentinel = fixture.root.path().join("release/candidate.toml");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, "unchanged journal\n").unwrap();
+        world.gate_repo = Some(fixture.repo.clone());
+        world.gate_revision = true;
+        world.preview_bump_judge = Some(Box::new(move |c| {
+            let commit = fixture.preview(c)?;
+            let git = GitCli::new(&fixture.repo);
+            let tree_file = |path: &str| {
+                git_ok(&git, &["show", &format!("{commit}:{path}")])
+                    .unwrap()
+                    .stdout_utf8()
+            };
+            assert!(tree_file("Cargo.toml").contains(&c.version));
+            assert!(tree_file("Cargo.lock").contains(&c.version));
+            if !red {
+                assert!(
+                    tree_file("crates/aterm-phase/src/phase.rs").contains("new(0, 2, \"0.2\")")
+                );
+                assert!(tree_file("CHANGELOG.md").contains("harness 0.2"));
+            }
+            assert_eq!(
+                fixture.preview(c)?,
+                commit,
+                "exec reconstructs the same object"
+            );
+            Ok(commit)
+        }));
+        let (code, last) = world.run(ReleaseOptions {
+            dry_run: true,
+            ..bump()
+        });
+        assert_eq!(code, if red { 1 } else { 0 }, "{last}\n{:?}", world.out);
+        assert_eq!(world.count("preview-bump"), 1);
+        assert_eq!(world.count("commit-gates-dry"), 1);
+        assert_eq!(world.count("bump"), 0);
+        assert!(world.journal().is_none());
+        assert!(
+            world.out.iter().any(|line| line.contains(if red {
+                "changelog"
+            } else {
+                "the preflight passes"
+            })),
+            "{:?}",
+            world.out
+        );
+        assert_eq!(
+            before,
+            (
+                read(&["show-ref"]),
+                read(&["rev-parse", "HEAD"]),
+                read(&["status", "--porcelain=v1"])
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel).unwrap(),
+            "unchanged journal\n"
+        );
+    }
+    let mut world = World::new();
+    world.own_cutter = false;
+    world.exec_result = Ok(());
+    let (code, last) = world.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(world.exec_commit.as_deref(), Some(BUMP));
+    assert_eq!(world.count("preview-bump"), 1);
+    assert_eq!(
+        world.count("commit-gates-dry"),
+        0,
+        "the base cutter gives no verdict"
+    );
+    assert!(world.journal().is_none());
 }

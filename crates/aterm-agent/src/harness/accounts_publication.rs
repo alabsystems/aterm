@@ -61,6 +61,10 @@ fn require_writer(store: &Store, held: &Lock) -> Result<(), String> {
 }
 
 impl<'a> PreparedPublication<'a> {
+    pub(super) fn changes(&self) -> bool {
+        self.changed
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -83,13 +87,15 @@ impl<'a> PreparedPublication<'a> {
         scope: Scope<'_>,
         plan: Plan,
         has_events: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SyncError> {
         require_writer(store, held)?;
         let previous = store.sync_read_receipt()?;
         plan.validate(store, scope)?;
         // A bounded ledger can retain identical bytes after an identical event.
         // That event still needs an intent and notification.
-        let changed = has_events || plan.images().any(|image| image.before != image.after);
+        let changed = has_events
+            || !plan.login_dirs.is_empty()
+            || plan.images().any(|image| image.before != image.after);
         let receipt = Receipt {
             schema: 1,
             id: aterm_uds::rand::hex_token::<16>().map_err(|why| why.to_string())?,
@@ -120,7 +126,7 @@ impl<'a> PreparedPublication<'a> {
             project = "aterm_agent::harness::accounts::sync_commit::publication::tests::transition"
         )
     )]
-    pub(super) fn persist(self) -> Result<Option<PendingPublication<'a>>, String> {
+    pub(super) fn persist(self) -> Result<Option<PendingPublication<'a>>, SyncError> {
         require_writer(self.store, self.held)?;
         #[cfg(test)]
         let check_previous = MUTANT.get() != 3;

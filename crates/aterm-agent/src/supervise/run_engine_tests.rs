@@ -1845,7 +1845,7 @@ fn unknown_input_keeps_the_persons_trust_dialog_held() {
     for input in [
         "",
         "input=- input_bytes=-",
-        "input=pending input_bytes=1 input_wait_ms=40 fg_rss_mb=-",
+        "input=pending input_bytes=1 input_wait_ms=40 fg_footprint_mb=-",
         "input=typeahead input_bytes=9",
     ] {
         let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
@@ -1996,8 +1996,8 @@ fn numbered_trust_dialog() -> Vec<String> {
 
 #[test]
 fn a_launch_the_server_witnesses_is_answered_within_the_grace() {
-    let pending = "input=pending input_bytes=1 input_wait_ms=40 fg_rss_mb=-";
-    let typeahead = "input=typeahead input_bytes=9 input_wait_ms=40 fg_rss_mb=-";
+    let pending = "input=pending input_bytes=1 input_wait_ms=40 fg_footprint_mb=-";
+    let typeahead = "input=typeahead input_bytes=9 input_wait_ms=40 fg_footprint_mb=-";
     let looked_again = || {
         vec![
             trust_dialog(false),
@@ -2135,7 +2135,7 @@ fn a_launch_missing_any_premise_keeps_the_persons_grace() {
     }
     for input in [
         INPUT_STALLED,
-        "input=stopped input_bytes=1 input_wait_ms=900 fg_rss_mb=-",
+        "input=stopped input_bytes=1 input_wait_ms=900 fg_footprint_mb=-",
     ] {
         let mut m = with(&|m| m.input = input);
         let (lines, noted) = full_power_watch(&mut m, "launch-stall");
@@ -2214,7 +2214,7 @@ fn an_attended_look_answers_a_launch_on_its_own_reads() {
         "{noted:#?}"
     );
     assert!(!noted.iter().any(|l| l.starts_with("HELD ")), "{noted:#?}");
-    let stopped = "input=stopped input_bytes=1 input_wait_ms=900 fg_rss_mb=-";
+    let stopped = "input=stopped input_bytes=1 input_wait_ms=900 fg_footprint_mb=-";
     for (what, autopilot, input) in [
         ("Autopilot off", Some("off"), INPUT_CLEAR),
         ("stalled", None, INPUT_STALLED),

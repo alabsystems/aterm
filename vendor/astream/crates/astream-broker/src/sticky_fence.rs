@@ -33,9 +33,7 @@
 //!   a write it gives up) lifts every fence its connection holds with
 //!   `Request::ClearGapFences` once it has read the answer to every write it sent: the
 //!   broker answers it after every write sent before it ([`StickyFenceTable::drop_conn`],
-//!   as a close does), so the lift reaches none of them. A close queues its lift on the
-//!   broker writer after every write the connection decoded, so cleanup cannot overtake a
-//!   pipelined successor whose acknowledgement the closing client did not read.
+//!   as a close does), so the lift reaches none of them.
 //! - Every `Hello` answered while the option is on says so (`REQUEST_GAP_FENCES` in its
 //!   request set), so a producer reads whether it may ask before it keeps several writes in
 //!   flight that a refused one must hold back.

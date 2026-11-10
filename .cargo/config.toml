@@ -117,12 +117,12 @@ CFLAGS_x86_64_apple_darwin = "-mmacosx-version-min=10.12"
 ship = "run --profile gate -p aterm-release --"
 # Every check, alone or in any combination, and the perf lanes
 # (crates/aterm-verify): `targo --unverified verify --help`. Share the test
-# profile, which inherits dev without overrides so builds reuse its dependency
-# units and retain debug assertions, and the workspace's feature unification,
+# profile, with incremental state off as in its child builds so they reuse its
+# dependency units and retain debug assertions, and the workspace's feature unification,
 # as verify's own builds have it (after `run`: targo drops the flag before the
 # subcommand, and a shim reads `run` first to place the build). The caller's
 # target dir is kept.
-verify = "run -Zfeature-unification --config resolver.feature-unification=\"workspace\" -q --profile test -p aterm-verify --"
+verify = "run -Zfeature-unification --config resolver.feature-unification=\"workspace\" --config profile.dev.incremental=false -q --profile test -p aterm-verify --"
 # The real-Claude lab (crates/aterm-lab): `targo --unverified lab help`. Dev
 # profile, the caller's target dir; the aterm it tests is the one beside it.
 lab = "run -q -p aterm-lab --"

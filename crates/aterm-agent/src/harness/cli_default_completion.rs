@@ -49,6 +49,14 @@ fn complete_with(
     let Some(path) = env.accounts_roster_for(Cli::Codex) else {
         return Ok(None);
     };
+    let store = env
+        .accounts_store_for(Cli::Codex)
+        .ok_or_else(|| no_home_for(Cli::Codex))?;
+    if store.sync_needs_recovery() {
+        store
+            .recover_sync_within(&accounts::LOCK_LADDER, &path)
+            .map_err(SyncError::into_message)?;
+    }
     if asked.is_none()
         && env
             .config
@@ -103,16 +111,15 @@ fn complete_with(
     if completed.email.is_none() {
         completed.email = Some(seen.clone());
     }
-    // Read source policy before taking the login locks. The recheck below is local-only.
+    // Capture source policy before taking the login locks. The final receipt
+    // also checks the retained source under its native admission locks.
     let source = super::super::accounts_sync::codex_completion_source(env, &completed)?;
-    let store = env
-        .accounts_store_for(Cli::Codex)
-        .ok_or_else(|| no_home_for(Cli::Codex))?;
     let _signing = take(&store)?;
     let _held = store
         .acquire_bounded()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+    store.recover_sync_held(&_held, &path)?;
     let _auth = super::super::codex_app_login::AuthLock::try_take(&home.join("auth.json"))
         .map_err(|e| format!("the default login lock: {e}"))?
         .ok_or("the default login is being changed; metadata is unchanged")?;
@@ -198,11 +205,22 @@ fn complete_with(
     if row.email.is_none() {
         local_roster(&path)?;
         let edited = with_email(&text, &row.label, &seen)?;
-        super::super::upgrade_models::write_atomic_mode(&path, &edited, None)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(why) = wake_for_roster(&store) {
-            return Err(why);
-        }
+        store
+            .transact_roster_admitted_held(
+                &_held,
+                env.now,
+                &mut None,
+                accounts::SyncTarget {
+                    path: &path,
+                    before: Some(&text),
+                    after: Some(&edited),
+                    mode: None,
+                    fleet: None,
+                },
+                false,
+                source.guard.as_ref(),
+            )
+            .map_err(SyncError::into_message)?;
     }
     Ok(Some(row.label.clone()))
 }

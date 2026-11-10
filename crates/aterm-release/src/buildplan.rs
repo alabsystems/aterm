@@ -14,6 +14,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::snapshot;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "qualify_hop_measure.rs"]
+mod hop_measure;
+
 #[path = "linux_release.rs"]
 pub mod linux;
 
@@ -82,11 +86,12 @@ pub struct BuildOutput {
 pub struct SliceBuild {
     pub triple: &'static str,
     pub secs: u64,
-    /// Peak resident bytes of the build child and the children it waited for (`wait4`'s `ru_maxrss`), `None` where the host does not report it.
+    /// Sampled peak physical footprint of the build's descendant tree; unread stays `None`.
     pub peak_bytes: Option<u64>,
-    /// CPU nanoseconds charged to the reaped build child and descendants it waited
-    /// for. This is not wall time and excludes descendants abandoned without a wait.
+    /// Sampled descendant CPU nanoseconds, a lower bound over observed incarnations.
     pub cpu_ns: Option<u64>,
+    /// Sampled wait for a core, using the verifier's accounting clock.
+    pub starved_ns: Option<u64>,
     /// The units Cargo reported and what the build wrote ([`Units`]); `None` when its messages
     /// could not be read.
     pub units: Option<Units>,
@@ -115,6 +120,7 @@ pub struct Units {
 struct BuildUsage {
     peak_bytes: Option<u64>,
     cpu_ns: Option<u64>,
+    starved_ns: Option<u64>,
     units: Option<Units>,
 }
 
@@ -790,6 +796,7 @@ fn build_slices(
                     secs,
                     peak_bytes: usage.peak_bytes,
                     cpu_ns: usage.cpu_ns,
+                    starved_ns: usage.starved_ns,
                     units: usage.units,
                 })
             }
@@ -1402,7 +1409,7 @@ pub(crate) fn pilot_build(
         ),
         (
             "accounting".to_string(),
-            aterm_json::Value::String("wait4: reaped child and waited descendants".to_string()),
+            aterm_json::Value::String("sampled-descendant-processes".to_string()),
         ),
         ("binary".to_string(), aterm_json::json!(retained)),
         ("runtime_app".to_string(), aterm_json::json!(runtime_app)),
@@ -1443,7 +1450,10 @@ pub(crate) fn pilot_build(
                 ]))
             }),
         ),
-        ("starved_s".to_string(), aterm_json::Value::Null),
+        (
+            "starved_s".to_string(),
+            aterm_json::json!(usage.starved_ns.map(|ns| ns as f64 / 1e9)),
+        ),
         ("inspection".to_string(), inspection),
         ("log".to_string(), aterm_json::json!(log)),
         (
@@ -1946,8 +1956,7 @@ pub(crate) fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
 }
 
 /// One compile call's line (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1): `-` where
-/// nothing measured it. A slice shares its build child's process group with the other slice, so
-/// no group read can split its starvation out.
+/// nothing measured it. Descendant selection separates concurrent slices sharing a group.
 fn compile_line(call: &str, usage: BuildUsage, wall: std::time::Duration) -> String {
     let units = usage.units.map_or_else(
         || "- fresh / - compiled".to_owned(),
@@ -1967,12 +1976,15 @@ fn compile_line(call: &str, usage: BuildUsage, wall: std::time::Duration) -> Str
     let peak = usage
         .peak_bytes
         .map_or_else(|| "-".to_owned(), |b| format!("{} MiB", b / (1024 * 1024)));
+    let starved = usage
+        .starved_ns
+        .map_or_else(|| "-".to_owned(), |ns| format!("{:.1}", ns as f64 / 1e9));
     let bytes = usage.units.map_or_else(
         || "-".to_owned(),
         |u| format!("{} MiB", u.output_bytes / (1024 * 1024)),
     );
     format!(
-        "compile {call}: {units}, {cpu} CPU-s, - starved-s, {:.1} s wall, peak {peak}, {bytes} written",
+        "compile {call}: {units}, {cpu} CPU-s, {starved} starved-s, {:.1} s wall, peak {peak}, {bytes} written",
         wall.as_secs_f64()
     )
 }
@@ -2070,9 +2082,7 @@ fn build_cpu_event(
                     aterm_json::Value::Object(aterm_json::Map::from([
                         (
                             "scope".to_string(),
-                            aterm_json::Value::String(
-                                "reaped-child-and-waited-descendants".to_string(),
-                            ),
+                            aterm_json::Value::String("sampled-descendant-processes".to_string()),
                         ),
                         (
                             "observed_s".to_string(),
@@ -2082,6 +2092,10 @@ fn build_cpu_event(
                         ),
                     ]))
                 }),
+            ),
+            (
+                "starved_s".to_string(),
+                aterm_json::json!(usage.starved_ns.map(|ns| ns as f64 / 1e9)),
             ),
             (
                 "peak_bytes".to_string(),
@@ -2095,29 +2109,23 @@ fn build_cpu_event(
     )
 }
 
-/// Wait for `child` and retain its CPU and peak resident memory, including the
-/// children it waited for (`wait4`'s rusage). These are accounting observations;
-/// each slice admits its memory separately. CPU is separate from the wall clock.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Wait for `child` while the verifier's clock samples its descendants, including those in
+/// other process groups. This changes no signal custody or memory admission.
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
 ) -> std::io::Result<(std::process::ExitStatus, BuildUsage)> {
-    let usage = child.wait_with_rusage()?;
+    let meter = aterm_verify::exec::UsageMeter::start(child.id());
+    let status = child.wait()?;
+    let usage = meter.finish();
     Ok((
-        usage.status,
+        status,
         BuildUsage {
-            peak_bytes: Some(usage.maxrss).filter(|b| *b > 0),
-            cpu_ns: u64::try_from(usage.cpu.as_nanos()).ok(),
+            peak_bytes: usage.map(|u| u.peak_bytes),
+            cpu_ns: usage.and_then(|u| u64::try_from(u.cpu.as_nanos()).ok()),
+            starved_ns: usage.and_then(|u| u64::try_from(u.starved.as_nanos()).ok()),
             units: None,
         },
     ))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn wait_with_peak(
-    mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, BuildUsage)> {
-    Ok((child.wait()?, BuildUsage::default()))
 }
 
 fn require_rustup_target(triple: &str) -> Result<(), String> {
@@ -3281,8 +3289,6 @@ mod tests {
             .unwrap();
         let (status, usage) = super::wait_with_peak(child).unwrap();
         assert_eq!(status.code(), Some(23));
-        assert!(usage.peak_bytes.is_some_and(|bytes| bytes > 0), "{usage:?}");
-        assert!(usage.cpu_ns.is_some(), "{usage:?}");
         let event = super::build_cpu_event(
             "build aterm native",
             "aterm",
@@ -3292,6 +3298,7 @@ mod tests {
             super::BuildUsage {
                 peak_bytes: usage.peak_bytes,
                 cpu_ns: Some(8_000_000_000),
+                starved_ns: Some(2_000_000_000),
                 units: Some(super::Units {
                     fresh: 3,
                     compiled: 2,
@@ -3314,8 +3321,9 @@ mod tests {
         assert_eq!(value["child_cpu"]["observed_s"].as_f64(), Some(8.0));
         assert_eq!(
             value["child_cpu"]["scope"].as_str(),
-            Some("reaped-child-and-waited-descendants")
+            Some("sampled-descendant-processes")
         );
+        assert_eq!(value["starved_s"].as_f64(), Some(2.0));
         let unknown = super::build_cpu_event(
             "build aterm native",
             "aterm",
@@ -4276,6 +4284,7 @@ mod tests {
                     secs: 1,
                     peak_bytes: None,
                     cpu_ns: None,
+                    starved_ns: None,
                     units: None,
                 }],
                 archs: "x86_64 arm64".into(),

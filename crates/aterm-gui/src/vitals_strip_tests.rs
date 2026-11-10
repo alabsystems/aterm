@@ -76,7 +76,7 @@ fn reading(i: u64) -> Sample {
         volume: Some(VolumeSample {
             total: 2_000_000_000_000,
             free: 1_000_000_000_000 - wobble * 1_000_003,
-            available: 1_000_000_000_000 - wobble * 1_000_003,
+            reserved: 0,
             mount: "/".into(),
         }),
         procs: Some(vec![

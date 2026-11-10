@@ -59,9 +59,9 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "host",
-            "integration input input_bytes input_wait_ms fg_rss_mb disk disk_free_mb disk_room_mb \
-         disk_age_ms job job_quiet_ms program_check program_check_stranded left syspolicyd \
-         syspolicyd_workers syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms service_mem \
+            "integration input input_bytes input_wait_ms fg_footprint_mb disk disk_free_mb \
+         disk_room_mb disk_age_ms job job_quiet_ms program_check program_check_stranded left \
+         syspolicyd syspolicyd_workers syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms service_mem \
          service_mem_top occupancy occupancy_hold ready slots idle_ready_min waits waits_ready",
         ),
         row(
@@ -262,7 +262,7 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`integration=<on|off|degraded> \
                      input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= \
-                     input_wait_ms= fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= \
+                     input_wait_ms= fg_footprint_mb= disk=<ok|low|short|emergency|-> disk_free_mb= \
                      disk_room_mb= disk_age_ms= job=<verdict|none> job_quiet_ms= \
                      program_check=<n>:<oldest_ms>|0|- \
                      program_check_stranded=<n>:<oldest_ms>|0|- left=<n>:<oldest_ms>|0:-|- \

@@ -832,11 +832,11 @@ fn lifeline_flag() -> Vec<String> {
     vec![aterm_uds::lifeline::FLAG.to_string(), "0".to_string()]
 }
 
-/// How long a jailed child the lab started may go without progress before it says it is ready
-/// (its `--ready-fd` byte, or a window's answer): a hang detector, never a latency budget.
+/// How long a jailed child the lab started may stay idle before it says it is ready (its
+/// `--ready-fd` byte, or a window's answer): a hang detector, never a latency budget.
 const READY_HANG: Duration = Duration::from_secs(60);
 
-/// How often a wait for a starting child looks at its progress ([`while_starting`]).
+/// How often a wait for a starting child looks at what it did ([`while_starting`]).
 const READY_LOOK: Duration = Duration::from_secs(1);
 
 /// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command` ([`launch_ready`],
@@ -875,8 +875,8 @@ fn jailed_command(
 
 /// A windowed instance launched in the jail ([`jailed_command`]).
 /// # Errors
-/// The launch failed, the child ended before its socket answered, it made no progress for `hang`
-/// before it answered, or the run was interrupted (`interrupted`).
+/// The launch failed, the child ended before its socket answered, it was idle for `hang` before
+/// it answered, or the run was interrupted (`interrupted`).
 fn launch_window(
     run: &Run,
     vars: &[(String, String)],
@@ -892,6 +892,7 @@ fn launch_window(
     *pid = procs::keep_forked(child);
     let door = Door::new(run)?;
     let child = *pid;
+    let mut starting = Starting::of(child, out);
     while_starting(
         || {
             if door.ctl(&["version"]).is_ok_and(|r| r.code == 0) {
@@ -902,7 +903,7 @@ fn launch_window(
                 Err("the window's instance ended before its control socket answered".into())
             }
         },
-        || progress_of(child, out),
+        || starting.active(),
         hang,
         Instant::now(),
         || {
@@ -912,41 +913,65 @@ fn launch_window(
     )
 }
 
-/// A starting child's progress: its CPU time used plus the length of its output `out`.
-fn progress_of(pid: i32, out: &Path) -> u64 {
-    crate::sys::cpu_used(pid)
-        .unwrap_or(0)
-        .saturating_add(fs::symlink_metadata(out).map_or(0, |m| m.len()))
+/// What a starting child did between two looks ([`while_starting`]): whether its process group
+/// (the lab starts it in a session of its own, so its pid is its group's) used CPU time or moved
+/// bytes, by the one idle predicate ([`aterm_sysprobe::activity`]), or its output `out` grew.
+struct Starting<'a> {
+    pgid: u32,
+    out: &'a Path,
+    seen: aterm_sysprobe::activity::Members,
+    said: Option<u64>,
 }
 
-/// A starting child's readiness, waited for as a hang detector on its `progress`.
+impl<'a> Starting<'a> {
+    /// The child `pid`, writing to `out`, before its first look.
+    fn of(pid: i32, out: &'a Path) -> Self {
+        Self {
+            pgid: u32::try_from(pid).unwrap_or(0),
+            out,
+            seen: aterm_sysprobe::activity::Members::new(),
+            said: None,
+        }
+    }
+
+    /// Whether the child did anything since the last look: its group was not idle
+    /// ([`aterm_sysprobe::activity::Used::idle`]) or its output's length moved. The first look
+    /// finds it active.
+    fn active(&mut self) -> bool {
+        let members = aterm_sysprobe::group_usage(self.pgid).unwrap_or_default();
+        let (used, seen) = aterm_sysprobe::activity::between(&self.seen, members);
+        self.seen = seen;
+        let said = fs::symlink_metadata(self.out).map_or(0, |m| m.len());
+        let wrote = self.said != Some(said);
+        self.said = Some(said);
+        !used.idle() || wrote
+    }
+}
+
+/// A starting child's readiness, waited for as a hang detector on whether it is `active`
+/// ([`Starting::active`]).
 /// # Errors
-/// The child ended before it was ready, it made no progress for `hang`, or `pause` failed.
+/// The child ended before it was ready, it was idle for `hang`, or `pause` failed.
 fn while_starting(
     mut look: impl FnMut() -> Result<bool, String>,
-    mut progress: impl FnMut() -> u64,
+    mut active: impl FnMut() -> bool,
     hang: Duration,
     start: Instant,
     mut pause: impl FnMut() -> Result<Instant, String>,
 ) -> Result<(), String> {
-    let mut still: Option<(u64, Instant)> = None;
+    let mut since = start;
     let mut now = start;
     loop {
         if look()? {
             return Ok(());
         }
-        let moved = progress();
-        let since = match still {
-            Some((seen, since)) if seen == moved => since,
-            _ => {
-                still = Some((moved, now));
-                now
-            }
-        };
+        if active() {
+            since = now;
+        }
         if now.saturating_duration_since(since) >= hang {
             return Err(format!(
-                "said nothing and made no progress (no CPU time used, no output written) for {} s: \
-                 the hang detector",
+                "said nothing and was idle (no CPU time used, no bytes moved, no output written) \
+                 for {} s: the hang detector",
                 hang.as_secs()
             ));
         }
@@ -1006,6 +1031,7 @@ pub(crate) fn launch_ready(
         .map_err(|e| format!("cannot start {}: {e}", program.join(" ")))?;
     *pid = procs::keep_forked(child);
     let child = *pid;
+    let mut starting = Starting::of(child, out);
     let name = program.first().map_or("the child", String::as_str);
     while_starting(
         || match ready.wait(READY_LOOK) {
@@ -1016,7 +1042,7 @@ pub(crate) fn launch_ready(
             )),
             aterm_agent::ready::Signal::Failed(e) => Err(format!("the ready signal: {e}")),
         },
-        || progress_of(child, out),
+        || starting.active(),
         hang,
         Instant::now(),
         || {
@@ -4748,7 +4774,7 @@ mod tests {
     }
 
     #[test]
-    fn a_starting_child_is_waited_for_while_it_makes_progress() {
+    fn a_starting_child_is_waited_for_while_it_is_active() {
         let t0 = Instant::now();
         let s = |n: u64| t0 + Duration::from_secs(n);
         let looks = std::cell::Cell::new(0u64);
@@ -4762,38 +4788,38 @@ mod tests {
                 looks.set(looks.get() + 1);
                 Ok(looks.get() == 3)
             },
-            || 0,
+            || false,
             READY_HANG,
             t0,
             tick,
         );
         assert_eq!(answered, Ok(()));
         assert_eq!(looks.get(), 3);
-        let e = while_starting(|| Err("ended".into()), || 0, READY_HANG, t0, || Ok(t0))
+        let e = while_starting(|| Err("ended".into()), || false, READY_HANG, t0, || Ok(t0))
             .expect_err("ended");
         assert_eq!(e, "ended");
-        // Starved: ready at the 300th second, its CPU time moving every 30 s.
+        // Starved: ready at the 300th second, active once every 30 s.
         clock.set(0);
         let started = while_starting(
             || Ok(clock.get() >= 300),
-            || clock.get() / 30,
+            || clock.get() % 30 == 0,
             READY_HANG,
             t0,
             tick,
         );
         assert_eq!(started, Ok(()), "a starved start is no hang");
-        // The negative control: the same start whose progress stood still from the 100th
-        // second is a hang at the 160th.
+        // The negative control: the same start idle from the 100th second is a hang at the
+        // 160th.
         clock.set(0);
         let e = while_starting(
             || Ok(clock.get() >= 300),
-            || clock.get().min(100),
+            || clock.get() <= 100,
             READY_HANG,
             t0,
             tick,
         )
         .expect_err("hang");
-        assert!(e.contains("made no progress"), "{e}");
+        assert!(e.contains("was idle"), "{e}");
         assert_eq!(
             clock.get(),
             160,
@@ -4801,7 +4827,7 @@ mod tests {
         );
         let e = while_starting(
             || Ok(false),
-            || 0,
+            || false,
             READY_HANG,
             t0,
             || Err("interrupted".to_string()),

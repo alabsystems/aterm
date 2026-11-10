@@ -396,7 +396,9 @@ fn execution_snapshot_readonly(
     let (mut state, _) = store.load(seat.now)?;
     let roster = accounts::bound(&raw, &logins);
     store.hydrate_auth_contexts(&mut state, &roster);
-    store.check_sync_read_receipt(&receipt)?;
+    store
+        .check_sync_read_receipt(&receipt)
+        .map_err(crate::harness::account_sync_error::SyncError::into_message)?;
     Ok(PoolSnapshot {
         roster,
         logins,

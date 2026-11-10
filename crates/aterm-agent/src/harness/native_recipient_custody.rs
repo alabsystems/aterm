@@ -15,6 +15,10 @@ pub use binding::{BoundRecipientCustody, bind_recipient_custody};
 mod writer;
 pub use writer::{RecipientWriter, open_recipient_writer};
 
+#[path = "native_recipient_closure.rs"]
+mod closure;
+pub use closure::close_recipient_reservation;
+
 const DIRECTORY: &str = "native-recipients";
 const ENROLLMENT: &str = "native-recipients.enrolled";
 const LOCK: &str = "native-recipients.lock";

@@ -130,3 +130,144 @@ fn measure_same_main_step_one() {
         })
     );
 }
+
+/// A real private bump, using local release history and the production editor pipeline.
+/// The only stand-in is the publication engine's manifest editor.
+#[cfg(unix)]
+pub(crate) struct BumpFixture {
+    pub root: aterm_tempfile::TempDir,
+    pub repo: PathBuf,
+    pub base: String,
+    real: Real,
+    origin: crate::github_remote::Remote,
+}
+
+#[cfg(unix)]
+impl BumpFixture {
+    pub fn new(red: bool) -> Self {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        crate::ledger::testing::init(
+            &repo,
+            &[
+                ("user.name", "Fixture"),
+                ("user.email", "fixture@example.invalid"),
+            ],
+        );
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\n[workspace.package]\nversion = \"0.5.0\"\n[package]\nname = \"fixture\"\nversion.workspace = true\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"fixture\"\nversion = \"0.5.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("RELEASES.ledger"), "1 0.5.0\n").unwrap();
+        std::fs::write(
+            repo.join("CHANGELOG.md"),
+            if red {
+                "# Changelog\n\n## [Unreleased]\n"
+            } else {
+                "# Changelog\n\n## [Unreleased]\n\n- A useful change.\n"
+            },
+        )
+        .unwrap();
+        let harness = repo.join("crates/aterm-phase/src/phase.rs");
+        std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        for h in aterm_phase::CliHarness::ALL {
+            std::fs::write(repo.join(h.version_file()), "pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 1, \"0.1\");\n").unwrap();
+        }
+        let git = GitCli::new(&repo);
+        let run = |args: &[&str]| {
+            crate::ledger::git_ok(&git, args)
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .to_owned()
+        };
+        run(&["add", "."]);
+        run(&["commit", "-qm", "release baseline"]);
+        run(&["tag", "v0.5.0"]);
+        if !red {
+            let text = std::fs::read_to_string(&harness).unwrap();
+            std::fs::write(&harness, format!("{text}\npub fn new_reader() {{}}\n")).unwrap();
+            run(&["add", "."]);
+            run(&["commit", "-qm", "reader change owes a harness bump"]);
+        }
+        let base = run(&["rev-parse", "HEAD"]);
+        let bare = root.path().join("origin.git");
+        run(&[
+            "clone",
+            "-q",
+            "--bare",
+            repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/fixture/app.git",
+        ]);
+        let origin = crate::github_remote::claim_fixture(&repo, &bare);
+        let engine = root.path().join("engine");
+        std::fs::create_dir_all(engine.join("bin")).unwrap();
+        aterm_tempfile::stand_in(&engine.join("bin/pub-bump-edit"), "#!/bin/sh\n/usr/bin/sed \"s/$3/$2/g\" \"$1/Cargo.toml\" > \"$1/Cargo.toml.next\" && /bin/mv \"$1/Cargo.toml.next\" \"$1/Cargo.toml\"\n").unwrap();
+        let mut real = Real::new(&repo, Some(&engine), true, false).unwrap();
+        real.release = root.path().join("release");
+        Self {
+            root,
+            repo,
+            base,
+            real,
+            origin,
+        }
+    }
+
+    pub fn preview(&mut self, c: &Candidate) -> Result<String, Refusal> {
+        let prover = Prover {
+            bin: crate::gates::trust_stage2_bin().unwrap(),
+            commit: "0".repeat(40),
+            source: "fixture Trust".into(),
+        };
+        let mut c = c.clone();
+        c.commit = self.base.clone();
+        self.real
+            .preview_bump_from_origin(&c, &prover, &self.origin)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_bump_tree_matches_the_real_bump_edits() {
+    let mut fixture = BumpFixture::new(false);
+    let c = Candidate {
+        commit: fixture.base.clone(),
+        version: "0.6.0".into(),
+        why: "fixture".into(),
+        bump_from: Some("0.5.0".into()),
+        carry: Vec::new(),
+    };
+    let preview = fixture.preview(&c).unwrap();
+    let prover = Prover {
+        bin: crate::gates::trust_stage2_bin().unwrap(),
+        commit: "0".repeat(40),
+        source: "fixture Trust".into(),
+    };
+    fixture.real.repo = fixture.repo.canonicalize().unwrap();
+    let (_, paths) = fixture
+        .real
+        .edit_bump("0.5.0", "0.6.0", &prover, &fixture.origin)
+        .unwrap();
+    let git = GitCli::new(&fixture.repo);
+    let mut add = vec!["add", "--"];
+    add.extend(paths.iter().map(String::as_str));
+    crate::ledger::git_ok(&git, &add).unwrap();
+    let actual = crate::ledger::git_ok(&git, &["write-tree"])
+        .unwrap()
+        .stdout_utf8();
+    let planned = crate::ledger::git_ok(&git, &["rev-parse", &format!("{preview}^{{tree}}")])
+        .unwrap()
+        .stdout_utf8();
+    assert_eq!(actual, planned);
+}

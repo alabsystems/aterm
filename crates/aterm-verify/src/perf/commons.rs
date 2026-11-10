@@ -204,7 +204,7 @@ fn measure(json_out: Option<&Path>, sustained: bool, workload: Workload) -> Resu
         "rustflags": bench_build::flags::describe(&flags),
         "toolchain": stdout_of(command(&driver.program).args(["--unverified", "--version"])),
         "machine": chip(),
-        "logical_cpus": std::thread::available_parallelism().ok().map(|count| count.get()),
+        "logical_cpus": aterm_capacity::cores(),
         "load_before_command": before,
         "load_after_command": after,
         "thermal": thermal(),

@@ -328,6 +328,7 @@ fn memory_reads_psi_and_drops_a_disabled_zswap() {
     let r = Root::new(root.path());
     let m = r.memory_detail().expect("a reading");
     assert_eq!(m.pressure, Some(MemoryLevel::Warn));
+    assert_eq!(m.available, 20_480_000 * 1024, "MemAvailable");
     assert_eq!((m.compressed, m.stored), (None, None));
     assert_eq!(m.shared, Some(1_024_000 * 1024));
     write(root.path(), "sys/module/zswap/parameters/enabled", "Y\n");
@@ -908,6 +909,48 @@ fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
         "no VmSwap reads 0 swapped"
     );
     assert_eq!(linux::status_footprint("Name:\tkthreadd\nPPid:\t0\n"), None);
+}
+
+/// ONE PROCESS'S FOOTPRINT (`procs::footprint` on Linux, `Root::footprint`) is the sweep's figure:
+/// its anonymous pages in memory and swapped (`RssAnon + VmSwap`), read whole however long its
+/// `status` is up to the cap. NEGATIVE CONTROL: the file-backed pages it maps are not its own, so
+/// `VmRSS + VmSwap` (the explicit-pid reader it replaced) is not what it reads; a `status` past
+/// the cap is `InvalidData`, and a kernel thread or a gone pid `NotFound`.
+#[test]
+fn one_processs_footprint_is_the_sweeps_anonymous_pages_and_swap() {
+    let status = "Name:\tclaude\nVmRSS:\t  412000 kB\nRssAnon:\t  300000 kB\n\
+                  RssFile:\t  110000 kB\nVmSwap:\t   20000 kB\n";
+    let long = format!(
+        "Name:\tlong\n{}RssAnon:\t 8 kB\nVmSwap:\t 4 kB\n",
+        "x\n".repeat(4096)
+    );
+    let past = format!("Name:\tpast\n{}", "x".repeat(linux::STATUS_CAP));
+    let root = tree(&[
+        ("proc/42/status", status),
+        ("proc/43/status", &long),
+        ("proc/44/status", &past),
+        ("proc/2/status", "Name:\tkthreadd\nPPid:\t0\n"),
+    ]);
+    let r = Root::new(root.path());
+    assert_eq!(r.footprint(42).ok(), Some(320_000 * 1024));
+    assert_ne!(
+        r.footprint(42).ok(),
+        Some(432_000 * 1024),
+        "not VmRSS + VmSwap"
+    );
+    assert_eq!(
+        r.footprint(43).ok(),
+        Some(12 * 1024),
+        "read whole past 4 KiB"
+    );
+    let kind = |pid| r.footprint(pid).map_err(|e| e.kind()).err();
+    assert_eq!(kind(44), Some(std::io::ErrorKind::InvalidData));
+    assert_eq!(
+        kind(2),
+        Some(std::io::ErrorKind::NotFound),
+        "a kernel thread"
+    );
+    assert_eq!(kind(99), Some(std::io::ErrorKind::NotFound), "gone");
 }
 
 #[test]

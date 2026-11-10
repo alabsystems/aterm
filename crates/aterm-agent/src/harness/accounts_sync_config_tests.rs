@@ -34,7 +34,11 @@ fn automatic_sync_refuses_disabled_or_unread_config_before_recovery_and_fetch() 
             &|_, _| panic!("disabled sync fetched a source"),
         )
         .expect_err("automatic sync must refuse");
-        assert_eq!(error, ACCOUNTS_SYNC_OFF, "refuse before state recovery");
+        assert_eq!(
+            error.to_string(),
+            ACCOUNTS_SYNC_OFF,
+            "refuse before state recovery"
+        );
         assert_eq!(std::fs::read(&state).unwrap(), state_bytes);
         assert!(!home.exists());
         assert!(!roster.exists());

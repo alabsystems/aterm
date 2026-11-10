@@ -157,6 +157,7 @@ fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool(
     ));
     assert_eq!(world.rows().row_for_login(None).unwrap().label, "b");
     assert!(wake.exists(), "the pool woke: {synced:?}");
+    let synced = synced.map_err(SyncError::from);
     assert!(!default_sync_settled(&synced), "{synced:?}");
 }
 

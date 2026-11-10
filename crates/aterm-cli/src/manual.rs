@@ -1641,7 +1641,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   stall_term [true]               restart a frozen worker at `stall_term_after_s` once
                                   (false: warn about it once)
   memory_ceiling [auto]           warn (and restart at idle under critical Mac memory
-                                  pressure) past this footprint (`auto`, GiB, or `off`)
+                                  pressure) past this footprint (`auto`, GiB, or `off`;
+                                  `auto`: an eighth of the Mac plus half the memory
+                                  `sys mem` calls available)
   upgrade [true]                  move idle sessions onto newer builds/models
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point

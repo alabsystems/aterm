@@ -35,7 +35,7 @@ impl Probe for Native {
         process::read_lineage(pid)
     }
     fn memory(&self, pid: u32) -> io::Result<u64> {
-        aterm_sysprobe::procs::pid_memory_bytes(pid)
+        aterm_sysprobe::procs::footprint(pid)
     }
     fn presence(&self, pid: i32) -> ProcessPresence {
         process::process_presence(pid)

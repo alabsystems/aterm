@@ -6,6 +6,7 @@
 //! This is not atomicity for unrelated transactions or independent unlocked paired reads.
 
 use super::*;
+use crate::harness::account_sync_error::{Retry, SyncError};
 use serde::{Deserialize, Serialize};
 
 #[path = "accounts_publication.rs"]
@@ -43,11 +44,18 @@ enum WakeRule {
     Events,
 }
 
+enum LoginDirectories {
+    Preserve,
+    Materialize,
+}
+
 struct Publication<'a> {
     target: Option<SyncTarget<'a>>,
+    directories: LoginDirectories,
     wake: WakeRule,
     retire_legacy: bool,
     outbox: Option<Image>,
+    source: Option<&'a super::super::alab_roster::ReceiptGuard>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -140,6 +148,9 @@ impl Image {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
+    /// Store-relative leaves only, each justified by an admitted after-roster row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    login_dirs: Vec<String>,
     // A missing path admits only fixed paths below this Store; local_logins adds bindings.
     // Some serializes identically to the original string field, preserving old digests.
     roster_path: Option<String>,
@@ -307,7 +318,145 @@ fn publication_parent(path: &Path) -> &Path {
         .unwrap_or(parent)
 }
 
+/// Admit a materialized login directory without changing it. Unix also checks
+/// ownership and ACLs; Windows keeps the existing inherited-permissions policy.
+fn judge_login_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        aterm_uds::private_file::judge_private_dir(dir)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                let linked = {
+                    use std::os::windows::fs::MetadataExt as _;
+                    // Junctions and other reparse points are not store-owned directories.
+                    meta.file_attributes() & 0x0400 != 0
+                };
+                #[cfg(not(windows))]
+                let linked = meta.file_type().is_symlink();
+                if !meta.is_dir() || linked {
+                    return Err(format!("{}: not a real login directory", dir.display()));
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Replay a directory intent. Its creation and Unix permission narrowing happen
+/// only after the receipt is durable; Windows inherits its parent's ACL as before.
+fn ensure_login_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        aterm_uds::private_file::ensure_private_dir(dir)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        judge_login_dir(dir)?;
+        aterm_types::fs_restricted::ensure_private_dir(dir).map_err(|e| e.to_string())?;
+        judge_login_dir(dir)
+    }
+}
+
+/// Directory names are single components, not account labels: collision and
+/// renewal homes also use `~` and `+`. The after-roster must name this same path.
+fn login_directory_path(store: &Store, leaf: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(leaf).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) if name == std::ffi::OsStr::new(leaf) => {
+            Ok(store.logins_dir().join(name))
+        }
+        _ => Err("directory intent is not a store-owned leaf".into()),
+    }
+}
+
 impl Plan {
+    fn capture_login_dirs(&mut self, store: &Store) -> Result<(), String> {
+        let Some(text) = self.roster.after.as_deref() else {
+            return Ok(());
+        };
+        let before = self
+            .roster
+            .before
+            .as_deref()
+            .map(|text| Roster::parse_for(store.cli, text))
+            .transpose()?
+            .unwrap_or_default();
+        let root = store.logins_dir();
+        let mut root_checked = false;
+        let mut dirs = BTreeSet::new();
+        for row in Roster::parse_for(store.cli, text)?.rows {
+            let Some(dir) = row.dir.as_deref().map(Path::new) else {
+                continue;
+            };
+            if dir.parent() != Some(root.as_path()) {
+                continue;
+            }
+            let retained = before
+                .row(&row.label)
+                .is_some_and(|before| before.dir == row.dir);
+            match std::fs::symlink_metadata(dir) {
+                Ok(_) if retained => continue,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if !root_checked {
+                judge_login_dir(&root)?;
+                root_checked = true;
+            }
+            let leaf = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("login directory is not UTF-8")?;
+            if login_directory_path(store, leaf)?.as_path() != dir {
+                return Err("login directory is not a store-owned leaf".into());
+            }
+            judge_login_dir(dir)?;
+            dirs.insert(leaf.to_owned());
+        }
+        self.login_dirs = dirs.into_iter().collect();
+        if !self.login_dirs.is_empty() {
+            self.wake = Some(true);
+        }
+        Ok(())
+    }
+
+    fn login_directory_paths(&self, store: &Store) -> Result<Vec<PathBuf>, String> {
+        if self.login_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let roster = Roster::parse_for(
+            store.cli,
+            self.roster
+                .after
+                .as_deref()
+                .ok_or("directory intent needs an after-roster")?,
+        )?;
+        let mut paths = BTreeSet::new();
+        for leaf in &self.login_dirs {
+            let path = login_directory_path(store, leaf)?;
+            if !roster
+                .rows
+                .iter()
+                .any(|row| row.dir.as_deref().map(Path::new) == Some(path.as_path()))
+                || !paths.insert(path)
+            {
+                return Err("directory intent is duplicate or absent from the after-roster".into());
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     fn paths(&self, store: &Store, scope: Scope<'_>) -> Result<Vec<(ImageRole, PathBuf)>, String> {
         let mut paths = vec![
             (ImageRole::State, store.state_file()),
@@ -368,6 +517,7 @@ impl Plan {
     }
 
     fn validate(&self, store: &Store, scope: Scope<'_>) -> Result<(), String> {
+        self.login_directory_paths(store)?;
         if let Some(roster) = scope.roster {
             validate_external_target(store, roster)?;
         }
@@ -464,12 +614,15 @@ impl Plan {
 
     /// Fresh intent admission requires its captured before-images. Recovery may
     /// also see after-images, but that does not admit a new transaction.
-    fn check_before(&self, store: &Store, scope: Scope<'_>) -> Result<(), String> {
+    fn check_before(&self, store: &Store, scope: Scope<'_>) -> Result<(), SyncError> {
         for (role, path) in self.paths(store, scope)? {
             if read(&path, role.limit())? != self.image(role)?.before {
-                return Err(format!(
-                    "{} changed before account publication; no new sync was admitted",
-                    path.display()
+                return Err(SyncError::retry(
+                    Retry::Changed,
+                    format!(
+                        "{} changed before account publication; no new sync was admitted",
+                        path.display()
+                    ),
                 ));
             }
         }
@@ -559,6 +712,16 @@ fn validate_external_target(store: &Store, target: &Path) -> Result<(), String> 
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(in crate::harness) fn retire_source_held(
+        &self,
+        held: &Lock,
+        now: i64,
+    ) -> Result<bool, String> {
+        self.retire_source_admitted_held(held, now, None)
+            .map_err(SyncError::into_message)
+    }
+
     /// Retire an automatic source when an unassigned import has no row images
     /// to publish. It still shares the ordinary fixed-file recovery protocol.
     #[cfg_attr(
@@ -593,11 +756,13 @@ impl Store {
             reason = "An independent writer supplies conflicting retained bytes."
         )
     )]
-    pub(in crate::harness) fn retire_source_held(
+    /// Retire a selected source with its native admission when it came from the registry.
+    pub(in crate::harness) fn retire_source_admitted_held(
         &self,
         held: &Lock,
         now: i64,
-    ) -> Result<bool, String> {
+        source: Option<&super::super::alab_roster::ReceiptGuard>,
+    ) -> Result<bool, SyncError> {
         if !self.native_writer_matches(held) {
             return Err("source retirement requires this account store's writer".into());
         }
@@ -612,6 +777,7 @@ impl Store {
         }
         let ledger = read(&self.ledger_path(), MAX_LEDGER)?;
         let plan = Plan {
+            login_dirs: Vec::new(),
             roster_path: None,
             roster_mode: None,
             local_logins: false,
@@ -630,7 +796,7 @@ impl Store {
             source_policy,
             outbox: None,
         };
-        self.publish_plan_scoped(held, Scope::default(), plan, &[], || Ok(()))?;
+        self.publish_plan_scoped(held, Scope::default(), plan, &[], source, || Ok(()))?;
         Ok(changed)
     }
 
@@ -690,8 +856,16 @@ impl Store {
         note: &mut Option<String>,
         edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        self.transact_state_images_held(held, now, note, None, Some(edit))
-            .map(|(events, _)| events)
+        self.transact_state_images_held(
+            held,
+            now,
+            note,
+            None,
+            Some(|state: &mut State| edit(state).map_err(SyncError::from)),
+            (None, || Ok(())),
+        )
+        .map(|(events, _)| events)
+        .map_err(SyncError::into_message)
     }
 
     /// Commit the local fleet projection with account state under one retained receipt.
@@ -703,8 +877,11 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         fleet: (&Path, &str),
-        (retire, edit): (bool, impl FnOnce(&mut State) -> Result<Vec<Event>, String>),
-    ) -> Result<bool, String> {
+        (retire, edit): (
+            bool,
+            impl FnOnce(&mut State) -> Result<Vec<Event>, SyncError>,
+        ),
+    ) -> Result<bool, SyncError> {
         if retire && !self.native_writer_matches(held) {
             return Err("source retirement requires this account store's writer".into());
         }
@@ -718,6 +895,7 @@ impl Store {
                 StateTarget::Fleet(fleet.0, fleet.1)
             }),
             Some(edit),
+            (None, || Ok(())),
         )
         .map(|(_, changed)| changed)
     }
@@ -731,19 +909,21 @@ impl Store {
         note: &mut Option<String>,
         target: SyncTarget<'_>,
         (retire, edit): (bool, impl FnOnce(&mut State) -> Result<Vec<Event>, String>),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SyncError> {
         self.transact_state_images_held(
             held,
             now,
             note,
             Some(StateTarget::Roster(target, retire)),
-            Some(edit),
+            Some(|state: &mut State| edit(state).map_err(SyncError::from)),
+            (None, || Ok(())),
         )
         .map(|(_, changed)| changed)
     }
 
     /// Roster-only publication retains the exact state without creating a machine
     /// identity or running a state edit. Login records remain read-only as well.
+    #[cfg(test)]
     pub(in crate::harness) fn transact_roster_held(
         &self,
         held: &Lock,
@@ -752,12 +932,42 @@ impl Store {
         target: SyncTarget<'_>,
         retire: bool,
     ) -> Result<bool, String> {
+        self.transact_roster_admitted_held(held, now, note, target, retire, None)
+            .map_err(SyncError::into_message)
+    }
+
+    pub(in crate::harness) fn transact_roster_admitted_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        target: SyncTarget<'_>,
+        retire: bool,
+        source: Option<&super::super::alab_roster::ReceiptGuard>,
+    ) -> Result<bool, SyncError> {
+        self.transact_roster_prepared_held(held, now, note, target, retire, (source, || Ok(())))
+    }
+
+    /// Validate and encode before performing optional local source publication.
+    pub(in crate::harness) fn transact_roster_prepared_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        target: SyncTarget<'_>,
+        retire: bool,
+        (source, auxiliary): (
+            Option<&super::super::alab_roster::ReceiptGuard>,
+            impl FnOnce() -> Result<(), String>,
+        ),
+    ) -> Result<bool, SyncError> {
         self.transact_state_images_held(
             held,
             now,
             note,
             Some(StateTarget::Roster(target, retire)),
-            None::<fn(&mut State) -> Result<Vec<Event>, String>>,
+            None::<fn(&mut State) -> Result<Vec<Event>, SyncError>>,
+            (source, auxiliary),
         )
         .map(|(_, changed)| changed)
     }
@@ -768,8 +978,13 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         target: Option<StateTarget<'_>>,
-        edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, String>>,
-    ) -> Result<(Vec<Event>, bool), String> {
+        edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, SyncError>>,
+        (source, auxiliary): (
+            Option<&super::super::alab_roster::ReceiptGuard>,
+            impl FnOnce() -> Result<(), String>,
+        ),
+    ) -> Result<(Vec<Event>, bool), SyncError> {
+        let materialize = matches!(&target, Some(StateTarget::Roster(..)));
         let retire_legacy = matches!(
             &target,
             Some(StateTarget::RetiringFleet(..) | StateTarget::Roster(_, true))
@@ -877,7 +1092,8 @@ impl Store {
         let policy_changed = source_policy
             .as_ref()
             .is_some_and(|image| image.before != image.after);
-        let plan = Plan {
+        let mut plan = Plan {
+            login_dirs: Vec::new(),
             local_logins: false,
             roster_path: target.as_ref().map(|target| target.roster_name.clone()),
             roster_mode: target.as_ref().and_then(|target| target.roster_mode),
@@ -908,8 +1124,10 @@ impl Store {
             source_policy,
             outbox: None,
         };
-        let changed = plan.images().any(|image| image.before != image.after) || !events.is_empty();
-        self.publish_plan_scoped(
+        if materialize {
+            plan.capture_login_dirs(self)?;
+        }
+        let changed = self.publish_plan_scoped(
             held,
             Scope {
                 roster: target.as_ref().map(|target| target.roster_path.as_path()),
@@ -919,7 +1137,8 @@ impl Store {
             },
             plan,
             &events,
-            || Ok(()),
+            source,
+            auxiliary,
         )?;
         if let Some(notes) = notes {
             super::super::journal::publish(&notes);
@@ -950,13 +1169,16 @@ impl Store {
             note,
             Publication {
                 target: None,
+                directories: LoginDirectories::Preserve,
                 wake: WakeRule::Events,
                 retire_legacy: false,
                 outbox: None,
+                source: None,
             },
-            edit,
+            |state, logins| edit(state, logins).map_err(Into::into),
             || Ok(()),
         )
+        .map_err(SyncError::into_message)
     }
 
     /// Publish account records with the current roster as an unchanged admission image.
@@ -1139,9 +1361,11 @@ impl Store {
                     after: Some(&text),
                     mode,
                 }),
+                directories: LoginDirectories::Preserve,
                 wake,
                 retire_legacy: false,
                 outbox: None,
+                source: None,
             },
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
@@ -1151,6 +1375,7 @@ impl Store {
             || Ok(()),
             native_publication,
         )
+        .map_err(SyncError::into_message)
     }
 
     /// Read an observed usage scope while holding its account writer, without publishing
@@ -1222,30 +1447,34 @@ impl Store {
             .unwrap_or_default();
         let cli = self.cli;
         let mut read_back = None;
-        let events = self.transact_images_held(
-            &held,
-            now,
-            &mut None,
-            Publication {
-                target: target.as_ref().map(|path| SyncTarget {
-                    fleet: None,
-                    path,
-                    before: text.as_deref(),
-                    after: text.as_deref(),
-                    mode: None,
-                }),
-                wake: WakeRule::Events,
-                retire_legacy: false,
-                outbox: None,
-            },
-            |state, logins| {
-                let events = edit(&raw, state, logins)?;
-                super::super::journal::learn(cli, &raw, state);
-                read_back = Some(seen(state));
-                Ok(events)
-            },
-            || Ok(()),
-        )?;
+        let events = self
+            .transact_images_held(
+                &held,
+                now,
+                &mut None,
+                Publication {
+                    target: target.as_ref().map(|path| SyncTarget {
+                        fleet: None,
+                        path,
+                        before: text.as_deref(),
+                        after: text.as_deref(),
+                        mode: None,
+                    }),
+                    directories: LoginDirectories::Preserve,
+                    wake: WakeRule::Events,
+                    retire_legacy: false,
+                    outbox: None,
+                    source: None,
+                },
+                |state, logins| {
+                    let events = edit(&raw, state, logins)?;
+                    super::super::journal::learn(cli, &raw, state);
+                    read_back = Some(seen(state));
+                    Ok(events)
+                },
+                || Ok(()),
+            )
+            .map_err(SyncError::into_message)?;
         let read_back = read_back.ok_or("usage transaction committed without its edit")?;
         Ok((events, read_back))
     }
@@ -1303,9 +1532,12 @@ impl Store {
     pub(in crate::harness) fn check_sync_read_receipt(
         &self,
         before: &Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SyncError> {
         if &self.sync_read_receipt()? != before {
-            return Err("account sync changed during this read; read again".into());
+            return Err(SyncError::retry(
+                Retry::Changed,
+                "account sync changed during this read; read again",
+            ));
         }
         Ok(())
     }
@@ -1332,6 +1564,7 @@ impl Store {
         ladder: &[std::time::Duration],
     ) -> Result<bool, String> {
         self.recover_within(ladder, None, || {})
+            .map_err(SyncError::into_message)
     }
 
     /// Resume a publication at the caller's roster, or state-only fixed store paths.
@@ -1339,7 +1572,7 @@ impl Store {
         &self,
         ladder: &[std::time::Duration],
         roster: &Path,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SyncError> {
         self.recover_within(ladder, Some(roster), || {})
     }
 
@@ -1348,7 +1581,7 @@ impl Store {
         ladder: &[std::time::Duration],
         roster: Option<&Path>,
         after_peek: impl FnOnce(),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SyncError> {
         if self.receipt()?.is_none_or(|receipt| receipt.plan.is_none()) {
             return Ok(false);
         }
@@ -1356,7 +1589,7 @@ impl Store {
         let held = self
             .acquire_within(ladder)
             .map_err(|why| why.to_string())?
-            .ok_or_else(|| LOCK_HELD.to_owned())?;
+            .ok_or_else(|| SyncError::retry(Retry::Busy, LOCK_HELD))?;
         // Another writer may have completed the peeked plan or admitted a new scope.
         let Some(plan) = self.receipt()?.and_then(|receipt| receipt.plan) else {
             return Ok(false);
@@ -1377,8 +1610,10 @@ impl Store {
                 },
                 &mut |_| Ok(()),
             )
+            .map_err(Into::into)
         } else {
             self.recover_sync_at(&held, None, &mut |_| Ok(()))
+                .map_err(Into::into)
         }
     }
 
@@ -1491,6 +1726,14 @@ impl Store {
             }
         }
         progress(0)?;
+        let directories = plan.login_directory_paths(self)?;
+        if !directories.is_empty() {
+            ensure_login_dir(&self.logins_dir())?;
+            for path in &directories {
+                ensure_login_dir(path)?;
+            }
+            durable_ancestry(directories.iter().map(PathBuf::as_path))?;
+        }
         for &(role, ref path) in &paths {
             let image = plan.image(role)?;
             let max = role.limit();
@@ -1583,24 +1826,73 @@ impl Store {
         ),
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, String> {
-        if retire_legacy && !self.native_writer_matches(held) {
-            return Err("source retirement requires this account store's writer".into());
-        }
-        // This path runs no recovery of its own: a pending or damaged receipt refuses it here.
-        self.sync_read_receipt()?;
-        self.transact_images_held(
+        self.transact_sync_publication_held(
             held,
             now,
             note,
             Publication {
                 target: Some(target),
+                directories: LoginDirectories::Preserve,
                 wake: WakeRule::Always,
                 retire_legacy,
                 outbox: None,
+                source: None,
+            },
+            |state, logins| edit(state, logins).map_err(Into::into),
+            auxiliary,
+        )
+        .map_err(SyncError::into_message)
+    }
+
+    /// Plan outside native custody, retain only the receipt under that custody,
+    /// and replay its images after every source guard has been released.
+    pub(in crate::harness) fn transact_sync_source_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        (target, source): (
+            SyncTarget<'_>,
+            Option<&super::super::alab_roster::ReceiptGuard>,
+        ),
+        (retire_legacy, edit): (
+            bool,
+            impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, SyncError>,
+        ),
+        auxiliary: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Vec<Event>, SyncError> {
+        self.transact_sync_publication_held(
+            held,
+            now,
+            note,
+            Publication {
+                target: Some(target),
+                directories: LoginDirectories::Materialize,
+                wake: WakeRule::Always,
+                retire_legacy,
+                outbox: None,
+                source,
             },
             edit,
             auxiliary,
         )
+    }
+
+    fn transact_sync_publication_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        publication: Publication<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, SyncError>,
+        auxiliary: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Vec<Event>, SyncError> {
+        if publication.retire_legacy && !self.native_writer_matches(held) {
+            return Err("source retirement requires this account store's writer".into());
+        }
+        // This path runs no recovery of its own: a pending or damaged receipt refuses it here.
+        self.sync_read_receipt()?;
+        self.transact_images_held(held, now, note, publication, edit, auxiliary)
     }
 
     /// The edit and publication of one transaction, whose caller has seen no pending receipt
@@ -1612,9 +1904,9 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         publication: Publication<'_>,
-        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, SyncError>,
         auxiliary: impl FnOnce() -> Result<(), String>,
-    ) -> Result<Vec<Event>, String> {
+    ) -> Result<Vec<Event>, SyncError> {
         self.transact_images_native_held(
             held,
             now,
@@ -1636,17 +1928,19 @@ impl Store {
         now: i64,
         note: &mut Option<String>,
         publication: Publication<'_>,
-        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, SyncError>,
         auxiliary: impl FnOnce() -> Result<(), String>,
         native_publication: Option<
             impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
         >,
-    ) -> Result<Vec<Event>, String> {
+    ) -> Result<Vec<Event>, SyncError> {
         let Publication {
             target,
+            directories,
             wake,
             retire_legacy,
             outbox,
+            source,
         } = publication;
         let roster = usage_target(target.as_ref().map(|target| target.path))?;
         let fleet = target
@@ -1757,7 +2051,8 @@ impl Store {
         } else {
             old_logins.clone()
         };
-        let plan = Plan {
+        let mut plan = Plan {
+            login_dirs: Vec::new(),
             local_logins: target.is_none(),
             roster_path: roster
                 .as_ref()
@@ -1792,6 +2087,9 @@ impl Store {
             source_policy: self.source_policy_image(retire_legacy, now)?,
             outbox,
         };
+        if matches!(directories, LoginDirectories::Materialize) {
+            plan.capture_login_dirs(self)?;
+        }
         self.publish_plan_scoped(
             held,
             Scope {
@@ -1800,6 +2098,7 @@ impl Store {
             },
             plan,
             &events,
+            source,
             auxiliary,
         )?;
         super::super::journal::publish(&notes);
@@ -1896,34 +2195,51 @@ impl Store {
             &mut None,
             Publication {
                 target: None,
+                directories: LoginDirectories::Preserve,
                 wake: WakeRule::Always,
                 retire_legacy: false,
                 outbox: Some(Image {
                     before,
                     after: Some(after),
                 }),
+                source: None,
             },
-            edit,
+            |state, logins| edit(state, logins).map_err(Into::into),
             || Ok(()),
         )
+        .map_err(SyncError::into_message)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourceReceipt",
+            action = "Publish",
+            project = "aterm_agent::harness::accounts::sync_commit::publication::tests::receipt_transition"
+        )
+    )]
     fn publish_plan_scoped(
         &self,
         held: &Lock,
         scope: Scope<'_>,
         plan: Plan,
         events: &[Event],
+        source: Option<&super::super::alab_roster::ReceiptGuard>,
         auxiliary: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, SyncError> {
         let prepared = PreparedPublication::new(self, held, scope, plan, !events.is_empty())?;
+        let changed = prepared.changes();
         // Neither phase object owns a callback. In particular, persisting an
         // intent cannot replay this auxiliary work while a source guard is held.
         auxiliary()?;
-        if let Some(pending) = prepared.persist()? {
+        let pending = match source {
+            Some(source) => source.with_admitted(|| prepared.persist())?,
+            None => prepared.persist()?,
+        };
+        if let Some(pending) = pending {
             pending.replay()?;
         }
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -2071,3 +2387,15 @@ mod source_policy_tests;
 #[cfg(any(test, debug_assertions))]
 #[allow(dead_code)]
 fn model_fleet_case_selection() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSourceReceipt",
+        action = "Scenario",
+        reason = "The host supplies source changes, save failures and process interruption."
+    )
+)]
+#[cfg(any(test, debug_assertions))]
+#[allow(dead_code)]
+fn model_source_receipt_scenario() {}

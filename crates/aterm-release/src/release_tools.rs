@@ -351,7 +351,7 @@ fn real_directory(path: &Path, what: &str) -> Result<(), String> {
     }
 }
 
-fn set_digest(cutter: &str, verify: &str) -> String {
+pub(crate) fn set_digest(cutter: &str, verify: &str) -> String {
     use aterm_digest::Sha256;
     let mut digest = Sha256::new();
     digest.update(b"aterm release frozen tools v1\0");

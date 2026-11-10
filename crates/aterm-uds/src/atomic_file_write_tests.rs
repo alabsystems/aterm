@@ -3,6 +3,25 @@
 
 use super::*;
 
+#[test]
+fn an_entry_write_keeps_a_real_rename_failure_and_its_destination() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let destination = dir.path().join("checkpoint");
+    std::fs::create_dir(&destination).unwrap();
+    let error =
+        write_entry_flushed(&destination, b"checkpoint", 0o600, Flush::Durable).unwrap_err();
+    let failure = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<WriteFailure>()
+        .unwrap();
+    assert_eq!(failure.operation, "rename to");
+    assert_eq!(failure.path, destination);
+    assert!(failure.error.raw_os_error().is_some());
+    assert!(destination.is_dir());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
 /// Every arm of [`write_flushed`] publishes by its rename: up to the rename `path` holds what it
 /// held and the one temporary beside it every new byte, and after it `path` holds the new bytes
 /// in the write's mode and no temporary is left.
@@ -105,11 +124,15 @@ fn an_entry_flushed_write_refuses_a_directory_it_cannot_flush() {
             let entry = write_entry_flushed(&path, bytes.as_bytes(), 0o600, flush);
             let best = write_flushed(&path, bytes.as_bytes(), 0o600, Some(flush));
             drop(failing);
-            assert_eq!(
-                entry.map_err(|e| e.raw_os_error()),
-                Err(Some(errno)),
-                "{flush:?} {errno}: an entry flush needs its directory's"
-            );
+            let error = entry.unwrap_err();
+            let failure = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<WriteFailure>()
+                .unwrap();
+            assert_eq!(failure.error.raw_os_error(), Some(errno));
+            assert_eq!(failure.path, dir.path());
+            assert_eq!(failure.operation, "flush directory");
             assert_eq!(
                 best.map_err(|e| e.raw_os_error()),
                 if best_effort_fails {

@@ -151,8 +151,7 @@ fn machine_shape() -> String {
             })
     };
     let chip = chip.unwrap_or_else(|| std::env::consts::ARCH.to_string());
-    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
-    format!("{}-{cores}c", slug(&chip))
+    format!("{}-{}c", slug(&chip), aterm_capacity::cores())
 }
 
 /// The CHIP half of a shape — the shape with a trailing `-<n>c` core count removed.

@@ -3459,7 +3459,7 @@ mod tests {
             since_unix: None,
             bytes: 1,
             stopped: false,
-            rss_mb: Some(39_731),
+            footprint_mb: Some(39_731),
             restart: crate::input_stall::Restart::default(),
             act: None,
         }
@@ -3589,7 +3589,7 @@ mod tests {
         assert_eq!(frozen.key, crate::input_stall::episode_key(&fact));
         assert!(
             frozen.what.ends_with(
-                "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB)"
+                "claude is frozen: not reading input since 14:02 (1 B queued, footprint 38.8 GB)"
             ),
             "{}",
             frozen.what

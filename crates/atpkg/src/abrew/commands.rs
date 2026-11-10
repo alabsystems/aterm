@@ -106,13 +106,121 @@ fn to_sentence_or(items: &[String]) -> String {
     }
 }
 
+/// Every tap directory brew sees (`Tap.installed`): any
+/// `Taps/*/*/` directory, hidden entries excluded, no `.git`
+/// requirement (brew suggests from plain directory contents).
+/// Glob (path) order.
+fn tap_dirs(prefix: &Prefix) -> Vec<tap::Tap> {
+    let mut out: Vec<tap::Tap> = Vec::new();
+    let Ok(users) = std::fs::read_dir(prefix.taps_dir()) else {
+        return out;
+    };
+    let mut user_entries: Vec<_> = users.flatten().collect();
+    user_entries.sort_by_key(|e| e.path());
+    for user_entry in user_entries {
+        let Some(user) = user_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if user.starts_with('.') || !user_entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(repos) = std::fs::read_dir(user_entry.path()) else {
+            continue;
+        };
+        let mut repo_entries: Vec<_> = repos.flatten().collect();
+        repo_entries.sort_by_key(|e| e.path());
+        for repo_entry in repo_entries {
+            let Some(dir) = repo_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if dir.starts_with('.') || !repo_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            // Brew downcases tap user/repo in names.
+            let repo = dir.strip_prefix("homebrew-").unwrap_or(&dir).to_lowercase();
+            out.push(tap::Tap {
+                path: repo_entry.path(),
+                user: user.to_lowercase(),
+                repo,
+            });
+        }
+    }
+    out
+}
+
+/// Brew's `Formula.fuzzy_search` dictionary:
+/// `Set.new(Formula.names + Formula.full_names)` — sorted
+/// unique short names (core API + tap leaves), then the
+/// sorted qualified tap names. Directory contents only; tap
+/// trust does not filter names.
+fn fuzzy_dictionary(api: &Api, core_names: &[String]) -> Vec<String> {
+    let mut qualified: Vec<String> = Vec::new();
+    for tap in tap_dirs(api.prefix()) {
+        if (tap.user == "homebrew" && tap.repo == "core")
+            || (tap.user == "homebrew" && tap.repo == "cask")
+        {
+            continue;
+        }
+        for leaf in tap_formula_names(&tap) {
+            qualified.push(format!("{}/{}/{leaf}", tap.user, tap.repo));
+        }
+    }
+    qualified.sort();
+    qualified.dedup();
+    let mut names: Vec<String> = core_names.to_vec();
+    names.extend(
+        qualified
+            .iter()
+            .map(|q| q.rsplit('/').next().unwrap_or(q).to_owned()),
+    );
+    names.sort();
+    names.dedup();
+    names.extend(qualified);
+    names
+}
+
+/// Brew search's cask-token dictionary (`Tap.each` order:
+/// installed tap dirs, the core cask tap's API tokens in its
+/// glob position or appended when its directory is absent;
+/// official non-cask taps contribute leaf tokens, others
+/// qualified), uniquified.
+fn cask_token_dictionary(api: &Api, core_tokens: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut saw_core_cask = false;
+    for tap in tap_dirs(api.prefix()) {
+        if tap.user == "homebrew" && tap.repo == "core" {
+            continue;
+        }
+        if tap.user == "homebrew" && tap.repo == "cask" {
+            saw_core_cask = true;
+            out.extend(core_tokens.iter().cloned());
+            continue;
+        }
+        let official = tap.user.eq_ignore_ascii_case("homebrew");
+        for token in tap_cask_tokens(&tap) {
+            if official {
+                out.push(token);
+            } else {
+                out.push(format!("{}/{}/{token}", tap.user, tap.repo));
+            }
+        }
+    }
+    if !saw_core_cask {
+        out.extend(core_tokens.iter().cloned());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|t| seen.insert(t.clone()));
+    out
+}
+
 /// Brew `FormulaOrCaskUnavailableError#did_you_mean`: empty when
 /// the spell checker finds nothing over the formula names.
 fn did_you_mean(api: &Api, name: &str) -> String {
     let Ok(rows) = api.index(false) else {
         return String::new();
     };
-    let dictionary: Vec<String> = rows.into_iter().map(|(n, _)| n).collect();
+    let core: Vec<String> = rows.into_iter().map(|(n, _)| n).collect();
+    let dictionary = fuzzy_dictionary(api, &core);
     let corrections = spell_correct(&dictionary, name);
     if corrections.is_empty() {
         String::new()
@@ -199,11 +307,20 @@ pub(super) fn foreign_unavailable(
             .taps_dir()
             .join(parts[0])
             .join(format!("homebrew-{}", parts[1]));
+        // Brew's tap error carries the qualified name, and its
+        // did_you_mean fuzzies that full string (so a qualified
+        // suggestion is the usual outcome).
+        let did = did_you_mean(api, name);
+        let suggestion = if did.is_empty() {
+            String::new()
+        } else {
+            format!(" {did}")
+        };
         if tap_dir.is_dir() {
-            format!("No available {noun} with the name \"{name}\".")
+            format!("No available {noun} with the name \"{name}\".{suggestion}")
         } else {
             format!(
-                "No available {noun} with the name \"{name}\".\n\
+                "No available {noun} with the name \"{name}\".{suggestion}\n\
                  This command requires the tap {}/{}.\n\
                  If you trust this tap, tap it explicitly and then try again:\n  \
                  brew tap {}/{}",
@@ -490,6 +607,151 @@ fn levenshtein_distance(s1: &[char], s2: &[char]) -> usize {
     x
 }
 
+/// The index permutation CRuby 4.0's `sort_by` produces for
+/// Float keys: enum.c's uniform introsort
+/// (`rb_uniform_intro_sort_2`), used whenever every key is a
+/// Float/Fixnum. Brew's fuzzy search sorts Jaro-Winkler
+/// distances with it, so its exact tie permutation is part of
+/// brew's suggestion order. Ported line-for-line (Hoare
+/// partition on the med3 value, insertion sort at 16, the
+/// uniform heapsort at the depth limit, sorted-input exit).
+pub(super) fn ruby_uniform_sort_permutation(keys: &[f64]) -> Vec<usize> {
+    // CRuby's uless: rb_float_cmp(a, b) < 0.
+    fn uless(a: f64, b: f64) -> bool {
+        a < b
+    }
+    fn med3_val(a: f64, b: f64, c: f64) -> f64 {
+        if uless(a, b) {
+            if uless(b, c) {
+                b
+            } else if uless(c, a) {
+                a
+            } else {
+                c
+            }
+        } else if uless(c, b) {
+            b
+        } else if uless(a, c) {
+            a
+        } else {
+            c
+        }
+    }
+    fn insertionsort(idx: &mut [usize], keys: &[f64], begin: usize, end: usize) {
+        if end - begin < 2 {
+            return;
+        }
+        for index in begin + 1..end {
+            let tmp = idx[index];
+            let mut j = index;
+            let mut k = index;
+            if uless(keys[tmp], keys[idx[begin]]) {
+                while begin < j {
+                    k -= 1;
+                    idx[j] = idx[k];
+                    j = k;
+                }
+            } else {
+                loop {
+                    k -= 1;
+                    if !uless(keys[tmp], keys[idx[k]]) {
+                        break;
+                    }
+                    idx[j] = idx[k];
+                    j = k;
+                }
+            }
+            idx[j] = tmp;
+        }
+    }
+    fn heap_down(idx: &mut [usize], keys: &[f64], begin: usize, mut offset: usize, len: usize) {
+        let tmp = idx[begin + offset];
+        loop {
+            let mut c = (offset << 1) + 1;
+            if c > len {
+                break;
+            }
+            if c < len && uless(keys[idx[begin + c]], keys[idx[begin + c + 1]]) {
+                c += 1;
+            }
+            if !uless(keys[tmp], keys[idx[begin + c]]) {
+                break;
+            }
+            idx[begin + offset] = idx[begin + c];
+            offset = c;
+        }
+        idx[begin + offset] = tmp;
+    }
+    fn heapsort(idx: &mut [usize], keys: &[f64], begin: usize, end: usize) {
+        let n = end - begin;
+        if n < 2 {
+            return;
+        }
+        let mut offset = n >> 1;
+        while offset > 0 {
+            offset -= 1;
+            heap_down(idx, keys, begin, offset, n - 1);
+        }
+        let mut offset = n - 1;
+        while offset > 0 {
+            idx.swap(begin, begin + offset);
+            offset -= 1;
+            heap_down(idx, keys, begin, 0, offset);
+        }
+    }
+    fn quicksort_intro(idx: &mut [usize], keys: &[f64], begin: usize, end: usize, d: usize) {
+        if end - begin <= 16 {
+            insertionsort(idx, keys, begin, end);
+            return;
+        }
+        if d == 0 {
+            heapsort(idx, keys, begin, end);
+            return;
+        }
+        let x = med3_val(
+            keys[idx[begin]],
+            keys[idx[begin + ((end - begin) >> 1)]],
+            keys[idx[end - 1]],
+        );
+        let mut i = begin as isize;
+        let mut j = end as isize - 1;
+        loop {
+            while uless(keys[idx[i as usize]], x) {
+                i += 1;
+            }
+            while uless(x, keys[idx[j as usize]]) {
+                j -= 1;
+            }
+            if i <= j {
+                idx.swap(i as usize, j as usize);
+                i += 1;
+                j -= 1;
+            }
+            if i > j {
+                break;
+            }
+        }
+        j += 1;
+        if end as isize - j > 1 {
+            quicksort_intro(idx, keys, j as usize, end, d - 1);
+        }
+        if i as usize - begin > 1 {
+            quicksort_intro(idx, keys, begin, i as usize, d - 1);
+        }
+    }
+    let n = keys.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    if n < 2 {
+        return idx;
+    }
+    if keys.windows(2).all(|w| !uless(w[1], w[0])) {
+        return idx;
+    }
+    let d = (usize::BITS - n.leading_zeros() - 1) as usize;
+    quicksort_intro(&mut idx, keys, 0, n, d << 1);
+    idx
+}
+
 /// DidYouMean::SpellChecker#correct over `dictionary`, in the gem's
 /// result order (Jaro-Winkler gate, distance-sorted, then the
 /// mistype/misspell Levenshtein cuts). This is brew's fuzzy search.
@@ -499,21 +761,20 @@ pub(super) fn spell_correct(dictionary: &[String], input: &str) -> Vec<String> {
     }
     let ninput = normalize(input);
     let threshold = if ninput.len() > 3 { 0.834 } else { 0.77 };
-    let mut words: Vec<&String> = dictionary
+    let words: Vec<&String> = dictionary
         .iter()
         .filter(|w| jaro_winkler_distance(&normalize(w), &ninput) >= threshold)
         .filter(|w| w.as_str() != input)
         .collect();
-    // The gem sorts ascending then reverses. Sets and
-    // distance-descending order match brew; inside an exact
-    // Jaro-Winkler tie group brew's order is CRuby's unstable
-    // sort (an artifact of its C qsort), which we do not chase —
-    // a stable sort keeps dictionary order there.
-    words.sort_by(|a, b| {
-        let da = jaro_winkler_distance(&a.chars().collect::<Vec<_>>(), &ninput);
-        let db = jaro_winkler_distance(&b.chars().collect::<Vec<_>>(), &ninput);
-        db.total_cmp(&da)
-    });
+    // The gem sorts ascending (CRuby's uniform introsort,
+    // ties in its exact permutation) then reverses.
+    let keys: Vec<f64> = words
+        .iter()
+        .map(|w| jaro_winkler_distance(&w.chars().collect::<Vec<_>>(), &ninput))
+        .collect();
+    let perm = ruby_uniform_sort_permutation(&keys);
+    let mut words: Vec<&String> = perm.iter().map(|&i| words[i]).collect();
+    words.reverse();
     let mistype = (ninput.len() as f64 * 0.25).ceil() as usize;
     let corrections: Vec<String> = words
         .iter()
@@ -703,37 +964,84 @@ fn tap_migration_reason(prefix: &Prefix, api: &Api, name: &str) -> Option<String
     None
 }
 
-/// Brew's silent `deleted_reason`: only when homebrew/core is
-/// actually cloned in this prefix (API-mode brew finds nothing
-/// either — `Tap.from_path` has no tap on disk).
-fn deleted_reason(prefix: &Prefix, name: &str) -> Option<String> {
-    let tap = tap::list(prefix)
-        .into_iter()
-        .find(|t| t.user == "homebrew" && t.repo == "core")?;
-    let shard = if name.starts_with("lib") {
-        "lib".to_string()
+/// Brew's `deleted_reason`: the tap is the one `Formulary.path`
+/// names (the qualified tap, else homebrew/core), and nothing
+/// happens when that tap is not on disk. Non-silent mode is
+/// `brew info`'s: the searching headline on stdout, the shallow
+/// warning and the not-found `Error:` line on stderr.
+fn deleted_reason_mode(prefix: &Prefix, name: &str, silent: bool) -> Option<String> {
+    let parts: Vec<&str> = name.split('/').collect();
+    let (user, repo, leaf) = if parts.len() == 3 {
+        (
+            parts[0].to_lowercase(),
+            parts[1].to_lowercase(),
+            parts[2].to_lowercase(),
+        )
     } else {
-        name.chars().next()?.to_string()
+        (
+            "homebrew".to_string(),
+            "core".to_string(),
+            Formula::short_name(name).to_lowercase(),
+        )
     };
-    let relative = format!("Formula/{shard}/{name}.rb");
+    let core = user == "homebrew" && repo == "core";
+    let tap = tap_dirs(prefix)
+        .into_iter()
+        .find(|t| t.user == user && t.repo == repo)?;
+    let tap_name = format!("{user}/{repo}");
+    let relative = if core {
+        let shard = if leaf.starts_with("lib") {
+            "lib".to_string()
+        } else {
+            leaf.chars().next()?.to_string()
+        };
+        format!("Formula/{shard}/{leaf}.rb")
+    } else if tap.path.join("Formula").is_dir() {
+        format!("Formula/{leaf}.rb")
+    } else if tap.path.join("HomebrewFormula").is_dir() {
+        format!("HomebrewFormula/{leaf}.rb")
+    } else {
+        format!("{leaf}.rb")
+    };
     if tap.path.join(&relative).is_file() {
         return None;
     }
-    let diff = tap_git(
-        &tap,
-        &[
-            "diff",
-            "--diff-filter=D",
-            "--name-only",
-            "@{1 month ago}",
-            "--",
-            &relative,
-        ],
-    )?;
-    if diff.is_empty() {
-        return None;
+    if !silent {
+        println!(
+            "{}",
+            super::tty::ohai("Searching for a previously deleted formula (in the last month)...")
+        );
+        if tap.path.join(".git/shallow").exists() {
+            super::tty::opoo!(
+                "Warning: {tap_name} is shallow clone. To get its complete history, run:\n  git -C \"$(brew --repo {tap_name})\" fetch --unshallow\n\n"
+            );
+        }
     }
-    let log = tap_git(
+    let not_found = |silent: bool| {
+        if !silent {
+            super::tty::onoe!("Error: No previously deleted formula found.");
+        }
+        None
+    };
+    // The core tap's history is wide; brew pre-checks it with a
+    // diff before the log search other taps go straight to.
+    if core {
+        let diff = tap_git(
+            &tap,
+            &[
+                "diff",
+                "--diff-filter=D",
+                "--name-only",
+                "@{1 month ago}",
+                "--",
+                &relative,
+            ],
+        );
+        if diff.is_none_or(|d| d.is_empty()) {
+            return not_found(silent);
+        }
+    }
+    let Some(log) = tap_git(
         &tap,
         &[
             "log",
@@ -745,7 +1053,9 @@ fn deleted_reason(prefix: &Prefix, name: &str) -> Option<String> {
             "--",
             &relative,
         ],
-    )?;
+    ) else {
+        return not_found(silent);
+    };
     let mut lines = log.lines();
     let _hash = lines.next()?;
     let short_hash = lines.next()?;
@@ -758,7 +1068,11 @@ fn deleted_reason(prefix: &Prefix, name: &str) -> Option<String> {
         .copied()
         .collect::<Vec<_>>()
         .join("\n  ");
-    let issues = "https://github.com/Homebrew/homebrew-core/issues";
+    let issues = if core {
+        "https://github.com/Homebrew/homebrew-core/issues".to_string()
+    } else {
+        format!("https://github.com/{user}/homebrew-{repo}/issues")
+    };
     if let Some(idx) = commit_message.rfind(" (#")
         && commit_message.ends_with(')')
     {
@@ -770,8 +1084,25 @@ fn deleted_reason(prefix: &Prefix, name: &str) -> Option<String> {
             commit_message = format!("{} ({issues}/{num})", &commit_message[..idx]);
         }
     }
+    // Brew also expands `Closes #N` / `Fixes #N` to issue URLs.
+    for verb in ["Closes #", "Fixes #"] {
+        let mut out = String::with_capacity(commit_message.len());
+        let mut rest = commit_message.as_str();
+        while let Some(idx) = rest.find(verb) {
+            let after = &rest[idx + verb.len()..];
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if num.is_empty() {
+                break;
+            }
+            out.push_str(&rest[..idx]);
+            out.push_str(&format!("{} {issues}/{num}", verb.trim_end_matches(" #")));
+            rest = &after[num.len()..];
+        }
+        out.push_str(rest);
+        commit_message = out;
+    }
     Some(format!(
-        "{name} was deleted from homebrew/core in commit {short_hash}:\n  {commit_message}\n\nTo show the formula before removal, run:\n  git -C \"$(brew --repo homebrew/core)\" show {short_hash}^:{relative_found}\n\nIf you still use this formula, consider creating your own tap:\n  https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap\n"
+        "{name} was deleted from {tap_name} in commit {short_hash}:\n  {commit_message}\n\nTo show the formula before removal, run:\n  git -C \"$(brew --repo {tap_name})\" show {short_hash}^:{relative_found}\n\nIf you still use this formula, consider creating your own tap:\n  https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap\n"
     ))
 }
 
@@ -780,7 +1111,31 @@ fn deleted_reason(prefix: &Prefix, name: &str) -> Option<String> {
 fn missing_formula_reason(prefix: &Prefix, api: &Api, query: &str) -> Option<String> {
     disallowed_reason(&query.to_lowercase())
         .or_else(|| tap_migration_reason(prefix, api, query))
-        .or_else(|| deleted_reason(prefix, query))
+        .or_else(|| deleted_reason_mode(prefix, query, true))
+}
+
+/// `brew info`'s MissingFormula reason (`show_info: true`): the
+/// same chain, with the deleted-formula search narrating.
+/// Brew's cask_reason arm would load and print the same-named
+/// cask's info, but a name reaches here only when cask
+/// resolution already failed, so that arm finds nothing either.
+fn missing_formula_reason_verbose(prefix: &Prefix, api: &Api, name: &str) -> Option<String> {
+    disallowed_reason(&name.to_lowercase())
+        .or_else(|| tap_migration_reason(prefix, api, name))
+        .or_else(|| deleted_reason_mode(prefix, name, false))
+}
+
+/// Brew info prints the reason after the unavailable error via
+/// `$stderr.puts reason` (no extra newline when the text ends
+/// with one).
+fn info_missing_reason(prefix: &Prefix, api: &Api, name: &str) {
+    if let Some(reason) = missing_formula_reason_verbose(prefix, api, name) {
+        if reason.ends_with('\n') {
+            eprint!("{reason}");
+        } else {
+            eprintln!("{reason}");
+        }
+    }
 }
 
 enum SearchMode {
@@ -942,7 +1297,8 @@ fn collect_name_hits(
             if let SearchMode::Text(q) = &mode {
                 // Brew's fuzzy dictionary is names + full names —
                 // canonical names only, never aliases.
-                let dictionary: Vec<String> = formula_rows.iter().map(|r| r.name.clone()).collect();
+                let core: Vec<String> = formula_rows.iter().map(|r| r.name.clone()).collect();
+                let dictionary = fuzzy_dictionary(api, &core);
                 for correction in spell_correct(&dictionary, q) {
                     if let Some(row) = by_name_f.get(correction.as_str())
                         && !results.iter().any(|r| r.0 == row.name)
@@ -975,7 +1331,8 @@ fn collect_name_hits(
                 }
             }
             if let SearchMode::Text(q) = &mode {
-                let dictionary: Vec<String> = cask_rows.iter().map(|r| r.name.clone()).collect();
+                let core_tokens: Vec<String> = cask_rows.iter().map(|r| r.name.clone()).collect();
+                let dictionary = cask_token_dictionary(api, &core_tokens);
                 for correction in spell_correct(&dictionary, q) {
                     if let Some(row) = cask_rows.iter().find(|r| r.name == correction)
                         && !results.iter().any(|r| r.name == row.name)
@@ -4582,6 +4939,7 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                             has_flag(rest, "--formula", "")
                         )
                     );
+                    info_missing_reason(prefix, api, name);
                     failures += 1;
                 }
             }
@@ -4631,14 +4989,36 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                 None => {
                     if has_flag(rest, "--formula", "") {
                         super::tty::onoe!("Error: {}", formula_unavailable(api, name));
+                        info_missing_reason(prefix, api, Formula::short_name(name));
                         failures += 1;
                         continue;
                     }
                     if name.contains('/') && !name.starts_with("homebrew/cask/") {
-                        if !printed {
-                            return not_native(prefix, args, "info (unresolved name)");
+                        // Brew reports qualified misses as tap
+                        // errors (three segments) or by leaf (the
+                        // two-segment shorthand); path-like shapes
+                        // keep the unresolved refusal.
+                        let segs: Vec<&str> = name.split('/').collect();
+                        let plain = segs.iter().all(|s| !s.is_empty() && !s.starts_with('.'));
+                        if segs.len() == 3 && plain {
+                            super::tty::onoe!(
+                                "Error: {}",
+                                foreign_unavailable(prefix, api, name, false, false)
+                            );
+                            info_missing_reason(prefix, api, name);
+                        } else if segs.len() == 2 && plain {
+                            super::tty::onoe!(
+                                "Error: {}",
+                                formula_unavailable(api, Formula::short_name(name))
+                            );
+                            info_missing_reason(prefix, api, Formula::short_name(name));
+                        } else {
+                            if !printed {
+                                return not_native(prefix, args, "info (unresolved name)");
+                            }
+                            super::tty::onoe!("Error: {}", formula_unavailable(api, name));
+                            info_missing_reason(prefix, api, Formula::short_name(name));
                         }
-                        super::tty::onoe!("Error: {}", formula_unavailable(api, name));
                         failures += 1;
                         continue;
                     }
@@ -4654,7 +5034,16 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                             printed = true;
                         }
                         Err(_) => {
-                            super::tty::onoe!("Error: {}", formula_unavailable(api, name));
+                            if name.starts_with("homebrew/cask/") && name.split('/').count() == 3 {
+                                super::tty::onoe!(
+                                    "Error: {}",
+                                    foreign_unavailable(prefix, api, name, false, false)
+                                );
+                                info_missing_reason(prefix, api, name);
+                            } else {
+                                super::tty::onoe!("Error: {}", formula_unavailable(api, name));
+                                info_missing_reason(prefix, api, Formula::short_name(name));
+                            }
                             failures += 1;
                         }
                     }
@@ -5098,7 +5487,14 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 continue;
             }
             if want_formula {
-                return failed(&format!("Error: {}", formula_unavailable(api, err_name)));
+                return failed(&format!(
+                    "Error: {}",
+                    if foreign {
+                        foreign_unavailable(prefix, api, &name, false, true)
+                    } else {
+                        formula_unavailable(api, err_name)
+                    }
+                ));
             }
         }
         if !want_formula {
@@ -5129,7 +5525,16 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
                 return failed(&format!("Error: {}", cask_unavailable(short)));
             }
         }
-        return failed(&format!("Error: {}", formula_unavailable(api, err_name)));
+        // A foreign miss with both kinds in play is brew's
+        // formula-or-cask tap error, not the formula one.
+        return failed(&format!(
+            "Error: {}",
+            if foreign {
+                foreign_unavailable(prefix, api, &name, false, false)
+            } else {
+                formula_unavailable(api, err_name)
+            }
+        ));
     }
     lines.sort_by(|a, b| a.0.cmp(&b.0));
     lines.dedup_by(|a, b| a.0 == b.0);
@@ -6064,7 +6469,7 @@ fn brew_config(prefix: &Prefix) -> String {
         }
     }
     let machine = super::machine::Machine::this();
-    let cores = std::thread::available_parallelism().map_or(0, |n| n.get());
+    let cores = aterm_capacity::cores();
     out.push_str(&format!("CPU: {cores}-core 64-bit {}\n", machine.arch()));
     let describe = |label: &str, parsed: Option<String>, path: Option<String>| match (parsed, path)
     {
@@ -6417,6 +6822,7 @@ const DOCTOR_CHECKS: &[&str] = &[
     "check_for_symlinked_cellar",
     "check_for_tap_ruby_files_locations",
     "check_for_unlinked_but_not_keg_only",
+    "check_for_unreadable_installed_formula",
     "check_for_unnecessary_cask_tap",
     "check_for_unnecessary_core_tap",
     "check_for_unsupported_macos",
@@ -7570,6 +7976,85 @@ fn portable_ruby_path(prefix: &Prefix) -> String {
     vendor.join("current/bin/ruby").display().to_string()
 }
 
+/// brew `Formulary.class_s`.
+fn formula_class_s(name: &str) -> String {
+    let lowered = name.to_lowercase();
+    let mut out: Vec<char> = Vec::new();
+    let mut upcase_next = true;
+    for ch in lowered.chars() {
+        if matches!(ch, '-' | '_' | '.') || ch.is_whitespace() {
+            upcase_next = true;
+            continue;
+        }
+        if upcase_next {
+            out.extend(ch.to_uppercase());
+            upcase_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    let mut class_name: String = out
+        .into_iter()
+        .map(|c| if c == '+' { 'x' } else { c })
+        .collect();
+    if let Some(at) = class_name.find('@')
+        && at > 0
+        && class_name[at + 1..].starts_with(|c: char| c.is_ascii_digit())
+    {
+        class_name.replace_range(at..at + 1, "AT");
+    }
+    class_name
+}
+
+/// Class constants a .rb file defines at line starts:
+/// (all `class X`, those declared `< Formula`), last
+/// `::` segment each, like brew's `format_list`.
+fn rb_class_constants(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut all: Vec<String> = Vec::new();
+    let mut formulae: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("class ") else {
+            continue;
+        };
+        let token: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        if token.is_empty() {
+            continue;
+        }
+        let short = token.rsplit("::").next().unwrap_or(&token).to_string();
+        let derived = rest[token.len()..]
+            .trim_start()
+            .strip_prefix('<')
+            .is_some_and(|superclass| {
+                superclass
+                    .trim_start()
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .next()
+                    == Some("Formula")
+            });
+        if !all.contains(&short) {
+            all.push(short.clone());
+        }
+        if derived && !formulae.contains(&short) {
+            formulae.push(short);
+        }
+    }
+    (all, formulae)
+}
+
+/// Whether the .rb file at `path` (aliases followed) defines
+/// the formula class brew's loader expects for `name`.
+fn rb_defines_formula_class(path: &std::path::Path, name: &str) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&resolved, 1024 * 1024) else {
+        return false;
+    };
+    let (_, formulae) = rb_class_constants(&text);
+    formulae.contains(&formula_class_s(name))
+}
+
 /// brew `Utils::Text.to_sentence`.
 fn utils_text_to_sentence(values: &[&str]) -> String {
     match values {
@@ -8421,9 +8906,7 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
                     Some(d) => Some(d),
                     None => {
                         if tap::lookup(prefix, name).is_none() {
-                            return failed(&format!(
-                                "Error: No available formula with the name \"{name}\"."
-                            ));
+                            return failed(&format!("Error: {}", formula_unavailable(api, name)));
                         }
                         None
                     }
@@ -10536,6 +11019,94 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                             "Homebrew could not find a working {tool} after refreshing its cached selection.\nMinimum required version: {minimum}\nInitial executable: {initial}\n"
                         )));
                     }
+                }
+            }
+            "check_for_unreadable_installed_formula" => {
+                // Data-only mirror of brew's Formulary.from_rack
+                // fallbacks: a keg is unreadable when no tap/API
+                // definition yields its expected formula class
+                // and the keg's own .brew copy doesn't either.
+                // Unavailable formulae (deleted) and untrusted
+                // taps are ignored, as brew's rescues ignore
+                // them. Ruby syntax errors inside an otherwise
+                // class-correct file are not detectable without
+                // evaluating Ruby.
+                let taps = super::tap::list(prefix);
+                let mut errors: Vec<String> = Vec::new();
+                for inst in &formulae {
+                    let full = prefix.full_name(inst);
+                    let tap_of = full.rsplit_once('/').map(|(tap, _)| tap.to_string());
+                    if let Some(tap_name) = &tap_of
+                        && !tap_name.to_lowercase().starts_with("homebrew/")
+                        && !super::trust::trusted(prefix, super::trust::TrustType::Formula, &full)
+                    {
+                        continue;
+                    }
+                    let own_tap_file = tap_of.as_ref().and_then(|tap_name| {
+                        taps.iter()
+                            .find(|t| t.name().eq_ignore_ascii_case(tap_name))
+                            .and_then(|t| super::tap::formula_file(t, &inst.name))
+                    });
+                    let mut readable = own_tap_file
+                        .as_ref()
+                        .is_some_and(|file| rb_defines_formula_class(file, &inst.name));
+                    if !readable
+                        && tap_of
+                            .as_deref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case("homebrew/core"))
+                    {
+                        readable = formula_rows
+                            .as_ref()
+                            .is_some_and(|rows| rows.iter().any(|r| r.name == inst.name));
+                    }
+                    if !readable {
+                        readable = taps.iter().any(|tap| {
+                            super::tap::formula_file(tap, &inst.name)
+                                .is_some_and(|file| rb_defines_formula_class(&file, &inst.name))
+                        });
+                    }
+                    if readable {
+                        continue;
+                    }
+                    let brew_rb = prefix
+                        .keg(&inst.name, &inst.version)
+                        .join(format!(".brew/{}.rb", inst.name));
+                    if !brew_rb.exists() {
+                        continue;
+                    }
+                    if rb_defines_formula_class(&brew_rb, &inst.name) {
+                        continue;
+                    }
+                    let resolved =
+                        std::fs::canonicalize(&brew_rb).unwrap_or_else(|_| brew_rb.clone());
+                    let text =
+                        crate::metadata_io::read_bounded_regular_utf8(&resolved, 1024 * 1024)
+                            .unwrap_or_default();
+                    let (all, formula_classes) = rb_class_constants(&text);
+                    let class_list = if all.is_empty() {
+                        "found no classes".to_string()
+                    } else if formula_classes.is_empty() {
+                        format!("only found: {} (not derived from Formula!)", all.join(", "))
+                    } else {
+                        format!("only found: {}", formula_classes.join(", "))
+                    };
+                    errors.push(format!(
+                        "{}\nIn formula file: {}\nExpected to find class {}, but {}.",
+                        formula_unavailable(api, &inst.name),
+                        brew_rb.display(),
+                        formula_class_s(&inst.name),
+                        class_list
+                    ));
+                }
+                if !errors.is_empty() {
+                    let listed: Vec<String> =
+                        errors.iter().map(|error| format!("{error}\n")).collect();
+                    let mut finding = DoctorFinding::new(append_indented_list(
+                        &listed,
+                        "Some installed formulae are not readable:\n",
+                    ));
+                    finding.affects = errors;
+                    findings.push(finding);
                 }
             }
             "check_user_path_1"
@@ -16294,12 +16865,8 @@ const fn unpin_outcome(pinned: bool, installed: bool, definitively_unknown: bool
 }
 
 pub(super) fn cmd_unpin(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
-    if operands(rest).is_empty() {
-        eprintln!(
-            "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
-        );
-        return ExitCode::from(1);
-    }
+    // Admission enforces brew's min-1 named args; a direct
+    // caller with none simply does nothing.
     let mut failures = 0;
     for name in operands(rest) {
         let short_owned = canonical_installed_name(prefix, api, Formula::short_name(&name), false);
@@ -22572,6 +23139,18 @@ fn bundle_computed_env(
     {
         env.insert("HOMEBREW_PATH".to_string(), path.clone());
     }
+    // The active prefix is abrew's own identity, not a caller
+    // setting: a stale inherited HOMEBREW_PREFIX (for example
+    // from a real-brew shellenv in the parent shell) must not
+    // leak into the child.
+    env.insert(
+        "HOMEBREW_PREFIX".to_string(),
+        prefix.root.display().to_string(),
+    );
+    env.insert(
+        "HOMEBREW_CELLAR".to_string(),
+        prefix.cellar().display().to_string(),
+    );
     if no_secrets {
         let sensitive = |k: &str| {
             let k = k.to_ascii_lowercase();
@@ -25259,6 +25838,285 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_dictionary_includes_tap_directory_names() {
+        // Brew's fuzzy dictionary is Set(names + full_names):
+        // sorted short names (core + tap leaves), then sorted
+        // qualified tap names — plain tap directories count,
+        // no .git, no trust gate.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let probe = p
+            .taps_dir()
+            .join("ProbeUser")
+            .join("homebrew-probe")
+            .join("Formula");
+        std::fs::create_dir_all(&probe).expect("mkdir");
+        std::fs::write(probe.join("custool.rb"), "# f\n").expect("write");
+        std::fs::write(probe.join("wget.rb"), "# f\n").expect("write");
+        let api = Api::read_only(p.clone());
+        let core = vec!["wget".to_string(), "cuetools".to_string()];
+        let dict = fuzzy_dictionary(&api, &core);
+        assert_eq!(
+            dict,
+            [
+                "cuetools",
+                "custool",
+                "wget",
+                "probeuser/probe/custool",
+                "probeuser/probe/wget"
+            ]
+        );
+        assert_eq!(spell_correct(&dict, "custol"), ["custool"]);
+        // Cask token dictionary: tap tokens qualified, core
+        // tokens appended when no core cask dir exists.
+        let casks = p
+            .taps_dir()
+            .join("ProbeUser")
+            .join("homebrew-probe")
+            .join("Casks");
+        std::fs::create_dir_all(&casks).expect("mkdir");
+        std::fs::write(casks.join("custapp.rb"), "# c\n").expect("write");
+        let dict = cask_token_dictionary(&api, &["caffeine".to_string()]);
+        assert_eq!(dict, ["probeuser/probe/custapp", "caffeine"]);
+    }
+
+    #[test]
+    fn spell_correct_tie_order_matches_cruby_uniform_sort() {
+        // Gate sets and outcomes measured from brew's own Ruby
+        // (DidYouMean::SpellChecker over the live dictionary);
+        // the tie order is CRuby 4.0's uniform introsort.
+        let dict: Vec<String> = [
+            "mpi4py",
+            "optipng",
+            "pbzip2",
+            "pcp",
+            "periphery",
+            "php",
+            "pick",
+            "pict",
+            "pie",
+            "pig",
+            "pigz",
+            "pike",
+            "pint",
+            "pip-audit",
+            "pip-completion",
+            "pip-tools",
+            "pipdeptree",
+            "pipe-rename",
+            "pipebench",
+            "pipelight",
+            "pipemeter",
+            "pipenv",
+            "pipes-sh",
+            "pipet",
+            "pipewire",
+            "pipewire-gstreamer",
+            "pipgrip",
+            "pipx",
+            "pit",
+            "pius",
+            "pivy",
+            "pixd",
+            "pixi",
+            "pixi-pack",
+            "pixz",
+            "pop",
+            "prips",
+            "pup",
+            "pyp",
+            "sip",
+            "spiped",
+            "vip",
+            "xpipe",
+            "zip",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            spell_correct(&dict, "pip"),
+            [
+                "pipx", "pit", "pie", "pig", "pop", "pup", "pcp", "pyp", "php", "sip", "vip", "zip"
+            ]
+        );
+        let dict: Vec<String> = [
+            "gfxutil", "gputils", "gti", "guile", "gut", "psutils", "suil",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            spell_correct(&dict, "gsutil"),
+            ["suil", "gputils", "gfxutil", "psutils"]
+        );
+        // Tie-heavy key batteries: the raw permutation must
+        // match Ruby's sort_by index for index.
+        let keys = [
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(0),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(0),
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(0),
+            f64::from_bits(0),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(0),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(0),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(0),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(0),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(0),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(0),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4603804719079489536),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(0),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(4593671619917905920),
+            f64::from_bits(0),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4604930618986332160),
+            f64::from_bits(4602678819172646912),
+            f64::from_bits(4598175219545276416),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(4600427019358961664),
+            f64::from_bits(4606056518893174784),
+            f64::from_bits(0),
+        ];
+        assert_eq!(
+            ruby_uniform_sort_permutation(&keys),
+            [
+                67, 71, 17, 77, 53, 33, 87, 34, 90, 51, 37, 4, 99, 35, 38, 31, 39, 25, 47, 61, 42,
+                21, 72, 74, 6, 89, 80, 84, 88, 44, 1, 3, 95, 92, 85, 30, 55, 28, 56, 26, 24, 57,
+                97, 46, 45, 0, 18, 20, 94, 9, 86, 78, 15, 16, 73, 69, 40, 64, 58, 48, 49, 50, 54,
+                43, 5, 10, 11, 82, 14, 52, 75, 41, 62, 70, 66, 63, 8, 91, 7, 93, 83, 22, 79, 68, 2,
+                32, 60, 96, 98, 59, 23, 65, 12, 13, 81, 27, 36, 76, 29, 19
+            ]
+        );
+        let keys = [
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(0),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(4611686018427387904),
+            f64::from_bits(4611686018427387904),
+            f64::from_bits(0),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(0),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(0),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(4611686018427387904),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(0),
+            f64::from_bits(0),
+            f64::from_bits(0),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(0),
+            f64::from_bits(4611686018427387904),
+            f64::from_bits(0),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(0),
+            f64::from_bits(4613937818241073152),
+            f64::from_bits(0),
+            f64::from_bits(4607182418800017408),
+            f64::from_bits(0),
+            f64::from_bits(0),
+            f64::from_bits(4616189618054758400),
+            f64::from_bits(4616189618054758400),
+        ];
+        assert_eq!(
+            ruby_uniform_sort_permutation(&keys),
+            [
+                34, 20, 21, 22, 14, 36, 12, 37, 10, 24, 6, 26, 32, 7, 5, 27, 29, 1, 35, 25, 16, 9,
+                8, 17, 15, 23, 3, 33, 2, 30, 31, 38, 39, 28, 19, 18, 13, 11, 4, 0
+            ]
+        );
+    }
+
+    #[test]
     fn spell_correct_matches_did_you_mean() {
         let dict: Vec<String> = ["zsxd", "zstd", "firefox", "firefly", "hello"]
             .iter()
@@ -25318,6 +26176,49 @@ mod tests {
              You can access it again by running:\n  brew tap homebrew/cask\n\
              And then you can install it by running:\n  brew install --cask newthing\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_reason_reads_core_tap_history() {
+        // A core tap whose history deletes a formula inside the
+        // last month: brew's deleted_reason quotes the commit.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let tap_dir = p.taps_dir().join("homebrew").join("homebrew-core");
+        std::fs::create_dir_all(tap_dir.join("Formula/o")).expect("mkdir");
+        let run = |args: &[&str]| {
+            let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+                .arg("-C")
+                .arg(&tap_dir)
+                .args(["-c", "user.email=a@b.c", "-c", "user.name=A"])
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(tap_dir.join("Formula/o/oldgone.rb"), "# f\n").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "-qm", "oldgone 1.0"]);
+        // A still-present formula never gets a deleted reason.
+        assert!(deleted_reason_mode(&p, "oldgone", true).is_none());
+        run(&["rm", "-q", "Formula/o/oldgone.rb"]);
+        run(&["commit", "-qm", "oldgone: remove formula"]);
+        let reason = deleted_reason_mode(&p, "oldgone", true).expect("deleted reason");
+        assert!(
+            reason.contains("oldgone was deleted from homebrew/core in commit "),
+            "{reason}"
+        );
+        assert!(reason.contains("oldgone: remove formula"), "{reason}");
+        assert!(
+            reason.contains("git -C \"$(brew --repo homebrew/core)\" show "),
+            "{reason}"
+        );
+        assert!(reason.contains(":Formula/o/oldgone.rb"), "{reason}");
+        // Unknown name: no deletion in the window, no reason.
+        assert!(deleted_reason_mode(&p, "neverwas", true).is_none());
     }
 
     #[cfg(unix)]
@@ -25637,6 +26538,19 @@ mod tests {
     }
 
     #[test]
+    fn formula_class_s_and_rb_class_scan() {
+        assert_eq!(super::formula_class_s("toolx"), "Toolx");
+        assert_eq!(super::formula_class_s("openssl@3"), "OpensslAT3");
+        assert_eq!(super::formula_class_s("gtk+"), "Gtkx");
+        assert_eq!(super::formula_class_s("foo-bar_baz.qux"), "FooBarBazQux");
+        let (all, formulae) = super::rb_class_constants(
+            "class WrongName < Formula\nend\nclass Helper\nend\nclass Ns::Deep < Formula\nend\n",
+        );
+        assert_eq!(all, ["WrongName", "Helper", "Deep"]);
+        assert_eq!(formulae, ["WrongName", "Deep"]);
+    }
+
+    #[test]
     fn bundle_exec_invocation_and_computed_env_are_separate() {
         let rest = vec![
             "exec".to_string(),
@@ -25671,6 +26585,14 @@ mod tests {
             assert_eq!(computed.env.get("HOMEBREW_PATH"), Some(path));
         }
         assert!(computed.env.get("PATH").is_some_and(|p| !p.is_empty()));
+        assert_eq!(
+            computed.env.get("HOMEBREW_PREFIX").map(String::as_str),
+            Some(prefix.root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            computed.env.get("HOMEBREW_CELLAR").map(String::as_str),
+            Some(prefix.cellar().to_string_lossy().as_ref())
+        );
 
         let mut shell_env = std::collections::BTreeMap::new();
         shell_env.insert("SHELL".to_string(), "/bin/sh".to_string());

@@ -5,6 +5,8 @@ use std::cell::{Cell, RefCell};
 
 use super::*;
 
+// accounts::Lock::drop explicitly unlocks the open file description, so these
+// release assertions remain immediate even if a forked child inherited its FD.
 pub(crate) fn lock_transition(
     state: &aterm_spec::interp::State,
     action: &str,

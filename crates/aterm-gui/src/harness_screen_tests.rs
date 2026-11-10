@@ -101,31 +101,6 @@ fn lan_instances_sort_numbered_macs_first_by_number() {
     assert_eq!(names, ["m1x", "M2", "m10", "guest", "Zulu"]);
 }
 
-/// The local fallback's load is `vm.loadavg`'s three figures in hundredths, rounded, braces
-/// apart or not; two figures are no load.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_local_fallback_reads_vm_loadavgs_three_loads() {
-    assert_eq!(
-        parse_loadavg_gui("{ 0.996 0.50 2.00 }\n"),
-        Some([100, 50, 200])
-    );
-    assert_eq!(parse_loadavg_gui("{1.23 0.50 2.00}"), Some([123, 50, 200]));
-    assert_eq!(parse_loadavg_gui("{ 1.0 2.0 }"), None);
-}
-
-/// The local fallback's uptime starts at `kern.boottime`'s `sec`, past the space `sysctl` writes
-/// after its `=`, and never at its `usec`.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_local_fallback_boots_at_kern_boottimes_sec() {
-    assert_eq!(
-        boot_secs("{ sec = 1792080066, usec = 752372 } Thu Oct 15 09:01:06 2026\n"),
-        Some(1_792_080_066)
-    );
-    assert_eq!(boot_secs("garbage"), None);
-}
-
 /// A Bonjour instance becomes a LAN row only when it is not this Mac, no swarm host by either
 /// name, and no computer listed already by either name or host stem; the local row lists
 /// nothing.
@@ -4146,10 +4121,7 @@ fn the_harness_reading_asks_nothing_of_the_fleet() {
         before,
         "the Harness page's reading sweeps nothing"
     );
-    let fleet = FleetAsk {
-        fleet: true,
-        local_vitals: true,
-    };
+    let fleet = FleetAsk { fleet: true };
     read(&FleetSlot::new(fleet));
     assert_eq!(
         sweeps(),
@@ -4179,16 +4151,6 @@ fn the_harness_reading_asks_nothing_of_the_fleet() {
     assert!(app.tabs_page_shown());
     app.start_harness_stats_refresh();
     assert_eq!(app.harness_screen.last_fleet_ask, Some(fleet));
-    app.vitals.snapshot = Some(std::sync::Arc::new(aterm_vitals::model::Snapshot::default()));
-    app.start_harness_stats_refresh();
-    assert_eq!(
-        app.harness_screen.last_fleet_ask,
-        Some(FleetAsk {
-            fleet: true,
-            local_vitals: false,
-        }),
-        "VitalsHost's snapshot is this Mac's vitals"
-    );
 }
 
 #[test]
@@ -4225,10 +4187,7 @@ fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
     };
     let mut app = App::headless_for_test();
     assert!(app.open_harness_settings(wid, HarnessFocus::Top));
-    app.harness_screen.reading = FleetAsk {
-        fleet: true,
-        local_vitals: false,
-    };
+    app.harness_screen.reading = FleetAsk { fleet: true };
     land(&mut app, report("sibling/1"));
     assert_eq!(siblings(&app), Some(vec!["sibling/1".to_string()]));
     app.start_harness_stats_refresh();
@@ -4244,10 +4203,7 @@ fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
         app.harness_screen.readings_asked, asked,
         "CONTROL: Tab Control not shown, nothing more asked"
     );
-    let swept = FleetAsk {
-        fleet: true,
-        local_vitals: true,
-    };
+    let swept = FleetAsk { fleet: true };
     app.start_harness_stats_refresh();
     app.harness_screen.stats.collecting = true;
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
@@ -5206,7 +5162,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         (Some(1), None)
     );
 
-    let hello = r#"{"os_version":"27.0","vitals":{"cpu_busy_pct":12,"cpu_cores":18},"sessions":[{"instance_pid":71,"local_id":2,"sid":"owned-sid","program":"codex","agent":"busy","task":"owned task"},{"instance_pid":72,"local_id":3,"program":"bash"}]}"#;
+    let hello = r#"{"os_version":"27.0","vitals":{"cpu_cores":18,"load_avg_100":[250,300,400]},"sessions":[{"instance_pid":71,"local_id":2,"sid":"owned-sid","program":"codex","agent":"busy","task":"owned task"},{"instance_pid":72,"local_id":3,"program":"bash"}]}"#;
     let (cached, host_tabs) = parsed(hello);
     let mut merged = rows.clone();
     let mut tabs = Vec::new();
@@ -5238,7 +5194,12 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         ),
         (Some(2), Some(2), Some(1), Some(1))
     );
-    assert!(member.vitals.contains("CPU 12%") && member.vitals.contains(&rows[0].vitals));
+    assert!(
+        member.vitals.contains("CPU 18c \u{b7} load 2.50/3.00/4.00")
+            && member.vitals.contains(&rows[0].vitals),
+        "{}",
+        member.vitals
+    );
     assert_eq!(tabs.len(), 2);
     assert!(
         tabs.iter()

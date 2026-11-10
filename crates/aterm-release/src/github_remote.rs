@@ -363,6 +363,13 @@ impl Remote {
     /// that exact commit, then record only the owned remote-tracking ref.
     pub(crate) fn fetch_origin(&self) -> Result<FetchedOrigin, String> {
         let before = self.tracking_main()?;
+        let observed = self.observe_origin()?;
+        self.record_main(before.as_deref(), &observed.main)?;
+        Ok(observed)
+    }
+
+    /// Import the observed main and tags without changing any local reference.
+    pub(crate) fn observe_origin(&self) -> Result<FetchedOrigin, String> {
         let main = self
             .get("refs/heads/main")?
             .ok_or("the authenticated origin has no main branch")?;
@@ -372,7 +379,6 @@ impl Remote {
         self.import_snapshot(std::iter::once(main.clone()).chain(tags.values().cloned()))?;
         self.require_commit(&main)?;
         let tags = self.peel_tags(tags)?;
-        self.record_main(before.as_deref(), &main)?;
         Ok(FetchedOrigin {
             main,
             tags: render_tags(tags),

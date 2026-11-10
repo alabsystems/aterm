@@ -18,7 +18,8 @@ pub struct HostFacts {
     pub model: String,
     /// The CPU's brand (`Apple M4 Max`); `-` where unread.
     pub cpu: String,
-    /// Logical cores.
+    /// The machine's logical cores (`aterm_sysprobe::cpu_layout`), not this process's
+    /// parallelism, which an affinity mask or a cgroup quota narrows; 0 where unread.
     pub cores: u32,
     /// Physical memory, MiB (0 where unread).
     pub mem_mib: u64,
@@ -39,10 +40,7 @@ impl HostFacts {
                 .map_or_else(|| "-".to_owned(), |h| host_word(&h)),
             model: aterm_sysprobe::machine_model().unwrap_or_else(|| "-".to_owned()),
             cpu: words.cpu.unwrap_or_else(|| "-".to_owned()),
-            cores: std::thread::available_parallelism()
-                .ok()
-                .and_then(|n| u32::try_from(n.get()).ok())
-                .unwrap_or(0),
+            cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores()).unwrap_or(u32::MAX),
             mem_mib: aterm_sysprobe::physical_memory_mib().unwrap_or(0),
             os: words.os.unwrap_or_else(|| "-".to_owned()),
             aterm: aterm_stamp::build_id(),

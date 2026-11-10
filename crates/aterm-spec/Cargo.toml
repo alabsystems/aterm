@@ -36,6 +36,10 @@ aterm-tempfile.workspace = true
 # `getpwuid_r`, which a test process cannot move the way it moves `$HOME`.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# `host::oversubscribed` reads the machine's load and logical cores (`load_average`,
+# `cpu_layout`), the one reader of each. Workspace crate; aterm-uds depends on it already, so it
+# is no new edge, and its own dependency on this crate is dev-only.
+aterm-sysprobe.workspace = true
 
 # Descriptor-backed pool identity uses Windows' 128-bit FILE_ID_INFO through the shared dirfd
 # boundary instead of unstable std metadata extensions.

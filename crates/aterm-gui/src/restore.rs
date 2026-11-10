@@ -1442,6 +1442,7 @@ impl RestoredSplitTree {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn depth(&self) -> usize {
         match self {
             Self::Leaf { .. } => 1,
@@ -1469,23 +1470,35 @@ impl RestoredSplitTree {
         }
     }
 
-    fn shape_is_bounded(&self) -> bool {
-        self.leaf_count() <= MAX_LEAVES_PER_TAB
-            && self.depth() <= MAX_SPLIT_DEPTH
-            && match self {
-                Self::Leaf { view } => view.bounded(),
-                Self::Split {
-                    ratio,
-                    first,
-                    second,
-                    ..
-                } => {
-                    ratio.is_finite()
-                        && (0.05..=0.95).contains(ratio)
-                        && first.shape_is_bounded()
-                        && second.shape_is_bounded()
-                }
+    fn bounded_shape(&self, remaining_depth: usize, remaining_leaves: &mut usize) -> bool {
+        if remaining_depth == 0 {
+            return false;
+        }
+        match self {
+            Self::Leaf { view } => {
+                let Some(next) = remaining_leaves.checked_sub(1) else {
+                    return false;
+                };
+                *remaining_leaves = next;
+                view.bounded()
             }
+            Self::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                ratio.is_finite()
+                    && (0.05..=0.95).contains(ratio)
+                    && first.bounded_shape(remaining_depth - 1, remaining_leaves)
+                    && second.bounded_shape(remaining_depth - 1, remaining_leaves)
+            }
+        }
+    }
+
+    fn shape_is_bounded(&self) -> bool {
+        let mut remaining_leaves = MAX_LEAVES_PER_TAB;
+        self.bounded_shape(MAX_SPLIT_DEPTH, &mut remaining_leaves)
     }
 
     fn retire_unhanded_terminals(&mut self, unhanded: &[u64]) {
@@ -1951,46 +1964,49 @@ impl WindowLayout {
             .find(|tab| tab.root.first_terminal_leaf().is_some())
     }
 
-    /// Validated canonical order.
-    pub(crate) fn canonical_order(&self) -> Option<Vec<TabOrderEntry>> {
+    /// Whether [`Self::tab_order`] is a valid canonical permutation of `tabs` and `native_tabs`.
+    fn canonical_order_is_valid(&self) -> bool {
         if self.tab_order.is_empty() {
-            return self.native_tabs.is_empty().then(|| {
-                (0..self.tabs.len())
-                    .map(|index| TabOrderEntry::Terminal { index })
-                    .collect()
-            });
+            return self.native_tabs.is_empty();
         }
         if self.tab_order.len() != self.tabs.len().saturating_add(self.native_tabs.len()) {
-            return None;
+            return false;
         }
-        let mut terminals = vec![false; self.tabs.len()];
-        let mut natives = vec![false; self.native_tabs.len()];
         let mut next_terminal = 0usize;
         let mut next_native = 0usize;
         for entry in &self.tab_order {
-            let (seen, index) = match *entry {
+            match *entry {
                 TabOrderEntry::Terminal { index } => {
                     if index != next_terminal {
-                        return None;
+                        return false;
                     }
                     next_terminal = next_terminal.saturating_add(1);
-                    (&mut terminals, index)
                 }
                 TabOrderEntry::Native { index } => {
                     if index != next_native {
-                        return None;
+                        return false;
                     }
                     next_native = next_native.saturating_add(1);
-                    (&mut natives, index)
                 }
-            };
-            let slot = seen.get_mut(index)?;
-            if std::mem::replace(slot, true) {
-                return None;
             }
         }
-        (terminals.into_iter().all(|seen| seen) && natives.into_iter().all(|seen| seen))
-            .then(|| self.tab_order.clone())
+        next_terminal == self.tabs.len() && next_native == self.native_tabs.len()
+    }
+
+    /// Validated canonical order.
+    pub(crate) fn canonical_order(&self) -> Option<Vec<TabOrderEntry>> {
+        if !self.canonical_order_is_valid() {
+            return None;
+        }
+        if self.tab_order.is_empty() {
+            Some(
+                (0..self.tabs.len())
+                    .map(|index| TabOrderEntry::Terminal { index })
+                    .collect(),
+            )
+        } else {
+            Some(self.tab_order.clone())
+        }
     }
 
     /// Active canonical index, migrating the legacy terminal projection when needed.
@@ -2022,7 +2038,7 @@ impl WindowLayout {
                 .iter()
                 .all(NativeTabRestore::shape_is_valid)
             && native_mirror_is_valid
-            && self.canonical_order().is_some()
+            && self.canonical_order_is_valid()
             && self.active_item.is_none_or(|index| index < canonical_count)
             && self.restored_tabs.iter().all(RestoredTab::shape_is_valid)
     }
@@ -2100,18 +2116,27 @@ impl WindowLayout {
         if !self.restored_tabs.is_empty() {
             return Some(());
         }
-        let order = self.canonical_order()?;
-        self.restored_tabs = order
-            .iter()
-            .map(|entry| match *entry {
-                TabOrderEntry::Terminal { index } => {
-                    RestoredTab::from_legacy_terminal(self.tabs.get(index)?)
-                }
-                TabOrderEntry::Native { index } => {
-                    RestoredTab::from_legacy_native(self.native_tabs.get(index)?)
-                }
-            })
-            .collect::<Option<Vec<_>>>()?;
+        if !self.canonical_order_is_valid() {
+            return None;
+        }
+        self.restored_tabs = if self.tab_order.is_empty() {
+            self.tabs
+                .iter()
+                .map(RestoredTab::from_legacy_terminal)
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            self.tab_order
+                .iter()
+                .map(|entry| match *entry {
+                    TabOrderEntry::Terminal { index } => {
+                        RestoredTab::from_legacy_terminal(self.tabs.get(index)?)
+                    }
+                    TabOrderEntry::Native { index } => {
+                        RestoredTab::from_legacy_native(self.native_tabs.get(index)?)
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
         Some(())
     }
 }
@@ -2307,11 +2332,13 @@ impl RestoreManifest {
                 let spilled = MAX_TABS_PER_WINDOW..MAX_TABS_PER_WINDOW + count;
                 let at = self.windows[host].restored_tabs.len();
                 let front = self.windows[donor].active_item;
-                let tabs = self.windows[donor]
+                let [donor_win, host_win] = self
+                    .windows
+                    .get_disjoint_mut([donor, host])
+                    .expect("spill_host_for never returns donor");
+                host_win
                     .restored_tabs
-                    .drain(spilled.clone())
-                    .collect::<Vec<_>>();
-                self.windows[host].restored_tabs.extend(tabs);
+                    .extend(donor_win.restored_tabs.drain(spilled.clone()));
                 match front {
                     Some(active) if spilled.contains(&active) => {
                         self.windows[donor].active_item = Some(MAX_TABS_PER_WINDOW - 1);

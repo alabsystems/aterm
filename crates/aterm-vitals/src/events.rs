@@ -243,7 +243,7 @@ impl Detector {
             self.thermal = Some(t);
         }
         if let Some(v) = s.volume.as_ref().filter(|v| v.total > 0) {
-            let free = v.available;
+            let free = v.free;
             let below = [
                 free.saturating_mul(10) < v.total,
                 free.saturating_mul(20) < v.total,
@@ -596,7 +596,7 @@ mod tests {
             s.volume = Some(VolumeSample {
                 total: 100_000_000_000,
                 free: available,
-                available,
+                reserved: 0,
                 mount: "/".into(),
             });
             s

@@ -263,7 +263,7 @@ fn example_b_a_calm_mac_is_two_lines() {
     assert_eq!(
         why("why", &c),
         "OK 4 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
-why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · available not reported · 128 GiB total, pressure normal; swap 0; no cause open
+why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · 108.0 GiB available · 128 GiB total, pressure normal; swap 0; no cause open
 you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
 CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
 OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit

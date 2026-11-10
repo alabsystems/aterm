@@ -127,15 +127,19 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
     };
     let sync = || {
         alab_roster::with_lab(lab.clone(), || {
-            let fleet = alab_roster::fleet_for(&lab, Cli::Claude, Some(&existing)).unwrap();
-            persist_accounts_sync(
-                &store,
+            let admission = AutomaticSource::capture_requested(&config_beside(&roster_path))?
+                .with_policy(store.source_policy()?, false);
+            let fleet = admission
+                .chosen(Cli::Claude, &roster_path, None)?
+                .ok_or("the native test source is missing")?;
+            persist_accounts_sync_with_pool(
+                (&store, &SourceProtection::default()),
                 &roster_path,
-                (&fleet, OptIn::Named),
+                (&fleet, OptIn::Named, None),
                 (test_machine("m22").key.as_str(), Some(&email("ann"))),
                 &BTreeMap::new(),
                 NOW,
-                (&[], &[]),
+                (&[], &[], Some(&admission)),
             )
         })
     };
@@ -497,6 +501,7 @@ impl Bed {
                 },
             )
         })
+        .map_err(SyncError::into_message)
     }
 
     fn roster(&self) -> Roster {

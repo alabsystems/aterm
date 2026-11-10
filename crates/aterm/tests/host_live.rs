@@ -2426,6 +2426,7 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
          start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
+         [ -t 0 ] && while [ -e \"$tmp/hold-registration-$VERSION\" ]; do sleep 0.05; done\n\
          mkdir -p \"$HOME/.claude/sessions\" \"$HOME/.claude/projects/-w\"\n\
          T=\"$HOME/.claude/projects/-w/$sid.jsonl\"\n\
          {ask}\n\
@@ -2436,7 +2437,6 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
          > \"$HOME/.claude/sessions/$$.json\"\n\
          trap 'rm -f \"$HOME/.claude/sessions/$$.json\"; exit 0' TERM\n\
          stty -echo -icanon min 1 time 0 2>/dev/null\n\
-         [ -t 0 ] && while [ -e \"$tmp/hold-idle-$VERSION\" ]; do sleep 0.05; done\n\
          W=$(stty size 2>/dev/null | cut -d' ' -f2); [ -n \"$W\" ] || W=200\n\
          W=$((W - 1))\n\
          r=$(grep -n '^❯' \"$tmp/sc/idle.txt\" | tail -n 1 | cut -d: -f1)\n\
@@ -3146,6 +3146,10 @@ fn a_fresh_session_behind(
         ["2.1.281 --model opus"],
         "{first:?}"
     );
+    // Keep registration pending before publication can wake the upgrader. An
+    // already-idle record would let the bounded first-idle wait finish before
+    // this test observes the restart's hand, even while the fake cannot read.
+    std::fs::write(inst.tmp.join("hold-registration-2.1.282"), "").expect("the gate");
     land(&inst, &newer);
     inst
 }
@@ -3198,8 +3202,7 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     let sel = format!("@{}", inst.sid);
     let pwned = inst.tmp.join("work/pwned");
     let prompt = format!("Fix the parser; touch {}", pwned.display());
-    let gate = inst.tmp.join("hold-idle-2.1.282");
-    std::fs::write(&gate, "").expect("the gate");
+    let gate = inst.tmp.join("hold-registration-2.1.282");
     let hand_on =
         |s: &String| field(s, "hand").is_some_and(|h| h.starts_with("lease:aterm-harness@"));
     let st = upgrade_until(&inst, Instant::now(), || status(&inst), hand_on);

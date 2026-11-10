@@ -634,6 +634,25 @@ pub struct KeyboardMapChange {
     pub user: Option<Vec<(i64, i64)>>,
 }
 
+/// One look at this machine, read in this process with no child process: what `hello`'s vitals
+/// map ([`crate::facts::gather_vitals`]). Each OS reading is taken once, so every figure a hello
+/// carries from one of them comes from the same moment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MachineReading {
+    /// The logical cores ([`aterm_sysprobe::cpu_layout`]); `None` where the layout reads none.
+    pub cores: Option<u32>,
+    /// The 1-, 5- and 15-minute load averages ([`aterm_sysprobe::load_average`]).
+    pub load: Option<[f64; 3]>,
+    /// The memory classes ([`aterm_sysprobe::memory_detail`]): total, available, used, wired,
+    /// compressed, swap and pressure.
+    pub memory: Option<aterm_sysprobe::MemoryDetail>,
+    /// The GPU ([`aterm_sysprobe::gpu`]): its device utilization, name and core count.
+    pub gpu: Option<aterm_sysprobe::GpuReading>,
+    /// The volume holding the account's home, placed as admission places it
+    /// ([`aterm_capacity::reading::volume_of`]); `None` where no home was given or it is unread.
+    pub volume: Option<aterm_sysprobe::volumes::Reading>,
+}
+
 /// A passive read of one keyboard service. An unreadable filter stays unknown rather
 /// than becoming an empty mapping or evidence that an earlier activation still holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1388,6 +1407,13 @@ pub trait System: Sync {
     /// The volume holding `path`, with the free space the window's disk watch holds it to
     /// ([`aterm_capacity::reading::Volume`]), or `None` where it cannot be read.
     fn volume(&self, _path: &Path) -> Option<aterm_capacity::reading::Volume> {
+        None
+    }
+
+    /// This machine now ([`MachineReading`]), its volume the one holding `home` (`None`: no
+    /// volume); `None` where this system reads no machine, as a test's does unless it sets one.
+    fn machine_reading(&self, home: Option<&Path>) -> Option<MachineReading> {
+        let _ = home;
         None
     }
 
@@ -2859,6 +2885,21 @@ impl System for Live {
         aterm_capacity::reading::Reading::now(path).volume
     }
 
+    fn machine_reading(&self, home: Option<&Path>) -> Option<MachineReading> {
+        let memory = aterm_sysprobe::memory_detail();
+        Some(MachineReading {
+            cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
+                .ok()
+                .filter(|n| *n > 0),
+            load: aterm_sysprobe::load_average(),
+            memory,
+            gpu: aterm_sysprobe::gpu(),
+            volume: home.and_then(|home| {
+                aterm_capacity::reading::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
+            }),
+        })
+    }
+
     fn running_app(&self) -> Option<PathBuf> {
         let exe = self.canonicalize(&self.agent_exe).ok()?;
         exe.ancestors()
@@ -3216,6 +3257,12 @@ mod fake {
         /// What [`System::volume`] answers for every path: `None`, unread, unless a test sets
         /// it.
         pub volume: Option<aterm_capacity::reading::Volume>,
+        /// What [`System::machine_reading`] answers: `None`, unread, unless a test sets it; asked
+        /// for no home, its volume left out, as the live system reads none.
+        pub machine: Option<super::MachineReading>,
+        /// The home each [`System::machine_reading`] call asked about, in order
+        /// ([`Fake::machine_homes`]).
+        machine_homes: Mutex<Vec<Option<PathBuf>>>,
         /// What [`System::awake_ms`] answers ([`Fake::awake_at`]): `None`, no awake clock,
         /// unless a test sets it.
         awake: Mutex<Option<u64>>,
@@ -3726,6 +3773,12 @@ mod fake {
         ) -> &Self {
             *self.model.lock().unwrap() = Some(Arc::new(model));
             self
+        }
+
+        /// The home each [`System::machine_reading`] call asked about, in order (`None`: no
+        /// home).
+        pub fn machine_homes(&self) -> Vec<Option<PathBuf>> {
+            self.machine_homes.lock().unwrap().clone()
         }
 
         /// Answer [`System::identity`] as `user`'s login on an arm64 Mac running macOS 27.0.
@@ -4583,6 +4636,19 @@ mod fake {
 
         fn volume(&self, _path: &Path) -> Option<aterm_capacity::reading::Volume> {
             self.volume.clone()
+        }
+
+        fn machine_reading(&self, home: Option<&Path>) -> Option<super::MachineReading> {
+            self.machine_homes
+                .lock()
+                .unwrap()
+                .push(home.map(Path::to_path_buf));
+            self.machine.clone().map(|mut reading| {
+                if home.is_none() {
+                    reading.volume = None;
+                }
+                reading
+            })
         }
 
         fn running_app(&self) -> Option<PathBuf> {
@@ -6084,6 +6150,25 @@ mod tests {
         assert_eq!(cmd.display(), "SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -l");
         assert!(!cmd.display().contains("agent-secret"));
         assert!(!format!("{cmd:?}").contains("agent-secret"), "{cmd:?}");
+    }
+
+    /// The live system reads this machine in process: its logical cores, and the volume holding
+    /// the home it is given, never smaller than what is free on it. CONTROL: asked for no home,
+    /// it reads no volume.
+    #[test]
+    fn the_live_system_reads_this_machine_and_the_homes_volume() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let live = Live::new();
+        let reading = live
+            .machine_reading(Some(home.path()))
+            .expect("the live system reads the machine");
+        assert!(reading.cores.is_some_and(|n| n > 0), "{reading:?}");
+        let volume = reading.volume.expect("the home's volume");
+        assert!(
+            volume.total > 0 && volume.total >= volume.free,
+            "{volume:?}"
+        );
+        assert_eq!(live.machine_reading(None).and_then(|r| r.volume), None);
     }
 
     #[test]

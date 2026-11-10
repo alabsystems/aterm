@@ -43,7 +43,67 @@ pub fn write_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Option<Flush>)
 /// As [`write`]; and the directory's flush after the rename failed or is unavailable here: `path`
 /// holds `bytes`, but its entry may not survive a power loss.
 pub fn write_entry_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Flush) -> io::Result<()> {
-    write_landing(path, bytes, mode, || Ok(()), Some(flush), Flush::dir)?
+    let (_, landed) = write_captured_context(
+        path,
+        mode,
+        |writer| writer.write_all(bytes),
+        |_| Ok(()),
+        || Ok(()),
+        WriteFlush {
+            mode: Some(flush),
+            diagnose: true,
+        },
+        |flush, dir| {
+            flush
+                .dir_diagnosed(dir)
+                .map_err(|error| write_error("flush directory", dir, error))
+        },
+    )
+    .map_err(WriteFailure::into_io)?;
+    landed
+}
+
+#[derive(Debug)]
+struct WriteFailure {
+    operation: &'static str,
+    path: PathBuf,
+    error: io::Error,
+}
+
+fn write_context(operation: &'static str, path: &Path, error: io::Error) -> WriteFailure {
+    WriteFailure {
+        operation,
+        path: path.into(),
+        error,
+    }
+}
+
+pub(crate) fn write_error(operation: &'static str, path: &Path, error: io::Error) -> io::Error {
+    write_context(operation, path, error).into_io()
+}
+
+impl WriteFailure {
+    fn into_io(self) -> io::Error {
+        io::Error::new(self.error.kind(), self)
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.operation,
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for WriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// Produce a file atomically, with the same permissions and durability as [`write`].
@@ -202,34 +262,72 @@ pub(super) fn write_captured_landing<T>(
     flush: Option<Flush>,
     flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
 ) -> io::Result<(T, Landed)> {
+    write_captured_context(
+        path,
+        mode,
+        produce,
+        capture,
+        check,
+        WriteFlush {
+            mode: flush,
+            diagnose: false,
+        },
+        flush_dir,
+    )
+    .map_err(|failure| failure.error)
+}
+
+struct WriteFlush {
+    mode: Option<Flush>,
+    diagnose: bool,
+}
+
+fn write_captured_context<T>(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+    capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
+    check: impl FnOnce() -> io::Result<()>,
+    flush: WriteFlush,
+    flush_dir: impl FnOnce(Flush, &Path) -> io::Result<()>,
+) -> Result<(T, Landed), WriteFailure> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| write_context("create directory", parent, e))?;
     }
-    let (tmp, file) = create_temp_beside(path, mode)?;
+    let (tmp, file) = create_temp_beside(path, mode)
+        .map_err(|e| write_context("create temporary beside", path, e))?;
     let mut temporary = Temporary {
         path: tmp,
         armed: true,
     };
     let mut file = file;
-    produce(&mut file)?;
+    let context = |operation, error| write_context(operation, &temporary.path, error);
+    produce(&mut file).map_err(|e| context("write", e))?;
     #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+        .map_err(|e| context("fchmod", e))?;
     #[cfg(windows)]
     let _ = mode;
-    if let Some(flush) = flush {
-        flush.file(&file)?;
+    if let Some(mode) = flush.mode {
+        let result = if flush.diagnose {
+            mode.file_diagnosed(&file)
+        } else {
+            mode.file(&file)
+        };
+        result.map_err(|e| context("flush file", e))?;
     }
-    let captured = capture(&file)?;
+    let captured = capture(&file).map_err(|e| context("capture metadata", e))?;
     drop(file);
-    check()?;
+    check().map_err(|e| context("check before rename", e))?;
     #[cfg(any(test, debug_assertions))]
     if let Some(error) = publication_seam::failure() {
-        return Err(error);
+        return Err(context("rename", error));
     }
-    std::fs::rename(&temporary.path, path)?;
+    std::fs::rename(&temporary.path, path).map_err(|e| write_context("rename to", path, e))?;
     // The old temporary name is free after the rename; do not remove a later user's file.
     temporary.armed = false;
-    let Some(flush) = flush else {
+    let Some(flush) = flush.mode else {
         return Ok((captured, Ok(())));
     };
     let dir = match path.parent() {

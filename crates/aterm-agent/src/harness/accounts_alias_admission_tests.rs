@@ -241,6 +241,7 @@ fn represented_sync(
                 replanned = true;
             },
         )
+        .map_err(SyncError::into_message)
     } else {
         bed.sync(Cli::Codex, None)
     };

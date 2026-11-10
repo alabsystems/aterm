@@ -849,7 +849,8 @@ pub fn cmd_services(prefix: &Prefix, rest: &[String]) -> ExitCode {
             let known = api.formula(name).is_ok() || tap::lookup(prefix, name).is_some();
             if !known {
                 return super::failed(&format!(
-                    "Error: No available formula with the name \"{name}\"."
+                    "Error: {}",
+                    super::commands::formula_unavailable(&api, name)
                 ));
             }
             targets.push((name.clone(), raw_service_of(&api, name)));

@@ -441,3 +441,121 @@ fn a_read_dated_in_the_future_is_read_again() {
     );
     assert_eq!(read.repos.len(), 1);
 }
+
+/// A [`read_home_in`] pass resolves `remote.origin.url` + `core.excludesFile` in one `git config`
+/// call, resolves `HEAD` + `origin/HEAD` + `origin/main` + `origin/master` in one `git
+/// for-each-ref` call, skips `rev-list --count` when `HEAD == main_head`, and passes the known
+/// `.git/index` path to [`work_status_in`]: a warm up-to-date checkout spawns 5 `git` processes
+/// instead of 11 (`103` vs `221` across the 21-checkout fixture).
+#[test]
+fn home_repos_pass_avoids_redundant_git_spawns_across_checkouts() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    for idx in 0..18 {
+        let name = format!("repo-{idx:02}");
+        let dir = clone_at(&home, &name, &format!("https://github.com/acme/{name}.git"));
+        let head = scratch_git(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        scratch_git(&dir, &["update-ref", "refs/remotes/origin/main", &head]);
+        scratch_git(
+            &dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+    let lagging = clone_at(&home, "lagging", "https://github.com/acme/lagging.git");
+    let first = scratch_git(&lagging, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    std::fs::write(lagging.join("a.txt"), "two\n").expect("a.txt");
+    scratch_git(&lagging, &["commit", "-q", "-am", "two"]);
+    let second = scratch_git(&lagging, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    scratch_git(
+        &lagging,
+        &["update-ref", "refs/remotes/origin/main", &second],
+    );
+    scratch_git(&lagging, &["reset", "-q", "--hard", &first]);
+    std::fs::write(lagging.join("dirty.txt"), "new\n").expect("dirty");
+    clone_at(&home, "unpushed", "https://github.com/acme/unpushed.git");
+    clone_at(&home, "non-matching", "https://github.com/acme/other.git");
+
+    let table = aterm_sysprobe::volumes::table();
+    // First pass warms the refreshed private index copies (`private_index`).
+    let (warmed, cold_starts) =
+        read_home_in_counted(&home, &table, PROBE_LIMIT, &|| false).expect("cold pass");
+    assert_eq!(warmed.repos.len(), 20);
+    assert_eq!(warmed.named("repo-00").and_then(|r| r.behind), Some(0));
+    assert_eq!(warmed.named("lagging").and_then(|r| r.behind), Some(1));
+    assert_eq!(warmed.named("lagging").and_then(|r| r.dirty), Some(true));
+    assert_eq!(warmed.named("unpushed").and_then(|r| r.behind), None);
+    assert_eq!(
+        cold_starts, 123,
+        "cold pass spawns 123 git processes (down from 241)"
+    );
+
+    for _ in 0..3 {
+        let (found, warm_starts) =
+            read_home_in_counted(&home, &table, PROBE_LIMIT, &|| false).expect("warm pass");
+        assert_eq!(found.repos, warmed.repos);
+        assert_eq!(
+            warm_starts, 103,
+            "warm pass spawns 103 git processes across 21 checkouts (down from 221)"
+        );
+    }
+
+    // Edge cases: detached HEAD, custom `origin/HEAD -> refs/remotes/origin/trunk`, and a
+    // repository-local `core.excludesFile` (caught by `local_config` so `work_status_in` skips
+    // `global_excludes` and honours the repository's own exclude file).
+    let edge_home = tmp.path().join("edge-home");
+    std::fs::create_dir_all(&edge_home).expect("edge-home");
+    let custom = clone_at(&edge_home, "custom", "https://github.com/acme/custom.git");
+    let custom_head = scratch_git(&custom, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    scratch_git(
+        &custom,
+        &["update-ref", "refs/remotes/origin/trunk", &custom_head],
+    );
+    scratch_git(
+        &custom,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    );
+    scratch_git(&custom, &["checkout", "-q", "--detach", &custom_head]);
+    let exclude_file = tmp.path().join("custom.exclude");
+    std::fs::write(&exclude_file, "*.ignored\n").expect("exclude");
+    std::fs::write(custom.join("secret.ignored"), "ignored\n").expect("secret");
+    scratch_git(
+        &custom,
+        &[
+            "config",
+            "core.excludesFile",
+            &exclude_file.display().to_string(),
+        ],
+    );
+    let _ = read_home_in_counted(&edge_home, &table, PROBE_LIMIT, &|| false).expect("edge cold");
+    let (edge, edge_warm_starts) =
+        read_home_in_counted(&edge_home, &table, PROBE_LIMIT, &|| false).expect("edge warm");
+    let repo = edge.named("custom").expect("custom repo");
+    assert_eq!(repo.head.as_deref(), Some(custom_head.as_str()));
+    assert_eq!(repo.branch, None, "detached HEAD reports no branch");
+    assert_eq!(repo.main_ref.as_deref(), Some("origin/trunk"));
+    assert_eq!(repo.behind, Some(0));
+    assert_eq!(
+        repo.dirty,
+        Some(false),
+        "repository-local core.excludesFile ignores secret.ignored"
+    );
+    assert_eq!(
+        edge_warm_starts, 6,
+        "--version + local_config + symbolic-ref + for-each-ref + rev-parse HEAD + status (global_excludes skipped)"
+    );
+}

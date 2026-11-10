@@ -540,10 +540,8 @@ pub type Measure = Box<dyn FnMut(&dyn Fn() -> bool) -> u64 + Send>;
 /// [`EVERY`] (longer after a long walk, [`RESTS`]), tells its claim what they grew by
 /// ([`Claim::wrote`]), so a waiter counts only the rest of the run's need as reserved, and keeps
 /// the most they held, which [`Self::finish`] returns as the run's [`Footprint`]. The run's end
-/// walks nothing more where a sample completed: it halts a walk under way, whose partial count is
-/// discarded, and keeps the most the completed samples read. A run that ended before any sample
-/// completed (under [`EVERY`], or halted in its first walk) is measured once at its end, so its
-/// growth is what it wrote, not 0.
+/// halts a walk under way, discards its partial count, and measures once more before releasing
+/// the claim. Writes after the last periodic sample must count too.
 pub struct Meter {
     start: u64,
     /// The tag of the directories it measures ([`Footprint::dirs`]).
@@ -605,20 +603,17 @@ impl Meter {
         let (stop, stopped) = mpsc::channel::<()>();
         let theirs = Arc::clone(&shared);
         let flag = Arc::clone(&halted);
-        let keep = move |now: Option<u64>| {
+        let keep = move |now: u64| {
             let mut s = theirs.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(now) = now {
-                s.peak = s.peak.max(now);
-                if let Some(claim) = s.claim.as_mut() {
-                    let _ = claim.wrote(now.saturating_sub(start));
-                }
+            s.peak = s.peak.max(now);
+            if let Some(claim) = s.claim.as_mut() {
+                let _ = claim.wrote(now.saturating_sub(start));
             }
             s.peak
         };
         let thread = std::thread::Builder::new()
             .name("capacity-meter".to_owned())
             .spawn(move || {
-                let mut sampled = false;
                 let mut rest = every;
                 while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(rest) {
                     let began = std::time::Instant::now();
@@ -627,14 +622,9 @@ impl Meter {
                         break;
                     }
                     rest = every.max(began.elapsed().saturating_mul(RESTS));
-                    keep(Some(now));
-                    sampled = true;
+                    keep(now);
                 }
-                if sampled {
-                    keep(None)
-                } else {
-                    keep(Some(measure(&|| false)))
-                }
+                keep(measure(&|| false))
             })
             .ok();
         Meter {
@@ -655,7 +645,7 @@ impl Meter {
     }
 
     /// End the run: let its claim go, and return what it took, tagged with the directories it
-    /// measured and what it built there. It walks them only where no sample completed.
+    /// measured and what it built there, including a final complete measurement.
     #[must_use]
     pub fn finish(self) -> Footprint {
         self.finish_emptying(|| {})
@@ -680,7 +670,7 @@ impl Meter {
     }
 
     /// Halt a walk under way and stop the thread: the most the directories held, as the
-    /// completed samples read it, or, with none, as one last look reads it, and the claim, which
+    /// completed samples and one last look read it, and the claim, which
     /// goes once the caller drops it.
     fn halt_holding(&mut self) -> (u64, Option<Claim>) {
         self.halted.store(true, Ordering::SeqCst);

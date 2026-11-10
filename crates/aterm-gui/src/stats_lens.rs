@@ -3988,7 +3988,7 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         None => vec![format!("as of {at}")],
     };
     let explainer = "Heat is how much memory is in use: apps, wired and compressed. Available \
-                     is free memory plus reclaimable file cache; unclassified memory is excluded."
+                     is what the system can hand out without swapping."
         .to_owned();
     let now = snap.at_unix_ms;
     let (vals, peaks, heat) = hour_columns(&c.view(Resource::Memory), now, 1_073_741_824.0);
@@ -4052,25 +4052,17 @@ fn memory_capacity_section(c: Ctx<'_>) -> Section<'_> {
     };
     let sample = m.sample;
     let line = words::memory_space_line(&sample);
-    let available = sample
-        .available()
-        .map_or_else(|| "not reported".into(), words::gib_figure);
     let short = format!(
         "{} used · {} available · {} total GiB",
         words::gib_figure(sample.used()),
-        available,
+        words::gib_figure(sample.available),
         words::gib_total(sample.total)
     );
     let rows = [
         format!("Used {} GiB", words::gib_figure(sample.used())),
-        sample.available().map_or_else(
-            || "Available not reported".into(),
-            |bytes| {
-                format!(
-                    "Available {} GiB (free + file cache)",
-                    words::gib_figure(bytes)
-                )
-            },
+        format!(
+            "Available {} GiB (without swapping)",
+            words::gib_figure(sample.available)
         ),
         format!("Total {} GiB", words::gib_total(sample.total)),
     ];

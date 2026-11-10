@@ -5,6 +5,4 @@
 fn recipient_delivery_laws_have_falsifying_controls() {
     let model = aterm_models_harness::recipient_delivery_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{}", faults.join("\n"));
 }

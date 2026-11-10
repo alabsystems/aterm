@@ -111,7 +111,8 @@ impl Store {
         };
         let snapshot = self.source_policy_unfenced()?;
         if fenced {
-            self.check_sync_read_receipt(&receipt)?;
+            self.check_sync_read_receipt(&receipt)
+                .map_err(crate::harness::account_sync_error::SyncError::into_message)?;
         }
         Ok(snapshot)
     }

@@ -240,7 +240,6 @@ fn native_migration_keeps_quota_walls_and_reports_hold_and_order_changes() {
             ..lab_account("bob", "claude-bob", &[("m22", Some(1))])
         }],
     );
-    let fleet = alab_roster::fleet_for(&lab, Cli::Claude, Some(&bed.roster())).unwrap();
     let walls = BTreeMap::from([(
         "legacy".to_owned(),
         upgrade::StandingWall {
@@ -250,15 +249,22 @@ fn native_migration_keeps_quota_walls_and_reports_hold_and_order_changes() {
             credits: None,
         },
     )]);
-    let result = persist_accounts_sync(
-        &bed.store,
-        &bed.roster,
-        (&fleet, OptIn::Named),
-        (fleet.alab.as_ref().unwrap().key.as_str(), None),
-        &walls,
-        NOW,
-        (&[], &[]),
-    )
+    let result = alab_roster::with_lab(lab, || {
+        let admission = AutomaticSource::capture_requested(bed.env.config.as_ref().unwrap())?
+            .with_policy(bed.store.source_policy()?, false);
+        let fleet = admission
+            .chosen(Cli::Claude, &bed.roster, None)?
+            .ok_or("the native test source is missing")?;
+        persist_accounts_sync_with_pool(
+            (&bed.store, &SourceProtection::default()),
+            &bed.roster,
+            (&fleet, OptIn::Named, None),
+            (fleet.alab.as_ref().unwrap().key.as_str(), None),
+            &walls,
+            NOW,
+            (&[], &[], Some(&admission)),
+        )
+    })
     .unwrap();
     let (state, _) = bed.store.load(NOW).unwrap();
     assert_eq!(

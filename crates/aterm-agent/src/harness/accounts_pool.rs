@@ -1306,13 +1306,17 @@ fn pool_read_using<T>(
 ) -> Result<T, String> {
     let store = seat.store(cli);
     let path = seat.config_dir.join(cli.accounts().roster_file);
-    store.recover_sync_within(&accounts::LOCK_LADDER, &path)?;
+    store
+        .recover_sync_within(&accounts::LOCK_LADDER, &path)
+        .map_err(super::account_sync_error::SyncError::into_message)?;
     // Even an empty roster may be an image of an interrupted pool creation. Keep this
     // no-lock fast path only across one completed receipt; a healthy empty pool still
     // needs no state directory, snapshot reads or usage polling.
     let empty = store.sync_read_receipt().and_then(|receipt| {
         let raw = read_roster()?;
-        store.check_sync_read_receipt(&receipt)?;
+        store
+            .check_sync_read_receipt(&receipt)
+            .map_err(super::account_sync_error::SyncError::into_message)?;
         Ok(raw.rows.is_empty().then_some(raw))
     });
     // A concurrent commit can invalidate the bracket. Resolve it once under the
