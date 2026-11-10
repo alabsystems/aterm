@@ -7,7 +7,9 @@
 //! hop, so the release never re-selects a moving main.
 //!
 //! * [`admit`] decides whether a commit can be carried: a non-merge commit of origin/main that
-//!   the line does not hold yet, moving no [`FROZEN`] path and not the release version.
+//!   the line does not hold yet, moving no [`FROZEN`] path and not the release version. A
+//!   backport from the line's head may land through a neutral merge when main holds every
+//!   changed path at the backport's exact content and mode, deletions included.
 //! * [`order`] puts the admitted fixes in ancestry order. [`carry`] makes one hop per fix
 //!   ([`hop_tree`]'s `git merge-tree` onto the head, then `git commit-tree` under the carried
 //!   commit's own author and committer, so a rebuild makes the same commit).
@@ -19,7 +21,7 @@
 //!
 //! A landed commit is one origin/main brought into its own tree ([`landed_since`]): a record
 //! merge puts a hop into main's history, and no hop's content into main, so a commit main
-//! reaches only through such a content-neutral merge is never carried.
+//! reaches only through such a content-neutral merge needs that separate content proof.
 //!
 //! Every function reads this clone's `origin/main` as last fetched, except [`record`], which
 //! fetches. A [`Stop`]'s [`Reason`] says what stopped it, and whether the line was judged (a
@@ -135,32 +137,84 @@ pub fn require_unpublished(surfaces: [bool; 5]) -> Result<(), String> {
     Ok(())
 }
 
-/// Read the newest retirement of this version in main's first-parent history.
+/// Read this version's terminal retirement from all of main's reachable history.
+/// Landings put the previous main on their second parent. Git's date order therefore
+/// decides neither reachability nor the winner: records must form one unambiguous chain.
+/// The production read bounds both elapsed time and complete stdout; exceeding either
+/// limit is an error, never evidence that no retirement exists.
 pub fn supersession(git: &dyn GitRunner, version: &str) -> Result<Option<Supersession>, String> {
-    let log = ledger::git_ok(
+    let log = ledger::git_read_ok(
         git,
         &[
             "log",
             "origin/main",
-            "--first-parent",
             "--format=%B%x00",
             "--fixed-strings",
             "--grep=Aterm-Line-Supersession: ",
         ],
     )
     .map_err(|e| e.to_string())?;
+    let mut records = BTreeMap::new();
     for message in log.stdout_utf8().split('\0') {
         for row in message.lines() {
             if let Some(json) = row.strip_prefix(SUPERSESSION) {
                 let record: Supersession = aterm_json::from_str(json)
                     .map_err(|e| format!("invalid line supersession on main: {e}"))?;
-                if record.replacement.version == version {
-                    return Ok(Some(record));
+                if record.replacement.version == version || record.previous.version == version {
+                    if record.previous.version != version
+                        || record.replacement.version != version
+                        || record.previous.base == record.replacement.base
+                        || !record.replacement.hops.is_empty()
+                    {
+                        return Err(format!("invalid supersession chain for v{version}"));
+                    }
+                    if let Some(other) =
+                        records.insert(record.previous.base.clone(), record.clone())
+                        && other != record
+                    {
+                        return Err(format!(
+                            "contradictory supersessions for v{version}: base {}",
+                            record.previous.base
+                        ));
+                    }
                 }
             }
         }
     }
-    Ok(None)
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let mut replacements = BTreeSet::new();
+    for record in records.values() {
+        if !replacements.insert(record.replacement.base.as_str()) {
+            return Err(format!("converging supersession chains for v{version}"));
+        }
+    }
+    let roots: Vec<_> = records
+        .keys()
+        .filter(|base| !replacements.contains(base.as_str()))
+        .cloned()
+        .collect();
+    if roots.len() != 1 {
+        return Err(format!("contradictory supersession chains for v{version}"));
+    }
+    let mut current = records.remove(&roots[0]).expect("root came from records");
+    while let Some(next) = records.remove(&current.replacement.base) {
+        if next.previous.started != current.replacement.started
+            || !next.previous.hops.starts_with(&current.replacement.hops)
+        {
+            return Err(format!(
+                "contradictory supersession line identity for v{version}"
+            ));
+        }
+        current = next;
+    }
+    if !records.is_empty() {
+        return Err(format!(
+            "disconnected or cyclic supersessions for v{version}"
+        ));
+    }
+    Ok(Some(current))
 }
 
 /// Record the replacement under main's compare-and-swap, preserving main's tree.
@@ -185,7 +239,10 @@ pub fn supersede(
             if current == *record {
                 return Ok(tip);
             }
-            if current.replacement.base != record.previous.base {
+            if current.replacement.base != record.previous.base
+                || current.replacement.started != record.previous.started
+                || !record.previous.hops.starts_with(&current.replacement.hops)
+            {
                 return Err("the line was superseded again; resume the current fleet line".into());
             }
         }
@@ -254,7 +311,7 @@ pub enum Reason {
     /// A merge: a hop carries one non-merge commit.
     Merge,
     /// A commit that is not on origin/main, or not landed there: origin/main reaches it only
-    /// through a content-neutral merge (a record merge's, [`landed_since`]).
+    /// through a content-neutral merge without an exact backport content proof.
     OffMain,
     /// The line holds the commit already: the head (for a hop, the previous head) descends from it.
     Held,
@@ -578,8 +635,8 @@ pub enum Recorded {
 /// carries it already ([`Admitted::Carried`]); it is not a merge (a refusal lists each side's
 /// non-merge commits, for the agent to name); it is on origin/main; the line's head does not
 /// hold it; it landed on main ([`landed_since`] the line's base: not only a record merge's
-/// second parent, like another line's hop); it moves no [`FROZEN`] path and not the release
-/// version.
+/// second parent, like another line's hop), or is an exact backport from the line's head
+/// ([`backport_on_main`]); it moves no [`FROZEN`] path and not the release version.
 ///
 /// # Errors
 /// Each refusal above, and COULD NOT RUN when git cannot read this clone.
@@ -648,7 +705,9 @@ pub fn admit(git: &dyn GitRunner, line: &Line, rev: &str) -> Result<Admitted, St
             "nothing to carry: drop it from --fix",
         ));
     }
-    if !landed_since(git, &line.base)?.contains(&commit) {
+    if !landed_since(git, &line.base)?.contains(&commit)
+        && !backport_on_main(git, line.head(), &parent, &commit)?
+    {
         return Err(unlanded(&commit, &read.subject));
     }
     let paths = moved(git, &parent, &commit)?;
@@ -745,6 +804,12 @@ pub fn order(git: &dyn GitRunner, fixes: Vec<Fix>) -> Result<Vec<Fix>, Stop> {
 /// one of those sources picks a driver ([`Reason::Steered`]), when git refuses a call or cannot
 /// read the commits.
 pub fn hop_tree(git: &dyn GitRunner, prev: &str, c: &str) -> Result<Merged, Stop> {
+    Ok(hop_merge(git, prev, c)?.0)
+}
+
+/// Keep the conflicted tree too: its blobs contain git's exact conflict markers for the
+/// refusal's diff. No worktree or index is changed.
+fn hop_merge(git: &dyn GitRunner, prev: &str, c: &str) -> Result<(Merged, String), Stop> {
     git_ready(git)?;
     let base = format!("{c}^");
     let empty = plumb(git, &["hash-object", "-w", "-t", "tree", "/dev/null"])?;
@@ -776,9 +841,10 @@ pub fn hop_tree(git: &dyn GitRunner, prev: &str, c: &str) -> Result<Merged, Stop
     let mut fields = merged.stdout.split(|b| *b == 0).map(lossy);
     let tree = fields.next().unwrap_or_default();
     match merged.status {
-        0 if !tree.is_empty() => Ok(Merged::Tree(tree)),
-        1 => Ok(Merged::Conflict(
-            fields.take_while(|path| !path.is_empty()).collect(),
+        0 if !tree.is_empty() => Ok((Merged::Tree(tree.clone()), tree)),
+        1 if !tree.is_empty() => Ok((
+            Merged::Conflict(fields.take_while(|path| !path.is_empty()).collect()),
+            tree,
         )),
         _ => Err(refused_call(git, &args, &merged)),
     }
@@ -890,20 +956,41 @@ pub fn carry(git: &dyn GitRunner, line: &Line, fixes: &[Fix]) -> Result<Vec<Hop>
                 )
             })
             .collect();
-        let tree = match hop_tree(git, &prev, &fix.commit)? {
+        let (merged, conflicted) = hop_merge(git, &prev, &fix.commit)?;
+        let tree = match merged {
             Merged::Tree(tree) => tree,
             Merged::Conflict(paths) => {
+                before.push(out(
+                    git,
+                    &[
+                        "diff-tree",
+                        "-p",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-color",
+                        "--text",
+                        "--diff-algorithm=histogram",
+                        "--unified=3",
+                        "--no-renames",
+                        "--ignore-submodules=none",
+                        &prev,
+                        &conflicted,
+                    ],
+                )?);
                 before.extend(reauthor_plan(git, &prev, &fix.commit, &paths)?);
                 let remedy = if earlier.is_empty() {
                     format!(
-                        "author it on {} and land it, then `{RELEASE_COMMAND} --fix <that commit>`",
+                        "author a backport on {} whose every changed path matches origin/main \
+                         in content and mode (including deletions), land it on main, then \
+                         `{RELEASE_COMMAND} --fix <that non-merge commit>`",
                         short(head)
                     )
                 } else {
                     format!(
                         "carry the fixes before it first (`{RELEASE_COMMAND} --fix {}`), then \
-                         author it on the head that makes and land it, then `{RELEASE_COMMAND} \
-                         --fix <that commit>`",
+                         author a backport on the head that makes whose every changed path \
+                         matches origin/main in content and mode (including deletions), land it \
+                         on main, then `{RELEASE_COMMAND} --fix <that non-merge commit>`",
                         earlier.join(" ")
                     )
                 };
@@ -1192,6 +1279,7 @@ fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<Strin
         if !landed
             .as_ref()
             .is_some_and(|set| set.contains(&hop.carries))
+            && !backport_on_main(git, prev, &carried.parents[0], &hop.carries)?
         {
             let stop = unlanded(&hop.carries, &carried.subject);
             return Err(bad(stop.reason, format!("hop {k}: {}", stop.why)));
@@ -1286,7 +1374,7 @@ fn drop_line() -> String {
 
 /// The commits origin/main brought into its own tree since `floor`: those its tip reaches and
 /// `floor` does not, walking every parent except past a content-neutral merge (one whose tree is
-/// its first parent's, as each [`record`] merge is), where only the first parent is followed. A
+/// a parent's, as each [`record`] merge is), where only parents with that tree are followed. A
 /// record merge puts a hop into main's history and none of its content into main's tree, so a
 /// commit main reaches only that way (another line's hop, or anything pushed under such a merge)
 /// is in origin/main's history and not in this set.
@@ -1319,7 +1407,7 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
     let outside: BTreeSet<&str> = range
         .values()
         .filter(|(_, parents)| parents.len() > 1)
-        .filter_map(|(_, parents)| parents.first().copied())
+        .flat_map(|(_, parents)| parents.iter().copied())
         .filter(|first| !range.contains_key(*first))
         .collect();
     let read_out;
@@ -1331,7 +1419,7 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
         let read: Vec<&str> = read_out.lines().collect();
         if read.len() != outside.len() {
             return Err(unread(format!(
-                "git rev-parse named {} tree(s) for {} first parent(s)",
+                "git rev-parse named {} tree(s) for {} merge parent(s)",
                 read.len(),
                 outside.len()
             )));
@@ -1349,35 +1437,65 @@ pub fn landed_since(git: &dyn GitRunner, floor: &str) -> Result<BTreeSet<String>
         if !landed.insert(commit) {
             continue;
         }
-        let neutral = parents.len() > 1
-            && parents
-                .first()
-                .and_then(|first| {
+        let unchanged: Vec<&str> = parents
+            .iter()
+            .copied()
+            .filter(|parent| {
+                parents.len() > 1 && {
                     range
-                        .get(first)
+                        .get(parent)
                         .map(|(t, _)| *t)
-                        .or_else(|| outside_trees.get(first).copied())
-                })
-                .is_some_and(|first| first == *tree);
-        let followed = if neutral { &parents[..1] } else { &parents[..] };
+                        .or_else(|| outside_trees.get(parent).copied())
+                        .is_some_and(|parent_tree| parent_tree == *tree)
+                }
+            })
+            .collect();
+        let followed = if unchanged.is_empty() {
+            &parents[..]
+        } else {
+            &unchanged[..]
+        };
         next.extend(followed.iter().copied().filter(|p| !landed.contains(*p)));
     }
     Ok(landed.into_iter().map(str::to_owned).collect())
 }
 
-/// The refusal for a commit origin/main holds only through a content-neutral merge.
+/// An alternative to the history proof: a commit based exactly on the previous line head,
+/// already in main's history, whose every changed path main holds at the commit's content
+/// and mode (or absent for a deletion). Compare raw, NUL-delimited paths, including gitlinks;
+/// rename detection is off, so both sides of a rename are obligations. No patch heuristics,
+/// text conversion, pathspecs or checkout state take part in this proof.
+fn backport_on_main(
+    git: &dyn GitRunner,
+    head: &str,
+    parent: &str,
+    commit: &str,
+) -> Result<bool, Stop> {
+    if parent != head {
+        return Ok(false);
+    }
+    let main = out(git, &["rev-parse", "origin/main^{commit}"])?;
+    let changed = moved_bytes(git, parent, commit)?;
+    let different: BTreeSet<Vec<u8>> = moved_bytes(git, commit, &main)?.into_iter().collect();
+    Ok(!changed.is_empty() && changed.iter().all(|path| !different.contains(path)))
+}
+
+/// The refusal when neither the history nor the backport content proof holds.
 fn unlanded(commit: &str, subject: &str) -> Stop {
     Stop::new(
         Reason::OffMain,
         format!(
-            "{} ({subject}) is in origin/main's history only through a merge that keeps its first \
+            "{} ({subject}) is in origin/main's history only through a merge that keeps a \
              parent's tree (a release line's record merge, or one like it): its change never \
-             landed in main's tree, and a hop carries only a landed fix",
+             landed in main's tree by that history, and it is not an exact backport from the \
+             line's head whose changed paths origin/main holds in content and mode",
             short(commit)
         ),
         format!(
-            "name the main commit that landed the change (`git log origin/main`), or land it on \
-             main first, then `{RELEASE_COMMAND} --fix <its commit>`"
+            "name the main commit that landed the change (`git log origin/main`), or author a \
+             backport on the line's head whose every changed path matches origin/main in \
+             content and mode (including deletions), land it on main, then \
+             `{RELEASE_COMMAND} --fix <that non-merge commit>`"
         ),
     )
 }
@@ -1745,6 +1863,13 @@ fn tree_of(git: &dyn GitRunner, commit: &str) -> Result<String, Stop> {
 /// The paths `to` moves against `from`, renames as a deletion and an addition, submodule
 /// pointers included whatever the config says.
 fn moved(git: &dyn GitRunner, from: &str, to: &str) -> Result<Vec<String>, Stop> {
+    Ok(moved_bytes(git, from, to)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
+
+fn moved_bytes(git: &dyn GitRunner, from: &str, to: &str) -> Result<Vec<Vec<u8>>, Stop> {
     let listed = ledger::git_ok(
         git,
         &[
@@ -1763,7 +1888,7 @@ fn moved(git: &dyn GitRunner, from: &str, to: &str) -> Result<Vec<String>, Stop>
         .stdout
         .split(|b| *b == 0)
         .filter(|path| !path.is_empty())
-        .map(lossy)
+        .map(<[u8]>::to_vec)
         .collect())
 }
 

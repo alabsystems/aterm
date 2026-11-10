@@ -590,21 +590,51 @@ fn one(
         report.converged.push((tag.clone(), missing.clone()));
         missing
     } else {
+        let mut retained = BTreeSet::new();
         match channel.release(&public, &tag) {
-            Ok(release) if release.assets == [upload::VERSION_RESERVATION.to_owned()] => {
+            Ok(release)
+                if release.assets == [upload::VERSION_RESERVATION.to_owned()]
+                    || (release.draft
+                        && release
+                            .assets
+                            .iter()
+                            .any(|name| name == upload::VERSION_RESERVATION)
+                        && channel.probe_public(&public, &tag, &mf) == Probe::Absent) =>
+            {
+                if let Some(extra) = release.assets.iter().find(|name| {
+                    name.as_str() != upload::VERSION_RESERVATION && !expected.contains(name)
+                }) {
+                    return Err(Error::refused(format!(
+                        "{public}@{tag} draft holds unexpected asset {extra} — refusing"
+                    )));
+                }
                 let reservation_dir = work.join("reservation").join(&tag);
+                let names: Vec<&str> = release.assets.iter().map(String::as_str).collect();
                 channel
-                    .download(
-                        &public,
-                        &tag,
-                        &[upload::VERSION_RESERVATION],
-                        &reservation_dir,
-                    )
+                    .download(&public, &tag, &names, &reservation_dir)
                     .map_err(|e| host_error(format!("read {public}@{tag} reservation"), &e))?;
                 upload::check_version_reservation(
                     &reservation_dir.join(upload::VERSION_RESERVATION),
                     &staged_pkg.version,
                 )?;
+                for name in release.assets.iter().filter(|name| expected.contains(name)) {
+                    let existing = reservation_dir.join(name);
+                    let admitted = dir.join(name);
+                    let size = |path: &Path| {
+                        crate::identity::open_regular_nonblock(path)
+                            .map(|(_, metadata)| metadata.len())
+                            .map_err(|e| Error::io(name, &e))
+                    };
+                    if size(&existing)? != size(&admitted)?
+                        || atpkg::sha256_file(&existing).map_err(|e| Error::io(name, &e))?
+                            != atpkg::sha256_file(&admitted).map_err(|e| Error::io(name, &e))?
+                    {
+                        return Err(Error::refused(format!(
+                            "{public}@{tag} draft asset {name} differs from the signed staging set — refusing"
+                        )));
+                    }
+                    retained.insert(name.clone());
+                }
             }
             Ok(_) => {
                 return Err(Error::refused(format!(
@@ -615,20 +645,42 @@ fn one(
             Err(HostError::NotFound) => {}
             Err(e) => return Err(host_error(format!("read {public}@{tag}"), &e)),
         }
+        let missing_names: Vec<String> = expected
+            .iter()
+            .filter(|name| !retained.contains(*name))
+            .cloned()
+            .collect();
         if opts.dry_run {
-            log.say(format!(
-                "DRY RUN — would create {public}@{tag} with: {}",
-                expected.join(" ")
-            ));
-            report.planned.push((tag, expected));
+            if retained.is_empty() {
+                log.say(format!(
+                    "DRY RUN — would create {public}@{tag} with: {}",
+                    expected.join(" ")
+                ));
+            } else {
+                log.say(format!(
+                    "DRY RUN — would resume {public}@{tag}, upload: {}, then publish the draft",
+                    missing_names.join(" ")
+                ));
+            }
+            report.planned.push((tag, missing_names));
             return Ok(());
         }
         let files: Vec<PathBuf> = expected.iter().map(|n| dir.join(n)).collect();
         let notes = public_notes(program, &staged_pkg, &dir)?;
         let reserved =
             upload::reserve_pack_version(channel, &public, &tag, &dir.join(&mf), &files, &notes)?;
+        let missing: Vec<PathBuf> = reserved
+            .files()
+            .iter()
+            .filter(|file| {
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| missing_names.iter().any(|missing| missing == name))
+            })
+            .cloned()
+            .collect();
         channel
-            .upload(&public, &tag, reserved.files(), Replace::Never)
+            .upload(&public, &tag, &missing, Replace::Never)
             .map_err(|e| host_error(format!("upload to {public}@{tag}"), &e))?;
         if reserved.release.draft {
             channel

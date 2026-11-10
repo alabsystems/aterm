@@ -1204,37 +1204,35 @@ fn plain_url_at(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<P
     })?;
     let col = col.checked_sub(span.start)?;
     let cells = &cells[span];
-    let previous = std::cell::Cell::new(None);
-    let ink = |cell: &RenderCell| {
-        let bg = aterm_render::rgb_to_u32(cell.bg);
-        let fg = aterm_render::rgb_to_u32(cell.fg);
-        if min_contrast <= 1.0 || fg == bg {
-            return (fg, bg);
-        }
-        if let Some((last_fg, last_bg, painted)) = previous.get()
-            && fg == last_fg
-            && bg == last_bg
-        {
-            return (painted, bg);
-        }
-        let painted = aterm_render::floor_fg_contrast(fg, bg, min_contrast);
-        previous.set(Some((fg, bg, painted)));
-        (painted, bg)
-    };
     let span = find_url_span(cells.len(), col, |i| {
         let cell = &cells[i];
-        let (fg, bg) = ink(cell);
-        if cell.wide || fg == bg { ' ' } else { cell.ch }
+        if cell.wide || cell.fg == cell.bg {
+            ' '
+        } else {
+            cell.ch
+        }
     })?;
     let cells = &cells[span];
-    let mut previous_visible = None;
-    let faint = cells.iter().map(ink).any(|(fg, bg)| {
-        if previous_visible == Some((fg, bg)) {
-            return false;
-        }
-        previous_visible = Some((fg, bg));
-        aterm_render::floor_fg_contrast(fg, bg, FAINT_URL_CONTRAST) != fg
-    });
+    let is_faint = |cell: &RenderCell| {
+        let bg = aterm_render::rgb_to_u32(cell.bg);
+        let fg = aterm_render::floor_min_contrast_fg(
+            aterm_render::rgb_to_u32(cell.fg),
+            bg,
+            min_contrast,
+        );
+        aterm_render::fg_contrast_would_change(fg, bg, FAINT_URL_CONTRAST)
+    };
+    let (first, rest) = cells.split_first()?;
+    let mut previous_visible = (first.fg, first.bg);
+    let faint = is_faint(first)
+        || rest.iter().any(|cell| {
+            let visible = (cell.fg, cell.bg);
+            if previous_visible == visible {
+                return false;
+            }
+            previous_visible = visible;
+            is_faint(cell)
+        });
     Some(PlainUrl { cells, faint })
 }
 
@@ -16161,6 +16159,9 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        if active_terminal_projection(ws, &self.view_store).is_none() {
+            return;
+        }
         let WindowState {
             layouts, tabs, fx, ..
         } = &mut **ws;

@@ -25,13 +25,6 @@ pub enum Kept {
         /// Its last verified record.
         last: Record,
     },
-    /// A folded reservation's range of numbers, both ends included: always another machine's.
-    Reserved {
-        /// The range's first number.
-        lo: u32,
-        /// The range's last number.
-        hi: u32,
-    },
     /// A roster label or alias naming the number for a Mac: the node it is bound to, if any.
     Label {
         /// The number.
@@ -60,7 +53,6 @@ impl Kept {
             Self::Tombstone { last, .. } => {
                 last.num == Some(num) || last.was.iter().any(|was| was.num == num)
             }
-            Self::Reserved { lo, hi } => (*lo..=*hi).contains(&num.get()),
             Self::Label { num: kept, .. } | Self::Row { num: kept, .. } | Self::OlderHost(kept) => {
                 *kept == num
             }
@@ -162,7 +154,6 @@ impl Fleet<'_> {
             .filter(|kept| kept.keeps(num))
             .any(|kept| match kept {
                 Kept::Tombstone { last, .. } => anchor.is_none() || last.anchor != anchor,
-                Kept::Reserved { .. } => true,
                 Kept::Label { node: of, .. } => !of.is_some_and(mine),
                 Kept::Row {
                     node: of, planned, ..
@@ -378,7 +369,6 @@ pub fn top(
                     raise(&mut firm, num.get());
                 }
             }
-            Kept::Reserved { hi, .. } => raise(&mut firm, (*hi).min(Number::MAX)),
             Kept::Label { .. } | Kept::Row { .. } | Kept::OlderHost(_) => {}
         }
     }

@@ -1650,6 +1650,57 @@ impl Bootstrap {
         self.revalidate_immutable_custody()
     }
 
+    /// Whether an open of this bootstrap's vault ([`Self::cached_until`]) would give it back now,
+    /// field for field, and neither refuse nor write: what lets a caller that keeps a bootstrap
+    /// across its work (`aterm-db`'s table-repair `Replica`, one a round) take it in place of a
+    /// fresh open, and open afresh, and keep that, only where this refuses.
+    ///
+    /// Beside its vault's paths, every field is a function of the vault observation and of the
+    /// files it pins (the descriptor and trust of the observation's control bytes, the device and
+    /// its lab mark of the identity and `device.age`), so [`Self::revalidate_custody`] judges them
+    /// all: the observation's every field as the open took it ([`Snapshot::same_observation`]) and
+    /// the digests of the six files an open pins (the identity, `commons.claim`, `device.age`,
+    /// `device.claim`, `default.pin`, `control.anchor`). The rest is what an open would repair or
+    /// refuse: the vault's folder and `commons/` this user's and exactly `0700`, as
+    /// `fsx::ensure_private_dir` leaves a folder (an open makes any other mode `0700`, but for a
+    /// vault folder its owner cannot search, whose observation it refuses first), each custody
+    /// lock a private file in the vault's folder, judged with it (an open makes a missing one,
+    /// narrows a folder whose mode opens it to others, and refuses a lock that is not private or a
+    /// folder an access list opens to others), the vault's creation claim
+    /// readable as an open's device custody reads it (`client::creation_requires_device`, which
+    /// refuses a claim that is malformed or not private), and the control journal holding the
+    /// descriptor's nodes, read as
+    /// [`Journal::read_existing`] reads it (an open refuses a control folder that is missing or no
+    /// folder, and would take the journal's writer and ingest a node it lacks; the read refuses a
+    /// folder that is missing, linked or holds no journal). The vault is judged as every session
+    /// judges it (`client::observe_commons_quiet`): files whose stamps have not moved give the
+    /// observation they gave, and a writer holding the vault meets a fresh read, which finds it
+    /// busy. This takes neither custody lock and makes no folder durable, as it writes nothing.
+    ///
+    /// # Errors
+    /// An open would give another bootstrap, repair or refuse, or would wait for a writer: the
+    /// vault is busy, changed or unavailable, a pinned file changed or is missing, a folder is not
+    /// this user's or not `0700`, a custody lock is missing or not private, the creation claim
+    /// cannot be read, or the control journal cannot be read or lacks a node of the descriptor.
+    pub fn stands(&self) -> Result<()> {
+        self.revalidate_custody()?;
+        let state = aterm_uds::private_file::JudgedDir::private(&self.paths.dir)?;
+        for name in ["commons.lock", "commons-device.lock"] {
+            state.open(name).map_err(|error| {
+                Error::new(format!("Commons custody lock is not private: {error}"))
+            })?;
+        }
+        fsx::private_dir_settled(&self.paths.dir)?;
+        fsx::private_dir_settled(&self.paths.dir.join("commons"))?;
+        client::creation_requires_device(&self.paths)?;
+        if descriptor_held(&self.journal_dir, &self.descriptor).is_none() {
+            return Err(Error::new(
+                "Commons control no longer holds its vault's descriptor",
+            ));
+        }
+        Ok(())
+    }
+
     /// Check the same immutable custody after a caller has independently
     /// revalidated and exclusively held the exact vault observation. This does
     /// not acquire another state observation or grant any authority by itself.
@@ -2353,17 +2404,23 @@ fn history_name(basis: &[u8; 32]) -> String {
 /// barrier, or one whose barrier failed), so a journal that holds them is made
 /// durable, as a writer's open would, before this returns it.
 fn holds_descriptor(journal_dir: &Path, descriptor: &Descriptor) -> Result<Option<Journal>> {
-    let holds = Journal::read_existing(journal_dir, descriptor.trust())
+    let holds = descriptor_held(journal_dir, descriptor);
+    if holds.is_some() {
+        aterm_durable::durable_dir(journal_dir)?;
+    }
+    Ok(holds)
+}
+
+/// [`holds_descriptor`]'s read with no flush: the journal in `journal_dir` when it holds every
+/// node of `descriptor`, read without its writer, `None` where it lacks one or cannot be read.
+fn descriptor_held(journal_dir: &Path, descriptor: &Descriptor) -> Option<Journal> {
+    Journal::read_existing(journal_dir, descriptor.trust())
         .ok()
         .filter(|journal| {
             std::iter::once(&descriptor.genesis)
                 .chain(&descriptor.repair)
                 .all(|node| journal.node(&node.id()).is_some())
-        });
-    if holds.is_some() {
-        aterm_durable::durable_dir(journal_dir)?;
-    }
-    Ok(holds)
+        })
 }
 
 fn pin_bytes(trust: Trust) -> Vec<u8> {

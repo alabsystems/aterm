@@ -13,7 +13,7 @@ use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
     CutState, EngineNow, EngineRows, Facts, JOURNAL_FILE, Journal, Prover, PublishGate,
     RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions, Reservation, SELECTION_FILE,
-    Side, StageTarget, Step, run_with,
+    Side, SignedDiscard, StageTarget, Step, run_with,
 };
 use crate::release_steps::Real;
 
@@ -204,6 +204,9 @@ struct World {
     cutter_recovery: crate::release_tools::Recovery,
     warming_active: bool,
     unrecorded_hops: BTreeSet<String>,
+    pending_lines: Vec<Line>,
+    pending_refusal: Option<Refusal>,
+    recorded_lines: Vec<Line>,
     rewind_refusal: Option<Refusal>,
     move_refusal: Option<Refusal>,
     asks: Vec<String>,
@@ -279,6 +282,8 @@ struct World {
     carry_refusal: Option<Refusal>,
     /// Exercise the production Git carry while keeping publication in this fake world.
     carry_repo: Option<PathBuf>,
+    /// Use real source admission too, for fixtures with a landed history.
+    admission_repo: Option<PathBuf>,
     /// The meaning check's answer ([`crate::line::verify`]).
     line_verify: Result<String, Refusal>,
     /// The qualify branches whose fake runs on until its stop fires, then ends stopped.
@@ -292,6 +297,7 @@ struct World {
     /// The build fails before its slices claim memory; later branches wait for its end.
     build_claims_late: bool,
     build_admission_waits: usize,
+    lint_first: bool,
     /// The build and the export do their work once the tree's end is told, and not when their
     /// stop fired by then.
     after_tree: bool,
@@ -300,7 +306,9 @@ struct World {
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
     signed: Option<u64>,
-    drafts_discarded: usize,
+    private_draft: Option<crate::publish::draft::tests::Lab>,
+    stage_private_draft: bool,
+    source_read_down: bool,
     prepared_signature: Option<u64>,
     prepare_code: i32,
     early_overlap: bool,
@@ -417,6 +425,9 @@ impl World {
             cutter_recovery: crate::release_tools::Recovery::Initial,
             warming_active: false,
             unrecorded_hops: BTreeSet::new(),
+            pending_lines: Vec::new(),
+            pending_refusal: None,
+            recorded_lines: Vec::new(),
             rewind_refusal: None,
             move_refusal: None,
             asks: Vec::new(),
@@ -458,17 +469,21 @@ impl World {
             tree_unread: false,
             carry_refusal: None,
             carry_repo: None,
+            admission_repo: None,
             line_verify: Ok("the line verifies".into()),
             holds: BTreeSet::new(),
             verify_half: None,
             export_pushes: false,
             build_claims_late: false,
             build_admission_waits: 0,
+            lint_first: false,
             after_tree: false,
             keep_build_on_test_red: false,
             sign_code: 0,
             signed: None,
-            drafts_discarded: 0,
+            private_draft: None,
+            stage_private_draft: false,
+            source_read_down: false,
             prepared_signature: None,
             prepare_code: 0,
             early_overlap: false,
@@ -615,8 +630,8 @@ fn ran(code: i32) -> Ran {
     }
 }
 
-/// The graph's branches over the world. The build marks its slice admission before the
-/// tree starts. Work then runs past the other branch starts, except an early build failure.
+/// The graph's branches over the world. A pending lint reserves memory before slices;
+/// other trees follow slice admission. Work runs past the other branch starts.
 /// A branch in [`World::holds`] runs unlocked until its stop fires.
 struct WorldBranches<'a> {
     w: std::sync::Mutex<&'a mut World>,
@@ -708,6 +723,10 @@ impl<'a> WorldBranches<'a> {
 }
 
 impl Branches for WorldBranches<'_> {
+    fn expect_tree_lint(&self) {
+        self.world().lint_first = true;
+        self.mark("lint-expected");
+    }
     fn keep_build_on_test_red(&self, _c: &Candidate) -> bool {
         self.world().keep_build_on_test_red
     }
@@ -791,7 +810,7 @@ impl Branches for WorldBranches<'_> {
             }
         }
         let pushes = self.world().export_pushes;
-        if pushes {
+        if pushes && target == StageTarget::Remote {
             stop.in_order(|| {
                 assert!(stop.push(), "the export's push begins before any red");
                 let event = aterm_json::json!({"schema": 1, "event": "qualify-branch",
@@ -802,6 +821,9 @@ impl Branches for WorldBranches<'_> {
             self.wait("a red", |seen| seen.contains(&"red"), &|| false);
         }
         let ran = self.world().export(c, target);
+        if pushes && target == StageTarget::Local {
+            self.mark("push");
+        }
         self.mark("export");
         if self.held(Branch::Export, stop) {
             return Ok(ran_code(130));
@@ -816,6 +838,11 @@ impl Branches for WorldBranches<'_> {
         work: BuildWork,
         stop: &BranchStop,
     ) -> Built {
+        if self.entered.lock().unwrap().contains(&"lint-expected") {
+            self.wait("lint admission", |seen| seen.contains(&"tree"), &|| {
+                stop.fired()
+            });
+        }
         if self.world().build_claims_late {
             let mut world = self.world();
             world.calls.push("build".into());
@@ -957,6 +984,22 @@ impl Branches for WorldBranches<'_> {
         }
         if w.sign_code == 0 {
             w.signed = w.journal().and_then(|j| j.reserved).map(|r| r.build);
+            if w.stage_private_draft {
+                if let Some(draft) = &mut w.private_draft {
+                    draft.resume();
+                } else {
+                    let journal = w.journal().unwrap();
+                    let reserved = journal.reserved.unwrap();
+                    let mut draft = crate::publish::draft::tests::Lab::for_cut(
+                        &journal.version,
+                        reserved.build,
+                        &reserved.commit,
+                    );
+                    draft.stage().unwrap();
+                    draft.attest();
+                    w.private_draft = Some(draft);
+                }
+            }
         }
         ran(w.sign_code)
     }
@@ -1260,7 +1303,11 @@ impl Backend for World {
                 "resume the current line",
             ));
         }
-        if self.supersession.is_some() {
+        if self
+            .supersession
+            .as_ref()
+            .is_some_and(|record| record.replacement.base != previous.base)
+        {
             return Err(Refusal::new(
                 "the line already has a durable supersession",
                 "resume the current line",
@@ -1296,7 +1343,11 @@ impl Backend for World {
                 "planted authoritative reread failure".into(),
             );
         }
-        match self.supersession.clone() {
+        match self
+            .supersession
+            .clone()
+            .filter(|record| record.replacement.base != previous.base)
+        {
             Some(record)
                 if record.previous == *previous
                     && record.replacement == *line
@@ -1361,6 +1412,13 @@ impl Backend for World {
             .clone()
             .filter(|line| line.version == version);
         Ok(line)
+    }
+    fn fleet_holder(&mut self, _head: &str) -> Option<String> {
+        Some("m3 (node fixture-m3, session cut-193, pid 193, boot fixture, start 123)".into())
+    }
+    fn main_past_line(&mut self, head: &str, main: &str) -> Option<(usize, usize)> {
+        let count = self.pos(main)?.checked_sub(self.pos(head)?)?;
+        Some((count, count))
     }
     fn fleet_line(
         &mut self,
@@ -1575,6 +1633,10 @@ impl Backend for World {
         Ok(!self.pre_line.contains(rev))
     }
     fn fix_of(&mut self, line: &Line, rev: &str) -> Result<Admitted, Refusal> {
+        if let Some(repo) = &self.admission_repo {
+            return crate::line::admit(&crate::ledger::testing::Git::new(repo), line, rev)
+                .map_err(Into::into);
+        }
         let named = || {
             Refusal::new(
                 format!("--fix {rev:?} names no commit of this clone"),
@@ -1649,7 +1711,24 @@ impl Backend for World {
             format!("recorded on main by the merge {}", &merge[..4]),
         ))
     }
-    fn verify_line(&mut self, _line: &Line) -> Result<String, Refusal> {
+    fn verify_line(&mut self, line: &Line) -> Result<String, Refusal> {
+        self.calls.push("verify-line".into());
+        if self.unrecorded_hops.contains(line.head()) {
+            return Err(Refusal::new(
+                format!(
+                    "the line's head {} is not on origin/main: origin/main does not hold its record merge",
+                    &line.head()[..12]
+                ),
+                "drop the line",
+            ));
+        }
+        self.line_verify.clone()
+    }
+    fn verify_pending_line(&mut self, line: &Line) -> Result<String, Refusal> {
+        self.pending_lines.push(line.clone());
+        if let Some(refusal) = self.pending_refusal.clone() {
+            return Err(refusal);
+        }
         self.calls.push("verify-line".into());
         self.line_verify.clone()
     }
@@ -1725,6 +1804,7 @@ impl Backend for World {
     }
     fn record_line(&mut self, line: &Line) -> Result<String, Refusal> {
         self.calls.push("record-line".into());
+        self.recorded_lines.push(line.clone());
         for hop in &line.hops {
             self.unrecorded_hops.remove(&hop.commit);
         }
@@ -1947,6 +2027,11 @@ impl Backend for World {
     }
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
         self.calls.push("source-publication".into());
+        if let Some(draft) = &self.private_draft {
+            draft.source_read(self.source_read_down).map_err(|e| {
+                Refusal::new(e.to_string(), "resume once the channel answers").could_not_run()
+            })?;
+        }
         if self.source_attested.contains(&c.commit) {
             Ok(())
         } else {
@@ -2021,19 +2106,19 @@ impl Backend for World {
         });
         ran(self.cut_code)
     }
-    fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String> {
+    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Vec<String> {
         self.calls.push(format!("discard-signed {version} {build}"));
+        if let Some(draft) = &self.private_draft {
+            let left = draft.discard_signed(reason);
+            if !left.is_empty() || reason == SignedDiscard::CancelPreparation {
+                return left;
+            }
+        }
         if self.signed == Some(build) {
             self.signed = None;
         }
         if self.prepared_signature == Some(build) {
             self.prepared_signature = None;
-        }
-        Vec::new()
-    }
-    fn discard_draft(&mut self, _version: &str, build: u64) -> Vec<String> {
-        if self.signed == Some(build) {
-            self.drafts_discarded += 1;
         }
         Vec::new()
     }
@@ -2168,6 +2253,17 @@ fn supersession_is_explicit_and_refuses_public_or_live_lines() {
     assert_eq!(code, 0, "{last}\n{:?}", replacement.out);
     assert_eq!(replacement.journal().unwrap().commit, TIP);
     assert!(replacement.supersession.is_some());
+
+    let mut again = setup();
+    again.supersession = Some(crate::line::Supersession {
+        previous: Line::start("0.6.0", OLD, 50),
+        replacement: again.existing_fleet_line.clone().unwrap(),
+        reason: "earlier retirement".into(),
+    });
+    let (code, last) = again.run(options());
+    assert_eq!(code, 0, "{last}\n{:?}", again.out);
+    assert_eq!(again.journal().unwrap().commit, TIP);
+    assert_eq!(again.count("supersede"), 1);
 
     let mut live = setup();
     live.fleet_refusal = Some("CUTTING ELSEWHERE: live progressing peer".into());
@@ -2504,34 +2600,31 @@ fn supersession_preflight_and_unknown_write_use_one_candidate_transaction() {
 #[test]
 fn superseded_journal_refuses_but_plain_resume_adopts_replacement() {
     let mut world = World::new();
-    let old = Line::start("0.6.0", NEXT, 100);
-    let new = Line::start("0.6.0", TIP, 200);
+    let record = super::release_line::hidden_supersession();
+    let old = record.previous.clone();
+    let new = record.replacement.clone();
     world.existing_fleet_line = Some(new.clone());
-    world.supersession = Some(crate::line::Supersession {
-        previous: old.clone(),
-        replacement: new.clone(),
-        reason: "broken cutter".into(),
-    });
+    world.supersession = Some(record);
     let candidate = || Candidate {
-        commit: NEXT.into(),
-        version: "0.6.0".into(),
+        commit: old.head().into(),
+        version: old.version.clone(),
         why: String::new(),
         bump_from: None,
         carry: Vec::new(),
     };
     let mut c = candidate();
     let mut journal = Some(Journal {
-        commit: NEXT.into(),
-        version: "0.6.0".into(),
-        line: Some(old),
+        commit: old.head().into(),
+        version: old.version.clone(),
+        line: Some(old.clone()),
         ..Journal::default()
     });
     assert!(crate::line_claim::follow(&mut world, &mut c, &mut journal).is_err());
-    assert_eq!(c.commit, NEXT);
+    assert_eq!(c.commit, old.head());
     // Negative control: a clone without the retired journal resumes the new line.
     let mut journal = None;
     crate::line_claim::follow(&mut world, &mut c, &mut journal).unwrap();
-    assert_eq!(c.commit, TIP);
+    assert_eq!(c.commit, new.head());
     assert_eq!(journal.unwrap().line(), new);
 }
 
@@ -2568,6 +2661,194 @@ fn fleet_line_adoption_keeps_the_candidates_head_and_drops_other_trees_records()
     candidate.commit = BUMP.into();
     crate::line_claim::select(&mut world, false, &mut candidate, &mut same, 1000).unwrap();
     assert_eq!(same.unwrap().done, ["commit-gates"]);
+}
+
+#[test]
+fn adopted_line_notice_names_the_selection_main_gap_and_remedies_once() {
+    let setup = || {
+        let mut world = World::new();
+        world.history.insert(1, NEXT.into());
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.versions.insert(NEXT.into(), "0.6.0".into());
+        world
+    };
+    let mut adopted = setup();
+    adopted.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 123));
+    let (code, last) = adopted.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", adopted.out);
+    let notices: Vec<_> = adopted
+        .out
+        .iter()
+        .filter(|s| s.contains("release: adopted/continued line"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{:?}", adopted.out);
+    let notice = notices[0];
+    println!("{notice}");
+    assert!(notice.contains("v0.6.0"), "{notice}");
+    assert!(notice.contains(NEXT), "{notice}");
+    assert!(
+        notice.contains("fleet claim refs/aterm-release/line/0.6.0"),
+        "{notice}"
+    );
+    assert!(notice.contains("holder m3"), "{notice}");
+    assert!(
+        notice
+            .contains("1 commits, 1 of them touching crates/aterm-release or crates/aterm-verify"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("targo --unverified ship release --fix <c>..."),
+        "{notice}"
+    );
+    assert!(
+        notice.contains(&format!(
+            "targo --unverified ship release --commit {TIP} --supersede"
+        )),
+        "{notice}"
+    );
+    let index = adopted.out.iter().position(|s| s == notice).unwrap();
+    let step_one = adopted
+        .out
+        .iter()
+        .position(|s| s.contains("[ 1/10]") && s.contains("start"))
+        .unwrap();
+    assert!(index <= step_one, "selection must be visible by step 1");
+
+    let mut main = setup();
+    main.existing_fleet_line = Some(Line::start("0.6.0", TIP, 123));
+    let (code, last) = main.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", main.out);
+    assert!(
+        !main.out.iter().any(|s| s.contains("adopted/continued line")
+            || s.contains("--fix <c>...")
+            || s.contains(&format!("--commit {TIP} --supersede")))
+    );
+}
+
+#[test]
+fn an_explicit_older_head_is_the_flag_selection_even_with_a_journal() {
+    let mut world = World::new();
+    world.history.insert(1, NEXT.into());
+    world.versions.insert(TIP.into(), "0.6.0".into());
+    world.versions.insert(NEXT.into(), "0.6.0".into());
+    std::fs::create_dir_all(world.release_dir()).unwrap();
+    Journal {
+        version: "0.6.0".into(),
+        commit: NEXT.into(),
+        line: Some(Line::start("0.6.0", NEXT, 123)),
+        ..Journal::default()
+    }
+    .save(&world.release_dir().join(JOURNAL_FILE))
+    .unwrap();
+    let (code, last) = world.run(ReleaseOptions {
+        commit: Some(NEXT.into()),
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:?}", world.out);
+    assert!(
+        !world
+            .out
+            .iter()
+            .any(|s| s.contains("adopted/continued line"))
+    );
+}
+
+#[test]
+fn journal_line_notice_precedes_old_cutter_exec_and_survives_continuation() {
+    let mut world = World::new();
+    world.history.insert(1, NEXT.into());
+    world.versions.insert(TIP.into(), "0.6.0".into());
+    world.versions.insert(NEXT.into(), "0.6.0".into());
+    std::fs::create_dir_all(world.release_dir()).unwrap();
+    Journal {
+        version: "0.6.0".into(),
+        commit: NEXT.into(),
+        line: Some(Line::start("0.6.0", NEXT, 123)),
+        ..Journal::default()
+    }
+    .save(&world.release_dir().join(JOURNAL_FILE))
+    .unwrap();
+    world.own_cutter = false;
+    world.exec_result = Ok(());
+    assert_eq!(world.run(mac()).0, 0);
+    assert_eq!(world.exec_commit.as_deref(), Some(NEXT));
+    assert_eq!(world.fetches, 0, "the notice adds no refresh");
+    assert!(
+        world
+            .out
+            .iter()
+            .any(|s| s.contains("adopted/continued line")
+                && s.contains("this clone's journal")
+                && s.contains("holder not recorded")
+                && s.contains(NEXT))
+    );
+    assert!(
+        !world.out.iter().any(|s| s.contains("[ 1/10]")),
+        "the old cutter takes over before step 1"
+    );
+
+    // Model the exec boundary with its retained pid/start claim and candidate journal.
+    let pending = Journal::load(&world.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.commit, NEXT);
+    std::fs::write(
+        world.release_dir().join(RUNNING_FILE),
+        format!(
+            "pid {}\nstarted {}\nlogs /previous\n",
+            world.pid, world.started
+        ),
+    )
+    .unwrap();
+    world.own_cutter = true;
+    assert_eq!(world.run(mac()).0, 0, "{:?}", world.out);
+    assert!(
+        !world
+            .out
+            .iter()
+            .any(|s| s.contains("adopted/continued line")),
+        "same run announces once across exec"
+    );
+}
+
+#[test]
+fn line_notice_counts_local_commits_and_each_tool_commit_once() {
+    use crate::ledger::{git_ok, testing::Git};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let git = Git::new(dir.path());
+    git_ok(&git, &["init", "-b", "main"]).unwrap();
+    git_ok(&git, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+    let head = git_ok(&git, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_string();
+    for (i, paths) in [
+        vec!["unrelated"],
+        vec!["crates/aterm-release/a"],
+        vec!["crates/aterm-release/a", "crates/aterm-verify/b"],
+        vec!["crates/aterm-verify/b"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for path in paths {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, i.to_string()).unwrap();
+        }
+        git_ok(&git, &["add", "."]).unwrap();
+        git_ok(&git, &["commit", "-m", "fixture change"]).unwrap();
+    }
+    let main = git_ok(&git, &["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout_utf8()
+        .trim()
+        .to_string();
+    let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+    assert_eq!(real.main_past_line(&head, &main), Some((4, 3)));
+    assert_eq!(real.main_past_line(&main, &main), Some((0, 0)));
+    assert_eq!(real.main_past_line("missing", &main), None);
 }
 
 #[test]
@@ -2692,6 +2973,10 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     let mut w = World::new();
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{:#?}", w.out);
+    assert!(
+        w.lint_first,
+        "a full qualify must arm the lint admission gate before launching slices"
+    );
     let starts: Vec<_> = w
         .out
         .iter()
@@ -2736,7 +3021,12 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     branches.sort_unstable();
     assert_eq!(
         branches,
-        ["build", "stage", "stage-fixtures", "verify --tree"],
+        [
+            "build",
+            "stage --dry-run",
+            "stage-fixtures",
+            "verify --tree"
+        ],
         "{:?}",
         w.calls
     );
@@ -2759,6 +3049,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "validation-tools",
             "disk-claim 30",
             "reserve",
+            "stage",
             "verify --bundle",
             "disk-let-go true",
             "sync",
@@ -2794,6 +3085,58 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         !w.release_dir().join(RUNNING_FILE).exists(),
         "the claim goes with the run"
     );
+}
+
+#[test]
+fn calendar_bumps_use_selection_utc_and_resume_the_same_journal_across_midnight() {
+    let at = |stamp| u64::try_from(aterm_types::rfc3339::parse_utc(stamp).unwrap()).unwrap();
+    let calendar_world = |version: &str, now| {
+        let mut w = World::new();
+        w.versions.insert(OLD.into(), version.into());
+        w.versions.insert(TIP.into(), version.into());
+        w.origin_tags.clear();
+        w.origin_tags.insert(format!("v{version}"), OLD.into());
+        w.ledger = vec![version.into()];
+        w.now = now;
+        w.stop_at_qualify = true;
+        w
+    };
+    let mut w = calendar_world("1.20261109.1", at("2026-11-09T23:59:00Z"));
+    assert_ne!(
+        w.run(bump()).0,
+        0,
+        "the inert controller stops at qualification"
+    );
+    let selected = w
+        .journal()
+        .expect("candidate journal written before qualification");
+    assert_eq!(selected.version, "1.20261109.2");
+    assert_eq!(
+        &aterm_types::rfc3339::format_rfc3339(selected.started)[..10],
+        "2026-11-09"
+    );
+    w.now = at("2026-11-10T12:00:00Z");
+    w.calls.clear();
+    assert_ne!(w.run(bump()).0, 0);
+    assert_eq!(
+        w.count("bump"),
+        0,
+        "resuming never allocates another daily counter"
+    );
+    let resumed = w.journal().unwrap();
+    assert_eq!(resumed.version, selected.version);
+    assert_eq!(resumed.started, selected.started);
+
+    let mut fresh = calendar_world("1.20261109.2", at("2026-11-10T00:00:00Z"));
+    assert_ne!(fresh.run(bump()).0, 0);
+    assert_eq!(fresh.journal().unwrap().version, "1.20261110.1");
+
+    let mut regressed = calendar_world("1.20261110.1", at("2026-11-09T12:00:00Z"));
+    let (exit, last) = regressed.run(bump());
+    assert_ne!(exit, 0);
+    assert!(last.contains("UTC clock precedes"), "{last}");
+    assert_eq!(regressed.count("bump"), 0);
+    assert!(regressed.journal().is_none());
 }
 
 /// A RELEASE CLAIMS ITS DISK BEFORE ANYTHING OF IT WRITES, UNTIL ITS VERIFY ENDS, AND A STAGE
@@ -4243,8 +4586,30 @@ pub(super) fn real_carry_fixture(
     dry_run: bool,
     judge_changelog: bool,
 ) -> (i32, String, Vec<String>) {
+    carry_fixture(repo, line, fixes, dry_run, judge_changelog, false)
+}
+
+/// Include real admission as well as carrying; only services beyond source git are faked.
+pub(super) fn real_fix_fixture(
+    repo: &Path,
+    line: &Line,
+    fixes: &[Fix],
+    dry_run: bool,
+) -> (i32, String, Vec<String>) {
+    carry_fixture(repo, line, fixes, dry_run, false, true)
+}
+
+fn carry_fixture(
+    repo: &Path,
+    line: &Line,
+    fixes: &[Fix],
+    dry_run: bool,
+    judge_changelog: bool,
+    real_admission: bool,
+) -> (i32, String, Vec<String>) {
     let mut w = World::new();
     w.carry_repo = Some(repo.to_path_buf());
+    w.admission_repo = real_admission.then(|| repo.to_path_buf());
     if judge_changelog {
         w.gate_repo = Some(repo.to_path_buf());
         w.gate_revision = true;
@@ -4335,7 +4700,7 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
         "would reserve build n",
         "the planned head has no release records yet",
         "pub stage aterm --commit 9111111111111111111111111111111111111111",
-        "checked with line::verify_pending before step 1",
+        "checked with line::verify_pending at step 1",
     ] {
         assert!(said(needle), "{needle}: {:#?}", w.out);
     }
@@ -5015,6 +5380,140 @@ fn a_pending_fix_survives_step_one_failure_without_a_fleet_record_deadlock() {
     assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
 }
 
+/// NEGATIVE CONTROLS: judging pending acceptance before handover lets the launcher's rule
+/// refuse without asking the frozen head. Keeping the old dry-only ancestry exemption and
+/// omitting the pending identity makes the dry run go ahead while the real run refuses.
+#[test]
+fn a_dry_pending_hop_asks_its_frozen_head_and_quotes_the_real_refusal() {
+    let mut w = red_line();
+    let recorded = w.journal().unwrap();
+    let refusal = Refusal::new(
+        format!(
+            "{} is not on origin/main — the engine stages only mainline commits",
+            &hop_of(FIX)[..9]
+        ),
+        format!(
+            "origin/main no longer holds the line's record merge: drop the line ({} --forget) and start a new one",
+            crate::release::RELEASE_COMMAND
+        ),
+    );
+    w.pending_refusal = Some(refusal.clone());
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    let dry = ReleaseOptions {
+        dry_run: true,
+        ..fix(&[FIX])
+    };
+    assert_eq!(w.run(dry.clone()), (0, String::new()));
+    assert_eq!(w.exec_commit.as_deref(), Some(hop_of(FIX).as_str()));
+    assert!(
+        w.pending_lines.is_empty(),
+        "the launcher never judges the pending head"
+    );
+    assert_eq!(w.journal().unwrap(), recorded);
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+
+    // The exec receiver reconstructs exactly the plan without writing a journal or a ref.
+    w.own_cutter = true;
+    let (code, dry_last) = w.run(dry);
+    assert_eq!(code, 1, "{dry_last}");
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains(&format!("WOULD REFUSE  {}", refusal.why))),
+        "{:?}",
+        w.out
+    );
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line == &format!("        fix: {}", refusal.remedy))
+    );
+    assert!(
+        dry_last.contains(&format!("would refuse at 1/10 checks: {}", refusal.why)),
+        "{dry_last}"
+    );
+    let planned = w.pending_lines.last().unwrap().clone();
+    assert_eq!(planned.head(), hop_of(FIX));
+    assert_eq!(w.journal().unwrap(), recorded);
+    assert!(!w.release_dir().join(SELECTION_FILE).exists());
+    assert_eq!(w.count("record-line"), 0);
+
+    let (code, real_last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{real_last}");
+    assert!(
+        real_last.starts_with(&format!("REFUSED at 1/10 checks: {}", refusal.why)),
+        "{real_last}"
+    );
+    assert!(real_last.contains(&refusal.remedy), "{real_last}");
+    let pending = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pending.line(),
+        planned,
+        "real preparation and the dry receiver ask about the same line"
+    );
+    assert_eq!(w.pending_lines.last(), Some(&planned));
+    assert_eq!(w.journal().unwrap(), recorded);
+    assert_eq!(w.head, recorded.commit);
+}
+
+/// NEGATIVE CONTROLS: leaving the refused private head in release.toml loses the recorded
+/// prefix; dropping candidate.toml loses hop 1; recording only the newly made hop loses its
+/// predecessor. A second dry run must judge the pending chain, not verify hop 1 as recorded.
+#[test]
+fn a_refused_pending_hop_is_carried_with_the_next_and_both_are_recorded() {
+    let mut w = red_line();
+    let recorded = w.journal().unwrap();
+    w.pending_refusal = Some(Refusal::new(
+        "planted frozen pending-hop refusal",
+        "carry its fix",
+    ));
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}");
+    assert!(
+        last.contains("candidate.toml retains pending line"),
+        "{last}"
+    );
+    assert_eq!(w.journal().unwrap(), recorded);
+    assert_eq!(w.head, recorded.commit);
+    let path = w.release_dir().join(SELECTION_FILE);
+    let first = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(first.line().hops.len(), 1);
+    assert!(w.unrecorded_hops.contains(first.line().head()));
+
+    w.history.push(FIX2.into());
+    w.versions.insert(FIX2.into(), recorded.version.clone());
+    w.existing_fleet_line = Some(recorded.line());
+    w.pending_refusal = None;
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..fix(&[FIX2])
+    });
+    assert_eq!(code, 0, "{last}\n{:?}", w.out);
+    let planned = w.pending_lines.last().unwrap().clone();
+    assert_eq!(
+        planned
+            .hops
+            .iter()
+            .map(|hop| hop.carries.as_str())
+            .collect::<Vec<_>>(),
+        [FIX, FIX2]
+    );
+    assert_eq!(Journal::load(&path).unwrap().unwrap(), first);
+    assert_eq!(w.journal().unwrap(), recorded);
+    assert_eq!(w.count("record-line"), 0);
+
+    let (code, last) = w.run(fix(&[FIX2]));
+    assert_eq!(code, 0, "{last}\n{:?}", w.out);
+    assert_eq!(w.recorded_lines.as_slice(), std::slice::from_ref(&planned));
+    assert_eq!(w.journal().unwrap().line(), planned);
+    assert!(!path.exists());
+    assert!(!w.unrecorded_hops.contains(&hop_of(FIX)));
+    assert!(!w.unrecorded_hops.contains(&hop_of(FIX2)));
+}
+
 /// A refusal in the frozen head's pre-step preview restores the checkout without erasing the
 /// only exact retry. NEGATIVE CONTROL: omit refusal settlement and main remains at the private
 /// hop; erase candidate.toml and the retry cannot distinguish it from a lost record.
@@ -5667,26 +6166,94 @@ fn a_source_red_stops_the_sign_and_nothing_is_claimed() {
     assert!(w.cut.is_none() && w.signed.is_none());
 }
 
-/// NEGATIVE CONTROL: omitting the run's cleanup callback leaves the completed
-/// private upload orphaned when the other side subsequently refuses.
+/// A source refusal does not prove that the draft belongs to another cut.
 #[test]
-fn a_source_refusal_withdraws_its_completed_draft_but_a_claim_keeps_recovery() {
+fn a_source_refusal_and_a_claim_both_keep_the_private_draft_for_recovery() {
     let mut w = World::new();
     w.sides = SideOrder::SignFirst;
+    w.stage_private_draft = true;
     w.publish_code = 1;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(w.signed.is_some() && w.cut.is_none());
-    assert_eq!(w.drafts_discarded, 1);
+    let draft = w.private_draft.as_ref().unwrap();
+    assert!(
+        draft
+            .fake
+            .release_state(draft.ctx.release_id.unwrap())
+            .unwrap()
+            .0
+            .draft
+    );
+    assert!(draft.ctx.journal_path.exists());
+    assert!(!draft.fake.seen().iter().any(|r| r.method == "DELETE"));
 
     let mut w = World::new();
+    w.stage_private_draft = true;
     w.cut_code = 1;
     w.cut_claims = true;
     w.cut_finishes = false;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
     assert!(w.cut.is_some());
-    assert_eq!(w.drafts_discarded, 0, "the claimed journal owns recovery");
+    let draft = w.private_draft.as_ref().unwrap();
+    assert!(
+        draft.ctx.journal_path.exists(),
+        "the claimed journal owns recovery"
+    );
+    assert!(!draft.fake.seen().iter().any(|r| r.method == "DELETE"));
+}
+
+/// NEGATIVE CONTROL: the unconditional exit cleanup deletes the signed source
+/// pair and draft journal on the first unavailable step-7 read.
+#[test]
+fn step7_could_not_run_keeps_signed_source_draft_and_resume_adopts_it() {
+    let mut w = World::new();
+    w.sides = SideOrder::SignFirst;
+    w.stage_private_draft = true;
+    w.source_read_down = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with("REFUSED at 7/10 publish: COULD NOT RUN"),
+        "{last}"
+    );
+    assert!(w.cut.is_none());
+    let draft = w.private_draft.as_ref().unwrap();
+    let id = draft.ctx.release_id.unwrap();
+    let state = draft.fake.release_state(id).expect("signed draft retained");
+    assert!(state.0.draft);
+    for name in crate::channel::SOURCE_ATTESTATION_ASSETS {
+        assert!(state.1.iter().any(|(asset, _)| asset == name));
+    }
+    let journal = std::fs::read(&draft.ctx.journal_path).unwrap();
+    let receipt = std::fs::read(draft.ctx.dist.join("draft-bytes.toml")).unwrap();
+    let posts = draft.posts();
+    // The second caller reads the already-published source before starting sign.
+    // Rejudging the bundle also leaves an early preparation child to cancel.
+    w.records.retain(|(_, _, check), _| check != "measure");
+    let preparations = w.count("cut --sign-prepare");
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(w.count("cut --sign-prepare"), preparations + 1);
+    let draft = w.private_draft.as_ref().unwrap();
+    assert_eq!(draft.posts(), posts);
+    assert_eq!(std::fs::read(&draft.ctx.journal_path).unwrap(), journal);
+    assert!(draft.fake.release_state(id).unwrap().0.draft);
+    w.source_read_down = false;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}");
+    let draft = w.private_draft.as_ref().unwrap();
+    assert_eq!(draft.ctx.release_id, Some(id));
+    assert_eq!(draft.fake.release_state(id).unwrap(), state);
+    assert_eq!(draft.posts(), posts, "resume adopts without another POST");
+    assert_eq!(std::fs::read(&draft.ctx.journal_path).unwrap(), journal);
+    assert_eq!(
+        std::fs::read(draft.ctx.dist.join("draft-bytes.toml")).unwrap(),
+        receipt
+    );
+    assert!(!draft.fake.seen().iter().any(|r| r.method == "DELETE"));
+    draft.fake.assert_clean();
 }
 
 #[test]
@@ -6795,8 +7362,10 @@ fn a_persons_signal_is_no_red_and_adds_no_stop() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.count("build"), 1, "{:?}", w.calls);
 
-    // A signal before the slices' claims leaves later branches unstarted.
+    // With lint already judged, a signal before slice admission leaves the remaining
+    // tree checks unstarted: they still follow the slices' claims.
     let mut w = World::new();
+    w.records.insert((BUMP.into(), None, "lint".into()), "ok");
     w.build_claims_late = true;
     w.signal_at = Some("build");
     interrupted(&mut w);
@@ -6813,6 +7382,8 @@ fn a_persons_signal_is_no_red_and_adds_no_stop() {
 #[test]
 fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     let mut w = World::new();
+    // Lint's standing judgment leaves the tree's compile behind slice admission.
+    w.records.insert((BUMP.into(), None, "lint".into()), "ok");
     w.build_claims_late = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
@@ -6843,11 +7414,10 @@ fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     }
 }
 
-/// AN EXPORT WHOSE STAGING PUSH BEGAN FINISHES IT (Q4): the tree's red comes while the push runs;
-/// the export is not stopped, staging finishes and is attested, and R is still refused for the
-/// red. Negative control: a stop that fires on a branch whose push began ends the export stopped.
+/// Export validation finishes before the tree's red. No staging write is admitted.
+/// Negative control: the old graph's Remote target leaves BUMP attested here.
 #[test]
-fn a_red_leaves_an_export_whose_push_began_to_finish() {
+fn a_refused_tree_leaves_nothing_staged_after_export_passes() {
     let mut w = World::new();
     w.verify_outcomes.insert("test", "FAIL");
     w.verify_code = 1;
@@ -6865,26 +7435,36 @@ fn a_red_leaves_an_export_whose_push_began_to_finish() {
         last.starts_with("REFUSED at 4/10 qualify") && last.contains("FAILED test"),
         "{last}"
     );
-    assert!(
-        w.out
-            .iter()
-            .any(|l| l.contains("tree: RED at") && l.contains("staging push began, so it finishes")),
-        "{:#?}",
-        w.out
-    );
-    assert_eq!(phases(&w, "export"), ["started", "push-began", "passed"]);
-    assert_eq!(
-        w.attested.as_deref(),
-        Some(BUMP),
-        "the staging push finished"
-    );
+    assert_eq!(w.attested, None);
+    assert_eq!(w.count("stage --dry-run"), 1);
+    assert_eq!(w.count("stage"), 0);
     assert_eq!(w.count("publish"), 0);
+}
+
+#[test]
+fn a_passing_qualify_stages_after_parallel_work_before_publication() {
+    let mut w = World::new();
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let at = |call: &str| w.calls.iter().position(|c| c == call).unwrap();
+    assert_eq!(w.count("stage --dry-run"), 1);
+    assert_eq!(w.count("stage"), 1);
+    for earlier in [
+        "stage --dry-run",
+        "verify --tree",
+        "build",
+        "stage-fixtures",
+    ] {
+        assert!(at(earlier) < at("stage"), "{:?}", w.calls);
+    }
+    assert!(at("stage") < at("publish"));
+    assert_eq!(w.attested.as_deref(), Some(BUMP));
 }
 
 /// A COULD NOT RUN STOPS NOTHING (Q5): the tree could not run, and the build and the export,
 /// which work only once its end is told, finish: the bundle and its fixtures are kept and R is
-/// staged, so the next run resumes the tree alone. Negative control: a graph that stops the
-/// other branches on a COULD NOT RUN ends both stopped here, nothing built or staged.
+/// checked privately, so the next run resumes the tree before staging. Negative control: a graph
+/// that stops the other branches on a COULD NOT RUN ends both stopped here, nothing built.
 #[test]
 fn a_could_not_run_stops_nothing() {
     let mut w = World::new();
@@ -6912,7 +7492,7 @@ fn a_could_not_run_stops_nothing() {
         w.journal().unwrap().artifact.is_some(),
         "the bundle is kept"
     );
-    assert_eq!(w.attested.as_deref(), Some(BUMP));
+    assert_eq!(w.attested, None);
 
     w.verify_half = None;
     w.verify_passes = true;
@@ -6923,7 +7503,7 @@ fn a_could_not_run_stops_nothing() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(
         ["verify --tree", "build", "stage", "verify --bundle"].map(|c| w.count(c)),
-        [1, 0, 0, 1],
+        [1, 0, 1, 1],
         "{:?}",
         w.calls
     );
@@ -7376,7 +7956,7 @@ fn fix_takes_its_commits_and_no_flag_that_starts_a_line() {
 #[test]
 fn a_public_version_is_major_minor_zero() {
     use crate::release::public_version;
-    assert_eq!(public_version("0.101.0"), Some((0, 101)));
+    assert_eq!(public_version("0.101.0"), Some((0, 101, 0)));
     for bad in ["0.101", "0.101.1", "0.101.0-dev", "v0.1.0", "0..0", ""] {
         assert_eq!(public_version(bad), None, "{bad}");
     }

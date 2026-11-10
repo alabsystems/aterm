@@ -604,7 +604,7 @@ impl PaletteState {
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
                 MenuAction::ReopenClosedTab => row.enabled = live.can_reopen_closed_tab,
                 MenuAction::ReopenClosedView => row.enabled = live.can_reopen_closed_view,
-                MenuAction::OpenMarkdown | MenuAction::OpenEditor => {
+                MenuAction::OpenEditor => {
                     row.enabled = live.local_file_picker_available;
                 }
                 MenuAction::SplitVertical
@@ -2906,7 +2906,7 @@ mod tests {
     #[test]
     fn local_file_open_rows_track_platform_picker_availability() {
         let mut state = PaletteState::new();
-        let actions = [MenuAction::OpenMarkdown, MenuAction::OpenEditor];
+        let actions = [MenuAction::OpenEditor];
 
         state.resolve(&PaletteLive {
             local_file_picker_available: false,

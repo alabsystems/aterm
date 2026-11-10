@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_uds::deadline::{self, RunError};
-use aterm_uds::spawnfd;
+use aterm_uds::spawnfd::{self, Tether as _};
 
 use crate::error::{Error, Result, SideEffect};
 
@@ -310,6 +310,12 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
     // Keep the private input directory until the command drops its descriptor.
     let input_dir;
     let mut cmd = spawnfd::command(&spec.program);
+    // A killed frontend cannot run its collector. Git ends none of its children
+    // on a SIGTERM, so the tie ends the group this child leads (`process_group(0)`
+    // in the collector): on Darwin its watcher signals the whole group, which its
+    // anchor holds as this child's (`aterm_uds::tether`), and stays for the group
+    // should git exit first. A descendant that left the group is not reached.
+    cmd.tether();
     cmd.args(&spec.args);
     cmd.env_clear();
     cmd.envs(spec.env.iter().map(|(name, value)| (name, value)));

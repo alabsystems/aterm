@@ -577,6 +577,28 @@ pub struct Replica {
     /// The claims ring's tables within [`crate::clock::BAND`] periods of one period, by digest,
     /// and that period: what a peer that sends no mark offered is matched against.
     offers: Arc<Mutex<Option<RingOffers>>>,
+    /// The bootstrap the last open of this replica's vault gave, which each round takes while it
+    /// stands ([`Bootstrap::stands`], [`Self::bootstrap`]) and opens afresh, and keeps, only once
+    /// it falls: a quiet round's open re-derived from unchanged files the bootstrap the round
+    /// before it had (about a seventh of its CPU: over origin/main `7514a3dd04`, 14.6% of a
+    /// sustained round's on-CPU samples over a long log and 16.3% over a short one, 2026-11-09).
+    ///
+    /// What a round that takes it gives up, by decision: the vault is judged, while the bootstrap
+    /// stands, only by the observation memo every session already judges it by
+    /// (`client::observe_commons_quiet`), where each open read it afresh, and its pinned files by
+    /// the digests kept while they stand, as every session's custody check judges them, where each
+    /// open read them again; the round makes no
+    /// folder durable, where each open made the vault's folder, `commons/` and the control
+    /// journal's folder durable, as no session's read of the journal does; and it takes neither
+    /// custody lock, which only the custody writers that change a file `stands` judges (creation,
+    /// recovery, an ingest) need. The bootstrap
+    /// holds this Mac's device seed and age identity for the replica's life, as its endpoint
+    /// already holds the device's signing identity (`Endpoint`'s `identity`) and the runtime's
+    /// serve its own bootstrap.
+    kept: Mutex<Option<Arc<Bootstrap>>>,
+    /// The bootstraps [`Self::bootstrap`] opened afresh, where none it kept stood.
+    #[cfg(test)]
+    bootstrap_opens: std::sync::atomic::AtomicUsize,
     /// The clock that places the ring windows, in place of the system's.
     #[cfg(test)]
     pub(crate) ring_clock: Option<u64>,
@@ -600,6 +622,7 @@ impl Replica {
         let session = Session::observe(&bootstrap)?;
         let trust = bootstrap.trust();
         let actor = session.actor();
+        drop(session);
         let mut map = BTreeMap::new();
         for (scope, path) in tables {
             if scope.trust() != trust || map.insert(scope.digest(), (scope, path)).is_some() {
@@ -617,6 +640,9 @@ impl Replica {
             marks: true,
             witnesses: true,
             offers: Arc::default(),
+            kept: Mutex::new(Some(Arc::new(bootstrap))),
+            #[cfg(test)]
+            bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             ring_clock: None,
             #[cfg(test)]
@@ -629,11 +655,13 @@ impl Replica {
         let bootstrap = Bootstrap::cached(&paths)
             .map_err(crate::table::failure)?
             .ok_or_else(|| Error::new("Commons repair has no secrets custody"))?;
-        Self::commons_from_bootstrap(paths, config, &bootstrap)
+        Self::commons_from_bootstrap(paths, config, bootstrap)
     }
 
     /// [`Self::commons`] sharing an absolute local-admission deadline. It still
-    /// caches no grant: every application batch revalidates custody/membership.
+    /// caches no grant: every application batch revalidates custody/membership,
+    /// and its rounds take the bootstrap it opened only while it stands
+    /// ([`Self::bootstrap`]).
     pub fn commons_until(
         paths: Paths,
         config: PathBuf,
@@ -642,21 +670,19 @@ impl Replica {
         let bootstrap = Bootstrap::cached_until(&paths, deadline)
             .map_err(crate::table::failure)?
             .ok_or_else(|| Error::new("Commons repair has no secrets custody"))?;
-        Self::commons_from_bootstrap(paths, config, &bootstrap)
+        Self::commons_from_bootstrap(paths, config, bootstrap)
     }
 
-    fn commons_from_bootstrap(
-        paths: Paths,
-        config: PathBuf,
-        bootstrap: &Bootstrap,
-    ) -> Result<Self> {
+    fn commons_from_bootstrap(paths: Paths, config: PathBuf, bootstrap: Bootstrap) -> Result<Self> {
         let trust = bootstrap.trust();
         let actor = bootstrap
             .request()
             .map_err(crate::table::failure)?
             .binding()
             .actor();
-        Ok(Self::commons_context(paths, config, trust, actor))
+        let mut replica = Self::commons_context(paths, config, trust, actor);
+        replica.kept = Mutex::new(Some(Arc::new(bootstrap)));
+        Ok(replica)
     }
 
     pub(crate) fn commons_from_session(
@@ -691,6 +717,9 @@ impl Replica {
             marks: true,
             witnesses: true,
             offers: Arc::default(),
+            kept: Mutex::new(None),
+            #[cfg(test)]
+            bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             ring_clock: None,
             #[cfg(test)]
@@ -801,7 +830,7 @@ impl Replica {
         }
         // Acquire every source before session admission and keep it through
         // this local batch. No guard survives the return to network I/O.
-        let _sources =
+        let mut sources =
             crate::generation::local_source_reads_until(bootstrap.paths(), admission_deadline())?;
         #[cfg(test)]
         tests::session_boundary(0);
@@ -809,12 +838,19 @@ impl Replica {
         // custody. Only a mutation waits for the control writer; reads use its
         // acknowledged prefix. No session survives this local batch. The session's
         // open, its peer and its observation stand for one moment of the vault, and
-        // read through one look at it, which ends before the batch runs. The look
-        // observes the state lock as the sources above already do, through the open's
-        // waits, so while their observation still guards the lock at the vault's path
-        // it keeps out no writer they let in.
-        let look = aterm_secrets::client::VaultLook::new(bootstrap.paths());
-        let session = if write {
+        // read through one look at it. A read's look is its batch's source read of the
+        // vault (the first of `sources`, this vault's), which keeps every writer of the
+        // state lock's files out from before the admission until the batch returns, and
+        // its session keeps it: the batch's own checks (its currency, its stores'
+        // contexts, its peers' roster) judge the moment its admission did. A write's
+        // look observes the lock beside the sources and ends before its batch runs,
+        // whose checks each observe the vault again.
+        let look = if write || sources.is_empty() {
+            aterm_secrets::client::VaultLook::new(bootstrap.paths())
+        } else {
+            sources.remove(0).into_look(bootstrap.paths())
+        };
+        let mut session = if write {
             Session::open_until_in(bootstrap, admission_deadline(), Some(&look))
         } else {
             Session::observe_in(bootstrap, Some(&look))
@@ -833,8 +869,51 @@ impl Replica {
         {
             return Err(Error::new("control history changed during table repair"));
         }
-        drop(look);
+        if write {
+            drop(look);
+        } else {
+            session.keep_look(look);
+        }
         run(&session)
+    }
+
+    /// The bootstrap a round admits its batches through: the one this replica keeps while it
+    /// stands ([`Bootstrap::stands`]), else a fresh open of its vault, kept in its place. A round
+    /// keeps the one it took; another round's fresh open only replaces what this replica keeps.
+    fn bootstrap(&self) -> Result<Arc<Bootstrap>> {
+        let kept = || {
+            self.kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let held = kept().clone();
+        if let Some(held) = held {
+            if held.stands().is_ok() {
+                return Ok(held);
+            }
+            let mut slot = kept();
+            if slot.as_ref().is_some_and(|slot| Arc::ptr_eq(slot, &held)) {
+                *slot = None;
+            }
+        }
+        let bootstrap = Bootstrap::cached_until(&self.paths, admission_deadline())
+            .map_err(|error| {
+                Error::from(error).context("table repair bootstrap custody admission")
+            })?
+            .ok_or_else(|| Error::new("table repair lost secrets custody"))?;
+        #[cfg(test)]
+        self.bootstrap_opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bootstrap = Arc::new(bootstrap);
+        *kept() = Some(Arc::clone(&bootstrap));
+        Ok(bootstrap)
+    }
+
+    /// How many bootstraps [`Self::bootstrap`] opened afresh.
+    #[cfg(test)]
+    pub(crate) fn test_bootstrap_opens(&self) -> usize {
+        self.bootstrap_opens
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn round(&self, peer: impl Into<Option<Actor>>) -> Result<Round<'_>> {
@@ -843,11 +922,7 @@ impl Replica {
             .as_ref()
             .map(|(_, config)| crate::catalog::policy::Policy::read(config))
             .transpose()?;
-        let bootstrap = Bootstrap::cached_until(&self.paths, admission_deadline())
-            .map_err(|error| {
-                Error::from(error).context("table repair bootstrap custody admission")
-            })?
-            .ok_or_else(|| Error::new("table repair lost secrets custody"))?;
+        let bootstrap = self.bootstrap()?;
         let (observation, legacy_observation) =
             self.observe(&bootstrap, peer, None, false, |session| {
                 Ok((session.observation()?, session.legacy_observation()?))
@@ -1322,7 +1397,8 @@ struct Round<'a> {
     replica: &'a Replica,
     /// When this side began the round, before its probe: a peer builds its mark after this.
     started: Instant,
-    bootstrap: Bootstrap,
+    /// What its batches are admitted through ([`Replica::bootstrap`]).
+    bootstrap: Arc<Bootstrap>,
     observation: [u8; 64],
     legacy_observation: Option<[u8; 64]>,
     /// The ring windows' clock for this whole exchange.

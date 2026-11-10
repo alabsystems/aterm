@@ -48,8 +48,6 @@ fn roster() -> SwarmRoster {
 fn policy() -> SwarmPolicy {
     SwarmPolicy {
         network_id: None,
-        reserved_labels: vec!["m60".to_owned(), "m20".to_owned()],
-        release_hosts: vec!["m61".to_owned(), "m8".to_owned()],
         servers: vec![
             "m8".to_owned(),
             "m63".to_owned(),
@@ -74,8 +72,12 @@ fn seats() -> Vec<(String, String)> {
 }
 
 /// Every number admission keeps off a newcomer is held from this Mac's rename, with what holds
-/// it; this Mac's own row and seats hold nothing; and the policy's servers are the numbers they
-/// are dialed by, a bare label or a URL's `m<N>.local`.
+/// it; this Mac's own row and seats hold nothing; the policy holds no number (no label is
+/// reserved, owner ruling 2026-11-09: not `m3`, not a steward's, not a server's); and the
+/// policy's servers are the numbers they are dialed by, a bare label or a URL's `m<N>.local`.
+///
+/// NEGATIVE CONTROL: hold `m3` by default or hold the policy's stewards or servers (the
+/// reservations this ruling removed) and the `held` equality and the free loop fail.
 #[test]
 fn the_vault_holds_what_admission_keeps_and_this_macs_own_is_free() {
     let labels = assemble(ME, Some(&roster()), Some(&policy()), &seats());
@@ -85,7 +87,6 @@ fn the_vault_holds_what_admission_keeps_and_this_macs_own_is_free() {
         .map(|(num, why)| (num.to_string(), *why))
         .collect();
     let want = [
-        ("m3", LabelHold::Reserved),
         ("m20", LabelHold::Label),
         ("m21", LabelHold::Alias),
         ("m22", LabelHold::Claim),
@@ -95,17 +96,18 @@ fn the_vault_holds_what_admission_keeps_and_this_macs_own_is_free() {
         ("m35", LabelHold::Label),
         ("m40", LabelHold::Denied),
         ("m50", LabelHold::Seat),
-        ("m60", LabelHold::Reserved),
-        ("m61", LabelHold::ReleaseHost),
-        ("m62", LabelHold::Steward),
-        ("m63", LabelHold::Server),
-        ("m64", LabelHold::Server),
     ];
     let want: Vec<_> = want
         .iter()
         .map(|(num, why)| ((*num).to_owned(), *why))
         .collect();
     assert_eq!(held, want);
+    for free in ["m3", "m62", "m63", "m64"] {
+        assert!(
+            !labels.held.contains_key(&n(free)),
+            "no Mac holds {free}, so nothing does: {labels:?}"
+        );
+    }
     assert_eq!(
         labels.own,
         BTreeSet::from([n("m5"), n("m8"), n("m9"), n("m70")]),
@@ -121,7 +123,7 @@ fn the_vault_holds_what_admission_keeps_and_this_macs_own_is_free() {
 
 /// This Mac's own numbers never free another Mac's hold: not a clash's suffixed seat beside the
 /// first claimant's bare one, not a sheet number two rows claim, not this Mac's stale
-/// `[machines]` name leading with another Mac's label. They free only a role's hold.
+/// `[machines]` name leading with another Mac's label.
 #[test]
 fn this_macs_own_numbers_never_free_another_macs() {
     let roster = SwarmRoster {
@@ -144,7 +146,8 @@ fn this_macs_own_numbers_never_free_another_macs() {
         !labels.own.contains(&n("m40")),
         "a suffixed seat's number is the first claimant's"
     );
-    // A role's label this Mac holds stays its own; the same policy read by another Mac holds it.
+    // A steward's label is held only by the Mac whose row has it: this Mac reads its own m8 as
+    // free, another Mac reads it as this Mac's label, and a steward no Mac is holds nothing.
     let steward = SwarmPolicy {
         stewards: vec![StewardPolicy {
             label: "m8".to_owned(),
@@ -157,10 +160,21 @@ fn this_macs_own_numbers_never_free_another_macs() {
     assert!(!mine.held.contains_key(&n("m8")));
     let theirs = assemble("age1stranger", Some(&roster), Some(&steward), &[]);
     assert_eq!(theirs.held.get(&n("m8")), Some(&LabelHold::Label));
+    let nobody = SwarmPolicy {
+        stewards: vec![StewardPolicy {
+            label: "m99".to_owned(),
+            rank: 0,
+            always_on: true,
+        }],
+        ..SwarmPolicy::default()
+    };
+    let stranger = assemble("age1stranger", Some(&roster), Some(&nobody), &[]);
+    assert!(!stranger.held.contains_key(&n("m99")), "{stranger:?}");
 }
 
 /// The rules' edges: a denied row's claim and `[machines]` name hold nothing (as admission reads
-/// a denied row), nor does a claim that is no bare number; with nothing read only `m3` is held;
+/// a denied row), nor does a claim that is no bare number; with nothing read nothing is held,
+/// `m3` included;
 /// and the same rows read as another Mac's hold every one of this Mac's numbers.
 #[test]
 fn a_denied_rows_claim_a_malformed_claim_and_nothing_read() {
@@ -171,14 +185,7 @@ fn a_denied_rows_claim_a_malformed_claim_and_nothing_read() {
             "{free} is free: {labels:?}"
         );
     }
-    let nothing = assemble(ME, None, None, &[]);
-    assert_eq!(
-        nothing,
-        LabLabels {
-            held: BTreeMap::from([(n("m3"), LabelHold::Reserved)]),
-            ..LabLabels::default()
-        }
-    );
+    assert_eq!(assemble(ME, None, None, &[]), LabLabels::default());
     let stranger = assemble("age1stranger", Some(&roster()), None, &seats());
     for num in ["m5", "m8", "m9", "m70"] {
         assert!(stranger.held.contains_key(&n(num)), "{num}: {stranger:?}");

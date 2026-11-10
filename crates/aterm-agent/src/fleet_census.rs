@@ -1864,7 +1864,8 @@ fn collect_local_census_inputs_until(
     if let Some(ref paths) = home_paths
         && (paths.dir.join("commons").is_dir()
             || paths.records_data_file().is_ok_and(|path| path.is_file()))
-        && let Ok(Some(bootstrap)) = aterm_secrets::commons::bootstrap::Bootstrap::cached(paths)
+        && let Ok(Some(bootstrap)) =
+            aterm_secrets::commons::bootstrap::Bootstrap::cached_until(paths, deadline)
         && let Ok(Some(access)) = bootstrap.access()
     {
         let mut count = 0usize;

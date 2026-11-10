@@ -207,6 +207,7 @@ mod tests {
         let me = Me {
             uuid: "11111111111111111111111111111111".into(),
             label: Some("m7".into()),
+            chosen: None,
             hw_hint: "aaaaaaaaaaaaaaaa".into(),
             enrolled_ms: None,
         };

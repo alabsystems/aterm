@@ -372,11 +372,23 @@ pub fn previous_release(
     version: &str,
     tags: &str,
 ) -> Result<Option<(String, String)>> {
+    recorded_release(ledger_text, version, tags, false)
+}
+
+fn recorded_release(
+    ledger_text: &str,
+    version: &str,
+    tags: &str,
+    include_current: bool,
+) -> Result<Option<(String, String)>> {
     let mut tags = crate::gates::tag_commits(tags);
     let shipped = |v: &str| tags.contains_key(&format!("v{v}"));
-    let Some(release) = crate::gates::predecessor_release(ledger_text, version, &shipped)
-        .map_err(|e| Error::new(format!("harness versions: {e}")))?
-    else {
+    let selected = if include_current {
+        crate::gates::release_through(ledger_text, version, &shipped)
+    } else {
+        crate::gates::predecessor_release(ledger_text, version, &shipped)
+    };
+    let Some(release) = selected.map_err(|e| Error::new(format!("harness versions: {e}")))? else {
         return Ok(None);
     };
     let commit = tags.remove(&format!("v{release}")).unwrap_or_default();
@@ -391,11 +403,7 @@ fn bump_base_release(
     version: &str,
     tags: &str,
 ) -> Result<Option<(String, String)>> {
-    previous_release(
-        ledger_text,
-        &crate::publish::bump_minor_release(version)?,
-        tags,
-    )
+    recorded_release(ledger_text, version, tags, true)
 }
 
 /// The files [`bump`] wrote for `owed`: each harness's version file, and the CHANGELOG when
@@ -440,11 +448,15 @@ fn apply_with(
     let version = crate::publish::release_version_from_workspace(
         &crate::publish::workspace_version(&manifest)?,
     )?;
-    let next = crate::publish::bump_minor_release(&version)?;
+    let ceiling = crate::gates::version_triple(&version)
+        .ok_or_else(|| Error::new(format!("cannot order product release {version}")))?;
     let mut names = Vec::new();
     for record in crate::ledger::parse(&ledger_text)?.iter().rev() {
         let name = format!("v{}", record.version);
-        if record.version != next && !names.contains(&name) {
+        // Match release_through: retired ledger versions are not candidate baselines.
+        if crate::gates::version_triple(&record.version).is_some_and(|key| key <= ceiling)
+            && !names.contains(&name)
+        {
             names.push(name);
         }
     }
@@ -894,15 +906,23 @@ fn read() {}
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
         command(&["tag", "-a", "v0.1.0", "-m", "release", &released]);
+        command(&["tag", "-a", "v0.3.0", "-m", "future release", &released]);
         command(&["init", "-q", "--bare", bare.to_str().unwrap()]);
         command(&["push", "-q", bare.to_str().unwrap(), "refs/tags/v0.1.0"]);
+        command(&["push", "-q", bare.to_str().unwrap(), "refs/tags/v0.3.0"]);
         command(&[
             "config",
             "remote.origin.url",
             "https://github.com/fixture/app.git",
         ]);
         std::fs::write(source.join("Cargo.toml"), "[workspace.package]\nversion = \"0.2.0\"\nrepository = \"https://github.com/fixture/app\"\n").unwrap();
-        std::fs::write(source.join(crate::ledger::LEDGER_FILE), "1 0.1.0\n").unwrap();
+        // Match release_through's eligibility: old two-component ledger rows
+        // are retained history, and a future canonical release is above the ceiling.
+        std::fs::write(
+            source.join(crate::ledger::LEDGER_FILE),
+            "1 0.0\n2 0.1.0\n3 0.3.0\n",
+        )
+        .unwrap();
         let origin = crate::github_remote::claim_fixture(&source, &bare);
         assert_eq!(
             origin.get("refs/heads/main").unwrap(),
@@ -1011,6 +1031,20 @@ fn read() {}
             previous_release(ledger, "0.2.0", tags).unwrap(),
             Some(("0.1.0".to_owned(), "abc123".to_owned())),
             "the release gate still compares a candidate against its predecessor"
+        );
+    }
+
+    #[test]
+    fn the_last_daily_counter_is_inspectable_without_allocating_a_successor() {
+        let ledger = "# seed\n1 1.20261109.1\n2 1.20261109.999999999\n3 1.20261110.1\n";
+        let tags = "old\trefs/tags/v1.20261109.1\nlast\trefs/tags/v1.20261109.999999999\nfuture\trefs/tags/v1.20261110.1\n";
+        assert_eq!(
+            bump_base_release(ledger, "1.20261109.999999999", tags).unwrap(),
+            Some(("1.20261109.999999999".into(), "last".into()))
+        );
+        assert_eq!(
+            bump_base_release(ledger, "1.20261109.1", tags).unwrap(),
+            Some(("1.20261109.1".into(), "old".into()))
         );
     }
 

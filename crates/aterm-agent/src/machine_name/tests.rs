@@ -1063,9 +1063,9 @@ fn a_fleet_key_is_in_and_a_home_with_no_vault_is_out() {
     assert!(super::standing_vault().is_none(), "a test reads no vault");
 }
 
-/// The vault's labels on today's lab (§11.86): a number its roster, log or policy gives another
-/// Mac or role is refused with what holds it, changing nothing; the same number with no labels
-/// read renames, which shows the labels are what refuse.
+/// The vault's labels on today's lab (§11.86): a number its roster or log gives another Mac is
+/// refused with what holds it, changing nothing; the same number with no labels read renames,
+/// which shows the labels are what refuse.
 #[test]
 fn a_number_the_vault_gives_another_mac_is_refused_with_its_holder() {
     let root = state();
@@ -1074,7 +1074,7 @@ fn a_number_the_vault_gives_another_mac_is_refused_with_its_holder() {
         num: num(20),
         nick: Some(Nickname::parse("Heron").expect("a nickname")),
     };
-    for hold in [LabelHold::Label, LabelHold::Seat, LabelHold::Reserved] {
+    for hold in [LabelHold::Label, LabelHold::Seat, LabelHold::Denied] {
         let lab = LabLabels {
             held: BTreeMap::from([(num(20), hold)]),
             ..LabLabels::default()
@@ -1208,9 +1208,9 @@ fn keeping_the_stored_number_reads_no_labels_but_a_number_change_requires_them()
         "a new explicit choice requires current labels even when its number was seeded"
     );
     assert_eq!(file::read(root.path()).unwrap(), Some(seeded.clone()));
-    let reserved = || {
+    let held_elsewhere = || {
         Ok(LabLabels {
-            held: BTreeMap::from([(num(7), client::LabelHold::Reserved)]),
+            held: BTreeMap::from([(num(7), client::LabelHold::Seat)]),
             ..LabLabels::default()
         })
     };
@@ -1218,14 +1218,14 @@ fn keeping_the_stored_number_reads_no_labels_but_a_number_change_requires_them()
         set_name(
             root.path(),
             &same,
-            reserved,
+            held_elsewhere,
             ByKind::Person,
             unread,
             NOW,
             false
         )
         .is_err(),
-        "a fresh role reservation prevents turning a stale seeded number into a chosen claim"
+        "another Mac's fresh seat on m7 prevents turning a stale seeded number into a chosen claim"
     );
     assert_eq!(file::read(root.path()).unwrap(), Some(seeded));
     let selected = set_name(

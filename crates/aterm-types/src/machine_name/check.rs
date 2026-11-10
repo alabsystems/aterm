@@ -55,9 +55,9 @@ pub enum Verdict {
         /// The holder.
         by: NodeId,
     },
-    /// Another Mac's vault label names it: a roster label, alias or claim, a log seat, a denied
-    /// label or a role the policy keeps (a [`Kept::Label`], or another node's [`super::Labels`]).
-    /// Other Macs reach that Mac or role by it, so neither a rename nor a take applies.
+    /// Another Mac's vault label names it: a roster label, alias or claim, a log seat or a denied
+    /// label (a [`Kept::Label`], or another node's [`super::Labels`]). Other Macs reach that Mac
+    /// by it, so neither a rename nor a take applies.
     Labelled {
         /// The node the label is bound to, where known.
         by: Option<NodeId>,
@@ -72,8 +72,6 @@ pub enum Verdict {
         /// The node it was.
         of: NodeId,
     },
-    /// A machine that left long ago had it, and only the number is kept.
-    Reserved,
     /// Another machine had it earlier, a machine that left included.
     EarlierName {
         /// That machine's node.
@@ -92,7 +90,6 @@ impl Verdict {
             Self::Free
                 | Self::TakesAuto { .. }
                 | Self::Retired { .. }
-                | Self::Reserved
                 | Self::EarlierName { .. }
                 | Self::Planned
         )
@@ -235,13 +232,6 @@ fn classify(fleet: &Fleet<'_>, me: NodeId, num: Number) -> Verdict {
         .min();
     if let Some(of) = retired {
         return Verdict::Retired { of };
-    }
-    let reserved = fleet
-        .kept
-        .iter()
-        .any(|kept| matches!(kept, Kept::Reserved { lo, hi } if (*lo..=*hi).contains(&num.get())));
-    if reserved {
-        return Verdict::Reserved;
     }
     let left = tombstones
         .filter(|(_, last)| last.was.iter().any(|was| was.num == num))

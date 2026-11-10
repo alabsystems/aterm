@@ -2534,6 +2534,126 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
     );
 }
 
+/// A CLICK'S YOLO OUTLIVES IT (owner, 2026-11-09: "it should go to yolo when I click"): the line a
+/// click on the off chip relaunches holds `--dangerously-skip-permissions` once, whatever
+/// permission flags its launch held (a mode, the allow flag that only puts bypass on the
+/// shift+tab ring), and that line is the launch every later restart reads. What a later restart
+/// (an upgrade, an account move, `aterm ctl restart`) types follows the mode the session is in:
+/// - the pill in bypass, or no reading at all: the flag, as launched;
+/// - no pill and a transcript whose last row is the mode the click left, written before the
+///   second the clicked process started in ([`transcript_mode`]): still the flag, since that row is not this
+///   process's;
+/// - the pill in another mode (the person shift+tabbed out): that mode, bypass kept on the ring by
+///   the allow flag, and no bypass flag, which beside a mode would launch in bypass;
+/// - the pill back in bypass on that line: the flag again, alone, so a routine restart never turns
+///   off yolo the person is in.
+///
+/// NEGATIVE CONTROLS: a row this process may have written does take the line out of bypass; a
+/// line with no bypass on its ring is not taken into it by any reading.
+#[test]
+fn a_clicks_bypass_flag_follows_the_mode_through_every_later_restart() {
+    use crate::harness::upgrade::{BYPASS_FLAG, permission_click_argv, rewrite_argv};
+    use crate::supervise::policy::turn_end::PermissionTo;
+    const ID: &str = "0badf00d-1111-2222-3333-4444555566ac";
+    const ALLOW: &str = "--allow-dangerously-skip-permissions";
+    let line = |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).to_string()).collect() };
+    let count = |argv: &[String], flag: &str| argv.iter().filter(|w| *w == flag).count();
+    let launches: [&[&str]; 4] = [
+        &["claude"],
+        &["claude", "--permission-mode", "plan", "--model", "opus"],
+        &["claude", ALLOW, "--permission-mode=auto", "--resume", ID],
+        &["claude", BYPASS_FLAG, "--model", "opus"],
+    ];
+    for launch in launches {
+        let clicked = permission_click_argv(&line(launch), PermissionTo::Bypass);
+        assert_eq!(count(&clicked, BYPASS_FLAG), 1, "{launch:?}: {clicked:?}");
+        assert!(
+            !clicked
+                .iter()
+                .any(|w| w.contains("permission-mode") || w == ALLOW),
+            "{launch:?}: and no other permission flag: {clicked:?}"
+        );
+        // The relaunched process's argv is the launch a later restart rewrites.
+        let resumed = rewrite_argv(&clicked, ID).expect("the click's line resumes");
+        let stale = transcript_mode(Some("plan".to_string()), Some(1_000), Some(1_001));
+        assert_eq!(stale, None, "a row older than the clicked process");
+        for mode in [Some("bypassPermissions"), None, stale.as_deref()] {
+            assert_eq!(
+                with_permission_mode(resumed.clone(), mode),
+                resumed,
+                "{launch:?} {mode:?}: as the click launched it"
+            );
+        }
+        let left = with_permission_mode(resumed.clone(), Some("plan"));
+        assert_eq!(
+            (count(&left, BYPASS_FLAG), count(&left, ALLOW)),
+            (0, 1),
+            "{launch:?}: out of bypass by shift+tab, bypass still on the ring: {left:?}"
+        );
+        assert!(left.windows(2).any(|w| w == ["--permission-mode", "plan"]));
+        let back = with_permission_mode(left.clone(), Some("bypassPermissions"));
+        assert_eq!(
+            (count(&back, BYPASS_FLAG), count(&back, ALLOW)),
+            (1, 0),
+            "{launch:?}: back in bypass by shift+tab, the flag is on the line again: {back:?}"
+        );
+        assert!(
+            !back.iter().any(|w| w.contains("permission-mode")),
+            "{launch:?}: and no mode beside it: {back:?}"
+        );
+        assert_eq!(
+            &back[back.len() - 2..],
+            ["--resume", ID],
+            "{launch:?}: the resume pair stays last"
+        );
+        assert_eq!(
+            with_permission_mode(back.clone(), Some("bypassPermissions")),
+            back,
+            "{launch:?}: and it stays there"
+        );
+        // Control: a row written after the second the process started in can be its own.
+        let own = transcript_mode(Some("plan".to_string()), Some(1_002), Some(1_001));
+        assert_eq!(own.as_deref(), Some("plan"));
+        assert_eq!(with_permission_mode(resumed.clone(), own.as_deref()), left);
+    }
+    // Control: no bypass on the ring, no way into it.
+    let plain = rewrite_argv(&line(&["claude", "--permission-mode", "plan"]), ID).expect("resumes");
+    assert_eq!(
+        with_permission_mode(plain.clone(), Some("bypassPermissions")),
+        plain
+    );
+}
+
+/// WHAT A TRANSCRIPT ROW SAYS OF THE RUNNING PROCESS ([`transcript_mode`]): nothing where the
+/// transcript was last written before the process started or in the second it started in, and
+/// never bypass; with either time unread the row stands, as it does once the transcript was
+/// written in a later second.
+#[test]
+fn a_transcripts_mode_row_is_read_only_where_it_can_be_this_processs() {
+    let row = |mode: &str| Some(mode.to_string());
+    for written in [99, 100] {
+        assert_eq!(transcript_mode(row("plan"), Some(written), Some(100)), None);
+    }
+    for (written, started) in [
+        (Some(101), Some(100)),
+        (None, Some(100)),
+        (Some(99), None),
+        (None, None),
+    ] {
+        assert_eq!(
+            transcript_mode(row("plan"), written, started).as_deref(),
+            Some("plan"),
+            "{written:?} {started:?}"
+        );
+        assert_eq!(
+            transcript_mode(row("bypassPermissions"), written, started),
+            None,
+            "{written:?} {started:?}: a row never takes a line into bypass"
+        );
+        assert_eq!(transcript_mode(None, written, started), None);
+    }
+}
+
 /// The ask of a click on the permission chip toward `to`, at Unix second `at`.
 fn click_ask(
     to: crate::supervise::policy::turn_end::PermissionTo,

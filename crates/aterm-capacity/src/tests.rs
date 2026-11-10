@@ -4933,13 +4933,37 @@ fn the_floor_is_the_watchs_own() {
     assert_eq!(pinned.lines("container:disk3", total, now).floor, 100 * GIB);
     let off = written("[disk]\nauto_free_gib = 0\n").lines("container:disk3", total, now);
     assert_eq!(off.floor, 0);
-    assert_eq!(floor::admission_floor(&off), 8 * GIB, "the emergency line");
+    assert_eq!(
+        floor::admission_floor(written("[disk]\nauto_free_gib = 0\n").knobs, &off),
+        8 * GIB,
+        "the emergency line"
+    );
     assert_eq!(
         written("[disk]\nauto_free_gib = \"lots\"\n[other]\nauto_free_gib = 99\n").knobs,
         floor::Knobs::default(),
         "a knob that is no whole number, or below another table, is unwritten"
     );
     assert_eq!(written("not toml [").knobs, floor::Knobs::default());
+}
+
+/// The 233.8 GiB request on m118 combined a 46.8 GiB measured claim with a 187 GiB
+/// cleanup floor. That floor is spare room for builds, not additional bytes this run writes.
+/// The old expression is the negative control; an explicit owner floor still applies.
+#[test]
+fn measured_claims_do_not_add_the_automatic_cleanup_reserve() {
+    let knobs = floor::Knobs::default();
+    let lines = floor::lines(knobs, Some(3730 * GIB), Some(120 * GIB));
+    let measured = 468 * GIB / 10;
+    assert_eq!(lines.floor, 187 * GIB);
+    assert_eq!(crate::gib(measured + lines.floor), "233.8 GiB");
+    assert_eq!(floor::admission_floor(knobs, &lines), 8 * GIB);
+    assert_eq!(
+        crate::gib(measured + floor::admission_floor(knobs, &lines)),
+        "54.8 GiB"
+    );
+    let pinned = floor::Knobs::from_toml("[disk]\nauto_free_gib = 20\n");
+    let lines = floor::lines(pinned, Some(3730 * GIB), Some(120 * GIB));
+    assert_eq!(floor::admission_floor(pinned, &lines), 20 * GIB);
 }
 
 /// A local volume is placed with the platform's error boxes off, and the caller's mode is

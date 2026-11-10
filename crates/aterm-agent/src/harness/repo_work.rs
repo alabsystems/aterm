@@ -1402,8 +1402,11 @@ impl PrivateIndex {
     /// it reads as an empty one, every tracked file then new.
     fn stands(&self) -> bool {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|meta| (meta.dev(), meta.ino()) == self.file)
+        self.path
+            .parent()
+            .zip(self.path.file_name().and_then(|name| name.to_str()))
+            .and_then(|(dir, name)| aterm_uds::private_file::open_private(dir, name).ok())
+            .is_some_and(|(_, meta)| (meta.dev(), meta.ino()) == self.file)
     }
 }
 
@@ -1428,13 +1431,14 @@ fn private_index_folder() -> Option<PathBuf> {
 /// whole) checks those files' contents as a status would, then writes the copy later than every
 /// file it lists. The refresh writes no untracked cache, whose folder records the later time
 /// would trust as a status of the source would not, and keeps every skip-worktree bit, which a
-/// status of the source clears for a present file only as it reads. It is named by the source's path and its identity, length and times, so a
-/// moved index is copied again, and kept only where those tell apart every later state of the
-/// index ([`aterm_uds::private_file::stamp_settled`]: its last change a second before the read,
-/// on a volume whose times this kernel sets); it is renamed into place only once refreshed.
+/// status of the source clears for a present file only as it reads. Every call reads the current
+/// source index before choosing a copy, named by its path, exact bytes and modification time.
+/// The modification time remains part of the input to git's racy-clean check; filesystem clock
+/// precision and a source replacement's inode do not decide whether bytes changed. A copy is
+/// renamed into place only once refreshed and is opened under the private-file rules before use.
 /// `None`, the repository's own index read as before, where the index cannot be found, read,
-/// copied or refreshed, changed within that second or lies on another kind of volume, or the
-/// cache folder cannot be made private.
+/// copied or refreshed, changes during its read, exhausts the existing read deadline, or the
+/// cache folder or copy is not private.
 #[cfg(unix)]
 fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
     use std::io::{Read as _, Write as _};
@@ -1459,43 +1463,61 @@ fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     };
-    #[cfg(test)]
-    let settle = index_seam::settle();
-    #[cfg(not(test))]
-    let settle = aterm_uds::private_file::SETTLE;
     let named = git(root, &["rev-parse", "--git-path", "index"], reads)?;
     let source = root.join(named.trim_end_matches(['\n', '\r']));
-    let began = std::time::SystemTime::now();
     let mut file = std::fs::File::open(&source).ok()?;
     let meta = file.metadata().ok()?;
-    if !meta.is_file() {
+    if !meta.is_file()
+        || Instant::now() >= reads.deadline.get()
+        || reads.held.is_some_and(|held| held())
+    {
         return None;
     }
-    let id = digest(source.as_os_str().as_bytes()).get(..32)?.to_owned();
-    let state = digest(stamp(&meta).as_bytes()).get(..16)?.to_owned();
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(meta.len().checked_add(1)?)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    // A read is admitted only for the opened source's extent and one unchanged descriptor.
+    // The stamp detects a competing write; it never substitutes for reading the bytes.
+    if bytes.len() as u64 != meta.len()
+        || file.metadata().ok().map(|now| stamp(&now)) != Some(stamp(&meta))
+        || Instant::now() >= reads.deadline.get()
+        || reads.held.is_some_and(|held| held())
+    {
+        return None;
+    }
+    let id = digest(source.as_os_str().as_bytes());
+    let mut content = aterm_digest::Sha256::new();
+    content.update(b"aterm refreshed index bytes v1\0");
+    content.update(meta.mtime().to_be_bytes());
+    content.update(meta.mtime_nsec().to_be_bytes());
+    content.update(&bytes);
+    let state: String = content
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let folder = private_index_folder()?;
+    match aterm_uds::private_file::check_private_dir(&folder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            aterm_uds::private_file::ensure_private_dir(&folder).ok()?;
+        }
+        Err(_) => return None,
+    }
     let name = format!("{id}-{state}.index");
     let path = folder.join(&name);
-    let handed = |path: PathBuf| {
-        let held = std::fs::symlink_metadata(&path).ok()?;
-        held.is_file().then(|| PrivateIndex {
+    let handed = || match aterm_uds::private_file::open_private(&folder, &name) {
+        Ok((_, held)) => Ok(Some(PrivateIndex {
             file: (held.dev(), held.ino()),
-            path,
-        })
+            path: path.clone(),
+        })),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(None),
+        Err(why) => Err(why),
     };
-    if let Some(copy) = handed(path.clone()) {
+    if let Some(copy) = handed().ok()? {
         return Some(copy);
-    }
-    if !aterm_uds::private_file::stamp_settled(&file, &meta, began, settle) {
-        return None;
-    }
-    std::fs::create_dir_all(folder.parent()?).ok()?;
-    aterm_uds::private_file::ensure_private_dir(&folder).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    // The bytes are the file the name says only where nothing wrote it during the read.
-    if file.metadata().ok().map(|now| stamp(&now)) != Some(stamp(&meta)) {
-        return None;
     }
     let temporary = format!(
         "{id}-{state}.{}.{}.tmp",
@@ -1523,6 +1545,8 @@ fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
                 "-c",
                 "core.untrackedCache=false",
                 "-c",
+                "core.sharedRepository=0600",
+                "-c",
                 "sparse.expectFilesOutsideOfPatterns=true",
                 "update-index",
                 "-q",
@@ -1546,7 +1570,7 @@ fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
         return None;
     }
     sweep_private_indexes(&folder, &id, &name);
-    handed(path)
+    handed().ok()?
 }
 
 /// Let go of what [`private_index`] keeps in `folder` that the copy `kept`, of the index `id`
@@ -3136,31 +3160,19 @@ fn git_to_run(
     Some(std::path::PathBuf::from(aterm_uds::os_path!("git")))
 }
 
-/// [`private_index`]'s seams for this thread's reads (tests): how old an index's last change must
-/// be for a copy of it to be kept (none unless a test sets one, so a test's reads take a copy from
-/// the first, however soon after the index changed, and each makes the same gits whenever it
-/// runs), what runs between a copy's handing out and its status, and whether the last
-/// [`work_status`] was answered by a copy.
+/// [`private_index`]'s seams for this thread's reads (tests): what runs between a copy's
+/// handing out and its status, and whether the last [`work_status`] was answered by a copy.
 #[cfg(all(test, unix))]
 pub(crate) mod index_seam {
     use std::cell::{Cell, RefCell};
     use std::path::Path;
-    use std::time::Duration;
 
     /// What runs with a copy's path before its status.
     type Hook = Box<dyn FnMut(&Path)>;
 
     std::thread_local! {
-        static SETTLE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static ANSWERED: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    /// Until the guard it returns drops, this thread's reads keep a copy only of an index whose
-    /// last change is `settle` old.
-    pub(crate) fn set_settle(settle: Duration) -> Reset {
-        SETTLE.with(|s| s.set(settle));
-        Reset(())
     }
 
     /// Until the guard it returns drops, `hook` runs with each copy's path before its status.
@@ -3175,19 +3187,13 @@ pub(crate) mod index_seam {
         ANSWERED.with(Cell::get)
     }
 
-    /// No settle and no hook again once dropped.
+    /// No hook again once dropped.
     pub(crate) struct Reset(());
 
     impl Drop for Reset {
         fn drop(&mut self) {
-            SETTLE.with(|s| s.set(Duration::ZERO));
             BEFORE.with(|b| *b.borrow_mut() = None);
         }
-    }
-
-    /// This thread's settle.
-    pub(super) fn settle() -> Duration {
-        SETTLE.with(Cell::get)
     }
 
     /// Run this thread's hook, if one is set, with the copy at `path`.

@@ -14,11 +14,15 @@
 //! ([`scan`]'s `into`). gitleaks itself, its config policy and the adjudication of its report
 //! are `aterm-verify`'s `export-scan` stage, which runs this scan, because this crate spawns
 //! nothing and parses neither TOML nor JSON.
+//! [`links`] holds shipping Markdown and inbound readers of changed targets to the
+//! engine's boundary-only dead-link rule, including targets outside the content cone.
 //!
 //! The engine's guards stay where they are: `pub stage` still runs them on every cut, over the
 //! whole export, as the backstop no repository can disable. This scan only finds their reds
-//! earlier, and a finding here names a file and line, never the text.
+//! earlier. A content finding names a file and line; a dead-link finding also names its target,
+//! as the engine's report does.
 
+pub mod links;
 pub mod rows;
 
 mod forbidden;
@@ -44,6 +48,8 @@ pub enum Guard {
     PrivateRefs,
     /// gitleaks, its config policy and the engine's adjudication of its report.
     Gitleaks,
+    /// `md_dead_links`: boundary-excluded targets and export escapes.
+    DeadLinks,
 }
 
 impl Guard {
@@ -55,6 +61,7 @@ impl Guard {
             Self::Forbidden => "forbidden content",
             Self::PrivateRefs => "private reference",
             Self::Gitleaks => "gitleaks",
+            Self::DeadLinks => "dead markdown link",
         }
     }
 }

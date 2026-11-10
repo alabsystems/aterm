@@ -848,8 +848,6 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
         let mut doc = opened.doc.clone();
         let policy = crate::swarm_roster::SwarmPolicy {
             network_id: Some("net-alab".to_owned()),
-            reserved_labels: vec!["m3".to_owned()],
-            release_hosts: Vec::new(),
             servers: Vec::new(),
             stewards: vec![
                 crate::swarm_roster::StewardPolicy {

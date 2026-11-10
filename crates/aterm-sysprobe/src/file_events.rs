@@ -8,41 +8,76 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-/// One delivered-event sample. A directory counts once per delivered event, which macOS
+/// One delivered-event sample. A path counts once per delivered event, which macOS
 /// may coalesce; this is not a syscall count or a complete record of every writer.
 #[derive(Debug, Default)]
 pub struct Census {
-    /// Delivered events per parent directory, up to 16,384 distinct directories.
-    pub directories: BTreeMap<String, u64>,
+    /// Delivered events per parent directory, or per file in a scoped file capture.
+    /// At most 16,384 distinct paths are retained.
+    pub counts: BTreeMap<String, u64>,
     /// MustScanSubDirs, UserDropped or KernelDropped markers: attribution is incomplete.
     pub dropped: u64,
-    /// Events whose new directory exceeded the bounded directory table.
+    /// Events whose new path exceeded the bounded table.
     pub overflow: u64,
+    #[cfg(any(target_os = "macos", test))]
+    roots: Vec<std::path::PathBuf>,
+    #[cfg(any(target_os = "macos", test))]
+    exact: bool,
 }
 
 impl Census {
+    fn configured(roots: &[std::path::PathBuf], exact: bool) -> Result<Self, String> {
+        let bytes = roots.iter().fold(0usize, |n, root| {
+            n.saturating_add(root.as_os_str().as_encoded_bytes().len())
+        });
+        if (exact && roots.is_empty())
+            || roots.len() > 256
+            || bytes > 65_536
+            || roots
+                .iter()
+                .any(|root| !root.is_absolute() || root.to_str().is_none_or(|s| s.contains('\0')))
+        {
+            return Err("file capture needs 1–256 absolute roots, at most 64 KiB total".into());
+        }
+        Ok(Self {
+            #[cfg(any(target_os = "macos", test))]
+            roots: roots.to_vec(),
+            #[cfg(any(target_os = "macos", test))]
+            exact,
+            ..Self::default()
+        })
+    }
+
     #[cfg(any(target_os = "macos", test))]
     fn add(&mut self, path: &str, flags: u32) {
         if flags & 7 != 0 {
             self.dropped += 1;
         }
-        let parent = Path::new(path).parent().unwrap_or(Path::new("/"));
-        let parent = parent.to_string_lossy();
-        if let Some(count) = self.directories.get_mut(parent.as_ref()) {
+        let path = Path::new(path);
+        if !self.roots.is_empty() && !self.roots.iter().any(|root| path.starts_with(root)) {
+            return;
+        }
+        let bucket = if self.exact {
+            path
+        } else {
+            path.parent().unwrap_or(Path::new("/"))
+        };
+        let bucket = bucket.to_string_lossy();
+        if let Some(count) = self.counts.get_mut(bucket.as_ref()) {
             *count += 1;
-        } else if self.directories.len() < 16_384 {
-            self.directories.insert(parent.into_owned(), 1);
+        } else if self.counts.len() < 16_384 {
+            self.counts.insert(bucket.into_owned(), 1);
         } else {
             self.overflow += 1;
         }
     }
 
-    /// Rank directories under `roots`, descending by delivered count. Empty roots selects
+    /// Rank paths under `roots`, descending by delivered count. Empty roots selects
     /// the whole stream. Component-aware matching excludes similarly named neighbours.
     #[must_use]
     pub fn ranked(&self, roots: &[std::path::PathBuf]) -> Vec<(&str, u64)> {
         let mut rows: Vec<_> = self
-            .directories
+            .counts
             .iter()
             .filter(|(path, _)| {
                 roots.is_empty() || roots.iter().any(|root| Path::new(path).starts_with(root))
@@ -56,17 +91,41 @@ impl Census {
 
 /// Subscribe on `/` with file-level events and NoDefer for `duration`. This runs the current
 /// thread's CF run loop: call it on a diagnostic thread, never a window's main thread.
+/// `ready` runs once after the stream starts, before sampling. A workload must wait for it;
+/// process launch alone does not establish that the subscription is ready.
 ///
 /// # Errors
 /// Returns an error off macOS, for a zero duration, or when CoreServices refuses the stream.
-pub fn capture(duration: Duration) -> Result<Census, String> {
+/// Roots must be absolute UTF-8 paths without NUL, at most 256 and 64 KiB total.
+/// File aggregation requires at least one root.
+pub fn capture(
+    duration: Duration,
+    granularity: Granularity<'_>,
+    ready: impl FnOnce(),
+) -> Result<Census, String> {
     if duration.is_zero() {
         return Err("duration must be positive".into());
     }
+    let counts = match granularity {
+        Granularity::Directories(roots) => Census::configured(roots, false)?,
+        Granularity::Files(roots) => Census::configured(roots, true)?,
+    };
     #[cfg(target_os = "macos")]
-    return mac::run(duration.as_secs_f64());
+    return mac::run(duration.as_secs_f64(), counts, ready);
     #[cfg(not(target_os = "macos"))]
-    Err("FSEvents is macOS-only".into())
+    {
+        let _ = (counts, ready);
+        Err("FSEvents is macOS-only".into())
+    }
+}
+
+/// Directory aggregation for a broad survey, or individual paths beneath a bounded scope.
+/// Focused filtering happens before allocation; dropped markers remain global in both modes.
+pub enum Granularity<'a> {
+    /// Retain parent directories across the whole stream.
+    Directories(&'a [std::path::PathBuf]),
+    /// Retain file paths only under these component-aware roots.
+    Files(&'a [std::path::PathBuf]),
 }
 
 /// SDK constants and context layout used by the stream, checked against Apple's headers.
@@ -202,8 +261,7 @@ mod mac {
         }
     }
 
-    pub fn run(seconds: f64) -> Result<Census, String> {
-        let mut counts = Census::default();
+    pub fn run(seconds: f64, mut counts: Census, ready: impl FnOnce()) -> Result<Census, String> {
         let mut context = Context {
             version: 0,
             info: (&raw mut counts).cast(),
@@ -214,12 +272,30 @@ mod mac {
         // SAFETY: valid NUL-terminated root; array borrows the string until stream teardown.
         // The context and all CoreFoundation objects outlive the synchronous run loop.
         unsafe {
-            let root =
-                CfObject(CFStringCreateWithCString(ptr::null(), c"/".as_ptr(), 0x0800_0100).cast());
-            if root.0.is_null() {
-                return Err("CFStringCreateWithCString failed".into());
+            let watched = [std::path::PathBuf::from("/")];
+            let mut strings = Vec::with_capacity(watched.len());
+            for path in watched {
+                use std::os::unix::ffi::OsStrExt as _;
+                let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| "event root contains NUL")?;
+                let value = CfObject(
+                    CFStringCreateWithCString(ptr::null(), text.as_ptr(), 0x0800_0100).cast(),
+                );
+                if value.0.is_null() {
+                    return Err("CFStringCreateWithCString failed".into());
+                }
+                strings.push(value);
             }
-            let paths = CfObject(CFArrayCreate(ptr::null(), &root.0, 1, ptr::null()).cast());
+            let values: Vec<_> = strings.iter().map(|value| value.0).collect();
+            let paths = CfObject(
+                CFArrayCreate(
+                    ptr::null(),
+                    values.as_ptr(),
+                    values.len() as isize,
+                    ptr::null(),
+                )
+                .cast(),
+            );
             if paths.0.is_null() {
                 return Err("CFArrayCreate failed".into());
             }
@@ -244,12 +320,11 @@ mod mac {
                 kCFRunLoopDefaultMode.cast(),
             );
             stream.started = FSEventStreamStart(stream.raw) != 0;
-            if stream.started {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 0);
-            }
             if !stream.started {
                 return Err("FSEventStreamStart refused".into());
             }
+            ready();
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 0);
             // End callbacks before moving their Census into the return value.
             drop(stream);
         }
@@ -277,9 +352,51 @@ mod tests {
         for i in 0..16_384 {
             census.add(&format!("/many/{i}/file"), 0);
         }
-        assert_eq!(census.directories.len(), 16_384);
+        assert_eq!(census.counts.len(), 16_384);
         assert_eq!(census.overflow, 3);
         census.add("/owned/logs/a", 0);
         assert_eq!(census.ranked(&["/owned".into()])[0].1, 3);
+    }
+
+    #[test]
+    fn focused_files_distinguish_journals_and_keys_without_hiding_global_drops() {
+        let mut files = Census::configured(&["/owned/state".into()], true).unwrap();
+        for path in ["/owned/state/control.astream", "/owned/state/device.age"] {
+            files.add(path, 0);
+        }
+        files.add("/owned/state-neighbour/other", 2);
+        assert_eq!(
+            files.ranked(&[]),
+            vec![
+                ("/owned/state/control.astream", 1),
+                ("/owned/state/device.age", 1)
+            ]
+        );
+        assert_eq!(files.dropped, 1);
+        // Negative control: the broad directory instrument deliberately coalesces these.
+        let mut directories = Census::default();
+        directories.add("/owned/state/control.astream", 0);
+        directories.add("/owned/state/device.age", 0);
+        assert_eq!(directories.ranked(&[]), vec![("/owned/state", 2)]);
+        assert!(Census::configured(&[], true).is_err());
+        assert!(Census::configured(&["relative".into()], true).is_err());
+        assert!(Census::configured(&vec!["/root".into(); 257], true).is_err());
+        assert!(Census::configured(&[format!("/{}", "x".repeat(65_536)).into()], true).is_err());
+    }
+
+    #[test]
+    fn invalid_capture_never_announces_a_ready_subscription() {
+        assert!(
+            capture(Duration::ZERO, Granularity::Directories(&[]), || panic!(
+                "not started"
+            ))
+            .is_err()
+        );
+        assert!(
+            capture(Duration::from_secs(1), Granularity::Files(&[]), || panic!(
+                "not started"
+            ))
+            .is_err()
+        );
     }
 }

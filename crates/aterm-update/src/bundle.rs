@@ -72,12 +72,15 @@ pub fn plist_declares_grant_desk(text: &str) -> bool {
 /// The `Info.plist` key declaring complete-recipient journal recovery support.
 pub const NATIVE_RECIPIENT_RECOVERY_KEY: &str = "<key>ATermNativeRecipientRecovery</key>";
 
-/// Reads ANG5 histories and recovers them only with complete recipient retirement evidence.
-pub const NATIVE_RECIPIENT_RECOVERY_TOKEN: &str = "recipients5";
+/// Reads ANG5 histories in the legacy issuer journal, not independent custody.
+pub const NATIVE_LEGACY_RECIPIENT_RECOVERY_TOKEN: &str = "recipients5";
 
-/// Whether an `Info.plist` declares complete-recipient recovery, not writer admission.
+/// Reads independently enrolled and bound ANG5 histories and requires recipient retirement.
+pub const NATIVE_RECIPIENT_RECOVERY_TOKEN: &str = "bound-recipients5";
+
+/// The recipient-history protocol an `Info.plist` declares, not writer admission.
 #[must_use]
-pub fn plist_declares_recipient_recovery(text: &str) -> bool {
+pub fn plist_recipient_recovery(text: &str) -> super::NativeRecipientRecovery {
     Capabilities::from_plist(text).recipient_recovery
 }
 
@@ -87,7 +90,7 @@ pub(crate) struct Capabilities {
     pub grant_chunks: bool,
     pub grant_empty: bool,
     pub grant_desk: bool,
-    pub recipient_recovery: bool,
+    pub recipient_recovery: super::NativeRecipientRecovery,
 }
 
 impl Capabilities {

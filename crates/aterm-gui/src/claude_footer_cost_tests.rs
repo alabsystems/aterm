@@ -732,7 +732,10 @@ fn each_reading_follows_its_rows() {
     app.harness = Some(host.clone());
     let _host = Hosted(host);
     let rule = AT_REST.bottom();
-    for (mode, word, not) in [(PLAN, "lame", "yolo"), (BYPASS, "yolo", "lame")] {
+    for (mode, word, not) in [
+        (PLAN, "\u{25cb} yolo", "\u{25cf} yolo"),
+        (BYPASS, "\u{25cf} yolo", "\u{25cb} yolo"),
+    ] {
         feed(
             &app,
             session,

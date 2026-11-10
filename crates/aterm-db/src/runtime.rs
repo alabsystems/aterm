@@ -109,47 +109,93 @@ pub fn private_attachment_port() -> Result<u16> {
 #[cfg(any(test, debug_assertions))]
 pub use discovery::db_discovery_replacement_environment;
 
+/// How often a serving loop runs its polled checks ([`serve_paced`]), and how long a background
+/// owner or a contended one waits between tries.
 const POLL: Duration = Duration::from_secs(2);
+/// The least time between two ticks of a serving loop ([`serve_paced`]): work a tick leaves (a
+/// beacon flood past its per-tick bound, a deadline that comes again at once) waits this long, so
+/// a loop never ticks more often than ten times a second, and only when something it waits on
+/// happened.
 const TICK: Duration = Duration::from_millis(100);
 
 /// What one tick of a serving loop ([`serve_paced`]) came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flow {
-    /// Serve on: the next tick follows a [`TICK`] later.
-    Serve,
+    /// Serve on: the next tick comes when something the loop waits on happens, or by this
+    /// deadline, the next its work keeps by the clock (`None`: none before the next round).
+    Serve(Option<Instant>),
     /// The loop ends with `Ok(())`: what it serves moved under it (a source, a generation, an
     /// enrollment's witness, Commons control come into view).
     End,
 }
 
-/// A serving loop: `tick(now, round)` every [`TICK`] until `stopped`, ending at the first tick
-/// that ends it ([`Flow::End`]) or fails. `round` says that the loop's polled checks (the
-/// generation, lease, custody and vault rechecks, the address refresh) are due in this tick: the
-/// first [`POLL`] after the loop starts, then [`POLL`] after the last tick that ran them returned,
-/// by `clock`, not after it started. A round slower than the interval (a busy vault waited for, a
-/// slow interface read) so still leaves the loop that long at rest before the next, instead of
-/// running round after round with no rest between. The rest belongs to the loop, not to the
-/// round: no path through a tick can leave it out.
-fn serve_paced<E>(
+/// A serving loop: `tick(state, now, round)` until `stopped`, ending at the first tick that ends
+/// it ([`Flow::End`]) or fails. Between ticks it waits (`wait(state, floor, until)`) for what its
+/// state waits on to happen ([`rest`]: a beacon, a connection, a round's end, a push), for its
+/// stop, or for `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the
+/// next round; never sooner than `floor`, one [`TICK`] after the tick began. An idle loop so wakes
+/// once a [`POLL`], not ten times a second.
+///
+/// `round` says that the loop's polled checks (the generation, lease, custody, configuration and
+/// vault rechecks, the address refresh) are due in this tick: the first [`POLL`] after the loop
+/// starts, then [`POLL`] after the last tick that ran them returned, by `clock`, not after it
+/// started. A round slower than the interval (a busy vault waited for, a slow interface read) so
+/// still leaves the loop that long at rest before the next, instead of running round after round
+/// with no rest between. The rest belongs to the loop, not to the round: no path through a tick
+/// can leave it out. What nothing can wait on is read at each tick, and so at each round at the
+/// latest: whether a window claims Commons (a lock, which raises no event), the remembered
+/// endpoints' and the hearing and clock ledgers' keeping (minutes apart), and the lab journal's
+/// flush (a minute apart).
+fn serve_paced<S, E>(
+    state: &mut S,
     clock: impl Fn() -> Instant,
     stopped: impl Fn() -> bool,
-    mut wait: impl FnMut(Duration),
-    mut tick: impl FnMut(Instant, bool) -> std::result::Result<Flow, E>,
+    mut wait: impl FnMut(&S, Instant, Instant),
+    mut tick: impl FnMut(&mut S, Instant, bool) -> std::result::Result<Flow, E>,
 ) -> std::result::Result<(), E> {
     let mut due = clock() + POLL;
     while !stopped() {
         let now = clock();
         let round = now >= due;
-        let flow = tick(now, round);
+        let flow = tick(state, now, round);
         if round {
             due = clock() + POLL;
         }
-        if flow? == Flow::End {
+        let Flow::Serve(next) = flow? else {
             return Ok(());
-        }
-        wait(TICK);
+        };
+        wait(state, now + TICK, next.map_or(due, |next| next.min(due)));
     }
     Ok(())
+}
+
+/// A serving loop's wait between ticks ([`serve_paced`]) on its transport: until a descriptor it
+/// waits on is ready ([`transport::Transport::waits_on`]), `stop` is set, or `until` comes, and
+/// never sooner than `floor`. A descriptor already ready (what the last tick left, or a ring
+/// during it) waits for `floor` alone, as does a transport without a doorbell, which nothing
+/// would wake for a round's end; a wait that fails rests a [`TICK`], so none spins. The doorbell
+/// is cleared before the tick it wakes reads what it announced.
+fn rest(stop: &Stop, transport: &transport::Transport, floor: Instant, until: Instant) {
+    let pace = || stop.sleep(floor.saturating_duration_since(Instant::now()));
+    match transport.waits_on() {
+        Some(fds) => match aterm_uds::ready::any_now(&fds) {
+            Ok(ready) if ready.is_empty() => {
+                if stop.wait_ready(&fds, Some(until.max(floor))).is_err() {
+                    stop.sleep(TICK);
+                }
+            }
+            Ok(_) => {
+                pace();
+            }
+            Err(_) => {
+                stop.sleep(TICK);
+            }
+        },
+        None => {
+            pace();
+        }
+    }
+    transport.clear_doorbell();
 }
 /// How often the contact ledger is kept, and a steward refreshes the roster from it.
 const KEEP: Duration = Duration::from_secs(600);
@@ -594,6 +640,9 @@ impl Pusher {
             table,
             deadline,
         });
+        if let Some(bell) = &*board.bell.lock_or_recover() {
+            bell.ring();
+        }
         let result = loop {
             if let Some((settled, pushed)) = desk.settled
                 && settled == id
@@ -640,6 +689,9 @@ struct Board {
     first: crate::replica::First,
     /// The mesh relay's answer to a push, asked before any round ([`Pusher::relay`]).
     relay: Mutex<Option<RelayAck>>,
+    /// The serving owner's doorbell, rung with each ask so it takes the ask at once
+    /// ([`Board::serving`]).
+    bell: Mutex<Option<Arc<aterm_uds::ready::Doorbell>>>,
 }
 
 #[derive(Default)]
@@ -679,8 +731,10 @@ impl Desk {
 }
 
 impl Board {
-    /// The owner serves repair until the guard drops; then every waiting push hears it.
-    fn serving(&self) -> Serving<'_> {
+    /// The owner serves repair until the guard drops; then every waiting push hears it. Each ask
+    /// rings `bell`, the owner's doorbell, while it serves.
+    fn serving(&self, bell: Option<Arc<aterm_uds::ready::Doorbell>>) -> Serving<'_> {
+        *self.bell.lock_or_recover() = bell;
         let generation = {
             let mut desk = self.desk.lock_or_recover();
             let generation = desk.start();
@@ -735,6 +789,7 @@ impl Drop for Serving<'_> {
         desk.stop();
         *self.board.first.lock_or_recover() = None;
         drop(desk);
+        *self.board.bell.lock_or_recover() = None;
         self.board.changed.notify_all();
     }
 }
@@ -815,9 +870,12 @@ impl Runtime {
 
     /// Start background Commons repair and steward enrollment for `aterm node serve` (C22).
     /// Before the one-mesh transport (`aterm_types::mesh_switch::MESH` off), it owns local
-    /// observation and transport while no interactive `aterm` window runs, yields both within
-    /// one tick when a window claims [`owner::WindowClaim`], and resumes once the last window
-    /// exits. With the mesh on it yields to no window: the node service is the one owner, and a
+    /// observation and transport while no interactive `aterm` window runs, yields both when a
+    /// window claims [`owner::WindowClaim`], and resumes once the last window exits. The claim
+    /// is a file lock taken in another process, which raises no event the serving loop can
+    /// wait on, so the loop reads it at each tick it takes for another reason, and at its
+    /// polled round at the latest: it yields within [`POLL`] (2 s) of the claim, while the
+    /// window waits with `OpenFailure::Owned` and tries again. With the mesh on it yields to no window: the node service is the one owner, and a
     /// window's runtime waits for its lease. Its first LAN use waits for the LAN broker as
     /// [`Self::start`]'s does.
     pub fn start_background(
@@ -918,10 +976,7 @@ impl Runtime {
                 // One streak of refusals ([`Refusals`]).
                 let mut refusals = Refusals::new(background);
                 while !worker.is_set() {
-                    // Opening an observer can migrate this directory. Never retain its
-                    // pre-migration name across a startup or another owner's handoff.
-                    let observer_dir = crate::network_state::directory(&observer_config);
-                    if yields && owner::window_claimed(&observer_dir) {
+                    if yields && owner::window_claimed(&observer_config) {
                         let publication = waiting_publication(
                             &paths,
                             &config,
@@ -936,7 +991,7 @@ impl Runtime {
                     if !background && window_claim.is_none() {
                         // Keep the working background owner until this window owns Commons.
                         // Retain priority across observer contention afterward.
-                        window_claim = owner::WindowClaim::acquire(&observer_dir).ok();
+                        window_claim = owner::WindowClaim::acquire(&observer_config).ok();
                     }
                     let mut history = match Observer::open(&observer_config, published.clone()) {
                         Ok(history) => history,
@@ -956,16 +1011,13 @@ impl Runtime {
                         }
                     };
                     if !background && window_claim.is_none() {
-                        window_claim = owner::WindowClaim::acquire(
-                            &crate::network_state::directory(&observer_config),
-                        )
-                        .ok();
+                        window_claim = owner::WindowClaim::acquire(&observer_config).ok();
                     }
                     while !worker.is_set() {
                         let mut serving = None;
                         let mut served = serve_mode_with_recovery(
                             (&paths, &config, recover_writer),
-                            yields,
+                            yields.then_some(observer_config.as_path()),
                             &worker,
                             &mut |status| {
                                 if matches!(status, Status::Active { .. } | Status::Pending) {
@@ -986,9 +1038,7 @@ impl Runtime {
                             history.unconfirm_local();
                             if yields
                                 && status == Status::Waiting
-                                && owner::window_claimed(&crate::network_state::directory(
-                                    &observer_config,
-                                ))
+                                && owner::window_claimed(&observer_config)
                             {
                                 report(Status::Waiting);
                                 break;
@@ -1155,7 +1205,7 @@ fn serve(
 ) -> std::result::Result<(), Status> {
     serve_mode(
         (paths, config),
-        false,
+        None,
         stop,
         report,
         history,
@@ -1172,7 +1222,7 @@ fn serve(
 )]
 fn serve_mode(
     (paths, config): (&Paths, &Path),
-    yield_to_window: bool,
+    window_config: Option<&Path>,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1182,7 +1232,7 @@ fn serve_mode(
 ) -> std::result::Result<(), Status> {
     serve_mode_with_recovery(
         (paths, config, true),
-        yield_to_window,
+        window_config,
         stop,
         report,
         history,
@@ -1198,7 +1248,7 @@ fn serve_mode(
 )]
 fn serve_mode_with_recovery(
     (paths, config, recover_writer): (&Paths, &Path, bool),
-    yield_to_window: bool,
+    window_config: Option<&Path>,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1208,7 +1258,7 @@ fn serve_mode_with_recovery(
 ) -> std::result::Result<(), Status> {
     // A background owner yields to a window's claim before it reads its configuration, so one
     // its configuration refuses still yields.
-    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
+    if window_config.is_some_and(owner::window_claimed) {
         return Err(Status::Waiting);
     }
     if !enabled(config).map_err(refusal("configuration"))? {
@@ -1225,7 +1275,7 @@ fn serve_mode_with_recovery(
     }
     serve_selected(
         (&paths, config),
-        yield_to_window,
+        window_config,
         stop,
         report,
         history,
@@ -1241,7 +1291,7 @@ fn serve_mode_with_recovery(
 )]
 fn serve_selected(
     (paths, config): (&Paths, &Path),
-    yield_to_window: bool,
+    window_config: Option<&Path>,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
@@ -1250,7 +1300,7 @@ fn serve_selected(
     board: &Board,
 ) -> std::result::Result<(), Status> {
     history.unconfirm_local();
-    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
+    if window_config.is_some_and(owner::window_claimed) {
         return Err(Status::Waiting);
     }
     if !enabled(config).map_err(refusal("configuration"))? {
@@ -1261,7 +1311,7 @@ fn serve_selected(
         _ => {
             return serve_presence(
                 (paths, config),
-                yield_to_window,
+                window_config,
                 stop,
                 report,
                 history,
@@ -1338,18 +1388,15 @@ fn serve_selected(
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refresh = Instant::now() + Duration::from_secs(30);
     let result = {
-        let _serving = board.serving();
+        let _serving = board.serving(transport.doorbell());
         let mut pushing: Option<Ask> = None;
         serve_paced(
+            &mut transport,
             Instant::now,
             || stop.is_set(),
-            |rest| {
-                stop.sleep(rest);
-            },
-            |now, round| {
-                if yield_to_window
-                    && owner::window_claimed(&crate::network_state::directory(config))
-                {
+            |transport, floor, until| rest(stop, transport, floor, until),
+            |transport, now, round| {
+                if window_config.is_some_and(owner::window_claimed) {
                     return Err(Status::Waiting);
                 }
                 if round {
@@ -1405,7 +1452,7 @@ fn serve_selected(
                     }
                     let candidates = network.addresses()?;
                     network.may_use(&candidates)?;
-                    network.refresh(&mut transport, &candidates);
+                    network.refresh(transport, &candidates);
                 }
                 if let Some(ask) = board.take() {
                     pushing = Some(ask);
@@ -1433,7 +1480,7 @@ fn serve_selected(
                     lab.tick(paths, now);
                 }
                 #[cfg(test)]
-                network.observed(&mut transport);
+                network.observed(transport);
                 let contacts = transport.take_contacts();
                 if let Some(hearing) = &mut hearing {
                     hearing.tick(paths, &bootstrap, &contacts, now);
@@ -1461,7 +1508,7 @@ fn serve_selected(
                 }
                 observe_transport(
                     history,
-                    &transport,
+                    transport,
                     if pending {
                         ObservationMode::Enrollment
                     } else {
@@ -1478,7 +1525,10 @@ fn serve_selected(
                         hints: transport.peers(),
                     }
                 });
-                Ok(Flow::Serve)
+                let due = transport.next_due(now);
+                Ok(Flow::Serve(Some(
+                    pushing.map_or(due, |ask| ask.deadline.min(due)),
+                )))
             },
         )
     };
@@ -1817,13 +1867,13 @@ fn contact_time(now_ms: u64, observed: Instant, authenticated: Instant) -> u64 {
 
 fn serve_presence(
     (paths, config): (&Paths, &Path),
-    yield_to_window: bool,
+    window_config: Option<&Path>,
     stop: &Stop,
     report: &mut impl FnMut(Status),
     history: &mut Observer,
     network: &Network,
 ) -> std::result::Result<(), Status> {
-    if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
+    if window_config.is_some_and(owner::window_claimed) {
         return Err(Status::Waiting);
     }
     let candidates = network.addresses()?;
@@ -1834,13 +1884,12 @@ fn serve_presence(
     let mut refresh = Instant::now() + Duration::from_secs(30);
     report(Status::Dormant);
     serve_paced(
+        &mut transport,
         Instant::now,
         || stop.is_set(),
-        |rest| {
-            stop.sleep(rest);
-        },
-        |now, round| {
-            if yield_to_window && owner::window_claimed(&crate::network_state::directory(config)) {
+        |transport, floor, until| rest(stop, transport, floor, until),
+        |transport, now, round| {
+            if window_config.is_some_and(owner::window_claimed) {
                 return Err(Status::Waiting);
             }
             if round {
@@ -1867,11 +1916,11 @@ fn serve_presence(
                 }
                 let candidates = network.addresses()?;
                 network.may_use(&candidates)?;
-                network.refresh(&mut transport, &candidates);
+                network.refresh(transport, &candidates);
             }
             transport.tick(now).map_err(|_| Status::Offline)?;
-            observe_transport(history, &transport, ObservationMode::Discovery);
-            Ok(Flow::Serve)
+            observe_transport(history, transport, ObservationMode::Discovery);
+            Ok(Flow::Serve(Some(transport.next_due(now))))
         },
     )
 }

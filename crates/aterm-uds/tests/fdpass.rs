@@ -233,7 +233,8 @@ fn a_plain_message_and_a_hangup_are_ordinary_receives() {
     assert!(got.fds.is_empty(), "no control message, no descriptors");
 
     drop(a);
-    let eof = fdpass::recv_with_fds(&b, &mut buf, 3).expect("hangup is not an error");
+    b.set_nonblocking(true).unwrap();
+    let eof = aterm_uds::deadline::once_released(|| fdpass::recv_with_fds(&b, &mut buf, 3));
     assert_eq!(eof.bytes, 0, "a hung-up peer reads as EOF");
     assert!(eof.fds.is_empty());
     let gone = fdpass::send_with_fds(&b, b"x", &[]).expect_err("the peer is gone");

@@ -2962,14 +2962,21 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// What the lights block names the bit set, wherever it is read: Claude's pill reads bypass
-/// (`⏵⏵ bypass permissions on`): yolo, the default, full auto and named quietly, in the glass's
-/// value ink (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
-pub const YOLO_ON: &str = "yolo";
-/// What it names the bit clear: any other mode its pill reads, `auto` included, and the side a
-/// click on `yolo` restarts toward (the settings' own mode): yolo turned off is lame (the owner's
-/// word, 2026-11-02), widened from manual to every mode that is not yolo (§8).
-pub const YOLO_OFF: &str = "lame";
+/// The bit's one word on the lights block, whichever way it reads: the chip says `yolo` and its mark
+/// says whether it is on ([`YOLO_ON_MARK`]) or off ([`YOLO_OFF_MARK`]). The owner, 2026-11-09: the
+/// off chip names the flag a click turns on, never another word for it
+/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
+pub const YOLO: &str = "yolo";
+/// The mark before [`YOLO`] where Claude's pill reads bypass (`⏵⏵ bypass permissions on`): `● yolo`,
+/// in the glass's value ink, as any value on the rule.
+pub const YOLO_ON_MARK: &str = "\u{25cf}";
+/// The mark before [`YOLO`] in any other mode its pill reads, `auto` included: `○ yolo`, in the
+/// glass's quiet ink.
+pub const YOLO_OFF_MARK: &str = "\u{25cb}";
+/// The bit set, in words (a screen reader's name for the chip, a log line): no mark is read aloud.
+pub const YOLO_ON_SAID: &str = "yolo on";
+/// The bit clear, in words.
+pub const YOLO_OFF_SAID: &str = "yolo off";
 
 /// How many items a rewritten mode row keeps ([`ModeRow`]); a row with more stands as drawn.
 pub const MODE_ROW_ITEMS: usize = 8;

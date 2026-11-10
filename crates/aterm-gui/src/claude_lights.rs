@@ -403,7 +403,7 @@ pub(crate) enum ChipFace {
 }
 
 /// How a block gives way in a rule short of room. The mode light keeps its place at every rung
-/// wherever it is drawn: on a plain line it is the only way back
+/// wherever it is drawn: on a plain line it is the only way to yolo
 /// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keep {
@@ -2453,10 +2453,10 @@ fn chips_width_at(
 pub(crate) const CHIP_RULE: char = '\u{2500}';
 
 /// The cells between `chip` and the next: a blank, the rule's `─` and a blank after an Autopilot
-/// chip with words after its glyph (`⊘ off ─ yolo`, `✓ landed ─ yolo`, a click's mode name
-/// `⤓ land ─ yolo`), which would otherwise read as one phrase with the mode's word; one blank
-/// after a bare glyph (`∞ yolo`, `⤓ yolo`) and after the mode's chip, whose word the next chip's
-/// glyph sets off (`∞ yolo ⇠ lab-sweep`).
+/// chip with words after its glyph (`⊘ off ─ ● yolo`, `✓ landed ─ ● yolo`, a click's mode name
+/// `⤓ land ─ ● yolo`), which would otherwise read as one phrase with the mode's word; one blank
+/// after a bare glyph (`∞ ● yolo`, `⤓ ● yolo`) and after the mode's chip, whose word the next chip's
+/// glyph sets off (`∞ ● yolo ⇠ lab-sweep`).
 fn gap_after(chip: Chip, worded: bool) -> usize {
     if worded && chip == Chip::Autopilot {
         3
@@ -2492,15 +2492,18 @@ fn sentence(words: &str) -> String {
     format!("{}{}.", first.unwrap_or_default(), chars.as_str())
 }
 
-/// What `light`'s title says (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): on `yolo` that no
-/// permission prompt is asked, on `lame` that it is not yolo, then where a click goes
-/// (`· click: lame`) and what its restart would end of Claude's running jobs (`· ends 1 shell`); a
-/// standing click says what its restart waits for, what it ends and that a click takes it back,
-/// a refusal its reason. The chip already shows the bit's word, so the title says what it means
-/// rather than repeating it, and names no mode but the bit. A title that says what a restart
-/// waits for or ends is a reason, its short form keeping that clause ([`TitleText::reason`]).
-/// Where the host `restarts` nothing ([`crate::permission_click::RESTARTS`]) the title says the
-/// bit's meaning alone, with no click and nothing a restart would end.
+/// What `light`'s title says (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, as the owner revised it
+/// 2026-11-09): the permission mode in Claude Code's own words, as its pill says it
+/// ([`Mode::pill_words`]), then what a click does. On the off chip (`○ yolo`) that is the mode,
+/// `· click: yolo`, and what the click's restart would end of Claude's running jobs
+/// (`plan mode on · click: yolo · ends 1 shell`). On the on chip (`● yolo`) it is the mode and
+/// what it means (`bypass permissions on · no prompts`) with no click named, because a click
+/// there does nothing: a click turns yolo on and never off. A standing click says what its
+/// restart waits for, what it ends and that a click takes it back, a refusal its reason. A title
+/// that says what a restart waits for or ends is a reason, its short form keeping that clause
+/// ([`TitleText::reason`]). Where the host `restarts` nothing
+/// ([`crate::permission_click::RESTARTS`]) the off chip's title is the mode alone, with no click
+/// and nothing a restart would end.
 fn light_title(
     s: &SessionLights,
     light: Light,
@@ -2562,7 +2565,7 @@ fn light_title(
             }
         };
     }
-    let Some(yolo) = s.shown.yolo() else {
+    let Some(mode) = s.shown.mode else {
         let words = "not on screen right now";
         return LightTitle {
             spoken: sentence(words),
@@ -2573,16 +2576,22 @@ fn light_title(
             },
         };
     };
-    // A click restarts onto the bit the chip does not show (`docs/DESIGN-yolo-binary-2026-11-04.md`
-    // §3): from bypass to the settings' mode, from any other to bypass.
-    let (head, to) = if yolo {
-        (
-            "no permission prompts",
-            aterm_agent::harness::footer::YOLO_OFF,
-        )
-    } else {
-        ("not yolo", aterm_agent::harness::footer::YOLO_ON)
-    };
+    let head = mode.pill_words();
+    // The on chip takes no click (owner, 2026-11-09: a click turns yolo on, never off), so its
+    // title names none and nothing a restart would end.
+    if mode == Mode::Bypass {
+        return LightTitle {
+            spoken: format!("{} {}", sentence(head), sentence(YOLO_ON_MEANS)),
+            text: TitleText {
+                whole: format!(
+                    "{head}{}{YOLO_ON_MEANS}",
+                    aterm_agent::harness::footer::MODE_ROW_SEP
+                ),
+                short: head.to_owned(),
+                reason: false,
+            },
+        };
+    }
     if !restarts {
         return LightTitle {
             spoken: sentence(head),
@@ -2593,8 +2602,11 @@ fn light_title(
             },
         };
     }
+    // A click on the off chip restarts onto the bypass line
+    // (`docs/DESIGN-yolo-binary-2026-11-04.md` §3).
+    let to = aterm_agent::harness::footer::YOLO;
     LightTitle {
-        spoken: format!("{} Click for {to}.{ends_said}", sentence(head)),
+        spoken: format!("{} Click to turn {to} on.{ends_said}", sentence(head)),
         text: TitleText {
             whole: format!("{head}{TITLE_CLICK}{to}{ends}"),
             short: format!("{head}{ends}"),
@@ -2602,6 +2614,9 @@ fn light_title(
         },
     }
 }
+
+/// What the on chip's title says bypass means, after the mode's own words.
+const YOLO_ON_MEANS: &str = "no prompts";
 
 /// What `chip`'s title says ([`TitleText`], each form without its trailing gap).
 fn title_of(
@@ -2703,8 +2718,8 @@ impl<'a> Face<'a> {
         self.word.is_some() || self.clock.is_some()
     }
 
-    /// The cells it takes: two for a wide character (`✋`, a cjk name). A face with no glyph
-    /// (the mode light's `yolo` or `lame` at rest) is its words alone, no blank before them.
+    /// The cells it takes: two for a wide character (`✋`, a cjk name). A face with no glyph is
+    /// its words alone, no blank before them.
     fn width(&self) -> usize {
         cells_of(self.glyph)
             + if self.worded() {
@@ -2802,23 +2817,25 @@ enum ChipTitle {
     Act(Act),
 }
 
-/// The mode light's face (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): `yolo` in bypass, in the
-/// glass's value ink; `lame` in any other mode, in the row's; [`PENDING_GLYPH`] before the word while
-/// a click stands, and alone where no bit is read (the light is drawn there only while a click
+/// The mode light's face (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, as the owner revised it
+/// 2026-11-09): one word, `yolo`, and a mark that says whether it is on. `● yolo` in bypass, in
+/// the glass's value ink, as any value on the rule (never the letter's hue, the accent or the
+/// warning ink: it is a fact, not an alarm); `○ yolo` in any other mode, in the glass's quiet
+/// ink, as the other off chips. [`PENDING_GLYPH`] takes the mark's cell while a click stands
+/// (`◌ yolo`), and stands alone where no bit is read (the light is drawn there only while a click
 /// stands, [`SessionLights::light_drawn`]).
 fn light_face(s: &SessionLights, inks: Inks) -> Face<'static> {
-    let glyph = if s.click.is_some() { PENDING_GLYPH } else { "" };
+    use aterm_agent::harness::footer::{YOLO, YOLO_OFF_MARK, YOLO_ON_MARK};
+    let mark = |at_rest: &'static str| {
+        if s.click.is_some() {
+            PENDING_GLYPH
+        } else {
+            at_rest
+        }
+    };
     match s.shown.yolo() {
-        Some(true) => Face::plain(
-            glyph,
-            Some(aterm_agent::harness::footer::YOLO_ON),
-            inks.title,
-        ),
-        Some(false) => Face::plain(
-            glyph,
-            Some(aterm_agent::harness::footer::YOLO_OFF),
-            inks.ink,
-        ),
+        Some(true) => Face::plain(mark(YOLO_ON_MARK), Some(YOLO), inks.title),
+        Some(false) => Face::plain(mark(YOLO_OFF_MARK), Some(YOLO), inks.quiet),
         None => Face::plain(PENDING_GLYPH, None, inks.ink),
     }
 }
@@ -3476,8 +3493,8 @@ pub(crate) struct Block {
     pub(crate) lights: Vec<RenderCell>,
     /// The cells the block holds in the rule (`footer::LightsWidth`'s chips).
     pub(crate) holds: usize,
-    /// The cells of [`Self::holds`] the mode's name a click brought up adds (`⤓ land ─ yolo`
-    /// over `⤓ yolo`: ` land` and the ` ─` that sets it off): the rule lays them only where they
+    /// The cells of [`Self::holds`] the mode's name a click brought up adds (`⤓ land ─ ● yolo`
+    /// over `⤓ ● yolo`: ` land` and the ` ─` that sets it off): the rule lays them only where they
     /// leave its fit as it stands without them.
     pub(crate) word: usize,
     cols: Vec<(std::ops::Range<usize>, Chip)>,
@@ -3489,9 +3506,9 @@ impl Block {
     /// Synthetic private-dev input through the production lights reading and chip composition:
     /// Autopilot `view`'s chip over Claude Code's mode row `mode` (`  ⏸ plan mode on (shift+tab
     /// to cycle)`), Autopilot's name worded on its chip where `worded`, as a click that just
-    /// reached it shows it (`⤓ land ─ lame`), else its glyph alone. The light beside it says the
-    /// bit the row reads, as on a live pane: `yolo` on a bypass row (`∞ yolo`), `lame` on any
-    /// other. A sample laid under a palette wears the chip of that palette's mode, so the two
+    /// reached it shows it (`⤓ land ─ ○ yolo`), else its glyph alone. The light beside it says
+    /// the bit the row reads, as on a live pane: `● yolo` on a bypass row (`∞ ● yolo`), `○ yolo`
+    /// on any other. A sample laid under a palette wears the chip of that palette's mode, so the two
     /// agree.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     pub(crate) fn layout_scene(
@@ -4981,11 +4998,13 @@ impl App {
     }
 
     /// A click on `session`'s permission light `light` (`docs/DESIGN-yolo-binary-2026-11-04.md`
-    /// §2, §3): it types nothing. Where the tab's click stands it takes it back, until its
-    /// restart is signalled (after that it does nothing); else it stands a
-    /// click asking the bit the pill does not show, whose lane restarts the tab's conversation
-    /// on that line when it may. A pill it cannot read, or a conversation not read, refuses it. On
-    /// a host with no restart ([`crate::permission_click::RESTARTS`]) it does nothing.
+    /// §2, §3, as the owner revised it 2026-11-09: a click turns yolo on and never off): it types
+    /// nothing. Where the tab's click stands it takes it back, until its restart is signalled
+    /// (after that it does nothing); else, on the off chip (`○ yolo`), it stands a click asking
+    /// bypass, whose lane restarts the tab's conversation on the line with
+    /// `--dangerously-skip-permissions` when it may; on the on chip (`● yolo`) it does nothing,
+    /// and the hover names no click. A pill it cannot read, or a conversation not read, refuses
+    /// it. On a host with no restart ([`crate::permission_click::RESTARTS`]) it does nothing.
     pub(crate) fn click_permission(&mut self, wid: WindowId, session: u64, light: Light) {
         if !crate::permission_click::RESTARTS {
             return;
@@ -5023,6 +5042,10 @@ impl App {
             }
             return;
         };
+        // Yolo is on: a click never turns it off, and says nothing (the hover names no click).
+        if pill == Mode::Bypass {
+            return;
+        }
         let Some(conversation) = crate::harness_host::published_snapshot(&tab)
             .and_then(|snap| snap.session)
             .or_else(|| self.footer_conversation(session))
@@ -5035,7 +5058,8 @@ impl App {
         self.stand_click(wid, session, &tab, pill, conversation);
     }
 
-    /// Stand tab `tab`'s click from pill `pill` on `conversation`, and start its lane.
+    /// Stand tab `tab`'s click from pill `pill` (never bypass: [`Self::click_permission`]) on
+    /// `conversation`, asking bypass, and start its lane.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -5057,22 +5081,14 @@ impl App {
         let click = aterm_agent::harness::permission_click::Click {
             tab: tab.to_owned(),
             conversation,
-            to: if from_yolo {
-                PermissionTo::Settings
-            } else {
-                PermissionTo::Bypass
-            },
+            to: PermissionTo::Bypass,
             at: aterm_time::unix_secs()
                 .and_then(|now| i64::try_from(now).ok())
                 .unwrap_or(0),
         };
         aterm_log::info!(
             "harness @{tab}: a permission click stands: {} asks {}",
-            if from_yolo {
-                aterm_agent::harness::footer::YOLO_ON
-            } else {
-                aterm_agent::harness::footer::YOLO_OFF
-            },
+            said_bit(from_yolo),
             click.to.word()
         );
         self.permission_clicks.clicks.stand(click, from_yolo);
@@ -5090,11 +5106,7 @@ impl App {
         if let Some(taken) = self.permission_clicks.clicks.take_back(tab) {
             aterm_log::info!(
                 "harness @{tab}: the permission click on {} is taken back",
-                if taken.from_yolo {
-                    aterm_agent::harness::footer::YOLO_ON
-                } else {
-                    aterm_agent::harness::footer::YOLO_OFF
-                }
+                said_bit(taken.from_yolo)
             );
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -5863,15 +5875,21 @@ impl App {
     }
 }
 
+/// The bit in words, as a log line and a screen reader say it (`yolo on`, `yolo off`): the chip's
+/// marks are not read aloud.
+pub(crate) const fn said_bit(yolo: bool) -> &'static str {
+    if yolo {
+        aterm_agent::harness::footer::YOLO_ON_SAID
+    } else {
+        aterm_agent::harness::footer::YOLO_OFF_SAID
+    }
+}
+
 /// The permission-mode light as a screen reader names it: the painted word in its name (WCAG
-/// 2.5.3), what the state does and where a click goes as its description.
+/// 2.5.3) with its mark said as `on` or `off`, the mode and what a click does as its description.
 #[cfg(a11y_tree)]
 fn light_spoken(s: &SessionLights, light: Light, now: Instant) -> (String, Option<String>) {
-    let word = match s.shown.yolo() {
-        Some(true) => aterm_agent::harness::footer::YOLO_ON,
-        Some(false) => aterm_agent::harness::footer::YOLO_OFF,
-        None => "unknown",
-    };
+    let word = s.shown.yolo().map_or("unknown", said_bit);
     let refused = s.refused.filter(|(_, _, until)| *until > now);
     let LightTitle { spoken, .. } =
         light_title(s, light, refused, crate::permission_click::RESTARTS);
@@ -6062,11 +6080,13 @@ mod tests {
     }
 
     /// THE LIGHT SAYS THE BIT, ON A HOSTED SESSION, AND KEEPS WHAT IT SAW
-    /// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): bypass wears `yolo` in the glass's value ink,
-    /// every other pill `lame` in the row's, each beside Autopilot at rest; a covered composer
-    /// keeps the last reading; a hover titles it apart from the chips. With no bit read the light
-    /// is drawn only while a click stands, as `◌` alone. CONTROL: an unhosted session draws no
-    /// chip under any pill.
+    /// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, owner 2026-11-09): bypass wears `● yolo` in
+    /// the glass's value ink, every other pill a quiet `○ yolo` (never another word for the flag),
+    /// each beside Autopilot at rest; a covered composer keeps the last reading; a hover titles it
+    /// apart from the chips: the mode in Claude's own words, then `click: yolo` on the off chip
+    /// alone, since a click turns yolo on and never off. With no bit read the light is drawn only
+    /// while a click stands, as `◌` alone. CONTROL: an unhosted session draws no chip under any
+    /// pill.
     #[test]
     fn the_light_says_the_bit_on_a_hosted_session_and_keeps_what_it_saw() {
         let now = Instant::now();
@@ -6074,12 +6094,16 @@ mod tests {
         let at = ChipAt::cruise(blank());
         let inks = Inks::of(blank(), at);
         let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
-        for (mode, word, ink) in [
-            (BYPASS, "yolo", inks.title),
-            (AUTO, "lame", inks.ink),
-            (PLAN, "lame", inks.ink),
-            (ACCEPT, "lame", inks.ink),
-            (MANUAL, "lame", inks.ink),
+        assert_ne!(
+            inks.quiet, inks.ink,
+            "CONTROL: the quiet ink is not the row's"
+        );
+        for (mode, word, ink, says) in [
+            (BYPASS, "\u{25cf} yolo", inks.title, "bypass permissions on"),
+            (AUTO, "\u{25cb} yolo", inks.quiet, "auto mode on"),
+            (PLAN, "\u{25cb} yolo", inks.quiet, "plan mode on"),
+            (ACCEPT, "\u{25cb} yolo", inks.quiet, "accept edits on"),
+            (MANUAL, "\u{25cb} yolo", inks.quiet, "manual mode on"),
         ] {
             let mut w = WindowLights::default();
             observe(&mut w, &screen(&bare, mode, ""));
@@ -6093,12 +6117,16 @@ mod tests {
             assert_eq!(text(&block.lights), format!("\u{221e} {word}"), "{mode:?}");
             assert_eq!(
                 block.cols,
-                vec![(0..1, Chip::Autopilot), (2..6, MODE)],
+                vec![(0..1, Chip::Autopilot), (2..8, MODE)],
                 "{mode:?}"
             );
             assert!(
                 block.lights[2..].iter().all(|c| c.fg == ink),
-                "{mode:?}: {word} in its ink"
+                "{mode:?}: {word} in its ink, mark and word"
+            );
+            assert!(
+                !text(&block.lights).contains("lame"),
+                "{mode:?}: the off chip names the flag, never another word"
             );
             assert!(block.title.is_empty(), "nothing asked for a title");
             w.observe(7, None);
@@ -6109,16 +6137,13 @@ mod tests {
             );
             w.hover = Some((7, Target::from(MODE)));
             let hovered = w.block(7, blank(), now, at, Keep::Drawn);
-            let (title, short) = if word == "yolo" {
-                (
-                    "no permission prompts \u{b7} click: lame",
-                    "no permission prompts",
-                )
+            let title = if mode == BYPASS {
+                format!("{says} \u{b7} no prompts")
             } else {
-                ("not yolo \u{b7} click: yolo", "not yolo")
+                format!("{says} \u{b7} click: yolo")
             };
             assert_eq!(text(&hovered.title), format!("{title}  "), "{mode:?}");
-            assert_eq!(text(&hovered.short_title), format!("{short}  "), "{mode:?}");
+            assert_eq!(text(&hovered.short_title), format!("{says}  "), "{mode:?}");
             assert!(!hovered.reason, "{mode:?}: a hover's title gives way first");
             assert_eq!(
                 hovered.lights.len(),
@@ -6150,36 +6175,53 @@ mod tests {
     }
 
     /// NO CLICK WHERE NOTHING RESTARTS (`docs/DESIGN-yolo-binary-2026-11-04.md` §2): on a host
-    /// with no restart the light's title says the bit's meaning alone, with no `click:` and no job a
+    /// with no restart the off light's title says the mode alone, with no `click:` and no job a
     /// restart would end, spoken the same. CONTROL: a host that restarts offers the click and names
-    /// the job.
+    /// the job. THE ON CHIP OFFERS NONE ANYWHERE (owner, 2026-11-09): a click never turns yolo
+    /// off, so its title names no click and no job on either host.
     #[test]
     fn the_light_offers_no_click_on_a_host_with_no_restart() {
-        for (mode, head, to) in [
-            (BYPASS, "no permission prompts", "lame"),
-            (PLAN, "not yolo", "yolo"),
-        ] {
-            let mut w = WindowLights::default();
-            observe(&mut w, &screen(&"\u{2500}".repeat(60), mode, ""));
-            let s = w.sessions.get_mut(&7).unwrap();
-            s.jobs = "1 shell".to_owned();
-            let none = light_title(s, Light::Mode, None, false);
-            assert_eq!(none.text.whole, head, "{mode:?}");
-            assert_eq!(none.text.short, head, "{mode:?}");
-            assert!(!none.text.reason, "{mode:?}");
-            assert_eq!(none.spoken, sentence(head), "{mode:?}");
-            let offered = light_title(s, Light::Mode, None, true);
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&"\u{2500}".repeat(60), PLAN, ""));
+        let s = w.sessions.get_mut(&7).unwrap();
+        s.jobs = "1 shell".to_owned();
+        let none = light_title(s, Light::Mode, None, false);
+        assert_eq!(none.text.whole, "plan mode on");
+        assert_eq!(none.text.short, "plan mode on");
+        assert!(!none.text.reason);
+        assert_eq!(none.spoken, "Plan mode on.");
+        let offered = light_title(s, Light::Mode, None, true);
+        assert_eq!(
+            offered.text.whole, "plan mode on \u{b7} click: yolo \u{b7} ends 1 shell",
+            "CONTROL: a host that restarts"
+        );
+        assert_eq!(offered.text.short, "plan mode on \u{b7} ends 1 shell");
+        assert_eq!(
+            offered.spoken,
+            "Plan mode on. Click to turn yolo on. Ends 1 shell."
+        );
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
+        let s = w.sessions.get_mut(&7).unwrap();
+        s.jobs = "1 shell".to_owned();
+        for restarts in [false, true] {
+            let on = light_title(s, Light::Mode, None, restarts);
             assert_eq!(
-                offered.text.whole,
-                format!("{head} \u{b7} click: {to} \u{b7} ends 1 shell"),
-                "CONTROL: {mode:?}"
+                on.text.whole, "bypass permissions on \u{b7} no prompts",
+                "{restarts}"
+            );
+            assert_eq!(on.text.short, "bypass permissions on", "{restarts}");
+            assert!(!on.text.reason, "{restarts}: nothing a restart would end");
+            assert_eq!(
+                on.spoken, "Bypass permissions on. No prompts.",
+                "{restarts}: no click is offered"
             );
         }
     }
 
     /// A WORDED CHIP NEVER RUNS INTO THE NEXT: after `⊘ off` the rule threads between the chips
-    /// (` ─ `, the rule's own cell once laid in the rule), so `⊘ off ─ lame` never reads as one
-    /// phrase, nor does a click's mode name (`⤓ land ─ lame`); the block's width counts it (the
+    /// (` ─ `, the rule's own cell once laid in the rule), so `⊘ off ─ ○ yolo` never reads as one
+    /// phrase, nor does a click's mode name (`⤓ land ─ ○ yolo`); the block's width counts it (the
     /// name's cells apart, [`Block::word`]) and no chip's hit takes it. CONTROL: a bare glyph
     /// (`∞`, `⤓`, `○`) stays one blank from the next chip.
     #[test]
@@ -6206,7 +6248,11 @@ mod tests {
                 });
             }
             let block = w.block(7, blank(), now, ChipAt::cruise(blank()), Keep::Drawn);
-            assert_eq!(text(&block.lights), format!("{lead}lame"), "{view:?}");
+            assert_eq!(
+                text(&block.lights),
+                format!("{lead}\u{25cb} yolo"),
+                "{view:?}"
+            );
             let gaps: Vec<usize> = block.rule_gaps().collect();
             let worded = lead.contains('\u{2500}');
             assert_eq!(
@@ -6242,7 +6288,7 @@ mod tests {
 
     /// THE MODE'S CHIP KEEPS ONE BLANK BEFORE THE TEAM CHIP: the rule sets off the Autopilot
     /// chip's word alone, where `⊘ off yolo` would misread; after the mode's word the Team chip's
-    /// own glyph sets it off (`∞ lame ⇠ lab-sweep`), as before the rule was drawn, and the fit
+    /// own glyph sets it off (`∞ ○ yolo ⇠ lab-sweep`), as before the rule was drawn, and the fit
     /// counts what is drawn. CONTROL: a harness held off keeps the rule before the mode.
     #[test]
     fn the_mode_chip_keeps_one_blank_before_the_team_chip() {
@@ -6257,10 +6303,14 @@ mod tests {
             task: None,
         });
         for (view, want, gaps) in [
-            (AutopilotView::Cruise, "\u{221e} lame \u{21e0} lab-sweep", 0),
+            (
+                AutopilotView::Cruise,
+                "\u{221e} \u{25cb} yolo \u{21e0} lab-sweep",
+                0,
+            ),
             (
                 AutopilotView::MasterOff,
-                "\u{2298} off \u{2500} lame \u{21e0} lab-sweep",
+                "\u{2298} off \u{2500} \u{25cb} yolo \u{21e0} lab-sweep",
                 1,
             ),
         ] {
@@ -6572,8 +6622,8 @@ mod tests {
     }
 
     /// A NARROW RULE GIVES UP TEAM, NEVER THE LIGHT (`docs/DESIGN-yolo-binary-2026-11-04.md`
-    /// §2): `yolo` and `lame` keep their place at every rung beside Autopilot, the only way back on
-    /// a plain line, so a rule too narrow for the two draws no chip; each rung's fit counts what
+    /// §2): `● yolo` and `○ yolo` keep their place at every rung beside Autopilot, the only way
+    /// to yolo on a plain line, so a rule too narrow for the two draws no chip; each rung's fit counts what
     /// it draws, and the chips drawn only go as the room does. CONTROL: Team is given up first.
     #[test]
     fn a_narrow_rule_gives_up_team_and_never_the_light() {
@@ -6599,20 +6649,21 @@ mod tests {
             )
             .map(|b| b.lights.iter().map(|c| c.ch).collect::<String>())
         };
-        let team = "\u{221e} lame \u{21e0} lab-sweep";
+        let team = "\u{221e} \u{25cb} yolo \u{21e0} lab-sweep";
         assert_eq!(
             fitted(&w, None, cells_of(team)).as_deref(),
             Some(team),
             "CONTROL: every chip"
         );
-        for room in 6..cells_of(team) {
+        let two = cells_of("\u{221e} \u{25cb} yolo");
+        for room in two..cells_of(team) {
             assert_eq!(
                 fitted(&w, None, room).as_deref(),
-                Some("\u{221e} lame"),
+                Some("\u{221e} \u{25cb} yolo"),
                 "{room}: Team first"
             );
         }
-        for room in 0..6 {
+        for room in 0..two {
             assert_eq!(
                 fitted(&w, None, room),
                 None,
@@ -6620,7 +6671,10 @@ mod tests {
             );
         }
         observe(&mut w, &screen(&bare, BYPASS, ""));
-        assert_eq!(fitted(&w, Some(MODE), 6).as_deref(), Some("\u{221e} yolo"));
+        assert_eq!(
+            fitted(&w, Some(MODE), two).as_deref(),
+            Some("\u{221e} \u{25cf} yolo")
+        );
         let drawn = |w: &WindowLights, selected: Option<Chip>, room: usize| -> Vec<Chip> {
             w.fitted(
                 7,
@@ -6687,10 +6741,11 @@ mod tests {
     }
 
     /// A HOVER THAT SAYS WHAT A CLICK ENDS IS A REASON (`docs/DESIGN-yolo-binary-2026-11-04.md`
-    /// §2, Appendix "Chip"): with Claude's shells running, the light's title adds
+    /// §2, Appendix "Chip"): with Claude's shells running, the off light's title adds
     /// `· ends 1 shell` to its whole and keeps it in its short form, a reason, which
     /// `footer::fit_rule` keeps in a rule where a plain hover's title gives way to the facts.
-    /// CONTROL: with no job running the short form is the head alone, and no reason.
+    /// CONTROLS: with no job running the short form is the head alone, and no reason; the on
+    /// light, whose click restarts nothing (owner, 2026-11-09), names no job and is never one.
     #[test]
     fn a_hover_that_says_what_a_click_ends_keeps_it_in_its_short_form() {
         use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
@@ -6704,10 +6759,8 @@ mod tests {
             branch: Some("main".into()),
             ..FooterFacts::default()
         };
-        for (mode, head, to) in [
-            (BYPASS, "no permission prompts", "lame"),
-            (PLAN, "not yolo", "yolo"),
-        ] {
+        for (mode, head) in [(BYPASS, "bypass permissions on"), (PLAN, "plan mode on")] {
+            let on = mode == BYPASS;
             let mut w = WindowLights::default();
             observe(&mut w, &screen(&"\u{2500}".repeat(60), mode, ""));
             w.note_autopilot(7, None, AutopilotView::Cruise, now);
@@ -6716,14 +6769,19 @@ mod tests {
             for jobs in ["", "1 shell"] {
                 w.sessions.get_mut(&7).unwrap().jobs = jobs.to_owned();
                 let block = w.block(7, blank(), now, at, Keep::Drawn);
-                let ends = if jobs.is_empty() {
+                let ends = if jobs.is_empty() || on {
                     String::new()
                 } else {
                     format!(" \u{b7} ends {jobs}")
                 };
+                let does = if on {
+                    " \u{b7} no prompts"
+                } else {
+                    " \u{b7} click: yolo"
+                };
                 assert_eq!(
                     text(&block.title),
-                    format!("{head} \u{b7} click: {to}{ends}  "),
+                    format!("{head}{does}{ends}  "),
                     "{mode:?} {jobs:?}"
                 );
                 assert_eq!(
@@ -6731,7 +6789,7 @@ mod tests {
                     format!("{head}{ends}  "),
                     "{mode:?} {jobs:?}"
                 );
-                assert_eq!(block.reason, !jobs.is_empty(), "{mode:?} {jobs:?}");
+                assert_eq!(block.reason, !jobs.is_empty() && !on, "{mode:?} {jobs:?}");
                 let widths = LightsWidth {
                     chips: block.holds,
                     title: block.title.len(),
@@ -6748,8 +6806,9 @@ mod tests {
                 );
             }
             let (plain, ends) = (&titled[0], &titled[1]);
-            assert!(
+            assert_eq!(
                 ends.difference(plain).next().is_some(),
+                !on,
                 "{mode:?}: some rule keeps the reason's title where a plain hover's gives way"
             );
         }
@@ -7219,12 +7278,12 @@ mod gesture_tests {
     }
 
     /// AT REST THE RULE CARRIES THE FACTS AND THE HARNESS CHIPS ALONE: a hosted session's rule
-    /// draws Autopilot and the bit (`yolo` on bypass, `lame` on auto) and no title, Claude's row
+    /// draws Autopilot and the bit (`● yolo` on bypass, `○ yolo` on auto) and no title, Claude's row
     /// as drawn (no rewrite asked). CONTROL: an unhosted session's rule draws no chip.
     #[test]
     fn at_rest_the_rule_carries_the_facts_and_the_harness_chips_alone() {
         for hosted in [true, false] {
-            for (mode, word) in [(BYPASS, "yolo"), (AUTO, "lame")] {
+            for (mode, word) in [(BYPASS, "\u{25cf} yolo"), (AUTO, "\u{25cb} yolo")] {
                 let (mut app, wid, session, _reader) = app();
                 let _host = hosted.then(|| host(&mut app));
                 publish_facts(&app, session);
@@ -7251,13 +7310,13 @@ mod gesture_tests {
                 let text = row_text(&app, wid, footer_row(&app, wid));
                 assert!(text.contains(WHOLE_FACTS), "{text:?}");
                 for gone in [
-                    "\u{25CB}",
-                    "\u{25CF}",
                     "\u{23F5}",
                     "autopilot",
-                    "no permission prompts",
-                    "not yolo",
+                    "no prompts",
+                    "mode on",
+                    "permissions on",
                     "click: ",
+                    "lame",
                 ] {
                     assert!(!text.contains(gone), "{gone:?} in {text:?}: no title");
                 }
@@ -7312,7 +7371,7 @@ mod gesture_tests {
         let (mut app, wid, session, mut reader) = app();
         let _host = host(&mut app);
         publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
+        draw_claude(&app, session, PLAN);
         frame(&mut app, wid);
         assert!(painted(&app, wid, MODE), "the bit, at rest");
         for want in [Chip::Autopilot, MODE] {
@@ -7515,7 +7574,10 @@ mod gesture_tests {
                     "{cols}: the reason beside the whole facts: {text:?}"
                 );
             }
-            assert!(text.contains("lame"), "{cols}: control: the chip: {text:?}");
+            assert!(
+                text.contains("\u{25cb} yolo"),
+                "{cols}: control: the chip: {text:?}"
+            );
         }
     }
 
@@ -7633,7 +7695,7 @@ mod gesture_tests {
         );
         frame(&mut app, wid);
         let text = row_text(&app, wid, at_rest.0);
-        assert!(text.contains("lame"), "the chip stays: {text:?}");
+        assert!(text.contains("\u{25cb} yolo"), "the chip stays: {text:?}");
         assert_eq!(hit(&app, wid, Light::Mode).0, at_rest.0);
         assert!(pty(&mut reader, 0).is_empty());
         let narrowest = u16::try_from(ACCEPT_SHORT.chars().count()).unwrap();
@@ -7718,15 +7780,20 @@ mod gesture_tests {
     /// THE HOVER SAYS WHAT A CLICK'S RESTART ENDS, READ PAST THE ⬆️'S GATE
     /// (`docs/DESIGN-yolo-binary-2026-11-04.md` Appendix "Chip"): with no ⬆️ on show, a hover on
     /// the light reads Claude's running jobs off its row under any pill (auto's left as Claude
-    /// draws it) and its title adds `· ends 1 shell`. CONTROL: at rest the frame reads no job
-    /// words.
+    /// draws it) and the off light's title adds `· ends 1 shell`. CONTROLS: at rest the frame
+    /// reads no job words; the on light, whose click restarts nothing, names none in its title.
     #[test]
     fn the_hover_says_what_a_clicks_restart_ends() {
-        for (mode, head) in [
-            ("  \u{23F5}\u{23F5} auto mode on \u{B7} 1 shell", "not yolo"),
+        for (mode, head, ends) in [
+            (
+                "  \u{23F5}\u{23F5} auto mode on \u{B7} 1 shell",
+                "auto mode on \u{b7} click: yolo",
+                true,
+            ),
             (
                 "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell",
-                "no permission prompts",
+                "bypass permissions on \u{b7} no prompts",
+                false,
             ),
         ] {
             let (mut app, wid, session, _reader) = wide_app();
@@ -7749,8 +7816,10 @@ mod gesture_tests {
             frame(&mut app, wid);
             assert_eq!(jobs(&app), "1 shell", "{mode:?}");
             let text = row_text(&app, wid, footer_row(&app, wid));
-            assert!(
-                text.contains(head) && text.contains("\u{b7} ends 1 shell"),
+            assert!(text.contains(head), "{mode:?}: {text:?}");
+            assert_eq!(
+                text.contains("\u{b7} ends 1 shell"),
+                ends,
                 "{mode:?}: {text:?}"
             );
         }
@@ -8285,7 +8354,7 @@ mod gesture_tests {
                     "{width}: {rule:?}"
                 );
                 2
-            } else if rule.contains("\u{221e} yolo  autopilot: cruise ") {
+            } else if rule.contains("\u{221e} \u{25cf} yolo  autopilot: cruise ") {
                 assert!(
                     !rule.contains("click") && !rule.contains("\u{2014}"),
                     "{width}: the short form is the mode phrase alone: {rule:?}"
@@ -8609,7 +8678,7 @@ mod word_tests;
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "claude_permission_click",
-    action = "ToLame",
+    action = "ToOff",
     reason = "Claude Code's own step: its pill leaves bypass (a person's shift+tab, the plan \
               tool, a restart that lands in the settings' mode)."
 )]

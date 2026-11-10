@@ -2723,7 +2723,7 @@ mod tests {
         assert!(witness.exists() && crate::store::build_is_complete(&build));
         assert!(incoming.join("bin/new").is_file());
         drop(child);
-        let publication = swap_into_place(&build, &incoming).unwrap();
+        let publication = aterm_uds::deadline::once_released(|| swap_into_place(&build, &incoming));
         assert!(!witness.exists() && build.join("bin/new").is_file());
         assert!(matches!(
             crate::lease::reclaim(prefix, &subject),

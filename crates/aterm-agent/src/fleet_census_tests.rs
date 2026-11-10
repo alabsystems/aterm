@@ -51,11 +51,13 @@ fn census_pass_waits_for_the_roster_writer_instead_of_losing_members() {
     .expect_err("an exhausted pass defers instead of publishing an empty census");
     assert!(busy.contains("roster is busy"), "{busy}");
     assert!(
-        client::test_without_roster_wait(pass)
-            .unwrap()
-            .roster
-            .members
-            .is_empty(),
+        client::test_without_roster_wait(|| {
+            super::collect_local_census_inputs(&state, Some(&home), Vec::new(), 1_793_000_000)
+        })
+        .unwrap()
+        .roster
+        .members
+        .is_empty(),
         "negative control loses the roster in a background pass"
     );
     let release = writer.clone();
@@ -1272,6 +1274,8 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
 #[cfg(unix)]
 #[test]
 fn collect_local_census_inputs_populates_commons_labels_and_count() {
+    use std::{cell::Cell, os::unix::fs::MetadataExt as _, rc::Rc};
+
     let root = aterm_tempfile::tempdir().unwrap();
     let srv_dir = root.path().join("server");
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1313,6 +1317,73 @@ fn collect_local_census_inputs_populates_commons_labels_and_count() {
             .iter()
             .any(|m| m.label == "m22" && m.in_commons)
     );
+
+    // The pass's existing deadline also bounds optional Commons custody. The real lock is
+    // held: a fresh production-size wait would call the observer, which releases only this
+    // holder so even the old producer reaches the assertion without a minute-long delay.
+    let mut owner = Some(
+        aterm_uds::private_file::PrivateLock::take(
+            &paths.dir,
+            "commons.lock",
+            Duration::ZERO,
+            "fixture owns Commons custody",
+        )
+        .unwrap(),
+    );
+    let (_pin, metadata) =
+        aterm_uds::private_file::open_private(&paths.dir, "commons.lock").unwrap();
+    let lock_identity = (metadata.dev(), metadata.ino());
+    let deadline = std::time::Instant::now();
+    let busy = aterm_secrets::commons::bootstrap::Bootstrap::cached_until(&paths, deadline)
+        .err()
+        .expect("the actual held custody refuses an exhausted admission");
+    assert_eq!(busy.kind(), aterm_secrets::ErrorKind::CustodyBusy);
+    let waited = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&waited);
+    let inputs = aterm_uds::file_lock::with_lock_wait_observer(
+        move |file| {
+            let metadata = file.metadata().unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), lock_identity);
+            observed.set(observed.get() + 1);
+            drop(owner.take());
+        },
+        || {
+            super::collect_local_census_inputs_until(
+                &state,
+                Some(&home),
+                Vec::new(),
+                1_762_000_000,
+                deadline,
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        waited.get(),
+        0,
+        "Commons must not start a fresh wait after the pass deadline"
+    );
+    assert!(
+        !inputs.roster.members.is_empty(),
+        "the readable roster is retained"
+    );
+    assert!(inputs.commons_labels.is_empty());
+    assert_eq!(
+        inputs.commons_member_count, None,
+        "busy is unknown, not an empty Commons"
+    );
+    // Dropping the observer releases its owned holder even when it was never called. The
+    // same exhausted deadline still permits a real first try when no lock is contended.
+    let inputs = super::collect_local_census_inputs_until(
+        &state,
+        Some(&home),
+        Vec::new(),
+        1_762_000_000,
+        deadline,
+    )
+    .unwrap();
+    assert!(inputs.commons_labels.contains("m22"));
+    assert_eq!(inputs.commons_member_count, Some(1));
 
     running.stop();
 }

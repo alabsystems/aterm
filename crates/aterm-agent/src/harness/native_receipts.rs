@@ -32,6 +32,15 @@ use std::time::{Duration, Instant};
 mod account;
 #[path = "native_receipts_recipients.rs"]
 mod recipients;
+#[path = "native_recipient_reservation.rs"]
+mod reservation;
+pub use reservation::{RecipientReservation, reserve_recipient_operation};
+#[path = "native_recipient_custody.rs"]
+mod recipient_custody;
+pub use recipient_custody::{
+    BoundRecipientCustody, RecipientCustody, RecipientWriter, bind_recipient_custody,
+    enroll_recipient_custody, open_recipient_writer,
+};
 #[cfg(any(test, debug_assertions))]
 #[path = "native_receipts_replay_bench.rs"]
 mod replay_bench;
@@ -1635,6 +1644,11 @@ fn observe_closure_at(paths: &Paths, prepare: &Prepare) -> io::Result<Closure> {
     {
         return Err(invalid());
     }
+    if prepare.receipt_mode.is_some() {
+        return Ok(
+            recipients::observe_at(paths, prepare)?.map_or(Closure::Other, Closure::Recipients)
+        );
+    }
     let Some((key, view)) = read(paths)? else {
         return Ok(Closure::Absent(None));
     };
@@ -1644,9 +1658,6 @@ fn observe_closure_at(paths: &Paths, prepare: &Prepare) -> io::Result<Closure> {
     if entry.recipients.is_some() {
         return Ok(recipients::observe_entry(&key, entry, prepare)?
             .map_or(Closure::Other, Closure::Recipients));
-    }
-    if prepare.receipt_mode.is_some() {
-        return Ok(Closure::Other);
     }
     let exact = entry.receipt.prepare == key.prepare(prepare)?
         || Some(entry.receipt.prepare) == key.legacy_prepare(prepare);
@@ -1839,6 +1850,31 @@ pub mod testing {
             Self {
                 paths: Paths::for_home(home),
             }
+        }
+
+        /// Enroll the independent recipient journal before freezing a test recipe.
+        /// # Errors
+        /// Refuses damaged custody or a failed durability barrier.
+        pub fn enroll_recipients(&self) -> io::Result<RecipientCustody> {
+            recipient_custody::enroll_at(&self.paths)
+        }
+
+        /// Reserve the marked operation through the production legacy writer.
+        /// # Errors
+        /// Refuses an invalid recipe, conflicting claim or damaged custody.
+        pub fn reserve_recipient(
+            &self,
+            prepare: &Prepare,
+            binding: &Binding,
+        ) -> io::Result<RecipientReservation> {
+            reservation::reserve_at(&self.paths, prepare, binding, LIMITS)
+        }
+
+        /// Count the independent journal's authenticated bindings and events.
+        /// # Errors
+        /// Refuses missing, incomplete or damaged custody.
+        pub fn recipient_record_count(&self) -> io::Result<u64> {
+            recipient_custody::record_count_at(&self.paths)
         }
 
         /// Commit a complete-format fixture with the production codec validation.

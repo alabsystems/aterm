@@ -445,7 +445,7 @@ impl PreverifyPublisher {
                 grant_chunks: false,
                 grant_empty: false,
                 grant_desk: false,
-                recipient_recovery: false,
+                recipient_recovery: aterm_update::NativeRecipientRecovery::Absent,
             },
             current_build,
             candidate,
@@ -8053,11 +8053,7 @@ impl App {
                                 aterm_log::info!(
                                     "harness @{}: the update's Commit, once written, drops the standing click on {}",
                                     click.click.tab,
-                                    if click.from_yolo {
-                                        aterm_agent::harness::footer::YOLO_ON
-                                    } else {
-                                        aterm_agent::harness::footer::YOLO_OFF
-                                    }
+                                    crate::claude_lights::said_bit(click.from_yolo)
                                 );
                             }
                             crate::seamless::commit_and_exit(commit_fd, proof)

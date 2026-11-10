@@ -16,6 +16,34 @@ use std::{
 const HEADER: usize = 16;
 const MESSAGE: usize = 12;
 
+/// Validate every netlink message in one notification datagram. This socket only joins
+/// multicast groups; it never sends the queries whose unicast replies could wake a recheck.
+pub(super) fn route_changed(bytes: &[u8]) -> io::Result<bool> {
+    let mut at = 0;
+    let mut changed = false;
+    while at < bytes.len() {
+        let length = usize::try_from(u32_at(bytes, at)?)
+            .map_err(|_| refuse("invalid route notification length"))?;
+        if length < HEADER || length > bytes.len() - at {
+            return Err(refuse("truncated route notification"));
+        }
+        match u16_at(bytes, at + 4)? {
+            1 | 3 => {} // NLMSG_NOOP / NLMSG_DONE.
+            2 | 4 => {
+                return Err(refuse(
+                    "route notification reports an error or lost messages",
+                ));
+            }
+            _ => changed = true,
+        }
+        at += align4(length)?;
+    }
+    if at != bytes.len() || bytes.is_empty() {
+        return Err(refuse("invalid route notification padding"));
+    }
+    Ok(changed)
+}
+
 fn attribute(wire: &mut Vec<u8>, kind: u16, bytes: &[u8]) {
     let length = bytes.len() + 4;
     wire.extend_from_slice(&(length as u16).to_ne_bytes());

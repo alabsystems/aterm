@@ -8,12 +8,14 @@
 //! aterm's models of the release cutter and its trust facts.
 
 mod models_release;
+mod models_release_lint_memory;
 mod models_release_publish_once;
 mod models_release_qualify;
 mod models_release_sign_beside;
 mod models_trust_facts;
 
 pub use models_release::*;
+pub use models_release_lint_memory::release_lint_memory_model;
 pub use models_release_publish_once::release_publish_once_model;
 pub use models_release_qualify::release_qualify_model;
 pub use models_release_sign_beside::release_sign_beside_publish_model;

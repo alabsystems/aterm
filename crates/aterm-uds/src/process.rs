@@ -1595,6 +1595,49 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
     Some(ProcessStart { boot, wall: None })
 }
 
+/// When `pid` started, in whole Unix seconds as `ps -o lstart` reckons it: the boot ([`boot_s`]),
+/// read at each call as `ps` reads it, plus the start in clock ticks its `/proc/<pid>/stat` holds
+/// ([`procfs::start_s`]). A zombie's is read as a live
+/// process's. `None` where either cannot be read: no such process, or one gone mid-read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_process_start_s(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat"))).ok()?;
+    let (_, ticks) = procfs::stat_start(&stat, pid)?;
+    let boot = boot_s()?;
+    let (_, per_second) = linux_reader()?;
+    Some(procfs::start_s(boot, ticks, per_second))
+}
+
+/// The boot in whole Unix seconds, `/proc/stat`'s `btime` ([`procfs::btime`]), read now: a step
+/// of the wall clock moves it. `None` where it cannot be read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn boot_s() -> Option<u64> {
+    // A line for each CPU and a count for each interrupt: a large host's outgrows
+    // `read_proc_text`'s per-pid cap.
+    const MAX_PROC_STAT_BYTES: u64 = 16 * 1024 * 1024;
+    let (stat, _) =
+        crate::atomic_file::read_regular(std::path::Path::new("/proc/stat"), MAX_PROC_STAT_BYTES)
+            .ok()?;
+    procfs::btime(&String::from_utf8_lossy(&stat))
+}
+
+/// `pid`'s parent pid, process group and controlling terminal's foreground group (`-1` with no
+/// terminal), from its `/proc/<pid>/stat` ([`procfs::stat_ids`]); `None` where it cannot be read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_process_ids(pid: i32) -> Option<(u32, i64, i64)> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat"))).ok()?;
+    procfs::stat_ids(&stat, pid)
+}
+
 /// How far [`read_process_start`]'s `boot` can precede a process's real start on Linux, in
 /// nanoseconds: one tick of `/proc/<pid>/stat`'s start time, `AT_CLKTCK` a second (10 ms at
 /// 100), rounded up ([`procfs::tick_span`]).
@@ -1730,6 +1773,41 @@ pub mod procfs {
             .parse()
             .ok()?;
         Some((state, start))
+    }
+
+    /// The parent pid, process group and controlling terminal's foreground group (`-1` with no
+    /// terminal) from a `/proc/<pid>/stat` line for `pid`: what `ps -o ppid=,pgid=,tpgid=` prints.
+    #[must_use]
+    pub fn stat_ids(stat: &str, pid: i32) -> Option<(u32, i64, i64)> {
+        let open = stat.find(" (")?;
+        if stat[..open].trim().parse::<i32>().ok()? != pid {
+            return None;
+        }
+        let close = stat.rfind(')')?;
+        if close < open {
+            return None;
+        }
+        let mut fields = stat[close + 1..].split_ascii_whitespace().skip(1);
+        let parent = fields.next()?.parse().ok()?;
+        let group = fields.next()?.parse().ok()?;
+        let foreground = fields.nth(2)?.parse().ok()?;
+        Some((parent, group, foreground))
+    }
+
+    /// The boot time in whole Unix seconds from a `/proc/stat` text (its `btime` line).
+    #[must_use]
+    pub fn btime(stat: &str) -> Option<u64> {
+        let b = stat.lines().find_map(|l| l.strip_prefix("btime "))?.trim();
+        (!b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| b.parse().ok())
+            .flatten()
+    }
+
+    /// A start `ticks` clock ticks (`per_second` a second) after a boot at Unix second `boot`,
+    /// in whole Unix seconds, cut short: `ps -o lstart`'s reckoning.
+    #[must_use]
+    pub const fn start_s(boot: u64, ticks: u64, per_second: u64) -> u64 {
+        boot.saturating_add(ticks / if per_second == 0 { 1 } else { per_second })
     }
 
     /// The parent pid in a `/proc/<pid>/status` text.
@@ -3023,6 +3101,44 @@ mod start_tests {
          281474237452063 281474237452063 281474237452267 0\n";
     const STATUS_501: &str = "Name:\tcat\nState:\tR (running)\nTgid:\t13\nPid:\t13\n\
          Uid:\t501\t502\t501\t502\nGid:\t20\t20\t20\t20\n";
+
+    /// The ids `ps -o ppid=,pgid=,tpgid=` prints, counted from the command name's last `)` (a
+    /// name may hold `)` and spaces), `-1` with no terminal; a boot second and a start in ticks
+    /// make `ps -o lstart`'s whole second, cut short. Negative control: counting from the first
+    /// `)` reads `TRICKY`'s state as `b` and its parent as `(c)`, which is no number.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_linux_process_s_ids_and_wall_start_are_read_as_ps_prints_them() {
+        assert_eq!(procfs::stat_ids(TRICKY, 7), Some((1, 1, -1)));
+        assert_eq!(procfs::stat_ids(CAT, 13), Some((1, 1, -1)));
+        assert_eq!(
+            procfs::stat_ids("40 (bash) S 39 40 40 34816 41 4194560 1", 40),
+            Some((39, 40, 41)),
+            "on a terminal, another group in front"
+        );
+        assert_eq!(procfs::stat_ids(CAT, 14), None, "another pid's line");
+        assert_eq!(procfs::stat_ids("13 (cat) R 1 1", 13), None, "cut short");
+        assert_eq!(
+            procfs::btime("cpu  1 2 3\nintr 9\nbtime 1794200000\nprocesses 7\n"),
+            Some(1_794_200_000)
+        );
+        assert_eq!(procfs::btime("cpu  1 2 3\n"), None, "no boot line");
+        assert_eq!(procfs::btime("btime -3\n"), None, "no whole second");
+        assert_eq!(
+            procfs::start_s(1_794_200_000, 51_831_871, 100),
+            1_794_718_318
+        );
+        assert_eq!(
+            procfs::start_s(1_794_200_000, 199, 100),
+            1_794_200_001,
+            "cut short"
+        );
+        assert_eq!(
+            procfs::start_s(5, 7, 0),
+            12,
+            "no tick rate read as one a second"
+        );
+    }
 
     /// `stat` field 22 counted from the command name's last `)`, the effective uid as the second
     /// `Uid:` id, a tick as its first instant; a process whose main thread alone exited has its

@@ -268,6 +268,14 @@ impl Default for MarkdownHistory {
 }
 
 impl MarkdownHistory {
+    /// Carry retained locations through a canonical document edit without visiting a new
+    /// entry or changing which history entry is current.
+    pub fn map_locations(&mut self, mut map: impl FnMut(MarkdownLocation) -> MarkdownLocation) {
+        for location in &mut self.entries {
+            *location = map(*location);
+        }
+    }
+
     pub fn visit(&mut self, location: MarkdownLocation) {
         if self
             .cursor

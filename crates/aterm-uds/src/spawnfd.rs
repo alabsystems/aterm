@@ -2023,7 +2023,12 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// through this executable ([`crate::tether::executable`]), whose watcher sends `SIGKILL`
 /// [`END_GRACE`](crate::process::END_GRACE) after the `SIGTERM` to the same process only
 /// ([`crate::tether::end_watched`]), once its thread has run; an unreadable identity gets no
-/// signal and the watcher exits, so the child can run on. In a process whose `main` never called
+/// signal and the watcher exits, so the child can run on. A child spawned at the head of its own
+/// process group (`process_group(0)`, or a session) has its group ended instead, `SIGTERM` then
+/// `SIGKILL` rounds, the group held as the child's by the watcher's anchor (a zombie it never
+/// reaps), so its descendants in that group end with it, even after the child itself exited;
+/// Linux's parent-death signal still reaches the child alone. In a
+/// process whose `main` never called
 /// [`crate::tether::entry`], or whose executable was replaced since ([`crate::tether::lost`]),
 /// the child starts untethered. Neither an exec nor a suspended start can be tethered.
 pub trait Tether {

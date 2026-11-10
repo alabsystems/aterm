@@ -151,6 +151,22 @@ pub trait ReleaseHost {
         files: &[PathBuf],
     ) -> Result<(), HostError>;
 
+    /// Create a new release `tag` carrying `files` as a draft, without publishing it.
+    /// An already-published release from the same create intent only converges when
+    /// its exact files and prerelease status agree; it is never changed.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::Refused`] when another publisher already owns the release.
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<(), HostError>;
+
     /// Upload `files` to the existing release `tag`.
     ///
     /// # Errors

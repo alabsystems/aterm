@@ -5271,6 +5271,76 @@ pub fn publish_local_node_key(
     Ok(minted.into_iter().next())
 }
 
+/// Publish a chosen number using the existing holder-signed `Name` record. Old members read
+/// it as a display name and retain their historical seat label; their log remains readable.
+/// No configured log or no active local signer means there is nothing to publish.
+///
+/// # Errors
+/// The number is held by another Mac, the signing key is unavailable, or the record store
+/// cannot be read or updated. A rejected label is never published as a successful rename.
+pub fn publish_local_chosen_name(
+    paths: &Paths,
+    number: aterm_types::machine_name::Number,
+) -> crate::Result<Option<Record>> {
+    if config(paths)?.is_none() {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let Some(observation) = StateLock::observe_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    let store = load_records(paths)?;
+    let Some(log) = store.log() else {
+        return Ok(None);
+    };
+    let Some((actor, _, _)) = open_local_member_signer_held(paths, log, &observation)? else {
+        return Ok(None);
+    };
+    let name = number.to_string();
+    if log.membership_ref().chosen_label(&actor) == Some(name.as_str()) {
+        return Ok(None);
+    }
+    drop(observation);
+    let Some((minted, _, ())) = author_and_commit_records_until(paths, deadline, |store| {
+        let Some(mut log) = store.log().cloned() else {
+            return Ok((Vec::new(), ()));
+        };
+        let Some((actor, device, incarnation)) = open_local_member_signer(paths, &log)? else {
+            return Ok((Vec::new(), ()));
+        };
+        if log.membership_ref().chosen_label(&actor) == Some(name.as_str()) {
+            return Ok((Vec::new(), ()));
+        }
+        // Judge C11 on each draft's observed generation, including a new draft after another
+        // writer moved the basis. A roster alias is a hold even without a matching log seat.
+        if let Some(why) = super::lab_labels(paths)?.held.get(&number) {
+            return Err(Error::new(format!("{number} is {}", why.phrase())));
+        }
+        let rec = device.with_seed(|seed| {
+            log.draft(
+                &actor,
+                aterm_time::unix_millis().unwrap_or(0),
+                Body::Name { name: name.clone() },
+            )
+            .sign(seed, incarnation)
+        })?;
+        log.insert(rec.clone())?;
+        if log.membership_ref().chosen_label(&actor) != Some(name.as_str()) {
+            return Err(Error::new(format!(
+                "{name} is held or concurrently chosen by another Mac"
+            )));
+        }
+        Ok((vec![rec], ()))
+    })?
+    else {
+        return Ok(None);
+    };
+    if !minted.is_empty() {
+        post_records_aside(paths, encode_records(&minted));
+    }
+    Ok(minted.into_iter().next())
+}
+
 /// Sign [`Body::Admit`] for `entrant` with this member's Commons device key and wrap every
 /// unwrapped [`EpochAudience::Commons`] and active [`EpochAudience::Everyone`] epoch to `entrant`'s
 /// recipient (`F18`).
@@ -6951,16 +7021,17 @@ fn plan_log_enrollment(
                 }
             }
         }
-        if crate::swarm_roster::leading_m_label(preferred_label).is_none() {
-            taken.insert(crate::swarm_roster::DEFAULT_RESERVED_RELEASE_LABEL.to_owned());
-            if let Ok(Some(policy)) =
-                crate::swarm_roster::SwarmPolicy::from_document(&admin.published_doc)
-            {
-                taken.extend(
-                    policy.effective_reserved(&admin.published_doc, Some(&combined_roster)),
-                );
-            }
-        }
+        // Every other machine's `[machines]` name holds its leading number (an admin may have no
+        // roster row); no number is reserved for a role or a policy list (owner ruling,
+        // 2026-11-09).
+        taken.extend(
+            admin
+                .published_doc
+                .machines()
+                .into_iter()
+                .filter(|m| Recipient::parse(&m.recipient).ok() != Some(binding.recipient()))
+                .filter_map(|m| crate::swarm_roster::leading_m_label(&m.name).map(|(_, l)| l)),
+        );
         let label = log
             .next_label(preferred_label, &taken, &BTreeSet::new())
             .ok_or_else(|| Error::new("no m<N> label up to m99999 is free"))?;

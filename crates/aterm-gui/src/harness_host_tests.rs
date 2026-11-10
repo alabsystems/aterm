@@ -8755,7 +8755,7 @@ fn a_standing_permission_click_holds_the_loops_act_for_its_own_bound() {
     let click = |tab: &str| Click {
         tab: tab.to_owned(),
         conversation: "c-1".to_owned(),
-        to: PermissionTo::Settings,
+        to: PermissionTo::Bypass,
         at: 1,
     };
     let world = Arc::new(World::default());
@@ -8770,7 +8770,7 @@ fn a_standing_permission_click_holds_the_loops_act_for_its_own_bound() {
     switches.set(&on(), false);
     let idle = idle_host("s-click", Program::Claude, switches, hooks);
     assert!(!idle.owns_turn_end(), "no click: nothing held");
-    clicks.stand(click("s-click"), true);
+    clicks.stand(click("s-click"), false);
     assert!(
         idle.owns_turn_end(),
         "a standing click holds the loop's act"
@@ -8782,7 +8782,7 @@ fn a_standing_permission_click_holds_the_loops_act_for_its_own_bound() {
     assert!(idle.owns_turn_end(), "the next click's own hold");
     assert!(clicks.take_back("s-click").is_some());
     assert!(!idle.owns_turn_end(), "taken back: nothing held");
-    clicks.stand(click("s-other"), true);
+    clicks.stand(click("s-other"), false);
     assert!(
         !idle.owns_turn_end(),
         "another tab's click holds nothing here"

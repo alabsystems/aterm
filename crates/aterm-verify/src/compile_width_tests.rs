@@ -31,6 +31,8 @@ fn the_real_lint_stage_installs_pool_flags_without_a_unit_memory_claim() {
         .unwrap();
     // No memory claim, yet the observation must belong to the pooled width.
     spec.mem = 0;
+    let events = dir.path().join("admission.events");
+    ctx.events = Some(crate::event_log::EventLog::open(&events).unwrap());
     let quiet = crate::Quiet::of(&ctx, std::slice::from_ref(&spec), crate::LIVE.admit_quiet);
     let observed = std::cell::Cell::new(false);
     let _ =
@@ -42,6 +44,16 @@ fn the_real_lint_stage_installs_pool_flags_without_a_unit_memory_claim() {
             crate::LIVE,
             || {},
             || {
+                let recorded = std::fs::read_to_string(&events).unwrap();
+                assert!(
+                    recorded
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("verify-event: "))
+                        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+                        .any(|event| event["event"].as_str() == Some("stage-admitted")
+                            && event["stage_id"].as_str() == Some("Tippy")),
+                    "resource admission must be visible before lint work starts"
+                );
                 assert_eq!(current(), Some(3));
                 let pool = ctx.pool.as_ref().unwrap();
                 let mut command = aterm_uds::spawnfd::command("unused");

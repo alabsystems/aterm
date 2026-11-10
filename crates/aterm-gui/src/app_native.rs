@@ -2911,6 +2911,19 @@ impl App {
             return Ok(false);
         }
         let viewport = self.native_ui_viewport_for(wid, view)?;
+        let viewport = match (
+            self.native_runtime.app(instance),
+            self.native_runtime.view_state(view),
+        ) {
+            (
+                Some(crate::native_app::NativeApp::Editor(editor)),
+                Some(crate::native_app::AppViewState::Editor(state)),
+            ) => match editor.workspace_layout(state, viewport).editor {
+                Some(rect) => rect,
+                None => return Ok(false),
+            },
+            _ => viewport,
+        };
         let toolbar = match (
             self.native_runtime.app(instance),
             self.native_runtime.view_state(view),
@@ -3125,6 +3138,21 @@ impl App {
         {
             let _ = self.compiled_native_ui(wid);
         }
+        // Wheel input belongs to the pane under the pointer. Keyboard scrolling
+        // belongs to the focused pane, without a wheel stealing that focus.
+        let workspace_reader = match self.native_runtime.view_state(view) {
+            Some(crate::native_app::AppViewState::Editor(state)) => state.markdown.as_ref(),
+            _ => None,
+        };
+        let reader_input = workspace_reader.is_some_and(|workspace| match &event {
+            AppEvent::ScrollAt { key, .. }
+                if workspace.mode == crate::native_app::MarkdownWorkspaceMode::Split =>
+            {
+                key.as_str().starts_with("markdown/")
+                    || key.as_str().starts_with("editor/markdown/reader-pane")
+            }
+            _ => !workspace.editor_focused(),
+        });
         let event = match event {
             AppEvent::ScrollAt { lines, .. } if kind != crate::native_app::AppKind::Settings => {
                 AppEvent::ScrollLines(lines)
@@ -3136,10 +3164,8 @@ impl App {
         {
             let _ = self.reconcile_editor_viewport(wid, instance, view)?;
         }
-        if matches!(
-            kind,
-            crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor
-        ) && let AppEvent::Action(invocation) = &event
+        if kind == crate::native_app::AppKind::Editor
+            && let AppEvent::Action(invocation) = &event
             && crate::command_registry::native_document_action(invocation.id.as_str()).is_none()
         {
             return Err(format!(
@@ -3147,28 +3173,40 @@ impl App {
                 invocation.id.as_str()
             ));
         }
-        let event = if kind == crate::native_app::AppKind::Markdown {
+        let event = if reader_input
+            && matches!(
+                event,
+                AppEvent::ScrollLines(_) | AppEvent::MarkdownPage { .. }
+            ) {
+            let viewport = self.native_ui_viewport_for(wid, view)?;
+            let viewport = match (
+                self.native_runtime.app(instance),
+                self.native_runtime.view_state(view),
+            ) {
+                (
+                    Some(crate::native_app::NativeApp::Editor(editor)),
+                    Some(crate::native_app::AppViewState::Editor(state)),
+                ) => editor
+                    .workspace_layout(state, viewport)
+                    .reader
+                    .unwrap_or(viewport),
+                _ => viewport,
+            };
             match event {
-                AppEvent::ScrollLines(lines) => {
-                    let viewport = self.native_ui_viewport_for(wid, view)?;
-                    AppEvent::MarkdownScroll {
-                        lines,
-                        viewport_width: viewport.width,
-                        viewport_height: viewport.height,
-                    }
-                }
+                AppEvent::ScrollLines(lines) => AppEvent::MarkdownScroll {
+                    lines,
+                    viewport_width: viewport.width,
+                    viewport_height: viewport.height,
+                },
                 AppEvent::MarkdownPage {
                     direction,
                     viewport_width: _,
                     viewport_height: _,
-                } => {
-                    let viewport = self.native_ui_viewport_for(wid, view)?;
-                    AppEvent::MarkdownPage {
-                        direction,
-                        viewport_width: viewport.width,
-                        viewport_height: viewport.height,
-                    }
-                }
+                } => AppEvent::MarkdownPage {
+                    direction,
+                    viewport_width: viewport.width,
+                    viewport_height: viewport.height,
+                },
                 event => event,
             }
         } else if kind == crate::native_app::AppKind::Editor {
@@ -3273,6 +3311,19 @@ impl App {
         } else {
             event
         };
+        if matches!(
+            event,
+            AppEvent::EditorCommand(
+                crate::native_editor::EditorCommand::IncrementalSearch
+                    | crate::native_editor::EditorCommand::SearchNext
+                    | crate::native_editor::EditorCommand::SearchPrevious
+                    | crate::native_editor::EditorCommand::GotoLine
+                    | crate::native_editor::EditorCommand::ExecuteCommand
+            )
+        ) && self.native_runtime.focus_markdown_editor(instance, view)
+        {
+            self.reconcile_editor_viewport(wid, instance, view)?;
+        }
         if kind == crate::native_app::AppKind::Editor
             && let Some(refusal) = self.refuse_editor_command(view, &event)
         {
@@ -3509,10 +3560,45 @@ impl App {
         };
         let folded = event.keypad_folded();
         let event = folded.as_ref().unwrap_or(event);
+        let markdown_workspace = match self.native_runtime.view_state(active_view) {
+            Some(crate::native_app::AppViewState::Editor(state)) => state.markdown.as_ref(),
+            _ => None,
+        };
+        let workspace_reader_active =
+            markdown_workspace.is_some_and(|state| !state.editor_focused());
+        // These commands belong to the document, including while its source
+        // editor is hidden. Other editor key bindings keep their usual meaning.
+        if markdown_workspace.is_some()
+            && let InputEvent::Key {
+                key: Key::Character(character),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+            && (mods.contains(Modifiers::SUPER) || cfg!(windows) && mods.contains(Modifiers::CTRL))
+            && !mods.intersects(Modifiers::ALT | Modifiers::SHIFT)
+        {
+            let action = match character {
+                'e' | 'E' if mods.contains(Modifiers::SUPER) => Some("editor/markdown/toggle"),
+                's' | 'S' => Some("editor/save"),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let _ = self.dispatch_native_event(
+                    wid,
+                    AppEvent::Action(crate::native_app::ActionInvocation {
+                        id: crate::native_ui::ActionId::new(action),
+                        value: None,
+                    }),
+                );
+                return true;
+            }
+        }
         let editor_active = self
             .native_runtime
             .app(instance)
-            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Editor);
+            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Editor)
+            && !workspace_reader_active;
         let editor_chord_pending = editor_active
             && matches!(
                 self.native_runtime.view_state(active_view),
@@ -3581,10 +3667,7 @@ impl App {
             .native_runtime
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings);
-        let markdown_active = self
-            .native_runtime
-            .app(instance)
-            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
+        let markdown_active = workspace_reader_active;
         // A list whose rows the arrows move between, as Settings' controls.
         let steps_focus = settings_active
             || self
@@ -4485,6 +4568,12 @@ impl App {
                         },
                     )?;
                 }
+            }
+            AppEffect::OpenMarkdownDocument {
+                document,
+                destination,
+            } => {
+                self.open_markdown_link(wid, document, &destination)?;
             }
             AppEffect::OpenDocumentEditor { document } => {
                 let outcome = self

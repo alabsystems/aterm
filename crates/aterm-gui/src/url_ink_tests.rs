@@ -4,14 +4,8 @@
 use super::{FAINT_URL_CONTRAST, PlainUrl, find_url_span};
 use crate::RenderCell;
 
-// The complete URL helper before lookup-local color reuse.
-fn uncached_url(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<PlainUrl<'_>> {
-    let ink = |cell: &RenderCell| {
-        let bg = aterm_render::rgb_to_u32(cell.bg);
-        let fg = aterm_render::rgb_to_u32(cell.fg);
-        let painted = aterm_render::floor_min_contrast_fg(fg, bg, min_contrast);
-        (painted, bg)
-    };
+// The complete URL helper before the contrast-change boolean query.
+fn previous_url(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<PlainUrl<'_>> {
     let span = find_url_span(cells.len(), col, |i| {
         let cell = &cells[i];
         if cell.wide { ' ' } else { cell.ch }
@@ -20,14 +14,27 @@ fn uncached_url(cells: &[RenderCell], col: usize, min_contrast: f32) -> Option<P
     let cells = &cells[span];
     let span = find_url_span(cells.len(), col, |i| {
         let cell = &cells[i];
-        let (fg, bg) = ink(cell);
-        if cell.wide || fg == bg { ' ' } else { cell.ch }
+        if cell.wide || cell.fg == cell.bg {
+            ' '
+        } else {
+            cell.ch
+        }
     })?;
     let cells = &cells[span];
-    let faint = cells
-        .iter()
-        .map(ink)
-        .any(|(fg, bg)| aterm_render::floor_fg_contrast(fg, bg, FAINT_URL_CONTRAST) != fg);
+    let mut previous_visible = None;
+    let faint = cells.iter().any(|cell| {
+        if previous_visible == Some((cell.fg, cell.bg)) {
+            return false;
+        }
+        previous_visible = Some((cell.fg, cell.bg));
+        let bg = aterm_render::rgb_to_u32(cell.bg);
+        let fg = aterm_render::floor_min_contrast_fg(
+            aterm_render::rgb_to_u32(cell.fg),
+            bg,
+            min_contrast,
+        );
+        aterm_render::floor_fg_contrast(fg, bg, FAINT_URL_CONTRAST) != fg
+    });
     Some(PlainUrl { cells, faint })
 }
 
@@ -70,6 +77,10 @@ fn recolor(cells: &mut [RenderCell], pattern: usize) {
             }
             5 if i.is_multiple_of(5) => cell.fg = cell.bg,
             6 if i.is_multiple_of(7) => cell.wide = true,
+            7 => {
+                cell.fg = [180 + (i * 19 % 76) as u8, 180, 230];
+                cell.bg = [(i * 11 % 50) as u8, 0, 0];
+            }
             _ => {}
         }
     }
@@ -86,14 +97,14 @@ fn lookup_local_ink_reuse_preserves_each_color_boundary() {
     ] {
         for cols in [8, 80, 512] {
             let base = row(text, cols);
-            for pattern in 0..7 {
+            for pattern in 0..8 {
                 let mut cells = base.clone();
                 recolor(&mut cells, pattern);
                 for contrast in [0.0, 1.0, 3.0, 4.5, 21.0, f32::NAN, f32::INFINITY] {
                     for col in (0..cells.len() + 2).chain([usize::MAX]) {
                         assert_eq!(
                             signature(super::plain_url_at(&cells, col, contrast)),
-                            signature(uncached_url(&cells, col, contrast)),
+                            signature(previous_url(&cells, col, contrast)),
                             "{text:?} cols={cols} pattern={pattern} contrast={contrast} col={col}"
                         );
                     }
@@ -115,6 +126,16 @@ fn equal_foregrounds_do_not_reuse_another_backgrounds_floor() {
     cells[8].bg = [100, 100, 100];
     let found = super::plain_url_at(&cells, 8, 4.5).expect("visible URL");
     assert!(!found.faint, "each background needs its own contrast floor");
+    for cell in &mut cells {
+        cell.fg = [255, 255, 255];
+        cell.bg = [0, 0, 0];
+    }
+    cells[8].bg = [240, 240, 240];
+    let found = super::plain_url_at(&cells, 8, 1.0).expect("visible URL");
+    assert!(
+        found.faint,
+        "equal foregrounds can have different faintness"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -138,8 +159,8 @@ fn instructions() -> Option<u64> {
 }
 
 #[test]
-#[ignore = "manual paired URL ink instruction measurement"]
-fn url_ink_cost() {
+#[ignore = "manual paired boolean-contrast URL instruction measurement"]
+fn url_contrast_boolean_cost() {
     use std::hint::black_box;
     type Probe = for<'a> fn(&'a [RenderCell], usize, f32) -> Option<PlainUrl<'a>>;
     let long = format!("https://example.com/{}", "x".repeat(400));
@@ -152,7 +173,16 @@ fn url_ink_cost() {
         ("alternating-hidden", "https://example.com/path", 3, 0, 4.5),
         ("varied", "https://example.com/path", 4, 0, 1.0),
         ("varied-floor", "https://example.com/path", 4, 0, 4.5),
+        ("varied-visible", "https://example.com/path", 7, 0, 1.0),
+        (
+            "varied-visible-floor",
+            "https://example.com/path",
+            7,
+            0,
+            4.5,
+        ),
         ("long-bright", long.as_str(), 0, 10, 1.0),
+        ("long-faint", long.as_str(), 1, 10, 1.0),
         ("long-floor", long.as_str(), 1, 10, 4.5),
         ("none", "ordinary text without a destination", 0, 10, 1.0),
         ("outside", long.as_str(), 0, usize::MAX, 4.5),
@@ -164,15 +194,16 @@ fn url_ink_cost() {
             1.0,
         ),
         ("infinite", "https://example.com/path", 1, 0, f32::INFINITY),
+        ("nan", "https://example.com/path", 1, 0, f32::NAN),
     ] {
         let mut cells = row(text, 1024);
         recolor(&mut cells, pattern);
         assert_eq!(
-            signature(uncached_url(&cells, col, contrast)),
+            signature(previous_url(&cells, col, contrast)),
             signature(super::plain_url_at(&cells, col, contrast))
         );
         let mut probes: [(&str, Probe); 2] = [
-            ("reference", uncached_url),
+            ("reference", previous_url),
             ("candidate", super::plain_url_at),
         ];
         for (_, probe) in probes {
@@ -196,7 +227,7 @@ fn url_ink_cost() {
                 }
                 let count = before.zip(instructions()).map(|(a, b)| b.saturating_sub(a));
                 println!(
-                    "url-ink case={name} cells={} col={col} variant={variant} sample={sample} iterations=5000 allocations={calls} instructions={count:?}",
+                    "url-boolean case={name} cells={} col={col} variant={variant} sample={sample} iterations=5000 allocations={calls} instructions={count:?}",
                     cells.len()
                 );
             }

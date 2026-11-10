@@ -23,7 +23,8 @@ use crate::{launch_isolation, standin};
 /// tethered one running the script [`TETHERED`] names.
 const PARENT: &str = "tether-parent";
 
-/// The variable that names [`PARENT`]'s tethered helper: [`TERMED`], [`DEAF`] or [`SESSION`].
+/// The variable that names [`PARENT`]'s tethered helper: [`TERMED`], [`DEAF`], [`SESSION`] or
+/// [`GROUP`].
 const TETHERED: &str = "TETHER_HELPER";
 
 /// A tethered helper that ends at `SIGTERM`: it says it ran, by its pid, and naps a tenth of a
@@ -41,6 +42,11 @@ const DEAF: &str = "deaf";
 /// A tethered helper in a session of its own (`setsid`), so it leads its own group: it says it
 /// ran, by its pid, and sleeps ten minutes in its own place, which ends at `SIGTERM`.
 const SESSION: &str = "session";
+
+/// A tethered helper spawned at the head of a group of its own (`process_group(0)`), a pipeline's
+/// root: it starts a `/bin/sleep` in its group, says it ran, by its pid, and sleeps ten minutes in
+/// its own place, each of the two ending at `SIGTERM`.
+const GROUP: &str = "group";
 
 /// The stand-in that spawns each of [`CASES`] plainly and tethered and says how each went.
 const PARITY: &str = "tether-parity";
@@ -64,6 +70,7 @@ fn tethered_script(word: &str) -> Option<[&'static str; 2]> {
         ]),
         DEAF => Some(["-c", "trap '' TERM; echo ran $$; exec /bin/sleep 600"]),
         SESSION => Some(HELPER),
+        GROUP => Some(["-c", "/bin/sleep 600 & echo ran $$; exec /bin/sleep 600"]),
         _ => None,
     }
 }
@@ -136,6 +143,9 @@ fn play_parent() -> ! {
             .stderr(Stdio::inherit());
         if tethered {
             helper.tether().setsid(word == SESSION);
+            if word == GROUP {
+                helper.process_group(0);
+            }
         }
         helper.spawn().unwrap_or_else(|e| {
             standin::put(format!("spawn: {e}\n").as_bytes());
@@ -425,7 +435,7 @@ impl Started {
 }
 
 /// Start the stand-in window as the test `entry`, its tethered helper `helper` ([`TERMED`],
-/// [`DEAF`] or [`SESSION`]), and wait for both its helpers to say they ran.
+/// [`DEAF`], [`SESSION`] or [`GROUP`]), and wait for both its helpers to say they ran.
 fn start_parent(entry: &str, helper: &str) -> Started {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -615,10 +625,11 @@ fn runs_sleep_with_its_thread_run(pid: u32) {
     );
 }
 
-/// A tethered helper that leads a session and group of its own holds that group alone: its
+/// A tethered helper that leads a session and group of its own holds that group with its
+/// watcher's anchor alone, a zombie that holds the group's number while the watcher lives: the
 /// watcher leads a session of its own ([`Watcher::of`] reads it), so a listing of the helper's
 /// group (a stage sweep's), a kill of it or a hangup of its terminal never counts or reaches the
-/// watcher. The watcher still ends the helper when the stand-in window is `SIGKILL`ed, then ends
+/// watcher. NEGATIVE CONTROL: a watcher with no anchor lists the helper alone. The watcher still ends the helper when the stand-in window is `SIGKILL`ed, then ends
 /// itself, and the plain helper runs on. The window is killed only once the helper runs its last
 /// image with its thread run, as the watcher's proof reads it. Linux has no watcher.
 #[cfg(target_os = "macos")]
@@ -637,11 +648,22 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
         members.complete,
         "the listing of the tethered helper's group (pid {tethered}) is whole: {members:?}"
     );
-    assert_eq!(
-        members.pids,
-        [helper],
-        "the tethered helper's group (pid {tethered}) holds exactly the helper: its watcher leads \
-         a session of its own"
+    let others: Vec<i32> = members
+        .pids
+        .iter()
+        .copied()
+        .filter(|&p| p != helper)
+        .collect();
+    assert!(
+        members.pids.contains(&helper)
+            && !members.pids.contains(&started.watcher.pid)
+            && matches!(
+                others[..],
+                [anchor] if aterm_uds::process::process_presence(anchor)
+                    == aterm_uds::process::ProcessPresence::Exited
+            ),
+        "the tethered helper's group (pid {tethered}) holds the helper and its watcher's anchor, \
+         an exited process, and not the watcher, which leads a session of its own: {members:?}"
     );
     runs_sleep_with_its_thread_run(tethered);
     started.parent.kill().expect("SIGKILL the stand-in window");
@@ -649,6 +671,122 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
     assert!(
         exits_within(&started.tethered_exit, MUST_HAPPEN),
         "the tethered helper in a session of its own (pid {tethered}) outlived its killed parent \
+         by {MUST_HAPPEN:?}"
+    );
+    aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        "nothing is left in the tethered helper's group",
+        || (!helpers_group.holds_any()).then_some(()),
+    );
+    plain_ran_on(started);
+}
+
+/// A tethered helper at the head of a group of its own ends with its group: when the stand-in
+/// window is `SIGKILL`ed, its watcher signals the group the helper leads, so the `/bin/sleep` the
+/// helper started in it ends too, where a signal to the helper alone would leave that sleep
+/// adopted and running (Git's `fetch` leaves `remote-http`, `fetch-pack` and `index-pack` so). The
+/// window is killed only once both run `/bin/sleep` with their threads run. The plain helper, in
+/// the window's group, runs on. Linux's parent-death signal reaches the helper alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
+    play_if_asked();
+    let mut started = start_parent(
+        "tether_live::a_tethered_group_leaders_group_ends_with_its_sigkilled_starter",
+        GROUP,
+    );
+    let tethered = started.tethered;
+    let helper = i32::try_from(tethered).expect("a pid");
+    let helpers_group = Group::of(helper);
+    runs_sleep_with_its_thread_run(tethered);
+    let kid = aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        "the helper's group holds the helper and the sleep it started",
+        || {
+            let members = aterm_uds::process::group_members(tethered)?;
+            let [kid] = members
+                .pids
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    // The watcher's anchor, a zombie, reads nothing and is passed by.
+                    p != helper && aterm_uds::process::read_lineage(p).is_some()
+                })
+                .collect::<Vec<_>>()[..]
+            else {
+                return None;
+            };
+            (members.complete && members.pids.contains(&helper)).then_some(kid)
+        },
+    );
+    runs_sleep_with_its_thread_run(kid.unsigned_abs());
+    started.parent.kill().expect("SIGKILL the stand-in window");
+    started.parent.wait().expect("reap it");
+    assert!(
+        exits_within(&started.tethered_exit, MUST_HAPPEN),
+        "the tethered group leader (pid {tethered}) outlived its killed parent by {MUST_HAPPEN:?}"
+    );
+    aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        &format!(
+            "the sleep the tethered group leader started in its group (pid {kid}) ended with it"
+        ),
+        || (!helpers_group.holds_any()).then_some(()),
+    );
+    plain_ran_on(started);
+}
+
+/// A tethered helper at the head of a group of its own that ends first leaves its group watched:
+/// the helper is `SIGKILL`ed by the test (as a Git `fetch` ends of a pipe its killed parent held),
+/// the `/bin/sleep` it started in its group runs on while the stand-in window lives, and ends when
+/// the window is `SIGKILL`ed, by the watcher that stayed for it. NEGATIVE CONTROL: a watcher that
+/// exits with its helper leaves the sleep adopted and running (the hang detector below fires).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter() {
+    play_if_asked();
+    let mut started = start_parent(
+        "tether_live::a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter",
+        GROUP,
+    );
+    let tethered = started.tethered;
+    let helper = i32::try_from(tethered).expect("a pid");
+    let helpers_group = Group::of(helper);
+    runs_sleep_with_its_thread_run(tethered);
+    let kid = aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        "the helper's group holds the sleep it started",
+        || {
+            aterm_uds::process::group_members(tethered)?
+                .pids
+                .into_iter()
+                .find(|&p| {
+                    p != helper
+                        && aterm_uds::process::read_lineage(p)
+                            .is_some_and(|l| l.pgid == tethered && l.parent == tethered)
+                })
+        },
+    );
+    runs_sleep_with_its_thread_run(kid.unsigned_abs());
+    // SAFETY: the tethered helper is this test's own, its exit watch not yet fired (it sleeps ten
+    // minutes), so its pid is still its own.
+    unsafe { libc::kill(helper, libc::SIGKILL) };
+    assert!(
+        exits_within(&started.tethered_exit, MUST_HAPPEN),
+        "the tethered helper (pid {tethered}) ended at its SIGKILL"
+    );
+    let kid_exit = aterm_uds::exitwatch::exit_fd(kid.unsigned_abs()).expect("watch the sleep");
+    assert_eq!(
+        aterm_uds::process::process_presence(started.watcher.pid),
+        aterm_uds::process::ProcessPresence::Present,
+        "the watcher (pid {}) stays while its helper's group holds the sleep",
+        started.watcher.pid
+    );
+    started.parent.kill().expect("SIGKILL the stand-in window");
+    started.parent.wait().expect("reap it");
+    assert!(
+        exits_within(&kid_exit, MUST_HAPPEN),
+        "the sleep the tethered helper left in its group (pid {kid}) outlived the killed window \
          by {MUST_HAPPEN:?}"
     );
     aterm_spec::wait::until_within(

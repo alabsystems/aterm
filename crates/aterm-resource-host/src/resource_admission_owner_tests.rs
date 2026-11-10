@@ -137,10 +137,15 @@ fn native_owner_fixture_sdk_lease_keeps_original_gc_custody() {
         std::io::ErrorKind::TimedOut
     );
     drop(lease);
-    let atpkg::lease::Reclaim::Clear(guard) = atpkg::lease::reclaim(&layout.prefix, &subject)
-    else {
-        panic!("fixture lease still retained after drop")
-    };
+    let guard = aterm_uds::deadline::once_released(|| {
+        match atpkg::lease::reclaim(&layout.prefix, &subject) {
+            atpkg::lease::Reclaim::Clear(guard) => Ok(guard),
+            atpkg::lease::Reclaim::Keep(atpkg::lease::Holders::Held(_)) => {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            other => panic!("fixture lease cannot be reclaimed: {other:?}"),
+        }
+    });
     drop(guard);
     std::fs::remove_dir(&build).unwrap();
     assert!(owner_fixture_sdk_lease(&layout.prefix, &build, "missing", Instant::now()).is_err());
@@ -1526,7 +1531,10 @@ fn accounted_root_waits_for_original_settlement_and_preserves_real_outcomes() {
         assert!(
             frame.observation.cpu_times.is_some() && frame.observation.peak_rss_bytes.is_some()
         );
-        assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+        assert_eq!(
+            aterm_uds::deadline::once_released(|| (&events).read(&mut [0])),
+            0
+        );
     }
 }
 
@@ -1678,7 +1686,10 @@ fn accounted_paid_no_child_refusal_waits_for_original_custody_settlement() {
         refused.observation,
         aterm_types::resource_admission::AccountingObservation::uncollected()
     );
-    assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+    assert_eq!(
+        aterm_uds::deadline::once_released(|| (&events).read(&mut [0])),
+        0
+    );
 }
 
 #[test]
@@ -1747,7 +1758,10 @@ fn accounted_memory_only_refusal_keeps_original_funded_ancestor_untouched() {
         refusal.observation,
         aterm_types::resource_admission::AccountingObservation::uncollected()
     );
-    assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+    assert_eq!(
+        aterm_uds::deadline::once_released(|| (&events).read(&mut [0])),
+        0
+    );
     assert_eq!(world.owner.debt.reserved().unwrap(), 1);
     assert!(process::read_identity(pid as i32).is_some());
     wire::send_cancel(

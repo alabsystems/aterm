@@ -57,21 +57,62 @@ fn one_folder_is_no_split() {
     let home = home();
     let h = home.as_path();
     let dots = h.join("dots");
-    assert_eq!(split(None, None, h), None);
+    assert_eq!(split(None, None, h).unwrap(), None);
     assert_eq!(
-        split(Some(dots.as_os_str()), Some(dots.as_os_str()), h),
+        split(Some(dots.as_os_str()), Some(dots.as_os_str()), h).unwrap(),
         None
     );
-    assert_eq!(split(Some(h.join(".config").as_os_str()), None, h), None);
-    assert_eq!(split(Some(OsStr::new("")), None, h), None, "empty is unset");
+    assert_eq!(
+        split(Some(h.join(".config").as_os_str()), None, h).unwrap(),
+        None
+    );
+    assert_eq!(
+        split(Some(OsStr::new("")), None, h).unwrap(),
+        None,
+        "empty is unset"
+    );
     std::fs::create_dir_all(h.join(".config/aterm")).unwrap();
     std::fs::create_dir_all(&dots).unwrap();
     std::os::unix::fs::symlink(h.join(".config/aterm"), dots.join("aterm")).unwrap();
     assert_eq!(
-        split(Some(dots.as_os_str()), None, h),
+        split(Some(dots.as_os_str()), None, h).unwrap(),
         None,
         "linked: one folder"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_config_folder_under_an_aliased_home_is_not_a_split() {
+    let home = home();
+    let h = home.as_path();
+    let alias = h.join("home-alias");
+    std::os::unix::fs::symlink(h, &alias).unwrap();
+    assert!(!h.join(".config").exists());
+    assert_eq!(
+        split(Some(alias.join(".config").as_os_str()), None, h).unwrap(),
+        None
+    );
+
+    let other = h.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let other_alias = h.join("other-alias");
+    std::os::unix::fs::symlink(&other, &other_alias).unwrap();
+    assert!(
+        split(Some(other_alias.join(".config").as_os_str()), None, h)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn an_unreadable_config_folder_is_not_treated_as_missing() {
+    let home = home();
+    let here = home.as_path().join("dots");
+    let unread = super::split_with(Some(here.as_os_str()), None, home.as_path(), &|_: &Path| {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    });
+    assert!(unread.is_err(), "{unread:?}");
 }
 
 /// A shell's `XDG_CONFIG_HOME` that launchd does not have splits the two (round 13): the
@@ -88,7 +129,9 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
         &dots.join("aterm/aterm.toml"),
         "[update]\nenabled = false\n",
     );
-    let s = split(Some(dots.as_os_str()), None, h).expect("a split");
+    let s = split(Some(dots.as_os_str()), None, h)
+        .unwrap()
+        .expect("a split");
     assert_eq!(s.here, dots.join("aterm"));
     assert_eq!(s.app, h.join(".config/aterm"));
     assert_eq!(s.unify, Some((h.join(".config/aterm"), dots.join("aterm"))));
@@ -129,7 +172,9 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
     let h = home.as_path();
     let dots = h.join("dots");
     write(&h.join(".config/aterm/aterm.toml"), "font_px = 18\n");
-    let s = split(Some(dots.as_os_str()), None, h).expect("a split");
+    let s = split(Some(dots.as_os_str()), None, h)
+        .unwrap()
+        .expect("a split");
     assert_eq!(
         s.unify,
         Some((dots.join("aterm"), h.join(".config/aterm"))),
@@ -144,7 +189,9 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
         &h.join(".config/aterm/aterm.toml"),
         "font_px = 18\ntheme = \"dark\"\n[packages]\nenabled = true\n",
     );
-    let s = split(Some(dots.as_os_str()), None, h).expect("a split");
+    let s = split(Some(dots.as_os_str()), None, h)
+        .unwrap()
+        .expect("a split");
     assert_eq!(s.unify, None, "both exist: nothing is linked over either");
     assert_eq!(s.unify_command(), None);
     assert!(s.compared);
@@ -162,7 +209,9 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
         &h.join(".config/aterm/aterm.toml"),
         "[packages]\nauto_install = false\n",
     );
-    let s = split(Some(dots.as_os_str()), None, h).expect("a split");
+    let s = split(Some(dots.as_os_str()), None, h)
+        .unwrap()
+        .expect("a split");
     assert!(s.compared && s.differs.is_empty(), "{s:?}");
     let said = s.said(h);
     assert!(said.contains("; the two say the same today."), "{said}");
@@ -176,7 +225,9 @@ fn launchd_s_xdg_config_home_is_the_app_s() {
     let home = home();
     let h = home.as_path();
     let app = h.join("appcfg");
-    let s = split(None, Some(app.as_os_str()), h).expect("a split");
+    let s = split(None, Some(app.as_os_str()), h)
+        .unwrap()
+        .expect("a split");
     assert_eq!(s.here, h.join(".config/aterm"));
     assert_eq!(s.app, app.join("aterm"));
     assert!(

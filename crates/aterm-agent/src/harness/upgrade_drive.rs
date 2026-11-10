@@ -820,7 +820,19 @@ pub(super) fn kernel_start(pid: u32) -> Option<String> {
     {
         aterm_sysprobe::kproc::record(pid).map(|r| super::footer::lstart_utc(r.start_s))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    // `ps -o lstart`'s second in `lstart_utc`'s spelling, which is `ps`'s own under `TZ=UTC`
+    // squashed, so a record an earlier build took by `ps` names the same start.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        aterm_uds::process::read_process_start_s(i32::try_from(pid).ok()?)
+            .map(super::footer::lstart_utc)
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android"
+    )))]
     {
         let s = squash(&ps(&["-o", "lstart=", "-p", &pid.to_string()])?);
         (!s.is_empty()).then_some(s)
@@ -850,7 +862,11 @@ pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
         let r = aterm_sysprobe::kproc::record(pid)?;
         Some((r.ppid, i64::from(r.pgid), i64::from(r.tpgid)))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        aterm_uds::process::read_process_ids(i32::try_from(pid).ok()?)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     {
         let out = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()])?;
         let mut it = out.split_whitespace();
@@ -5826,6 +5842,10 @@ impl St {
             .then(|| start_of(self.pid))
             .flatten()
             .map(|now| squash(&now));
+        // A start unread because the process went between the two reads (reaped as it was
+        // asked) is its exit, not an unreadable start: only a pid that still lives after the
+        // start's read failed leaves it unproven.
+        let live = live && (now.is_some() || alive(self.pid));
         super::relaunch::agent_exit(&self.pid_start, live, now.as_deref())
     }
 
@@ -11103,7 +11123,12 @@ fn visit_models(
     let move_plan = |shell: u32| -> Result<Plan, NoPlan> {
         let home = args.env_var(super::accounts::HOME_ENV);
         let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
-        let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
+        let mode = resume_mode(
+            &records,
+            &sf.session_id,
+            shown_mode.clone(),
+            models::parse_lstart(&sf.proc_start),
+        );
         let model = model_to.clone().or_else(hand_model);
         let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
         plan_move(
@@ -13102,7 +13127,12 @@ fn restart(
         Err(why) => return said(r, format!("wait:{why}")),
     };
     let model = recorded(&st.model_list).or(hand_model);
-    let mode = resume_mode(&records, &sf.session_id, shown_mode.map(str::to_owned));
+    let mode = resume_mode(
+        &records,
+        &sf.session_id,
+        shown_mode.map(str::to_owned),
+        models::parse_lstart(&sf.proc_start),
+    );
     let launch = Launch {
         launch_env,
         billing: if !st.model_list.is_empty() {

@@ -337,8 +337,8 @@ pub struct NameSet {
 /// the write. The local file is the edit's sole base; its own older signed records cannot
 /// replace it. A number held by another signed node is refused until the registry's conflict
 /// resolution can move that node. So is a
-/// number the vault holds for another Mac or role (`lab`, read before any lock is taken:
-/// [`lab_labels`], its roster, log seats and policy, which other Macs reach a Mac by on today's
+/// number the vault holds for another Mac (`lab`, read before any lock is taken:
+/// [`lab_labels`], its roster and log seats, which other Macs reach a Mac by on today's
 /// lab, §11.86 of `docs/DESIGN-machine-names-2026-11-04.md`), and a move off the number the
 /// policy names this Mac's vault server by, which other Macs dial as `m<N>.local` and which the
 /// macOS names follow while identity naming is on. `lab` is not read for a request that keeps the
@@ -491,7 +491,7 @@ fn moves(held: &MachineName, num: Number) -> bool {
         || held.migration == Some(Migration::Waiting)
 }
 
-/// The vault's labels as the pure check keeps them: each number held for another Mac or role,
+/// The vault's labels as the pure check keeps them: each number held for another Mac,
 /// bound to no node in view.
 fn kept_labels(lab: Option<&client::LabLabels>) -> Vec<Kept> {
     lab.iter()
@@ -549,7 +549,7 @@ fn current_record(held: &MachineName) -> Record {
 ///
 /// # Errors
 /// Why the rename is refused: the number moved while `lab` was unread, the move leaves the
-/// policy's server name, or the check gives the number to another node, Mac or role.
+/// policy's server name, or the check gives the number to another node or Mac.
 fn judge(
     num: Number,
     held: &MachineName,
@@ -579,7 +579,7 @@ fn judge(
     }
     let verdict = match check(&num.to_string(), fleet, node) {
         // Same is a no-op for a chosen number, but selecting a seeded/automatic number
-        // makes a new claim. Its current lab reservation still governs that choice.
+        // makes a new claim. Its current lab hold still governs that choice.
         Verdict::Same if moves(held, num) && lab.is_some_and(|lab| lab.held.contains_key(&num)) => {
             Verdict::Labelled { by: None }
         }
@@ -886,7 +886,7 @@ pub fn standing_vault() -> Option<client::Paths> {
     client::Paths::locate().ok()
 }
 
-/// The numbers this Mac's vault gives other Macs and roles ([`client::lab_labels`]), which
+/// The numbers this Mac's vault gives other Macs ([`client::lab_labels`]), which
 /// [`set_name`] holds a rename off: nothing where no vault is read ([`standing_vault`]).
 ///
 /// # Errors

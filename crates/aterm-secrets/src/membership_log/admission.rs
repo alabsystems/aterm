@@ -628,8 +628,8 @@ impl Log {
     /// C11's label for a Mac asking under `requested` (`docs/DESIGN-alab-swarm-2026-10-27.md`
     /// C11, held by the log under F15): `requested` itself when it is an `m<N>` that no founder,
     /// no `Admit` this log holds (a removed Mac's included) and nothing in `taken` (the swarm
-    /// roster's labels, aliases, claims, deny-list and `[machines]` names, and the reserved
-    /// labels) names; otherwise the `m<N>` one above the highest of all of them and of `counted`
+    /// roster's labels, aliases, claims, deny-list and `[machines]` names: no number is reserved)
+    /// names; otherwise the `m<N>` one above the highest of all of them and of `counted`
     /// (the fleet-accounts sheet's numbers, which hold no label by themselves, as the roster's
     /// `next_free_number` counts them), or, where that would pass `m99999` (the highest an
     /// `Admit` carries, [`is_label`]), the lowest one none of them names. `None` only when every

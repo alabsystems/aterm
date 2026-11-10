@@ -522,7 +522,7 @@ fn a_facts_row_counts_only_at_its_writers_own_key() {
 
 /// Schema rows go in once, by the owner verb, and never below a version already visible: a
 /// newer build's `machine` row at version 2 keeps this build's version-1 row out, and the reader
-/// shows version 2.
+/// shows version 2. The source's earlier free-text coordinates upgrade once to version 3's keys.
 /// NEGATIVE CONTROL: with `schema_rows` publishing every collection whatever is stored, the
 /// version-1 `machine` row is written beside the newer one: `` left: 2 ``.
 #[test]
@@ -531,12 +531,57 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
     let newer = json!({"r": 2, "x": {"format": "att/1", "version": 2}});
+    let mut earlier_source = registry::SOURCE.schema_row();
+    let object = earlier_source.as_object_mut().unwrap();
+    object.insert("r".into(), json!(2));
+    let schema = object.get_mut("x").unwrap().as_object_mut().unwrap();
+    schema.insert("version".into(), json!(2));
+    let differs = schema
+        .get_mut("columns")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|column| column["name"] == json!("differs"))
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .get_mut("type")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .get_mut("list")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .get_mut("struct")
+        .unwrap()
+        .as_array_mut()
+        .unwrap();
+    for member in differs {
+        let max = match member["name"].as_str().unwrap() {
+            "pk" => 32,
+            "elem" => 64,
+            _ => continue,
+        };
+        member
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), json!({"text": max}));
+    }
     registry
-        .write(vec![vec![Change {
-            collection: SCHEMA.into(),
-            key: "machine".into(),
-            value: Some(newer.clone()),
-        }]])
+        .write(vec![vec![
+            Change {
+                collection: SCHEMA.into(),
+                key: "machine".into(),
+                value: Some(newer.clone()),
+            },
+            Change {
+                collection: SCHEMA.into(),
+                key: registry::SOURCE.name.into(),
+                value: Some(earlier_source),
+            },
+        ]])
         .unwrap();
     assert_eq!(registry.publish_schema().unwrap(), 1);
     assert_eq!(registry.publish_schema().unwrap(), 0);
@@ -564,6 +609,21 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     );
     let address = view.schema(ADDRESS.name);
     assert!(matches!(address, SchemaState::One { version: 2, .. }));
+    assert_eq!(
+        view.schema(registry::SOURCE.name),
+        SchemaState::One {
+            version: 3,
+            row: registry::SOURCE.schema_row()
+        }
+    );
+    assert_eq!(
+        view.ops
+            .iter()
+            .flat_map(|op| &op.changes)
+            .filter(|c| c.collection == SCHEMA && c.key == registry::SOURCE.name)
+            .count(),
+        2
+    );
 }
 
 /// A new grid row of a preference is born under the key of its machine and account, whichever

@@ -211,6 +211,8 @@ mod linux_vz_host;
 mod linux_xwire;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod local_signins;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod machine_labels;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod local_signins {
     pub fn cmd(_: &[String]) -> crate::Res {
@@ -864,6 +866,8 @@ Outside any lab (no jail, no stub):
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
                                  a passing run's record goes to docs/measured/)
+  machine-labels                  two private members: rename onto a sheet number, merge its rows, and check fleet,
+                                 membership, --host and survey (debug lab image; no system-name writes)
   swarm rotate [--aterm PATH] [--keep]
                                  run a private headless aterm with two enrolled Claude Code logins, wall the first through
                                  the usage-tap seam (`harness tap`), verify `rotations[]` grows, and serve a turn on the second
@@ -1259,6 +1263,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "agy-upgrade" => upgrade_agy::cmd_agy_upgrade(args),
         "agy-relaunch" => relaunch_agy::cmd_agy_relaunch(args),
         "fleet-sim" => fleet_sim::cmd(args),
+        #[cfg(debug_assertions)]
+        "machine-labels" => machine_labels::cmd(args),
         "service-acceptance" => service_acceptance::cmd(args),
         "artifact-serve" => artifact_serve::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),

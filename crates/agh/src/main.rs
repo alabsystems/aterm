@@ -5,5 +5,8 @@
 //! The dev shim: `aterm agh` and argv0 `agh` are the shipped forms.
 
 fn main() -> std::process::ExitCode {
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
     agh::cli::main_entry(std::env::args_os().skip(1).collect())
 }

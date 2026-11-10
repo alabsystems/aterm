@@ -182,9 +182,7 @@ pub(crate) enum MenuAction {
     NewWindow,
     /// New Tab — a new in-window session (`App::open_tab`).
     NewTab,
-    /// Choose one local UTF-8 file and open it in a read-only Markdown tab.
-    OpenMarkdown,
-    /// Choose one local UTF-8 file and open it in the native editor.
+    /// Open one local UTF-8 document; Markdown starts in Read mode.
     OpenEditor,
     /// Save the active editor document through its existing file grant.
     Save,
@@ -373,7 +371,6 @@ impl MenuAction {
             MenuAction::Version => 36,
             MenuAction::ApplyUpdate => 37,
             MenuAction::ReopenClosedTab => 38,
-            MenuAction::OpenMarkdown => 39,
             MenuAction::OpenEditor => 40,
             MenuAction::ReopenClosedView => 41,
             MenuAction::CopySessionId => 42,
@@ -463,7 +460,6 @@ impl MenuAction {
             36 => MenuAction::Version,
             37 => MenuAction::ApplyUpdate,
             38 => MenuAction::ReopenClosedTab,
-            39 => MenuAction::OpenMarkdown,
             40 => MenuAction::OpenEditor,
             41 => MenuAction::ReopenClosedView,
             42 => MenuAction::CopySessionId,
@@ -1094,7 +1090,6 @@ impl MenuAction {
             | MenuAction::Quit
             | MenuAction::NewWindow
             | MenuAction::NewTab
-            | MenuAction::OpenMarkdown
             | MenuAction::OpenEditor
             | MenuAction::Save
             | MenuAction::ReopenClosedTab
@@ -1158,7 +1153,6 @@ impl MenuAction {
             | MenuAction::Quit
             | MenuAction::NewWindow
             | MenuAction::NewTab
-            | MenuAction::OpenMarkdown
             | MenuAction::OpenEditor
             | MenuAction::Save
             | MenuAction::ReopenClosedTab
@@ -1237,8 +1231,7 @@ impl MenuAction {
             MenuAction::Quit => "Quit aterm.",
             MenuAction::NewWindow => "Open a new window of this aterm.",
             MenuAction::NewTab => "Open a new terminal tab in this window.",
-            MenuAction::OpenMarkdown => "Choose a local file and open it as read-only Markdown.",
-            MenuAction::OpenEditor => "Choose a local file and open it in the editor.",
+            MenuAction::OpenEditor => "Open a local file. Markdown starts in Read mode.",
             MenuAction::Save => "Save changes to the active file.",
             MenuAction::ReopenClosedTab => "Reopen the tab closed most recently.",
             MenuAction::ReopenClosedView => {
@@ -1421,7 +1414,6 @@ impl MenuAction {
             "Quit" => Some(MenuAction::Quit),
             "NewWindow" => Some(MenuAction::NewWindow),
             "NewTab" => Some(MenuAction::NewTab),
-            "OpenMarkdown" => Some(MenuAction::OpenMarkdown),
             "OpenEditor" => Some(MenuAction::OpenEditor),
             "Save" => Some(MenuAction::Save),
             "ReopenClosedTab" => Some(MenuAction::ReopenClosedTab),
@@ -1651,12 +1643,6 @@ const FILE_MENU: &[MenuEntry] = &[
         mods: MenuMods::Command,
     },
     Separator,
-    Item {
-        label: "Open Markdown…",
-        action: MenuAction::OpenMarkdown,
-        key: "",
-        mods: MenuMods::None,
-    },
     Item {
         label: "Open File…",
         action: MenuAction::OpenEditor,
@@ -3875,7 +3861,6 @@ mod tests {
         "Quit",
         "NewWindow",
         "NewTab",
-        "OpenMarkdown",
         "OpenEditor",
         "ReopenClosedTab",
         "ReopenClosedView",
@@ -4699,7 +4684,6 @@ mod tests {
             item(MenuAction::OpenEditor),
             ("o", super::MenuMods::Command)
         );
-        assert_eq!(item(MenuAction::OpenMarkdown), ("", super::MenuMods::None));
         for (action, key, mods) in [
             (MenuAction::HarnessLog, "l", super::MenuMods::CommandShift),
             (MenuAction::NextNeed, "j", super::MenuMods::CommandShift),

@@ -7606,7 +7606,6 @@ impl App {
             }
             Some(
                 crate::native_app::AppViewState::About(_)
-                | crate::native_app::AppViewState::Markdown(_)
                 | crate::native_app::AppViewState::Recovery(_)
                 | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_),
@@ -7633,6 +7632,15 @@ impl App {
         let (instance, view) = self.active_native_view(wid)?;
         match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Editor(state)) => {
+                if let Some(workspace) = state.markdown.as_ref()
+                    && !workspace.editor_focused()
+                {
+                    let range = workspace.reader.selection.clone()?;
+                    let document = self.native_runtime.document_id(instance)?;
+                    let snapshot = self.document_store.snapshot(document)?;
+                    let text = snapshot.text.get(range).filter(|text| !text.is_empty())?;
+                    return Some(read(&[text]));
+                }
                 let buffer = state.buffer.as_ref()?;
                 if buffer.minibuffer_active() {
                     return None;
@@ -7660,13 +7668,6 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 (!selected.is_empty()).then(|| read(&selected))
-            }
-            Some(crate::native_app::AppViewState::Markdown(state)) => {
-                let range = state.selection.clone()?;
-                let document = self.native_runtime.document_id(instance)?;
-                let snapshot = self.document_store.snapshot(document)?;
-                let text = snapshot.text.get(range).filter(|text| !text.is_empty())?;
-                Some(read(&[text]))
             }
             Some(crate::native_app::AppViewState::Settings(state)) => {
                 let text = state.selected_text()?;
@@ -9400,7 +9401,8 @@ impl App {
         };
         matches!(
             self.native_runtime.view_state(view),
-            Some(crate::native_app::AppViewState::Editor(_))
+            Some(crate::native_app::AppViewState::Editor(state))
+                if state.markdown.as_ref().is_none_or(|workspace| workspace.editor_focused())
         ) && self.inline_rename_edit(wid).is_none()
             && self
                 .windows
@@ -9472,6 +9474,12 @@ impl App {
 
     fn ime_recipient(&self, wid: WindowId) -> ImeRecipient {
         let native = self.active_native_view(wid).and_then(|(instance, view)| {
+            let state = self.native_runtime.view_state(view)?;
+            if matches!(state, crate::native_app::AppViewState::Editor(editor)
+                if editor.markdown.as_ref().is_some_and(|workspace| !workspace.editor_focused()))
+            {
+                return None;
+            }
             Some(NativeImeRecipient {
                 instance,
                 view,
@@ -9763,13 +9771,10 @@ impl App {
     }
 
     /// Hand one picker-approved path to the capability-bounded document opener.
-    fn open_local_document_path(
-        &mut self,
-        kind: crate::native_app::AppKind,
-        path: &std::path::Path,
-    ) -> Result<String, String> {
+    fn open_local_document_path(&mut self, path: &std::path::Path) -> Result<String, String> {
         let uri = crate::native_document_host::path_to_file_uri(path)
             .map_err(|error| format!("document open failed: {error}"))?;
+        let kind = crate::native_app::AppKind::Markdown;
         let admission = self.request_document_tab(kind, &uri)?;
         Ok(
             admission.message(&crate::app_documents::DocumentAdmissionKey {
@@ -9780,18 +9785,8 @@ impl App {
         )
     }
 
-    fn choose_and_open_document(&mut self, kind: crate::native_app::AppKind) {
-        let (title, prompt) = match kind {
-            crate::native_app::AppKind::Markdown => ("Open Markdown", "Open as Markdown"),
-            crate::native_app::AppKind::Editor => ("Open File", "Open"),
-            crate::native_app::AppKind::Mail
-            | crate::native_app::AppKind::About
-            | crate::native_app::AppKind::Settings
-            | crate::native_app::AppKind::SystemState
-            | crate::native_app::AppKind::Recovery
-            | crate::native_app::AppKind::Allocation
-            | crate::native_app::AppKind::Workers => return,
-        };
+    fn choose_and_open_document(&mut self) {
+        let (title, prompt) = ("Open File", "Open");
         if self.headless {
             crate::logging::stderr_line!(
                 "aterm-gui: {title} needs a window; a headless instance has no file picker"
@@ -9801,7 +9796,7 @@ impl App {
         let Some(path) = menu::choose_local_file(title, prompt) else {
             return;
         };
-        if let Err(error) = self.open_local_document_path(kind, &path) {
+        if let Err(error) = self.open_local_document_path(&path) {
             crate::logging::stderr_line!("aterm-gui: selected document was not opened: {error}");
             menu::notify("Couldn’t Open File", &error);
         }
@@ -9956,11 +9951,8 @@ impl App {
                 );
             }
             MenuAction::NewTab => self.open_tab(),
-            MenuAction::OpenMarkdown => {
-                self.choose_and_open_document(crate::native_app::AppKind::Markdown);
-            }
             MenuAction::OpenEditor => {
-                self.choose_and_open_document(crate::native_app::AppKind::Editor);
+                self.choose_and_open_document();
             }
             MenuAction::Save | MenuAction::Find | MenuAction::FindNext | MenuAction::FindPrev => {
                 self.dispatch_document_menu_action(action);

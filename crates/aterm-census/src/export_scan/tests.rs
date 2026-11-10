@@ -10,6 +10,159 @@ use crate::scan_set::test_fixtures::disk_tree;
 
 const BASELINE: &str = "# Paths\nquokkaword\n";
 
+/// NEGATIVE CONTROL: the same link to shipping contrib/README.md must stay green.
+/// Missing in dev stays informational, exactly as the engine's boundary-only guard.
+#[test]
+fn dead_links_follow_the_engine_boundary_and_the_inbound_change_cone() {
+    let files = [
+        (MANIFEST, "README.md\ncontrib\n".to_string()),
+        ("README.md", "[setup](docs/x.md)\n".to_string()),
+        ("docs/x.md", "private setup\n".to_string()),
+        ("contrib/README.md", "public setup\n".to_string()),
+    ];
+    let root = tree("dead-links", &files);
+    let paths = listed(&files);
+    let listing = Listing {
+        root: &root,
+        paths: &paths,
+        gitlinks: &[],
+        whole: true,
+        export: &|| Vec::new(),
+    };
+    let scan = |changed: &[String]| links::scan(&listing, Some(&engine()), Some(changed));
+    let changed = ["README.md".to_string()];
+    let red = scan(&changed);
+    assert_eq!(red.findings.len(), 1);
+    assert_eq!(
+        red.findings[0].detail,
+        "dead link (excluded by the publish boundary): docs/x.md"
+    );
+    assert_eq!(
+        scan(&["docs/x.md".into()]).findings,
+        red.findings,
+        "an excluded target brings its unchanged shipping reader into the cone"
+    );
+    assert!(
+        scan(&["contrib/README.md".into()]).findings.is_empty(),
+        "an unrelated change does not inherit the red"
+    );
+    std::fs::write(root.join("README.md"), "[setup](contrib/README.md)\n").unwrap();
+    assert!(scan(&changed).findings.is_empty());
+    std::fs::write(root.join("README.md"), "[setup](missing.md)\n").unwrap();
+    let missing = scan(&changed);
+    assert!(missing.findings.is_empty());
+    assert_eq!(missing.upstream, 1);
+    std::fs::write(root.join("README.md"), "[setup](docs/x.md)\n").unwrap();
+    std::fs::rename(root.join("docs/x.md"), root.join("docs/renamed.md")).unwrap();
+    let gone = scan(&["docs/x.md".into(), "docs/renamed.md".into()]);
+    assert_eq!(gone.targets, 1, "the old name of a rename is judged too");
+    assert_eq!(
+        gone.upstream, 1,
+        "the engine tolerates a link missing in dev too"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dead_link_target_recognition_preserves_engine_quirks() {
+    let files = [
+        (MANIFEST, "README.md\ncontrib\n".to_string()),
+        ("README.md", String::new()),
+        ("docs/x.md", String::new()),
+        ("LICENSE", String::new()),
+        ("contrib/README.md", String::new()),
+    ];
+    let root = tree("dead-links-parser", &files);
+    let paths = listed(&files);
+    let listing = Listing {
+        root: &root,
+        paths: &paths,
+        gitlinks: &[],
+        whole: true,
+        export: &|| Vec::new(),
+    };
+    for (text, red, upstream) in [
+        ("[x](<docs/x.md#anchor>)", 1, 0),
+        ("[x](docs/x.md?query)", 1, 0),
+        ("[x](docs/x.md \"title\")", 1, 0),
+        ("[x](docs/x.md 'title')", 0, 0),
+        ("[x](\u{a0}docs/x.md)", 1, 0),
+        ("[x]:\r\ndocs/x.md#anchor", 1, 0),
+        ("[x](LICENSE)", 1, 0),
+        ("[x](/docs/x.md)", 1, 0),
+        ("[x](docs)", 1, 0),
+        ("[x](contrib)", 0, 0),
+        ("[x](absent/../contrib/README.md)", 1, 0),
+        ("[x](contrib/README.md/../README.md)", 1, 0),
+        ("[x](../outside)", 1, 0),
+        ("[x](a\0b.md)", 1, 0),
+        (
+            "[x](#anchor) [x](https://example.com/x) [x](mailto:x) [x](tel:x) [x](//host/x)",
+            0,
+            0,
+        ),
+        ("[x](missing.md)", 0, 1),
+        ("[x](docs%2Fx.md)", 0, 1),
+        ("[x](<>)", 0, 1),
+    ] {
+        std::fs::write(root.join("README.md"), text).unwrap();
+        let scanned = links::scan(&listing, Some(&engine()), None);
+        assert_eq!(
+            (scanned.findings.len(), scanned.upstream),
+            (red, upstream),
+            "{text:?}"
+        );
+    }
+    std::fs::write(root.join("README.md"), b"\xff[x](docs/x.md)").unwrap();
+    assert!(
+        links::scan(&listing, Some(&engine()), None)
+            .findings
+            .is_empty(),
+        "strict UTF-8, as in the engine"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn dead_links_resolve_exported_symlinks_and_exempt_gitlinks() {
+    let files = [
+        (MANIFEST, "README.md\ncontrib\n".to_string()),
+        ("README.md", "[x](contrib/alias)\n".to_string()),
+        ("docs/x.md", String::new()),
+        ("contrib/README.md", String::new()),
+    ];
+    let root = tree("dead-links-symlink", &files);
+    let mut paths = listed(&files);
+    paths.push("contrib/alias".into());
+    let listing = Listing {
+        root: &root,
+        paths: &paths,
+        gitlinks: &["module".into()],
+        whole: true,
+        export: &|| Vec::new(),
+    };
+    let alias = root.join("contrib/alias");
+    for (target, red, upstream) in [
+        ("README.md", 0, 0),
+        ("../docs/x.md", 1, 0),
+        ("../../escape", 1, 0),
+        ("/outside", 1, 0),
+        ("alias", 1, 0), // The loop path itself exists in dev's captured tree.
+        ("../module/x.md", 0, 0),
+    ] {
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        let scanned = links::scan(&listing, Some(&engine()), Some(&["contrib/alias".into()]));
+        assert_eq!(
+            (scanned.findings.len(), scanned.upstream),
+            (red, upstream),
+            "{target}"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn engine() -> Engine {
     Engine {
         baseline: ("synthetic baseline".into(), BASELINE.into()),

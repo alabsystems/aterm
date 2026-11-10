@@ -439,6 +439,75 @@ const PRERELEASE: PublishPatch = PublishPatch {
     make_latest: MakeLatest::False,
 };
 
+impl AghHost {
+    fn create_release(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+        publish: bool,
+    ) -> Result<(), HostError> {
+        let (s, permit) = self.permit(slug)?;
+        let journal = self.github.journal(&s).map_err(|e| self.write_error(&e))?;
+        let files = self.open_files(files)?;
+        let req = DraftRequest {
+            tag_name: tag.to_string(),
+            target_commitish: None,
+            name: title.to_string(),
+            body: notes.to_string(),
+            prerelease: true,
+            make_latest: Some(MakeLatest::False),
+        };
+        let releases = self.github.releases(&s);
+        let release = match releases.create(&permit, &req, &journal) {
+            Ok(Outcome::Done(ensured)) => ensured.object,
+            Ok(Outcome::NeverSent(e)) => return Err(self.write_error(&e)),
+            // A rate limit settles as a refusal (nothing was created, so a rerun POSTs once
+            // more), but it is `Unreachable` as on every other write (design §10.3, F14).
+            Ok(Outcome::Refused(e)) if e.kind == Kind::RateLimited => {
+                return Err(HostError::Unreachable(self.redacted(&e.why)));
+            }
+            Ok(Outcome::Refused(e)) => return Err(HostError::Refused(self.redacted(&e.why))),
+            Ok(Outcome::Unknown { intent, .. }) => {
+                return Err(HostError::Unreachable(Self::outcome_unknown(&intent)));
+            }
+            Err(e) => return Err(self.write_error(&e)),
+        };
+        if !release.draft {
+            // The created-intent rule found the release this journal's draft was published
+            // as: an earlier run's publish landed and its answer was lost. Nothing is uploaded
+            // and no PATCH is sent: `ensure` runs its publish step here, whose guard converges
+            // without one on a release published with the same files as a prerelease, and
+            // refuses any other. So an immutable release converges, and one made a full
+            // release since is refused.
+            return self.converged_published(&s, tag, &release, &files);
+        }
+        for file in &files {
+            releases
+                .upload(&permit, &release, file, AghReplace::Never)
+                .map_err(|e| self.write_error(&e))?;
+        }
+        if !publish {
+            return Ok(());
+        }
+        let expected: BTreeMap<String, agh::model::Sha256Digest> = files
+            .iter()
+            .map(|file| (file.name.clone(), file.sha256))
+            .collect();
+        releases
+            .publish(
+                &permit,
+                release.id,
+                &PublishGuard::expecting(expected),
+                &PRERELEASE,
+            )
+            .map_err(|e| self.write_error(&e))?;
+        Ok(())
+    }
+}
+
 impl ReleaseHost for AghHost {
     fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
         let s = self.own_or_refuse(slug)?;
@@ -512,59 +581,18 @@ impl ReleaseHost for AghHost {
         notes: &str,
         files: &[PathBuf],
     ) -> Result<(), HostError> {
-        let (s, permit) = self.permit(slug)?;
-        let journal = self.github.journal(&s).map_err(|e| self.write_error(&e))?;
-        let files = self.open_files(files)?;
-        let req = DraftRequest {
-            tag_name: tag.to_string(),
-            target_commitish: None,
-            name: title.to_string(),
-            body: notes.to_string(),
-            prerelease: true,
-            make_latest: Some(MakeLatest::False),
-        };
-        let releases = self.github.releases(&s);
-        let release = match releases.create(&permit, &req, &journal) {
-            Ok(Outcome::Done(ensured)) => ensured.object,
-            Ok(Outcome::NeverSent(e)) => return Err(self.write_error(&e)),
-            // A rate limit settles as a refusal (nothing was created, so a rerun POSTs once
-            // more), but it is `Unreachable` as on every other write (design §10.3, F14).
-            Ok(Outcome::Refused(e)) if e.kind == Kind::RateLimited => {
-                return Err(HostError::Unreachable(self.redacted(&e.why)));
-            }
-            Ok(Outcome::Refused(e)) => return Err(HostError::Refused(self.redacted(&e.why))),
-            Ok(Outcome::Unknown { intent, .. }) => {
-                return Err(HostError::Unreachable(Self::outcome_unknown(&intent)));
-            }
-            Err(e) => return Err(self.write_error(&e)),
-        };
-        if !release.draft {
-            // The created-intent rule found the release this journal's draft was published
-            // as: an earlier run's publish landed and its answer was lost. Nothing is uploaded
-            // and no PATCH is sent: `ensure` runs its publish step here, whose guard converges
-            // without one on a release published with the same files as a prerelease, and
-            // refuses any other. So an immutable release converges, and one made a full
-            // release since is refused.
-            return self.converged_published(&s, tag, &release, &files);
-        }
-        for file in &files {
-            releases
-                .upload(&permit, &release, file, AghReplace::Never)
-                .map_err(|e| self.write_error(&e))?;
-        }
-        let expected: BTreeMap<String, agh::model::Sha256Digest> = files
-            .iter()
-            .map(|file| (file.name.clone(), file.sha256))
-            .collect();
-        releases
-            .publish(
-                &permit,
-                release.id,
-                &PublishGuard::expecting(expected),
-                &PRERELEASE,
-            )
-            .map_err(|e| self.write_error(&e))?;
-        Ok(())
+        self.create_release(slug, tag, title, notes, files, true)
+    }
+
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<(), HostError> {
+        self.create_release(slug, tag, title, notes, files, false)
     }
 
     fn upload(

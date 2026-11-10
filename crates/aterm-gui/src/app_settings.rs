@@ -308,7 +308,6 @@ impl App {
                     }
                     crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
@@ -354,7 +353,6 @@ impl App {
                     }
                     crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
@@ -399,7 +397,6 @@ impl App {
                     }
                     crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
@@ -588,7 +585,6 @@ impl App {
                     }
                     crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)

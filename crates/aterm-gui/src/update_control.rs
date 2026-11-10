@@ -9,9 +9,11 @@ use crate::{App, Wake};
 use aterm_types::MutexExt as _;
 
 pub(crate) struct Snapshot {
+    /// Live automatic-checking preference, independent of platform support and install policy.
     pub(crate) enabled: bool,
     pub(crate) owner: Option<String>,
     pub(crate) repo: Option<String>,
+    /// Live automatic-install preference, including when no update is staged.
     pub(crate) auto_apply: bool,
     staged: Option<StagedUpdate>,
     posture: Option<ApplyPosture>,

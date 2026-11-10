@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machine numbers this Mac's vault gives to other Macs and to the lab's roles, read from its
-//! local copy (`docs/DESIGN-machine-names-2026-11-04.md` §11.86): what a person's rename of this
-//! Mac (`aterm name set`, Rename This Mac…) must not take on today's lab, where other Macs reach a
-//! Mac by its roster label and aliases, its log seat and the policy's names, not by a name record.
+//! The machine numbers this Mac's vault gives to other Macs, read from its local copy
+//! (`docs/DESIGN-machine-names-2026-11-04.md` §11.86): what a person's rename of this Mac
+//! (`aterm name set`, Rename This Mac…) must not take on today's lab, where other Macs reach a Mac
+//! by its roster label and aliases and its log seat, not by a name record.
 //!
 //! The rules are admission's (`admit::labels_taken`): every other row's label, aliases, claim and
 //! `[machines]` name, the roster's denied labels (a removed Mac's included: the roster read
-//! overlays the log's removals as denied labels), each other seat's bare label in the membership
-//! log, the policy's reserved labels, release hosts, stewards and the servers it dials by a
-//! number where this Mac reads the policy, and `m3`. This Mac's own row and seats free only the
-//! policy's holds, never another Mac's. A fleet-accounts sheet's
-//! numbers hold nothing: a rename onto one binds its rows to this Mac, which is how the owner
-//! names a Mac its sheet already knows.
+//! overlays the log's removals as denied labels), and each other seat's bare label in the
+//! membership log. Only a Mac holds a number: none is reserved, `m3` included, and no role or
+//! policy list holds one (owner ruling, 2026-11-09). This Mac's own row and seats never free
+//! another Mac's hold. A fleet-accounts sheet's numbers hold nothing: a rename onto one binds its
+//! rows to this Mac, which is how the owner names a Mac its sheet already knows.
 
 use super::*;
-use crate::swarm_roster::{DEFAULT_RESERVED_RELEASE_LABEL, SwarmPolicy, SwarmRoster};
+use crate::swarm_roster::{SwarmPolicy, SwarmRoster};
 use aterm_types::machine_name::Number;
 
 /// Hang detector for the whole-generation read waiting for the vault's state writer.
 const LOCK_HANG: Duration = Duration::from_secs(60);
 
-/// What gives a number to another Mac or a role ([`LabLabels::held`]).
+/// What gives a number to another Mac ([`LabLabels::held`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelHold {
     /// Another Mac's roster label.
@@ -37,14 +36,6 @@ pub enum LabelHold {
     Seat,
     /// The roster denies it: a Mac named so reads as denied (the survey drops such a label).
     Denied,
-    /// The policy reserves it, or it is `m3`, the release host's.
-    Reserved,
-    /// The policy names it a release host.
-    ReleaseHost,
-    /// The policy names it a steward.
-    Steward,
-    /// The policy names it a vault server, which other Macs dial as `<label>.local`.
-    Server,
 }
 
 impl LabelHold {
@@ -58,10 +49,6 @@ impl LabelHold {
             Self::VaultName => "the start of another Mac's name in the vault",
             Self::Seat => "another Mac's seat in the membership log",
             Self::Denied => "denied by the vault's roster, which reads a Mac named so as denied",
-            Self::Reserved => "reserved by the vault's policy",
-            Self::ReleaseHost => "a release host's in the vault's policy",
-            Self::Steward => "a steward's in the vault's policy",
-            Self::Server => "a vault server's in the vault's policy, which other Macs dial by it",
         }
     }
 }
@@ -69,11 +56,10 @@ impl LabelHold {
 /// The numbers this Mac's vault gives, from its local copy ([`lab_labels`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LabLabels {
-    /// Each number the vault gives another Mac or a role, with the first holder found: the
-    /// roster, then the log, then the policy.
+    /// Each number the vault gives another Mac, with the first holder found: the roster, then
+    /// the log.
     pub held: BTreeMap<Number, LabelHold>,
     /// This Mac's own: its roster row's label, aliases and claim, and its log seats' bare labels.
-    /// None is held for a role, though another Mac's row or seat may hold one.
     pub own: BTreeSet<Number>,
     /// This Mac's roster label.
     pub label: Option<Number>,
@@ -82,7 +68,7 @@ pub struct LabLabels {
     pub servers: BTreeSet<Number>,
 }
 
-/// The numbers this Mac's vault gives to other Macs and roles, read from its local copy under
+/// The numbers this Mac's vault gives to other Macs, read from its local copy under
 /// one shared observation of its state lock, so no apply lands between the roster (as the
 /// trusted log overlays it), the policy where this Mac reads it, and the log's seats. Nothing
 /// where no vault is configured or this Mac holds no identity, and nothing for a Mac its vault
@@ -215,8 +201,7 @@ fn bare(label: &str) -> Option<Number> {
 /// [`lab_labels`] over what it read: `me` is this Mac's age recipient, and each seat a log label
 /// with its Mac's recipient. Another Mac's row or seat holds its numbers whatever this Mac's own
 /// say (two rows may claim one sheet number, and this Mac's stale `[machines]` name may lead with
-/// another Mac's label); this Mac's own numbers free only the policy's holds and `m3`'s, so it
-/// may keep or return to a role's label it has.
+/// another Mac's label). The policy holds no number: it only names the servers it dials.
 pub(crate) fn assemble(
     me: &str,
     roster: Option<&SwarmRoster>,
@@ -275,37 +260,10 @@ pub(crate) fn assemble(
             hold(&mut held, bare(seat), LabelHold::Seat);
         }
     }
-    let mut roles = BTreeMap::new();
-    let mut servers = BTreeSet::new();
-    if let Some(policy) = policy {
-        for reserved in &policy.reserved_labels {
-            hold(&mut roles, Number::leading(reserved), LabelHold::Reserved);
-        }
-        for host in &policy.release_hosts {
-            hold(&mut roles, Number::leading(host), LabelHold::ReleaseHost);
-        }
-        for steward in &policy.stewards {
-            hold(
-                &mut roles,
-                Number::leading(&steward.label),
-                LabelHold::Steward,
-            );
-        }
-        for num in policy.servers.iter().filter_map(|server| dialed(server)) {
-            servers.insert(num);
-            hold(&mut roles, Some(num), LabelHold::Server);
-        }
-    }
-    hold(
-        &mut roles,
-        Number::parse(DEFAULT_RESERVED_RELEASE_LABEL).ok(),
-        LabelHold::Reserved,
-    );
-    for (num, why) in roles {
-        if !own.contains(&num) {
-            held.entry(num).or_insert(why);
-        }
-    }
+    let servers = policy
+        .into_iter()
+        .flat_map(|policy| policy.servers.iter().filter_map(|server| dialed(server)))
+        .collect();
     LabLabels {
         held,
         own,

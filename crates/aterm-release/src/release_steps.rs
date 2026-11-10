@@ -12,6 +12,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::channel::source_attestation_findings;
 use crate::gates::{Outcome, Precheck, PrecheckGate};
 use crate::interrupt;
 use crate::ledger::{BYTE_EXACT, GitCli, GitRunner};
@@ -20,7 +21,7 @@ use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
     CutState, EngineNow, EngineRows, Facts, PUBLISH_GATE_ENV, Prover, PublishGate, RELEASE_COMMAND,
-    Ran, Refusal, Reservation, Side, StageTarget, Step, SupersedeResult,
+    Ran, Refusal, Reservation, Side, SignedDiscard, StageTarget, Step, SupersedeResult,
 };
 
 #[path = "release_scanner_tools.rs"]
@@ -414,6 +415,7 @@ pub struct Real {
     /// The one Release-rank line marker, retained across the in-place cutter exec.
     line_priority: Option<aterm_capacity::Claim>,
     fleet_line: Option<crate::line_claim::Claim>,
+    fleet_holder: Option<(String, String)>,
     /// The qualify graph's one pool ([`Backend::qualify_begin`]), handed to every child it starts.
     pool: Option<Pool>,
     warming: Option<WarmingVerifier>,
@@ -573,11 +575,13 @@ struct RealBranches<'a> {
     tree_index: TreeIndexHandoff,
 }
 
-/// The tree branch's one-way handoff to the fixture consumer. The index file itself carries the
+/// The tree branch's resource admission and executable-index handoff. Lint's admission
+/// releases slice launch; completion releases waiters even when no stage ran. The index carries the
 /// candidate, compiler and executable content identity; these bits distinguish "not written yet"
 /// from "the tree ended without usable evidence" without making the build compile beside it.
 #[derive(Default)]
-struct TreeIndexHandoff {
+pub(crate) struct TreeIndexHandoff {
+    lint: std::sync::Mutex<Option<Result<PathBuf, String>>>,
     expected: std::sync::atomic::AtomicBool,
     completion: std::sync::atomic::AtomicU8,
     bundle_finished: std::sync::atomic::AtomicBool,
@@ -585,7 +589,7 @@ struct TreeIndexHandoff {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-enum TreeIndexCompletion {
+pub(crate) enum TreeIndexCompletion {
     #[default]
     Pending = 0,
     /// The tree ended without a red; an absent index may use the bounded fallback compile.
@@ -595,12 +599,51 @@ enum TreeIndexCompletion {
 }
 
 impl TreeIndexHandoff {
+    pub(crate) fn expect_lint(&self, events: PathBuf) {
+        // Clear a resumed run's old signal synchronously, before either branch starts.
+        let prepared = crate::durable::write_atomic_durable(&events, b"", 0o600)
+            .map(|()| events)
+            .map_err(|e| format!("prepare lint admission events: {e}"));
+        *self
+            .lint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared);
+    }
+
+    pub(crate) fn await_lint(
+        &self,
+        admitted: impl Fn(&Path) -> bool,
+        stopped: impl Fn() -> bool,
+        keep_build_after_test_red: impl Fn() -> bool,
+        mut wait: impl FnMut(),
+    ) -> Result<(), String> {
+        let gate = self
+            .lint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(gate) = gate else { return Ok(()) };
+        let events = gate?;
+        loop {
+            let completion = self.completion();
+            if stopped()
+                || (completion == TreeIndexCompletion::Stopped && !keep_build_after_test_red())
+            {
+                return Err("the tree stopped before slice launch".into());
+            }
+            if admitted(&events) || completion != TreeIndexCompletion::Pending {
+                return Ok(());
+            }
+            wait();
+        }
+    }
+
     fn expect(&self) {
         self.expected
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn finish(&self, completion: TreeIndexCompletion) {
+    pub(crate) fn finish(&self, completion: TreeIndexCompletion) {
         debug_assert_ne!(completion, TreeIndexCompletion::Pending);
         self.completion
             .store(completion as u8, std::sync::atomic::Ordering::SeqCst);
@@ -756,6 +799,11 @@ impl Branches for RealBranches<'_> {
         self.tree_index.expect();
     }
 
+    fn expect_tree_lint(&self) {
+        self.tree_index
+            .expect_lint(self.branch_log(Branch::Tree).with_extension("events"));
+    }
+
     fn build_admitted(&self, ended: &dyn Fn() -> bool) {
         // With no initial build token, neither slice can finish. Tree must run first even
         // when memory admits only one slice, so waiting for both memory claims would deadlock.
@@ -806,6 +854,21 @@ impl Branches for RealBranches<'_> {
         stop: &BranchStop,
     ) -> Built {
         let _finished = FinishShare(self.real.pool.as_ref(), 0);
+        if let Err(error) = self.tree_index.await_lint(
+            |path| {
+                crate::check_record::events(path)
+                    .is_ok_and(|events| events.whole() && events.lint_admitted)
+            },
+            || stop.fired() || interrupt::caught().is_some(),
+            || self.keep_build_on_test_red(c),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+        ) {
+            let why = Refusal::new(error, format!("run {RELEASE_COMMAND} again")).could_not_run();
+            return Built {
+                artifact: work.bundle.then(|| Err(why.clone())),
+                fixtures: work.fixtures.then_some(Err(why)),
+            };
+        }
         let start = || {
             self.real
                 .build_branch(c, reserved, prover, work, &self.tree_index, stop)
@@ -916,26 +979,13 @@ impl Branches for RealBranches<'_> {
 
 /// Both slices must have their claims before the tree can compete for memory. A build
 /// that fails or serializes on a smaller machine releases the wait by ending instead.
-fn slices_hold_memory(me: u32) -> bool {
+pub(crate) fn slices_hold_memory(me: u32) -> bool {
     let Some(records) = aterm_capacity::Ledger::user().and_then(|l| l.list().ok()) else {
         return false;
     };
-    let Some(procs) = interrupt::listing() else {
-        return false;
-    };
+    let procs = interrupt::listing().unwrap_or_default();
     let parent: std::collections::BTreeMap<i32, i32> =
         procs.iter().map(|p| (p.pid, p.parent)).collect();
-    let descends = |pid: u32| {
-        let mut at = i32::try_from(pid).unwrap_or(0);
-        for _ in 0..64 {
-            match parent.get(&at) {
-                Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
-                Some(&up) if up > 1 => at = up,
-                _ => return false,
-            }
-        }
-        false
-    };
     ["aarch64-apple-darwin", "x86_64-apple-darwin"]
         .iter()
         .all(|triple| {
@@ -943,9 +993,26 @@ fn slices_hold_memory(me: u32) -> bool {
                 r.held.is_some()
                     && r.need.what == format!("release slice {triple}")
                     && r.need.mem > 0
-                    && descends(r.pid)
+                    && owns_process(me, r.pid, &parent)
             })
         })
+}
+
+/// Inline pilots hold their own slice claims; a cut's build child holds descendants'.
+/// Without a process read only the current process's ownership is known.
+fn owns_process(me: u32, pid: u32, parent: &std::collections::BTreeMap<i32, i32>) -> bool {
+    if pid == me {
+        return true;
+    }
+    let mut at = i32::try_from(pid).unwrap_or(0);
+    for _ in 0..64 {
+        match parent.get(&at) {
+            Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
+            Some(&up) if up > 1 => at = up,
+            _ => return false,
+        }
+    }
+    false
 }
 
 struct Forwarded {
@@ -1084,6 +1151,7 @@ impl Real {
             disk_claim: None,
             line_priority: None,
             fleet_line: None,
+            fleet_holder: None,
             pool: None,
             warming: None,
             warm_verifier: None,
@@ -5874,29 +5942,51 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
     aterm_toolchain::rustup::wasm_clause(config).map_err(|e| Refusal::new(e.why, e.remedy))
 }
 
-fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
-    crate::channel::SOURCE_ATTESTATION_ASSETS
-        .into_iter()
-        .filter_map(|name| {
-            let count = release
-                .get("assets")
-                .and_then(aterm_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|a| a.get("name").and_then(aterm_json::Value::as_str) == Some(name))
-                .count();
-            match count {
-                1 => None,
-                0 => Some(format!(
-                    "{name} is missing — the signed source manifest `pub publish` attaches \
-                     (`pub sign-release aterm` attaches it to a published release)"
-                )),
-                _ => Some(format!(
-                    "{name} is duplicated — the source manifest must be unambiguous"
-                )),
-            }
-        })
-        .collect()
+/// Where step 7 reads the release it judges: the private draft `cut --sign` journaled, by id
+/// (GitHub's lookup by tag answers only a published release, so it 404s on every draft), else
+/// the published release of `tag`.
+fn source_release_path(slug: &str, tag: &str, draft: Option<u64>) -> String {
+    match draft {
+        Some(id) => format!("repos/{slug}/releases/{id}"),
+        None => format!("repos/{slug}/releases/tags/{tag}"),
+    }
+}
+
+/// Why the release read for `tag` is not the one this cut publishes, and its remedy: another
+/// release than the journaled draft, or a draft GitHub no longer binds to `tag` (it names one
+/// `untagged-…` after an edit that names no tag).
+fn source_binding_problem(
+    release: &aterm_json::Value,
+    slug: &str,
+    tag: &str,
+    draft: Option<u64>,
+) -> Option<(String, String)> {
+    let id = release.get("id").and_then(aterm_json::Value::as_u64);
+    if let Some(want) = draft
+        && id != Some(want)
+    {
+        let read = id.map_or_else(|| "no id".to_string(), |id| id.to_string());
+        return Some((
+            format!(
+                "{slug}'s release read for {tag} is {read}, not the private draft {want} dist/draft-state.toml journals"
+            ),
+            "finish or abandon the journaled draft (ship cut --abandon)".to_string(),
+        ));
+    }
+    let bound = release
+        .get("tag_name")
+        .and_then(aterm_json::Value::as_str)
+        .unwrap_or("");
+    if bound == tag {
+        return None;
+    }
+    let id = id.map_or_else(|| "<id>".to_string(), |id| id.to_string());
+    Some((
+        format!(
+            "{slug} release {id} is bound to `{bound}`, not {tag}: GitHub drops a draft's tag when an edit names none"
+        ),
+        format!("bind it back (agh api repos/{slug}/releases/{id} -X PATCH -f tag_name={tag})"),
+    ))
 }
 
 /// The lean-download shape of a published release, from what GitHub serves (its release JSON, never the files the cut wrote): the problems, empty when it carries the shape.
@@ -6274,14 +6364,23 @@ fn supersession_record(previous: Line, replacement: Line) -> crate::line::Supers
     }
 }
 
-/// Classify one authoritative reread by the complete durable record. A different record carries
+/// Discard a retirement that established the requested previous line: it says nothing
+/// about whether this request retired that line in turn.
+fn retirement_after_previous(
+    requested: &crate::line::Supersession,
+    reread: Result<Option<crate::line::Supersession>, String>,
+) -> Result<Option<crate::line::Supersession>, String> {
+    reread.map(|record| record.filter(|record| record.replacement.base != requested.previous.base))
+}
+
+/// Classify one authoritative reread by the complete durable record. A competing record carries
 /// its replacement so the clone can converge immediately rather than restoring a retired line.
 fn classify_supersession_reread(
     requested: &crate::line::Supersession,
     reread: Result<Option<crate::line::Supersession>, String>,
     retry_absent: bool,
 ) -> SupersedeResult {
-    match reread {
+    match retirement_after_previous(requested, reread) {
         Ok(Some(record)) if record == *requested => {
             SupersedeResult::Committed("the exact earlier supersession is durable".into())
         }
@@ -6301,13 +6400,13 @@ fn classify_supersession_reread(
 
 /// A stopped claim is not evidence that its source write is absent: another cutter may have
 /// adopted an aged claim and committed a supersession before the old holder observed the loss.
-/// Preserve the claim's own refusal only when the authoritative source still names no record.
+/// Preserve the claim's refusal when the source names no retirement of the requested previous line.
 fn classify_claim_stop(
     requested: &crate::line::Supersession,
     why: String,
     reread: Result<Option<crate::line::Supersession>, String>,
 ) -> SupersedeResult {
-    match reread {
+    match retirement_after_previous(requested, reread) {
         Ok(None) => SupersedeResult::Refused {
             why,
             retry: false,
@@ -6943,6 +7042,9 @@ impl Backend for Real {
         } else {
             claim.line.clone()
         };
+        if let Some(holder) = &claim.previous_holder {
+            self.fleet_holder = Some((claim.line.head().to_string(), holder.clone()));
+        }
         self.fleet_line = Some(claim);
         Ok(selected)
     }
@@ -6986,7 +7088,7 @@ impl Backend for Real {
         }
         if crate::line::supersession(&self.git(), &line.version)
             .map_err(|why| Refusal::new(why, "retry the current line read").could_not_run())?
-            .is_some()
+            .is_some_and(|record| record.replacement.base != previous.base)
         {
             return Err(Refusal::new(
                 "the line already has a durable supersession",
@@ -7039,7 +7141,7 @@ impl Backend for Real {
             return self.classify_after_claim_stop(&requested, error.why);
         }
         match crate::line::supersession(&self.git(), &line.version) {
-            Ok(Some(record)) => {
+            Ok(Some(record)) if record.replacement.base != expected_previous.base => {
                 let result = self.verify_supersede_result(classify_supersession_reread(
                     &requested,
                     Ok(Some(record)),
@@ -7050,7 +7152,7 @@ impl Backend for Real {
                 }
                 return result;
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(why) => return self.classify_after_claim_stop(&requested, why),
         }
         if previous != *expected_previous {
@@ -7139,8 +7241,10 @@ impl Backend for Real {
 
     fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, Refusal> {
         let retry = || "retry the fleet line read";
-        let mut line = crate::line_claim::existing(&self.repo, version)
+        let snapshot = crate::line_claim::existing_with_holder(&self.repo, version)
             .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
+        self.fleet_holder = snapshot.holder;
+        let mut line = snapshot.line;
         // Source discovery must see durable supersessions even when the independent claim
         // read was stale. It reads no engine or roster, and step 1 consumes the same result.
         self.prefetch_source()?;
@@ -7151,6 +7255,34 @@ impl Backend for Real {
                 .map_err(|error| Refusal::new(error.to_string(), retry()).could_not_run())?;
         }
         Ok(line)
+    }
+
+    fn fleet_holder(&mut self, head: &str) -> Option<String> {
+        self.fleet_holder
+            .as_ref()
+            .filter(|(h, _)| h == head)
+            .map(|(_, holder)| holder.clone())
+    }
+
+    fn main_past_line(&mut self, head: &str, main: &str) -> Option<(usize, usize)> {
+        let range = format!("{head}..{main}");
+        let count = |args: &[&str]| {
+            let out = self.git().git_read(args).ok()?;
+            out.success()
+                .then(|| out.stdout_utf8().trim().parse::<usize>().ok())
+                .flatten()
+        };
+        Some((
+            count(&["rev-list", "--count", &range])?,
+            count(&[
+                "rev-list",
+                "--count",
+                &range,
+                "--",
+                "crates/aterm-release",
+                "crates/aterm-verify",
+            ])?,
+        ))
     }
 
     fn fleet_boundary(&mut self, line: &Line, step: Step) -> Result<(), String> {
@@ -8781,13 +8913,30 @@ impl Backend for Real {
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
         let slug = self.slug();
         let tag = format!("v{}", c.version);
-        let release = self.release_json(&slug, &tag).map_err(|why| {
-            Refusal::new(
+        let draft = crate::publish::journaled_draft(&self.repo.join("dist"), &c.version).map_err(
+            |why| {
+                Refusal::new(
+                    format!("the private draft journal of {tag} cannot be read: {why}"),
+                    format!("run {RELEASE_COMMAND} again once dist/ is readable"),
+                )
+                .could_not_run()
+            },
+        )?;
+        let release = self
+            .github_read(&source_release_path(&slug, &tag, draft))
+            .map_err(|e| {
+                Refusal::new(
+                    format!("could not read {slug} {tag} from GitHub's API ({e})"),
+                    format!("run {RELEASE_COMMAND} again once the channel answers"),
+                )
+                .could_not_run()
+            })?;
+        if let Some((why, fix)) = source_binding_problem(&release, &slug, &tag, draft) {
+            return Err(Refusal::new(
                 why,
-                format!("run {RELEASE_COMMAND} again once the channel answers"),
-            )
-            .could_not_run()
-        })?;
+                format!("{fix}, then {RELEASE_COMMAND} (nothing was claimed)"),
+            ));
+        }
         let missing = source_attestation_findings(&release);
         if missing.is_empty() {
             return Ok(());
@@ -8801,11 +8950,8 @@ impl Backend for Real {
         ))
     }
 
-    fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String> {
-        crate::publish::discard_signed(&self.repo.join("dist"), version, build)
-    }
-    fn discard_draft(&mut self, version: &str, build: u64) -> Vec<String> {
-        crate::publish::discard_draft(&self.repo.join("dist"), version, build)
+    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Vec<String> {
+        crate::publish::discard_signed(&self.repo.join("dist"), version, build, reason)
     }
     fn cut(
         &mut self,
@@ -10579,6 +10725,202 @@ pub(crate) mod dry_tools_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn slice_claim_ownership_includes_the_pilot_and_excludes_other_workers() {
+        let parents = std::collections::BTreeMap::from([(7, 1), (8, 7), (9, 8), (100, 1)]);
+        assert!(super::owns_process(7, 7, &parents));
+        assert!(super::owns_process(7, 9, &parents));
+        assert!(!super::owns_process(7, 100, &parents));
+        assert!(super::owns_process(7, 7, &Default::default()));
+        assert!(!super::owns_process(7, 9, &Default::default()));
+    }
+
+    /// Exercise the real admission gate against the recorded-peak model. A stale
+    /// admission cannot launch slices; an undersized claim cannot enter the model.
+    #[test]
+    fn lint_admission_precedes_slices_and_refines_the_recorded_memory_model() {
+        use aterm_spec::interp::{bmc, with_buggy, with_consts};
+        let model = aterm_models_release::release_lint_memory_model();
+        assert!(bmc(&model).is_ok());
+        assert_eq!(
+            aterm_spec::interp::find_deadlock(&model, |s| s["lint"] == 2
+                && s["native"] == 2
+                && s["compat"] == 2),
+            None
+        );
+        // Bind the model's envelopes to the production unit claim chooser, using
+        // the fresh m112 peaks. This never changes a slice's actual claims.
+        let unit = aterm_verify::unitgraph::UnitName {
+            package: "aterm".into(),
+            kind: "aterm bin".into(),
+        };
+        for (triple, peak, claim_const) in [
+            ("aarch64-apple-darwin", 46_219_853_824, "NativeClaim"),
+            ("x86_64-apple-darwin", 25_890_799_616, "CompatClaim"),
+        ] {
+            let mut records = aterm_capacity::book::Records::default();
+            records.push(
+                aterm_capacity::book::Key {
+                    checkout: String::new(),
+                    stage: "release slice unit".into(),
+                    crates: Some(vec!["aterm".into()]),
+                    variant: Some(format!("{triple} aterm bin")),
+                },
+                peak,
+                1,
+            );
+            let need = crate::slice_units::unit_need(triple, &records, &unit, 4 << 30);
+            assert!(need.mem >= peak);
+            let modeled = model
+                .consts
+                .iter()
+                .find(|(name, _)| *name == claim_const)
+                .unwrap()
+                .1;
+            assert_eq!(need.mem, u64::try_from(modeled).unwrap() << 20);
+        }
+        for mutant in [1, 2, 3] {
+            assert!(bmc(&with_buggy(&model, mutant)).is_err(), "mutant {mutant}");
+        }
+        let lint_claim_mib = aterm_capacity::peak_claim(26_452_845_576).div_ceil(1 << 20);
+        assert_eq!(
+            model
+                .consts
+                .iter()
+                .find(|(name, _)| *name == "LintClaim")
+                .unwrap()
+                .1,
+            i64::try_from(lint_claim_mib).unwrap()
+        );
+        let small = with_consts(&model, &[("LintClaim", 1)]);
+        assert!(
+            small
+                .successors("LintAdmitted", &small.init_state())
+                .is_empty()
+        );
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree.events");
+        let event =
+            "verify-event: {\"schema\":1,\"event\":\"stage-admitted\",\"stage_id\":\"Tippy\"}\n";
+        std::fs::write(&path, event).unwrap();
+        let handoff = super::TreeIndexHandoff::default();
+        handoff.expect_lint(path.clone());
+        assert!(
+            !crate::check_record::events(&path).unwrap().lint_admitted,
+            "a previous run's event must be cleared before either branch starts"
+        );
+        // Starting a stage or admitting another stage proves no lint admission.
+        for other in [
+            "verify-event: {\"schema\":1,\"event\":\"stage-started\",\"stage_id\":\"Tippy\"}\n",
+            "verify-event: {\"schema\":1,\"event\":\"stage-admitted\",\"stage_id\":\"TestCompile\"}\n",
+        ] {
+            std::fs::write(&path, other).unwrap();
+            assert!(!crate::check_record::events(&path).unwrap().lint_admitted);
+        }
+        std::fs::write(&path, "").unwrap();
+        let state = std::cell::RefCell::new(model.init_state());
+        let polls = std::cell::Cell::new(0);
+        handoff
+            .await_lint(
+                |path| {
+                    crate::check_record::events(path).is_ok_and(|e| e.whole() && e.lint_admitted)
+                },
+                || false,
+                || false,
+                || {
+                    assert_eq!(
+                        polls.replace(1),
+                        0,
+                        "the gate must observe the admission on its next read"
+                    );
+                    assert!(
+                        model.successors("SlicesStart", &state.borrow()).is_empty(),
+                        "NEGATIVE CONTROL: no slice can overtake lint admission"
+                    );
+                    let next = model
+                        .successors("LintAdmitted", &state.borrow())
+                        .pop()
+                        .unwrap();
+                    *state.borrow_mut() = next;
+                    std::fs::write(&path, event).unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            polls.get(),
+            1,
+            "without the gate, slices launch before the wait callback"
+        );
+        let mut state = state.into_inner();
+        for action in [
+            "SlicesStart",
+            "CompatRuns",
+            "LintEnds",
+            "NativeRuns",
+            "NativeEnds",
+            "CompatEnds",
+        ] {
+            let next = model.successors(action, &state).pop().unwrap();
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                &state,
+                &next,
+                Some(action),
+                "qualify lint admission",
+            );
+            assert!(ok, "{action}: {why}");
+            state = next;
+        }
+        assert_eq!(state["held"], 0);
+        // The undersized mutant admits both links beside lint, fitting its declared
+        // claims while exceeding memory at the recorded lint peak.
+        let mutant = with_buggy(&model, 1);
+        let mut state = mutant.init_state();
+        for action in ["UndersizedLint", "SlicesStart", "NativeRuns", "CompatRuns"] {
+            state = mutant.successors(action, &state).pop().unwrap();
+        }
+        assert!(mutant.check_invariant("FitsMemory", &state));
+        assert!(!mutant.check_invariant("FitsRecordedMemory", &state));
+    }
+
+    #[test]
+    fn an_ended_tree_releases_lint_waiters_without_starting_after_a_red() {
+        for (completion, keep_build, interrupted, succeeds) in [
+            (super::TreeIndexCompletion::Compile, false, false, true),
+            (super::TreeIndexCompletion::Stopped, false, false, false),
+            (super::TreeIndexCompletion::Stopped, true, false, true),
+            (super::TreeIndexCompletion::Stopped, true, true, false),
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let handoff = super::TreeIndexHandoff::default();
+            handoff.expect_lint(dir.path().join("events"));
+            handoff.finish(completion);
+            let answer = handoff.await_lint(
+                |_| false,
+                || interrupted,
+                || keep_build,
+                || panic!("a completed tree must release the waiter"),
+            );
+            assert_eq!(answer.is_ok(), succeeds);
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let handoff = super::TreeIndexHandoff::default();
+        handoff.expect_lint(dir.path().to_owned());
+        assert!(
+            handoff
+                .await_lint(
+                    |_| true,
+                    || false,
+                    || true,
+                    || panic!("a failed gate preparation must not wait")
+                )
+                .is_err(),
+            "a gate that could not clear stale events must never authorize slice launch"
+        );
+    }
+
+    #[test]
     fn a_staged_supersession_refusal_names_the_fix_hop_remedy() {
         let previous = super::Line::start("0.189.0", "0123456789abcdef0123456789abcdef01234567", 1);
         let refusal = super::SupersedeCheck::Present(
@@ -10634,6 +10976,20 @@ mod tests {
                 winner: None,
                 ..
             }
+        ));
+        let earlier = supersession_record(Line::start("0.189.0", &"0".repeat(40), 0), previous);
+        assert!(matches!(
+            classify_supersession_reread(&requested, Ok(Some(earlier.clone())), true),
+            SupersedeResult::Refused {
+                retry: true,
+                winner: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_claim_stop(&requested, "claim stopped".into(), Ok(Some(earlier))),
+            SupersedeResult::Refused { why, retry: false, winner: None }
+                if why == "claim stopped"
         ));
         assert!(matches!(
             classify_supersession_reread(&requested, Err("unreadable".into()), true),
@@ -12233,7 +12589,11 @@ mod tests {
         let mut real = Real::new(&repo, Some(&source), true, false).unwrap();
         let prover = real.prover(None).unwrap();
         let from = real.version_at("HEAD").unwrap();
-        let to = crate::publish::bump_minor_release(&from).unwrap();
+        let to = aterm_types::release_version::ReleaseVersion::parse(&from)
+            .unwrap()
+            .successor()
+            .unwrap()
+            .to_string();
         crate::cut_timing::measure("fixture-bump-origin", || {
             crate::publish::native_origin(&repo).unwrap()
         });
@@ -14127,6 +14487,53 @@ mod tests {
         ] {
             assert!(!source_attestation_findings(&release(&assets, "")).is_empty());
         }
+    }
+
+    /// 0.193.0's step 7 read its private draft by tag and GitHub answered 404, as it does for
+    /// every draft: a journaled draft is read by its id, a cut with none by its tag.
+    #[test]
+    fn step_seven_reads_the_journaled_private_draft_by_id() {
+        assert_eq!(
+            source_release_path("o/aterm", "v0.6.0", Some(440_210_489)),
+            "repos/o/aterm/releases/440210489"
+        );
+        assert_eq!(
+            source_release_path("o/aterm", "v0.6.0", None),
+            "repos/o/aterm/releases/tags/v0.6.0"
+        );
+    }
+
+    #[test]
+    fn a_draft_github_unbound_or_another_release_is_refused_before_the_claim() {
+        let with = |id: u64, tag: &str| -> aterm_json::Value {
+            aterm_json::from_str(&format!(
+                "{{\"id\":{id},\"tag_name\":\"{tag}\",\"assets\":[]}}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            source_binding_problem(&with(7, "v0.6.0"), "o/a", "v0.6.0", Some(7)),
+            None
+        );
+        assert_eq!(
+            source_binding_problem(&with(7, "v0.6.0"), "o/a", "v0.6.0", None),
+            None
+        );
+        let (why, fix) = source_binding_problem(
+            &with(7, "untagged-88239b0cc2be8b1abf48"),
+            "o/a",
+            "v0.6.0",
+            Some(7),
+        )
+        .unwrap();
+        assert!(why.contains("untagged-88239b0cc2be8b1abf48"), "{why}");
+        assert!(
+            fix.contains("releases/7 -X PATCH -f tag_name=v0.6.0"),
+            "{fix}"
+        );
+        let (why, _) =
+            source_binding_problem(&with(8, "v0.6.0"), "o/a", "v0.6.0", Some(7)).unwrap();
+        assert!(why.contains("not the private draft 7"), "{why}");
     }
 
     #[test]

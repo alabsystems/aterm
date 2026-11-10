@@ -748,22 +748,43 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
             .all(|r| drawn_marks(&app, wid, r).is_empty()),
         "control: no switch draws no mark"
     );
+    // The permission light's own mark (`● yolo`) is the one disc on the rule, drawn over its
+    // own cell as the switch's is; no switch face stands beside it.
     let faces = [BandIcon::Disc, BandIcon::Ring, BandIcon::DottedRing];
     let on_rule = drawn_marks(&app, wid, rule);
+    let light = app.windows[&wid].input_scratch.cells[rule]
+        .iter()
+        .position(|c| c.ch == BandIcon::Disc.ch())
+        .and_then(|col| u16::try_from(col).ok())
+        .expect("the light's mark is on the rule");
+    assert_eq!(
+        on_rule
+            .iter()
+            .copied()
+            .filter(|i| faces.contains(&i.icon))
+            .collect::<Vec<_>>(),
+        [ChromeIcon {
+            col: light,
+            icon: BandIcon::Disc,
+        }],
+        "control: the rule's chips and facts, no switch face: {on_rule:?} on {:?}",
+        row_text(&app, wid, rule)
+    );
     assert!(
-        on_rule.iter().all(|i| !faces.contains(&i.icon)),
-        "control: the rule's chip and facts, no switch face: {on_rule:?} on {:?}",
+        row_text(&app, wid, rule).contains("\u{25cf} yolo"),
+        "the disc is the light's: {:?}",
         row_text(&app, wid, rule)
     );
 }
 
-/// Line D's marks, the chip's and the facts' (`◆`, `⌂`, `⎇`), are drawn as the switch's is: each
+/// Line D's marks, the chips' (Autopilot's, and the permission light's `●`) and the facts' (`◆`,
+/// `⌂`, `⎇`), are drawn as the switch's is: each
 /// the glass's icon over its own cell, whole strokes in the marks' ink where the font's thin
 /// glyph read faint on Day at 1x (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1, §4.3,
 /// §7's "Day inks vivid"); Cruise's `∞` is no mark and keeps its glyph.
 /// NEGATIVE CONTROL: handing the icon painter only the rule's cells before the facts (the S7
-/// footer's `&r.painted[..facts_at]`) draws no mark under Cruise and only the chip's under Off
-/// and Land (run once, restored).
+/// footer's `&r.painted[..facts_at]`) draws only the chips' marks, never the facts' (run once,
+/// restored).
 #[test]
 fn line_ds_marks_are_drawn_as_the_switchs_are() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -781,7 +802,12 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
     let marks = |app: &App, chip: Option<BandIcon>| {
         let mut want: Vec<ChromeIcon> = chip
             .into_iter()
-            .chain([BandIcon::Diamond, BandIcon::House, BandIcon::Fork])
+            .chain([
+                BandIcon::Disc,
+                BandIcon::Diamond,
+                BandIcon::House,
+                BandIcon::Fork,
+            ])
             .map(|icon| ChromeIcon {
                 col: at(app, icon.ch()),
                 icon,
@@ -798,7 +824,7 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
     assert_eq!(
         drawn(&app),
         marks(&app, None),
-        "Cruise: the facts' marks, and no icon for ∞"
+        "Cruise: the light's mark and the facts', and no icon for ∞"
     );
     for (mode, icon) in [
         (Autopilot::Off, BandIcon::Ring),
@@ -810,7 +836,7 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
         assert_eq!(
             drawn(&app),
             want,
-            "{mode:?}: the chip's mark and the facts'"
+            "{mode:?}: the chips' marks and the facts'"
         );
         frame(&mut app, wid);
         assert_eq!(drawn(&app), want, "{mode:?}: painted again");

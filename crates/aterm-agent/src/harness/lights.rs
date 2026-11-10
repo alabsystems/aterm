@@ -13,8 +13,8 @@ pub const SETTLE_MS: u64 = 2500;
 /// One light of the row; the permission mode is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Light {
-    /// Claude's permission mode, one bit whatever its pill names: yolo in bypass
-    /// ([`footer::YOLO_ON`]), not yolo in every other mode ([`footer::YOLO_OFF`]).
+    /// Claude's permission mode, one bit whatever its pill names: yolo on in bypass
+    /// ([`footer::YOLO_ON_MARK`]), off in every other mode ([`footer::YOLO_OFF_MARK`]).
     Mode,
 }
 
@@ -51,6 +51,27 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The anchor id of the mode's pill (`mode.auto`), [`Self::of_indicator`]'s inverse.
+    #[must_use]
+    pub const fn indicator(self) -> &'static str {
+        match self {
+            Mode::Bypass => "mode.bypass",
+            Mode::Auto => "mode.auto",
+            Mode::AcceptEdits => "mode.accept_edits",
+            Mode::DontAsk => "mode.dont_ask",
+            Mode::Plan => "mode.plan",
+            Mode::Manual => "mode.manual",
+        }
+    }
+
+    /// The mode in Claude Code's own words, as its pill says it (`auto mode on`,
+    /// `bypass permissions on`): what the chip's hover names the mode by, so aterm keeps no
+    /// vocabulary of its own for a mode.
+    #[must_use]
+    pub const fn pill_words(self) -> &'static str {
+        aterm_phase::anchor_text(self.indicator())
+    }
+
     /// The mode a pill's anchor id (`mode.auto`, [`footer::pill_indicator`]) names.
     #[must_use]
     pub fn of_indicator(id: &str) -> Option<Mode> {
@@ -261,6 +282,24 @@ mod tests {
         for pill in &footer::PILLS {
             assert!(Mode::of_indicator(pill.id).is_some(), "{}", pill.id);
         }
+        for mode in ALL_MODES {
+            assert_eq!(Mode::of_indicator(mode.indicator()), Some(mode), "{mode:?}");
+            assert!(
+                mode.pill_words().ends_with(" on"),
+                "{mode:?}: the pill's own words"
+            );
+        }
+        assert_eq!(Mode::Plan.pill_words(), "plan mode on");
+        // The chip says one word either way, and its mark says which (owner, 2026-11-09): the
+        // off chip never wears another word for the flag.
+        assert_eq!(
+            (footer::YOLO, footer::YOLO_ON_MARK, footer::YOLO_OFF_MARK),
+            ("yolo", "\u{25cf}", "\u{25cb}")
+        );
+        assert_eq!(
+            (footer::YOLO_ON_SAID, footer::YOLO_OFF_SAID),
+            ("yolo on", "yolo off")
+        );
     }
 
     /// THE BIT IS BYPASS ALONE (`docs/DESIGN-yolo-binary-2026-11-04.md` §1): yolo where the pill

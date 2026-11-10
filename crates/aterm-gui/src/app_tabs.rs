@@ -1649,8 +1649,8 @@ impl App {
         titles: &[String],
     ) -> Vec<crate::session_chrome::TabChromeExt> {
         // A backstop bound on the cache (`detach_session_view` drops a closed
-        // session's entry). The live-id set is collected first so the retain
-        // closure borrows no field.
+        // session's entry): `pool` is borrowed separately so the retain
+        // closure borrows no other field of `self`.
         if self.session_chrome.len() > 64 {
             let pool = &self.pool;
             self.session_chrome
@@ -9059,7 +9059,7 @@ mod mixed_tab_tests {
     }
 
     #[test]
-    fn reopened_editor_shares_canonical_document_but_gets_fresh_runtime_ids() {
+    fn reopened_editor_keeps_document_identity_and_shares_only_a_live_controller() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-reopen-shared-document-{}-{:?}",
             std::process::id(),
@@ -9071,37 +9071,71 @@ mod mixed_tab_tests {
         std::fs::write(&path, "shared\n").unwrap();
         let uri = file_uri(&path);
 
-        let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.open_document_tab(crate::native_app::AppKind::Markdown, &uri)
-            .unwrap();
-        app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
-            .unwrap();
-        let (old_instance, old_view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(old_instance).unwrap();
-        let canonical_uri = app
-            .document_store
-            .canonical_uri(document)
-            .expect("canonical shared URI")
-            .to_string();
-        let old_tab = app.windows[&wid].tab_set.active_id().unwrap();
-        assert_eq!(app.document_store.view_count(document), Some(2));
-
-        app.close_active_native_tab(wid).unwrap();
-        assert_eq!(app.document_store.view_count(document), Some(1));
-        app.reopen_last_closed_tab().unwrap();
-        let (new_instance, new_view) = app.active_native_view(wid).unwrap();
-        let new_tab = app.windows[&wid].tab_set.active_id().unwrap();
-        assert_ne!(new_instance, old_instance);
-        assert_ne!(new_view, old_view);
-        assert_ne!(new_tab, old_tab);
-        assert_eq!(app.native_runtime.document_id(new_instance), Some(document));
-        assert_eq!(
-            app.document_store.id_for_uri(&canonical_uri),
-            Some(document)
-        );
-        assert_eq!(app.document_store.view_count(document), Some(2));
-        assert!(app.structural_invariants_ok());
+        for keep_peer in [false, true] {
+            let mut app = App::headless_for_test();
+            app.open_document_tab(crate::native_app::AppKind::Markdown, &uri)
+                .unwrap();
+            let opened = app.active_native_view(wid).unwrap();
+            app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
+                .unwrap();
+            let (old_instance, old_view) = app.active_native_view(wid).unwrap();
+            assert_eq!(
+                (old_instance, old_view),
+                opened,
+                "Read and Edit reuse one view"
+            );
+            let document = app.native_runtime.document_id(old_instance).unwrap();
+            let canonical_uri = app
+                .document_store
+                .canonical_uri(document)
+                .expect("canonical shared URI")
+                .to_string();
+            let old_tab = app.windows[&wid].tab_set.active_id().unwrap();
+            assert_eq!(app.document_store.view_count(document), Some(1));
+            if keep_peer {
+                let peer = WindowId(1);
+                app.install_window_state(peer, crate::stub_session(99), 38, 132);
+                app.open_document_tab_in_window(peer, crate::native_app::AppKind::Editor, &uri)
+                    .unwrap();
+                let (peer_instance, peer_view) = app.active_native_view(peer).unwrap();
+                assert_eq!(peer_instance, old_instance);
+                assert_ne!(peer_view, old_view);
+                app.frontmost_window = Some(wid);
+            }
+            let retained_views = usize::from(keep_peer);
+            app.close_active_native_tab(wid).unwrap();
+            assert_eq!(
+                app.document_store.view_count(document),
+                Some(retained_views)
+            );
+            assert_eq!(app.native_runtime.app(old_instance).is_some(), keep_peer);
+            app.reopen_last_closed_tab().unwrap();
+            let (new_instance, new_view) = app.active_native_view(wid).unwrap();
+            let new_tab = app.windows[&wid].tab_set.active_id().unwrap();
+            assert_eq!(new_instance == old_instance, keep_peer);
+            assert_ne!(new_view, old_view);
+            assert_ne!(new_tab, old_tab);
+            assert_eq!(app.native_runtime.document_id(new_instance), Some(document));
+            assert_eq!(
+                app.document_store.id_for_uri(&canonical_uri),
+                Some(document)
+            );
+            assert_eq!(
+                app.document_store.view_count(document),
+                Some(retained_views + 1)
+            );
+            assert!(
+                app.dispatch_native_view_event(
+                    wid,
+                    old_view,
+                    crate::native_app::AppEvent::FocusChanged(None),
+                )
+                .is_err(),
+                "retired view input cannot reach the reopened view"
+            );
+            assert!(app.structural_invariants_ok());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -180,6 +180,11 @@ pub struct Session<'a> {
     history: std::cell::RefCell<std::collections::BTreeMap<Digest, Historical>>,
     generation: Option<crate::generation::Observation>,
     generation_deadline: Option<std::time::Instant>,
+    /// The look at this session's vault its checks judge through, where its admission kept one
+    /// ([`Self::keep_look`]): a table-repair read batch's, standing on the batch's source read of
+    /// the vault, so the batch is one moment of it. `None` for every other session, whose checks
+    /// each observe the vault on their own call.
+    look: Option<aterm_secrets::client::VaultLook<'a>>,
 }
 
 /// `bootstrap`'s custody checked again ([`Bootstrap::revalidate_custody`]), the vault observed
@@ -203,13 +208,21 @@ fn revalidate(
 thread_local! {
     /// How many of this thread's session checks that a look at the vault ([`Session::observe_in`])
     /// can serve were handed none, and asked on their own calls: an open's custody (`revalidate`)
-    /// and access (`Session::with_generation`), a peer's or an observation's currency
-    /// (`Session::current_in`), and a peer's roster (`Session::peer_member_in`). A check handed a
-    /// look counts as served by it, though where the look observes nothing or looks at another
-    /// vault `aterm-secrets` answers on its own call uncounted; a peer's roster read on its own
-    /// call because its look is at another vault counts. A session's other checks (a read batch's
-    /// custody, `Session::context`'s currency, ...) are not counted.
+    /// and access (`Session::with_generation`), the session's currency wherever it is judged
+    /// (`Session::current_in`: a peer's, an observation's, an endpoint's context, a writer's;
+    /// `Session::current_observed`: a store's context, `Session::context`), and a peer's roster
+    /// (`Session::peer_member_in`). A check handed a look, or judged through the look its session
+    /// keeps ([`Session::keep_look`]), counts as served by it, though where the look observes
+    /// nothing or looks at another vault `aterm-secrets` answers on its own call uncounted; a
+    /// peer's roster read on its own call because its look is at another vault counts. A session's
+    /// other checks (a store read batch's custody, its opening and closing context
+    /// (`Session::read_context`, asked afresh by design), its records' keys and history, ...) are
+    /// not counted.
     pub(crate) static OWN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many of this thread's store read batch fences (`Session::read_context`'s context)
+    /// asked the session's currency afresh, on their own calls, as they do whatever look the
+    /// session keeps.
+    pub(crate) static FENCES_AFRESH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One more of [`OWN_CHECKS`].
@@ -448,7 +461,7 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
-        self.observation_in(None)
+        self.observation_in(self.look.as_ref())
     }
 
     /// [`Self::observation`], its currency judged through `look` where given
@@ -519,12 +532,18 @@ impl<'a> Session<'a> {
     /// Share this batch's validated control context with a detached endpoint
     /// constructor. A caller must release the session before network I/O.
     pub(crate) fn control_context(&self) -> Result<(&Bootstrap, &Journal)> {
-        if !self.access.is_current(&self.journal) {
+        if !self.current() {
             return Err(Error::new(
                 "Commons membership changed during endpoint setup",
             ));
         }
         Ok((self.bootstrap, &self.journal))
+    }
+
+    /// Whether this session's access is current, judged through the look it keeps where it keeps
+    /// one ([`Self::current_in`]).
+    fn current(&self) -> bool {
+        self.current_in(self.look.as_ref())
     }
 
     /// Whether this session's access is current ([`Access::is_current`]), judged through `look`
@@ -540,8 +559,31 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// [`Access::is_current_observed`], judged through the look this session keeps where it keeps
+    /// one ([`Access::is_current_observed_in`]).
+    fn current_observed(&self) -> Result<bool> {
+        match &self.look {
+            Some(look) => self.access.is_current_observed_in(&self.journal, look),
+            None => {
+                #[cfg(test)]
+                own_check();
+                self.access.is_current_observed(&self.journal)
+            }
+        }
+        .map_err(failure)
+    }
+
+    /// Keep `look`, the look at this session's vault its admission judged through, for every check
+    /// this session makes after it until the session drops: a table-repair read batch's, which
+    /// stands on the batch's source read of the vault (`Replica::observe`), so the batch's own
+    /// checks of its currency, its store contexts and its peers' roster stand for the moment its
+    /// admission judged, as its admission's did.
+    pub(crate) fn keep_look(&mut self, look: aterm_secrets::client::VaultLook<'a>) {
+        self.look = Some(look);
+    }
+
     fn peer_member(&self, actor: Actor) -> Result<&aterm_secrets::commons::roster::Member> {
-        self.peer_member_in(actor, None)
+        self.peer_member_in(actor, self.look.as_ref())
     }
 
     /// [`Self::peer_member`], the session's currency judged, and its roster read, through `look`
@@ -580,7 +622,7 @@ impl<'a> Session<'a> {
 
     /// Current peer membership for an already channel-authenticated actor.
     pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
-        self.peer_in(actor, None)
+        self.peer_in(actor, self.look.as_ref())
     }
 
     /// [`Self::peer`], the session's currency judged, and its roster read, through `look` where
@@ -615,7 +657,7 @@ impl<'a> Session<'a> {
         std::collections::BTreeSet<Actor>,
         std::collections::BTreeMap<Actor, aterm_secrets::commons::binding::Binding>,
     )> {
-        if !self.access.is_current(&self.journal) {
+        if !self.current() {
             return Err(Error::new(
                 "Commons membership changed during writer observation",
             ));
@@ -648,7 +690,7 @@ impl<'a> Session<'a> {
     /// one membership check and one roster read rather than one of each per member (each roster
     /// read verifies the vault and its log).
     pub(crate) fn writers(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
-        if !self.access.is_current(&self.journal) {
+        if !self.current() {
             return Err(Error::new(
                 "Commons membership changed during writer observation",
             ));
@@ -684,7 +726,7 @@ impl<'a> Session<'a> {
     pub(crate) fn observed_account_targets(
         &self,
     ) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
-        if !self.access.is_current(&self.journal) {
+        if !self.current() {
             return Err(Error::new(
                 "Commons membership changed during target observation",
             ));
@@ -1148,6 +1190,7 @@ impl<'a> Session<'a> {
             history: std::cell::RefCell::default(),
             generation,
             generation_deadline: deadline,
+            look: None,
         })
     }
     pub fn actor(&self) -> Actor {
@@ -1311,17 +1354,29 @@ impl<'a> Session<'a> {
     }
 
     fn context(&self, scope: Scope) -> Result<()> {
+        self.context_judged(scope, false)
+    }
+
+    /// [`Self::context`], its currency asked on its own call where `afresh`, whatever look the
+    /// session keeps: a store read batch's opening and closing fences ([`Self::read_context`]).
+    fn context_judged(&self, scope: Scope, afresh: bool) -> Result<()> {
         if self.generation.is_some() {
             self.generation_guard(false)?;
         }
-        // A store open asks this outside a read batch's source reads, so a vault writer can hold
-        // the state lock: that is busy, which a read observes again, not stale membership.
-        if scope.trust != self.journal.trust()
-            || !self
-                .access
+        // Asked with no source read of the vault held (a store open outside a read batch), a vault
+        // writer can hold the state lock: that is busy, which a read observes again, not stale
+        // membership. A table-repair read batch asks it through its look, under its source read,
+        // except at a store read batch's fences, which ask afresh.
+        let current = if afresh {
+            #[cfg(test)]
+            FENCES_AFRESH.set(FENCES_AFRESH.get() + 1);
+            self.access
                 .is_current_observed(&self.journal)
                 .map_err(failure)?
-        {
+        } else {
+            self.current_observed()?
+        };
+        if scope.trust != self.journal.trust() || !current {
             return Err(Error::new(
                 "table has another trust context or stale membership",
             ));
@@ -1332,7 +1387,7 @@ impl<'a> Session<'a> {
     /// and currency, without the journal writer lock a read does not hold.
     pub(crate) fn may_write(&self) -> Result<()> {
         if self.access.local().role() != Role::Writer
-            || !self.access.is_current(&self.journal)
+            || !self.current()
             || aterm_secrets::client::swarm_roster_until(
                 self.bootstrap.paths(),
                 crate::admission::deadline(),
@@ -1373,7 +1428,7 @@ impl<'a> Session<'a> {
         self.generation_guard(true)?;
         if !self.journal.is_writer()
             || self.access.local().role() != Role::Writer
-            || !self.access.is_current(&self.journal)
+            || !self.current()
             || aterm_secrets::client::swarm_roster_until(
                 self.bootstrap.paths(),
                 crate::admission::deadline(),
@@ -1603,11 +1658,12 @@ impl<'a> Session<'a> {
         if !current.inventory().eq(self.journal.inventory()) || !self.access.is_current(&current) {
             return Err(Error::snapshot_changed());
         }
-        // A generation's check can wait, so what follows it is asked afresh, and a journal's own
-        // head is its handle's to answer. Under a log with neither, currency asks the log and holds
-        // a journal only to its trust: the answer just given, for a journal of that trust.
+        // A generation's check can wait, so what follows it is asked afresh (on its own call, not
+        // through a look the session keeps), and a journal's own head is its handle's to answer.
+        // Under a log with neither, currency asks the log and holds a journal only to its trust:
+        // the answer just given, for a journal of that trust.
         if self.generation.is_some() || !self.access.is_log_backed() {
-            return self.context(scope);
+            return self.context_judged(scope, true);
         }
         if scope.trust != self.journal.trust() || self.journal.trust() != current.trust() {
             return Err(Error::new(

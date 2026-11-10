@@ -17,9 +17,12 @@
 //!    whose record is not whole, exits non-zero, and nothing is pushed.
 //! 4. Push (a push git reports failed whose landing main holds landed). Where main moved to M2
 //!    meanwhile, compose the pass onto M2 when AGENTS.md's rule holds: a clean merge and
-//!    disjoint changed files, except a sole shared `Cargo.lock` whose isolated local product
-//!    version alone moved ([`version::independent_lock`]). The four immutable trees retain
-//!    every other lock byte and the source-proven binary-leaf identity boundary. That
+//!    disjoint endpoint changes after discarding only shared paths with identical mode,
+//!    type and object (or all absent) in checked, new main and merge, including parent trees.
+//!    Unavailable entry evidence keeps the original overlap. A sole remaining shared
+//!    `Cargo.lock` may instead carry an isolated local product-version move
+//!    ([`version::independent_lock`]). The four immutable trees retain every other lock
+//!    byte and the source-proven binary-leaf identity boundary. That
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
 //!    ([`COMPOSES`] in a row at most). Where the rule fails, merge M2 and judge the branch's
 //!    delta from M2 against its new dependencies (`verify --base M2`); after [`REJUDGES`]
@@ -765,8 +768,8 @@ struct GitStatus {
 }
 
 impl Git<'_> {
-    /// The writer and historical reader apply one composition rule, including the
-    /// isolated product-version exception. The returned reason is the writer's report.
+    /// The writer and historical reader share exact entry convergence and the isolated
+    /// product-version exception. The returned reason is the writer's report.
     fn independent_changes(
         &self,
         base: &str,
@@ -776,18 +779,32 @@ impl Git<'_> {
     ) -> Result<Option<String>, String> {
         let theirs = self.files(base, main)?;
         let ours = self.files(base, checked)?;
-        let overlap: Vec<_> = theirs.intersection(&ours).collect();
+        let mut overlap: Vec<_> = theirs.intersection(&ours).collect();
         if overlap.is_empty() {
             return Ok(Some(
                 "the merge is clean and its new commits touch none of the branch's files".into(),
             ));
+        }
+        // Optional endpoint evidence: discard a shared path only when its full
+        // entry agrees in checked, main and the already verified clean merge.
+        // Including tree entries distinguishes a deleted path from a directory.
+        if let (Ok(main_changes), Ok(merge_changes)) = (
+            self.entry_changes(checked, main),
+            self.entry_changes(checked, tree),
+        ) {
+            overlap.retain(|path| main_changes.contains(*path) || merge_changes.contains(*path));
+            if overlap.is_empty() {
+                return Ok(Some(
+                    "the merge is clean and every shared path has the same entry in the checked tree, new main and merge".into(),
+                ));
+            }
         }
         if overlap.len() == 1
             && overlap[0].as_slice() == b"Cargo.lock"
             && let Some((old, new)) = version::independent_lock(self, base, main, checked, tree)
         {
             return Ok(Some(format!(
-                "the merge is clean and its only shared file is Cargo.lock, where the isolated product version moved from {old} to {new}; every other lock byte is preserved"
+                "the merge is clean and its only differing shared file is Cargo.lock, where the isolated product version moved from {old} to {new}; every other lock byte is preserved"
             )));
         }
         Ok(None)
@@ -896,6 +913,21 @@ impl Git<'_> {
         self.paths(&[
             "diff-tree",
             "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            from,
+            to,
+        ])
+    }
+
+    /// Every changed entry, including parent trees and mode or type changes.
+    fn entry_changes(&self, from: &str, to: &str) -> Result<BTreeSet<Vec<u8>>, String> {
+        self.paths(&[
+            "diff-tree",
+            "-r",
+            "-t",
             "-z",
             "--name-only",
             "--no-renames",
@@ -1107,12 +1139,15 @@ pub fn usage() -> String {
         "usage: targo --unverified verify land [--admit wait|now]\n\n\
          Land this checkout's branch on {REMOTE}/{MAIN}, judged: merge {REMOTE}/{MAIN} (M1), run\n\
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
-         it (a clean merge and disjoint files, except a sole shared Cargo.lock whose isolated\n\
-         local product version alone moved) or merge it and\n\
+         it (a clean merge and disjoint or exactly convergent entries, except a sole remaining\n\
+         shared Cargo.lock whose isolated local product version alone moved) or merge it and\n\
          judge the branch's delta from that main tip, at most {REJUDGES} times. A red main's lane already named at the\n\
          main commit merged (M1, or the moved main a re-judge merged), in a crate outside the\n\
          branch's own, is INHERITED: named, not counted. The landing merge carries\n\
          Aterm-Checked, Aterm-Composed-Onto and Aterm-Inherited trailers.\n\n\
+         Convergence requires identical mode, type and object (or all absent) in checked, new\n\
+         main and merge, including parent trees. Disjoint changes need no extra entry reads;\n\
+         unavailable evidence retains the original overlap and lock rule.\n\n\
          The lock exception validates four immutable trees, preserving every other lock byte,\n\
          dependency, format and mode. Uncertain evidence is judged again. Aterm-Checked still\n\
          names the tree that ran; a composed product identity is not that earlier executable.\n\n\

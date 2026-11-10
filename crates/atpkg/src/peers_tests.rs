@@ -1061,3 +1061,70 @@ fn a_store_whose_person_turned_sharing_off_answers_no_units_stream() {
     client.read_to_string(&mut answer).unwrap();
     assert!(answer.starts_with("HTTP/1.1 404"), "{answer:?}");
 }
+
+/// On Unix, an idle `share` waits on its listener, its stop's bell and `FileWatch` on `units.off`
+/// rather than waking every `FALLBACK_POLL`, both while serving and while `--off` stands; and an
+/// `--off` noticed through a wake on the listener before `FileWatch` settles still hears `--on`
+/// inside the same settle window.
+#[cfg(unix)]
+#[test]
+fn an_idle_sharing_store_waits_without_polling_when_serving_and_when_off() {
+    let layout = crate::testdir::layout("atpkg-peers-idle-wait-");
+    let stop = Arc::new(Stop::new());
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (said, notes) = mpsc::channel();
+    let thread = std::thread::spawn({
+        let (layout, stop, looks) = (layout.clone(), Arc::clone(&stop), Arc::clone(&looks));
+        move || {
+            share_counting(
+                &layout,
+                &Share {
+                    listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    stop: &stop,
+                    members: &loopback,
+                    refresh: HANG,
+                    note: &|line| {
+                        let _ = said.send(line.to_owned());
+                    },
+                },
+                Some(&looks),
+            );
+        }
+    });
+    heard(&notes, "serving");
+    let parked = Instant::now();
+    while looks.load(Ordering::Relaxed) == 0 {
+        assert!(parked.elapsed() < HANG, "share never entered its wait");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let at_rest = looks.load(Ordering::Relaxed);
+    std::thread::sleep(FALLBACK_POLL * 3);
+    assert_eq!(
+        looks.load(Ordering::Relaxed),
+        at_rest,
+        "an idle sharing server looked again with no connection, off or stop"
+    );
+
+    // Rapid `--off` -> listener poke -> `--on` inside `FileWatch::QUIET` must still resume serving.
+    let bound = serving(&layout).expect("recorded serving address");
+    turn_off(&layout).unwrap();
+    let _ = TcpStream::connect(bound);
+    heard(&notes, "off");
+    turn_on(&layout).unwrap();
+    heard(&notes, "serving");
+
+    // While `--off` stands, `wait_while_off` also sleeps without polling.
+    turn_off(&layout).unwrap();
+    heard(&notes, "off");
+    std::thread::sleep(aterm_uds::file_watch::QUIET * 2);
+    let off_at_rest = looks.load(Ordering::Relaxed);
+    std::thread::sleep(FALLBACK_POLL * 3);
+    assert_eq!(
+        looks.load(Ordering::Relaxed),
+        off_at_rest,
+        "a turned-off sharing server polled while waiting for --on or stop"
+    );
+
+    stop.set();
+    thread.join().unwrap();
+}

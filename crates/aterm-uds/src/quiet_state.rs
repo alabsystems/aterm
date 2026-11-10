@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! One-time macOS migration of an owned state directory. The atomic exchange preserves
-//! every inode and leaves a regular-file fence at the old name, never a second writable
-//! store. A caller supplies the legacy writer lease; new writers use the migrated inodes.
+//! One-time macOS handoffs of owned state. Atomic exchanges preserve inodes and leave
+//! type fences at retired names, never second writable stores. Directory handoffs retain
+//! the legacy writer lease; non-authoritative file caches fence older atomic publishers.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,25 @@ pub fn selected(legacy: &Path) -> PathBuf {
     legacy.to_path_buf()
 }
 
+/// Move an owned, non-authoritative file cache into `.ubd`, preserving the file's inode.
+/// The directory fence and file exchange atomically: an old writer either publishes before
+/// the exchange (its latest file moves), or its rename over the directory is refused.
+/// No legacy writer lease or second writable store is needed. Returns its new path;
+/// other platforms return its original path. A retired cache never falls back.
+///
+/// # Errors
+/// On macOS, refuses unsafe/private state, files exceeding `maximum`, ambiguous stores,
+/// a busy migration, unsupported atomic exchanges and filesystem/durability failures.
+pub fn prepare_file_cache(legacy: &Path, maximum: usize) -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return mac::prepare_file_cache(legacy, maximum).map(|()| destination(legacy));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (legacy, maximum);
+        Ok(legacy.to_path_buf())
+    }
+}
+
 /// Prepare the quiet directory without losing retained data. `acquire` must exclude the
 /// legacy directory's durable writers, and its returned guard must retain that exclusion
 /// until dropped. The callback is never called for a fresh or already migrated directory.
@@ -70,6 +89,115 @@ mod mac {
         ffi::OsStrExt as _,
         fs::{MetadataExt as _, OpenOptionsExt as _},
     };
+
+    const CACHE_MARKER: &str = "retired-cache";
+    const CACHE_RETIRED: &[u8] = b"aterm file cache moved atomically into .ubd\n";
+
+    fn name(legacy: &Path) -> io::Result<&str> {
+        legacy
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 80
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+            .ok_or_else(|| io::Error::other("invalid state name"))
+    }
+
+    fn read_directory_marker(path: &Path) -> io::Result<()> {
+        private_file::check_private_dir(path)?;
+        let bytes = private_file::read_private(path, CACHE_MARKER, CACHE_RETIRED.len())
+            .map_err(io::Error::other)?;
+        let entries = std::fs::read_dir(path)?
+            .take(2)
+            .collect::<io::Result<Vec<_>>>()?;
+        if bytes != CACHE_RETIRED || entries.len() != 1 || entries[0].file_name() != CACHE_MARKER {
+            return Err(io::Error::other("file cache retirement fence differs"));
+        }
+        Ok(())
+    }
+
+    fn directory_marker(path: &Path) -> io::Result<()> {
+        private_file::create_private_dir(path)?;
+        // An empty stage is the crash state before its marker was written. Never adopt
+        // a populated directory without validating its existing marker.
+        if std::fs::read_dir(path)?.next().transpose()?.is_none() {
+            private_file::write_private_flushed(
+                path,
+                CACHE_MARKER,
+                CACHE_RETIRED,
+                aterm_durable::Flush::Durable,
+            )?;
+        }
+        read_directory_marker(path)
+    }
+
+    fn bounded_file(path: &Path, maximum: usize) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache needs a parent"))?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("cache needs a filename"))?;
+        let (_, metadata) = private_file::open_private(parent, name).map_err(io::Error::other)?;
+        if metadata.len() > maximum as u64 {
+            return Err(io::Error::other("file cache exceeds its bound"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_file_cache(legacy: &Path, maximum: usize) -> io::Result<()> {
+        let name = name(legacy)?;
+        let target = destination(legacy);
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::other("cache needs a parent"))?;
+        private_file::create_private_dir(parent)?;
+        let _migration = private_file::PrivateLock::take(
+            parent,
+            &format!("{name}.migration.lock"),
+            std::time::Duration::ZERO,
+            "cache migration is running",
+        )?;
+        let old = kind(legacy)?;
+        let new = kind(&target)?;
+        if old.is_some_and(|k| k.is_symlink()) || new.is_some_and(|k| k.is_symlink()) {
+            return Err(io::Error::other("file cache migration refuses symlinks"));
+        }
+        if old.is_some_and(|k| k.is_dir()) {
+            read_directory_marker(legacy)?;
+            if new.is_some() {
+                bounded_file(&target, maximum)?;
+            }
+            return Ok(());
+        }
+        if old.is_none() {
+            if new.is_some() {
+                return Err(io::Error::other("file cache has an unfenced destination"));
+            }
+            directory_marker(legacy)?;
+            aterm_durable::Flush::Durable.dir(
+                legacy
+                    .parent()
+                    .ok_or_else(|| io::Error::other("cache needs a parent"))?,
+            )?;
+            return Ok(());
+        }
+        if !old.is_some_and(|k| k.is_file()) || new.is_some_and(|k| !k.is_dir()) {
+            return Err(io::Error::other(
+                "file cache migration found ambiguous stores",
+            ));
+        }
+        bounded_file(legacy, maximum)?;
+        directory_marker(&target)?;
+        swap_entries(legacy, &target)?;
+        // A cooperating old atomic writer may have published a newer inode just before
+        // the exchange. Judge that actual winner; never follow a substituted link.
+        bounded_file(&target, maximum)
+    }
 
     fn kind(path: &Path) -> io::Result<Option<std::fs::FileType>> {
         match std::fs::symlink_metadata(path) {
@@ -123,16 +251,7 @@ mod mac {
         legacy: &Path,
         acquire: impl FnOnce() -> io::Result<G>,
     ) -> io::Result<()> {
-        let name = legacy
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| {
-                !s.is_empty()
-                    && s.len() <= 80
-                    && s.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-            })
-            .ok_or_else(|| io::Error::other("invalid state directory name"))?;
+        let name = name(legacy)?;
         let target = destination(legacy);
         let parent = target
             .parent()
@@ -172,14 +291,22 @@ mod mac {
             ));
         }
         marker(&target)?;
+        swap_entries(legacy, &target)
+    }
+
+    fn swap_entries(legacy: &Path, target: &Path) -> io::Result<()> {
         let from = std::ffi::CString::new(legacy.as_os_str().as_bytes())?;
         let to = std::ffi::CString::new(target.as_os_str().as_bytes())?;
         // SAFETY: both C strings outlive this call. RENAME_SWAP exchanges both entries in
-        // one filesystem transaction, preserving the directory and every held inode lock.
+        // one filesystem transaction, preserving each inode and every held inode lock.
         if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        aterm_durable::Flush::Durable.dir(parent)?;
+        aterm_durable::Flush::Durable.dir(
+            target
+                .parent()
+                .ok_or_else(|| io::Error::other("state needs a parent"))?,
+        )?;
         aterm_durable::Flush::Durable.dir(
             legacy
                 .parent()
@@ -193,6 +320,77 @@ mod mac {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn file_cache_exchange_preserves_the_inode_and_refuses_old_atomic_writers() {
+        let scratch = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+        let old = scratch.path().join("peers.state");
+        crate::private_file::write_private(scratch.path(), "peers.state", b"verified hints")
+            .unwrap();
+        let inode = std::fs::metadata(&old).unwrap().ino();
+        let pending = scratch.path().join("old-writer-pending");
+        std::fs::write(&pending, b"old publication").unwrap();
+        let quiet = prepare_file_cache(&old, 1024).unwrap();
+        assert!(aterm_tempfile::is_quiet(&quiet));
+        assert_eq!(std::fs::metadata(&quiet).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&quiet).unwrap(), b"verified hints");
+        assert!(old.is_dir());
+        assert!(
+            std::fs::rename(&pending, &old).is_err(),
+            "an old rename cannot fork the cache"
+        );
+        assert!(crate::private_file::write_private(scratch.path(), "peers.state", b"old").is_err());
+        assert_eq!(prepare_file_cache(&old, 1024).unwrap(), quiet);
+        let fresh = scratch.path().join("fresh.state");
+        let target = prepare_file_cache(&fresh, 1024).unwrap();
+        assert!(fresh.is_dir());
+        assert!(!target.exists());
+        crate::private_file::write_private(
+            target.parent().unwrap(),
+            target.file_name().unwrap().to_str().unwrap(),
+            b"new hints",
+        )
+        .unwrap();
+        assert_eq!(prepare_file_cache(&fresh, 1024).unwrap(), target);
+    }
+
+    #[test]
+    fn staged_file_handoff_resumes_latest_publication_and_preserves_unsafe_stores() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let old = scratch.path().join("peers.state");
+        crate::private_file::write_private(scratch.path(), "peers.state", b"before").unwrap();
+        // A public-protocol fence reproduces the stage before an exchange. An old
+        // writer may still publish while that migration is crashed.
+        let donor = scratch.path().join("donor.state");
+        prepare_file_cache(&donor, 1024).unwrap();
+        std::fs::rename(&donor, destination(&old)).unwrap();
+        crate::private_file::write_private(scratch.path(), "peers.state", b"latest").unwrap();
+        let inode = std::fs::metadata(&old).unwrap().ino();
+        let quiet = prepare_file_cache(&old, 1024).unwrap();
+        assert_eq!(std::fs::read(&quiet).unwrap(), b"latest");
+        assert_eq!(std::fs::metadata(&quiet).unwrap().ino(), inode);
+        let ambiguous = scratch.path().join("ambiguous.state");
+        crate::private_file::write_private(scratch.path(), "ambiguous.state", b"original").unwrap();
+        crate::private_file::write_private(
+            destination(&ambiguous).parent().unwrap(),
+            "ambiguous.state.noindex",
+            b"other",
+        )
+        .unwrap();
+        assert!(prepare_file_cache(&ambiguous, 1024).is_err());
+        assert_eq!(std::fs::read(&ambiguous).unwrap(), b"original");
+        assert_eq!(std::fs::read(destination(&ambiguous)).unwrap(), b"other");
+        let oversized = scratch.path().join("oversized.state");
+        crate::private_file::write_private(scratch.path(), "oversized.state", b"too large")
+            .unwrap();
+        assert!(prepare_file_cache(&oversized, 1).is_err());
+        assert!(oversized.is_file());
+        assert!(!destination(&oversized).exists());
+        let linked = scratch.path().join("linked.state");
+        std::os::unix::fs::symlink(&oversized, &linked).unwrap();
+        assert!(prepare_file_cache(&linked, 1024).is_err());
+        assert!(oversized.is_file());
+    }
 
     #[test]
     fn migration_preserves_inodes_and_locks_and_fences_legacy_writers() {

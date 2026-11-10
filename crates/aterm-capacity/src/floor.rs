@@ -5,7 +5,9 @@
 //! volume's free space, scaled to its size and raised to its room. The window's disk watch
 //! (`aterm-agent`'s `harness::disk`) and every tool that admits a disk need read them here,
 //! from the same inputs ([`Watch`]): the owner's `[disk]` knobs in aterm.toml ([`Knobs::read`])
-//! and the room the watch measured ([`crate::room`]).
+//! and the room the watch measured ([`crate::room`]). Measured build claims retain only the
+//! emergency line or an explicit owner floor ([`admission_floor`]); the cleanup target already
+//! includes room for builds and is not an additional reservation.
 
 use crate::room::Rooms;
 
@@ -218,7 +220,7 @@ fn on_volume(knobs: Knobs, total: Option<u64>) -> InForce {
 pub struct Lines {
     /// Below this the volume is `low` and the watch warns.
     pub warn: u64,
-    /// Below this the volume is `short` and the automatic pass runs (`0`: off). Admission keeps free space above it.
+    /// Below this the volume is `short` and the automatic pass runs (`0`: off).
     pub floor: u64,
     /// Where the pressure pass stops: the floor plus [`PRESSURE_MARGIN_GIB`].
     pub target: u64,
@@ -259,10 +261,12 @@ pub fn default_floor(total: u64) -> u64 {
     lines(Knobs::default(), Some(total), Some(room_bounds(total).0)).floor
 }
 
-/// The free space admission keeps on a volume with `lines`: the floor, or where the owner turned the floor off (`disk.auto_free_gib = 0`), the emergency line below which writes fail.
+/// The free space a measured disk claim leaves untouched. The watch's automatic cleanup
+/// target includes room for future builds; adding it to a claim for those builds counts that
+/// work twice. Admission retains the emergency line, or a nonzero floor the owner wrote.
 #[must_use]
-pub const fn admission_floor(lines: &Lines) -> u64 {
-    if lines.floor > 0 {
+pub const fn admission_floor(knobs: Knobs, lines: &Lines) -> u64 {
+    if knobs.written.auto_free_gib && lines.floor > 0 {
         lines.floor
     } else {
         lines.emergency

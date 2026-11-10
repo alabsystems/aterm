@@ -121,6 +121,11 @@ fn the_token_rides_stdin_and_never_argv_or_the_environment() {
         Some("-q"),
         "no curlrc"
     );
+    assert!(
+        curl.args.iter().any(|a| a == "--tlsv1.2"),
+        "never below TLS 1.2: {:?}",
+        curl.args
+    );
     assert!(curl.args.windows(2).any(|w| w == ["-H", "@-"]));
     for scrubbed in [
         "CURL_HOME",

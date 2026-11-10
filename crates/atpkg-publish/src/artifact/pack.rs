@@ -307,21 +307,11 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
     })
 }
 
-/// Whether `v` is a release line, `MAJOR.MINOR.0`: decimal, no leading zero, the patch `0`,
-/// and no pre-release or build metadata (the publication versioning rule).
+/// Whether `v` is a historical `MAJOR.MINOR.0` or calendar `1.YYYYMMDD.N` release line,
+/// without pre-release or build metadata.
 #[must_use]
 pub fn is_release_line(v: &str) -> bool {
-    let canonical = |p: Option<&str>| {
-        p.is_some_and(|p| {
-            !p.is_empty()
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && (p == "0" || !p.starts_with('0'))
-                && p.parse::<u64>().is_ok()
-        })
-    };
-    let mut parts = v.split('.');
-    let (major, minor, patch) = (parts.next(), parts.next(), parts.next());
-    canonical(major) && canonical(minor) && patch == Some("0") && parts.next().is_none()
+    aterm_types::release_version::ReleaseVersion::parse(v).is_some()
 }
 
 /// `meta` held to a harness row's rule ([`Harness`]): its `expose` is the row's tool, or
@@ -356,7 +346,7 @@ pub fn held_to_harness(program: &str, h: Harness, mut meta: Metadata) -> Result<
     };
     if !is_release_line(own) {
         return Err(Error::refused(format!(
-            "{program}'s version `{own}` is not MAJOR.MINOR.0 (the patch is always 0, and a \
+            "{program}'s version `{own}` is not MAJOR.MINOR.0 or calendar 1.YYYYMMDD.N (and a \
              dev build's `+g<sha>` is the pack's to stamp, never the manifest's)"
         )));
     }
@@ -372,7 +362,9 @@ pub fn held_to_harness(program: &str, h: Harness, mut meta: Metadata) -> Result<
 /// A refusal when `own` is not a release line or `sha` is not 9..=40 lowercase hex.
 pub fn dev_version(own: &str, sha: &str) -> Result<String> {
     if !is_release_line(own) {
-        return Err(Error::refused(format!("`{own}` is not MAJOR.MINOR.0")));
+        return Err(Error::refused(format!(
+            "`{own}` is not a historical MAJOR.MINOR.0 or calendar 1.YYYYMMDD.N"
+        )));
     }
     if !(9..=40).contains(&sha.len())
         || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

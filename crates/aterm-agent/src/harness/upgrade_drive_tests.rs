@@ -26647,7 +26647,11 @@ fn a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look() {
     assert!(!saved.line.contains("--resume"), "afresh: {}", saved.line);
 }
 
-/// The upgrade resumes in the mode the tab's pill shows.
+/// The upgrade resumes in the mode the tab's pill shows. With no pill it resumes in the
+/// transcript's last mode row where the transcript was written after the second its process
+/// started in, and as launched where it was not: that row is the mode of the process this one
+/// replaced (`relaunch::transcript_mode`), which is how a click's
+/// `--dangerously-skip-permissions` outlives a restart made before its first turn.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one() {
@@ -26667,10 +26671,25 @@ fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one()
         r#"{{"rows":["{rule}","❯ ","{rule}","  ⏵⏵ auto mode on (shift+tab to cycle)"],"cursor":{{"row":1,"col":2}},"seq":77,"human_ms":null,"first":0}}"#
     );
     let bypass = ["--dangerously-skip-permissions"];
-    for (name, transcript, screen, launch, want, gone) in [
+    // The transcript's last write, `by` seconds from now: the stand-in agent started this second.
+    let written = |opts: &Opts, by: i64| {
+        let at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(now_s().saturating_add_signed(by));
+        std::fs::File::options()
+            .write(true)
+            .open(
+                opts.home
+                    .join(format!(".claude/projects/p/{SESSION}.jsonl")),
+            )
+            .expect("the transcript")
+            .set_modified(at)
+            .expect("its last write");
+    };
+    for (name, transcript, by, screen, launch, want, gone) in [
         (
             "pill-auto-over-bypass",
             "bypassPermissions",
+            60,
             auto_pill.clone(),
             &bypass[..],
             Some("'--permission-mode' 'auto'"),
@@ -26679,10 +26698,29 @@ fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one()
         (
             "no-pill-transcript-plan",
             "plan",
+            60,
             idle_screen(),
             &[][..],
             Some("'--permission-mode' 'plan'"),
             Some("'auto'"),
+        ),
+        (
+            "no-pill-own-plan-row-leaves-bypass",
+            "plan",
+            60,
+            idle_screen(),
+            &bypass[..],
+            Some("'--allow-dangerously-skip-permissions' '--permission-mode' 'plan'"),
+            Some("'--dangerously-skip-permissions'"),
+        ),
+        (
+            "no-pill-older-plan-row-keeps-a-clicks-flag",
+            "plan",
+            -60,
+            idle_screen(),
+            &bypass[..],
+            Some("'--dangerously-skip-permissions'"),
+            Some("permission-mode"),
         ),
     ] {
         let (r, saved, _) = visit_launched(
@@ -26698,7 +26736,7 @@ fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one()
                 ..Answers::default()
             },
             launch,
-            &|_| {},
+            &|opts| written(opts, by),
         );
         assert_eq!(r.step, "wait:changed-before-signal", "{name}: {r:?}");
         let line = saved.expect("state").line;
@@ -30112,6 +30150,67 @@ mod stall;
 #[cfg(target_os = "macos")]
 #[path = "upgrade_drive_kproc_tests.rs"]
 mod kproc;
+
+/// An agent reaped between the read that finds it alive and the read of its start has exited:
+/// asked again, it is gone. One still alive with its start unread stays unproven, and one alive
+/// at its recorded start runs. NEGATIVE CONTROL: the judgement on the first read alone (alive,
+/// start unread) is unproven, the `wait:exit-unproven` a reaped agent ended its wait at.
+#[test]
+fn an_agent_reaped_between_its_alive_and_start_reads_has_exited() {
+    use super::super::relaunch::{AgentExit, agent_exit};
+    const BORN: &str = "Sat Jan 3 04:05:06 2026";
+    let st = St {
+        pid: 4242,
+        pid_start: BORN.into(),
+        ..St::default()
+    };
+    let asked = std::cell::Cell::new(0);
+    let reaped = |_| {
+        asked.set(asked.get() + 1);
+        asked.get() == 1
+    };
+    assert_eq!(st.agent_exit_by(reaped, |_| None), AgentExit::Gone);
+    assert_eq!(asked.get(), 2, "asked again once its start read nothing");
+    assert_eq!(
+        agent_exit(&st.pid_start, true, None),
+        AgentExit::Unproven,
+        "NEGATIVE CONTROL: the first read alone"
+    );
+    assert_eq!(st.agent_exit_by(|_| true, |_| None), AgentExit::Unproven);
+    assert_eq!(
+        st.agent_exit_by(|_| true, |_| Some(BORN.into())),
+        AgentExit::Runs
+    );
+}
+
+/// On Linux a process's ids and start, read from `/proc`, are the ones `ps` prints (its start in
+/// `ps -o lstart`'s spelling under `TZ=UTC`, which records taken by `ps` hold): this process's
+/// and a parked child's leading its own group; a reaped one has neither.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_processs_ids_and_start_are_the_ones_ps_prints() {
+    let mut own = parked().process_group(0).spawn().expect("spawn");
+    for pid in [std::process::id(), own.id()] {
+        let ps_ids = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()]).expect("ps ids");
+        let w: Vec<i64> = ps_ids
+            .split_whitespace()
+            .map(|n| n.parse().expect("number"))
+            .collect();
+        let read = ids(pid).expect("ids");
+        assert_eq!(
+            (i64::from(read.0), read.1, read.2),
+            (w[0], w[1], w[2]),
+            "{pid}"
+        );
+        let lstart = squash(&ps(&["-o", "lstart=", "-p", &pid.to_string()]).expect("ps lstart"));
+        assert_eq!(kernel_start(pid).as_deref(), Some(lstart.as_str()), "{pid}");
+    }
+    let own_id = own.id();
+    let _ = own.kill();
+    let _ = own.wait();
+    assert_eq!(ids(own_id), None, "reaped: no process");
+    assert_eq!(kernel_start(own_id), None);
+}
 
 /// A stop that repeats rests longer, never for good: the same reason in a row doubles the rest up
 /// to four times `RETRY_S`.

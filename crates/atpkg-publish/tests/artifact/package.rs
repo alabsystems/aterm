@@ -400,8 +400,14 @@ fn the_version_form_and_the_origin_are_read_exactly() {
         dev_version("0.1.0-dev.13600+codex.0.164.0.gabcdef012"),
         Some((13600, "abcdef012"))
     );
+    assert_eq!(
+        dev_version("1.20261109.2-dev.13600+codex.0.164.0.gabcdef012"),
+        Some((13600, "abcdef012"))
+    );
     for bad in [
         "0.1.0",
+        "1.20261109.0-dev.13600+codex.0.164.0.gabcdef012",
+        "1.20260229.1-dev.13600+codex.0.164.0.gabcdef012",
         "0.1.0+gabcdef012",
         "0.1.0+codex.0.164.0",
         "0.1.1-dev.13600+codex.0.164.0.gabcdef012",

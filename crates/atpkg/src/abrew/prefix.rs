@@ -527,6 +527,19 @@ impl Prefix {
         {
             return full;
         }
+        // A brew tab records the origin tap at `source.tap`
+        // instead of abrew's `full_name` word.
+        if let Some(receipt) = read_receipt(&dir, 1024 * 1024)
+            && let Some(tap) = receipt
+                .get("source")
+                .and_then(|source| source.get("tap"))
+                .and_then(aterm_json::Value::as_str)
+        {
+            let full = format!("{tap}/{}", inst.name);
+            if tap.matches('/').count() == 1 && super::valid_name(&full) {
+                return full;
+            }
+        }
         match inst.kind {
             Kind::Formula => format!("homebrew/core/{}", inst.name),
             Kind::Cask => format!("homebrew/cask/{}", inst.name),
@@ -1844,6 +1857,16 @@ mod tests {
         .unwrap();
         let inst = p.installed_one(Kind::Cask, "firefox").unwrap();
         assert_eq!(p.full_name(&inst), "homebrew/cask/firefox");
+        // A brew tab records the origin tap at source.tap.
+        let dir = p.keg("taptool", "3.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("INSTALL_RECEIPT.json"),
+            r#"{"installed_by":"abrew","name":"taptool","version":"3.0","source":{"tap":"someone/tap"}}"#,
+        )
+        .unwrap();
+        let inst = p.installed_one(Kind::Formula, "taptool").unwrap();
+        assert_eq!(p.full_name(&inst), "someone/tap/taptool");
     }
 
     #[test]

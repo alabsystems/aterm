@@ -2188,6 +2188,18 @@ fn staged(
         if let Some(why) = ended(ctx) {
             return Err(why);
         }
+        let admission = format!(
+            "verify-event: {}\n",
+            aterm_json::json!({
+                "schema": 1,
+                "event": "stage-admitted",
+                "stage_id": format!("{:?}", spec.id),
+                "memory_bytes": claim.as_ref().map_or(0, |held| held.claim.record().need.mem),
+                "memory_waiting_s": claim.as_ref().map(|held| held.claim.waited().as_secs_f64()),
+                "at_unix_ms": aterm_time::unix_millis(),
+            })
+        );
+        let _ = event_log::emit(ctx.events.as_ref(), &admission);
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
         let jobs = compile_width::jobs_for(ctx, spec.id);
@@ -3761,6 +3773,11 @@ mod tests {
             assert_eq!(held.len(), 1);
             assert_eq!(discovered.tippy, Some(managed.join(toolchain::TIPPY)));
             drop(held);
+            aterm_uds::deadline::once_released(|| match lease::holders(&prefix, &subject) {
+                Holders::Free => Ok(()),
+                Holders::Held(_) => Err(std::io::ErrorKind::WouldBlock.into()),
+                Holders::Unknown(error) => panic!("lease probe failed: {error}"),
+            });
             assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
         }
         let _ = std::fs::remove_dir_all(&home);

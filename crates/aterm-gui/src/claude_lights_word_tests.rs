@@ -128,7 +128,7 @@ fn a_clicks_mode_name_holds_then_fades_a_step_at_a_time_and_goes() {
 
 /// THE NAME FOLLOWS THE GLYPH, IS THE CHIP'S, AND GIVES WAY FIRST: Land at rest is `⤓` alone;
 /// with its name, `⤓ land` in the chip's letter, the whole of it the chip's (a click on the name
-/// cycles too), set off from the next chip as any word is (`⤓ land ─ lame`),
+/// cycles too), set off from the next chip as any word is (`⤓ land ─ ○ yolo`),
 /// [`super::Block::word`] counting what it adds; a rule with room for the rest alone lays the rest, never a narrower
 /// rung; a name for another mode, or a click in flight, lays none.
 #[test]
@@ -169,14 +169,14 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
     let rest_plan = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
-    assert_eq!(text(&rest_plan.lights), "\u{2913} lame");
+    assert_eq!(text(&rest_plan.lights), "\u{2913} \u{25cb} yolo");
     w.sessions.get_mut(&S).expect("noted").word = word;
     let beside = w
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert_eq!(
         text(&beside.lights),
-        "\u{2913} land \u{2500} lame",
+        "\u{2913} land \u{2500} \u{25cb} yolo",
         "set off as a word is"
     );
     assert_eq!(
@@ -237,7 +237,7 @@ fn the_name_follows_the_glyph_in_its_tone_where_the_rest_leaves_room() {
         .fitted(S, blank(), now, ChipAt::cruise(blank()), None, None, 40)
         .expect("fits");
     assert!(
-        text(&other.lights).starts_with("\u{25cb} lame"),
+        text(&other.lights).starts_with("\u{25cb} \u{25cb} yolo"),
         "Land's name never names Off"
     );
     assert_eq!(other.word, 0);

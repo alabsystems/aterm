@@ -319,10 +319,32 @@ fn now() -> u64 {
 }
 
 pub fn existing(repo: &Path, version: &str) -> Result<Option<crate::line::Line>, String> {
+    existing_with_holder(repo, version).map(|snapshot| snapshot.line)
+}
+
+/// The selected line and the exact head/holder evidence read from its fleet claim.
+pub struct Existing {
+    pub line: Option<crate::line::Line>,
+    pub holder: Option<(String, String)>,
+}
+
+/// Keep the holder from the same claim read used for selection.
+pub fn existing_with_holder(repo: &Path, version: &str) -> Result<Existing, String> {
     let name = reference(version)?;
     let stopped = AtomicBool::new(false);
-    let old = remote(&Network::new(repo, &stopped)?, &name)?.map(|(_, state)| state.line);
-    current(&GitCli::new(repo), version, old)
+    let old = remote(&Network::new(repo, &stopped)?, &name)?.map(|(_, state)| state);
+    let holder = old
+        .as_ref()
+        .map(|s| (s.line.head().to_string(), holder_words(&s.holder)));
+    let line = current(&GitCli::new(repo), version, old.map(|s| s.line))?;
+    Ok(Existing { line, holder })
+}
+
+fn holder_words(holder: &Holder) -> String {
+    format!(
+        "{} (node {}, session {}, pid {}, boot {}, start {})",
+        holder.host, holder.node, holder.sid, holder.pid, holder.boot, holder.start
+    )
 }
 
 /// Apply main's durable retirement to the independently read claim.
@@ -439,6 +461,7 @@ struct Lease {
     sha: String,
     pub state: State,
     local: PathBuf,
+    previous_holder: Option<String>,
 }
 
 impl Lease {
@@ -511,6 +534,10 @@ impl Lease {
                     }
                 },
             );
+            let previous_holder = old
+                .as_ref()
+                .filter(|(_, state)| state.line.head() == selected.head())
+                .map(|(_, state)| holder_words(&state.holder));
             let state = State {
                 line: selected,
                 holder: holder.clone(),
@@ -534,6 +561,7 @@ impl Lease {
                 sha: previous.into(),
                 state,
                 local,
+                previous_holder,
             };
             // Make the identity observable before publishing it. A failure here can never
             // strand a remote lease with no host record from which to prove its death.
@@ -653,6 +681,7 @@ impl Local {
 /// advances progress on completed rows, never on a heartbeat or arbitrary log activity.
 pub struct Claim {
     pub line: crate::line::Line,
+    pub previous_holder: Option<String>,
     tx: std::sync::mpsc::Sender<Request>,
     worker: Option<std::thread::JoinHandle<()>>,
     local: Arc<Local>,
@@ -670,6 +699,7 @@ impl Claim {
     ) -> Result<Self, String> {
         let lease = Lease::take(repo, line, continued)?;
         let line = lease.state.line.clone();
+        let previous_holder = lease.previous_holder.clone();
         let local = Arc::new(Local {
             state: Mutex::new(lease.state.clone()),
             path: lease.local.clone(),
@@ -698,6 +728,7 @@ impl Claim {
             std::thread::spawn(move || publish_progress(lease, &publishing, &stopping, &rx));
         Ok(Self {
             line,
+            previous_holder,
             tx,
             worker: Some(worker),
             local,
@@ -1514,6 +1545,7 @@ mod tests {
             sha: "old".into(),
             state: old.clone(),
             local: local.path.clone(),
+            previous_holder: None,
         };
         local.update(|state| state.step = "build".into()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1694,6 +1726,7 @@ mod tests {
             sha: first.clone(),
             state: initial.clone(),
             local: dir.path().join("local.json"),
+            previous_holder: None,
         };
         git_ok(
             &a,

@@ -2891,10 +2891,8 @@ fn spawn_member_heartbeat_at(
                     // network place's evidence under `state` (`aterm_net::fleet_member`'s
                     // `note_place`), which this Mac's member desk tells the home ALab LAN by.
                     if !answered.is_empty()
-                        && let Some((_, payload)) =
-                            aterm_net::fleet_member::read_pushed_facts(&state)
-                                .into_iter()
-                                .find(|(n, _)| n == me.node())
+                        && let Some(payload) =
+                            aterm_net::fleet_member::read_pushed_facts_of(&state, me.node())
                     {
                         let keyring = aterm_net::fleet_member::Keyring::read(&state);
                         for done in &answered {

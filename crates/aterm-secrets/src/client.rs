@@ -149,7 +149,7 @@ pub use log_entries::{
     acknowledged_commons_log, admin_mirror_log, admit_member_in_log, applied_version_names_log,
     check_log_commons_enrollment, configure_log_member, enroll_commons_member_in_log,
     keyed_epochs_environment, local_swarm_roster_for_log, member_denied_by_roster,
-    publish_local_node_key, remove_member_in_log, trusted_commons_log,
+    publish_local_chosen_name, publish_local_node_key, remove_member_in_log, trusted_commons_log,
 };
 #[cfg(any(test, debug_assertions))]
 pub use log_entries::{TestPassClaim, test_hold_pass_claim};
@@ -214,6 +214,9 @@ pub use steward::{
     steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use vault_memo::test_looks_observed;
 pub use vault_memo::{
     DeskInputs, VaultLook, acknowledged_commons_log_now, config_now, desk_inputs,
     desk_inputs_quiet, local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now,
@@ -979,10 +982,12 @@ std::thread_local! {
 /// bounded variant and a publish's draft), so no vault pass takes the state mid-draft and the
 /// draft's own reads of it (its signer, its roster) see the state its snapshot was read from
 /// rather than finding it busy; a pass's look, until it is done reading
-/// (`log_entries::look_until`); and a vault look's, across the memos it asks ([`VaultLook`]). The
-/// holder drops it before any exclusive take of the same lock. flock(2) grants this thread neither lock while it holds the
-/// other, so in a build with debug assertions an exclusive take of the lock on this thread under
-/// it panics rather than wait on it for good.
+/// (`log_entries::look_until`); and a vault look's, across the memos it asks ([`VaultLook`]),
+/// which for `aterm-db`'s table-repair read batch is the batch's source read, held until the batch
+/// returns ([`CommonsSourceRead::into_look`]). The holder drops it before any exclusive take of
+/// the same lock. flock(2) grants this thread neither lock while it holds the other, so in a build
+/// with debug assertions an exclusive take of the lock on this thread under it panics rather than
+/// wait on it for good.
 pub(crate) struct Observing {
     lock: StateLock,
     #[cfg(debug_assertions)]
@@ -3917,7 +3922,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
 /// Drop it before network I/O or any vault mutation.
 #[must_use = "hold the source read guard for the local batch"]
 pub struct CommonsSourceRead {
-    _lock: StateLock,
+    lock: StateLock,
 }
 
 /// Try to hold existing vault state for a local Commons batch. Missing or busy
@@ -3928,7 +3933,20 @@ pub struct CommonsSourceRead {
 /// # Errors
 /// The existing lock cannot be opened safely or its shared lock fails.
 pub fn try_commons_source_read(paths: &Paths) -> crate::Result<Option<CommonsSourceRead>> {
-    Ok(StateLock::observe(paths)?.map(|lock| CommonsSourceRead { _lock: lock }))
+    Ok(StateLock::observe(paths)?.map(|lock| CommonsSourceRead { lock }))
+}
+
+impl CommonsSourceRead {
+    /// This read as a look at the vault at `paths` ([`VaultLook`]), which stands on the read's
+    /// observation of the state lock for as long as it held the read, rather than observing the
+    /// lock again: `aterm-db`'s table-repair read batch, which holds its vault's source read from
+    /// before its admission until its batch returns, judges the batch through it. `paths` must be
+    /// the vault this read was taken of ([`try_commons_source_read`]); each ask still judges only
+    /// while the observation guards the lock at that vault's path ([`StateLock::observes`]).
+    #[must_use]
+    pub fn into_look(self, paths: &Paths) -> VaultLook<'_> {
+        VaultLook::standing_on(paths, self.lock)
+    }
 }
 
 /// How long a file must have stood unchanged before a Commons journal view or a kept file digest
@@ -3949,7 +3967,7 @@ pub(crate) fn hold_commons_source(paths: &Paths) -> crate::Result<CommonsSourceR
         reason.failure("Commons vault became unavailable while acquiring custody")
     };
     match StateLock::observe_classified(paths)? {
-        StateObservation::Held(lock) => Ok(CommonsSourceRead { _lock: lock }),
+        StateObservation::Held(lock) => Ok(CommonsSourceRead { lock }),
         StateObservation::Absent => Err(unavailable(Unavailable::MissingStateLock)),
         StateObservation::Busy => Err(unavailable(Unavailable::Busy)),
     }

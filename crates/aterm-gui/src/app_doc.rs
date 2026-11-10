@@ -508,7 +508,11 @@ mod tests {
         let markdown = fixture("readme.md", b"# hi\n");
         app.open_document_tab(AppKind::Markdown, &markdown.uri)
             .unwrap();
-        assert_eq!(rows(&doc(&app, "ls")), vec![row.clone()]);
+        let listed = rows(&doc(&app, "ls"));
+        assert_eq!(listed.len(), 2, "Read is a live amacs document view");
+        assert_eq!(listed[0], row);
+        let markdown_view = app.active_native_view(WindowId(0)).unwrap().1;
+        assert_eq!(listed[1].doc, document_of(&app, markdown_view).get());
 
         let edit_tab = tab_of(&app, edit_view);
         select(&mut app, edit_tab);
@@ -656,6 +660,12 @@ mod tests {
             .unwrap();
         let shown = app.active_native_view(WindowId(0)).unwrap().1;
         let markdown_doc = document_of(&app, shown).get();
+        let DocAnswer::Text(read) =
+            app.doc_answer(DocQuery::Read(DocNames::Id(markdown_doc)), Instant::now())
+        else {
+            panic!("the Read workspace remains a live document");
+        };
+        assert_eq!(read.text.as_ref(), "# two\n");
         let missing = fixture("three.txt", b"three\n");
         let unknown = known + markdown_doc + 100;
         for (rest, answer) in [
@@ -666,10 +676,6 @@ mod tests {
             (
                 format!("read {}", missing.uri),
                 format!("ERR unknown doc {}\n", missing.uri),
-            ),
-            (
-                format!("read {markdown_doc}"),
-                format!("ERR unknown doc {markdown_doc}\n"),
             ),
             (
                 "read file://host/x".to_string(),

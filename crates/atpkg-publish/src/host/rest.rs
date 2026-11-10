@@ -808,6 +808,49 @@ fn asset_of(object: &Value, name: &str) -> Result<(u64, u64), HostError> {
     }
 }
 
+impl RestHost {
+    fn create_release(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+        publish: bool,
+    ) -> Result<(), HostError> {
+        let client = self.writer()?;
+        for file in files {
+            file_name(file)?;
+        }
+        let body = aterm_json::json!({
+            "tag_name": tag,
+            "name": title,
+            "body": notes,
+            "draft": true,
+            "prerelease": true,
+            "make_latest": "false",
+        });
+        let made = client
+            .send(
+                Method::Post,
+                &format!("/repos/{slug}/releases"),
+                Some(&body),
+            )
+            .and_then(|a| a.success())
+            .and_then(|a| a.json())
+            .map_err(|e| host_error(&e))?;
+        let id = Self::id_of(&made)?;
+        for file in files {
+            Self::upload_one(&client, slug, id, file, file_name(file)?)?;
+        }
+        if publish {
+            Self::publish(&client, slug, id)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ReleaseHost for RestHost {
     fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
         let client = self.reader()?;
@@ -887,32 +930,18 @@ impl ReleaseHost for RestHost {
         notes: &str,
         files: &[PathBuf],
     ) -> Result<(), HostError> {
-        let client = self.writer()?;
-        for file in files {
-            file_name(file)?;
-        }
-        let body = aterm_json::json!({
-            "tag_name": tag,
-            "name": title,
-            "body": notes,
-            "draft": true,
-            "prerelease": true,
-            "make_latest": "false",
-        });
-        let made = client
-            .send(
-                Method::Post,
-                &format!("/repos/{slug}/releases"),
-                Some(&body),
-            )
-            .and_then(|a| a.success())
-            .and_then(|a| a.json())
-            .map_err(|e| host_error(&e))?;
-        let id = Self::id_of(&made)?;
-        for file in files {
-            Self::upload_one(&client, slug, id, file, file_name(file)?)?;
-        }
-        Self::publish(&client, slug, id)
+        self.create_release(slug, tag, title, notes, files, true)
+    }
+
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<(), HostError> {
+        self.create_release(slug, tag, title, notes, files, false)
     }
 
     fn upload(

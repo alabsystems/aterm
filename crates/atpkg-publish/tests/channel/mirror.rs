@@ -309,6 +309,70 @@ fn matching_reservation_metadata_is_verified_and_a_marker_only_public_release_re
 }
 
 #[test]
+fn interrupted_draft_payloads_resume_only_from_the_exact_signed_staging_set() {
+    let tag = "atpkg-ay-8256";
+    for (op, failure) in [
+        (FakeOp::Upload, FakeFail::Partial),
+        (FakeOp::PublishDraft, FakeFail::Refuse),
+    ] {
+        let (rig, q) = setup("mirror-partial-draft", index());
+        rig.host.fail_next(op, failure);
+        assert!(run(&rig, &q, false).0.is_err());
+        let draft = rig.host.release_of(&public(), tag).unwrap();
+        assert!(draft.draft);
+        assert!(draft.assets.contains_key(upload::VERSION_RESERVATION));
+        assert!(draft.assets.len() > 1);
+        assert!(rig.host.published_releases(&public()).unwrap().is_empty());
+        let before = writes(&rig.host).len();
+        let planned = ok(&rig, &q, true).0;
+        let missing: Vec<String> = ["pkg-ay-8256.toml", "pkg-ay-8256.toml.sig", TARBALL]
+            .into_iter()
+            .filter(|name| !draft.assets.contains_key(*name))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(planned.planned, [(tag.to_string(), missing)]);
+        assert_eq!(writes(&rig.host).len(), before);
+        assert_eq!(rig.host.release_of(&public(), tag), Some(draft.clone()));
+
+        for corruption in ["extra", "reservation", "missing-reservation", "payload"] {
+            let mut other = draft.clone();
+            match corruption {
+                "extra" => {
+                    other
+                        .assets
+                        .insert("unrelated.bin".into(), b"extra".to_vec());
+                }
+                "reservation" => {
+                    other
+                        .assets
+                        .insert(upload::VERSION_RESERVATION.into(), b"wrong".to_vec());
+                }
+                "missing-reservation" => {
+                    other.assets.remove(upload::VERSION_RESERVATION);
+                }
+                "payload" => {
+                    other.assets.insert(TARBALL.into(), b"other bytes".to_vec());
+                }
+                _ => unreachable!(),
+            }
+            rig.host.put(&public(), tag, other.clone());
+            let before = writes(&rig.host).len();
+            assert!(run(&rig, &q, false).0.is_err(), "{corruption}");
+            assert_eq!(writes(&rig.host).len(), before, "{corruption}");
+            assert_eq!(rig.host.release_of(&public(), tag), Some(other));
+        }
+
+        rig.host.put(&public(), tag, draft);
+        ok(&rig, &q, false);
+        let complete = rig.host.release_of(&public(), tag).unwrap();
+        assert!(!complete.draft);
+        for (name, bytes) in rig.host.release_of(&staging(), tag).unwrap().assets {
+            assert_eq!(complete.assets[&name], bytes);
+        }
+    }
+}
+
+#[test]
 fn a_published_pack_is_immutable_and_must_verify() {
     let (rig, q) = setup("mirror-immutable", index());
     ok(&rig, &q, false);
@@ -423,6 +487,16 @@ impl ReleaseHost for Dark {
         files: &[PathBuf],
     ) -> std::result::Result<(), HostError> {
         self.inner.create(slug, tag, title, notes, files)
+    }
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> std::result::Result<(), HostError> {
+        self.inner.create_draft(slug, tag, title, notes, files)
     }
     fn upload(
         &self,
@@ -844,6 +918,16 @@ impl ReleaseHost for RefusesOne {
         files: &[PathBuf],
     ) -> std::result::Result<(), HostError> {
         self.inner.create(slug, tag, title, notes, files)
+    }
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> std::result::Result<(), HostError> {
+        self.inner.create_draft(slug, tag, title, notes, files)
     }
     fn upload(
         &self,

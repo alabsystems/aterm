@@ -9,6 +9,10 @@ use super::*;
 const JOURNAL: &str = "draft-state.toml";
 const RECEIPT: &str = "draft-bytes.toml";
 
+pub(super) fn has_journal(dist: &Path) -> Result<bool> {
+    Journal::load(&dist.join(JOURNAL)).map(|draft| draft.is_some())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Bytes {
     files: Vec<FileDigest>,
@@ -205,6 +209,13 @@ pub(super) fn prepare(ctx: &mut CutCtx, opts: &CutOptions) -> Result<()> {
     })
 }
 
+/// The release id this clone's private-draft journal names for `version`, when it names one.
+pub(super) fn journaled_release(dist: &Path, version: &str) -> Result<Option<u64>> {
+    Ok(Journal::load(&dist.join(JOURNAL))?
+        .filter(|draft| draft.version == version)
+        .and_then(|draft| draft.release_id))
+}
+
 /// Delete only this journal's exact draft. A published release is never withdrawn.
 pub(super) fn discard(dist: &Path, version: &str, build: u64) -> Result<()> {
     let path = dist.join(JOURNAL);
@@ -263,19 +274,24 @@ pub(super) fn forget_published(ctx: &CutCtx) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::channel::ChannelRelease;
 
-    struct Lab {
+    pub(crate) struct Lab {
         _dir: aterm_tempfile::TempDir,
-        fake: agh_fake::FakeGithub,
-        ctx: CutCtx,
+        pub(crate) fake: agh_fake::FakeGithub,
+        pub(crate) ctx: CutCtx,
+        route: crate::github::Fixture,
         _route: crate::github::FixtureGuard,
     }
 
     impl Lab {
         fn new() -> Self {
+            Self::for_cut("0.191.0", 191, &"a".repeat(40))
+        }
+
+        pub(crate) fn for_cut(version: &str, build: u64, commit: &str) -> Self {
             let dir = aterm_tempfile::tempdir().unwrap();
             let repo = dir.path().to_path_buf();
             assert!(
@@ -303,7 +319,7 @@ mod tests {
                 agh_fake::ReleaseSpec::published("v0.190.0", "2026-11-08T00:00:00Z"),
             );
             let ports = fake.ports();
-            let route = crate::github::Fixture {
+            let fixture = crate::github::Fixture {
                 origins: aterm_update_core::github_rest::Origins::loopback(
                     ports.api,
                     ports.uploads,
@@ -312,8 +328,8 @@ mod tests {
                 ),
                 token: Some(token),
                 spawn: None,
-            }
-            .enter();
+            };
+            let route = fixture.clone().enter();
             let mut ctx = CutCtx {
                 credentials: None,
                 apple: sign::AppleTier::Inactive,
@@ -322,10 +338,10 @@ mod tests {
                 dist: dist.clone(),
                 journal_path: dist.join(JOURNAL),
                 slug: slug.into(),
-                version: "0.191.0".into(),
-                tag: "v0.191.0".into(),
-                build: 191,
-                commit: "a".repeat(40),
+                version: version.into(),
+                tag: format!("v{version}"),
+                build,
+                commit: commit.into(),
                 min_build: None,
                 artifact: Some("b".repeat(64)),
                 macho_sha256: Some("c".repeat(64)),
@@ -353,7 +369,7 @@ mod tests {
                 reserved: Some(crate::release::Reservation {
                     build: ctx.build,
                     commit: ctx.commit.clone(),
-                    line: "191 0.191.0".into(),
+                    line: format!("{build} {version}"),
                 }),
                 ..Default::default()
             };
@@ -376,11 +392,13 @@ mod tests {
                 _dir: dir,
                 fake,
                 ctx,
+                route: fixture,
                 _route: route,
             }
         }
 
-        fn stage(&mut self) -> Result<()> {
+        pub(crate) fn stage(&mut self) -> Result<()> {
+            let _route = self.route.clone().enter();
             let slug = self.ctx.slug.clone();
             channel::stage_on_channel(&mut NetworkOnly(LiveChannelRelease {
                 ctx: &mut self.ctx,
@@ -389,7 +407,8 @@ mod tests {
             }))
         }
 
-        fn publish(&mut self) -> Result<()> {
+        pub(crate) fn publish(&mut self) -> Result<()> {
+            let _route = self.route.clone().enter();
             // The native ledger/fence are separately exercised by the claimed
             // pipeline's tests. This fixture exercises the real REST/asset path.
             self.ctx.kind = CutKind::DryRun;
@@ -401,12 +420,55 @@ mod tests {
             }))
         }
 
-        fn posts(&self) -> usize {
+        pub(crate) fn posts(&self) -> usize {
             self.fake
                 .seen()
                 .iter()
                 .filter(|r| r.method == "POST")
                 .count()
+        }
+
+        pub(crate) fn attest(&self) {
+            for name in channel::SOURCE_ATTESTATION_ASSETS {
+                self.fake.apply(agh_fake::Change::AddAsset {
+                    release_id: self.ctx.release_id.unwrap(),
+                    spec: agh_fake::AssetSpec::uploaded(name, b"source evidence"),
+                });
+            }
+        }
+
+        pub(crate) fn source_read(&self, unavailable: bool) -> Result<()> {
+            let _route = self.route.clone().enter();
+            let path = format!(
+                "repos/{}/releases/{}",
+                self.ctx.slug,
+                self.ctx.release_id.unwrap()
+            );
+            if unavailable {
+                self.fake.fault(
+                    agh_fake::Match::api(&format!("/{path}")).method("GET"),
+                    agh_fake::Fault::Status {
+                        status: 404,
+                        body: "unavailable source read".into(),
+                        headers: Vec::new(),
+                    },
+                );
+            }
+            crate::github::get(&path).map(|_| ())
+        }
+
+        pub(crate) fn resume(&mut self) {
+            self.ctx.kind = CutKind::Draft;
+            self.ctx.release_id = None;
+            self.ctx.release_intent = false;
+            self.ctx.upload_intents.clear();
+            adopt(&mut self.ctx).unwrap();
+            self.stage().unwrap();
+        }
+
+        pub(crate) fn discard_signed(&self, reason: crate::release::SignedDiscard) -> Vec<String> {
+            let _route = self.route.clone().enter();
+            super::discard_signed(&self.ctx.dist, &self.ctx.version, self.ctx.build, reason)
         }
     }
 
@@ -503,6 +565,9 @@ mod tests {
             "404",
             "draft asset URLs are private"
         );
+        lab.attest();
+        assert!(lab.source_read(true).is_err());
+        lab.source_read(false).unwrap();
         lab.publish().unwrap();
         assert!(!lab.fake.release_state(id).unwrap().0.draft);
         let patches: Vec<_> = lab
@@ -520,11 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn refusal_after_draft_removes_only_the_owned_private_release() {
+    fn lost_reservation_discards_only_the_owned_private_release() {
         let mut lab = Lab::new();
         lab.stage().unwrap();
+        lab.attest();
         let id = lab.ctx.release_id.unwrap();
-        discard(&lab.ctx.dist, &lab.ctx.version, lab.ctx.build).unwrap();
+        assert!(
+            lab.discard_signed(crate::release::SignedDiscard::LostReservation)
+                .is_empty()
+        );
         assert!(lab.fake.release_state(id).is_none());
         assert_eq!(lab.fake.release_ids(&lab.ctx.slug).len(), 1);
         assert!(!lab.ctx.journal_path.exists());
@@ -533,15 +602,34 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_sign_preparation_keeps_an_existing_attested_draft_and_its_bytes() {
+        let mut lab = Lab::new();
+        lab.stage().unwrap();
+        lab.attest();
+        let id = lab.ctx.release_id.unwrap();
+        let state = lab.fake.release_state(id).unwrap();
+        let journal = fs::read(&lab.ctx.journal_path).unwrap();
+        assert!(
+            discard_signed(
+                &lab.ctx.dist,
+                &lab.ctx.version,
+                lab.ctx.build,
+                crate::release::SignedDiscard::CancelPreparation
+            )
+            .is_empty()
+        );
+        assert_eq!(lab.fake.release_state(id), Some(state));
+        assert_eq!(fs::read(&lab.ctx.journal_path).unwrap(), journal);
+        check_bytes(&lab.ctx).unwrap();
+        lab.fake.assert_clean();
+    }
+
+    #[test]
     fn matching_resume_adopts_without_another_upload_and_mismatch_refuses() {
         let mut lab = Lab::new();
         lab.stage().unwrap();
         let posts = lab.posts();
-        let saved = Journal::load(&lab.ctx.journal_path).unwrap().unwrap();
-        lab.ctx.release_id = saved.release_id;
-        lab.ctx.release_intent = saved.release_intent;
-        lab.ctx.upload_intents = saved.upload_intents;
-        lab.stage().unwrap();
+        lab.resume();
         assert_eq!(
             lab.posts(),
             posts,
@@ -579,6 +667,165 @@ mod tests {
         assert_eq!(posts, lab.posts());
         assert!(lab.fake.release_state(id).unwrap().0.draft);
         assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
+    }
+
+    /// NEGATIVE CONTROL: today's make_head publishes each incomplete source pair.
+    #[test]
+    fn cut_requires_both_source_attestations_on_the_bound_release_before_patch() {
+        for missing in [
+            vec!["SHA256SUMS", "SHA256SUMS.sig"],
+            vec!["SHA256SUMS"],
+            vec!["SHA256SUMS.sig"],
+        ] {
+            let mut lab = Lab::new();
+            lab.stage().unwrap();
+            for name in channel::SOURCE_ATTESTATION_ASSETS {
+                if !missing.contains(&name) {
+                    lab.fake.apply(agh_fake::Change::AddAsset {
+                        release_id: lab.ctx.release_id.unwrap(),
+                        spec: agh_fake::AssetSpec::uploaded(name, b"source evidence"),
+                    });
+                }
+            }
+            // A complete pair on another release cannot authorize this cut.
+            let other = lab.fake.release_ids(&lab.ctx.slug)[0];
+            for name in channel::SOURCE_ATTESTATION_ASSETS {
+                lab.fake.apply(agh_fake::Change::AddAsset {
+                    release_id: other,
+                    spec: agh_fake::AssetSpec::uploaded(name, b"foreign source evidence"),
+                });
+            }
+            let posts = lab.posts();
+            let error = lab.publish().unwrap_err().to_string();
+            assert!(error.contains("pub sign-release aterm"), "{error}");
+            for name in missing {
+                assert!(error.contains(name), "{error}");
+            }
+            assert_eq!(lab.posts(), posts);
+            assert!(
+                lab.fake
+                    .release_state(lab.ctx.release_id.unwrap())
+                    .unwrap()
+                    .0
+                    .draft
+            );
+            assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
+            lab.attest();
+            lab.publish().unwrap();
+            lab.fake.assert_clean();
+        }
+    }
+
+    #[test]
+    fn head_patch_refuses_each_duplicated_source_attestation() {
+        for name in channel::SOURCE_ATTESTATION_ASSETS {
+            let mut lab = Lab::new();
+            lab.stage().unwrap();
+            lab.attest();
+            let id = lab.ctx.release_id.unwrap();
+            let path = format!("repos/{}/releases/{id}", lab.ctx.slug);
+            let mut release = crate::github::get(&path).unwrap();
+            let duplicate = release["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"].as_str() == Some(name))
+                .unwrap()
+                .clone();
+            release
+                .as_object_mut()
+                .unwrap()
+                .get_mut("assets")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(duplicate);
+            lab.fake.fault(
+                agh_fake::Match::api(&format!("/{path}")).method("GET"),
+                agh_fake::Fault::Status {
+                    status: 200,
+                    body: release.to_string(),
+                    headers: Vec::new(),
+                },
+            );
+            lab.ctx.kind = CutKind::DryRun;
+            let slug = lab.ctx.slug.clone();
+            let error = LiveChannelRelease {
+                ctx: &mut lab.ctx,
+                slug: &slug,
+                bound: Some((id, false)),
+            }
+            .make_head()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(name) && error.contains("pub sign-release aterm"),
+                "{error}"
+            );
+            assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
+            lab.fake.assert_clean();
+        }
+    }
+
+    #[test]
+    fn head_patch_rechecks_source_attestations_before_retrying() {
+        let mut lab = Lab::new();
+        lab.stage().unwrap();
+        lab.attest();
+        let id = lab.ctx.release_id.unwrap();
+        let path = format!("/repos/{}/releases/{id}", lab.ctx.slug);
+        let release = crate::github::get(&path).unwrap();
+        let mut incomplete = release.clone();
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .get_mut("assets")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["name"].as_str() != Some("SHA256SUMS.sig"));
+        for response in [release, incomplete] {
+            lab.fake.fault(
+                agh_fake::Match::api(&path).method("GET"),
+                agh_fake::Fault::Status {
+                    status: 200,
+                    body: response.to_string(),
+                    headers: Vec::new(),
+                },
+            );
+        }
+        lab.fake.fault(
+            agh_fake::Match::api(&path).method("PATCH"),
+            agh_fake::Fault::Status {
+                status: 502,
+                body: "transient patch refusal".into(),
+                headers: Vec::new(),
+            },
+        );
+        lab.ctx.kind = CutKind::DryRun;
+        let slug = lab.ctx.slug.clone();
+        let error = LiveChannelRelease {
+            ctx: &mut lab.ctx,
+            slug: &slug,
+            bound: Some((id, false)),
+        }
+        .make_head()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("SHA256SUMS.sig") && error.contains("pub sign-release aterm"),
+            "{error}"
+        );
+        assert_eq!(
+            lab.fake
+                .seen()
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .count(),
+            1
+        );
+        assert!(lab.fake.release_state(id).unwrap().0.draft);
+        lab.fake.assert_clean();
     }
 
     #[test]

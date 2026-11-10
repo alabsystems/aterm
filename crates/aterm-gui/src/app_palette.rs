@@ -1724,8 +1724,8 @@ mod tests {
     #[test]
     fn each_window_palette_keeps_its_own_find_availability_on_snapshot_rescope_and_refresh() {
         use crate::menu::MenuAction;
-        use crate::native_app::{AppEvent, AppKind};
-        use crate::native_editor::EditorCommand;
+        use crate::native_app::{AppEvent, AppKind, AppViewState, MarkdownWorkspaceMode};
+        use crate::native_editor::{EditorCommand, Minibuffer};
         use crate::palette::PaletteState;
         use amacs::input::EditorInput;
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
@@ -1749,7 +1749,7 @@ mod tests {
         let editor_window = WindowId(0);
         app.open_document_tab_in_window(editor_window, AppKind::Editor, &uri)
             .unwrap();
-        let (instance, _) = app.active_native_view(editor_window).unwrap();
+        let (instance, editor_view) = app.active_native_view(editor_window).unwrap();
         let document = app.native_runtime.document_id(instance).unwrap();
         let original = app.document_store.snapshot(document).unwrap();
         app.dispatch_native_event(
@@ -1776,14 +1776,28 @@ mod tests {
         let reader_window = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         app.open_document_tab_in_window(reader_window, AppKind::Markdown, &uri)
             .unwrap();
+        let reader_identity = app.active_native_view(reader_window).unwrap();
+        let (_, reader_view) = reader_identity;
+        assert_ne!(editor_view, reader_view);
+        assert_eq!(
+            app.native_runtime.document_id(reader_identity.0),
+            Some(document)
+        );
+        assert!(matches!(
+            app.native_runtime.view_state(reader_view),
+            Some(AppViewState::Editor(state)) if state.markdown.as_ref()
+                .is_some_and(|workspace| workspace.mode == MarkdownWorkspaceMode::Read)
+        ));
         assert_eq!(app.frontmost_window, Some(reader_window));
         let editor_palette = app.palette_snapshot(editor_window);
         let reader_palette = app.palette_snapshot(reader_window);
         assert_eq!(find_enabled(&editor_palette), [true; 3]);
-        assert_eq!(find_enabled(&reader_palette), [false; 3]);
-        assert!(
-            !app.palette_live().can_find,
-            "the menu still follows the front window"
+        assert_eq!(find_enabled(&reader_palette), [true, false, false]);
+        let live = app.palette_live();
+        assert_eq!(
+            (live.can_find, live.can_find_again),
+            (true, false),
+            "the menu follows the front view's own search query"
         );
 
         app.palette_open_state(editor_window, editor_palette);
@@ -1797,7 +1811,7 @@ mod tests {
         );
         assert_eq!(
             find_enabled(app.windows[&reader_window].palette().unwrap()),
-            [false; 3]
+            [true, false, false]
         );
 
         app.palette_sync_native_scope(editor_window);
@@ -1806,6 +1820,36 @@ mod tests {
             [true; 3]
         );
         assert_eq!(app.frontmost_window, Some(reader_window));
+        let editor_before = editor_buffer(&app, editor_view).clone();
+        app.palette_edit_in(
+            reader_window,
+            crate::app_search::SearchEdit::Insert("find".to_string()),
+        );
+        assert_eq!(
+            app.windows[&reader_window]
+                .palette()
+                .unwrap()
+                .selected_action(),
+            Some(MenuAction::Find)
+        );
+        app.palette_activate_in(reader_window);
+        assert_eq!(app.active_native_view(reader_window), Some(reader_identity));
+        assert!(matches!(
+            app.native_runtime.view_state(reader_view),
+            Some(AppViewState::Editor(state)) if state.markdown.as_ref()
+                .is_some_and(|workspace| workspace.mode == MarkdownWorkspaceMode::Edit)
+                && matches!(state.buffer.as_ref().unwrap().minibuffer,
+                    Minibuffer::Search { ref query, .. } if query.is_empty())
+        ));
+        assert_eq!(editor_buffer(&app, editor_view), &editor_before);
+        assert_eq!(
+            find_enabled(&app.palette_snapshot(reader_window)),
+            [true, false, false]
+        );
+        assert_eq!(
+            find_enabled(app.windows[&editor_window].palette().unwrap()),
+            [true; 3]
+        );
         let after = app.document_store.snapshot(document).unwrap();
         assert_eq!(after.seq, original.seq);
         assert_eq!(after.text, original.text);
@@ -2152,7 +2196,7 @@ mod tests {
     #[test]
     fn find_availability_tracks_content_and_query_without_changing_documents() {
         use crate::app_search::SearchEdit;
-        use crate::native_app::{AppEvent, AppKind, AppViewState};
+        use crate::native_app::{AppEvent, AppKind, AppViewState, MarkdownWorkspaceMode};
         use amacs::input::EditorInput;
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
 
@@ -2196,17 +2240,26 @@ mod tests {
 
         app.open_document_tab(AppKind::Markdown, &uri(&first))
             .unwrap();
-        assert_find_availability(&app, wid, false, false);
-        assert!(app.search_find_again(false).is_err());
-
-        app.open_document_tab(AppKind::Editor, &uri(&first))
-            .unwrap();
-        let (instance, _) = app.active_native_view(wid).unwrap();
+        let identity = app.active_native_view(wid).unwrap();
+        let (instance, view) = identity;
         let document = app.native_runtime.document_id(instance).unwrap();
         let original = app.document_store.snapshot(document).unwrap();
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(AppViewState::Editor(state)) if state.markdown.as_ref()
+                .is_some_and(|workspace| workspace.mode == MarkdownWorkspaceMode::Read)
+        ));
+        assert_find_availability(&app, wid, true, false);
+        assert!(app.search_find_again(false).is_err());
+        app.find_requested();
+        assert_eq!(app.active_native_view(wid), Some(identity));
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(AppViewState::Editor(state)) if state.markdown.as_ref()
+                .is_some_and(|workspace| workspace.mode == MarkdownWorkspaceMode::Edit)
+        ));
         assert_find_availability(&app, wid, true, false);
         assert!(app.search_find_again(true).is_err());
-        app.find_requested();
         app.dispatch_native_event(
             wid,
             AppEvent::EditorInput(EditorInput::Text("needle".to_string())),

@@ -142,6 +142,7 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Email
             | Ty::Secret
             | Ty::Url
+            | Ty::Key
             | Ty::Ref(_)
     )
 }
@@ -281,7 +282,7 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
     };
     match ty {
         Ty::Text(_) => Ok(Value::String(text.to_owned())),
-        Ty::AccountLabel(_) | Ty::Enum(_) | Ty::Url | Ty::Ref(_) => {
+        Ty::AccountLabel(_) | Ty::Enum(_) | Ty::Url | Ty::Key | Ty::Ref(_) => {
             Ok(Value::String(text.trim().to_owned()))
         }
         Ty::Hex(_) => Ok(Value::String(text.trim().to_ascii_lowercase())),

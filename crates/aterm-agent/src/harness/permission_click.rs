@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A person's click on a Claude Code tab's permission chip (`yolo`/`lame`): the one look the
+//! A person's click on a Claude Code tab's permission chip (`○ yolo`, off): the one look the
 //! window's click lane makes for the ask it holds ([`look`]), and what that look found ([`Look`]).
 //!
 //! The ask stands in the window's memory while it waits, never on disk; the restart it makes is

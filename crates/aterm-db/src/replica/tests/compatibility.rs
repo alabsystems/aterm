@@ -193,7 +193,7 @@ fn pair_from_lab_with(lab: Lab, history: u64, holder: Holder) -> Pair {
     Pair { lab, scope, paths }
 }
 
-fn log_pair() -> Pair {
+pub(super) fn log_pair() -> Pair {
     pair_from_lab(Lab::new(&[Role::Writer, Role::Writer]))
 }
 
@@ -998,6 +998,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
         );
     }
     let reads_before = history_reads.then(aterm_secrets::client::test_retained_history_read_counts);
+    let opens = [a.test_bootstrap_opens(), b.test_bootstrap_opens()];
     let reading = process_cpu();
     let start = process_cpu();
     let reading = start - reading;
@@ -1025,6 +1026,11 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
         }
     }
     let spent = process_cpu() - start;
+    assert_eq!(
+        [a.test_bootstrap_opens(), b.test_bootstrap_opens()],
+        opens,
+        "a quiet round takes the bootstrap its side kept and opens none"
+    );
     // Every round has joined its responder. End the read-count interval before
     // inventory verification and the separate witness microchecks below.
     let reads = reads_before.map(|before| {
@@ -1180,6 +1186,59 @@ fn history_read_counts_value(
         "publications": counts.publications,
         "replacements": counts.replacements,
     })
+}
+
+/// A replica's rounds take the bootstrap it keeps while that stands (`Bootstrap::stands`), and
+/// open one afresh, and keep it, only once it falls: quiet rounds open none, a vault publication
+/// makes the next round open one and the round after it none, and a device claim replaced since
+/// the open makes the next round meet that open's refusal.
+///
+/// NEGATIVE CONTROL: `Replica::bootstrap` opening at every round fails the quiet rounds' count;
+/// one taking what it keeps unchecked fails at the publication (the round's own admission meets
+/// the changed vault); one returning the refusal of what it kept in place of opening fails at the
+/// publication.
+#[test]
+fn a_replica_keeps_its_bootstrap_while_it_stands() {
+    use aterm_secrets::client;
+    let pair = log_pair();
+    let replica = pair.replica(0);
+    for _ in 0..4 {
+        replica.round(None).unwrap();
+    }
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        0,
+        "quiet rounds take the bootstrap the replica opened"
+    );
+    let paths = &pair.lab.paths[0];
+    let admin = client::admin_open(paths).unwrap();
+    client::admin_publish(paths, &admin, &admin.doc).unwrap();
+    replica.round(None).unwrap();
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        1,
+        "a vault publication makes the next round open afresh"
+    );
+    replica.round(None).unwrap();
+    assert_eq!(
+        replica.test_bootstrap_opens(),
+        1,
+        "the round after it takes the bootstrap that open kept"
+    );
+    let claim = paths.dir.join("commons/device.claim");
+    let mut bytes = std::fs::read(&claim).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&claim, bytes).unwrap();
+    let refused = replica
+        .round(None)
+        .err()
+        .expect("a replaced device claim refuses the round");
+    assert!(
+        refused
+            .to_string()
+            .contains("Commons device differs from its immutable claim"),
+        "the round meets the fresh open's refusal: {refused}"
+    );
 }
 
 /// A table round's reads stand on the check each store's open ran in their session

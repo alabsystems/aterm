@@ -83,6 +83,22 @@ fn pooled_lint_claim_reads_its_recorded_width_and_retains_the_peak_margin() {
             "unpooled work keeps its own peak"
         );
     }
+    // Both fresh runs from the paired cold workload update the same width's book.
+    for peak in [23_826_572_800, 26_452_845_576] {
+        records.push(pooled.clone(), peak, 3);
+    }
+    assert_eq!(
+        need_for_jobs(
+            &records,
+            &Records::default(),
+            &lint,
+            &key,
+            Some(128 * GIB),
+            Some(18)
+        )
+        .bytes,
+        31_743_414_691,
+    );
     // An observed heavy run of the same width must raise the claim, never be capped
     // at the historical 27 GiB figure or at the cold estimate.
     records.push(pooled, 40 * GIB, 3);

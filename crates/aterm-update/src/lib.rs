@@ -689,6 +689,19 @@ pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::fr
 #[cfg(not(target_os = "macos"))]
 pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::ZERO;
 
+/// The authenticated recipient-history protocol a candidate can recover.
+/// This is reader evidence, never writer or execution authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeRecipientRecovery {
+    /// No recognized declaration was authenticated.
+    #[default]
+    Absent,
+    /// ANG5 history in the legacy issuer journal.
+    LegacyJournal,
+    /// ARC1 enrollment, ARB1 binding and ANG5 history in independent custody.
+    BoundJournal,
+}
+
 /// What an outgoing build learns from a handoff candidate's bundle once the pre-verify has
 /// authenticated it, never from a bundle that failed a check.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -702,9 +715,9 @@ pub struct HandoffCandidateFacts {
     /// The candidate's sealed `Info.plist` declares it rebuilds a window that held only an empty
     /// Workers list.
     pub grant_desk: bool,
-    /// The candidate's sealed `Info.plist` declares ANG5 parsing and historical recovery.
+    /// The candidate's sealed `Info.plist` declares this recipient-history protocol.
     /// This does not authorize a writer or attest to other active or rollback images.
-    pub recipient_recovery: bool,
+    pub recipient_recovery: NativeRecipientRecovery,
 }
 
 impl HandoffCandidateFacts {
@@ -750,9 +763,9 @@ impl HandoffCandidateFacts {
 pub use bundle::{
     HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, HANDOFF_GRANT_DESK_KEY,
     HANDOFF_GRANT_DESK_TOKEN, HANDOFF_GRANT_EMPTY_KEY, HANDOFF_GRANT_EMPTY_TOKEN,
-    NATIVE_RECIPIENT_RECOVERY_KEY, NATIVE_RECIPIENT_RECOVERY_TOKEN, plist_declares_grant_chunks,
-    plist_declares_grant_desk, plist_declares_grant_empty, plist_declares_recipient_recovery,
-    plist_marks_dev_build,
+    NATIVE_LEGACY_RECIPIENT_RECOVERY_TOKEN, NATIVE_RECIPIENT_RECOVERY_KEY,
+    NATIVE_RECIPIENT_RECOVERY_TOKEN, plist_declares_grant_chunks, plist_declares_grant_desk,
+    plist_declares_grant_empty, plist_marks_dev_build, plist_recipient_recovery,
 };
 
 /// Non-macOS: there is no `.app` bundle, so nothing to pre-verify, refuse or read.
@@ -768,7 +781,7 @@ pub fn preverify_staged_for_handoff(
         grant_chunks: false,
         grant_empty: false,
         grant_desk: false,
-        recipient_recovery: false,
+        recipient_recovery: NativeRecipientRecovery::Absent,
     })
 }
 
@@ -3748,7 +3761,10 @@ pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 #[derive(Debug, Clone)]
 pub struct UpdateStatus {
     pub linux: Option<LinuxUpdateStatus>,
-    /// Whether the updater is configured to act on this build/machine.
+    /// Availability reported by the producer: [`status`] uses platform support on
+    /// macOS and also requires readable enrollment state on Linux. It does not
+    /// read the live `[update] enabled` preference; a GUI control response replaces
+    /// this field with that preference after obtaining its live settings snapshot.
     pub enabled: bool,
     /// Whether this launch has a bundle the updater could replace.
     pub installable: bool,
@@ -5505,7 +5521,7 @@ mod handoff_candidate_facts_tests {
                         grant_chunks: true,
                         grant_empty: true,
                         grant_desk: true,
-                        recipient_recovery: true,
+                        recipient_recovery: NativeRecipientRecovery::BoundJournal,
                     })
                 ),
                 Ok(HandoffCandidateFacts {
@@ -5513,7 +5529,7 @@ mod handoff_candidate_facts_tests {
                     grant_chunks: true,
                     grant_empty: true,
                     grant_desk: true,
-                    recipient_recovery: true,
+                    recipient_recovery: NativeRecipientRecovery::BoundJournal,
                 }),
                 "{policy:?}"
             );
@@ -5540,7 +5556,7 @@ mod handoff_candidate_facts_tests {
                 grant_chunks: false,
                 grant_empty: false,
                 grant_desk: false,
-                recipient_recovery: false,
+                recipient_recovery: NativeRecipientRecovery::Absent,
             })
         );
         assert_eq!(
@@ -5574,7 +5590,7 @@ mod handoff_candidate_facts_tests {
         };
         assert_eq!(
             grants(HandoffCandidateFacts::read(&app)),
-            Ok((false, false, false, false))
+            Ok((false, false, false, NativeRecipientRecovery::Absent))
         );
         std::fs::write(
             contents.join("Info.plist"),
@@ -5600,17 +5616,41 @@ mod handoff_candidate_facts_tests {
         let all = HandoffCandidateFacts::read(&app);
         std::fs::write(
             contents.join("Info.plist"),
+            "<plist><dict><key>ATermNativeRecipientRecovery</key><string>recipients5</string></dict></plist>",
+        ).unwrap();
+        let legacy_reader = HandoffCandidateFacts::read(&app);
+        std::fs::write(
+            contents.join("Info.plist"),
             include_str!("../../../apps/aterm-mac/Info.plist"),
         )
         .unwrap();
         let current = HandoffCandidateFacts::read(&app);
         std::fs::write(contents.join("Info.plist"), "<plist><dict/></plist>").unwrap();
         let replaced = HandoffCandidateFacts::read(&app);
-        assert_eq!(grants(chunks_only), Ok((true, false, false, false)));
-        assert_eq!(grants(both), Ok((true, true, false, false)));
-        assert_eq!(grants(all), Ok((true, true, true, false)));
-        assert_eq!(grants(current), Ok((true, true, true, true)));
-        assert_eq!(grants(replaced), Ok((false, false, false, false)));
+        assert_eq!(
+            grants(chunks_only),
+            Ok((true, false, false, NativeRecipientRecovery::Absent))
+        );
+        assert_eq!(
+            grants(both),
+            Ok((true, true, false, NativeRecipientRecovery::Absent))
+        );
+        assert_eq!(
+            grants(all),
+            Ok((true, true, true, NativeRecipientRecovery::Absent))
+        );
+        assert_eq!(
+            grants(legacy_reader),
+            Ok((false, false, false, NativeRecipientRecovery::LegacyJournal))
+        );
+        assert_eq!(
+            grants(current),
+            Ok((true, true, true, NativeRecipientRecovery::BoundJournal))
+        );
+        assert_eq!(
+            grants(replaced),
+            Ok((false, false, false, NativeRecipientRecovery::Absent))
+        );
     }
 }
 

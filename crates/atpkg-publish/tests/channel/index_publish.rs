@@ -80,6 +80,16 @@ impl ReleaseHost for Faulty {
     ) -> std::result::Result<(), HostError> {
         self.inner.create(slug, tag, title, notes, files)
     }
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> std::result::Result<(), HostError> {
+        self.inner.create_draft(slug, tag, title, notes, files)
+    }
     fn upload(
         &self,
         slug: &Slug,

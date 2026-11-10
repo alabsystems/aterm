@@ -968,9 +968,10 @@ pub struct Prepare {
     /// The machine and boot of the host this prepare is for, as `boot=`. A host admits a
     /// stamped prepare only when the stamp is its own current machine and boot.
     pub boot: Option<BootStamp>,
-    /// The issuer journal's custody this prepare is for, as `custody=<64 lowercase hex>`: the
-    /// SHA-256 of the established custody anchor (`native_receipts::custody`). A host admits a
-    /// stamped prepare only when the stamp is its own current custody.
+    /// Custody this prepare is for, as `custody=<64 lowercase hex>`. Legacy mode names
+    /// the issuer journal's established genesis (`native_receipts::custody`); complete
+    /// mode names its independently enrolled recipient journal. Admission must check
+    /// the stamp against the corresponding current custody.
     pub custody: Option<String>,
 }
 

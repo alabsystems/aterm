@@ -206,7 +206,7 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
 
 /// A click's line ([`permission_click_argv`]) takes every permission flag off, in every spelling
 /// the table knows and wherever it stood, and then puts on the one its direction asks for: none
-/// for `yolo`, one `--dangerously-skip-permissions` for `lame`. The rest keeps its order, a `--`
+/// toward the settings' mode, one `--dangerously-skip-permissions` toward bypass. The rest keeps its order, a `--`
 /// tail included, and an unknown spelling stays for the plan to refuse.
 #[test]
 fn a_click_takes_every_permission_flag_off_and_puts_its_own_on() {
@@ -238,7 +238,7 @@ fn a_click_takes_every_permission_flag_off_and_puts_its_own_on() {
         .chain(rest)
         .chain(tail)
         .collect();
-    assert_eq!(bypass, argv(&skipped), "lame: the one bypass flag");
+    assert_eq!(bypass, argv(&skipped), "off: the one bypass flag");
     assert_eq!(
         permission_click_argv(
             &argv(&["claude", BYPASS_FLAG, BYPASS_FLAG]),

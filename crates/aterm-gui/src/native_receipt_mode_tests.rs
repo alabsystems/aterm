@@ -62,6 +62,9 @@ fn refusing_new_writes_preserves_exact_complete_history_reads() {
             capability: "cd".repeat(32),
         };
         let journal = facts.native_journal.as_ref().unwrap();
+        request.custody = Some(journal.enroll_recipients().unwrap().stamp().into());
+        request.rejection_domain = Some(journal.rejection_domain().unwrap());
+        journal.reserve_recipient(&request, &binding).unwrap();
         journal
             .record_recipient(&request, &binding, RecipientAppend::Prepare)
             .unwrap();
@@ -77,7 +80,8 @@ fn refusing_new_writes_preserves_exact_complete_history_reads() {
             run(&handle.ctx, &facts, Request::prepare(request), actor),
             expected
         );
-        assert_eq!(journal.record_count().unwrap(), 2);
+        assert_eq!(journal.record_count().unwrap(), 1);
+        assert_eq!(journal.recipient_record_count().unwrap(), 3);
         no_admission(&handle.ctx, &facts);
     }
 }

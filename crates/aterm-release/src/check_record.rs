@@ -1352,6 +1352,8 @@ fn remove(at: &Path) -> Result<(), String> {
 /// What one `verify release` run said, read from its events file ([`events`]).
 #[derive(Debug, Default)]
 pub struct RunEvents {
+    /// The lint passed resource admission. This is a scheduling signal, never a verdict.
+    pub lint_admitted: bool,
     /// The verifier image captured before compilation, distinct from the next on-disk image.
     pub running_driver: Option<String>,
     /// Linked measuring executables reported by the compiler, never inferred from source paths.
@@ -1415,6 +1417,9 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
             Ok(None) => {}
         }
         match event["event"].as_str() {
+            Some("stage-admitted") if event["stage_id"].as_str() == Some("Tippy") => {
+                run.lint_admitted = true;
+            }
             Some("measure-driver") => {
                 let digest = event["sha256"]
                     .as_str()

@@ -112,8 +112,6 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 fn native_source_admission_refines_receipt_custody() {
     let model = aterm_models_db::native_source_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let mut admitted = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

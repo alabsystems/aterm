@@ -15,7 +15,7 @@ fn each_law_holds_and_its_own_break_is_caught() {
     let model = claude_permission_click_model();
     assert!(interp::violated_invariants(&interp::with_buggy(&model, 0)).is_empty());
     for (dial, law) in [
-        (1, "AClickAsksTheOtherBit"),
+        (1, "AClickOnlyTurnsYoloOn"),
         (2, "TheSignalKeepsItsAsk"),
         (3, "ADoubleClickIsOneClick"),
         (4, "ARefusalIsSaid"),
@@ -33,8 +33,8 @@ fn each_law_holds_and_its_own_break_is_caught() {
     }
 }
 
-/// A click on `yolo` whose restart lands in bypass (a home whose settings choose it) ends at its
-/// restart: nothing stands and nothing signals again. NEGATIVE CONTROL: the retired end at the pill
+/// A click on the off chip whose restart lands out of bypass (a home that disables it) ends at
+/// its restart: nothing stands and nothing signals again. NEGATIVE CONTROL: the retired end at the pill
 /// (`Buggy = 7`) keeps the ask while the pill shows what it showed, and signals a second restart.
 #[test]
 fn a_click_ends_at_its_restart_not_at_the_pill() {

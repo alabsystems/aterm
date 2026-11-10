@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::app_edit::Placement;
 use crate::document_store::{DocumentId, DocumentViewId};
 use crate::native_app::{
-    AppEvent, AppKind, AppViewState, EditorApp, EventResult, MarkdownApp, MarkdownViewState,
-    NativeApp, TextInputEvent,
+    AppEvent, AppKind, AppViewState, EditorApp, EventResult, MarkdownWorkspaceMode,
+    MarkdownWorkspaceView, NativeApp, TextInputEvent,
 };
 use crate::native_document_host::{
     AdmittedDocument, DEFAULT_DOCUMENT_LIMIT, DocumentGrant, DocumentGrantStore, DocumentHostError,
@@ -821,11 +821,11 @@ pub(crate) struct DocumentHostRuntime {
     /// open; see [`App::begin_document_admission`]).
     admissions: BTreeMap<(WindowId, DocumentAdmissionKey), PendingDocumentAdmission>,
     next_admission: u64,
-    /// The line each pending open reveals once its tab is installed
+    /// The location each pending open reveals once its tab is installed
     /// ([`App::open_document_tab_at`]): keyed like
-    /// [`Self::admissions`], the latest request's line winning, and taken by
+    /// [`Self::admissions`], the latest request's location winning, and taken by
     /// the install (or dropped with a failed one).
-    reveals: BTreeMap<(WindowId, DocumentAdmissionKey), LineReveal>,
+    reveals: BTreeMap<(WindowId, DocumentAdmissionKey), DocumentReveal>,
     /// The `edit` verb's tickets ([`crate::app_edit`]).
     pub(crate) edits: crate::app_edit::EditTickets,
     /// A document view closed, or a Suspended document's save or journal write landed, since the last [`App::release_unheld_documents`].
@@ -841,6 +841,12 @@ pub(crate) struct DocumentHostRuntime {
 pub(crate) struct LineReveal {
     pub(crate) line: u32,
     pub(crate) col: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DocumentReveal {
+    Line(LineReveal),
+    MarkdownFragment(String),
 }
 
 impl Default for DocumentHostRuntime {
@@ -1372,6 +1378,21 @@ impl App {
             Some(NativeApp::Editor(editor)) => editor.document,
             _ => return Ok(None),
         };
+        // Read mode and the reader pane own their input. Document commands,
+        // including Save/Finish/Abort, still belong to this same editor.
+        if matches!(event, AppEvent::TextInput(_) | AppEvent::EditorInput(_))
+            && matches!(self.native_runtime.view_state(view), Some(AppViewState::Editor(state))
+                if state.markdown.as_ref().is_some_and(|workspace| !workspace.editor_focused()))
+        {
+            return Ok(None);
+        }
+        #[cfg(any(a11y_tree, test))]
+        if matches!(event, AppEvent::InsertText(_))
+            && matches!(self.native_runtime.view_state(view), Some(AppViewState::Editor(state))
+                if state.markdown.as_ref().is_some_and(|workspace| !workspace.editor_focused()))
+        {
+            return Ok(None);
+        }
         let editor_event = match event {
             #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(_) | AppEvent::EditorSetSelection { .. } => true,
@@ -1708,28 +1729,33 @@ impl App {
                 self.native_documents.unvouched.insert(document, unvouched);
             }
             self.edit_document_committed(document, source_view, *seq);
-            let other_views = self
+            let document_views = self
                 .view_store
                 .iter()
                 .filter_map(|(view, link)| match link {
                     crate::tab_model::View::Native(native)
-                        if view != source_view
-                            && self
-                                .native_runtime
-                                .document_id(native.instance)
-                                .is_some_and(|candidate| candidate == document) =>
+                        if self
+                            .native_runtime
+                            .document_id(native.instance)
+                            .is_some_and(|candidate| candidate == document) =>
                     {
                         Some(view)
                     }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            for view in other_views {
+            for view in document_views {
                 if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
-                    && let Some(buffer) = state.buffer.as_mut()
                 {
                     for (seq, deltas) in &commits {
-                        buffer.observe_external(*seq, deltas);
+                        if view != source_view
+                            && let Some(buffer) = state.buffer.as_mut()
+                        {
+                            buffer.observe_external(*seq, deltas);
+                        }
+                        if let Some(workspace) = state.markdown.as_mut() {
+                            workspace.observe_document_edits(deltas);
+                        }
                     }
                 }
             }
@@ -2595,8 +2621,10 @@ impl App {
                 self.begin_document_admission_for(
                     wid,
                     DocumentAdmissionKey {
+                        // Ordinary opens prefer Read when the admitted canonical
+                        // document supports Markdown, regardless of an alias's suffix.
+                        kind: AppKind::Markdown,
                         uri,
-                        kind: AppKind::Editor,
                         edit: None,
                     },
                     DocumentAdmissionPurpose::DirectoryEntry,
@@ -3205,10 +3233,13 @@ impl App {
 
         let views = self.document_native_views(document);
         for (_, _, view) in &views {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(*view)
-                && let Some(buffer) = state.buffer.as_mut()
-            {
-                buffer.observe_external(seq, &deltas);
+            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(*view) {
+                if let Some(buffer) = state.buffer.as_mut() {
+                    buffer.observe_external(seq, &deltas);
+                }
+                if let Some(workspace) = state.markdown.as_mut() {
+                    workspace.observe_document_edits(&deltas);
+                }
                 state.status = Some(status.to_string());
             }
         }
@@ -4802,6 +4833,43 @@ impl App {
         line: Option<u32>,
         col: Option<u32>,
     ) -> Result<String, String> {
+        self.open_document_tab_revealing(
+            wid,
+            kind,
+            uri,
+            line.map(|line| DocumentReveal::Line(LineReveal { line, col })),
+        )
+    }
+
+    /// Resolve only the clicked Markdown document, then use the same bounded
+    /// admission path as File Open. A fragment is applied to the live buffer.
+    pub(crate) fn open_markdown_link(
+        &mut self,
+        wid: WindowId,
+        source: DocumentId,
+        destination: &str,
+    ) -> Result<(), String> {
+        let source_uri = self
+            .document_store
+            .canonical_uri(source)
+            .ok_or_else(|| "the Markdown link's source document is gone".to_string())?;
+        let (uri, fragment) = crate::native_app::resolve_markdown_link(source_uri, destination)?;
+        self.open_document_tab_revealing(
+            wid,
+            AppKind::Markdown,
+            &uri,
+            fragment.map(DocumentReveal::MarkdownFragment),
+        )
+        .map(|_| ())
+    }
+
+    fn open_document_tab_revealing(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        reveal: Option<DocumentReveal>,
+    ) -> Result<String, String> {
         let slot = (
             wid,
             DocumentAdmissionKey {
@@ -4810,11 +4878,9 @@ impl App {
                 edit: None,
             },
         );
-        match line {
-            Some(line) => {
-                self.native_documents
-                    .reveals
-                    .insert(slot.clone(), LineReveal { line, col });
+        match reveal {
+            Some(reveal) => {
+                self.native_documents.reveals.insert(slot.clone(), reveal);
             }
             None => {
                 self.native_documents.reveals.remove(&slot);
@@ -4824,7 +4890,7 @@ impl App {
         match &admission {
             Ok(DocumentAdmission::Opened(_)) => {
                 if let Some(reveal) = self.native_documents.reveals.remove(&slot) {
-                    self.reveal_document_line(wid, reveal)?;
+                    self.reveal_opened_document(wid, reveal)?;
                 }
             }
             Ok(DocumentAdmission::InFlight(_) | DocumentAdmission::Coalesced(_)) => {}
@@ -4833,6 +4899,75 @@ impl App {
             }
         }
         admission.map(|admission| admission.message(&slot.1))
+    }
+
+    fn reveal_opened_document(
+        &mut self,
+        wid: WindowId,
+        reveal: DocumentReveal,
+    ) -> Result<(), String> {
+        let fragment = match reveal {
+            DocumentReveal::Line(line) => return self.reveal_document_line(wid, line),
+            DocumentReveal::MarkdownFragment(fragment) => fragment,
+        };
+        let (instance, view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "the linked document is not focused".to_string())?;
+        let document = self
+            .native_runtime
+            .document_id(instance)
+            .ok_or_else(|| "the linked document is gone".to_string())?;
+        let snapshot = self
+            .document_store
+            .snapshot(document)
+            .ok_or_else(|| "the linked document buffer is gone".to_string())?;
+        let offset = if fragment.is_empty() {
+            0
+        } else {
+            let parsed = crate::native_markdown::parse(&snapshot.text);
+            crate::native_markdown::local_anchor(&parsed, &format!("#{fragment}"))
+                .ok_or_else(|| format!("the linked heading #{fragment} was not found"))?
+        };
+        let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) else {
+            return Err("the linked document is not an editor workspace".into());
+        };
+        let workspace = state
+            .markdown
+            .as_mut()
+            .ok_or_else(|| "the linked document does not support Markdown reading".to_string())?;
+        if workspace.editor_focused() {
+            let buffer = state
+                .buffer
+                .as_mut()
+                .ok_or_else(|| "the linked editor buffer is gone".to_string())?;
+            if !state.preedit.is_empty() || buffer.minibuffer_active() {
+                return Err("finish the source input before following a heading".into());
+            }
+            buffer.selections = vec![crate::native_editor::Selection::caret(offset)];
+            buffer.primary = 0;
+            buffer.ensure_primary_visible(&snapshot.text, buffer.viewport_lines());
+        }
+        if workspace.reader.history.current().is_none() {
+            workspace
+                .reader
+                .history
+                .visit(crate::native_markdown::MarkdownLocation::new(
+                    workspace.reader.source_anchor,
+                    workspace.reader.visual_row,
+                ));
+        }
+        workspace.reader.source_anchor = offset;
+        workspace.reader.visual_row = 0;
+        workspace
+            .reader
+            .history
+            .visit(crate::native_markdown::MarkdownLocation::new(offset, 0));
+        state.common.retire_input();
+        state.common.presentation_revision = state.common.presentation_revision.saturating_add(1);
+        self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+        self.refresh_native_presentation(wid, instance, view);
+        self.request_native_redraw(wid);
+        Ok(())
     }
 
     /// Put the caret of `wid`'s focused editor on `reveal`'s line and column, scrolled into view.
@@ -4867,6 +5002,8 @@ impl App {
             .snapshot(document)
             .ok_or_else(|| "the opened document disappeared".to_string())?;
         let offset = crate::path_link::line_col_offset(&snapshot.text, reveal.line, reveal.col);
+        self.native_runtime
+            .set_editor_markdown_mode(instance, view, MarkdownWorkspaceMode::Edit);
         let Some(crate::native_app::AppViewState::Editor(state)) =
             self.native_runtime.view_state_mut(view)
         else {
@@ -5303,7 +5440,7 @@ impl App {
             .install_admitted_document(wid, key.kind, &uri, admitted, Placement::FocusOrNewTab)
             .map_err(DocumentAdmissionRejected::Failed)?;
         if let Some(reveal) = reveal {
-            self.reveal_document_line(wid, reveal)
+            self.reveal_opened_document(wid, reveal)
                 .map_err(DocumentAdmissionRejected::Failed)?;
         }
         Ok(installed.line())
@@ -5355,6 +5492,11 @@ impl App {
         admitted: AdmittedDocument,
         placement: Placement,
     ) -> Result<InstalledDocument, String> {
+        // Markdown is an opening intent, never a second document application.
+        // Its Read/Edit/Split views keep the editor's identity, buffer and grant.
+        let read_intent = kind == AppKind::Markdown;
+        Self::validate_document_request(kind, false)?;
+        let kind = AppKind::Editor;
         let existing = self.document_store.id_for_uri(admitted.canonical_uri());
         if let Some(document) = existing
             && self.document_store.directory(document).is_some() != admitted.directory.is_some()
@@ -5517,6 +5659,16 @@ impl App {
         if placement == Placement::FocusOrNewTab
             && let Some((tab, view)) = self.document_view_in_window(wid, kind, document)
         {
+            if !read_intent
+                && let Some(instance) = self.native_runtime.instance_for_document(kind, document)
+            {
+                self.native_runtime.set_editor_markdown_mode(
+                    instance,
+                    view,
+                    MarkdownWorkspaceMode::Edit,
+                );
+                self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+            }
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.tab_set.switch_to(tab);
                 if let Some(target) = ws.tab_set.active_mut() {
@@ -5551,10 +5703,6 @@ impl App {
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .map_or_else(|| granted.grant.path.display().to_string(), str::to_string);
-        let snapshot = self
-            .document_store
-            .snapshot(document)
-            .ok_or_else(|| "canonical document disappeared".to_string())?;
         let presentation = crate::tab_model::TabPresentation {
             title: title.clone(),
             icon: Some(kind.icon()),
@@ -5563,48 +5711,33 @@ impl App {
             closable: true,
             tooltip: Some(format!("{} · {}", kind.display_name(), uri)),
         };
-        let state = match kind {
-            AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
-            AppKind::Editor => AppViewState::Editor(Box::default()),
-            AppKind::Mail
-            | AppKind::About
-            | AppKind::Settings
-            | AppKind::SystemState
-            | AppKind::Recovery
-            | AppKind::Allocation
-            | AppKind::Workers => {
-                return Err("requested app is not a document app".to_string());
-            }
+        let mut state = crate::native_app::EditorViewState::default();
+        let instance = self.native_runtime.instance_for_document(kind, document);
+        let markdown = instance.map_or_else(
+            || crate::native_app::is_markdown_uri(&granted.grant.canonical_uri),
+            |instance| matches!(self.native_runtime.app(instance), Some(NativeApp::Editor(editor)) if editor.markdown.is_some()),
+        );
+        if markdown {
+            state.markdown = Some(MarkdownWorkspaceView::new(
+                if read_intent && self.document_store.concealed(document).is_none() {
+                    MarkdownWorkspaceMode::Read
+                } else {
+                    MarkdownWorkspaceMode::Edit
+                },
+            ));
+        }
+        let state = AppViewState::Editor(Box::new(state));
+        let install = if let Some(instance) = instance {
+            self.install_native_tab_keeping(wid, instance, state, presentation, keep)
+                .map(|(tab, view)| (instance, tab, view))
+        } else {
+            let mut editor =
+                EditorApp::new_with_uri(document, title, granted.grant.canonical_uri.clone());
+            editor.concealed = self.document_store.concealed(document).cloned();
+            editor.read_only = self.document_store.read_only(document);
+            let app = NativeApp::Editor(Box::new(editor));
+            self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
         };
-        let install =
-            if let Some(instance) = self.native_runtime.instance_for_document(kind, document) {
-                self.install_native_tab_keeping(wid, instance, state, presentation, keep)
-                    .map(|(tab, view)| (instance, tab, view))
-            } else {
-                let app = match kind {
-                    AppKind::Markdown => NativeApp::Markdown(MarkdownApp::new_with_uri(
-                        document,
-                        title,
-                        uri.to_string(),
-                        snapshot.text.as_ref(),
-                    )),
-                    AppKind::Editor => {
-                        let mut editor = EditorApp::new_with_uri(document, title, uri.to_string());
-                        editor.concealed = self.document_store.concealed(document).cloned();
-                        NativeApp::Editor(editor)
-                    }
-                    AppKind::Mail
-                    | AppKind::About
-                    | AppKind::Settings
-                    | AppKind::SystemState
-                    | AppKind::Recovery
-                    | AppKind::Allocation
-                    | AppKind::Workers => {
-                        return Err("requested app is not a document app".to_string());
-                    }
-                };
-                self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
-            };
         let (instance, tab, view) = install.map_err(|error| {
             aterm_log::warn!("could not install native document tab: {error:?}");
             "This document could not be reopened".to_string()
@@ -5614,6 +5747,18 @@ impl App {
             self.rollback_document_tab(wid, tab);
             return Err(error);
         }
+        // Seed derived readers from the canonical buffer before the first paint or
+        // semantic action. It may already contain a recovered or unsaved draft.
+        let snapshot = self
+            .document_store
+            .snapshot(document)
+            .ok_or_else(|| "the attached document disappeared".to_string())?;
+        self.native_runtime.publish_document(
+            document,
+            snapshot.text.as_ref(),
+            self.document_store.revision(document).unwrap_or(0),
+            self.document_store.dirty(document).unwrap_or(false),
+        );
         if let Some(listing) = self.document_store.directory(document)
             && let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
             && let Some(buffer) = &mut state.buffer
@@ -5703,10 +5848,6 @@ impl App {
     ) -> Result<(), String> {
         let document_view = DocumentViewId(view.get());
         match kind {
-            AppKind::Markdown => self
-                .document_store
-                .attach_view(document, document_view)
-                .map_err(|error| format!("could not attach Markdown view: {error:?}")),
             AppKind::Editor => {
                 let buffer = self
                     .editor_workspace
@@ -5741,7 +5882,8 @@ impl App {
                 }
                 Ok(())
             }
-            AppKind::Mail
+            AppKind::Markdown
+            | AppKind::Mail
             | AppKind::About
             | AppKind::Settings
             | AppKind::SystemState
@@ -6442,7 +6584,7 @@ mod tests {
     }
 
     #[test]
-    fn file_save_is_disabled_for_markdown_and_terminal_content() {
+    fn markdown_reopen_keeps_save_available_and_terminal_has_no_document_save() {
         let dir = fresh_dir("aterm-file-save-non-editor");
         let path = dir.join("reader.md");
         fs::write(&path, "# Original\n").unwrap();
@@ -6453,17 +6595,17 @@ mod tests {
         commit(&mut app, wid, "draft ");
         app.open_document_tab(AppKind::Markdown, &file_uri(&path))
             .unwrap();
-        assert!(!app.can_save_document(wid));
-        assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
-        assert!(app.save_front_document().is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# Original\n");
+        assert!(app.can_save_document(wid));
+        assert!(app.palette_snapshot(wid).action_by_name("Save").is_ok());
+        app.save_front_document().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "draft # Original\n");
 
         app.switch_tab_in(wid, 0);
         assert!(app.active_native_view(wid).is_none());
         assert!(!app.can_save_document(wid));
         assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
         assert!(app.save_front_document().is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# Original\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "draft # Original\n");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6534,7 +6676,7 @@ mod tests {
     }
 
     #[test]
-    fn find_navigation_refuses_non_search_native_content_without_using_terminal_query() {
+    fn find_navigation_without_a_document_query_never_uses_the_terminal_query() {
         let dir = fresh_dir("aterm-native-find-refusal");
         let path = dir.join("reader.md");
         fs::write(&path, "# needle").unwrap();
@@ -6743,6 +6885,229 @@ mod tests {
                 .is_err()
         );
         assert_eq!(app.active_native_view(wid).unwrap(), focus);
+    }
+
+    #[test]
+    fn relative_markdown_link_opens_only_its_target_and_reveals_unsaved_headings_on_reuse() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let source = base.join("index.md");
+        let target = base.join("target.md");
+        let other = base.join("untouched.md");
+        fs::write(
+            &source,
+            "[Kept](target.md#kept)\n\n[Draft](target.md#draft-heading)\n",
+        )
+        .unwrap();
+        let target_text = "# Target\n\n## Kept\n\nBody.\n";
+        fs::write(&target, target_text).unwrap();
+        fs::write(&other, "# Not granted\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Markdown, &file_uri(&source))
+            .unwrap();
+        let (source_instance, _) = app.active_native_view(wid).unwrap();
+        let source_document = app.native_runtime.document_id(source_instance).unwrap();
+        let click = |app: &mut App, index| {
+            app.dispatch_native_event(
+                wid,
+                AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new(format!("markdown/link/{index}")),
+                    value: None,
+                }),
+            )
+            .unwrap()
+        };
+        click(&mut app, 0);
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        assert_ne!(document, source_document);
+        assert_eq!(
+            app.document_store.canonical_uri(document),
+            Some(file_uri(&target).as_str())
+        );
+        assert!(app.document_store.id_for_uri(&file_uri(&other)).is_none());
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor");
+        };
+        assert_eq!(
+            state.markdown.as_ref().unwrap().mode,
+            MarkdownWorkspaceMode::Read
+        );
+        assert_eq!(
+            state.markdown.as_ref().unwrap().reader.source_anchor,
+            target_text.find("## Kept").unwrap()
+        );
+        let tabs = app.windows[&wid].tab_set.len();
+        assert!(app.native_runtime.set_editor_markdown_mode(
+            instance,
+            view,
+            MarkdownWorkspaceMode::Edit
+        ));
+        commit(&mut app, wid, "## Draft heading\n\n");
+        let draft = app.document_store.snapshot(document).unwrap();
+        let anchor = draft.text.find("## Draft heading").unwrap();
+        app.open_document_tab(AppKind::Markdown, &file_uri(&source))
+            .unwrap();
+        click(&mut app, 1);
+        assert_eq!(app.active_native_view(wid), Some((instance, view)));
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor");
+        };
+        assert_eq!(
+            state.markdown.as_ref().unwrap().mode,
+            MarkdownWorkspaceMode::Edit
+        );
+        assert_eq!(
+            state.buffer.as_ref().unwrap().primary_selection().head,
+            anchor
+        );
+        let reused = app.document_store.snapshot(document).unwrap();
+        assert_eq!((reused.seq, reused.text), (draft.seq, draft.text));
+        assert_eq!(fs::read_to_string(&target).unwrap(), target_text);
+        assert!(
+            app.open_markdown_link(wid, source_document, "untouched.md?query=1")
+                .is_err()
+        );
+        assert!(
+            app.open_markdown_link(wid, source_document, "private.txt")
+                .is_err()
+        );
+        assert!(app.document_store.id_for_uri(&file_uri(&other)).is_none());
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn relative_markdown_link_fragment_survives_coalesced_async_admission() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let source = base.join("source.md");
+        let target = base.join("target.md");
+        fs::write(&source, "# Source\n").unwrap();
+        let text = "# Target\n\n## First\n\n## Second\n";
+        fs::write(&target, text).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Markdown, &file_uri(&source))
+            .unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let key = admission_key(&file_uri(&target), AppKind::Markdown);
+        let ticket = app.mint_document_admission(wid, key.clone());
+        app.open_markdown_link(wid, document, "target.md#first")
+            .unwrap();
+        app.open_markdown_link(wid, document, "target.md#second")
+            .unwrap();
+        assert!(app.document_store.id_for_uri(&key.uri).is_none());
+        assert_eq!(app.document_admission_pending(wid, &key), Some(ticket));
+        app.complete_document_admission(worker_outcome(ticket, wid, &key))
+            .unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor");
+        };
+        let workspace = state.markdown.as_ref().unwrap();
+        assert_eq!(workspace.mode, MarkdownWorkspaceMode::Read);
+        assert_eq!(
+            workspace.reader.source_anchor,
+            text.find("## Second").unwrap()
+        );
+        assert!(app.native_documents.reveals.is_empty());
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn markdown_uri_spellings_share_canonical_controller_and_view_capability() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap().join("notes.md");
+        fs::write(&path, "# Canonical\n").unwrap();
+        let canonical = file_uri(&path);
+        let encoded = canonical.strip_suffix(".md").unwrap().to_string() + "%2Emd";
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Markdown, &encoded).unwrap();
+        let (instance, first) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("editor");
+        };
+        assert_eq!(editor.canonical_uri, canonical);
+        assert!(
+            editor.markdown.is_some(),
+            "language comes from the admitted canonical URI"
+        );
+        for (intent, mode) in [
+            (AppKind::Markdown, MarkdownWorkspaceMode::Read),
+            (AppKind::Editor, MarkdownWorkspaceMode::Edit),
+        ] {
+            app.open_document_tab_in_window_with_config_symlinks(
+                wid,
+                intent,
+                &canonical,
+                false,
+                Placement::NewTab,
+            )
+            .unwrap();
+            let (current, view) = app.active_native_view(wid).unwrap();
+            assert_eq!(current, instance);
+            assert_ne!(view, first);
+            assert_eq!(app.native_runtime.document_id(current), Some(document));
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("editor");
+            };
+            assert_eq!(state.markdown.as_ref().unwrap().mode, mode);
+        }
+        assert_eq!(app.document_store.view_count(document), Some(3));
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_alias_suffix_does_not_choose_markdown_capability_or_open_mode() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let wid = WindowId(0);
+        for (alias, target, markdown) in [
+            ("alias.txt", "target.md", true),
+            ("alias.md", "target.txt", false),
+        ] {
+            let path = base.join(target);
+            fs::write(&path, "# Target\n").unwrap();
+            std::os::unix::fs::symlink(&path, base.join(alias)).unwrap();
+            let mut app = App::headless_for_test();
+            app.open_document_tab(AppKind::Editor, &file_uri(&base))
+                .unwrap();
+            let (_, directory) = app.active_native_view(wid).unwrap();
+            app.execute_editor_effect(
+                directory,
+                EditorEffect::OpenPath {
+                    uri: file_uri(&base.join(alias)),
+                },
+            )
+            .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+                panic!("editor");
+            };
+            assert_eq!(editor.canonical_uri, file_uri(&path));
+            assert_eq!(editor.markdown.is_some(), markdown);
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("editor");
+            };
+            assert_eq!(state.markdown.is_some(), markdown);
+            if let Some(workspace) = &state.markdown {
+                assert_eq!(workspace.mode, MarkdownWorkspaceMode::Read);
+            } else {
+                commit(&mut app, wid, "editable ");
+                let document = app.native_runtime.document_id(instance).unwrap();
+                assert_eq!(
+                    app.document_store.snapshot(document).unwrap().text.as_ref(),
+                    "editable # Target\n"
+                );
+            }
+            assert!(app.structural_invariants_ok());
+        }
     }
 
     #[test]
@@ -6973,14 +7338,14 @@ mod tests {
         let line = app
             .complete_document_admission(outcome)
             .expect("a live window installs the admitted document");
-        assert!(line.starts_with("app markdown file://"), "{line}");
+        assert!(line.starts_with("app editor file://"), "{line}");
         assert_eq!(app.document_admission_pending(wid, &key), None);
         let (instance, _) = app
             .active_native_view(wid)
             .expect("the Markdown tab is active");
         assert_eq!(
             app.native_runtime.app(instance).map(|app| app.kind()),
-            Some(AppKind::Markdown)
+            Some(AppKind::Editor)
         );
         let canonical = crate::native_document_host::path_to_file_uri(
             &fs::canonicalize(dir.join("dropped.md")).unwrap(),
@@ -7026,8 +7391,8 @@ mod tests {
         let document = app.document_store.id_for_uri(&canonical).unwrap();
         assert_eq!(
             app.document_native_views(document).len(),
-            2,
-            "one document, one Editor view and one Markdown view — never a duplicate registration"
+            1,
+            "Read and Edit intents reuse one canonical document view"
         );
         let replay = worker_outcome(ticket, wid, &key);
         assert!(matches!(
@@ -9541,11 +9906,16 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let suffix = |uri: &str| if uri == one_uri { "one" } else { "two" };
-        assert_eq!(documents.len(), 3);
-        for ((title, tooltip), uri) in documents.iter().zip([&one_uri, &one_uri, &two_uri]) {
-            assert_eq!(*title, format!("README.md — {}", suffix(uri)));
-            assert!(tooltip.ends_with(uri.as_str()), "{tooltip:?} names {uri}");
+        assert_eq!(documents.len(), 2);
+        for ((title, tooltip), (suffix, path)) in
+            documents.iter().zip([("one", &one), ("two", &two)])
+        {
+            let canonical_uri = file_uri(&fs::canonicalize(path).unwrap());
+            assert_eq!(*title, format!("README.md — {suffix}"));
+            assert!(
+                tooltip.ends_with(canonical_uri.as_str()),
+                "{tooltip:?} names the admitted canonical file {canonical_uri}"
+            );
         }
         app.refresh_window_tabs(wid);
         assert_eq!(
@@ -9929,7 +10299,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_edit_action_completes_its_reader_status_after_editor_focus() {
+    fn markdown_mode_change_keeps_the_live_document_after_its_file_disappears() {
         let dir = fresh_dir("aterm-app-edit-handoff");
         let path = dir.join("handoff.md");
         let source = "# Handoff\n\nBody\n";
@@ -9938,8 +10308,8 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.open_document_tab(AppKind::Markdown, &uri).unwrap();
-        let (markdown_instance, markdown_view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(markdown_instance).unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
         app.dispatch_native_event(
             wid,
             AppEvent::Action(crate::native_app::ActionInvocation {
@@ -9948,118 +10318,42 @@ mod tests {
             }),
         )
         .unwrap();
-        let reader_state = |app: &App| {
-            let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
-            else {
-                panic!("the original Markdown reader remains attached");
-            };
-            (
-                state.history.clone(),
-                state.source_anchor,
-                state.visual_row,
-                state.selection.clone(),
-                state.mode,
-            )
-        };
-        let before_reader = reader_state(&app);
-        assert_eq!(before_reader.3, Some(0..source.len()));
         let before_document = app.document_store.snapshot(document).unwrap();
         let before_tabs = app.windows[&wid].tab_set.tabs().to_vec();
         let before_views = app.view_store.len();
-        let before_generation = app.native_runtime.view_generation(markdown_view);
         fs::remove_file(&path).unwrap();
 
-        let failure = app
-            .dispatch_native_event(
-                wid,
-                AppEvent::Action(crate::native_app::ActionInvocation {
-                    id: crate::native_ui::ActionId::new("markdown/edit"),
-                    value: None,
-                }),
-            )
-            .expect_err("Edit must still report the missing-file admission failure to its caller");
-        assert!(failure.contains("handoff.md"), "{failure}");
-
-        let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
-        else {
-            panic!("the failed handoff must leave its reader available");
-        };
-        let failed_notice = state.notice.clone();
-        let failure_reason = failure.split(':').next().unwrap();
-        let terminal_failure_notice = failed_notice.as_deref().is_some_and(|notice| {
-            notice != "Opening editor…"
-                && notice != "Editor opened"
-                && notice.contains(failure_reason)
-        });
-        assert_eq!(
-            app.active_native_view(wid),
-            Some((markdown_instance, markdown_view))
-        );
-        assert_eq!(app.windows[&wid].tab_set.tabs(), before_tabs);
-        assert_eq!(app.view_store.len(), before_views);
-        assert_eq!(
-            app.native_runtime.view_generation(markdown_view),
-            before_generation
-        );
-        assert_eq!(app.document_store.view_count(document), Some(1));
-        assert!(
-            app.native_runtime
-                .instance_for_document(AppKind::Editor, document)
-                .is_none()
-        );
-        assert_eq!(reader_state(&app), before_reader);
-        let after_failure = app.document_store.snapshot(document).unwrap();
-        assert_eq!(
-            (after_failure.seq, after_failure.text),
-            (before_document.seq, before_document.text.clone())
-        );
-        assert_eq!(app.document_store.dirty(document), Some(false));
-        assert!(!path.exists());
-
-        fs::write(&path, source).unwrap();
         app.dispatch_native_event(
             wid,
             AppEvent::Action(crate::native_app::ActionInvocation {
-                id: crate::native_ui::ActionId::new("markdown/edit"),
+                id: crate::native_ui::ActionId::new("editor/markdown/edit"),
                 value: None,
             }),
         )
         .unwrap();
 
-        let (active_instance, _) = app.active_native_view(wid).unwrap();
-        assert_eq!(
-            app.native_runtime.app(active_instance).map(NativeApp::kind),
-            Some(AppKind::Editor)
-        );
-        assert_eq!(
-            app.native_runtime.document_id(active_instance),
-            Some(document)
-        );
-        let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
-        else {
-            panic!("the completed handoff still owns its original reader");
+        assert_eq!(app.active_native_view(wid), Some((instance, view)));
+        assert_eq!(app.windows[&wid].tab_set.tabs(), before_tabs);
+        assert_eq!(app.view_store.len(), before_views);
+        assert_eq!(app.document_store.view_count(document), Some(1));
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("the workspace keeps its editor ownership");
         };
-        assert_eq!(state.notice.as_deref(), Some("Editor opened"));
-        assert_eq!(reader_state(&app), before_reader);
+        let workspace = state.markdown.as_ref().unwrap();
+        assert_eq!(workspace.mode, MarkdownWorkspaceMode::Edit);
+        assert_eq!(workspace.reader.selection, Some(0..source.len()));
+        let after = app.document_store.snapshot(document).unwrap();
         assert_eq!(
-            app.native_runtime.view_generation(markdown_view),
-            before_generation
-        );
-        assert_eq!(app.windows[&wid].tab_set.len(), before_tabs.len() + 1);
-        assert_eq!(app.view_store.len(), before_views + 1);
-        assert_eq!(app.document_store.view_count(document), Some(2));
-        let after_retry = app.document_store.snapshot(document).unwrap();
-        assert_eq!(
-            (after_retry.seq, after_retry.text),
+            (after.seq, after.text),
             (before_document.seq, before_document.text)
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert!(
+            !path.exists(),
+            "a mode change does not recreate or save the file"
+        );
         assert!(app.structural_invariants_ok());
         let _ = fs::remove_dir_all(dir);
-        assert!(
-            terminal_failure_notice,
-            "the reader must finish the failed handoff with its actual reason: notice={failed_notice:?}, failure={failure:?}"
-        );
     }
 
     #[test]
@@ -11578,13 +11872,21 @@ mod tests {
             let artifact = app
                 .retained_native_leaf_artifact(wid, view, false)
                 .expect("the retained Editor scene matches its current authority");
-            let save = artifact
-                .compiled
-                .semantic(&crate::native_ui::UiKey::new("editor/save-button"))
+            let mut save_controls = artifact.compiled.semantics.iter().filter(|node| {
+                node.action
+                    .as_ref()
+                    .is_some_and(|action| action.as_str() == "editor/save")
+            });
+            let save = save_controls
+                .next()
                 .expect("the retained toolbar has Save")
                 .state
                 .unwrap()
                 .enabled;
+            assert!(
+                save_controls.next().is_none(),
+                "the responsive toolbar has exactly one Save control"
+            );
             let revert = artifact
                 .compiled
                 .semantic(&crate::native_ui::UiKey::new("editor/disk-reload"))
@@ -12950,8 +13252,15 @@ mod tests {
         let uri = file_uri(&path);
         let mut app = App::headless_for_test();
         app.open_document_tab(AppKind::Markdown, &uri).unwrap();
-        app.open_document_tab(AppKind::Editor, &uri).unwrap();
         let wid = WindowId(0);
+        app.open_document_tab_in_window_with_config_symlinks(
+            wid,
+            AppKind::Editor,
+            &uri,
+            false,
+            Placement::NewTab,
+        )
+        .unwrap();
         let (instance, _) = app.active_native_view(wid).unwrap();
         let document = app.native_runtime.document_id(instance).unwrap();
         commit(&mut app, wid, "dirty ");
@@ -14358,7 +14667,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_file_opens_and_reuses_the_active_document_app_kind() {
+    fn dropped_markdown_opens_one_read_workspace_from_either_document_mode() {
         let dir = fresh_dir("aterm-app-document-drop");
         let source = dir.join("source.md");
         let dropped = dir.join("dropped file.md");
@@ -14374,7 +14683,7 @@ mod tests {
             let (instance, _) = app.active_native_view(wid).expect("dropped document view");
             assert_eq!(
                 app.native_runtime.app(instance).map(NativeApp::kind),
-                Some(kind)
+                Some(AppKind::Editor)
             );
             let document = app
                 .native_runtime

@@ -185,6 +185,32 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
 /// The source publish's attestation pair, allowed beside the binary asset set.
 pub const SOURCE_ATTESTATION_ASSETS: [&str; 2] = ["SHA256SUMS", "SHA256SUMS.sig"];
 
+/// Each source attestation must occur exactly once on the release being published.
+pub(crate) fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
+    SOURCE_ATTESTATION_ASSETS
+        .into_iter()
+        .filter_map(|name| {
+            let count = release
+                .get("assets")
+                .and_then(aterm_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|a| a.get("name").and_then(aterm_json::Value::as_str) == Some(name))
+                .count();
+            match count {
+                1 => None,
+                0 => Some(format!(
+                    "{name} is missing — the signed source manifest `pub publish` attaches \
+                     (`pub sign-release aterm` attaches it to a published release)"
+                )),
+                _ => Some(format!(
+                    "{name} is duplicated — the source manifest must be unambiguous"
+                )),
+            }
+        })
+        .collect()
+}
+
 /// The provenance record's file name in `dist/` (`bundle::write_provenance`'s).
 #[must_use]
 pub fn provenance_asset_name(version: &str) -> String {

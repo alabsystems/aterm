@@ -179,6 +179,8 @@ pub enum Ty {
     SecretRef,
     /// An inner-sealed secret, revealed only through the local audited API.
     Secret,
+    /// A structural row or set-element key, without a target-collection relation.
+    Key,
     /// A primary key of the named collection.
     Ref(&'static str),
     Set(&'static Ty),
@@ -233,6 +235,7 @@ impl Ty {
             Self::Url => json!("url"),
             Self::SecretRef => json!("secret_ref"),
             Self::Secret => json!("secret"),
+            Self::Key => json!("key"),
             Self::Ref(collection) => json!({"ref": collection}),
             Self::Set(inner) => json!({"set": inner.word()}),
             Self::List(inner, max) => json!({"list": inner.word(), "max": max}),

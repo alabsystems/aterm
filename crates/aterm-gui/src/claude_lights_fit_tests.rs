@@ -224,7 +224,7 @@ impl World {
 
 fn nothing(_: &mut World) {}
 
-/// Claude in plan mode: the light, `lame`, drawn beside Autopilot.
+/// Claude in plan mode: the light, `○ yolo`, drawn beside Autopilot.
 fn planned(w: &mut World) {
     w.session().shown = Reading {
         mode: Some(Mode::Plan),
@@ -268,6 +268,13 @@ fn refusing(w: &mut World) {
 
 fn light_titled(w: &mut World) {
     w.focus.1 = Some(Chip::Light(Light::Mode));
+}
+
+/// The off light under the pointer: its title names what a click's restart would end, which
+/// the on light's, whose click restarts nothing, never does.
+fn off_light_titled(w: &mut World) {
+    planned(w);
+    light_titled(w);
 }
 
 fn lit(w: &mut World) {
@@ -325,7 +332,7 @@ fn cases() -> Vec<Case> {
         ("a refusal's new reason", refusing, |w| {
             w.session().refused = Some((Light::Mode, Refusal::Failed, later()));
         }),
-        ("the job words its title names", light_titled, |w| {
+        ("the job words its title names", off_light_titled, |w| {
             w.session().jobs = "1 shell".to_owned();
         }),
         ("Autopilot's word", nothing, land),

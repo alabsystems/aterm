@@ -103,12 +103,13 @@
 	     in the layout is the offer. -->
 	<key>ATermHandoffGrantDesk</key>
 	<string>desk1</string>
-	<!-- This build reads ANG5 complete-recipient histories and can recover an
+	<!-- This build reads ARC1 enrollment, ARB1 bindings and ANG5 histories
+	     in independent recipient custody. It can recover an
 	     expired operation after proving every recorded recipient retired.
 	     Read only after authenticating this bundle. This declaration grants
 	     no writer permission and says nothing about other live or rollback images. -->
 	<key>ATermNativeRecipientRecovery</key>
-	<string>recipients5</string>
+	<string>bound-recipients5</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>NSHumanReadableCopyright</key>

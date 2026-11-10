@@ -158,9 +158,7 @@ fn text_of<'a>(v: &'a aterm_json::Value, key: &str, file: &str) -> Result<&'a st
 #[must_use]
 pub fn dev_version(version: &str) -> Option<(u64, &str)> {
     let v = atpkg::alab::AlabVersion::parse(version)?;
-    if v.core.2 != 0 {
-        return None;
-    }
+    aterm_types::release_version::ReleaseVersion::from_components(v.core)?;
     Some((v.dev?, v.sha9?))
 }
 

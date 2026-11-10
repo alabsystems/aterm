@@ -456,8 +456,28 @@ fn version_helpers_port_the_shell_derivations() {
         publish::release_version_from_workspace("0.2.0").unwrap(),
         "0.2.0"
     );
+    assert_eq!(
+        publish::release_version_from_workspace("1.20261109.2").unwrap(),
+        "1.20261109.2"
+    );
+    let selected_at =
+        u64::try_from(aterm_types::rfc3339::parse_utc("2026-11-10T00:00:00Z").unwrap()).unwrap();
+    assert_eq!(
+        publish::allocate_release_after("1.20261109.2", selected_at).unwrap(),
+        "1.20261110.1"
+    );
     for bad in [
-        "0.2.1", "1.10.7", "0.2", "0.2.1.1", "v0.2.1", "01.2.1", "0.2.x", "",
+        "0.2.1",
+        "1.10.7",
+        "0.2",
+        "0.2.1.1",
+        "v0.2.1",
+        "01.2.1",
+        "0.2.x",
+        "",
+        "1.20261109.0",
+        "1.20260229.1",
+        "1.20261131.1",
     ] {
         assert!(
             publish::release_version_from_workspace(bad).is_err(),

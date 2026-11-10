@@ -11201,6 +11201,66 @@ fn pushed_facts_records_reject_unsafe_or_corrupt_current_without_legacy_fallback
     }
 }
 
+/// Pruning judges each record by its key line alone: a denied publisher's record goes even
+/// where its payload is past the cap or no UTF-8, which no read admits; a record of another
+/// version is left unjudged, and a node's own payload reads alone as [`read_pushed_facts`]
+/// pairs it. NEGATIVE CONTROL: judged by its whole read, the two records past a read stay.
+#[test]
+fn pushed_facts_pruning_judges_each_record_by_its_key_line_alone() {
+    let state = State::new("facts-prune-head");
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let [big, bad, own, other] = ["44", "55", "66", "77"].map(|b| b.repeat(16));
+    let denied = NodeIdentity::from_seed(&big, &[0x33; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &big, Some(denied), "wire\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(format!("{big}.facts")))
+        .unwrap()
+        .set_len((PUSHED_FACTS_MAX + 1) as u64)
+        .unwrap();
+    store_pushed_facts(state.dir(), &bad, "wire\n").unwrap();
+    write_private(
+        &dir,
+        &format!("{bad}.facts"),
+        &[
+            format!("{PUSHED_FACTS_MAGIC}{}\n", denied.hex()).as_bytes(),
+            &[0xff],
+        ]
+        .concat(),
+    )
+    .unwrap();
+    store_pushed_facts(state.dir(), &own, "own wire\n").unwrap();
+    store_pushed_facts(state.dir(), &other, "wire\n").unwrap();
+    write_private(
+        &dir,
+        &format!("{other}.facts"),
+        format!("aterm-pushed-facts-v2\n{}\nfuture\n", denied.hex()).as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(own.clone(), "own wire\n".to_owned())]
+    );
+    assert_eq!(
+        read_pushed_facts_of(state.dir(), &own).as_deref(),
+        Some("own wire\n")
+    );
+    assert_eq!(
+        read_pushed_facts_of(state.dir(), &big),
+        None,
+        "past the cap"
+    );
+    assert_eq!(read_pushed_facts_of(state.dir(), "own"), None, "no node id");
+    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    left.sort();
+    assert_eq!(left, [format!("{own}.facts"), format!("{other}.facts")]);
+}
+
 #[test]
 fn pushed_facts_write_failure_keeps_the_previous_record_and_a_later_writer_wins() {
     use std::sync::mpsc;

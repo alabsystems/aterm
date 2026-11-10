@@ -128,6 +128,89 @@ pub fn any_until(fds: &[BorrowedFd<'_>], deadline: std::time::Instant) -> io::Re
     ready_set(fds, |fd| read_pollfd(*fd), Wait::Until(deadline))
 }
 
+/// [`any_until`] with the deadline optional: `None` waits until a descriptor is ready, with no
+/// timeout. Returns the ready indices; an empty vector means `deadline` came.
+/// # Errors
+/// Empty or unrepresentable set, or poll error other than interruption.
+pub fn any(fds: &[BorrowedFd<'_>], deadline: Option<std::time::Instant>) -> io::Result<Vec<usize>> {
+    ready_set(
+        fds,
+        |fd| read_pollfd(*fd),
+        deadline.map_or(Wait::Forever, Wait::Until),
+    )
+}
+
+/// Which of `fds` are readable, at their end or in error now, asked once with zero timeout and
+/// reading nothing.
+/// # Errors
+/// Empty or unrepresentable set, or poll error other than interruption.
+pub fn any_now(fds: &[BorrowedFd<'_>]) -> io::Result<Vec<usize>> {
+    ready_set(fds, |fd| read_pollfd(*fd), Wait::Now)
+}
+
+/// A wake any thread rings, as often as it likes, for a loop that polls it beside its own
+/// descriptors ([`Doorbell::fd`]): a nonblocking pipe that [`Doorbell::ring`] writes a byte into
+/// and [`Doorbell::clear`] empties. Unlike a stop's bell ([`crate::stop::Stop::bell`]), which
+/// rings once for good, it rings again after each clear. The loop clears it before it reads the
+/// state a ring announces, so a ring that comes during that read polls ready at its next wait.
+#[derive(Debug)]
+pub struct Doorbell {
+    reader: std::io::PipeReader,
+    ringer: std::io::PipeWriter,
+}
+
+impl Doorbell {
+    /// A doorbell not rung: a pipe (two descriptors, kept out of children), both ends nonblocking.
+    ///
+    /// # Errors
+    /// The pipe could not be made (this process is out of descriptors), or its ends could not be
+    /// made nonblocking.
+    pub fn new() -> io::Result<Self> {
+        use std::os::fd::AsFd as _;
+        let (reader, ringer) = crate::kept_out(std::io::pipe)?;
+        for fd in [reader.as_fd(), ringer.as_fd()] {
+            // SAFETY: F_GETFL reads the flags of a descriptor this function owns.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            // SAFETY: F_SETFL takes an integer flag word for the same owned descriptor.
+            if flags < 0
+                || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self { reader, ringer })
+    }
+
+    /// Ring: the next poll of [`Self::fd`] reads ready until [`Self::clear`]. A pipe already full
+    /// of rings is rung already, so a write it refuses changes nothing.
+    pub fn ring(&self) {
+        use std::io::Write as _;
+        let _ = (&self.ringer).write(&[1]);
+    }
+
+    /// Take every ring so far: `true` when it was rung since the last clear.
+    pub fn clear(&self) -> bool {
+        use std::io::Read as _;
+        let mut rung = false;
+        let mut bytes = [0; 64];
+        while let Ok(read) = (&self.reader).read(&mut bytes) {
+            if read == 0 {
+                break;
+            }
+            rung = true;
+        }
+        rung
+    }
+
+    /// The descriptor that polls readable while the doorbell is rung: poll it, never read it.
+    #[must_use]
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.reader.as_fd()
+    }
+}
+
 /// Wait for mixed read/write interests until an absolute deadline, without
 /// consuming bytes or notifications. Returns indices into the supplied set;
 /// hangup/error also wake, and an empty result means expiry. An already expired
@@ -401,6 +484,34 @@ pub fn for_read(stream: &crate::CtlStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A doorbell polls ready from its first ring until its clear, and rings again after it: many
+    /// rings take one clear, and a clear of an unrung doorbell takes nothing. Nothing is timed:
+    /// each poll asks once.
+    ///
+    /// NEGATIVE CONTROL (2026-11-09): with `clear` reading one byte instead of every ring, the
+    /// second poll after three rings read ready (`left: [0], right: []`).
+    #[test]
+    fn a_doorbell_reads_rung_until_cleared_and_rings_again() {
+        use super::*;
+        let bell = Doorbell::new().unwrap();
+        assert!(any_now(&[bell.fd()]).unwrap().is_empty());
+        assert!(!bell.clear());
+        for _ in 0..3 {
+            bell.ring();
+        }
+        assert_eq!(any_now(&[bell.fd()]).unwrap(), [0]);
+        assert!(bell.clear());
+        assert_eq!(any_now(&[bell.fd()]).unwrap(), Vec::<usize>::new());
+        bell.ring();
+        assert_eq!(any(&[bell.fd()], None).unwrap(), [0]);
+        assert!(bell.clear());
+        assert!(
+            any(&[bell.fd()], Some(std::time::Instant::now()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn mixed_readiness_reports_writable_readable_and_hangup_without_consuming_bytes() {
         use super::*;

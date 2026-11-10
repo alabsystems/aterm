@@ -1100,6 +1100,7 @@ pub(super) fn overlay_log_membership(
             active_log_labels.insert(canon);
         }
     }
+    overlay_chosen_labels(membership, roster);
     for lbl in removed_labels {
         let canon = leading_m_label(&lbl).map_or(lbl, |(_, c)| c);
         if !active_log_labels.contains(&canon)
@@ -1116,6 +1117,74 @@ pub(super) fn overlay_log_membership(
         }
     }
     roster.canonicalize();
+}
+
+/// Project holder-signed number choices over historical roster rows, retaining only aliases
+/// that still belong to this Mac. The signed log grants no right to another roster holder.
+fn overlay_chosen_labels(membership: &crate::membership_log::Membership, roster: &mut SwarmRoster) {
+    let choices: BTreeMap<_, _> = membership
+        .members()
+        .iter()
+        .filter_map(|(actor, member)| {
+            Some((
+                member.binding.recipient().to_bech32(),
+                membership.label_after_choice(actor)?,
+            ))
+        })
+        .collect();
+    for (actor, member) in membership.members() {
+        let Some(label) = membership.label_after_choice(actor) else {
+            continue;
+        };
+        let rec = member.binding.recipient().to_bech32();
+        let Some(pos) = roster.members.iter().position(|row| row.recipient == rec) else {
+            continue;
+        };
+        if roster.is_member_denied(&roster.members[pos]) {
+            continue;
+        }
+        if roster.members.iter().any(|other| {
+            other.recipient != rec
+                && (choices
+                    .get(&other.recipient)
+                    .copied()
+                    .unwrap_or(&other.label)
+                    == label
+                    || other.aliases.iter().any(|alias| alias == label))
+        }) {
+            continue;
+        }
+        let old = roster.members[pos].label.clone();
+        let held: BTreeSet<_> = roster
+            .members
+            .iter()
+            .filter(|row| row.recipient != rec)
+            .flat_map(|row| {
+                std::iter::once(
+                    choices
+                        .get(&row.recipient)
+                        .copied()
+                        .unwrap_or(&row.label)
+                        .to_owned(),
+                )
+                .chain(row.aliases.clone())
+            })
+            .chain(
+                membership
+                    .members()
+                    .iter()
+                    .filter(|(other, _)| *other != actor)
+                    .map(|(_, member)| member.label.clone()),
+            )
+            .collect();
+        let row = &mut roster.members[pos];
+        row.label = label.to_owned();
+        row.aliases
+            .retain(|alias| alias != label && !held.contains(alias));
+        if old != label && !held.contains(&old) && !row.aliases.contains(&old) {
+            row.aliases.push(old);
+        }
+    }
 }
 
 /// Read the verified `aterm-swarm-lease` `holder` label from the locally applied vault copy, if present.

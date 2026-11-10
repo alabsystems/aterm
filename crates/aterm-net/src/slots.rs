@@ -4,107 +4,181 @@
 //! Network listener slot admission ([`Slots`], [`pick_displaced`]) and unauthenticated
 //! [`HandshakeWatchdog`] deadline for [`crate::fleet`].
 
-#[cfg(any(windows, all(unix, any(test, debug_assertions))))]
+#[cfg(any(unix, windows))]
 use aterm_uds::deadline::poll_timeout_ms;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// How long [`Slots::make_room`] waits for the handshake it evicted to free its slot.
-const EVICTION_WAIT: Duration = Duration::from_millis(200);
+/// The existing LAN validity and failed-accept retry bound. Ordinary fleet listeners do not
+/// use this as an idle timer; slot displacement also retains this bounded release wait.
+pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
 
-/// Wait until a non-blocking listener may accept, or until `timeout` expires. On unix only tests
-/// and [`crate::lan::Listener::pending_within`] wait on a listener alone: the accept loop polls its
-/// stop's bell beside it (`fleet::wait_for_a_connection`).
-#[cfg(all(unix, any(test, debug_assertions)))]
+/// Sources ready in one native listener wait. A timeout has no ready source.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ListenerReady {
+    #[cfg(unix)]
+    pub(crate) listener: bool,
+    #[cfg(unix)]
+    pub(crate) stop: bool,
+    #[cfg(unix)]
+    pub(crate) live: bool,
+    #[cfg(unix)]
+    pub(crate) withdrawn: bool,
+    #[cfg(unix)]
+    pub(crate) changes: bool,
+}
+
+/// Wait on the selected listener/control/validity sources until one is ready or the absolute
+/// deadline expires. `None` is an indefinite wait; interruption never resets the deadline.
+#[cfg(unix)]
 pub(crate) fn wait_listener_readable(
-    listener: &std::net::TcpListener,
-    timeout: Duration,
-) -> io::Result<bool> {
+    listener: Option<&TcpListener>,
+    stop: Option<std::os::fd::BorrowedFd<'_>>,
+    live: Option<&aterm_uds::CtlStream>,
+    withdrawn: Option<std::os::fd::BorrowedFd<'_>>,
+    changes: Option<std::os::fd::BorrowedFd<'_>>,
+    deadline: Option<Instant>,
+) -> io::Result<Option<ListenerReady>> {
     use std::os::fd::AsRawFd as _;
 
-    let started = Instant::now();
-    let mut remaining = timeout;
-    loop {
-        let mut descriptor = libc::pollfd {
-            fd: listener.as_raw_fd(),
+    let mut descriptors = Vec::with_capacity(5);
+    let mut add = |fd| {
+        let at = descriptors.len();
+        descriptors.push(libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
-        };
-        // SAFETY: `descriptor` is one initialized pollfd valid for the call; `listener` keeps its
-        // borrowed descriptor open for the whole wait.
+        });
+        at
+    };
+    let listener_at = listener.map(|socket| add(socket.as_raw_fd()));
+    let stop_at = stop.map(|fd| add(fd.as_raw_fd()));
+    let live_at = live.map(|socket| add(socket.as_raw_fd()));
+    let withdrawn_at = withdrawn.map(|fd| add(fd.as_raw_fd()));
+    let changes_at = changes.map(|fd| add(fd.as_raw_fd()));
+    if descriptors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no listener wait source",
+        ));
+    }
+    loop {
+        let timeout = deadline.map_or(-1, |at| {
+            poll_timeout_ms(at.saturating_duration_since(Instant::now()))
+        });
+        // SAFETY: at most five initialized pollfds borrow live sources for this call.
         let result = unsafe {
             libc::poll(
-                std::ptr::from_mut(&mut descriptor),
-                1,
-                poll_timeout_ms(remaining),
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout,
             )
         };
         if result >= 0 {
-            return Ok(result > 0);
+            // A saturated native timeout can end before the absolute deadline.
+            if result == 0 && deadline.is_some_and(|at| Instant::now() < at) {
+                continue;
+            }
+            return Ok((result > 0).then(|| ListenerReady {
+                listener: listener_at.is_some_and(|at| descriptors[at].revents != 0),
+                stop: stop_at.is_some_and(|at| descriptors[at].revents != 0),
+                live: live_at.is_some_and(|at| descriptors[at].revents != 0),
+                withdrawn: withdrawn_at.is_some_and(|at| descriptors[at].revents != 0),
+                changes: changes_at.is_some_and(|at| descriptors[at].revents != 0),
+            }));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-        remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Ok(false);
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Ok(None);
         }
     }
 }
 
 #[cfg(windows)]
 pub(crate) fn wait_listener_readable(
-    listener: &std::net::TcpListener,
-    timeout: Duration,
-) -> io::Result<bool> {
+    listener: Option<&TcpListener>,
+    deadline: Option<Instant>,
+) -> io::Result<Option<ListenerReady>> {
     use aterm_win32::Win32::Networking::WinSock::{
         POLLIN, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
     use std::os::windows::io::AsRawSocket as _;
 
-    let started = Instant::now();
-    let mut remaining = timeout;
+    let listener = listener
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no listener wait source"))?;
+    let mut descriptor = WSAPOLLFD {
+        fd: listener.as_raw_socket() as usize,
+        events: POLLIN,
+        revents: 0,
+    };
     loop {
-        let mut descriptor = WSAPOLLFD {
-            fd: listener.as_raw_socket() as usize,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: std initialized Winsock before it created `listener`; `descriptor` names that
-        // live borrowed socket for the duration of the call.
-        let result = unsafe {
-            WSAPoll(
-                std::ptr::from_mut(&mut descriptor),
-                1,
-                poll_timeout_ms(remaining),
-            )
-        };
+        let timeout = deadline.map_or(-1, |at| {
+            poll_timeout_ms(at.saturating_duration_since(Instant::now()))
+        });
+        // SAFETY: the initialized entry borrows the live Winsock listener for this call.
+        let result = unsafe { WSAPoll(&raw mut descriptor, 1, timeout) };
         if result != SOCKET_ERROR {
-            return Ok(result > 0);
+            // A saturated native timeout can end before the absolute deadline.
+            if result == 0 && deadline.is_some_and(|at| Instant::now() < at) {
+                continue;
+            }
+            return Ok((result > 0).then_some(ListenerReady {}));
         }
-        // SAFETY: WSAGetLastError takes no arguments and only reads that slot.
+        // SAFETY: WSAGetLastError takes no arguments and reads only the calling thread's slot.
         let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-        remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Ok(false);
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Ok(None);
         }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn wait_listener_readable(
-    _listener: &std::net::TcpListener,
+    _listener: Option<&TcpListener>,
+    _deadline: Option<Instant>,
+) -> io::Result<Option<ListenerReady>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native listener waits unavailable",
+    ))
+}
+
+/// Observe only the TCP accept queue without consuming a connection or a control hint.
+/// # Errors
+/// The timeout cannot be represented as a deadline, or the native wait fails.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) fn listener_pending_within(
+    listener: &TcpListener,
     timeout: Duration,
 ) -> io::Result<bool> {
-    std::thread::sleep(timeout);
-    Ok(false)
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "listener wait timeout is too large",
+        )
+    })?;
+    wait_listener_readable(
+        Some(listener),
+        #[cfg(unix)]
+        None,
+        #[cfg(unix)]
+        None,
+        #[cfg(unix)]
+        None,
+        #[cfg(unix)]
+        None,
+        Some(deadline),
+    )
+    .map(|ready| ready.is_some_and(|ready| ready.listener))
 }
 
 /// The address a connection is counted against ([`pick_displaced`]).
@@ -199,7 +273,14 @@ impl Slots {
             project = "slots::tests::slots_conform_to_net_slot_displacement"
         )
     )]
-    pub(crate) fn make_room(&self, source: IpAddr) -> bool {
+    pub(crate) fn make_room(
+        self: &Arc<Self>,
+        source: IpAddr,
+        stop: &aterm_uds::stop::Stop,
+    ) -> bool {
+        if stop.is_set() {
+            return false;
+        }
         let held = self.lock();
         if held.len() < self.capacity {
             return true;
@@ -221,11 +302,16 @@ impl Slots {
                 break;
             }
         }
+        let until = Instant::now() + ACCEPT_POLL;
         let (held, _) = self
             .freed
-            .wait_timeout_while(held, EVICTION_WAIT, |held| held.len() >= self.capacity)
+            .wait_timeout_while(
+                held,
+                until.saturating_duration_since(Instant::now()),
+                |held| held.len() >= self.capacity && !stop.is_set(),
+            )
             .unwrap_or_else(PoisonError::into_inner);
-        held.len() < self.capacity
+        !stop.is_set() && held.len() < self.capacity
     }
 
     /// Give connection `id`, armed with `phase`, a slot, freed when the returned tenure drops.
@@ -567,7 +653,7 @@ pub(crate) mod tests {
     use super::*;
     use aterm_spec::wait::MUST_HAPPEN;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const CAP: usize = crate::fleet::MAX_SLOTS;
@@ -590,13 +676,24 @@ pub(crate) mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
         let waiter = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
-            wait_listener_readable(&waiting_listener, TEST_WAIT)
+            wait_listener_readable(
+                Some(&waiting_listener),
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                Some(Instant::now() + TEST_WAIT),
+            )
         });
         entered_rx.recv().unwrap();
 
         let started = Instant::now();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        assert!(waiter.join().unwrap().unwrap());
+        assert!(waiter.join().unwrap().unwrap().is_some());
         let elapsed = started.elapsed();
         assert!(
             elapsed < MAX_READY_WAKE,
@@ -614,14 +711,28 @@ pub(crate) mod tests {
 
     #[test]
     fn idle_listener_readiness_wait_is_bounded_without_spinning() {
-        const TIMEOUT: Duration = Duration::from_millis(200);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let started = Instant::now();
-        assert!(!wait_listener_readable(&listener, TIMEOUT).unwrap());
+        assert!(
+            wait_listener_readable(
+                Some(&listener),
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                Some(started + ACCEPT_POLL),
+            )
+            .unwrap()
+            .is_none()
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed < MUST_HAPPEN,
-            "an idle readiness wait must end at its {TIMEOUT:?} timeout ({elapsed:?})"
+            "the explicit {ACCEPT_POLL:?} readiness deadline ends within the hang detector ({elapsed:?})"
         );
         assert_eq!(
             aterm_uds::accept(
@@ -917,7 +1028,21 @@ pub(crate) mod tests {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
-                    if !wait_listener_readable(&listener, Duration::from_millis(200)).unwrap() {
+                    if wait_listener_readable(
+                        Some(&listener),
+                        #[cfg(unix)]
+                        None,
+                        #[cfg(unix)]
+                        None,
+                        #[cfg(unix)]
+                        None,
+                        #[cfg(unix)]
+                        None,
+                        Some(Instant::now() + ACCEPT_POLL),
+                    )
+                    .unwrap()
+                    .is_none()
+                    {
                         continue;
                     }
                     while let Ok((tcp, _)) = aterm_uds::accept(
@@ -1463,7 +1588,10 @@ pub(crate) mod tests {
         let slots = Arc::new(Slots::new(CAP, GRACE));
         let mut conns: Vec<Conn> = Vec::new();
         let accept = |conns: &mut Vec<Conn>, source: IpAddr, deadline: Duration| {
-            assert!(slots.make_room(source), "a slot is free");
+            assert!(
+                slots.make_room(source, &aterm_uds::stop::Stop::new()),
+                "a slot is free"
+            );
             let peer = TcpStream::connect(addr).unwrap();
             let (tcp, _) = aterm_uds::accept(
                 &listener,
@@ -1518,7 +1646,7 @@ pub(crate) mod tests {
 
         let newcomer = std::thread::spawn({
             let slots = Arc::clone(&slots);
-            move || slots.make_room(b)
+            move || slots.make_room(b, &aterm_uds::stop::Stop::new())
         });
         until("the eviction", &|| conns[1].claim() == WD_EVICTED);
         check(&mut seen, "Evict", project(&slots, &conns, true));
@@ -1557,7 +1685,7 @@ pub(crate) mod tests {
 
         let newcomer = std::thread::spawn({
             let slots = Arc::clone(&slots);
-            move || slots.make_room(b)
+            move || slots.make_room(b, &aterm_uds::stop::Stop::new())
         });
         until("the eviction", &|| conns[2].claim() == WD_EVICTED);
         check(&mut seen, "Evict", project(&slots, &conns, true));

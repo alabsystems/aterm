@@ -34,9 +34,20 @@ struct Run {
     /// The most dials open at once from [`HANDSHAKE`] after the first contact on, when every dial
     /// the search left open has ended.
     most_open_settled: usize,
+    /// How many times the run woke to drive the hints.
+    wakes: usize,
 }
 
-/// Drive `hints` as the transport's tick does, every runtime tick for `horizon`, with every
+/// When a simulated run ([`run`]) wakes: every runtime tick, as the serving loop once did, or as
+/// it does now, at the earliest of the next beacon, the next dial's end and [`dial_due`], never
+/// sooner than a tick after the last wake (`super::super::serve_paced`'s floor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pace {
+    Tick,
+    Due,
+}
+
+/// Drive `hints` as the transport's tick does, for `horizon`, waking as `pace` says, with every
 /// endpoint in `answers` beaconing every [`BEACON`] and behaving as its answer says: a dial starts
 /// only where [`next_dial`] admits one, and each ends as its endpoint answers ([`Hints::finish`]).
 fn run(
@@ -45,13 +56,29 @@ fn run(
     pending: bool,
     horizon: Duration,
 ) -> Run {
+    run_paced(hints, answers, pending, horizon, Pace::Tick)
+}
+
+/// [`run`], waking as `pace` says.
+fn run_paced(
+    hints: &mut Hints,
+    answers: &BTreeMap<SocketAddr, Answer>,
+    pending: bool,
+    horizon: Duration,
+    pace: Pace,
+) -> Run {
     let start = Instant::now();
     let mut dial = start;
     let mut beacon = start;
     let mut open: Vec<(SocketAddr, Instant)> = Vec::new();
     let mut run = Run::default();
     let mut now = start;
+    let ends = |(address, started): &(SocketAddr, Instant)| match answers[address] {
+        Answer::After(within) => *started + within,
+        Answer::Never => *started + HANDSHAKE,
+    };
     while now <= start + horizon {
+        run.wakes += 1;
         if now >= beacon {
             for (n, address) in answers.keys().enumerate() {
                 let wire = Hints::new([n as u8 + 10; 32]).wire(address.port());
@@ -59,10 +86,6 @@ fn run(
             }
             beacon = now + BEACON;
         }
-        let ends = |(address, started): &(SocketAddr, Instant)| match answers[address] {
-            Answer::After(within) => *started + within,
-            Answer::Never => *started + HANDSHAKE,
-        };
         let (ended, still): (Vec<_>, Vec<_>) = open.into_iter().partition(|dial| ends(dial) <= now);
         open = still;
         for (address, started) in ended {
@@ -80,17 +103,18 @@ fn run(
             let (repair, outcome) = outcome;
             hints.finish(address, repair, outcome, now);
         }
-        let dialing: Vec<_> = open
-            .iter()
-            .map(|(address, _)| (address, answers[address]))
-            .zip(&open)
-            .map(|((address, answer), (_, started))| Dialing {
-                started: *started,
-                established: hints.established(*address),
-                heard: matches!(answer, Answer::After(_)),
-            })
-            .collect();
-        if let Some((address, _)) = next_dial(hints, &dialing, pending, &mut dial, now) {
+        let dialing = |hints: &Hints, open: &[(SocketAddr, Instant)]| -> Vec<_> {
+            open.iter()
+                .map(|(address, started)| Dialing {
+                    started: *started,
+                    established: hints.established(*address),
+                    heard: matches!(answers[address], Answer::After(_)),
+                })
+                .collect()
+        };
+        if let Some((address, _)) =
+            next_dial(hints, &dialing(hints, &open), pending, &mut dial, now)
+        {
             open.push((address, now));
             run.starts.push((now - start, address));
         }
@@ -101,7 +125,19 @@ fn run(
         {
             run.most_open_settled = run.most_open_settled.max(open.len());
         }
-        now += super::super::TICK;
+        let floor = now + super::super::TICK;
+        now = match pace {
+            Pace::Tick => floor,
+            Pace::Due => [
+                Some(beacon),
+                open.iter().map(ends).min(),
+                dial_due(hints, &dialing(hints, &open), pending, dial, now),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(floor, |due| due.max(floor)),
+        };
     }
     run
 }
@@ -269,4 +305,86 @@ fn dial_room_places_rounds_and_staggering_dials() {
     // Parked dials count against the bound.
     assert_eq!(dial_room(&[parked; DIALS], false, false, now), None);
     assert_eq!(dial_room(&[parked; DIALS], true, false, now), None);
+}
+
+/// The serving loop that wakes only by its deadlines ([`dial_due`], [`Pace::Due`]) keeps every
+/// CR2 law the ticking loop keeps, on the same endpoints: slow endpoints delay first contact by at
+/// most a stagger each, dials stay within their bound and their spacing, and a node that found its
+/// peer runs one discovery dial at a time while its peer's rounds go on; and it wakes for a
+/// fraction of the ticks. Counted on an injected clock, never timed.
+///
+/// NEGATIVE CONTROLS (2026-11-09), each planted in [`dial_due`]: with no deadline where
+/// [`dial_room`] leaves no room (the stagger's parking ignored), two slow endpoints delayed first
+/// contact to the next beacon (`delayed first contact to 5.05s`); with no deadline from
+/// [`Hints::next_dial_at`] (`None`), to the beacon after it (`10.05s`).
+#[test]
+fn a_loop_woken_by_its_dial_deadlines_keeps_the_stagger_laws() {
+    for slow in [ROUNDS as u8, DIALS as u8 - 1] {
+        let answers = behind(slow, Duration::from_millis(50));
+        let horizon = 4 * HANDSHAKE;
+        let run = run_paced(
+            &mut Hints::new([1; 32]),
+            &answers,
+            false,
+            horizon,
+            Pace::Due,
+        );
+        let contact = run.contact.expect("the peer is reached within the run");
+        assert!(
+            contact <= STAGGER * u32::from(slow) + Duration::from_millis(50),
+            "{slow} slow endpoints delayed first contact to {contact:?}"
+        );
+        let ticks = run_paced(
+            &mut Hints::new([1; 32]),
+            &answers,
+            false,
+            horizon,
+            Pace::Tick,
+        )
+        .wakes;
+        assert!(
+            run.wakes * 4 < ticks,
+            "{} wakes beside {ticks} ticks",
+            run.wakes
+        );
+    }
+    for pending in [false, true] {
+        let answers: BTreeMap<_, _> = (1..=50u8)
+            .map(|n| (SocketAddr::from(([10, 1, 1, n], 4000)), Answer::Never))
+            .collect();
+        let run = run_paced(
+            &mut Hints::new([1; 32]),
+            &answers,
+            pending,
+            Duration::from_secs(180),
+            Pace::Due,
+        );
+        assert_eq!(run.most_open, DIALS, "pending={pending}: {run:?}");
+        assert!(
+            run.starts
+                .windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 >= SPACING),
+            "dials closer than the spacing: {:?}",
+            run.starts
+        );
+    }
+    let peer = SocketAddr::from(([10, 1, 0, 9], 4000));
+    let mut answers = behind(30, Duration::from_secs(2));
+    answers.remove(&SocketAddr::from(([10, 1, 9, 9], 4000)));
+    answers.insert(peer, Answer::After(Duration::from_secs(2)));
+    let run = run_paced(
+        &mut Hints::new([1; 32]),
+        &answers,
+        false,
+        Duration::from_secs(300),
+        Pace::Due,
+    );
+    let contact = run.contact.expect("the peer is reached");
+    assert!(run.most_open_settled <= ROUNDS + 1, "{run:?}");
+    let rounds = run
+        .starts
+        .iter()
+        .filter(|(at, address)| *address == peer && *at > contact)
+        .count();
+    assert!(rounds >= 20, "the peer's rounds went on: {rounds} in 300 s");
 }

@@ -6371,15 +6371,43 @@ fn linked_keg_version(prefix: &Prefix, i: &Installed) -> Option<String> {
 // Brew's run order: alphabetical, with the two slow checks last.
 const DOCTOR_CHECKS: &[&str] = &[
     "check_access_directories",
+    "check_brew_git_origin",
     "check_brew_path",
+    "check_cask_corrupt_dirs",
     "check_cask_deprecated_disabled",
+    "check_cask_environment_variables",
+    "check_cask_install_location",
+    "check_cask_load_path",
+    "check_cask_quarantine_support",
+    "check_cask_software_versions",
+    "check_cask_staging_location",
+    "check_cask_taps",
+    "check_cask_xattr",
+    "check_casktap_integrity",
+    "check_clt_minimum_version",
+    "check_clt_up_to_date",
+    "check_coretap_integrity",
     "check_dangling_pins",
     "check_deleted_formula",
     "check_deprecated_cask_taps",
     "check_deprecated_disabled",
     "check_deprecated_official_taps",
-    "check_brew_git_origin",
     "check_exist_directories",
+    "check_filesystem_case_sensitive",
+    "check_for_broken_symlinks",
+    "check_for_duplicate_casks",
+    "check_for_duplicate_formulae",
+    "check_for_emudhra_certificates",
+    "check_for_external_cmd_name_conflict",
+    "check_for_gettext",
+    "check_for_git",
+    "check_for_iconv",
+    "check_for_installed_developer_tools",
+    "check_for_multiple_volumes",
+    "check_for_nix_homebrew",
+    "check_for_non_prefixed_coreutils",
+    "check_for_non_prefixed_findutils",
+    "check_for_other_frameworks",
     "check_for_pydistutils_cfg_in_home",
     "check_for_stray_dylibs",
     "check_for_stray_headers",
@@ -6387,29 +6415,37 @@ const DOCTOR_CHECKS: &[&str] = &[
     "check_for_stray_pcs",
     "check_for_stray_static_libs",
     "check_for_symlinked_cellar",
-    "check_for_git",
-    "check_filesystem_case_sensitive",
-    "check_for_gettext",
-    "check_for_iconv",
-    "check_for_non_prefixed_coreutils",
-    "check_for_non_prefixed_findutils",
+    "check_for_tap_ruby_files_locations",
     "check_for_unlinked_but_not_keg_only",
     "check_for_unnecessary_cask_tap",
     "check_for_unnecessary_core_tap",
-    "check_homebrew_prefix",
+    "check_for_unsupported_macos",
     "check_git_newline_settings",
+    "check_git_status",
     "check_git_version",
+    "check_github_api_tokens",
+    "check_homebrew_prefix",
+    "check_homebrew_repository_git_hooks",
+    "check_if_supported_sdk_available",
+    "check_if_xcode_needs_clt_installed",
     "check_install_receipts",
+    "check_missing_deps",
+    "check_multiple_cellars",
+    "check_pkgconf_macos_sdk_mismatch",
+    "check_tap_git_branch",
     "check_tmpdir",
     "check_tmpdir_sticky_bit",
+    "check_tools",
     "check_untrusted_taps",
     "check_user_path_1",
     "check_user_path_2",
     "check_user_path_3",
-    "check_for_broken_symlinks",
-    "check_github_api_tokens",
-    "check_missing_deps",
-    "check_multiple_cellars",
+    "check_xcode_license_approved",
+    "check_xcode_minimum_version",
+    "check_xcode_prefix",
+    "check_xcode_prefix_exists",
+    "check_xcode_select_path",
+    "check_xcode_up_to_date",
 ];
 
 /// Ruby `Shellwords.shellescape` as brew's `Utils::Shell.sh_quote`
@@ -6636,12 +6672,16 @@ fn stray_files(dir: &str, pattern: &str, allow: &[&str], verbose: bool) -> Vec<S
     if !root.is_dir() {
         return Vec::new();
     }
-    fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+    fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>, recurse: bool) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Ruby's Dir.glob never matches dotfiles by default.
+            if name.starts_with('.') {
+                continue;
+            }
             let rel = if rel.is_empty() {
                 name.clone()
             } else {
@@ -6654,14 +6694,16 @@ fn stray_files(dir: &str, pattern: &str, allow: &[&str], verbose: bool) -> Vec<S
                 continue;
             }
             if meta.is_dir() {
-                walk(&entry.path(), &rel, out);
+                if recurse {
+                    walk(&entry.path(), &rel, out, recurse);
+                }
             } else if meta.is_file() {
                 out.push(rel);
             }
         }
     }
     let mut rels: Vec<String> = Vec::new();
-    walk(root, "", &mut rels);
+    walk(root, "", &mut rels, pattern.contains("**"));
     let mut hits: Vec<String> = rels
         .into_iter()
         .filter(|rel| glob_match(pattern, rel))
@@ -6881,6 +6923,651 @@ fn gnubin_on_path(prefix: &Prefix, name: &str, paths: &[String]) -> bool {
             .to_string(),
     ];
     paths.iter().any(|entry| candidates.contains(entry))
+}
+
+/// brew `GitRepository.branch_name` (None outside a repo).
+fn git_branch_name(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).join(".git").exists() {
+        return None;
+    }
+    let refname = git_capture(
+        &["-C", path, "rev-parse", "--symbolic-full-name", "HEAD"],
+        false,
+    )?;
+    let refname = refname.trim();
+    if refname.is_empty() {
+        return None;
+    }
+    if refname == "HEAD" {
+        return Some("HEAD".to_string());
+    }
+    refname.strip_prefix("refs/heads/").map(str::to_owned)
+}
+
+/// brew `GitRepository.origin_branch_name`.
+fn git_origin_branch_name(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).join(".git").exists() {
+        return None;
+    }
+    let refname = git_capture(
+        &["-C", path, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+        false,
+    )?;
+    let refname = refname.trim();
+    if refname.is_empty() {
+        return None;
+    }
+    refname
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_owned)
+}
+
+/// Whether `path` is a regular executable file (not a symlink
+/// check: brew's `File.file?` follows links).
+fn executable_regular_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// brew `Diagnostic.user_tilde`.
+fn user_tilde(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if path == home {
+        "~".to_string()
+    } else if !home.is_empty()
+        && let Some(rest) = path.strip_prefix(&format!("{home}/"))
+    {
+        format!("~/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+/// brew `Utils.pluralize(word, count)` without the count.
+fn pluralize(word: &str, count: usize) -> String {
+    if count == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+/// Caskroom token dirs without `.metadata/*/*/Casks/*.{rb,json}`
+/// (brew `Cask::Caskroom.corrupt_cask_dirs`).
+fn corrupt_cask_dirs(prefix: &Prefix) -> Vec<String> {
+    let room = prefix.root.join("Caskroom");
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&room) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let mut has_metadata = false;
+        'outer: for version in std::fs::read_dir(path.join(".metadata"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Ok(stamps) = std::fs::read_dir(version.path()) else {
+                continue;
+            };
+            for stamp in stamps.flatten() {
+                let casks = stamp.path().join("Casks");
+                if let Ok(files) = std::fs::read_dir(&casks)
+                    && files.flatten().any(|f| {
+                        f.path()
+                            .extension()
+                            .is_some_and(|x| x == "rb" || x == "json")
+                    })
+                {
+                    has_metadata = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !has_metadata {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// brew `Diagnostic.examine_git_origin`.
+fn examine_git_origin(repo_path: &std::path::Path, desired: &str) -> Option<DoctorFinding> {
+    if git_version().is_none() || !repo_path.join(".git").exists() {
+        return None;
+    }
+    let desired_remote = |url: &str| {
+        super::trust::same_remote(url, desired)
+            || [desired, &format!("{desired}.git"), &format!("{desired}/")]
+                .iter()
+                .any(|cand| url.eq_ignore_ascii_case(cand))
+    };
+    let repo = repo_path.display().to_string();
+    let current = origin_url_from_config(repo_path).or_else(|| {
+        git_capture(
+            &[
+                "-C",
+                repo.as_str(),
+                "config",
+                "--local",
+                "--get",
+                "remote.origin.url",
+            ],
+            true,
+        )
+        .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
+        .filter(|v| !v.is_empty())
+    });
+    if current.as_deref().is_some_and(desired_remote) {
+        return None;
+    }
+    let remotes = git_capture(&["-C", repo.as_str(), "remote", "-v"], false).unwrap_or_default();
+    let mut other: Option<(String, String)> = None;
+    for line in remotes.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(url), Some(dir)) = (parts.next(), parts.next(), parts.next())
+            && name != "origin"
+            && dir == "(fetch)"
+            && desired_remote(url)
+        {
+            other = Some((name.to_string(), url.to_string()));
+            break;
+        }
+    }
+    match (&current, &other) {
+        (None, _) => Some(
+            DoctorFinding::new(format!(
+                "Missing {desired} git origin remote.\n\nWithout a correctly configured origin, Homebrew won't update properly.\n",
+            ))
+            .with_remediation(
+                vec![format!("git -C \"{repo}\" remote add origin {desired}")],
+                format!(
+                    "You can solve this by adding the remote:\n  git -C \"{repo}\" remote add origin {}\n",
+                    super::tty::url(desired)
+                ),
+            ),
+        ),
+        (Some(cur), Some((name, url))) => Some(
+            DoctorFinding::new(format!(
+                "The current git origin is:\n  {cur}\nbut the `{name}` remote is:\n  {url}\n\nWith a non-standard origin, Homebrew won't update properly\nand `--changed` options compare against the wrong branch.\n",
+            ))
+            .with_remediation(
+                vec![
+                    format!("git -C \"{repo}\" remote rename origin fork"),
+                    format!("git -C \"{repo}\" remote rename {name} origin"),
+                ],
+                format!(
+                    "You can solve this by renaming the remotes:\n  git -C \"{repo}\" remote rename origin fork\n  git -C \"{repo}\" remote rename {name} origin\n",
+                ),
+            ),
+        ),
+        (Some(cur), None) => Some(
+            DoctorFinding::new(format!(
+                "The current git origin is:\n  {cur}\n\nWith a non-standard origin, Homebrew won't update properly.\n",
+            ))
+            .with_remediation(
+                vec![format!("git -C \"{repo}\" remote set-url origin {desired}")],
+                format!(
+                    "You can solve this by setting the origin remote:\n  git -C \"{repo}\" remote set-url origin {}\n",
+                    super::tty::url(desired)
+                ),
+            ),
+        ),
+    }
+}
+
+/// brew `Diagnostic.broken_tap` for tap at `tap_path` whose
+/// full name is `full_name` and short name `name`.
+fn broken_tap(
+    prefix: &Prefix,
+    tap_path: &std::path::Path,
+    full_name: &str,
+    name: &str,
+) -> Option<DoctorFinding> {
+    if git_version().is_none() || !prefix.root.join(".git").exists() {
+        return None;
+    }
+    let commands = vec![
+        format!("rm -rf \"{}\"", tap_path.display()),
+        format!("brew tap {name}"),
+    ];
+    let finding = DoctorFinding::new(format!("{full_name} was not tapped properly!"))
+        .with_remediation(
+            commands.clone(),
+            append_indented_list(&commands, "You can solve this by tapping again:\n"),
+        );
+    let tap_str = tap_path.display().to_string();
+    let remote = origin_url_from_config(tap_path).or_else(|| {
+        git_capture(
+            &[
+                "-C",
+                tap_str.as_str(),
+                "config",
+                "--local",
+                "--get",
+                "remote.origin.url",
+            ],
+            true,
+        )
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    });
+    if remote.is_none() {
+        return Some(finding);
+    }
+    let head = |path: &str| {
+        git_capture(
+            &["-C", path, "rev-parse", "--verify", "--quiet", "HEAD"],
+            false,
+        )
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    };
+    let tap_head = head(&tap_str);
+    if tap_head.is_none() {
+        return Some(finding);
+    }
+    if tap_head != head(&prefix.root.display().to_string()) {
+        return None;
+    }
+    Some(finding)
+}
+
+/// brew `MacOS.active_developer_dir` (`xcode-select -print-path`).
+fn active_developer_dir() -> String {
+    super::fetch::run_capture("/usr/bin/xcode-select", &["-print-path"])
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// brew `MacOS::Xcode.bundle_path`: the default app, else
+/// Spotlight's answer for the Xcode bundle id.
+fn xcode_bundle_path() -> Option<std::path::PathBuf> {
+    let default = std::path::Path::new("/Applications/Xcode.app");
+    if default.exists() {
+        return Some(default.to_path_buf());
+    }
+    for id in ["com.apple.dt.Xcode", "com.apple.Xcode"] {
+        if let Ok(out) = super::fetch::run_capture(
+            "/usr/bin/mdfind",
+            &[&format!("kMDItemCFBundleIdentifier == '{id}'")],
+        ) {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().next()
+                && !line.is_empty()
+            {
+                return Some(std::path::PathBuf::from(line));
+            }
+        }
+    }
+    None
+}
+
+/// brew `MacOS::Xcode.prefix`.
+fn xcode_prefix() -> Option<String> {
+    let dir = active_developer_dir();
+    if dir.is_empty()
+        || dir == "/Library/Developer/CommandLineTools"
+        || !std::path::Path::new(&dir).is_dir()
+    {
+        xcode_bundle_path().map(|p| p.join("Contents/Developer").display().to_string())
+    } else {
+        Some(dir.trim_end_matches('/').to_string())
+    }
+}
+
+/// brew `MacOS::CLT.installed?`.
+fn clt_installed() -> bool {
+    std::path::Path::new("/Library/Developer/CommandLineTools/usr/bin/clang").exists()
+}
+
+/// brew `MacOS::CLT.version` (pkgutil receipt version).
+fn clt_version() -> Option<String> {
+    if !clt_installed() {
+        return None;
+    }
+    let out = super::fetch::run_capture(
+        "/usr/sbin/pkgutil",
+        &["--pkg-info=com.apple.pkg.CLTools_Executables"],
+    )
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("version: "))
+        .map(|v| v.trim().to_string())
+}
+
+/// brew `MacOS::CLT.detect_clang_version`.
+fn clt_clang_version() -> Option<String> {
+    let out = super::fetch::run_capture(
+        "/Library/Developer/CommandLineTools/usr/bin/clang",
+        &["--version"],
+    )
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let idx = text.find("clang-")? + "clang-".len();
+    let version: String = text[idx..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version)
+}
+
+/// The macOS major version string brew keys its tables on.
+fn macos_major_string() -> String {
+    super::machine::Machine::this()
+        .macos_version()
+        .map(|v| v.split('.').next().unwrap_or(v).to_string())
+        .unwrap_or_default()
+}
+
+/// brew `MacOS::Xcode.latest_version`.
+fn xcode_latest_version() -> String {
+    let arm = cfg!(target_arch = "aarch64");
+    match macos_major_string().as_str() {
+        "27" => "27.0".to_string(),
+        "26" => if arm { "27.0" } else { "26.6" }.to_string(),
+        "15" => "26.3".to_string(),
+        "14" => "16.2".to_string(),
+        "13" => "15.2".to_string(),
+        "12" => "14.2".to_string(),
+        "11" => "13.2.1".to_string(),
+        other => format!("{other}.0"),
+    }
+}
+
+/// brew `MacOS::Xcode.minimum_version`.
+fn xcode_minimum_version() -> String {
+    match macos_major_string().as_str() {
+        "15" => "16.0".to_string(),
+        "14" => "15.0".to_string(),
+        "13" => "14.1".to_string(),
+        "12" => "13.1".to_string(),
+        "11" => "12.2".to_string(),
+        other => format!("{other}.0"),
+    }
+}
+
+/// brew `MacOS::CLT.latest_version`.
+fn clt_latest_version() -> String {
+    match macos_major_string().as_str() {
+        "13" => "15.1".to_string(),
+        "11" => "13.2".to_string(),
+        _ => xcode_latest_version(),
+    }
+}
+
+/// brew `MacOS::CLT.minimum_version`.
+fn clt_minimum_version() -> String {
+    match macos_major_string().as_str() {
+        "15" => "16.0.0".to_string(),
+        "14" => "15.0.0".to_string(),
+        "13" => "14.0.0".to_string(),
+        "12" => "13.0.0".to_string(),
+        "11" => "12.5.0".to_string(),
+        other => format!("{other}.0.0"),
+    }
+}
+
+/// brew `MacOS::CLT.latest_clang_version`.
+fn clt_latest_clang_version() -> String {
+    match macos_major_string().as_str() {
+        "27" => "2100.3.34.2".to_string(),
+        "26" => if cfg!(target_arch = "aarch64") {
+            "2100.3.34.2"
+        } else {
+            "2100.1.1.101"
+        }
+        .to_string(),
+        "15" => "1700.6.4.2".to_string(),
+        "14" => "1600.0.26.6".to_string(),
+        "13" => "1500.1.0.2.5".to_string(),
+        "12" => "1400.0.29.202".to_string(),
+        _ => "1300.0.29.30".to_string(),
+    }
+}
+
+/// brew `OS::Mac.version.prerelease?` (newest unsupported = 28).
+fn macos_prerelease() -> bool {
+    macos_major_string().parse::<u64>().is_ok_and(|m| m >= 28)
+}
+
+/// brew `MacOS::Xcode.update_instructions`.
+fn xcode_update_instructions() -> String {
+    if macos_prerelease() {
+        format!(
+            "Xcode can be updated from:\n  {}\n",
+            super::tty::url("https://developer.apple.com/download/all/")
+        )
+    } else {
+        "Xcode can be updated from the App Store.\n".to_string()
+    }
+}
+
+/// brew `MacOS::CLT.installation_instructions`.
+fn clt_installation_instructions() -> String {
+    if macos_prerelease() {
+        format!(
+            "Install the Command Line Tools for Xcode {} from:\n  {}\n",
+            clt_minimum_version().split('.').next().unwrap_or_default(),
+            super::tty::url("https://developer.apple.com/download/all/")
+        )
+    } else {
+        "Install the Command Line Tools:\n  xcode-select --install\n".to_string()
+    }
+}
+
+/// brew `MacOS::CLT.update_instructions`.
+fn clt_update_instructions() -> String {
+    let location = if dotted_version_cmp(&macos_major_string(), "13") != std::cmp::Ordering::Less {
+        "System Settings"
+    } else {
+        "System Preferences"
+    };
+    format!(
+        "Update them from Software Update in {location}.\n\nIf that doesn't show you any updates, run:\n  sudo rm -rf /Library/Developer/CommandLineTools\n  sudo xcode-select --install\n\nAlternatively, manually download them from:\n  {}.\nYou should download the Command Line Tools for Xcode {}.\n",
+        super::tty::url("https://developer.apple.com/download/all/"),
+        clt_latest_version()
+    )
+}
+
+/// Whether the GitHub Actions env is present (brew's
+/// `GitHub::Actions.env_set?`).
+fn github_actions_env() -> bool {
+    std::env::var_os("GITHUB_ACTIONS").is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+}
+
+/// brew `MacOSVersion.pretty_name`.
+fn macos_pretty_name() -> String {
+    match super::machine::current_os_symbol().as_str() {
+        "golden_gate" => "Golden Gate",
+        "tahoe" => "Tahoe",
+        "sequoia" => "Sequoia",
+        "sonoma" => "Sonoma",
+        "ventura" => "Ventura",
+        "monterey" => "Monterey",
+        "big_sur" => "Big Sur",
+        "catalina" => "Catalina",
+        "mojave" => "Mojave",
+        "high_sierra" => "High Sierra",
+        "sierra" => "Sierra",
+        "el_capitan" => "El Capitan",
+        _ => "Dunno",
+    }
+    .to_string()
+}
+
+/// The newest SDK version in the active SDK root (brew's
+/// `MacOS.latest_sdk_version`, name-parsed).
+fn newest_sdk_version() -> Option<String> {
+    let root = if clt_installed() {
+        "/Library/Developer/CommandLineTools/SDKs".to_string()
+    } else {
+        format!("{}/SDKs", xcode_prefix()?)
+    };
+    let entries = std::fs::read_dir(&root).ok()?;
+    let mut best: Option<String> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        let name = resolved.file_name()?.to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("MacOSX") else {
+            continue;
+        };
+        let Some(version) = rest.strip_suffix(".sdk") else {
+            continue;
+        };
+        if version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let version = if version.contains('.') {
+            version.to_string()
+        } else {
+            format!("{version}.0")
+        };
+        if best
+            .as_deref()
+            .is_none_or(|b| dotted_version_cmp(&version, b) == std::cmp::Ordering::Greater)
+        {
+            best = Some(version);
+        }
+    }
+    best
+}
+
+/// Whether a working `xattr` exists (brew
+/// `Cask::Quarantine.xattr_available?`): locate it and run `-h`.
+fn xattr_available() -> bool {
+    let candidates = [std::path::PathBuf::from("/usr/bin/xattr")];
+    candidates.iter().any(|path| {
+        path.exists()
+            && super::fetch::run_capture(&path.display().to_string(), &["-h"])
+                .is_ok_and(|out| out.status.success())
+    })
+}
+
+/// brew `OS::Mac.version.outdated_release?` (oldest supported 15).
+fn macos_outdated_release() -> bool {
+    macos_major_string().parse::<u64>().is_ok_and(|m| m < 15)
+}
+
+/// Read one DER TLV at `pos`: (tag, content_range, next_pos).
+fn der_tlv(bytes: &[u8], pos: usize) -> Option<(u8, std::ops::Range<usize>, usize)> {
+    let tag = *bytes.get(pos)?;
+    let mut idx = pos + 1;
+    let first_len = *bytes.get(idx)?;
+    idx += 1;
+    let len = if first_len & 0x80 == 0 {
+        usize::from(first_len)
+    } else {
+        let count = usize::from(first_len & 0x7f);
+        if count == 0 || count > 4 || idx + count > bytes.len() {
+            return None;
+        }
+        let mut value = 0usize;
+        for i in 0..count {
+            value = (value << 8) | usize::from(bytes[idx + i]);
+        }
+        idx += count;
+        value
+    };
+    let end = idx.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some((tag, idx..end, end))
+}
+
+/// Subject CNs of one DER certificate (minimal X.509 walk:
+/// Certificate → TBSCertificate → [version] serial issuer validity
+/// subject → RDNSequence sets of (OID, value)).
+fn cert_subject_cns(der: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some((0x30, outer, _)) = der_tlv(der, 0) else {
+        return out;
+    };
+    let Some((0x30, tbs, _)) = der_tlv(der, outer.start) else {
+        return out;
+    };
+    let mut pos = tbs.start;
+    // Optional explicit version [0].
+    if let Some((0xa0, _, next)) = der_tlv(der, pos) {
+        pos = next;
+    }
+    // serial, signature, issuer, validity
+    for _ in 0..4 {
+        let Some((_, _, next)) = der_tlv(der, pos) else {
+            return out;
+        };
+        pos = next;
+    }
+    let Some((0x30, subject, _)) = der_tlv(der, pos) else {
+        return out;
+    };
+    let mut set_pos = subject.start;
+    while set_pos < subject.end {
+        let Some((0x31, set, next)) = der_tlv(der, set_pos) else {
+            break;
+        };
+        set_pos = next;
+        let mut atv_pos = set.start;
+        while atv_pos < set.end {
+            let Some((0x30, atv, next)) = der_tlv(der, atv_pos) else {
+                break;
+            };
+            atv_pos = next;
+            let Some((0x06, oid, next)) = der_tlv(der, atv.start) else {
+                continue;
+            };
+            if der[oid] == [0x55, 0x04, 0x03]
+                && let Some((_, value, _)) = der_tlv(der, next)
+            {
+                out.push(String::from_utf8_lossy(&der[value]).into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Base64-decode a PEM block body with this workspace's codec.
+fn pem_der(body: &str) -> Option<Vec<u8>> {
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    aterm_codec::base64::decode(&compact).ok()
+}
+
+/// The portable-ruby path brew's doctor prints in the emudhra
+/// remediation: the versioned vendor ruby when present.
+fn portable_ruby_path(prefix: &Prefix) -> String {
+    let vendor = prefix.root.join("Library/Homebrew/vendor/portable-ruby");
+    if let Ok(entries) = std::fs::read_dir(&vendor) {
+        let mut candidates: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path().join("bin/ruby").display().to_string())
+            .collect();
+        candidates.sort();
+        if let Some(first) = candidates.into_iter().next() {
+            return first;
+        }
+    }
+    vendor.join("current/bin/ruby").display().to_string()
 }
 
 /// brew `Utils::Text.to_sentence`.
@@ -7768,16 +8455,17 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     let named = operands(rest);
     let wanted: Vec<&str> = if named.is_empty() {
         // Brew drops cask checks from a full run when no
-        // casks are installed.
-        if prefix.installed(Kind::Cask).is_empty() {
-            DOCTOR_CHECKS
-                .iter()
-                .copied()
-                .filter(|c| !c.starts_with("check_cask_"))
-                .collect()
-        } else {
-            DOCTOR_CHECKS.to_vec()
-        }
+        // casks are installed, and runs the two slow checks
+        // last.
+        let slow = ["check_for_broken_symlinks", "check_missing_deps"];
+        let any_casks = !prefix.installed(Kind::Cask).is_empty();
+        let mut ordered: Vec<&str> = DOCTOR_CHECKS
+            .iter()
+            .copied()
+            .filter(|c| !slow.contains(c) && (any_casks || !c.starts_with("check_cask_")))
+            .collect();
+        ordered.extend(slow.iter().filter(|c| DOCTOR_CHECKS.contains(c)));
+        ordered
     } else {
         named.iter().map(String::as_str).collect()
     };
@@ -7800,6 +8488,7 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     };
 
     let mut findings: Vec<DoctorFinding> = Vec::new();
+    let mut infos: Vec<String> = Vec::new();
     let mut unknown_check = false;
     for check in wanted {
         match check {
@@ -8621,102 +9310,12 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 }
             }
             "check_brew_git_origin" => {
-                let repo_path = prefix.root.clone();
-                if git_version().is_some() && repo_path.join(".git").exists() {
-                    let desired = std::env::var("HOMEBREW_BREW_GIT_REMOTE")
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| "https://github.com/Homebrew/brew".to_string());
-                    let desired_remote = |url: &str| {
-                        super::trust::same_remote(url, &desired)
-                            || [
-                                desired.as_str(),
-                                &format!("{desired}.git"),
-                                &format!("{desired}/"),
-                            ]
-                            .iter()
-                            .any(|cand| url.eq_ignore_ascii_case(cand))
-                    };
-                    let repo = repo_path.display().to_string();
-                    let current = origin_url_from_config(&repo_path).or_else(|| {
-                        git_capture(
-                            &[
-                                "-C",
-                                repo.as_str(),
-                                "config",
-                                "--local",
-                                "--get",
-                                "remote.origin.url",
-                            ],
-                            true,
-                        )
-                        .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
-                        .filter(|v| !v.is_empty())
-                    });
-                    if !current.as_deref().is_some_and(desired_remote) {
-                        let remotes = git_capture(&["-C", repo.as_str(), "remote", "-v"], false)
-                            .unwrap_or_default();
-                        let mut other: Option<(String, String)> = None;
-                        for line in remotes.lines() {
-                            let mut parts = line.split_whitespace();
-                            if let (Some(name), Some(url), Some(dir)) =
-                                (parts.next(), parts.next(), parts.next())
-                                && name != "origin"
-                                && dir == "(fetch)"
-                                && desired_remote(url)
-                            {
-                                other = Some((name.to_string(), url.to_string()));
-                                break;
-                            }
-                        }
-                        let finding = match (&current, &other) {
-                            (None, _) => Some(
-                                DoctorFinding::new(format!(
-                                    "Missing {desired} git origin remote.\n\nWithout a correctly configured origin, Homebrew won't update properly.\n",
-                                ))
-                                .with_remediation(
-                                    vec![format!(
-                                        "git -C \"{repo}\" remote add origin {desired}"
-                                    )],
-                                    format!(
-                                        "You can solve this by adding the remote:\n  git -C \"{repo}\" remote add origin {}\n",
-                                        super::tty::url(&desired)
-                                    ),
-                                ),
-                            ),
-                            (Some(cur), Some((name, url))) => Some(
-                                DoctorFinding::new(format!(
-                                    "The current git origin is:\n  {cur}\nbut the `{name}` remote is:\n  {url}\n\nWith a non-standard origin, Homebrew won't update properly\nand `--changed` options compare against the wrong branch.\n",
-                                ))
-                                .with_remediation(
-                                    vec![
-                                        format!("git -C \"{repo}\" remote rename origin fork"),
-                                        format!("git -C \"{repo}\" remote rename {name} origin"),
-                                    ],
-                                    format!(
-                                        "You can solve this by renaming the remotes:\n  git -C \"{repo}\" remote rename origin fork\n  git -C \"{repo}\" remote rename {name} origin\n",
-                                    ),
-                                ),
-                            ),
-                            (Some(cur), None) => Some(
-                                DoctorFinding::new(format!(
-                                    "The current git origin is:\n  {cur}\n\nWith a non-standard origin, Homebrew won't update properly.\n",
-                                ))
-                                .with_remediation(
-                                    vec![format!(
-                                        "git -C \"{repo}\" remote set-url origin {desired}"
-                                    )],
-                                    format!(
-                                        "You can solve this by setting the origin remote:\n  git -C \"{repo}\" remote set-url origin {}\n",
-                                        super::tty::url(&desired)
-                                    ),
-                                ),
-                            ),
-                        };
-                        if let Some(finding) = finding {
-                            findings.push(finding);
-                        }
-                    }
+                let desired = std::env::var("HOMEBREW_BREW_GIT_REMOTE")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "https://github.com/Homebrew/brew".to_string());
+                if let Some(finding) = examine_git_origin(&prefix.root, &desired) {
+                    findings.push(finding);
                 }
             }
             "check_filesystem_case_sensitive" => {
@@ -8864,6 +9463,1081 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                     }
                 }
             }
+            "check_for_duplicate_formulae" | "check_for_duplicate_casks" => {
+                // Brew 7 initializes `@non_core_taps` to `[]` in
+                // Diagnostic::Checks#initialize, so its `||=`
+                // never populates it and both duplicate checks
+                // are dead upstream (verified against the oracle
+                // with a shadowing tap). Match that reality.
+            }
+            "check_git_status" => {
+                if git_version().is_some() {
+                    let taps = super::tap::list(prefix);
+                    let tap_path = |repo: &str| {
+                        taps.iter()
+                            .find(|t| t.user.eq_ignore_ascii_case("homebrew") && t.repo == repo)
+                            .map(|t| t.path.clone())
+                            .unwrap_or_else(|| {
+                                prefix
+                                    .root
+                                    .join(format!("Library/Taps/homebrew/homebrew-{repo}"))
+                            })
+                    };
+                    let repos: [(&str, std::path::PathBuf); 3] = [
+                        ("Homebrew/brew", prefix.root.clone()),
+                        ("Homebrew/homebrew-core", tap_path("core")),
+                        ("Homebrew/homebrew-cask", tap_path("cask")),
+                    ];
+                    for (name, path) in repos {
+                        if !path.exists() {
+                            continue;
+                        }
+                        let path_str = path.display().to_string();
+                        let status = git_capture(
+                            &[
+                                "-C",
+                                path_str.as_str(),
+                                "status",
+                                "--untracked-files=all",
+                                "--porcelain",
+                            ],
+                            false,
+                        )
+                        .unwrap_or_default();
+                        if status.trim().is_empty() {
+                            continue;
+                        }
+                        let modified: Vec<String> =
+                            status.lines().map(|l| l.trim().to_string()).collect();
+                        let mut message =
+                            format!("You have uncommitted modifications to {name}.\n");
+                        message
+                            .push_str(&append_indented_list(&modified, "Uncommitted files:\n\n"));
+                        let commands = vec![format!(
+                            "git -C \"{path_str}\" stash -u && git -C \"{path_str}\" clean -d -f"
+                        )];
+                        let mut finding = DoctorFinding::new(message).with_remediation(
+                            commands.clone(),
+                            append_indented_list(
+                                &commands,
+                                "If this is a surprise to you, then you should stash these modifications.\nStashing returns Homebrew to a pristine state but can be undone\nshould you later need to do so for some reason.\n\n",
+                            ),
+                        );
+                        finding.affects = modified;
+                        findings.push(finding);
+                    }
+                }
+            }
+            "check_tap_git_branch" => {
+                if std::env::var_os("CI").is_none() && git_version().is_some() {
+                    let mut deprecated: Vec<String> = Vec::new();
+                    let mut commands: Vec<String> = Vec::new();
+                    if git_branch_name(&prefix.root.display().to_string()).as_deref()
+                        == Some("master")
+                    {
+                        deprecated.push("Homebrew/brew".to_string());
+                    }
+                    for tap in super::tap::list(prefix) {
+                        let path = tap.path.display().to_string();
+                        let branch = git_branch_name(&path);
+                        if branch.as_deref() == Some("master")
+                            && tap.user.eq_ignore_ascii_case("homebrew")
+                        {
+                            deprecated.push(tap.name());
+                        } else {
+                            let origin = git_origin_branch_name(&path);
+                            if origin != branch {
+                                commands.push(format!(
+                                    "git -C $(brew --repo {}) checkout {}",
+                                    tap.name(),
+                                    origin.as_deref().unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                    let mut message = String::new();
+                    if !deprecated.is_empty() {
+                        message.push_str(&append_indented_list(
+                            &deprecated,
+                            "The following repositories are on the deprecated \"master\" branch.\nThe \"master\" branch sync will stop and this warning will become an error\nwhen Homebrew 5.2.0 is released (no earlier than 2026-06-10).\nRun `brew update` to migrate to \"main\":\n\n",
+                        ));
+                    }
+                    if !commands.is_empty() {
+                        if !deprecated.is_empty() {
+                            message.push('\n');
+                        }
+                        message.push_str(
+                            "Some taps are not on the default git origin branch and may not receive updates.\n",
+                        );
+                    }
+                    if !message.is_empty() {
+                        let mut finding = DoctorFinding::new(message);
+                        if !commands.is_empty() {
+                            finding = finding.with_remediation(
+                                commands.clone(),
+                                append_indented_list(
+                                    &commands,
+                                    "If this is a surprise to you, check out the default branch with:\n",
+                                ),
+                            );
+                        }
+                        findings.push(finding);
+                    }
+                }
+            }
+            "check_homebrew_repository_git_hooks" => {
+                let mut found: Vec<String> = Vec::new();
+                let hooks = prefix.root.join(".git/hooks");
+                if hooks.is_dir()
+                    && let Ok(entries) = std::fs::read_dir(&hooks)
+                {
+                    let mut paths: Vec<String> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|path| {
+                            !path
+                                .file_name()
+                                .is_some_and(|n| n.to_string_lossy().ends_with(".sample"))
+                        })
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    paths.sort();
+                    found.append(&mut paths);
+                }
+                let gitconfig = prefix.root.join(".gitconfig");
+                if gitconfig.exists() {
+                    found.push(gitconfig.display().to_string());
+                }
+                if !found.is_empty() {
+                    let root = prefix.root.display();
+                    let commands = vec![format!(
+                        "rm -rf \"{root}/.git/hooks\" \"{root}/.gitconfig\""
+                    )];
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &found,
+                            "Git hooks or a repository-local `.gitconfig` were found in your Homebrew repository.\nHomebrew does not use these, and they can break Homebrew operations.\n\nPaths found:\n",
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "Remove them with:\n"),
+                        ),
+                    );
+                }
+            }
+            "check_for_external_cmd_name_conflict" => {
+                let tap_dir = prefix.root.join("Library/Taps");
+                let mut map: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                if let Ok(users) = std::fs::read_dir(&tap_dir) {
+                    for user in users.flatten() {
+                        let Ok(repos) = std::fs::read_dir(user.path()) else {
+                            continue;
+                        };
+                        for repo in repos.flatten() {
+                            let cmd_dir = repo.path().join("cmd");
+                            let Ok(entries) = std::fs::read_dir(&cmd_dir) else {
+                                continue;
+                            };
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                if name.starts_with("brew-") && executable_regular_file(&path) {
+                                    let key = name.strip_suffix(".rb").unwrap_or(&name).to_string();
+                                    map.entry(key).or_default().push(path.display().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                map.retain(|_, paths| paths.len() > 1);
+                let ci_test_bot_only = std::env::var_os("CI").is_some_and(|v| !v.is_empty())
+                    && map.len() == 1
+                    && map.contains_key("brew-test-bot");
+                if !map.is_empty() && !ci_test_bot_only {
+                    let mut message =
+                        "You have external commands with conflicting names.\n".to_string();
+                    for (name, paths) in &map {
+                        message.push_str(&append_indented_list(
+                            paths,
+                            &format!("Found command `{name}` in the following places:\n"),
+                        ));
+                    }
+                    findings.push(DoctorFinding::new(message));
+                }
+            }
+            "check_cask_install_location" => {
+                let legacy = prefix.cellar().join("brew-cask");
+                let mut locations: Vec<String> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&legacy) {
+                    for entry in entries.flatten() {
+                        locations.push(entry.path().display().to_string());
+                    }
+                }
+                locations.sort();
+                locations.reverse();
+                if !locations.is_empty() {
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &locations,
+                            "Legacy installs at:\n",
+                        ))
+                        .with_remediation(
+                            vec!["brew uninstall --force brew-cask".to_string()],
+                            "Run `brew uninstall --force brew-cask`.\n",
+                        ),
+                    );
+                }
+            }
+            "check_cask_staging_location" => {
+                let actions = std::env::var_os("GITHUB_ACTIONS")
+                    .is_some_and(|v| !v.to_string_lossy().trim().is_empty());
+                if !actions {
+                    let path = prefix.root.join("Caskroom");
+                    let shown = user_tilde(&path.display().to_string());
+                    infos.push(format!(
+                        "{}\n{shown}",
+                        super::tty::ohai("Cask Staging Location")
+                    ));
+                    if path.exists() && !crate::platform::dir_writable_by_caller(&path) {
+                        let user =
+                            std::env::var("USER").unwrap_or_else(|_| "$(whoami)".to_string());
+                        let commands = vec![format!("sudo chown -R {user} {shown}")];
+                        findings.push(
+                            DoctorFinding::new(format!(
+                                "The staging path {shown} is not writable by the current user.\n",
+                            ))
+                            .with_remediation(
+                                commands.clone(),
+                                append_indented_list(&commands, "To fix this, run:\n"),
+                            ),
+                        );
+                    }
+                }
+            }
+            "check_cask_corrupt_dirs" => {
+                let corrupt = corrupt_cask_dirs(prefix);
+                if !corrupt.is_empty() {
+                    let commands: Vec<String> = corrupt
+                        .iter()
+                        .map(|token| format!("brew reinstall --cask --force {token}"))
+                        .collect();
+                    let paths: Vec<String> = corrupt
+                        .iter()
+                        .map(|token| format!("{}/Caskroom/{token}", prefix.root.display()))
+                        .collect();
+                    findings.push(
+                        DoctorFinding::new(append_indented_list(
+                            &paths,
+                            &format!(
+                                "Some directories in the Caskroom do not have valid metadata.\nThe following {} cannot be upgraded as-is:\n",
+                                pluralize("cask", corrupt.len())
+                            ),
+                        ))
+                        .with_remediation(
+                            commands.clone(),
+                            append_indented_list(&commands, "To fix this, run:\n"),
+                        ),
+                    );
+                }
+            }
+            "check_cask_taps" => {
+                let mut error_paths: Vec<String> = Vec::new();
+                let mut taps_info: Vec<String> = Vec::new();
+                for tap in super::tap::list(prefix) {
+                    let casks_dir = tap.path.join("Casks");
+                    match std::fs::read_dir(&casks_dir) {
+                        Ok(_) => {
+                            let count = tap_cask_tokens(&tap).len();
+                            if count > 0 {
+                                taps_info.push(format!(
+                                    "{} ({})",
+                                    tap.path.display(),
+                                    pluralize_with_count("cask", count)
+                                ));
+                            }
+                        }
+                        Err(e)
+                            if casks_dir.exists() || e.kind() != std::io::ErrorKind::NotFound =>
+                        {
+                            error_paths.push(tap.path.display().to_string());
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let info_body = if taps_info.is_empty() {
+                    "<NONE>".to_string()
+                } else {
+                    taps_info.join("\n")
+                };
+                infos.push(format!("{}\n{info_body}", super::tty::ohai("Cask Taps:")));
+                if !error_paths.is_empty() {
+                    findings.push(DoctorFinding::new(format!(
+                        "Unable to read from cask {}: {}",
+                        pluralize("tap", error_paths.len()),
+                        utils_text_to_sentence(
+                            &error_paths.iter().map(String::as_str).collect::<Vec<_>>()
+                        )
+                    )));
+                }
+            }
+            "check_cask_load_path" => {
+                // Brew inspects Ruby's $LOAD_PATH (never empty in
+                // practice); abrew has no Ruby load path and the
+                // finding cannot fire downstream either.
+                infos.push(format!("{}\n<NONE>", super::tty::ohai("$LOAD_PATHS")));
+            }
+            "check_cask_environment_variables" => {
+                let fixed = [
+                    "RUBYLIB",
+                    "RUBYOPT",
+                    "RUBYPATH",
+                    "RBENV_VERSION",
+                    "CHRUBY_VERSION",
+                    "GEM_HOME",
+                    "GEM_PATH",
+                    "BUNDLE_PATH",
+                    "PATH",
+                    "SHELL",
+                    "HOMEBREW_CASK_OPTS",
+                ];
+                let mut vars: Vec<String> = std::env::vars_os()
+                    .map(|(k, _)| k.to_string_lossy().into_owned())
+                    .filter(|k| {
+                        k == "LANG"
+                            || k == "LANGUAGE"
+                            || (k.starts_with("LC_")
+                                && !k[3..].is_empty()
+                                && k[3..].chars().all(|c| !c.is_whitespace()))
+                    })
+                    .collect();
+                vars.extend(fixed.iter().map(|v| v.to_string()));
+                vars.sort();
+                let lines: Vec<String> = vars
+                    .iter()
+                    .filter_map(|var| {
+                        std::env::var(var)
+                            .ok()
+                            .map(|value| format!("{var}=\"{}\"", brew_sh_quote(&value)))
+                    })
+                    .collect();
+                let info_body = if lines.is_empty() {
+                    "<NONE>".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                infos.push(format!(
+                    "{}\n{info_body}",
+                    super::tty::ohai("Cask Environment Variables:")
+                ));
+            }
+            "check_coretap_integrity" => {
+                let taps = super::tap::list(prefix);
+                if let Some(tap) = taps
+                    .iter()
+                    .find(|t| t.user.eq_ignore_ascii_case("homebrew") && t.repo == "core")
+                {
+                    let desired = std::env::var("HOMEBREW_CORE_GIT_REMOTE")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "https://github.com/Homebrew/homebrew-core".to_string());
+                    if let Some(finding) =
+                        broken_tap(prefix, &tap.path, "homebrew/homebrew-core", "homebrew/core")
+                            .or_else(|| examine_git_origin(&tap.path, &desired))
+                    {
+                        findings.push(finding);
+                    }
+                }
+                // Absent core tap: brew clones it when API installs
+                // are disabled (ensure_installed!); doctor here
+                // stays read-only.
+            }
+            "check_casktap_integrity" => {
+                let taps = super::tap::list(prefix);
+                if let Some(tap) = taps
+                    .iter()
+                    .find(|t| t.user.eq_ignore_ascii_case("homebrew") && t.repo == "cask")
+                {
+                    let desired = origin_url_from_config(&tap.path)
+                        .unwrap_or_else(|| "https://github.com/Homebrew/homebrew-cask".to_string());
+                    if let Some(finding) =
+                        broken_tap(prefix, &tap.path, "homebrew/homebrew-cask", "homebrew/cask")
+                            .or_else(|| examine_git_origin(&tap.path, &desired))
+                    {
+                        findings.push(finding);
+                    }
+                }
+            }
+            "check_for_nix_homebrew" => {
+                let nix = prefix
+                    .root
+                    .file_name()
+                    .is_some_and(|n| n == ".homebrew-is-managed-by-nix")
+                    || prefix.root.join(".managed_by_nix_darwin").exists()
+                    || (std::env::var("HOMEBREW_UPDATE_BEFORE").as_deref() == Ok("nix")
+                        && std::env::var("HOMEBREW_UPDATE_AFTER").as_deref() == Ok("nix"))
+                    || std::env::var("HOMEBREW_BUNDLE_FILE")
+                        .is_ok_and(|v| v.starts_with("/nix/store/"));
+                if nix {
+                    let mut finding = DoctorFinding::new(
+                        "Your Homebrew installation is managed by Nix.\nHomebrew does not support Nix-managed installations.\n",
+                    );
+                    finding.tier = DoctorTier::N(3);
+                    findings.push(finding);
+                }
+            }
+            "check_for_other_frameworks" => {
+                let found: Vec<String> =
+                    ["expat.framework", "libexpat.framework", "libcurl.framework"]
+                        .iter()
+                        .map(|f| format!("/Library/Frameworks/{f}"))
+                        .filter(|f| std::path::Path::new(f).exists())
+                        .collect();
+                if !found.is_empty() {
+                    findings.push(
+                        DoctorFinding::new(
+                            "Some frameworks can be picked up by CMake's build system and will likely\ncause the build to fail.\n",
+                        )
+                        .with_remediation(
+                            Vec::new(),
+                            append_indented_list(
+                                &found,
+                                "To compile CMake, you may wish to move these out of the way:\n",
+                            ),
+                        ),
+                    );
+                }
+            }
+            "check_for_tap_ruby_files_locations" => {
+                let mut blocks: Vec<String> = Vec::new();
+                for tap in super::tap::list(prefix) {
+                    let formula_dir = if tap.user.eq_ignore_ascii_case("homebrew") {
+                        tap.path.join("Formula")
+                    } else {
+                        [
+                            tap.path.join("Formula"),
+                            tap.path.join("HomebrewFormula"),
+                            tap.path.clone(),
+                        ]
+                        .into_iter()
+                        .find(|d| d.is_dir())
+                        .unwrap_or_else(|| tap.path.join("Formula"))
+                    };
+                    let mut bad: Vec<String> = Vec::new();
+                    for dir in [
+                        tap.path.join("Formula"),
+                        tap.path.join("HomebrewFormula"),
+                        tap.path.clone(),
+                    ] {
+                        if dir == formula_dir || !dir.exists() {
+                            continue;
+                        }
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.extension().is_some_and(|x| x == "rb") {
+                                    bad.push(path.display().to_string());
+                                }
+                            }
+                        }
+                    }
+                    if !bad.is_empty() {
+                        blocks.push(append_indented_list(
+                            &bad,
+                            &format!(
+                                "Found Ruby file outside {} tap formula directory.\n({}):\n",
+                                tap.name(),
+                                formula_dir.display()
+                            ),
+                        ));
+                    }
+                }
+                if !blocks.is_empty() {
+                    findings.push(DoctorFinding::new(blocks.join("\n")));
+                }
+            }
+            "check_for_multiple_volumes" => {
+                let cellar = prefix.cellar();
+                if cellar.exists()
+                    && let Ok(real_cellar) = std::fs::canonicalize(&cellar)
+                {
+                    let temp = brew_temp();
+                    let probe = temp.join(format!("doctor{}", std::process::id()));
+                    if std::fs::create_dir(&probe).is_ok() {
+                        let real_tmp = std::fs::canonicalize(&probe)
+                            .ok()
+                            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                        let _ = std::fs::remove_dir(&probe);
+                        if let Some(real_tmp) = real_tmp {
+                            let vol_cellar = volume_of(&real_cellar.display().to_string());
+                            let vol_tmp = volume_of(&real_tmp.display().to_string());
+                            if vol_cellar.is_some() && vol_cellar != vol_tmp {
+                                let mut finding = DoctorFinding::new(
+                                    "Your Cellar and TEMP directories are on different volumes.\nmacOS won't move relative symlinks across volumes unless the target file already\nexists. Formulae known to be affected by this are Git and Narwhal.\n",
+                                )
+                                .with_remediation(
+                                    Vec::new(),
+                                    "You should set the `$HOMEBREW_TEMP` environment variable to a suitable\ndirectory on the same volume as your Cellar.\n",
+                                );
+                                finding.tier = DoctorTier::N(2);
+                                findings.push(finding);
+                            }
+                        }
+                    }
+                }
+            }
+            "check_for_installed_developer_tools" => {
+                if xcode_prefix().is_none() && !clt_installed() {
+                    findings.push(
+                        DoctorFinding::new("No developer tools installed.\n")
+                            .with_remediation(Vec::new(), clt_installation_instructions()),
+                    );
+                }
+            }
+            "check_if_xcode_needs_clt_installed" => {
+                if !clt_installed() {
+                    let full = super::machine::Machine::this()
+                        .macos_version()
+                        .unwrap_or_default()
+                        .to_string();
+                    let sdk_newer = newest_sdk_version().is_some_and(|sdk| {
+                        dotted_version_cmp(&full, &sdk) == std::cmp::Ordering::Less
+                    });
+                    if sdk_newer {
+                        let pretty = macos_pretty_name();
+                        findings.push(
+                            DoctorFinding::new(format!(
+                                "Xcode alone is not sufficient on {pretty}.\n"
+                            ))
+                            .with_remediation(Vec::new(), clt_installation_instructions()),
+                        );
+                    }
+                }
+            }
+            "check_xcode_prefix" => {
+                if let Some(prefix) = xcode_prefix()
+                    && prefix.contains(' ')
+                {
+                    findings.push(DoctorFinding::new(
+                        "Xcode is installed to a directory with a space in the name.\nThis will cause some formulae to fail to build.\n",
+                    ));
+                }
+            }
+            "check_xcode_prefix_exists" => {
+                if let Some(prefix) = xcode_prefix()
+                    && !std::path::Path::new(&prefix).exists()
+                {
+                    findings.push(
+                        DoctorFinding::new(format!(
+                            "The directory Xcode is reportedly installed to doesn't exist:\n  {prefix}\n"
+                        ))
+                        .with_remediation(
+                            Vec::new(),
+                            "You may need to `xcode-select` the proper path if you have moved Xcode.\n",
+                        ),
+                    );
+                }
+            }
+            "check_xcode_select_path" => {
+                if !clt_installed()
+                    && xcode_prefix().is_some()
+                    && !std::path::Path::new(&format!(
+                        "{}/usr/bin/xcodebuild",
+                        active_developer_dir()
+                    ))
+                    .is_file()
+                {
+                    let path = xcode_bundle_path()
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "/Developer".to_string());
+                    let commands = vec![format!("sudo xcode-select --switch {path}")];
+                    findings.push(
+                        DoctorFinding::new("Your Xcode is configured with an invalid path.\n")
+                            .with_remediation(
+                                commands.clone(),
+                                append_indented_list(
+                                    &commands,
+                                    "You should change it to the correct path:\n",
+                                ),
+                            ),
+                    );
+                }
+            }
+            "check_xcode_license_approved" => {
+                if let Ok(out) = super::fetch::run_capture("/usr/bin/xcrun", &["--find", "clang"]) {
+                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                    if text.contains("license") && !out.status.success() {
+                        let commands = vec!["sudo xcodebuild -license".to_string()];
+                        findings.push(
+                            DoctorFinding::new("You have not agreed to the Xcode license.\n")
+                                .with_remediation(
+                                    commands.clone(),
+                                    append_indented_list(
+                                        &commands,
+                                        "Agree to the license by opening Xcode.app or running:\n",
+                                    ),
+                                ),
+                        );
+                    }
+                }
+            }
+            "check_xcode_minimum_version" => {
+                if let Some(version) = super::machine::Machine::this().xcode_version()
+                    && xcode_prefix().is_some()
+                    && dotted_version_cmp(version, &xcode_minimum_version())
+                        == std::cmp::Ordering::Less
+                {
+                    let prefix = xcode_prefix().unwrap_or_default();
+                    let mut shown = version.to_string();
+                    if prefix != "/Applications/Xcode.app/Contents/Developer" {
+                        shown = format!("{version} => {prefix}");
+                    }
+                    let bundle = xcode_bundle_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    findings.push(
+                        DoctorFinding::new(format!(
+                            "Your Xcode ({shown}) at {bundle} is too outdated.\n"
+                        ))
+                        .with_remediation(
+                            Vec::new(),
+                            format!(
+                                "Please update to Xcode {} (or delete it).\n{}",
+                                xcode_latest_version(),
+                                xcode_update_instructions()
+                            ),
+                        ),
+                    );
+                }
+            }
+            "check_xcode_up_to_date" => {
+                if let Some(version) = super::machine::Machine::this().xcode_version()
+                    && xcode_prefix().is_some()
+                    && dotted_version_cmp(version, &xcode_minimum_version())
+                        != std::cmp::Ordering::Less
+                    && dotted_version_cmp(version, &xcode_latest_version())
+                        == std::cmp::Ordering::Less
+                    && !github_actions_env()
+                {
+                    let mut remediation = format!(
+                        "Please update to Xcode {} (or delete it).\n{}",
+                        xcode_latest_version(),
+                        xcode_update_instructions()
+                    );
+                    if macos_prerelease() {
+                        let current = super::fetch::run_capture("/usr/bin/xcode-select", &["-p"])
+                            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                            .unwrap_or_default();
+                        remediation.push_str(&format!(
+                            "If {} is installed, you may need to:\n  sudo xcode-select --switch /Applications/Xcode.app\nCurrent developer directory is:\n  {current}",
+                            xcode_latest_version()
+                        ));
+                    }
+                    let mut finding =
+                        DoctorFinding::new(format!("Your Xcode ({version}) is outdated."))
+                            .with_remediation(Vec::new(), remediation);
+                    finding.tier = DoctorTier::N(2);
+                    findings.push(finding);
+                }
+            }
+            "check_clt_minimum_version" => {
+                if let Some(version) = clt_version()
+                    && dotted_version_cmp(&version, &clt_minimum_version())
+                        == std::cmp::Ordering::Less
+                {
+                    findings.push(
+                        DoctorFinding::new("Your Command Line Tools are too outdated.\n")
+                            .with_remediation(Vec::new(), clt_update_instructions()),
+                    );
+                }
+            }
+            "check_clt_up_to_date" => {
+                let below_minimum = clt_version().is_some_and(|v| {
+                    dotted_version_cmp(&v, &clt_minimum_version()) == std::cmp::Ordering::Less
+                });
+                let major_minor_patch_gt = clt_version().is_some_and(|v| {
+                    let head: Vec<&str> = v.split('.').take(3).collect();
+                    dotted_version_cmp(&head.join("."), &clt_latest_version())
+                        == std::cmp::Ordering::Greater
+                });
+                let outdated = !below_minimum
+                    && !major_minor_patch_gt
+                    && clt_clang_version().is_some_and(|clang| {
+                        dotted_version_cmp(&clang, &clt_latest_clang_version())
+                            == std::cmp::Ordering::Less
+                    });
+                if outdated && !github_actions_env() {
+                    let mut finding =
+                        DoctorFinding::new("A newer Command Line Tools release is available.")
+                            .with_remediation(Vec::new(), clt_update_instructions());
+                    finding.tier = DoctorTier::N(2);
+                    findings.push(finding);
+                }
+            }
+            "check_cask_software_versions" => {
+                infos.push(format!(
+                    "{}\nabrew {} (aterm)",
+                    super::tty::ohai("Homebrew Version"),
+                    aterm_stamp::app_version()
+                ));
+                let full = super::machine::Machine::this()
+                    .macos_version()
+                    .unwrap_or_default()
+                    .to_string();
+                infos.push(format!("{}\n{}", super::tty::ohai("macOS"), full));
+                let sip = if executable_regular_file(std::path::Path::new("/usr/bin/csrutil")) {
+                    super::fetch::run_capture("/usr/bin/csrutil", &["status"])
+                        .map(|out| {
+                            let text = String::from_utf8_lossy(&out.stdout);
+                            let cleaned = text
+                                .replace(
+                                    "This is an unsupported configuration, likely to break in the future and leave your machine in an unknown state.",
+                                    "",
+                                )
+                                .replace("System Integrity Protection status: ", "")
+                                .replace(['\t', '.'], "");
+                            let trimmed = cleaned.trim();
+                            let mut chars = trimmed.chars();
+                            match chars.next() {
+                                Some(first) => {
+                                    first.to_uppercase().collect::<String>()
+                                        + &chars
+                                            .collect::<String>()
+                                            .to_lowercase()
+                                }
+                                None => String::new(),
+                            }
+                        })
+                        .unwrap_or_else(|_| "N/A".to_string())
+                } else {
+                    "N/A".to_string()
+                };
+                infos.push(format!("{}\n{}", super::tty::ohai("SIP"), sip));
+            }
+            "check_cask_quarantine_support" => {
+                if !xattr_available() {
+                    findings.push(DoctorFinding::new(
+                        "No Cask quarantine support available: there's no working version of `xattr` on this system.",
+                    ));
+                }
+            }
+            "check_cask_xattr" => {
+                if xattr_available() {
+                    if !std::path::Path::new("/usr/bin/xattr").exists() {
+                        findings.push(DoctorFinding::new("Unable to find `xattr`."));
+                    } else if let Ok(out) = super::fetch::run_capture("/usr/bin/xattr", &["-h"])
+                        && !out.status.success()
+                    {
+                        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                        if stderr.contains("ImportError: No module named pkg_resources") {
+                            let python =
+                                super::fetch::run_capture("/usr/bin/python", &["--version"])
+                                    .map(|p| {
+                                        let mut t = String::from_utf8_lossy(&p.stdout).into_owned();
+                                        t.push_str(&String::from_utf8_lossy(&p.stderr));
+                                        t
+                                    })
+                                    .unwrap_or_default();
+                            if python.contains("Python 2.7") {
+                                let commands = vec![
+                                    "sudo /usr/bin/python -m pip install -I setuptools".to_string(),
+                                ];
+                                findings.push(
+                                    DoctorFinding::new(
+                                        "Your Python installation has a broken version of setuptools.\n",
+                                    )
+                                    .with_remediation(
+                                        commands.clone(),
+                                        append_indented_list(
+                                            &commands,
+                                            "To this fix, reinstall macOS or run:\n",
+                                        ),
+                                    ),
+                                );
+                            } else {
+                                let commands = vec![
+                                    "defaults write com.apple.versioner.python Version 2.7"
+                                        .to_string(),
+                                ];
+                                findings.push(
+                                    DoctorFinding::new("The system Python version is wrong.\n")
+                                        .with_remediation(
+                                            commands.clone(),
+                                            append_indented_list(&commands, "To fix this, run:\n"),
+                                        ),
+                                );
+                            }
+                        } else if stderr.contains("pkg_resources.DistributionNotFound") {
+                            findings.push(DoctorFinding::new(
+                                "Your Python installation is unable to find `xattr`.",
+                            ));
+                        } else {
+                            findings.push(DoctorFinding::new(format!(
+                                "unknown xattr error: {}",
+                                stderr.lines().last().unwrap_or_default()
+                            )));
+                        }
+                    }
+                }
+            }
+            "check_for_emudhra_certificates" => {
+                if !github_actions_env() {
+                    let cert_file = "/etc/ssl/cert.pem";
+                    match std::fs::read_to_string(cert_file) {
+                        Ok(contents) => {
+                            let root_names =
+                                ["emSign ECC Root CA - G3", "AAA Certificate Services"];
+                            let mut cns: Vec<String> = Vec::new();
+                            let mut rest = contents.as_str();
+                            let mut parse_failed = false;
+                            while let Some(start) = rest.find("-----BEGIN CERTIFICATE-----") {
+                                let after = &rest[start + 27..];
+                                let Some(end) = after.find("-----END CERTIFICATE-----") else {
+                                    parse_failed = true;
+                                    break;
+                                };
+                                match pem_der(&after[..end]) {
+                                    Some(der) => cns.extend(cert_subject_cns(&der)),
+                                    None => parse_failed = true,
+                                }
+                                rest = &after[end + 25..];
+                            }
+                            if parse_failed && cns.is_empty() {
+                                findings.push(
+                                    DoctorFinding::new(format!(
+                                        "Could not check {cert_file} for roots that trust compromised CAs."
+                                    ))
+                                    .with_remediation(
+                                        Vec::new(),
+                                        "Ensure the file is readable and contains valid PEM certificates,\nthen rerun `brew doctor`.\n",
+                                    ),
+                                );
+                            } else {
+                                let mut roots: Vec<String> = Vec::new();
+                                for cn in cns {
+                                    if root_names.contains(&cn.as_str()) && !roots.contains(&cn) {
+                                        roots.push(cn);
+                                    }
+                                }
+                                if !roots.is_empty() {
+                                    let script = format!(
+                                        "{}/Library/Homebrew/utils/emudhra_certificates.rb",
+                                        prefix.root.display()
+                                    );
+                                    let mut finding = DoctorFinding::new(append_indented_list(
+                                        &roots,
+                                        &format!(
+                                            "Root certificates in {cert_file} can trust compromised CAs.\nCommand-line tools using this file may accept forged TLS certificates:\n"
+                                        ),
+                                    ))
+                                    .with_remediation(
+                                        Vec::new(),
+                                        format!(
+                                            "Run this script to create a backup and remove these roots:\n  sudo {} --disable=gems,rubyopt {}\n\nThe script validates the bundle before replacing it. Removing the roots\ncan break HTTPS connections to some websites.\n\nRun `brew doctor` afterwards and after system updates, which can restore\nthe roots.\nFor details and software update plans, see:\n  https://support.apple.com/en-us/149555\n",
+                                            portable_ruby_path(prefix),
+                                            script
+                                        ),
+                                    );
+                                    finding.links =
+                                        vec!["https://support.apple.com/en-us/149555".to_owned()];
+                                    findings.push(finding);
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => {
+                            findings.push(
+                                DoctorFinding::new(format!(
+                                    "Could not check {cert_file} for roots that trust compromised CAs."
+                                ))
+                                .with_remediation(
+                                    Vec::new(),
+                                    "Ensure the file is readable and contains valid PEM certificates,\nthen rerun `brew doctor`.\n",
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            "check_for_unsupported_macos" => {
+                let developer =
+                    std::env::var_os("HOMEBREW_DEVELOPER").is_some_and(|v| !v.is_empty());
+                if !developer && std::env::var_os("HOMEBREW_INTEGRATION_TEST").is_none() {
+                    let intel = !cfg!(target_arch = "aarch64");
+                    let (tier, who, version, what) = if macos_outdated_release() {
+                        (
+                            3,
+                            "We (and Apple)".to_string(),
+                            macos_major_string(),
+                            "old version.".to_string(),
+                        )
+                    } else if intel {
+                        (
+                            3,
+                            "We".to_string(),
+                            "on Intel x86_64".to_string(),
+                            "platform (as-of September 2026, announced August 2025).\n\nApple have dropped Intel x86_64 support in macOS Golden Gate (27).\nGitHub Actions are dropping macOS Intel x86_64 runners in 2027.\nHomebrew is a non-profit project run entirely by volunteers, not employees.\nIf the biggest companies in the world cannot support macOS Intel x86_64\nany longer, sadly neither can we.".to_string(),
+                        )
+                    } else if macos_prerelease() {
+                        (
+                            2,
+                            "We".to_string(),
+                            macos_major_string(),
+                            "pre-release version.".to_string(),
+                        )
+                    } else {
+                        (2, String::new(), String::new(), String::new())
+                    };
+                    if !what.is_empty() {
+                        let major: u64 = macos_major_string().parse().unwrap_or(0);
+                        let remediation = if (intel || macos_outdated_release()) && major <= 26 {
+                            let mut text =
+                                "Homebrew no longer builds bottles for this configuration.\n"
+                                    .to_string();
+                            if intel && major >= 26 {
+                                text.push_str("Existing bottles may still work, but updated formulae may build from source.\n");
+                            } else {
+                                text.push_str(&format!(
+                                    "Consider MacPorts, which provides binary packages for this macOS version:\n  {}\n",
+                                    super::tty::url("https://www.macports.org")
+                                ));
+                            }
+                            Some(text)
+                        } else {
+                            None
+                        };
+                        let mut finding = DoctorFinding::new(format!(
+                            "You are using macOS {version}.\n{who} do not provide support for this {what}\n"
+                        ));
+                        finding.tier = DoctorTier::N(tier);
+                        if let Some(remediation) = remediation {
+                            finding = finding.with_remediation(Vec::new(), remediation);
+                        }
+                        findings.push(finding);
+                    }
+                }
+            }
+            "check_if_supported_sdk_available" => {
+                let dev_installed = xcode_prefix().is_some() || clt_installed();
+                if dev_installed {
+                    let has_sdk = newest_sdk_version().is_some_and(|sdk| {
+                        dotted_version_cmp(&sdk, &macos_major_string()) != std::cmp::Ordering::Less
+                    });
+                    if !has_sdk {
+                        let clt_below = clt_version().is_some_and(|v| {
+                            dotted_version_cmp(&v, &clt_minimum_version())
+                                == std::cmp::Ordering::Less
+                        });
+                        let xcode_below = super::machine::Machine::this()
+                            .xcode_version()
+                            .is_some_and(|v| {
+                                dotted_version_cmp(v, &xcode_minimum_version())
+                                    == std::cmp::Ordering::Less
+                            });
+                        let source_clt = clt_installed();
+                        if !(source_clt && clt_below) && !(!source_clt && xcode_below) {
+                            let (source, instructions) = if source_clt {
+                                ("Command Line Tools (CLT)", clt_update_instructions())
+                            } else {
+                                ("Xcode", xcode_update_instructions())
+                            };
+                            findings.push(
+                                DoctorFinding::new(format!(
+                                    "Your {source} does not support macOS {}.\nIt is either outdated or was modified.\n",
+                                    macos_major_string()
+                                ))
+                                .with_remediation(
+                                    Vec::new(),
+                                    format!(
+                                        "Please update your {source} or delete it if no updates are available.\n{instructions}"
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            "check_pkgconf_macos_sdk_mismatch" => {
+                if !macos_prerelease()
+                    && !macos_outdated_release()
+                    && let Some(inst) =
+                        prefix.installed_one(super::prefix::Kind::Formula, "pkgconf")
+                {
+                    let receipt = prefix
+                        .keg("pkgconf", &inst.version)
+                        .join("INSTALL_RECEIPT.json");
+                    let built_on_os = std::fs::read(&receipt)
+                        .ok()
+                        .and_then(|bytes| aterm_json::from_slice::<aterm_json::Value>(&bytes).ok())
+                        .and_then(|value| {
+                            value
+                                .get("built_on")
+                                .and_then(|b| b.get("os_version"))
+                                .and_then(aterm_json::Value::as_str)
+                                .map(|v| v.strip_prefix("macOS ").unwrap_or(v).to_string())
+                        });
+                    if let Some(built) = built_on_os {
+                        let built_major = built.split('.').next().unwrap_or_default();
+                        if !built_major.is_empty() && built_major != macos_major_string() {
+                            findings.push(DoctorFinding::new(format!(
+                                "You have pkgconf installed that was built on macOS {built},\n        but you are running macOS {}.\n\nThis can cause issues with packages that depend on system libraries, such as libffi.\nTo fix this issue, reinstall pkgconf:\n  brew reinstall pkgconf\n\nFor more information, see: https://github.com/Homebrew/brew/issues/16137\n",
+                                macos_major_string()
+                            )));
+                        }
+                    }
+                }
+            }
+            "check_tools" => {
+                for tool in ["git", "curl"] {
+                    let minimum = match tool {
+                        "git" => std::env::var("HOMEBREW_MINIMUM_GIT_VERSION")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| "2.30.0".to_string()),
+                        _ => std::env::var("HOMEBREW_MINIMUM_CURL_VERSION")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| "7.41.0".to_string()),
+                    };
+                    let env_key = format!("HOMEBREW_{}", tool.to_uppercase());
+                    let initial = std::env::var(&env_key)
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| tool.to_string());
+                    let version_of = |prog: &str| -> Option<String> {
+                        let out = super::fetch::run_capture(prog, &["--version"]).ok()?;
+                        if !out.status.success() {
+                            return None;
+                        }
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        let first = text.lines().next()?;
+                        let rest = first
+                            .strip_prefix(&format!("{tool} version "))
+                            .or_else(|| first.strip_prefix(&format!("{tool} ")))?;
+                        let version: String = rest
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.')
+                            .collect();
+                        if version.contains('.') {
+                            Some(version)
+                        } else {
+                            None
+                        }
+                    };
+                    let ok = [initial.as_str(), tool].iter().any(|prog| {
+                        version_of(prog).is_some_and(|v| {
+                            dotted_version_cmp(&v, &minimum) != std::cmp::Ordering::Less
+                        })
+                    });
+                    if !ok {
+                        findings.push(DoctorFinding::new(format!(
+                            "Homebrew could not find a working {tool} after refreshing its cached selection.\nMinimum required version: {minimum}\nInitial executable: {initial}\n"
+                        )));
+                    }
+                }
+            }
             "check_user_path_1"
             | "check_user_path_2"
             | "check_user_path_3"
@@ -8962,6 +10636,11 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     {
         prefix.restore_stale_asides();
         let _ = prefix.rebuild_state();
+    }
+    if doctor_verbose {
+        for info in &infos {
+            println!("{info}");
+        }
     }
     if json {
         // Finding.support_tier: unsupported wins, else the max
@@ -20044,6 +21723,14 @@ pub(super) fn cmd_bundle(
             Some(entries) => bundle_env(prefix, api, args, rest, &entries),
             None => failed("abrew: Brewfile was not admitted"),
         },
+        "exec" => match prepared {
+            Some(entries) => bundle_exec(prefix, api, args, rest, &entries, false),
+            None => failed("abrew: Brewfile was not admitted"),
+        },
+        "sh" => match prepared {
+            Some(entries) => bundle_exec(prefix, api, args, rest, &entries, true),
+            None => failed("abrew: Brewfile was not admitted"),
+        },
         "list" => bundle_list(rest),
         "cleanup" => bundle_cleanup(prefix, api, rest),
         _ => super::unsupported("bundle subcommand is not native"),
@@ -20793,6 +22480,58 @@ fn bundle_env(
     let no_secrets = has_flag(rest, "--no-secrets", "")
         || std::env::var_os("HOMEBREW_BUNDLE_NO_SECRETS").is_some_and(|v| !v.is_empty());
 
+    let computed = match bundle_computed_env(prefix, api, entries, no_secrets) {
+        Ok(computed) => computed,
+        Err(code) => return code,
+    };
+    let old_env = computed.old_env;
+    let env = computed.env;
+    let path_like = |v: &str| v.split_once(':').is_some_and(|(head, _)| !head.is_empty());
+
+    for (key, value) in &env {
+        if key.starts_with("HOMEBREW_") || key.starts_with("PORTABLE_RUBY_") {
+            continue;
+        }
+        if value.trim().is_empty() {
+            continue;
+        }
+        let old_value = old_env.get(key);
+        if old_value.is_some_and(|o| o == value) {
+            continue;
+        }
+        if key.contains("PATH") && path_like(value) {
+            let old_parts: Vec<&str> = old_value
+                .map(|o| o.split(':').collect())
+                .unwrap_or_default();
+            let new_parts: Vec<&str> = value
+                .split(':')
+                .filter(|p| !old_parts.contains(p))
+                .collect();
+            if new_parts.is_empty() {
+                continue;
+            }
+            println!(
+                "export {key}=\"{}:${{{key}:-}}\"",
+                brew_sh_quote(&new_parts.join(":"))
+            );
+        } else {
+            println!("export {key}=\"{}\"", brew_sh_quote(value));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+struct BundleComputedEnv {
+    old_env: std::collections::BTreeMap<String, String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+fn bundle_computed_env(
+    prefix: &Prefix,
+    api: &Api,
+    entries: &[bundle::BrewfileEntry],
+    no_secrets: bool,
+) -> Result<BundleComputedEnv, ExitCode> {
     // Resolve the Brewfile's formulae like Formulary.factory.
     struct Dep {
         name: String,
@@ -20805,7 +22544,10 @@ fn bundle_env(
             continue;
         };
         let Some(record) = api.formula(name).ok().or_else(|| tap::lookup(prefix, name)) else {
-            return failed(&format!("Error: {}", formula_unavailable(api, name)));
+            return Err(failed(&format!(
+                "Error: {}",
+                formula_unavailable(api, name)
+            )));
         };
         deps.push(Dep {
             name: record.name.clone(),
@@ -20823,6 +22565,13 @@ fn bundle_env(
         })
         .collect();
     let mut env = old_env.clone();
+    // brew.sh records the caller's PATH before replacing it
+    // with the superenv PATH; exec later appends it back.
+    if !env.contains_key("HOMEBREW_PATH")
+        && let Some(path) = old_env.get("PATH")
+    {
+        env.insert("HOMEBREW_PATH".to_string(), path.clone());
+    }
     if no_secrets {
         let sensitive = |k: &str| {
             let k = k.to_ascii_lowercase();
@@ -21105,37 +22854,385 @@ fn bundle_env(
         }
     }
 
-    for (key, value) in &env {
-        if key.starts_with("HOMEBREW_") || key.starts_with("PORTABLE_RUBY_") {
-            continue;
-        }
-        if value.trim().is_empty() {
-            continue;
-        }
-        let old_value = old_env.get(key);
-        if old_value.is_some_and(|o| o == value) {
-            continue;
-        }
-        if key.contains("PATH") && path_like(value) {
-            let old_parts: Vec<&str> = old_value
-                .map(|o| o.split(':').collect())
-                .unwrap_or_default();
-            let new_parts: Vec<&str> = value
-                .split(':')
-                .filter(|p| !old_parts.contains(p))
-                .collect();
-            if new_parts.is_empty() {
-                continue;
+    Ok(BundleComputedEnv { old_env, env })
+}
+
+struct BundleExecInvocation {
+    check: bool,
+    install: bool,
+    no_secrets: bool,
+    command: Vec<String>,
+}
+
+fn bundle_switch_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.chars().any(|c| !c.is_whitespace()))
+}
+
+fn bundle_switch_env(name: &str) -> bool {
+    bundle_switch_enabled(std::env::var(name).ok().as_deref())
+}
+
+fn bundle_exec_invocation(rest: &[String], shell: bool) -> Result<BundleExecInvocation, ExitCode> {
+    let mut invocation = BundleExecInvocation {
+        check: bundle_switch_env("HOMEBREW_BUNDLE_CHECK"),
+        install: false,
+        no_secrets: bundle_switch_env("HOMEBREW_BUNDLE_NO_SECRETS"),
+        command: Vec::new(),
+    };
+    let mut services = bundle_switch_env("HOMEBREW_BUNDLE_SERVICES");
+    let mut idx = 1;
+    while idx < rest.len() {
+        let arg = rest[idx].as_str();
+        if arg == "--" {
+            if !shell {
+                invocation.command = rest[idx + 1..].to_vec();
+            } else if idx + 1 < rest.len() {
+                return Err(failed(
+                    "Error: Invalid usage: This command does not take named arguments.",
+                ));
             }
-            println!(
-                "export {key}=\"{}:${{{key}:-}}\"",
-                brew_sh_quote(&new_parts.join(":"))
-            );
+            break;
+        }
+        if arg == "--file" {
+            idx += 2;
+            continue;
+        }
+        if arg == "--sandbox" || arg.starts_with("--sandbox=") {
+            return Err(super::unsupported(
+                "bundle exec/sh services and sandbox execution are not native",
+            ));
+        }
+        match arg {
+            "--check" => invocation.check = true,
+            "--install" => invocation.install = true,
+            "--no-secrets" => invocation.no_secrets = true,
+            "--services" => services = true,
+            "--deny-network" => {
+                return Err(super::unsupported(
+                    "bundle exec/sh services and sandbox execution are not native",
+                ));
+            }
+            "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d" => {}
+            _ if arg.starts_with("--file=") => {}
+            _ if arg.starts_with('-') && arg != "-" => {
+                return Err(super::unsupported(
+                    "bundle arguments or Brewfile rows are not native",
+                ));
+            }
+            _ => {
+                if shell {
+                    return Err(failed(
+                        "Error: Invalid usage: This command does not take named arguments.",
+                    ));
+                }
+                invocation.command = rest[idx..].to_vec();
+                break;
+            }
+        }
+        idx += 1;
+    }
+    if services {
+        return Err(super::unsupported(
+            "bundle exec/sh services and sandbox execution are not native",
+        ));
+    }
+    if !shell && invocation.command.is_empty() {
+        return Err(failed(
+            "Error: Invalid usage: This command requires at least 1 named argument.",
+        ));
+    }
+    Ok(invocation)
+}
+
+fn bundle_which(command: &str, path_value: &str) -> Option<std::path::PathBuf> {
+    path_value.split(':').find_map(|entry| {
+        let dir = if entry.is_empty() {
+            std::path::Path::new(".")
         } else {
-            println!("export {key}=\"{}\"", brew_sh_quote(value));
+            std::path::Path::new(entry)
+        };
+        let candidate = dir.join(command);
+        executable_file(&candidate).then_some(candidate)
+    })
+}
+
+fn prepend_env_path(env: &mut std::collections::BTreeMap<String, String>, key: &str, dir: &str) {
+    let current = env.get(key).cloned().unwrap_or_default();
+    let mut parts: Vec<String> = current
+        .split(':')
+        .filter(|part| !part.is_empty() && *part != dir)
+        .map(str::to_owned)
+        .collect();
+    parts.insert(0, dir.to_string());
+    env.insert(key.to_string(), parts.join(":"));
+}
+
+fn run_bundle_command(
+    command: &[String],
+    env: std::collections::BTreeMap<String, String>,
+) -> ExitCode {
+    let Some((program, args)) = command.split_first() else {
+        return failed("Error: Invalid usage: No command to execute was specified!");
+    };
+    let mut cmd = aterm_uds::spawnfd::transparent(program);
+    #[cfg(unix)]
+    cmd.env_exactly(env.iter());
+    #[cfg(not(unix))]
+    {
+        cmd.env_clear();
+        cmd.envs(env.iter());
+    }
+    cmd.args(args);
+    match cmd.status() {
+        Ok(status) => status.code().map_or(ExitCode::from(1), |code| {
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }),
+        Err(e) => failed(&format!("abrew: cannot run {program}: {e}")),
+    }
+}
+
+const BUNDLE_BASH_PROMPT: &str = r#"if [[ -f ~/.bashrc ]]; then
+  source ~/.bashrc
+fi
+export PATH="${BREW_PROMPT_PATH}:${PATH}"
+PS1="\[\033[1;32m\]${BREW_PROMPT_TYPE} \[\033[1;31m\]\w \[\033[1;34m\]$\[\033[0m\] "
+unset BREW_PROMPT_PATH
+unset BREW_PROMPT_TYPE
+"#;
+
+const BUNDLE_ZSH_PROMPT: &str = r#"if [[ -s "${HOME}/.zshrc" ]]; then
+  source "${HOME}/.zshrc"
+fi
+PROMPT="%F{green}${BREW_PROMPT_TYPE} %B%F{red}%~ %F{blue}$%f%b "
+export PATH="${BREW_PROMPT_PATH}:${PATH}"
+unset BREW_PROMPT_PATH
+unset BREW_PROMPT_TYPE
+"#;
+
+fn bundle_effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        crate::platform::our_uid()
+    }
+}
+
+fn bundle_prompt_script(
+    prefix: &Prefix,
+    temp: &std::path::Path,
+    shell: &str,
+) -> Result<std::path::PathBuf, ExitCode> {
+    let (library, contents, fallback_name) = if shell == "zsh" {
+        (
+            "Library/Homebrew/utils/zsh/brew-sh-prompt-zshrc.zsh",
+            BUNDLE_ZSH_PROMPT,
+            format!("brew-zsh-prompt-{}.zsh", bundle_effective_uid()),
+        )
+    } else {
+        (
+            "Library/Homebrew/utils/bash/brew-sh-prompt-bashrc.bash",
+            BUNDLE_BASH_PROMPT,
+            format!("brew-bash-prompt-{}.bash", bundle_effective_uid()),
+        )
+    };
+    let library_path = prefix.root.join(library);
+    if library_path.is_file() {
+        return Ok(library_path);
+    }
+    let path = temp.join(fallback_name);
+    std::fs::create_dir_all(temp)
+        .and_then(|()| std::fs::write(&path, contents))
+        .map_err(|e| {
+            failed(&format!(
+                "abrew: cannot prepare bundle shell prompt {}: {e}",
+                path.display()
+            ))
+        })?;
+    Ok(path)
+}
+
+fn bundle_shell_command(
+    prefix: &Prefix,
+    mut env: std::collections::BTreeMap<String, String>,
+) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), ExitCode> {
+    env.remove("HOMEBREW_FORCE_API_AUTO_UPDATE");
+    let preferred = env
+        .get("SHELL")
+        .filter(|path| !path.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "/bin/bash".to_string());
+    let shell_name = preferred
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let prompt_path = env.get("PATH").cloned().unwrap_or_default();
+    if matches!(shell_name.as_str(), "bash" | "zsh") {
+        env.insert("BREW_PROMPT_PATH".to_string(), prompt_path);
+        env.insert("BREW_PROMPT_TYPE".to_string(), "brew bundle".to_string());
+    }
+    let temp = env
+        .get("HOMEBREW_TEMP")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(brew_temp);
+    let command = match shell_name.as_str() {
+        "zsh" => {
+            let zdotdir = temp.join(format!("brew-zsh-prompt-{}", bundle_effective_uid()));
+            let script = bundle_prompt_script(prefix, &temp, "zsh")?;
+            std::fs::create_dir_all(&zdotdir).map_err(|e| {
+                failed(&format!(
+                    "abrew: cannot prepare bundle shell prompt {}: {e}",
+                    zdotdir.display()
+                ))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&zdotdir, std::fs::Permissions::from_mode(0o700));
+            }
+            let target = zdotdir.join(".zshrc");
+            if script != target {
+                std::fs::copy(&script, &target).map_err(|e| {
+                    failed(&format!(
+                        "abrew: cannot prepare bundle shell prompt {}: {e}",
+                        target.display()
+                    ))
+                })?;
+            }
+            #[cfg(unix)]
+            if let Some(home) = env.get("HOME").filter(|path| !path.is_empty()) {
+                for file in [".zshenv", ".zsh_history", ".zsh_sessions", ".zcompdump"] {
+                    let dest = zdotdir.join(file);
+                    if let Ok(meta) = std::fs::symlink_metadata(&dest)
+                        && !meta.is_dir()
+                    {
+                        let _ = std::fs::remove_file(&dest);
+                    }
+                    if !dest.exists() {
+                        let _ = std::os::unix::fs::symlink(
+                            std::path::Path::new(home).join(file),
+                            &dest,
+                        );
+                    }
+                }
+            }
+            env.insert("ZDOTDIR".to_string(), zdotdir.display().to_string());
+            vec![preferred]
+        }
+        "bash" => {
+            let script = bundle_prompt_script(prefix, &temp, "bash")?;
+            vec![
+                preferred,
+                "--rcfile".to_string(),
+                script.display().to_string(),
+            ]
+        }
+        _ => {
+            env.insert(
+                "PS1".to_string(),
+                "\\[\\033[1;32m\\]brew bundle \\[\\033[1;31m\\]\\w \\[\\033[1;34m\\]$\\[\\033[0m\\] "
+                    .to_string(),
+            );
+            vec![preferred]
+        }
+    };
+    if !super::no_env_hints() {
+        print!("Entering a shell with the bundle's environment...\nUse `exit` to return.\n");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+    Ok((command, env))
+}
+
+/// `brew bundle exec` / `brew bundle sh` without service
+/// supervision or sandboxing. Delegation is a transparent
+/// child process with exactly the computed bundle
+/// environment; this process never evaluates the command or
+/// its arguments.
+fn bundle_exec(
+    prefix: &Prefix,
+    api: &Api,
+    args: &[String],
+    rest: &[String],
+    entries: &[bundle::BrewfileEntry],
+    shell: bool,
+) -> ExitCode {
+    let invocation = match bundle_exec_invocation(rest, shell) {
+        Ok(invocation) => invocation,
+        Err(code) => return code,
+    };
+    if invocation.check {
+        let code = bundle_check(prefix, api, &["--quiet".to_string()], entries);
+        if code != ExitCode::SUCCESS {
+            return code;
         }
     }
-    ExitCode::SUCCESS
+    if invocation.install {
+        let code = bundle_file(prefix, api, args, entries);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    if !shell
+        && invocation
+            .command
+            .first()
+            .is_some_and(|command| command.trim().is_empty())
+    {
+        return failed("Error: Invalid usage: No command to execute was specified!");
+    }
+    let computed = match bundle_computed_env(prefix, api, entries, invocation.no_secrets) {
+        Ok(computed) => computed,
+        Err(code) => return code,
+    };
+    let mut env = computed.env;
+
+    // Brew drops temporary-directory settings that are no
+    // longer writable before the child sees them.
+    for key in ["TMPDIR", "HOMEBREW_TEMP"] {
+        let drop_value = env.get(key).is_some_and(|value| {
+            !value.is_empty()
+                && !std::fs::metadata(value).is_ok_and(|meta| !meta.permissions().readonly())
+        });
+        if drop_value {
+            env.remove(key);
+        }
+    }
+
+    let (command, env) = if shell {
+        match bundle_shell_command(prefix, env) {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        }
+    } else {
+        let command = invocation.command;
+        if !command[0].contains('/') {
+            let path_value = env.get("PATH").cloned().unwrap_or_default();
+            let found = bundle_which(&command[0], &path_value);
+            if let Some(found) = &found
+                && let Some(dir) = found.parent()
+            {
+                prepend_env_path(&mut env, "PATH", &dir.display().to_string());
+            }
+            let path_value = env.get("PATH").cloned().unwrap_or_default();
+            if bundle_which(&command[0], &path_value).is_none() {
+                return failed(&format!(
+                    "Error: command was not found in your PATH: {}",
+                    command[0]
+                ));
+            }
+        }
+        (command, env)
+    };
+    run_bundle_command(&command, env)
 }
 
 fn bundle_file(
@@ -23457,6 +25554,36 @@ mod tests {
     }
 
     #[test]
+    fn der_walk_extracts_subject_cn() {
+        // Certificate SEQ { TBS SEQ { [0] {int}, int, SEQ, SEQ,
+        // SEQ, SEQ { SET { SEQ { OID CN, UTF8 "Test Root" } } } } }
+        fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, body.len() as u8];
+            out.extend_from_slice(body);
+            out
+        }
+        let atv = tlv(
+            0x30,
+            &[tlv(0x06, &[0x55, 0x04, 0x03]), tlv(0x0c, b"Test Root")].concat(),
+        );
+        let subject = tlv(0x30, &tlv(0x31, &atv));
+        let tbs = tlv(
+            0x30,
+            &[
+                tlv(0xa0, &tlv(0x02, &[2])),
+                tlv(0x02, &[1]),
+                tlv(0x30, &tlv(0x06, &[0x2a])),
+                tlv(0x30, &[]),
+                tlv(0x30, &[]),
+                subject,
+            ]
+            .concat(),
+        );
+        let cert = tlv(0x30, &tbs);
+        assert_eq!(super::cert_subject_cns(&cert), ["Test Root"]);
+    }
+
+    #[test]
     fn dotted_version_and_origin_config() {
         use std::cmp::Ordering;
         assert_eq!(
@@ -23483,6 +25610,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::origin_url_from_config(dir.path()), None);
+    }
+
+    #[test]
+    fn stray_files_skip_dotfiles_and_nonrecursive_globs() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("libkeep.dylib"), b"x").unwrap();
+        std::fs::write(root.join(".hidden.dylib"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/libdeep.dylib"), b"x").unwrap();
+        std::fs::create_dir_all(root.join(".hdir")).unwrap();
+        std::fs::write(root.join(".hdir/libsecret.dylib"), b"x").unwrap();
+        let root = root.display().to_string();
+        assert_eq!(
+            super::stray_files(&root, "*.dylib", &[], false),
+            [format!("{root}/libkeep.dylib")]
+        );
+        assert_eq!(
+            super::stray_files(&root, "**/*.dylib", &[], true),
+            [
+                format!("{root}/libkeep.dylib"),
+                format!("{root}/sub/libdeep.dylib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_exec_invocation_and_computed_env_are_separate() {
+        let rest = vec![
+            "exec".to_string(),
+            "--file=/tmp/Brewfile".to_string(),
+            "/usr/bin/printf".to_string(),
+            "--check".to_string(),
+            "--install".to_string(),
+            "--no-secrets".to_string(),
+            "-vq".to_string(),
+            "token with spaces".to_string(),
+        ];
+        let invocation = super::bundle_exec_invocation(&rest, false).unwrap();
+        assert_eq!(
+            invocation.command,
+            [
+                "/usr/bin/printf",
+                "--check",
+                "--install",
+                "--no-secrets",
+                "-vq",
+                "token with spaces",
+            ]
+        );
+        assert!(!invocation.install);
+
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = super::super::prefix::Prefix::at(temp.path());
+        prefix.ensure().unwrap();
+        let api = super::super::api::Api::new(prefix.clone());
+        let computed = super::bundle_computed_env(&prefix, &api, &[], false).unwrap();
+        if let Some(path) = computed.old_env.get("PATH") {
+            assert_eq!(computed.env.get("HOMEBREW_PATH"), Some(path));
+        }
+        assert!(computed.env.get("PATH").is_some_and(|p| !p.is_empty()));
+
+        let mut shell_env = std::collections::BTreeMap::new();
+        shell_env.insert("SHELL".to_string(), "/bin/sh".to_string());
+        shell_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        shell_env.insert(
+            "HOMEBREW_FORCE_API_AUTO_UPDATE".to_string(),
+            "1".to_string(),
+        );
+        let (command, shell_env) = super::bundle_shell_command(&prefix, shell_env).unwrap();
+        assert_eq!(command, ["/bin/sh"]);
+        assert!(!shell_env.contains_key("HOMEBREW_FORCE_API_AUTO_UPDATE"));
+        assert!(!shell_env.contains_key("BREW_PROMPT_PATH"));
+        assert_eq!(
+            shell_env.get("PS1").map(String::as_str),
+            Some(
+                "\\[\\033[1;32m\\]brew bundle \\[\\033[1;31m\\]\\w \\[\\033[1;34m\\]$\\[\\033[0m\\] "
+            )
+        );
+
+        #[cfg(unix)]
+        {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            env.insert(
+                "BUNDLE_R355_TEST".to_string(),
+                "value with spaces".to_string(),
+            );
+            let command = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test \"$BUNDLE_R355_TEST\" = 'value with spaces'".to_string(),
+            ];
+            assert_eq!(
+                super::run_bundle_command(&command, env),
+                std::process::ExitCode::SUCCESS
+            );
+        }
     }
 
     #[test]

@@ -14,12 +14,17 @@ use crate::{
 };
 use aterm_net::lan::{Cancellation, Connection, Listener, Multicast, Scope};
 use aterm_secrets::commons::hearing::Said;
+use aterm_uds::ready::Doorbell;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    os::fd::{AsFd as _, BorrowedFd},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -102,13 +107,34 @@ struct Worker {
     /// Raised once its round's peer authenticates ([`Repair::hear`]): the dial holds its place
     /// from then on ([`dial_room`]).
     heard: Arc<std::sync::atomic::AtomicBool>,
+    /// Raised as its thread's round ends, before it rings the transport's doorbell ([`Ended`]):
+    /// the tick that the ring wakes takes the round, whose thread may still be returning.
+    ended: Arc<AtomicBool>,
 }
+
+/// A repair thread's end, told as its body returns or unwinds: it raises the worker's `ended`,
+/// then rings the doorbell the serving loop waits on ([`Transport::waits_on`]), so the loop takes
+/// the round at once rather than at its next polled round.
+struct Ended {
+    ended: Arc<AtomicBool>,
+    bell: Option<Arc<Doorbell>>,
+}
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.ended.store(true, Ordering::Release);
+        if let Some(bell) = &self.bell {
+            bell.ring();
+        }
+    }
+}
+
 impl Worker {
     fn start(
         endpoint: Arc<Endpoint>,
         connection: Option<Connection>,
         target: Option<SocketAddr>,
         scope: Scope,
+        bell: Option<Arc<Doorbell>>,
         repair: Repair,
         started: Instant,
     ) -> io::Result<Self> {
@@ -125,9 +151,15 @@ impl Worker {
                 .install(connection, began_ms)?;
         }
         let control = channel.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = Ended {
+            ended: ended.clone(),
+            bell,
+        };
         let task = thread::Builder::new()
             .name("commons-repair".into())
             .spawn(move || {
+                let _end = end;
                 let mut repair = repair;
                 repair.begin_round();
                 let mut connection = connection;
@@ -254,6 +286,7 @@ impl Worker {
             target,
             started,
             heard,
+            ended,
         })
     }
     fn stop(&self) {
@@ -281,6 +314,7 @@ pub(crate) fn test_worker(
         None,
         Some(target),
         Scope::Loopback,
+        None,
         repair,
         Instant::now(),
     )
@@ -328,12 +362,79 @@ thread_local! {
 }
 
 /// Where a transport keeps the endpoints it verified across restarts ([`Hints::remember`]): a
-/// private file in its endpoint's Commons custody directory, read only where it names the same
+/// private cache beside its endpoint's Commons custody keys, read only where it names the same
 /// trust and seat. A file that is missing, damaged or another's reads as none, and a write that
-/// fails stops nothing: the next start reads what it finds.
+/// fails stops nothing: the next start reads what it finds. On macOS the cache moves into
+/// `.ubd` under that directory; custody keys and authoritative journals stay in place.
 struct Memory {
     dir: std::path::PathBuf,
+    name: String,
     scope: MemoryScope,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod quiet_memory_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+
+    #[test]
+    fn remembered_cache_moves_without_keys_or_scope_or_age_changes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let scope = [7; std::mem::size_of::<MemoryScope>()];
+        let remembered = Remembered {
+            actor: [3; 48],
+            address: "192.0.2.1:6543".parse().unwrap(),
+            at_ms: 1234,
+        };
+        aterm_uds::private_file::write_private(root.path(), "device.age", b"custody stays here")
+            .unwrap();
+        let key_inode = std::fs::metadata(root.path().join("device.age"))
+            .unwrap()
+            .ino();
+        aterm_uds::private_file::write_private(
+            root.path(),
+            REMEMBERED_NAME,
+            &Remembered::encode(&scope, &[remembered]),
+        )
+        .unwrap();
+        let cache_inode = std::fs::metadata(root.path().join(REMEMBERED_NAME))
+            .unwrap()
+            .ino();
+        let memory = Memory::prepare(root.path(), scope).unwrap();
+        assert!(aterm_tempfile::is_quiet(&memory.dir));
+        assert_eq!(
+            std::fs::metadata(memory.dir.join(&memory.name))
+                .unwrap()
+                .ino(),
+            cache_inode
+        );
+        assert_eq!(memory.read(), vec![remembered]);
+        assert_eq!(
+            std::fs::metadata(root.path().join("device.age"))
+                .unwrap()
+                .ino(),
+            key_inode
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("device.age")).unwrap(),
+            b"custody stays here"
+        );
+        assert!(
+            aterm_uds::private_file::write_private(root.path(), REMEMBERED_NAME, b"old writer")
+                .is_err()
+        );
+        let newer = Remembered {
+            at_ms: 5678,
+            ..remembered
+        };
+        memory.write(&[newer]);
+        assert_eq!(memory.read(), vec![newer]);
+        let other = Memory::prepare(root.path(), [8; std::mem::size_of::<MemoryScope>()]).unwrap();
+        assert!(
+            other.read().is_empty(),
+            "another trust/seat cannot become a candidate"
+        );
+    }
 }
 impl Memory {
     fn of(endpoint: &Endpoint) -> Option<Self> {
@@ -343,13 +444,26 @@ impl Memory {
         scope[16..48].copy_from_slice(&trust.authority);
         scope[48..80].copy_from_slice(&trust.genesis);
         scope[80..].copy_from_slice(&actor);
-        Some(Self {
-            dir: dir.to_owned(),
-            scope,
-        })
+        // This is only a dial hint. A refused migration leaves its data untouched and
+        // disables persistence for this transport; authenticated discovery still runs.
+        Self::prepare(dir, scope).ok()
+    }
+    fn prepare(dir: &std::path::Path, scope: MemoryScope) -> io::Result<Self> {
+        let path =
+            aterm_uds::quiet_state::prepare_file_cache(&dir.join(REMEMBERED_NAME), REMEMBERED_MAX)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("discovery cache needs a filename"))?
+            .to_owned();
+        let dir = path
+            .parent()
+            .ok_or_else(|| io::Error::other("discovery cache needs a parent"))?
+            .to_owned();
+        Ok(Self { dir, name, scope })
     }
     fn read(&self) -> Vec<Remembered> {
-        aterm_uds::private_file::read_private(&self.dir, REMEMBERED_NAME, REMEMBERED_MAX)
+        aterm_uds::private_file::read_private(&self.dir, &self.name, REMEMBERED_MAX)
             .ok()
             .and_then(|bytes| Remembered::decode(&self.scope, &bytes))
             .unwrap_or_default()
@@ -357,7 +471,7 @@ impl Memory {
     fn write(&self, entries: &[Remembered]) {
         let bytes = Remembered::encode(&self.scope, entries);
         // One that fails is kept again at the next change or refresh ([`Hints::remembered`]).
-        let _kept = aterm_uds::private_file::write_private(&self.dir, REMEMBERED_NAME, &bytes);
+        let _kept = aterm_uds::private_file::write_private(&self.dir, &self.name, &bytes);
     }
 }
 
@@ -455,6 +569,9 @@ pub(super) struct Transport {
     push: Option<Push>,
     /// The latest failed local link operation since the last refresh, bounded like a repair error.
     failure: Option<String>,
+    /// What each round's end and each push asked of the owner rings ([`Self::waits_on`]); none
+    /// where the pipe could not be made, and the owner then ticks every [`super::TICK`].
+    doorbell: Option<Arc<Doorbell>>,
     /// A LAN attachment's stand-in (tests): while it reads false each address refreshed is one no
     /// bind reaches (its checks refuse it, as an attachment that changed since its address was
     /// read), and once it reads true it is the loopback ([`Self::standing_in`]).
@@ -596,6 +713,7 @@ impl Transport {
             completed: VecDeque::new(),
             push: None,
             failure: None,
+            doorbell: Doorbell::new().ok().map(Arc::new),
             #[cfg(test)]
             stand_in: None,
             #[cfg(test)]
@@ -828,6 +946,79 @@ impl Transport {
         }
         Ok(())
     }
+    /// Its outgoing workers as dial admission reads them ([`dial_room`]).
+    fn dialing(&self) -> Vec<Dialing> {
+        self.workers
+            .iter()
+            .filter(|worker| !worker.incoming)
+            .map(|worker| Dialing {
+                started: worker.started,
+                established: worker
+                    .target
+                    .is_some_and(|address| self.hints.established(address)),
+                heard: worker.heard.load(Ordering::Acquire),
+            })
+            .collect()
+    }
+
+    /// The doorbell its rounds' ends ring, for the owner's pushes to ring too
+    /// (`super::Board::serving`); none where the pipe could not be made.
+    pub(super) fn doorbell(&self) -> Option<Arc<Doorbell>> {
+        self.doorbell.clone()
+    }
+
+    /// Take what rang the doorbell, before the tick that reads what it announced.
+    pub(super) fn clear_doorbell(&self) {
+        if let Some(bell) = &self.doorbell {
+            bell.clear();
+        }
+    }
+
+    /// What the serving loop waits on between ticks besides its stop and the clock
+    /// ([`Self::next_due`]): the doorbell, which each round's end and each push rings; each link's
+    /// multicast socket, where beacons come; and each link's listener while its incoming rounds
+    /// leave room for one more, as [`Self::tick`] accepts only then (a connection it cannot take
+    /// yet waits for a round's end, which rings). `None` without a doorbell: nothing would wake
+    /// the loop for a round's end, so it keeps its tick.
+    pub(super) fn waits_on(&self) -> Option<Vec<BorrowedFd<'_>>> {
+        let bell = self.doorbell.as_ref()?;
+        let accepts = self.endpoint.is_some()
+            && self.workers.iter().filter(|worker| worker.incoming).count() < INCOMING;
+        let mut fds = vec![bell.fd()];
+        for link in &self.links {
+            fds.push(link.hints.as_fd());
+            if accepts && let Some(listener) = &link.listener {
+                fds.push(listener.as_fd());
+            }
+        }
+        Some(fds)
+    }
+
+    /// When [`Self::tick`] next has work by the clock alone, as `now` reads it: its links' next
+    /// beacon, its token's rotation, and its next dial ([`dial_due`]). What comes without the
+    /// clock wakes the loop through [`Self::waits_on`]. Its seats' read ([`SEATS`]), the expiry of
+    /// endpoints and presence heard ([`Hints::expire_presence`]) and the remembered endpoints'
+    /// refresh, which nothing waits for, ride on the owner's polled round (`super::POLL`, the same
+    /// two seconds as [`SEATS`]), so each comes at most that much late.
+    pub(super) fn next_due(&self, now: Instant) -> Instant {
+        let mut due = self.rotate;
+        if !self.links.is_empty() {
+            due = due.min(self.beacon);
+            if let Some(endpoint) = &self.endpoint
+                && let Some(dial) = dial_due(
+                    &self.hints,
+                    &self.dialing(),
+                    endpoint.pending(),
+                    self.dial,
+                    now,
+                )
+            {
+                due = due.min(dial);
+            }
+        }
+        due
+    }
+
     pub(super) fn tick(&mut self, now: Instant) -> io::Result<()> {
         if now >= self.versions_at {
             self.versions_at = now + SEATS;
@@ -861,7 +1052,8 @@ impl Transport {
         }
         let mut index = 0;
         while index < self.workers.len() {
-            if self.workers[index].task.is_finished() {
+            let worker = &self.workers[index];
+            if worker.ended.load(Ordering::Acquire) || worker.task.is_finished() {
                 let worker = self.workers.swap_remove(index);
                 self.finish(worker, now);
             } else {
@@ -907,6 +1099,7 @@ impl Transport {
                                 Some(connection),
                                 None,
                                 self.scope,
+                                self.doorbell.clone(),
                                 Repair::default(),
                                 now,
                             )?);
@@ -945,18 +1138,7 @@ impl Transport {
         if let Some(endpoint) = &self.endpoint
             && !self.links.is_empty()
         {
-            let dialing: Vec<_> = self
-                .workers
-                .iter()
-                .filter(|worker| !worker.incoming)
-                .map(|worker| Dialing {
-                    started: worker.started,
-                    established: worker
-                        .target
-                        .is_some_and(|address| self.hints.established(address)),
-                    heard: worker.heard.load(std::sync::atomic::Ordering::Acquire),
-                })
-                .collect();
+            let dialing = self.dialing();
             if let Some((address, repair)) = next_dial(
                 &mut self.hints,
                 &dialing,
@@ -969,6 +1151,7 @@ impl Transport {
                     None,
                     Some(address),
                     self.scope,
+                    self.doorbell.clone(),
                     repair,
                     now,
                 ) {
@@ -1078,6 +1261,30 @@ fn next_dial(
     *dial = now + SPACING;
     Some(next)
 }
+/// When [`next_dial`] may next start a dial beside `dialing`, by the clock alone, as `now` reads
+/// it: where [`dial_room`] leaves room, once the spacing since the last dial (`dial`) and the
+/// earliest wait of an endpoint `hints` holds have passed ([`Hints::next_dial_at`]); where it
+/// leaves none, once the youngest discovery dial holding a place parks ([`STAGGER`]). `None`
+/// where only something the loop hears can make room or an endpoint (a round's end, a beacon).
+/// It may be early, never late: a tick it wakes that starts no dial asks again after it.
+fn dial_due(
+    hints: &Hints,
+    dialing: &[Dialing],
+    pending: bool,
+    dial: Instant,
+    now: Instant,
+) -> Option<Instant> {
+    match dial_room(dialing, pending, hints.has_established(), now) {
+        Some(discovery) => hints.next_dial_at(now, discovery).map(|at| at.max(dial)),
+        None => dialing
+            .iter()
+            .filter(|dialed| !dialed.established && !dialed.heard)
+            .map(|dialed| dialed.started + STAGGER)
+            .filter(|parks| *parks > now)
+            .min(),
+    }
+}
+
 impl Drop for Transport {
     fn drop(&mut self) {
         self.stop();

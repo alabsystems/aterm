@@ -972,6 +972,15 @@ impl Endpoint {
         Ok(self)
     }
 
+    /// How many bootstraps this endpoint's table repair opened afresh, where it kept none that
+    /// still stood (`crate::replica::Replica::bootstrap`); none without table repair.
+    #[cfg(test)]
+    pub(crate) fn test_bootstrap_opens(&self) -> usize {
+        self.application
+            .as_ref()
+            .map_or(0, crate::replica::Replica::test_bootstrap_opens)
+    }
+
     /// Place this endpoint's ring windows by `secs` (seconds since the Unix epoch), not the
     /// system clock.
     #[cfg(test)]

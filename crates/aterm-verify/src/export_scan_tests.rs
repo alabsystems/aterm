@@ -224,6 +224,42 @@ fn verdict(ctx: &Ctx, scanner: Result<Scanner, String>) -> (Vec<Outcome>, Vec<St
     )
 }
 
+/// The link pass needs inbound readers even when the content cone exports no file.
+/// CONTROL: a change to another excluded target does not inherit this README's red.
+#[test]
+fn an_excluded_target_change_judges_its_unchanged_shipping_reader() {
+    let (_dir, ctx) = checkout("// ordinary source\n");
+    let write = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        &ctx.root.join(MANIFEST),
+        "README.md\ncontrib\n.gitleaks.toml\n",
+    );
+    write(&ctx.root.join("README.md"), "[setup](docs/x.md)\n");
+    write(&ctx.root.join("docs/x.md"), "setup\n");
+    write(&ctx.root.join("contrib/README.md"), "public setup\n");
+    git(&ctx.root, &["add", "-A"]);
+    git(&ctx.root, &["commit", "-qm", "documents"]);
+    write(&ctx.root.join("docs/x.md"), "changed setup\n");
+    let (_, ids, report) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert_eq!(ids, ["README.md"], "{:?}", report.findings());
+    write(&ctx.root.join("docs/x.md"), "setup\n");
+    write(&ctx.root.join("docs/unrelated.md"), "other\n");
+    assert!(
+        verdict(&ctx, Err("fixture scanner unavailable".into()))
+            .1
+            .is_empty()
+    );
+    write(&ctx.root.join("README.md"), "[setup](contrib/README.md)\n");
+    assert!(
+        verdict(&ctx, Err("fixture scanner unavailable".into()))
+            .1
+            .is_empty()
+    );
+}
+
 /// Release input scopes the real content guard to unreceipted files. The same forbidden row
 /// in a file covered by a landing receipt is the negative control: it is not scanned again.
 #[test]

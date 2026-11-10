@@ -2737,10 +2737,57 @@ fn an_edit_withdrawing_a_preference_is_reported() {
 /// right: None ``.
 #[test]
 fn a_cell_an_edit_clears_is_reported() {
-    let edited = |full: &Value, bare: &Value| {
+    let edited = |full: &Value, bare: &Value, phone: Option<&str>| {
         let first = sheets(full, Mode::Authoritative);
         let mut book = Book::new();
-        let cells = apply(&mut book, &planned(&first, &Cells::new()));
+        if let Some(pk) = phone {
+            let number = SEALER
+                .seal(
+                    PHONE.name,
+                    pk,
+                    "number",
+                    &secret::Secret::new("4155550101".into()),
+                )
+                .unwrap();
+            let changes = [
+                ("number", json!(number)),
+                ("last4", json!("0101")),
+                ("label", json!("phone-1")),
+                ("row", json!("live")),
+            ]
+            .into_iter()
+            .map(|(col, x)| {
+                cell::change(
+                    &PHONE,
+                    cell::CellKey {
+                        pk,
+                        col,
+                        elem: None,
+                    },
+                    &cell::CellValue::owner(PHONE.version, x),
+                )
+                .unwrap()
+            })
+            .collect();
+            book.write(1, &[], changes);
+        }
+        let before = book.cells();
+        let cells = apply(&mut book, &planned(&first, &before));
+        if let Some(pk) = phone {
+            let phones = cell::project(&PHONE, &cells);
+            assert_eq!(phones.rows.len(), 1);
+            let number = phones.rows[pk]
+                .get("number")
+                .and_then(Value::as_str)
+                .unwrap();
+            assert!(SEALER.holds(
+                PHONE.name,
+                pk,
+                "number",
+                number,
+                &secret::Secret::new("4155550101".into())
+            ));
+        }
         let mut read = sheets(bare, Mode::Authoritative);
         let earlier: BTreeSet<String> = first.iter().map(|sheet| sheet.source.clone()).collect();
         for sheet in &mut read {
@@ -2756,6 +2803,7 @@ fn a_cell_an_edit_clears_is_reported() {
             "location": "SF", "notes": "desk",
         })),
         &computers(json!({"label": "m3"})),
+        None,
     );
     for column in [
         "make",
@@ -2782,6 +2830,8 @@ fn a_cell_an_edit_clears_is_reported() {
             "label": "phone-1",
         })),
         &phones(json!({})),
+        // A valid random-key shape whose hex happens to be decimal is still an identifier.
+        Some("ph-1234567890123456"),
     );
     let phone = plan
         .planned
@@ -2807,6 +2857,7 @@ fn a_cell_an_edit_clears_is_reported() {
             ],
         )]),
         &emails(vec![email_row(1)]),
+        Some("ph-1234567890123456"),
     );
     assert_eq!(step(&plan, "address", &login, "phone"), Some(&Step::Kept));
     let mailbox = plan

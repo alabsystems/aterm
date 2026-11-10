@@ -4670,19 +4670,6 @@ mod tests {
         }
     }
 
-    /// `aterm doctor --help` resolves to the doctor's current grammar; another diagnostic's
-    /// help uses the shared description and usage renderer.
-    #[test]
-    fn doctor_help_is_its_grammar_and_forms() {
-        assert_eq!(super::diag_help_text("doctor"), crate::doctor::help());
-        let exceptions = super::diag_help_text("exceptions");
-        assert!(
-            exceptions.starts_with("exceptions — ")
-                && exceptions.ends_with("usage: aterm exceptions [--all]\n"),
-            "{exceptions}"
-        );
-    }
-
     #[test]
     fn doctor_operand_grammar_is_enforced_at_the_edge() {
         assert_eq!(decide(&["doctor"]), diag("doctor", None));

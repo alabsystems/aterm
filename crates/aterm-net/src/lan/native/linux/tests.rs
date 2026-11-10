@@ -64,8 +64,16 @@ fn offload_metrics_and_repeated_empty_padding_keep_direct_route_evidence() {
 #[test]
 fn malformed_route_attributes_do_not_authorize_or_allocate() {
     let bytes = reply();
+    assert!(route_changed(&bytes).unwrap());
+    let mut joined = bytes.clone();
+    joined.extend_from_slice(&bytes);
+    assert!(
+        route_changed(&joined).unwrap(),
+        "all messages in one datagram are consumed"
+    );
     for end in 0..bytes.len() {
         assert!(parse(&bytes[..end], 88, peer()).is_err());
+        assert!(route_changed(&bytes[..end]).is_err());
     }
     for length in [0_u16, 1, 3, u16::MAX] {
         let mut bad = bytes.clone();
@@ -80,6 +88,12 @@ fn malformed_route_attributes_do_not_authorize_or_allocate() {
     let mut error = bytes;
     error[4..6].copy_from_slice(&2_u16.to_ne_bytes());
     assert!(parse(&error, 88, peer()).is_err());
+    assert!(route_changed(&error).is_err());
+    error[4..6].copy_from_slice(&4_u16.to_ne_bytes());
+    assert!(
+        route_changed(&error).is_err(),
+        "NLMSG_OVERRUN loses validity events"
+    );
 }
 
 #[test]
@@ -112,6 +126,20 @@ fn queries_bind_address_port_uid_and_ipv6_scope_without_mutating_routes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn live_kernel_loopback_route_is_readable_without_connecting() {
+    use std::os::fd::AsRawFd;
+
+    let changes = super::super::RouteChanges::open().unwrap();
+    let descriptor = changes.fd().as_raw_fd();
+    // SAFETY: both fcntl queries read flags of this owned live descriptor.
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor, libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    // SAFETY: F_GETFD has no additional arguments on this live descriptor.
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
     let route = lookup(
         None,
         "127.0.0.1:9".parse().unwrap(),

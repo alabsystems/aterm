@@ -7,13 +7,12 @@ use super::{
     Attachment, Connection, Scope, local_attachments, native, ready, refuse, same_subnet,
     unambiguous, unicast,
 };
+use aterm_uds::stop::Stop;
 use std::{
     io,
     net::{IpAddr, SocketAddr, SocketAddrV6, TcpListener},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    os::fd::BorrowedFd,
+    sync::Arc,
 };
 
 /// A socket bound to one observed LAN attachment, or explicitly to loopback.
@@ -24,11 +23,18 @@ pub struct Listener {
     local: SocketAddr,
     pub(crate) scope: Scope,
     attachment: Option<Attachment>,
-    withdrawn: Arc<AtomicBool>,
+    withdrawn: Arc<Stop>,
+    changes: Option<native::RouteChanges>,
+}
+impl std::os::fd::AsFd for Listener {
+    /// Borrow readiness only: [`Listener::accept`] still rechecks the attachment.
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.tcp)
+    }
 }
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.withdrawn.store(true, Ordering::Release);
+        let _ = self.withdrawn.set();
     }
 }
 
@@ -37,12 +43,12 @@ impl Drop for Listener {
 pub(crate) struct Witness {
     local: SocketAddr,
     attachment: Option<Attachment>,
-    withdrawn: Arc<AtomicBool>,
+    withdrawn: Arc<Stop>,
 }
 impl Witness {
     pub(crate) fn recheck(&self) -> io::Result<()> {
         let checked = (|| {
-            if self.withdrawn.load(Ordering::Acquire) {
+            if self.withdrawn.is_set() {
                 return Err(refuse("listener was withdrawn; bind again"));
             }
             if let Some(attachment) = &self.attachment
@@ -53,8 +59,8 @@ impl Witness {
             Ok(())
         })();
         if checked.is_err() {
-            self.withdrawn.store(true, Ordering::Release);
-        } else if self.withdrawn.load(Ordering::Acquire) {
+            let _ = self.withdrawn.set();
+        } else if self.withdrawn.is_set() {
             return Err(refuse("listener was withdrawn; bind again"));
         }
         checked
@@ -147,6 +153,11 @@ impl Listener {
             ));
         }
         let until = native::deadline();
+        // Subscribe before the first observation so changes during bind remain queued.
+        let changes = match scope {
+            Scope::Lan => Some(native::RouteChanges::open()?),
+            Scope::Loopback => None,
+        };
         let attachment = match scope {
             Scope::Lan => Some(
                 local_attachments(Some(local), None)
@@ -178,7 +189,8 @@ impl Listener {
             local,
             scope,
             attachment,
-            withdrawn: Arc::new(AtomicBool::new(false)),
+            withdrawn: Arc::new(Stop::new()),
+            changes,
         };
         listener.recheck()?;
         Ok(listener)
@@ -187,6 +199,30 @@ impl Listener {
     /// The exact bound address, including the assigned ephemeral port.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.tcp.local_addr()
+    }
+
+    /// Borrow this listener's permanent withdrawal bell. It stays ready after withdrawal;
+    /// observing it never consumes another waiter's notification.
+    pub(crate) fn withdrawal_bell(&self) -> io::Result<BorrowedFd<'_>> {
+        self.withdrawn.bell()
+    }
+
+    /// This LAN listener's own route/interface notification descriptor. Loopback has none.
+    pub(crate) fn changes_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.changes.as_ref().map(native::RouteChanges::fd)
+    }
+
+    /// Drain notifications without waiting. Lookup-only traffic does not ask for another
+    /// recheck; losing this listener's event source withdraws it rather than leaving it asleep.
+    pub(crate) fn drain_changes(&self) -> io::Result<bool> {
+        let result = self
+            .changes
+            .as_ref()
+            .map_or(Ok(false), native::RouteChanges::drain);
+        if result.is_err() {
+            let _ = self.withdrawn.set();
+        }
+        result
     }
 
     pub(crate) fn witness(&self) -> Witness {
@@ -200,7 +236,7 @@ impl Listener {
     /// Withdraw permanently if the socket or its attachment changed. The owner
     /// must stop service and drop this listener on error, then bind a fresh one.
     pub fn recheck(&self) -> io::Result<()> {
-        if self.withdrawn.load(Ordering::Acquire) {
+        if self.withdrawn.is_set() {
             return Err(refuse("listener was withdrawn; bind again"));
         }
         let result = (|| {
@@ -211,8 +247,8 @@ impl Listener {
             self.witness().recheck()
         })();
         if result.is_err() {
-            self.withdrawn.store(true, Ordering::Release);
-        } else if self.withdrawn.load(Ordering::Acquire) {
+            let _ = self.withdrawn.set();
+        } else if self.withdrawn.is_set() {
             return Err(refuse("listener was withdrawn; bind again"));
         }
         result
@@ -242,13 +278,14 @@ impl Listener {
     /// The wait on the socket fails.
     #[cfg(any(test, debug_assertions))]
     pub fn pending_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
-        crate::slots::wait_listener_readable(&self.tcp, timeout)
+        crate::slots::listener_pending_within(&self.tcp, timeout)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn source_selection_refuses_ambiguous_virtual_and_unscoped_addresses() {
@@ -323,13 +360,30 @@ mod tests {
     #[test]
     fn withdrawal_is_permanent_and_service_drops_the_listening_socket() {
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        assert!(listener.changes_fd().is_none());
+        assert!(!listener.drain_changes().unwrap());
+        let withdrawn = Arc::clone(&listener.withdrawn);
+        let ready = || {
+            aterm_uds::ready::any_interests_now(&[aterm_uds::ready::Watch::new(
+                withdrawn.bell().unwrap(),
+                aterm_uds::ready::Interest::Read,
+            )])
+            .unwrap()
+        };
+        assert!(ready().is_empty());
         let address = listener.local_addr().unwrap();
         listener.local.set_port(0);
         assert!(listener.recheck().is_err());
+        assert_eq!(ready(), vec![0]);
         listener.local = address;
         assert!(
             listener.recheck().is_err(),
             "restoring an observation cannot restore a withdrawn listener"
+        );
+        assert_eq!(
+            ready(),
+            vec![0],
+            "another observer cannot consume withdrawal"
         );
         let stopped = std::sync::Arc::new(AtomicBool::new(false));
         let event = stopped.clone();
@@ -344,7 +398,7 @@ mod tests {
                 per_source: 1,
                 lifetime: aterm_spec::wait::MUST_HAPPEN,
             },
-            &aterm_uds::stop::Stop::new(),
+            &Stop::new(),
             |_, _| panic!("withdrawn listener must not admit a peer"),
             move |e| {
                 if matches!(e, crate::fleet::FleetEvent::Stopped(_)) {
@@ -361,6 +415,7 @@ mod tests {
             },
         );
         assert!(stopped.load(Ordering::Acquire));
+        assert_eq!(ready(), vec![0]);
         assert!(
             std::net::TcpStream::connect_timeout(&address, aterm_spec::wait::MUST_HAPPEN).is_err()
         );
@@ -376,7 +431,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                crate::slots::wait_listener_readable(&listener.tcp, aterm_spec::wait::MUST_HAPPEN)
+                crate::slots::listener_pending_within(&listener.tcp, aterm_spec::wait::MUST_HAPPEN)
                     .unwrap()
             );
             listener.accept().unwrap().into_parts().1.recheck().unwrap();
@@ -392,7 +447,17 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let witness = listener.witness();
         witness.recheck().unwrap();
+        let withdrawn = Arc::clone(&listener.withdrawn);
+        let bell = withdrawn.bell().unwrap();
         drop(listener);
+        assert_eq!(
+            aterm_uds::ready::any_interests_now(&[aterm_uds::ready::Watch::new(
+                bell,
+                aterm_uds::ready::Interest::Read,
+            )])
+            .unwrap(),
+            vec![0]
+        );
         assert!(witness.recheck().is_err());
         assert!(
             std::net::TcpStream::connect_timeout(&address, aterm_spec::wait::MUST_HAPPEN).is_err()
@@ -408,7 +473,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::slots::wait_listener_readable(&listener.tcp, aterm_spec::wait::MUST_HAPPEN)
+            crate::slots::listener_pending_within(&listener.tcp, aterm_spec::wait::MUST_HAPPEN)
                 .unwrap()
         );
         let (_, proof) = listener.accept().unwrap().into_parts();

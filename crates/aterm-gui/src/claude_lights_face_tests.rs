@@ -1577,17 +1577,24 @@ fn lands_letters_read_on_every_builtin_theme() {
     );
 }
 
-/// YOLO READS AS A VALUE, NEVER RED (the owner, 2026-11-02): on every built-in theme every cell
-/// of `yolo` wears the glass's value ink, at 7:1 or more, whatever grey the rule it sits on wears,
-/// and `lame` the row's own ink (`docs/DESIGN-yolo-binary-2026-11-04.md` §2). NEGATIVE CONTROL:
-/// Claude's rule grey, floored to read, is not that ink on some ground, so the rule no longer
-/// decides it.
+/// YOLO ON READS AS A VALUE, NEVER LIT; YOLO OFF IS QUIET (the owner, 2026-11-02 and 2026-11-09):
+/// on every built-in theme every cell of `● yolo`, mark and word, wears the glass's value ink, at
+/// 7:1 or more, whatever grey the rule it sits on wears: the ink of any value on the rule, never
+/// Claude's red, the glass's warning ink or the letter's hue Autopilot's glyph wears beside it.
+/// Every cell of `○ yolo` wears the glass's quiet ink, as the other off chips, still at 4.5:1,
+/// and the chip never says another word for the flag
+/// (`docs/DESIGN-yolo-binary-2026-11-04.md` §2). NEGATIVE CONTROLS: Claude's rule grey, floored
+/// to read, is not the value ink on some ground, so the rule no longer decides it; on some theme
+/// the letter's hue, the warning ink and the row's ink each differ from the ink the chip wears,
+/// so the chip is not in them by another name.
 #[test]
 fn yolo_wears_the_value_ink_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
     let now = Instant::now();
     let old_red = [0xE0, 0x5A, 0x5A];
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     let mut apart = Vec::new();
+    let (mut hued, mut warned, mut rowed) = (false, false, false);
     for name in aterm_types::scheme::builtin_names() {
         let row = theme_row(name);
         let ground = row.bg;
@@ -1595,27 +1602,45 @@ fn yolo_wears_the_value_ink_on_every_builtin_theme() {
         if crate::chrome_band::ensure_contrast([0x88; 3], ground, 4.5) != at.value() {
             apart.push(name);
         }
+        let warn = rgb(at.glass.warn());
+        let lit = Inks::of(row, at).ink;
         for (mode, face, ink) in [
-            (Mode::Bypass, "yolo", at.value()),
-            (Mode::Plan, "lame", Inks::of(row, at).ink),
+            (Mode::Bypass, "\u{25cf} yolo", at.value()),
+            (Mode::Plan, "\u{25cb} yolo", at.quiet()),
         ] {
             let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
             w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(mode);
             w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
             let block = w.block(7, row, now, at, Keep::Drawn);
             let all = text(&block.lights);
+            assert!(!all.contains("lame"), "{name}: {all:?}");
             let first = all
                 .find(face)
                 .map(|at| all[..at].chars().count())
                 .unwrap_or_else(|| panic!("{name}: {face:?} drawn: {all:?}"));
+            let letter = block.lights[0].fg;
             for cell in block.lights[first..first + face.chars().count()].iter() {
                 assert_eq!(cell.fg, ink, "{name}: {face}");
                 assert_ne!(cell.fg, old_red, "{name}: never Claude's red");
             }
+            hued |= ink != letter;
+            warned |= ink != warn;
+            rowed |= mode == Mode::Plan && ink != lit;
             if mode == Mode::Bypass {
                 assert!(
                     contrast(ink, ground) >= 6.99,
                     "{name}: {ink:?} on {ground:?}"
+                );
+                assert_ne!(ink, warn, "{name}: yolo on is no warning");
+                assert_ne!(ink, letter, "{name}: nor lit in the letter's hue");
+            } else {
+                assert!(
+                    contrast(ink, ground) >= 4.49,
+                    "{name}: the quiet ink still reads: {ink:?} on {ground:?}"
+                );
+                assert!(
+                    contrast(ink, ground) <= contrast(at.value(), ground),
+                    "{name}: off is never louder than on"
                 );
             }
         }
@@ -1623,6 +1648,11 @@ fn yolo_wears_the_value_ink_on_every_builtin_theme() {
     assert!(
         !apart.is_empty(),
         "NEGATIVE CONTROL: Claude's grey is the value ink on every ground"
+    );
+    assert!(
+        hued && warned && rowed,
+        "NEGATIVE CONTROL: the letter's hue, the warning ink and the row's ink are inks of \
+         their own: {hued} {warned} {rowed}"
     );
 }
 

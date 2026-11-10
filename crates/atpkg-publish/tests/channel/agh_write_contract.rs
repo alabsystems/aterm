@@ -1063,8 +1063,11 @@ fn a_cut_upload_is_converged_by_the_rerun_agh() {
 }
 
 fn case_publish_draft_keeps_a_prerelease_and_a_missing_tag_is_not_found(w: &dyn WriteWorld) {
-    w.lay("v1", true, &[("a.bin", b"ay")]);
     let s = w.slug();
+    w.host()
+        .create_draft(&s, "v1", "title", "notes", &[file(w.dir(), "a.bin", b"ay")])
+        .expect("the draft reservation");
+    assert_eq!(w.read("v1"), vec![held(true, &[("a.bin", b"ay")])]);
     w.host().publish_draft(&s, "v1").expect("the publish");
     assert_eq!(w.read("v1"), vec![held(false, &[("a.bin", b"ay")])]);
     assert_eq!(w.host().publish_draft(&s, "v9"), Err(HostError::NotFound));
@@ -1884,6 +1887,17 @@ impl ReleaseHost for PublishedOnly {
 
     fn create(&self, _: &Slug, _: &str, _: &str, _: &str, _: &[PathBuf]) -> Result<(), HostError> {
         panic!("create")
+    }
+
+    fn create_draft(
+        &self,
+        _: &Slug,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[PathBuf],
+    ) -> Result<(), HostError> {
+        panic!("create_draft")
     }
 
     fn upload(&self, _: &Slug, _: &str, _: &[PathBuf], _: Replace) -> Result<(), HostError> {

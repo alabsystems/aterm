@@ -9,6 +9,75 @@ use crate::commons::binding::Request;
 use crate::commons::journal::Trust;
 use crate::membership_log::{Member, Membership, NodeStanding, Removal};
 
+/// A vault machine named `laptop` takes m3 when Macs hold only m1 and m2.
+/// NEGATIVE CONTROL: adding a Mac named m3 makes the same VaultMachine path choose m4;
+/// restoring the old unconditional m3 hold makes the first assertion fail.
+#[test]
+fn vault_machine_enrollment_uses_m3_unless_a_mac_holds_it() {
+    use crate::client::log_entries_tests::join_host;
+    use crate::commons::bootstrap::Bootstrap;
+
+    for holds_m3 in [false, true] {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let owner = Paths::for_home(&root.path().join("owner"));
+        let vault = root.path().join("alab.vault");
+        let created =
+            test_create_unbound(&owner, vault.to_str().unwrap(), None, Some("m1")).unwrap();
+        admin_keys::legacy::publish_legacy(&owner, &admin_open(&owner).unwrap());
+        admin_commons_init(&owner).unwrap();
+        let admin = admin_open(&owner).unwrap();
+        let mut doc = admin.doc.clone();
+        let mut approved = Vec::new();
+        for (name, byte) in [("m2", 71), ("m3", 72)] {
+            if name == "m3" && !holds_m3 {
+                continue;
+            }
+            let recipient = Identity::from_secret_bytes([byte; 32])
+                .recipient()
+                .to_bech32();
+            doc.add_machine(name, &recipient).unwrap();
+            approved.push(recipient);
+        }
+        admin_publish_approved(&owner, &admin, &doc, &approved).unwrap();
+        genesis::sign_genesis(
+            &owner,
+            &root.path().join("genesis"),
+            &decode_key32(&created.signer).unwrap(),
+            true,
+        )
+        .unwrap();
+        let newcomer = Paths::for_home(&root.path().join("laptop"));
+        let recipient = machine_identity(&newcomer).unwrap().recipient().to_bech32();
+        let admin = admin_open(&owner).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine("laptop", &recipient).unwrap();
+        admin_publish_approved(&owner, &admin, &doc, &[recipient]).unwrap();
+        join_host(
+            &newcomer,
+            &format!("{}#{}", vault.display(), created.signer),
+            "laptop",
+        );
+        let bootstrap = Bootstrap::required(&newcomer).unwrap();
+        let request = bootstrap.request().unwrap();
+        let store = load_records(&owner).unwrap();
+        let plan = plan_log_enrollment(
+            &owner,
+            store.log().unwrap(),
+            bootstrap.trust(),
+            request.binding(),
+            false,
+        )
+        .unwrap();
+        match plan {
+            LogEnrollPlan::VaultMachine { name, label } => {
+                assert_eq!(name, "laptop");
+                assert_eq!(label, if holds_m3 { "m4" } else { "m3" });
+            }
+            _ => panic!("a post-genesis vault machine must use VaultMachine enrollment"),
+        }
+    }
+}
+
 /// A request on one root, its recipient chosen by `recipient` and its writer key by `writer`.
 fn request(recipient: u8, writer: u8) -> Request {
     Request::create(

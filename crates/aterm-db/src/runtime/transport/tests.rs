@@ -147,6 +147,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         None,
         Some(addr),
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -157,6 +158,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         Some(connection),
         None,
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -198,6 +200,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         Some(connection),
         None,
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -218,6 +221,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         completed: VecDeque::new(),
         push: None,
         failure: None,
+        doorbell: None,
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -286,6 +290,7 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
             None,
             Some(address),
             Scope::Loopback,
+            None,
             repair,
             Instant::now(),
         )
@@ -295,6 +300,7 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
             Some(accept_ready(&listener)),
             None,
             Scope::Loopback,
+            None,
             Repair::default(),
             Instant::now(),
         )
@@ -363,6 +369,7 @@ fn round_at(
         None,
         Some(address),
         Scope::Loopback,
+        None,
         repair,
         Instant::now(),
     )
@@ -372,6 +379,7 @@ fn round_at(
         Some(accept_ready(listener)),
         None,
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -420,6 +428,7 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
                 None,
                 Some(address),
                 Scope::Loopback,
+                None,
                 repair,
                 Instant::now(),
             )
@@ -452,6 +461,7 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
             None,
             Some(address),
             Scope::Loopback,
+            None,
             repair,
             Instant::now(),
         )
@@ -501,6 +511,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
                 None,
                 Some(address),
                 Scope::Loopback,
+                None,
                 repair,
                 Instant::now(),
             )
@@ -510,6 +521,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
                 Some(accept_ready(listener)),
                 None,
                 Scope::Loopback,
+                None,
                 Repair::default(),
                 Instant::now(),
             )
@@ -540,6 +552,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
             None,
             Some(address),
             Scope::Loopback,
+            None,
             repair,
             Instant::now(),
         )
@@ -560,6 +573,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
         None,
         Some(address),
         Scope::Loopback,
+        None,
         repair,
         Instant::now(),
     )
@@ -569,6 +583,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
         Some(accept_ready(&current)),
         None,
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -655,6 +670,7 @@ fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
                 None,
                 Some(listener.local_addr().unwrap()),
                 Scope::Loopback,
+                None,
                 Repair::default(),
                 Instant::now(),
             )
@@ -731,6 +747,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             None,
             Some(address),
             Scope::Loopback,
+            None,
             repair,
             Instant::now(),
         )
@@ -740,6 +757,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             Some(accept_ready(&known)),
             None,
             Scope::Loopback,
+            None,
             Repair::default(),
             Instant::now(),
         )
@@ -781,6 +799,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             None,
             Some(listeners[0].local_addr().unwrap()),
             Scope::Loopback,
+            None,
             Repair::default(),
             Instant::now(),
         )
@@ -815,6 +834,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
         Some(accept_ready(&known)),
         None,
         Scope::Loopback,
+        None,
         Repair::default(),
         Instant::now(),
     )
@@ -851,6 +871,7 @@ fn pending_enrollment_uses_all_workers_without_a_listener() {
                 None,
                 Some(listener.local_addr().unwrap()),
                 Scope::Loopback,
+                None,
                 Repair::default(),
                 now,
             )
@@ -913,6 +934,7 @@ fn a_peer_is_dialled_and_repairs_beside_two_stalled_dials() {
                 None,
                 Some(listeners[0].local_addr().unwrap()),
                 Scope::Loopback,
+                None,
                 Repair::default(),
                 start,
             )
@@ -956,6 +978,7 @@ fn a_peer_is_dialled_and_repairs_beside_two_stalled_dials() {
             Some(accept_ready(&peer)),
             None,
             Scope::Loopback,
+            None,
             Repair::default(),
             staggered,
         )
@@ -1027,6 +1050,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         completed: VecDeque::new(),
         push: None,
         failure: None,
+        doorbell: None,
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -1845,6 +1869,7 @@ fn a_dial_disowns_its_endpoint_only_on_evidence() {
             None,
             Some(target),
             Scope::Loopback,
+            None,
             Repair::default(),
             Instant::now(),
         )
@@ -1909,6 +1934,7 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
         task: thread::spawn(|| panic!("intentional worker failure")),
         started: now,
         heard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ended: Arc::new(AtomicBool::new(false)),
     });
     let until = now + Duration::from_secs(60);
     while !transport.workers.is_empty() {
@@ -1960,4 +1986,81 @@ fn a_dial_failure_names_a_held_lan_apart_from_an_unreachable_peer() {
     for kind in [io::ErrorKind::NotConnected, io::ErrorKind::InvalidInput] {
         assert_eq!(cause(io::Error::from(kind)), RepairCause::Io, "{kind:?}");
     }
+}
+
+/// A round's end rings the doorbell its transport's owner waits on ([`Transport::waits_on`]), and
+/// raises the worker's `ended` first, so the tick that ring wakes takes the round: a dial to a
+/// port nothing listens on ends at once, and the doorbell then polls ready, which a doorbell no
+/// round rang does not. A ring that never comes reaches the hang detector's minute.
+///
+/// NEGATIVE CONTROL (2026-11-09): with [`Ended`]'s drop raising `ended` but not ringing, the wait
+/// reached the minute (`a round's end rang the doorbell`).
+#[test]
+fn a_rounds_end_rings_its_transports_doorbell() {
+    let lab = Lab::new();
+    let bell = Arc::new(Doorbell::new().unwrap());
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = closed.local_addr().unwrap();
+    drop(closed);
+    let worker = Worker::start(
+        lab.endpoints[0].clone(),
+        None,
+        Some(target),
+        Scope::Loopback,
+        Some(bell.clone()),
+        Repair::default(),
+        Instant::now(),
+    )
+    .unwrap();
+    let rang = aterm_uds::ready::any(&[bell.fd()], Some(Instant::now() + Duration::from_secs(60)))
+        .unwrap();
+    assert_eq!(rang, [0], "a round's end rang the doorbell");
+    assert!(
+        worker.ended.load(Ordering::Acquire),
+        "the round's end is raised before its ring"
+    );
+    assert!(bell.clear());
+    let (_, _, success, _) = worker.task.join().unwrap();
+    assert!(!success, "nothing listens there");
+}
+
+/// An idle transport keeps no deadline sooner than its next beacon, and waits on its doorbell,
+/// its link's multicast socket and its listener: once a peer it may dial is heard, its next dial
+/// is due at once, and once that peer is in its round, nothing is due before the beacon.
+///
+/// NEGATIVE CONTROL (2026-11-09): with [`Transport::next_due`] leaving its dial out, the heard
+/// peer was not due (`a heard peer is dialled at once`).
+#[test]
+fn an_idle_transport_waits_for_its_beacon_and_a_heard_peer_for_its_dial() {
+    let lab = Lab::new();
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    transport.endpoint = Some(lab.endpoints[0].clone());
+    transport.refresh(&[SocketAddr::from((Ipv4Addr::LOCALHOST, 0))]);
+    let now = Instant::now();
+    assert_eq!(transport.interfaces(), 1, "the loopback link opened");
+    assert!(transport.next_due(now) <= transport.beacon);
+    assert!(transport.next_due(now) > now, "nothing is due at once");
+    assert_eq!(
+        transport.waits_on().map(|fds| fds.len()),
+        Some(3),
+        "its doorbell, its multicast socket and its listener"
+    );
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = closed.local_addr().unwrap();
+    drop(closed);
+    transport
+        .hints
+        .observe(&Hints::new([9; 32]).wire(target.port()), target, now);
+    assert!(
+        transport.next_due(now) <= now,
+        "a heard peer is dialled at once"
+    );
+    transport.tick(now).unwrap();
+    assert_eq!(transport.workers.len(), 1, "the heard peer is dialled");
+    assert_eq!(
+        transport.next_due(now),
+        transport.beacon.min(transport.rotate),
+        "with its one peer in a round, nothing is due before the beacon"
+    );
+    transport.stop();
 }

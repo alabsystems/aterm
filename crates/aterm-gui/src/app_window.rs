@@ -1798,12 +1798,10 @@ impl App {
             self.quit_capture = Some(self.capture_restore_manifest());
         }
         let ids = self.window_terminal_sessions(wid);
-        let view_ids: Vec<crate::tab_model::ViewId> = ws
-            .tab_set
-            .tabs()
-            .iter()
-            .flat_map(|tab| tab.root.leaves())
-            .collect();
+        let mut view_ids: Vec<crate::tab_model::ViewId> = Vec::new();
+        for tab in ws.tab_set.tabs() {
+            tab.root.visit(&mut |&view| view_ids.push(view));
+        }
         let plan = crate::session_log::ClosedKeep::plan(&self.pool.drops_of(&ids));
         for (id, planned) in ids.into_iter().zip(plan) {
             if self.detach_session_view(id) {

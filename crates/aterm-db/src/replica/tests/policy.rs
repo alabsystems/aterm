@@ -132,36 +132,108 @@ fn vault_read_spans_session_admission_and_ends_with_the_local_batch() {
 /// A local batch's admission (its session's open, and the peer and the observation it checks at
 /// once after it: `Replica::observe`) hands one look at the vault
 /// ([`aterm_secrets::client::VaultLook`]) to each of its custody, access, currency and roster
-/// checks: none is made without one ([`crate::table::OWN_CHECKS`]), for a read or for a write, and
-/// a batch's own `Session::peer` still asks its currency and its roster each on its own call. That
+/// checks: none is made without one ([`crate::table::OWN_CHECKS`]), for a read or for a write. A
+/// read's look is its batch's source read of the vault, so its admission opens no look of its own
+/// (`aterm_secrets::client::test_looks_observed`), and its session keeps it: the batch's own
+/// checks (a peer's currency and roster, its observation and its legacy one, an endpoint's
+/// context, a store's context and inventory) are judged through it, none on its own call. A
+/// write's look ends before its batch runs, whose own `Session::peer` asks its currency and its
+/// roster each on its own call. Run on a pair whose access reads the journal alone and on one whose
+/// access is log-backed (`compatibility::log_pair`), whose observation asks its currency too. That
 /// the look serves them, observing the state lock once for all of them, is `aterm-secrets`'
-/// `a_session_look_observes_once_and_judges_as_its_own_calls`; this pair's access is not
-/// log-backed, so its currency checks read the journal alone either way.
+/// `a_session_look_observes_once_and_judges_as_its_own_calls`.
 /// NEGATIVE CONTROLS (2026-11-09): with `Replica::observe`'s peer check on its own call
 /// (`Session::peer`), a read's admission asks two (`a read's admission`); with its write opened
 /// by `Session::open_until`, a write's asks two (`a write's admission`); with
 /// `Session::peer_member_in` reading the roster on its own call whatever its look, a read's asks
-/// one.
+/// one; with the read's look dropped before its batch runs (`a read batch's own checks`), or
+/// opened by `VaultLook::new` (`a read's own looks`), and with the session's currency (`Session::current`), its context
+/// (`Session::current_observed`), its observation or its peer judged on its own call (`a read
+/// batch's own checks`, the observation's over the log-backed pair), and with a write keeping its
+/// look into its batch (`a write batch's own checks`), each fails.
 #[test]
 fn a_local_batch_is_admitted_through_one_look_at_the_vault() {
-    let p = Pair::new(false, 1);
+    for log_backed in [false, true] {
+        let p = if log_backed {
+            super::compatibility::log_pair()
+        } else {
+            Pair::new(false, 1)
+        };
+        let replica = p.replica(0);
+        let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+        let round = replica.round(peer).unwrap();
+        let own = || crate::table::OWN_CHECKS.get();
+        let looks = aterm_secrets::client::test_looks_observed;
+        let (before, looks_before) = (own(), looks());
+        let (admitted, read_looks, batch) = round
+            .local(peer, |session| {
+                let (admitted, read_looks) = (own() - before, looks() - looks_before);
+                assert_eq!(session.is_log_backed(), log_backed, "CONTROL: its access");
+                session.peer(peer)?;
+                session.observation()?;
+                session.legacy_observation()?;
+                session.control_context()?;
+                let store = Store::observe(session, &p.paths[0], p.scope)?;
+                assert_eq!(store.inventory(session)?.count(), 1, "CONTROL: its record");
+                Ok((admitted, read_looks, own() - before - admitted))
+            })
+            .unwrap();
+        assert_eq!(admitted, 0, "a read's admission (log-backed {log_backed})");
+        assert_eq!(
+            read_looks, 0,
+            "a read's own looks (log-backed {log_backed})"
+        );
+        assert_eq!(
+            batch, 0,
+            "a read batch's own checks (log-backed {log_backed})"
+        );
+        let (before, looks_before) = (own(), looks());
+        let (admitted, write_looks, batch) = round
+            .local_write(peer, |session| {
+                let (admitted, write_looks) = (own() - before, looks() - looks_before);
+                session.peer(peer)?;
+                Ok((admitted, write_looks, own() - before - admitted))
+            })
+            .unwrap();
+        assert_eq!(admitted, 0, "a write's admission (log-backed {log_backed})");
+        assert_eq!(
+            write_looks, 1,
+            "a write's own looks (log-backed {log_backed})"
+        );
+        assert_eq!(
+            batch, 2,
+            "a write batch's own checks (log-backed {log_backed})"
+        );
+    }
+}
+
+/// A store read batch's opening and closing fences (`Session::read_context`) ask the session's
+/// currency afresh, on their own calls, though the session keeps its batch's look: a table-repair
+/// read batch's store open over a journal pair's two records replays them in one read batch, whose
+/// two fences each ask afresh ([`crate::table::FENCES_AFRESH`]), and whose other checks ask
+/// nothing on their own calls ([`crate::table::OWN_CHECKS`]).
+/// NEGATIVE CONTROL (2026-11-10): with `read_context` judging through the session's look, its
+/// fences ask none afresh (`a read batch's fences`).
+#[test]
+fn a_store_read_batchs_fences_ask_afresh_under_a_kept_look() {
+    let p = Pair::new(false, 2);
     let replica = p.replica(0);
     let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
     let round = replica.round(peer).unwrap();
+    let fences = || crate::table::FENCES_AFRESH.get();
     let own = || crate::table::OWN_CHECKS.get();
-    let before = own();
-    let (admitted, batch) = round
+    let (fenced, asked) = round
         .local(peer, |session| {
-            let admitted = own() - before;
-            session.peer(peer)?;
-            Ok((admitted, own() - before - admitted))
+            assert!(!session.is_log_backed(), "CONTROL: its access");
+            let (fences_before, own_before) = (fences(), own());
+            let store = Store::observe(session, &p.paths[0], p.scope)?;
+            let judged = (fences() - fences_before, own() - own_before);
+            assert_eq!(store.inventory(session)?.count(), 2, "CONTROL: its records");
+            Ok(judged)
         })
         .unwrap();
-    assert_eq!(admitted, 0, "a read's admission");
-    assert_eq!(batch, 2, "a batch's own checks");
-    let before = own();
-    let admitted = round.local_write(peer, |_| Ok(own() - before)).unwrap();
-    assert_eq!(admitted, 0, "a write's admission");
+    assert_eq!(fenced, 2, "a read batch's fences");
+    assert_eq!(asked, 0, "a read batch's own checks");
 }
 
 /// Another of this Mac's rounds ingesting into `p`'s first table: a writer's commit, which overtakes

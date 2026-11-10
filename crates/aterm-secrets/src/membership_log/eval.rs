@@ -60,15 +60,20 @@
 //! member let in never outvote the quorum that voided them, and mutual quorum `Remove`s that
 //! each void a share of the other remove both, whichever cutoff comes first.
 //!
-//! **Labels.** A Mac's label claim is the label in its first `Admit` (or its genesis entry). An
+//! **Initial labels.** A Mac's initial label claim is in its first `Admit` (or its genesis entry). An
 //! `Admit` claims when it is authorized in its own causal past, which no later record changes,
 //! or under the quorums that take effect. A label claimed by two or more Macs is held bare by
 //! none: each takes the label plus the first four hex digits of its binding's SHA-256
 //! (`m40-3fa2`), except that a claim never suffixes a Mac whose claim it already had in its
-//! past. Claims only accrue as the log grows, so a Mac's label changes at most once, the first
-//! time its log shows a clash. The exceptions: a Mac with concurrent first `Admit`s that claim
-//! different labels takes the suffix on the label of the one with the lowest id, which a later
+//! past. Initial claims only accrue as the log grows, so the fallback changes at most once, the
+//! first time its log shows a clash. The exceptions: a Mac with concurrent first `Admit`s that
+//! claim different labels takes the suffix on the label of the one with the lowest id, which a later
 //! concurrent `Admit` can move; and a claim that only the quorums authorize lapses if they do.
+//! An authorized holder-signed bare-number `Name` chooses a new label when no other current
+//! member holds it. Concurrent choices of a free number remain unresolved; a choice already
+//! in another choice's past stands. Free moves release their seat labels for other choices.
+//! Existing readers accept this same Name wire record as a display name and retain the old
+//! seat label; membership, authorization and record decoding do not change.
 //!
 //! **Names and node keys.** A member's latest effective `Name` (its highest sequence, at a tie the
 //! lowest id) overrides the name its entry carried, and its latest effective `Node` the node key,
@@ -271,8 +276,8 @@ pub struct Member {
     pub node_key: Option<[u8; 32]>,
     /// Its host name: from its latest effective `Name`, else from its entry.
     pub name: String,
-    /// Its label: the `m<N>` it claimed, with its binding's suffix when another Mac claimed the
-    /// same label.
+    /// Its effective chosen number, else its initial seat label with its binding's suffix when
+    /// another Mac claimed that initial label.
     pub label: String,
     /// The member whose `Admit` let it in; `None` for a founder.
     pub admitted_by: Option<MemberId>,
@@ -368,6 +373,8 @@ pub struct RevokingRow {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Membership {
     members: BTreeMap<MemberId, Member>,
+    chosen_labels: BTreeMap<MemberId, String>,
+    number_choices: BTreeSet<MemberId>,
     removed: BTreeMap<MemberId, Removal>,
     removed_recipients: BTreeSet<Recipient>,
     revoking_rows: BTreeSet<RevokingRow>,
@@ -387,6 +394,21 @@ type RetiredBySeat = BTreeMap<MemberId, Vec<[u8; 32]>>;
 type Rank = (u64, RecordId);
 
 impl Membership {
+    /// The bare number this member chose in an authorized, holder-signed `Name`, when no other
+    /// member holds or concurrently chooses it. Initial seat names are not chosen claims.
+    pub fn chosen_label(&self, member: &MemberId) -> Option<&str> {
+        self.chosen_labels.get(member).map(String::as_str)
+    }
+
+    /// The effective label after a signed number choice, including the seat fallback while
+    /// competing choices are unresolved. Registry mirrors must follow that fallback too.
+    pub fn label_after_choice(&self, member: &MemberId) -> Option<&str> {
+        self.number_choices
+            .contains(member)
+            .then(|| self.label(member))
+            .flatten()
+    }
+
     /// Every member, by actor.
     pub const fn members(&self) -> &BTreeMap<MemberId, Member> {
         &self.members
@@ -1603,7 +1625,8 @@ impl<'a> Graph<'a> {
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         let plain = self.authorized_records(&self.no_void(), &apart.plain, scratch);
-        let labels = self.labels(&plain, &authorized, &standing, &effects.out, &effects.void);
+        let mut labels = self.labels(&plain, &authorized, &standing, &effects.out, &effects.void);
+        let (chosen_labels, number_choices) = self.chosen_labels(&mut labels, &standing);
         // A quorum's signers are the shares that counted for it weighed with nothing void (what
         // `weigh(q, None)` gives), as the walk weighed it apart.
         let mut quorums: Vec<Quorum> = accepted
@@ -1760,6 +1783,7 @@ impl<'a> Graph<'a> {
                 claimed_labels.insert(seat.label.to_owned());
             }
         }
+        claimed_labels.extend(chosen_labels.values().cloned());
         let (nodes, retired) = self.nodes(
             &members,
             (&removed, &superseded_by, &removed_recipients),
@@ -1813,6 +1837,8 @@ impl<'a> Graph<'a> {
         }
         Membership {
             members,
+            chosen_labels,
+            number_choices,
             removed,
             removed_recipients,
             revoking_rows,
@@ -1832,6 +1858,80 @@ impl<'a> Graph<'a> {
             let (a, b) = (&self.records[a], &self.records[b]);
             a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id()))
         })
+    }
+
+    /// Derive current labels from the existing holder-signed Name wire record. Concurrent
+    /// choices of a free number are unresolved; none displaces an incumbent. Free moves
+    /// release their old number, so chains settle without reserving historical seat labels.
+    fn chosen_labels(
+        &self,
+        labels: &mut BTreeMap<MemberId, String>,
+        standing: &Standing,
+    ) -> (BTreeMap<MemberId, String>, BTreeSet<MemberId>) {
+        let unproved: BTreeSet<_> = self
+            .listed()
+            .iter()
+            .filter(|founder| {
+                founder.binding.is_none()
+                    && !standing.members.iter().any(|(member, &entry)| {
+                        self.entrant(entry, member)
+                            .is_some_and(|(seat, _)| seat.binding.recipient() == founder.recipient)
+                    })
+            })
+            .map(|founder| founder.label.as_str())
+            .collect();
+        let mut pending = BTreeMap::new();
+        for member in standing.members.keys() {
+            let numbers: Vec<_> = standing
+                .names
+                .get(member)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| {
+                    matches!(self.records[i].body(), Body::Name { name }
+                    if aterm_types::machine_name::Number::parse(name)
+                        .is_ok_and(|number| number.to_string() == *name))
+                })
+                .collect();
+            if let Some(i) = self.latest(Some(&numbers))
+                && let Body::Name { name } = self.records[i].body()
+            {
+                pending.insert(*member, (i, name.clone()));
+            }
+        }
+        let number_choices = pending.keys().copied().collect();
+        let mut chosen = BTreeMap::new();
+        loop {
+            let ready: Vec<_> = pending
+                .iter()
+                .filter(|(member, (at, label))| {
+                    let number = aterm_types::machine_name::Number::parse(label).ok();
+                    let holds = |held: &str| {
+                        aterm_types::machine_name::Number::leading(held)
+                            .is_some_and(|held| Some(held) == number)
+                    };
+                    (labels.get(*member) == Some(label)
+                        || !pending.iter().any(|(other, (there, theirs))| {
+                            other != *member && theirs == label && !self.before(*at, *there)
+                        }))
+                        && !labels.iter().any(|(other, held)| {
+                            other != *member && standing.members.contains_key(other) && holds(held)
+                        })
+                        && !unproved.iter().any(|held| holds(held))
+                })
+                .map(|(member, (_, label))| (*member, label.clone()))
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for (member, label) in ready {
+                pending.remove(&member);
+                labels.insert(member, label.clone());
+                chosen.insert(member, label);
+            }
+        }
+        (chosen, number_choices)
     }
 
     /// Whether `member` is now out (either voided by a quorum `Remove` or removed by a standing

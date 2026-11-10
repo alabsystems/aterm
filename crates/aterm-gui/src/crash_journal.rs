@@ -512,12 +512,13 @@ impl Reopened {
         let mut out = PanesWithoutFolder::NONE;
         for window in &self.manifest.windows {
             if window.restored_tabs.is_empty() {
-                out.gone += window
-                    .tabs
-                    .iter()
-                    .flat_map(crate::restore::PaneLayout::leaves)
-                    .filter(|leaf| leaf.cwd().is_some_and(&not_found))
-                    .count();
+                for tab in &window.tabs {
+                    tab.visit_leaves(&mut |leaf| {
+                        if leaf.cwd().is_some_and(&not_found) {
+                            out.gone += 1;
+                        }
+                    });
+                }
             } else {
                 for tab in &window.restored_tabs {
                     walk(&tab.root, &not_found, &mut out);

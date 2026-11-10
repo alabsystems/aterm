@@ -307,7 +307,7 @@ impl LinuxDecl {
 pub struct ReleaseOptions {
     /// Build and freeze this clean origin/main checkout without starting a cut.
     pub prefreeze: bool,
-    /// `--bump`: commit the next MINOR on origin/main's tip and start a line at it.
+    /// `--bump`: commit the next product version on origin/main's tip and start a line at it.
     pub bump: bool,
     /// `--commit <rev>`: start a line at this commit of origin/main.
     pub commit: Option<String>,
@@ -420,7 +420,7 @@ pub fn is_value(word: &str) -> bool {
 /// This clone's release: what a re-run resumes with.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Journal {
-    /// The release version, `X.Y.0`.
+    /// The frozen public product version: historical `X.Y.0` or calendar `1.YYYYMMDD.N`.
     pub version: String,
     /// R, full: the head of [`Journal::line`].
     pub commit: String,
@@ -458,6 +458,14 @@ pub struct Journal {
     /// Present only in `candidate.toml` while an explicit supersession is undecided.
     #[serde(default)]
     pub(crate) supersede: Option<SupersedeTxn>,
+}
+
+/// In-memory diagnostics never change the authoritative candidate or release journals.
+struct LineSelection {
+    head: String,
+    source: String,
+    holder: Option<String>,
+    announced: bool,
 }
 
 /// A PREPARED release, as `--prepare` left it.
@@ -1320,9 +1328,13 @@ pub trait Branches: Sync {
     /// content-checked test-executable index. Backends without a separate fixture consumer need
     /// no state of their own.
     fn expect_tree_index(&self) {}
+    /// Prepare the tree's admission signal before any branch starts. The build waits for
+    /// lint to reserve memory before launching either slice.
+    fn expect_tree_lint(&self);
     /// Return once both release slices hold memory, their successful all-Fresh bundle has already
     /// completed, or `ended` says the build ended.
-    /// The measured critical path gets memory before the tree's moldable compile.
+    /// With no pending lint, the measured critical path gets memory before the
+    /// tree's moldable compile.
     fn build_admitted(&self, ended: &dyn Fn() -> bool);
     /// The export check of R: `pub stage` to the staging tier (`Remote`) or without its push
     /// (`Local`); its push begun is [`BranchStop::push`].
@@ -1385,6 +1397,15 @@ pub trait PendingSign: Send {
     fn finish(self: Box<Self>) -> Ran;
 }
 
+/// What proves a privately signed copy may be removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedDiscard {
+    /// Stop unused preparation; a journaled draft still owns its signed bytes.
+    CancelPreparation,
+    /// The reservation was spent elsewhere, so this signed copy cannot ship.
+    LostReservation,
+}
+
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
     /// State the selected base's B8 evidence without steering selection or refusing a cut.
@@ -1417,6 +1438,14 @@ pub trait Backend {
     /// Read the existing version line before judging a freshly selected main tip.
     fn fleet_existing(&mut self, _version: &str) -> Result<Option<crate::line::Line>, Refusal> {
         Ok(None)
+    }
+    /// Holder evidence retained by the existing claim read or acquisition; no network read.
+    fn fleet_holder(&mut self, _head: &str) -> Option<String> {
+        None
+    }
+    /// Local commits reachable from main but not head, and the subset changing cutter/check code.
+    fn main_past_line(&mut self, _head: &str, _main: &str) -> Option<(usize, usize)> {
+        None
     }
     fn fleet_supersession(
         &mut self,
@@ -1642,12 +1671,7 @@ pub trait Backend {
     ) -> Ran;
     /// Discard the copy step 7 signed of build `build` of `version` from the clone's `dist/`
     /// ([`crate::publish::discard_signed`]); what could not be removed.
-    fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String>;
-    /// Withdraw this run's journaled private draft after both step 7 children
-    /// settled. Claimed cuts keep their ordinary recovery journal.
-    fn discard_draft(&mut self, _version: &str, _build: u64) -> Vec<String> {
-        Vec::new()
-    }
+    fn discard_signed(&mut self, version: &str, build: u64, reason: SignedDiscard) -> Vec<String>;
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal>;
     /// Distribution and the main reader consume the public release independently.
     /// Both join before returning; each successful half keeps its own completion.
@@ -1713,6 +1737,7 @@ struct Run<'b> {
     opts: ReleaseOptions,
     dry: bool,
     journal_path: PathBuf,
+    line_selection: Option<LineSelection>,
     journal: Option<Journal>,
     claim: Option<RunClaim>,
     /// Why this run could not claim the clone ([`Run::take_claim`]): its checks refuse with it.
@@ -1758,8 +1783,6 @@ struct Run<'b> {
     /// The candidate-only explicit supersession transaction, if one is being selected or
     /// recovered.
     supersede: Option<SupersedeTxn>,
-    /// Locally constructed dry-run hops; no journal or ref records this plan.
-    dry_line: Option<crate::line::Line>,
     dry_unavailable: Vec<String>,
 }
 
@@ -1775,6 +1798,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         opts: opts.clone(),
         dry: opts.dry_run,
         journal_path: release_dir.join(JOURNAL_FILE),
+        line_selection: None,
         journal: None,
         claim: None,
         claim_refused: None,
@@ -1806,7 +1830,6 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         last: String::new(),
         early_sign: None,
         supersede: None,
-        dry_line: None,
         dry_unavailable: Vec::new(),
     };
     let went = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.go()));
@@ -1854,18 +1877,9 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         }
     };
     run.discard_early_sign();
-    if code != 0
-        && !run.dry
-        && run.claim.is_some()
-        && !run.claimed()
-        && let Some(reserved) = run.reservation()
-    {
-        let n = reserved.build;
-        let version = run.version();
-        for why in run.b.discard_draft(&version, n) {
-            run.say(&format!("        private draft cleanup: {why}"));
-        }
-    }
+    // A failed run does not invalidate its private draft. It can already hold
+    // the source engine's signed evidence; retain its journal for adoption.
+    // The claim's lost-reservation path handles copies that can no longer ship.
     run.b.stop_tools();
     Outcome {
         code,
@@ -1966,6 +1980,24 @@ impl Run<'_> {
             .journal
             .as_ref()
             .and_then(|journal| journal.supersede.clone());
+        if !self.claim.as_ref().is_some_and(|claim| claim.continued)
+            && self.opts.commit.is_none()
+            && let Some(journal) = self.journal.as_ref()
+        {
+            self.line_selection = Some(LineSelection {
+                head: journal.commit.clone(),
+                source: format!(
+                    "this clone's journal {}",
+                    if selection.exists() {
+                        selection.display().to_string()
+                    } else {
+                        self.journal_path.display().to_string()
+                    }
+                ),
+                holder: None,
+                announced: false,
+            });
+        }
         if let Some(txn) = &self.supersede {
             let requested = self
                 .opts
@@ -3083,7 +3115,7 @@ impl Run<'_> {
                         short(&at)
                     ),
                     format!(
-                        "release the next MINOR: {RELEASE_COMMAND} --forget, then \
+                        "release the next product version: {RELEASE_COMMAND} --forget, then \
                          {RELEASE_COMMAND} --bump"
                     ),
                 ));
@@ -4166,12 +4198,23 @@ impl Run<'_> {
             let previous = candidate.commit.clone();
             crate::line_claim::follow(self.b, &mut candidate, &mut self.journal)
                 .map_err(|r| self.halted(r))?;
+            if candidate.commit != previous {
+                self.fleet_selection(&candidate);
+            }
             self.cand = Some(candidate);
             if self.commit_r() != previous && !self.opts.fix.is_empty() {
                 let journal = self.journal.clone();
                 self.cand = Some(self.fix_candidate(journal.as_ref(), false)?);
             }
         }
+        let journaled = self
+            .journal
+            .as_ref()
+            .filter(|j| !j.finished())
+            .map(|j| j.prover.clone());
+        self.prover = Some(self.b.prover(journaled.as_deref()).map_err(|why| {
+            self.halted(Refusal::new(why, "restore the locked Trust toolchain").could_not_run())
+        })?);
         let mut candidate = self.cand.clone().ok_or(Halt::Said(1))?;
         if !candidate.carry.is_empty() {
             let mut line = self.journal.as_ref().ok_or(Halt::Said(1))?.line();
@@ -4188,9 +4231,6 @@ impl Run<'_> {
                 ));
             }
             line.hops.extend(hops);
-            self.b
-                .verify_pending_line(&line)
-                .map_err(|r| self.halted(r))?;
             candidate.commit = line.head().to_owned();
             candidate.why = format!(
                 "planned head of line v{} from {}; carries {} locally before step 1",
@@ -4203,17 +4243,13 @@ impl Run<'_> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            self.dry_line = Some(line);
+            // Give the frozen image the same pending identity as real preparation. It must
+            // judge that identity through the ordinary acceptance path, never a dry-only
+            // ancestry exemption. Nothing saves this in-memory journal.
+            let prover = self.prover.clone().ok_or(Halt::Said(1))?;
+            self.journal = Some(self.carried_journal(&candidate, line, &prover));
             self.cand = Some(candidate);
         }
-        let journaled = self
-            .journal
-            .as_ref()
-            .filter(|j| !j.finished())
-            .map(|j| j.prover.clone());
-        self.prover = Some(self.b.prover(journaled.as_deref()).map_err(|why| {
-            self.halted(Refusal::new(why, "restore the locked Trust toolchain").could_not_run())
-        })?);
         self.own_cutter()
     }
 
@@ -4479,6 +4515,9 @@ impl Run<'_> {
             return self.stop_pending_selection(why, pending.as_ref());
         }
         if selected.commit != self.commit_r() {
+            self.fleet_selection(&selected);
+        }
+        if selected.commit != self.commit_r() {
             if let Some(pending) = pending
                 && let Err(rewind) = self.b.rewind_selection(&pending)
             {
@@ -4622,12 +4661,12 @@ impl Run<'_> {
             }
         } else if self.opts.bump {
             let v0 = self.b.version_at(&tip).unwrap_or_default();
-            let Some((major, minor)) = public_version(&v0) else {
+            if public_version(&v0).is_none() {
                 return self.refuse_hard(Refusal::new(
-                    format!("origin/main's version '{v0}' is not MAJOR.MINOR.0"),
+                    format!("origin/main's version '{v0}' is not a canonical product release"),
                     "fix [workspace.package] version on main",
                 ));
-            };
+            }
             let used = if selecting {
                 self.b.local_tag(&format!("v{v0}")) || self.b.ledger_versions(&tip).contains(&v0)
             } else {
@@ -4642,7 +4681,13 @@ impl Run<'_> {
                     "release it as it is: drop --bump",
                 ));
             }
-            let v = format!("{major}.{}.0", minor + 1);
+            let v = match crate::publish::allocate_release_after(&v0, self.t_start) {
+                Ok(version) => version,
+                Err(error) => return self.refuse_hard(Refusal::new(
+                    format!("cannot allocate after {v0}: {error}"),
+                    "restore the UTC clock or advance the product source through its canonical version claim",
+                )),
+            };
             Candidate {
                 commit: tip.clone(),
                 why: format!("--bump {v0} -> {v} on origin/main's tip {}", short(&tip)),
@@ -4667,7 +4712,7 @@ impl Run<'_> {
             if public_version(&cand.version).is_none() {
                 return self.refuse_hard(Refusal::new(
                     format!(
-                        "{} has no public MAJOR.MINOR.0 version",
+                        "{} has no historical MAJOR.MINOR.0 or calendar 1.YYYYMMDD.N product version",
                         short(&cand.commit)
                     ),
                     "select a release commit with --commit",
@@ -4677,10 +4722,7 @@ impl Run<'_> {
             return Ok(());
         }
 
-        if !self.b.is_ancestor(&cand.commit, &tip)
-            && !self.pending_line_heads(&cand.commit)
-            && self.dry_line.is_none()
-        {
+        if !self.b.is_ancestor(&cand.commit, &tip) && !self.pending_line_heads(&cand.commit) {
             self.cand = Some(cand.clone());
             let hop = self.heads_a_hop(&cand.commit);
             return self.refuse_hard(
@@ -4718,10 +4760,13 @@ impl Run<'_> {
             }
         }
         if public_version(&v).is_none() {
-            let remedy = format!("release the next MINOR: {}", self.start_remedy("--bump"));
+            let remedy = format!(
+                "release the next product version: {}",
+                self.start_remedy("--bump")
+            );
             self.refuse(Refusal::new(
                 format!(
-                    "{} declares version '{v}', not a public MAJOR.MINOR.0",
+                    "{} declares version '{v}', not a historical MAJOR.MINOR.0 or calendar 1.YYYYMMDD.N",
                     short(&r)
                 ),
                 remedy,
@@ -4730,7 +4775,10 @@ impl Run<'_> {
 
         if let Some(prev) = self.prev_release(&r, &v) {
             if !newer(&v, &prev) {
-                let remedy = format!("release the next MINOR: {}", self.start_remedy("--bump"));
+                let remedy = format!(
+                    "release the next product version: {}",
+                    self.start_remedy("--bump")
+                );
                 self.refuse(Refusal::new(
                     format!("v{v} is not newer than v{prev}, the release it would succeed"),
                     remedy,
@@ -4760,7 +4808,10 @@ impl Run<'_> {
                     "origin/main still declares {v0}: find what cut v{v} (git ls-remote --tags \
                      origin v{v}) and bring main's version past it, then {RELEASE_COMMAND} --bump"
                 ),
-                None => format!("release the next MINOR: {}", self.start_remedy("--bump")),
+                None => format!(
+                    "release the next product version: {}",
+                    self.start_remedy("--bump")
+                ),
             };
             self.refuse(Refusal::new(
                 format!("v{v} is already cut (its tag is on origin), and this clone journals no cut of it"),
@@ -4787,7 +4838,7 @@ impl Run<'_> {
             && self.b.origin_tag(&format!("v{v}")).is_none()
         {
             let remedy = format!(
-                "finish that release: {}; or release the next MINOR: {}",
+                "finish that release: {}; or release the next product version: {}",
                 self.start_remedy(&format!("--commit {newest}")),
                 self.start_remedy("--bump")
             );
@@ -4867,7 +4918,7 @@ impl Run<'_> {
             ),
             format!(
                 "finish it: {RELEASE_COMMAND} without {flag}; or drop it and release the next \
-                 MINOR: {RELEASE_COMMAND} --forget, then --bump"
+                 product version: {RELEASE_COMMAND} --forget, then --bump"
             ),
         ))
     }
@@ -5004,6 +5055,38 @@ impl Run<'_> {
         ))
     }
 
+    /// The constructing cutter's pending identity, used in memory by a dry run and saved in
+    /// candidate.toml by real preparation. No facts of the previous head belong to this one.
+    fn carried_journal(
+        &mut self,
+        candidate: &Candidate,
+        line: crate::line::Line,
+        prover: &Prover,
+    ) -> Journal {
+        let mut asks = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.asks.clone())
+            .unwrap_or_default();
+        for key in &self.early_asks {
+            if !asks.contains(key) {
+                asks.push(key.clone());
+            }
+        }
+        Journal {
+            version: candidate.version.clone(),
+            commit: candidate.commit.clone(),
+            prover: prover.bin.display().to_string(),
+            trustc: prover.commit.clone(),
+            started: self.b.now(),
+            linux: self.linux.clone(),
+            done: vec![PENDING_LINE.into()],
+            asks,
+            line: Some(line),
+            ..Journal::default()
+        }
+    }
+
     fn commit(&mut self, selecting: bool) -> Result<String, Halt> {
         let Some(mut cand) = self.cand.clone() else {
             return Ok(String::new());
@@ -5108,33 +5191,7 @@ impl Run<'_> {
             && self.supersede.is_none()
             && let Some(line) = carried.as_ref()
         {
-            let now = self.b.now();
-            let mut asks = self
-                .journal
-                .as_ref()
-                .map(|journal| journal.asks.clone())
-                .unwrap_or_default();
-            for key in &self.early_asks {
-                if !asks.contains(key) {
-                    asks.push(key.clone());
-                }
-            }
-            let pending = Journal {
-                version: cand.version.clone(),
-                commit: cand.commit.clone(),
-                prover: prover.bin.display().to_string(),
-                trustc: prover.commit.clone(),
-                bumped: false,
-                started: now,
-                linux: self.linux.clone(),
-                done: vec![PENDING_LINE.into()],
-                asks,
-                reserved: None,
-                artifact: None,
-                prepared: None,
-                line: Some(line.clone()),
-                supersede: None,
-            };
+            let pending = self.carried_journal(&cand, line.clone(), &prover);
             let path = self.b.release_dir().join(SELECTION_FILE);
             if let Err(why) = pending.save(&path) {
                 self.refuse(Refusal::new(
@@ -5158,7 +5215,9 @@ impl Run<'_> {
             .as_ref()
             .is_some_and(|j| j.commit == cand.commit);
         if !same {
-            let now = self.b.now();
+            let calendar = aterm_types::release_version::ReleaseVersion::parse(&cand.version)
+                .is_some_and(|v| v.is_calendar());
+            let now = if calendar { self.t_start } else { self.b.now() };
             let line = carried
                 .or_else(|| {
                     self.supersede
@@ -5167,6 +5226,7 @@ impl Run<'_> {
                         .map(|txn| txn.replacement.clone())
                 })
                 .unwrap_or_else(|| crate::line::Line::start(&cand.version, &cand.commit, now));
+            let started = if calendar { line.started } else { now };
             let asks = self
                 .journal
                 .as_ref()
@@ -5178,7 +5238,7 @@ impl Run<'_> {
                 prover: prover.bin.display().to_string(),
                 trustc: prover.commit.clone(),
                 bumped,
-                started: now,
+                started,
                 linux: self.linux.clone(),
                 done: if selecting && !line.hops.is_empty() {
                     vec![PENDING_LINE.into()]
@@ -5242,6 +5302,7 @@ impl Run<'_> {
     }
 
     fn own_cutter(&mut self) -> Flow {
+        self.announce_line_selection();
         let r = self.commit_r();
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
@@ -5283,6 +5344,52 @@ impl Run<'_> {
                     Err(refusal) => self.refuse(refusal),
                 }
             }
+        }
+    }
+
+    fn fleet_selection(&mut self, candidate: &Candidate) {
+        self.line_selection = Some(LineSelection {
+            head: candidate.commit.clone(),
+            source: format!("fleet claim refs/aterm-release/line/{}", candidate.version),
+            holder: self.b.fleet_holder(&candidate.commit),
+            announced: false,
+        });
+    }
+
+    /// Say this before exec: the selected head may have a cutter predating this diagnostic.
+    fn announce_line_selection(&mut self) {
+        let head = self.commit_r();
+        let Some(journal) = self.journal.as_ref().filter(|j| j.commit == head) else {
+            return;
+        };
+        let Some(selection) = self
+            .line_selection
+            .as_ref()
+            .filter(|s| !s.announced && s.head == head)
+        else {
+            return;
+        };
+        if head == self.tip {
+            return;
+        }
+        let line = journal.line();
+        let source = selection.source.clone();
+        let holder = selection
+            .holder
+            .as_deref()
+            .unwrap_or("not recorded")
+            .to_string();
+        let main = self.tip.clone();
+        let gap = self.b.main_past_line(&head, &main).map_or_else(
+            || "comparison with this head unavailable from local history".to_string(),
+            |(all, tools)| format!("past this head by {all} commits, {tools} of them touching crates/aterm-release or crates/aterm-verify"),
+        );
+        self.say(&format!(
+            "release: adopted/continued line v{} (base {}) from {source}; holder {holder}; head {head}; origin/main {main}: {gap}. This release uses the line's content. Carry fixes onto the line: {RELEASE_COMMAND} --fix <c>...; or start the line again at main: {RELEASE_COMMAND} --commit {main} --supersede",
+            line.version, line.base,
+        ));
+        if let Some(selection) = self.line_selection.as_mut() {
+            selection.announced = true;
         }
     }
 
@@ -5675,10 +5782,11 @@ impl Run<'_> {
     /// Step 4, after step 1 judged R's preflight: its reservation where the build needs one, then the qualify
     /// graph — the tree half of `verify release`, the bundle's build and the export check, at once
     /// ([`run_graph`]) — and the verdict of each branch it ran. A red refuses R at once, every
-    /// other branch stopped (an export whose staging push began finishes it); a COULD NOT RUN lets
+    /// other branch stopped; a COULD NOT RUN lets
     /// the others finish, so their records survive for the next run. A peer's cut that reaches the
     /// reservation while the graph runs sets its bundle aside: one more round reserves anew and
-    /// builds again, the tree's records and the staging kept.
+    /// builds again, the tree's records and the staging kept. Concurrent export validation
+    /// is private; staging follows only after all of the graph's verdicts pass.
     fn qualify(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
@@ -5722,16 +5830,34 @@ impl Run<'_> {
             None => self.reservation(),
         };
         // A new reservation sets the old bundle aside, so the plan is asked again.
-        let (plan, done) = self.qualify_plan();
+        let (mut plan, done) = self.qualify_plan();
         if plan.branches().is_empty() {
             return Ok(done);
+        }
+        // No append-only staging write may precede the other branches' verdicts.
+        // The engine's dry run keeps the expensive export work parallel; its real
+        // stage below revalidates rather than trusting a private attestation.
+        let deferred = plan.export == Some(StageTarget::Remote)
+            && (plan.build.is_some() || plan.tree.is_some());
+        if deferred {
+            plan.export = Some(StageTarget::Local);
         }
         let graph = if self.export_alone(&plan) {
             self.stage_claimed(|run| run.qualify_graph(c, p, reserved.as_ref(), &plan))?
         } else {
             self.qualify_graph(c, p, reserved.as_ref(), &plan)
         };
-        self.qualified(c, graph?, done)
+        let mut words = self.qualified(c, graph?, done, plan.export == Some(StageTarget::Local))?;
+        if deferred {
+            self.halt_if_interrupted()?;
+            let ran = self.stage_claimed(|run| run.b.stage(c, p, StageTarget::Remote))?;
+            self.refresh();
+            match self.stage_verdict(c, ran) {
+                Ok(note) => words.push(note),
+                Err(refusal) => return Err(self.halt(refusal)),
+            }
+        }
+        Ok(words)
     }
 
     /// `plan` runs the export alone, with no disk claim held: it takes a stage's own.
@@ -5869,7 +5995,9 @@ impl Run<'_> {
             };
             said.push(format!(
                 "the export — pub stage aterm --commit {commit} --repo-path <this clone>{}",
-                if target == StageTarget::Local {
+                if target == StageTarget::Remote && (plan.build.is_some() || plan.tree.is_some()) {
+                    " --dry-run, then stage remotely only after every parallel verdict passes"
+                } else if target == StageTarget::Local {
                     " --dry-run, without a staging push"
                 } else {
                     ""
@@ -5895,6 +6023,7 @@ impl Run<'_> {
         c: &Candidate,
         graph: Graph,
         done: Vec<String>,
+        local_export: bool,
     ) -> Result<Vec<String>, Halt> {
         let mut words = Vec::new();
         let mut refused: BTreeMap<Branch, Refusal> = BTreeMap::new();
@@ -5945,7 +6074,7 @@ impl Run<'_> {
         }
         self.refresh();
         match graph.export {
-            Some(Ok(ran)) if self.opts.qualify => {
+            Some(Ok(ran)) if local_export => {
                 if ran.code == 0 {
                     self.exported_locally = true;
                     words.push(
@@ -6099,9 +6228,8 @@ impl Run<'_> {
         refusal.detail(ran.detail)
     }
 
-    /// The meaning check before the export: [`Backend::verify_line`] on the journaled line when
-    /// it has hops, its summary or its refusal. A dry run with fixes still to carry checks the
-    /// line it has and says the new head is checked before its export too.
+    /// The meaning check before export. A dry pending head has already passed the frozen
+    /// image's pending check at step 1; its record merge is still only a plan.
     fn line_holds(&mut self, c: &Candidate) -> Result<Option<String>, Halt> {
         let line = self
             .journal
@@ -6109,20 +6237,16 @@ impl Run<'_> {
             .map(Journal::line)
             .filter(|line| !line.hops.is_empty());
         let mut said = Vec::new();
-        if let Some(line) = line {
+        if self.dry && self.pending_line_heads(&c.commit) {
+            said.push(format!(
+                "planned head {} checked with line::verify_pending at step 1; would verify its record merge before export",
+                short(&c.commit)
+            ));
+        } else if let Some(line) = line {
             match self.b.verify_line(&line) {
                 Ok(summary) => said.push(summary),
                 Err(refusal) => self.refuse(refusal)?,
             }
-        }
-        if self.dry
-            && !c.carry.is_empty()
-            && let Some(line) = self.dry_line.clone()
-        {
-            said.push(format!(
-                "planned head {} checked with line::verify_pending before step 1",
-                short(line.head())
-            ));
         }
         Ok((!said.is_empty()).then(|| said.join("; ")))
     }
@@ -6251,7 +6375,7 @@ impl Run<'_> {
                     short(&at)
                 ),
                 format!(
-                    "release the next MINOR: {RELEASE_COMMAND} --forget, then {RELEASE_COMMAND} \
+                    "release the next product version: {RELEASE_COMMAND} --forget, then {RELEASE_COMMAND} \
                      --bump"
                 ),
             )),
@@ -6281,9 +6405,7 @@ impl Run<'_> {
             out.extend(self.b.cut_gates(c, &creds, kind));
             // Real preparation has carried already; the dry plan's immutable head is also
             // constructed before checks, so both ask these gates of the head they would ship.
-            if c.carry.is_empty() || self.dry_line.is_some() {
-                out.extend(self.b.head_gates(c));
-            }
+            out.extend(self.b.head_gates(c));
         }
         out
     }
@@ -6764,7 +6886,10 @@ impl Run<'_> {
         let _ = child.finish();
         let n = self.reservation().map_or(0, |r| r.build);
         let version = self.version();
-        for why in self.b.discard_signed(&version, n) {
+        for why in self
+            .b
+            .discard_signed(&version, n, SignedDiscard::CancelPreparation)
+        {
             self.say(&format!("        discard early signature: {why}"));
         }
     }
@@ -7148,7 +7273,9 @@ impl Run<'_> {
             // The number is spent elsewhere, so the copy can never ship: discarded here whether
             // the cut reached its claim (which discards it too) or refused before it.
             let build = spent.reservation.build;
-            let left = self.b.discard_signed(&self.version(), build);
+            let left =
+                self.b
+                    .discard_signed(&self.version(), build, SignedDiscard::LostReservation);
             let discarded = if left.is_empty() {
                 "was discarded".to_string()
             } else {
@@ -7363,8 +7490,10 @@ fn lost_record() -> String {
 /// commit, and `--fix` carries it onto the line as a hop, so the release never re-selects main.
 pub(crate) fn fix_remedy(head: &str) -> String {
     format!(
-        "land the fix on main (based on {} when it must apply to the line's head), then \
-         {RELEASE_COMMAND} --fix <the fix's own non-merge commit>",
+        "land the fix on main, then {RELEASE_COMMAND} --fix <the fix's own non-merge commit>; \
+         if it conflicts, author a backport on {} whose every changed path matches origin/main \
+         in content and mode (including deletions), land it on main, then \
+         {RELEASE_COMMAND} --fix <that non-merge commit>",
         short(head)
     )
 }
@@ -7553,9 +7682,10 @@ fn branch_event(br: &dyn Branches, branch: Branch, phase: &str, at: u64, seconds
     br.say(&format!("release-event: {event}"));
 }
 
-/// Run step 4's graph on `br`: the build first; the tree once both slices hold memory
-/// ([`Branches::build_admitted`]), then the export, each in a thread of its
-/// own; the ledger's memory claims decide what runs together, and every branch draws from the
+/// Run step 4's graph on `br`: the build branch first, then the tree and export. When
+/// lint runs, the build waits for its resource admission before launching slices; otherwise
+/// the tree follows slice admission ([`Branches::build_admitted`]). Each branch has its
+/// own thread; the ledger decides what runs together, and every branch draws from the
 /// one pool [`Backend::qualify_begin`] made. A branch's red stops the other branches at once,
 /// except a proven test-execution red retains an already running build for the next hop
 /// ([`BranchStop::fire`]: an export whose staging push began finishes it, and a branch not
@@ -7591,6 +7721,14 @@ fn run_graph(
             {
                 br.expect_tree_index();
             }
+            let lint_first = plan.build.is_some_and(|work| work.bundle)
+                && plan
+                    .tree
+                    .as_ref()
+                    .is_some_and(|run| run.checks.iter().any(|c| c == "lint"));
+            if lint_first {
+                br.expect_tree_lint();
+            }
             if let (Some(work), Some(reserved)) = (plan.build, reserved) {
                 start_branch(
                     s,
@@ -7600,7 +7738,7 @@ fn run_graph(
                     stop_of(Branch::Build),
                     move |stop| Note::Built(br.build(c, reserved, p, work, stop)),
                 );
-                if work.bundle {
+                if work.bundle && !lint_first {
                     br.build_admitted(&|| settled.load(Ordering::SeqCst));
                 }
             }
@@ -8120,35 +8258,14 @@ fn signal_name(sig: i32) -> String {
     }
 }
 
-/// `MAJOR.MINOR.0` → (MAJOR, MINOR).
+/// A historical or calendar public product version's full three-component identity.
 #[must_use]
-pub fn public_version(v: &str) -> Option<(u64, u64)> {
-    let mut parts = v.split('.');
-    let (major, minor, patch) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || patch != "0" {
-        return None;
-    }
-    let number = |s: &str| -> Option<u64> {
-        (!s.is_empty()
-            && (s == "0" || !s.starts_with('0'))
-            && s.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| s.parse::<u64>().ok())
-        .flatten()
-    };
-    Some((number(major)?, number(minor)?))
+pub fn public_version(v: &str) -> Option<(u64, u64, u64)> {
+    aterm_types::release_version::ReleaseVersion::parse(v).map(|v| v.components())
 }
 
 fn newer(a: &str, b: &str) -> bool {
-    let key = |v: &str| {
-        let mut p = v.split('.').map(|x| {
-            (!x.starts_with('+'))
-                .then(|| x.parse::<u64>().ok())
-                .flatten()
-                .unwrap_or(0)
-        });
-        (p.next().unwrap_or(0), p.next().unwrap_or(0))
-    };
-    key(a) > key(b)
+    matches!((public_version(a), public_version(b)), (Some(a), Some(b)) if a > b)
 }
 
 #[cfg(test)]
@@ -8187,6 +8304,9 @@ mod tests {
     }
 
     impl Branches for AllFreshHandoff {
+        fn expect_tree_lint(&self) {
+            unreachable!("this fixture runs only the test check");
+        }
         fn say(&self, _line: &str) {}
 
         fn now(&self) -> u64 {
@@ -8581,9 +8701,15 @@ malformed\trow\n\
         assert_eq!(fmt_dur(3600), "1h00m");
         assert_eq!(fmt_dur(9480), "2h38m");
 
-        assert_eq!(public_version("0.1.0"), Some((0, 1)));
+        assert_eq!(public_version("0.1.0"), Some((0, 1, 0)));
         assert_eq!(public_version("00.1.0"), None);
         assert_eq!(public_version("0.01.0"), None);
+        assert_eq!(public_version("1.20261109.2"), Some((1, 20261109, 2)));
+        assert!(newer("1.20261109.2", "1.20261109.1"));
+        assert!(!newer("1.20261109.1", "1.20261109.2"));
+        assert!(newer("1.20261110.1", "1.20261109.999999999"));
+        assert_eq!(public_version("1.20261109.0"), None);
+        assert_eq!(public_version("1.20260229.1"), None);
         assert!(!newer("+2.0", "1.0"));
         assert!(!newer("1.+2", "1.1"));
     }

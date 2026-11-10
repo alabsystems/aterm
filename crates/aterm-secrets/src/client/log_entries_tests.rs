@@ -7093,7 +7093,7 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     doc.set_entry(
         &Audience::Everyone,
         crate::SWARM_POLICY_ENTRY,
-        b"release_hosts = [\"m22\"]\n",
+        b"servers = []\n",
     )
     .unwrap();
     doc.set_entry(&Audience::Everyone, "gh_access_token", b"token-v2")

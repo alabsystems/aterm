@@ -1058,6 +1058,46 @@ impl Hints {
         self.follow_up.retain(|queued| *queued != address);
         Some((address, std::mem::take(&mut peer.repair)))
     }
+    /// When [`Self::next_allowed`] may next pick an endpoint, by the clock alone, as `now` reads
+    /// it: at or before `now` where it may pick one now, else the earliest wait (`next`) of an
+    /// endpoint it would pick once that wait ends, the follow-up queue's first where its hold
+    /// keeps the rest back; `None` where it holds none it would ever pick by waiting (each it
+    /// holds is in a round, a `Bus` speaker, held for a build, or established-only turns exclude
+    /// it). It reads what [`Self::next_allowed`] reads and changes nothing; an endpoint whose
+    /// expiry that call would take first can make it early, never late.
+    pub(super) fn next_dial_at(&self, now: Instant, allow_discovery: bool) -> Option<Instant> {
+        let candidate = |address: &SocketAddr, peer: &Peer| {
+            !peer.busy
+                && (allow_discovery || peer.established())
+                && !speaks_bus(&self.bus, &self.addresses, address, peer)
+                && self
+                    .addresses
+                    .get(&address.ip())
+                    .copied()
+                    .or_else(|| peer.repair.actor())
+                    .is_none_or(|actor| !self.needs_update.contains_key(&actor))
+        };
+        // The follow-up hold ([`Self::next_allowed`]): while a queued endpoint waits and none is
+        // due, the queue's first wait comes before every other endpoint's.
+        if !self.hurrying && self.follow_up_left > 0 {
+            let queued = self.follow_up.iter().filter_map(|address| {
+                self.peers
+                    .get(address)
+                    .filter(|peer| candidate(address, peer))
+                    .map(|peer| peer.next)
+            });
+            if let Some(first) = queued.clone().min()
+                && queued.clone().all(|next| next > now)
+            {
+                return Some(first);
+            }
+        }
+        self.peers
+            .iter()
+            .filter(|(address, peer)| candidate(address, peer))
+            .map(|(_, peer)| peer.next)
+            .min()
+    }
     /// A push's hurry: dial every verified peer now, one whose round runs now again as that round
     /// ends; a `Bus` speaker is left to the mesh ([`Self::bus_speakers`]). Until [`Self::calm`],
     /// progress and the first quiet confirmation are followed at once, so a table first
@@ -1941,7 +1981,8 @@ mod tests {
                 .for_each(|peer| peer.verified = true);
             assert_eq!(hints.hurry(now), 1);
             let mut dials = 0;
-            // Ten virtual seconds at the runtime's 100 ms tick. The peer keeps
+            // Ten virtual seconds of ticks 100 ms apart, the closest the runtime's TICK floor
+            // lets two ticks come (its worst case). The peer keeps
             // answering but, in the quiet case, cannot take the pushed table.
             for tick in 0..100 {
                 let at = now + Duration::from_millis(100 * tick);
@@ -2088,8 +2129,8 @@ mod tests {
             Outcome::Repaired { transferred: true },
             resume + Duration::from_millis(100),
         );
-        // Both writers completed through the normal path. On ordinary 100 ms
-        // ticks, the later queued retry becomes eligible one tick earlier.
+        // Both writers completed through the normal path. On ticks 100 ms apart (the
+        // TICK floor), the later queued retry becomes eligible one tick earlier.
         assert!(hints.next(resume + Duration::from_millis(300)).is_none());
         let earlier = resume + Duration::from_millis(400);
         let later = resume + Duration::from_millis(500);
@@ -2277,8 +2318,9 @@ mod tests {
         assert!(hints.next(tried + Duration::from_secs(11)).is_some());
     }
 
-    /// Dials of one verified endpoint in ten virtual minutes at 100 ms ticks, each ending as
-    /// `outcome` says for the dial's index.
+    /// Dials of one verified endpoint in ten virtual minutes of ticks 100 ms apart (the closest
+    /// the runtime's TICK floor lets them come), each ending as `outcome` says for the dial's
+    /// index.
     fn dials_in_ten_minutes(mut outcome: impl FnMut(usize) -> Outcome) -> usize {
         let mut hints = hints();
         let now = Instant::now();

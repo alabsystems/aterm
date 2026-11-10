@@ -21,6 +21,12 @@ path = "src/main.rs"
 # A dev shim over `agh::cli::main_entry`; the shipped form is `aterm agh` and argv0 `agh`.
 test = false
 
+[[bin]]
+name = "agh-git-fixture"
+path = "tests/git_fixture.rs"
+# Dev-only native pass-through for the real Git abrupt-stop integration test.
+test = false
+
 [dependencies]
 # The one HTTPS client: methods, streaming, phases, idle deadlines, secret headers (§5).
 aterm-http = { workspace = true }

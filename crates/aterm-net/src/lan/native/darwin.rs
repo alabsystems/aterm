@@ -252,6 +252,15 @@ pub(super) const fn moves_interfaces(kind: u8) -> bool {
     !matches!(kind, 0x1..=0xb | 0x14)
 }
 
+/// A listener rechecks for route changes as well as attachment changes. Ordinary RTM_GET
+/// replies are ignored: a recheck must not wake itself by asking the kernel for its route.
+pub(super) fn route_changed(bytes: &[u8]) -> io::Result<bool> {
+    if bytes.len() < 4 || usize::from(u16_at(bytes, 0)?) != bytes.len() || bytes[2] != 5 {
+        return Err(refuse("invalid route notification"));
+    }
+    Ok(!matches!(bytes[3], 0x4 | 0x14))
+}
+
 /// The receive room [`Watch::open`] asks for on its routing socket: some 400 interface or
 /// address messages between two drains, where the kernel's default (8 KiB) holds some 50.
 #[cfg(target_os = "macos")]

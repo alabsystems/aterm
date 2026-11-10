@@ -32,7 +32,14 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                 if mode.is_none()
                     && matches!(
                         value.as_str(),
-                        "alone" | "shared" | "chain" | "tree" | "series"
+                        "alone"
+                            | "shared"
+                            | "chain"
+                            | "tree"
+                            | "series"
+                            | "qualify-before"
+                            | "qualify-after"
+                            | "qualify-series"
                     ) =>
             {
                 mode = Some(value)
@@ -43,7 +50,7 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     let options = Options {
         verify: verify.ok_or("qualify-pilot requires --verify PATH")?,
         before,
-        mode: mode.ok_or("qualify-pilot requires --mode alone|shared|chain|tree|series")?,
+        mode: mode.ok_or("qualify-pilot requires --mode alone|shared|chain|tree|series|qualify-before|qualify-after|qualify-series")?,
     };
     if (options.mode == "series") != options.before.is_some() {
         return Err("only series requires --before-verify PATH".into());
@@ -366,6 +373,7 @@ fn observation<T: serde::Serialize>(read: Result<T, i32>) -> aterm_json::Value {
 enum TreeWork {
     CompileTests,
     Lint,
+    Qualify,
 }
 
 impl TreeWork {
@@ -373,12 +381,14 @@ impl TreeWork {
         match self {
             Self::CompileTests => "test",
             Self::Lint => "lint",
+            Self::Qualify => "qualify",
         }
     }
     fn arguments(self) -> Vec<&'static str> {
         match self {
             Self::CompileTests => vec!["test", "--all", "--as-release", "--compile-only"],
             Self::Lint => vec!["release", "--tree", "--checks", "lint"],
+            Self::Qualify => vec!["release", "--tree"],
         }
     }
 }
@@ -393,7 +403,12 @@ fn tree(
         return Ok(Vec::new());
     }
     std::thread::scope(|scope| {
-        let handles = [TreeWork::CompileTests, TreeWork::Lint].map(|work| scope.spawn(move || {
+        let work = if matches!(opts.mode.as_str(), "qualify-before" | "qualify-after") {
+            vec![TreeWork::Qualify]
+        } else {
+            vec![TreeWork::CompileTests, TreeWork::Lint]
+        };
+        let handles: Vec<_> = work.into_iter().map(|work| scope.spawn(move || {
             let check = work.label();
             let (program, prefix) = invocation(&opts.verify, opts.mode == "chain");
             let mut cmd = aterm_uds::spawnfd::command(program);
@@ -410,9 +425,11 @@ fn tree(
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
             let usage = child.wait_with_rusage().map_err(|e| e.to_string())?;
             let row = aterm_json::json!({"check":check,"wall_s":started.elapsed().as_secs_f64(),"cpu_s":usage.cpu.as_secs_f64(),"success":usage.status.success()});
+            crate::durable::write_fresh(&root.join(format!("tree-{check}.result.json")), row.to_string())
+                .map_err(|e| e.to_string())?;
             if !usage.status.success() { return Err(format!("pilot tree {check}: {row}")); }
             Ok(row)
-        }));
+        })).collect();
         handles
             .into_iter()
             .map(|h| h.join().map_err(|_| "pilot tree panicked".to_owned())?)
@@ -518,7 +535,14 @@ fn under_reservation<R, T>(
 }
 
 fn order(mode: &str) -> Vec<&str> {
-    if mode == "series" {
+    if mode == "qualify-series" {
+        vec![
+            "qualify-before",
+            "qualify-after",
+            "qualify-after",
+            "qualify-before",
+        ]
+    } else if mode == "series" {
         vec!["alone", "shared", "chain", "chain", "shared", "tree"]
     } else {
         vec![mode]
@@ -526,6 +550,14 @@ fn order(mode: &str) -> Vec<&str> {
 }
 
 fn require_series_grant(mode: &str, requested: u32, granted: u32) -> Result<(), String> {
+    // The control's shared FIFO has two Cargo clients for slices and one for the
+    // tree. With fewer implicit tokens a memory waiter could hold the last CPU
+    // token needed by the branch that can release its memory.
+    if mode.starts_with("qualify-") && granted < 3 {
+        return Err(format!(
+            "qualify comparison needs at least 3 slots for its three Cargo clients, got {granted}; no take started"
+        ));
+    }
     if mode == "series" && granted != requested {
         Err(format!(
             "series needs the full {requested}-core grant, got {granted}; no take started"
@@ -573,12 +605,17 @@ fn one(
             }
             Ok(())
         });
-        let tree = scope.spawn(|| tree(repo, root, opts, pool));
-        let slices = crate::buildplan::contention_slices(take, root, pool, opts.mode == "tree");
-        let tree = tree.join().map_err(|_| "pilot tree panicked")?;
+        let pair = if matches!(opts.mode.as_str(), "qualify-before" | "qualify-after") {
+            qualify_pair(repo, take, root, opts, pool)
+        } else {
+            let tree = scope.spawn(|| tree(repo, root, opts, pool));
+            let slices = crate::buildplan::contention_slices(take, root, pool, opts.mode == "tree");
+            let tree = tree.join().map_err(|_| "pilot tree panicked".to_owned());
+            slices.and_then(|slices| tree.and_then(|tree| tree.map(|tree| (slices, tree))))
+        };
         drop(done);
         sampler.join().map_err(|_| "pilot sampler panicked")??;
-        Ok((slices?, tree?))
+        pair
     })?;
     let (verify_sha256, _) = crate::dmg::sha256_and_size(&opts.verify)?;
     let report = aterm_json::json!({"mode":opts.mode,"source":commit,"slots":pool.slots(),"wall_s":started.elapsed().as_secs_f64(),"slices":slices,"tree":tree,"verify_sha256":verify_sha256,"verify":opts.verify});
@@ -586,6 +623,87 @@ fn one(
         .map_err(|e| e.to_string())?;
     println!("qualify-pilot-result: {report}");
     Ok(())
+}
+
+/// The same cold slices and complete release tree in both arms. The control uses
+/// the former slice-admission edge; the treatment uses the production lint gate.
+fn qualify_pair(
+    repo: &Path,
+    take: &crate::buildplan::Take,
+    root: &Path,
+    opts: &Options,
+    pool: &aterm_capacity::Jobserver,
+) -> Result<(Vec<aterm_json::Value>, Vec<aterm_json::Value>), String> {
+    use crate::release_steps::TreeIndexHandoff;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ended = AtomicBool::new(false);
+    let handoff = TreeIndexHandoff::default();
+    if opts.mode == "qualify-after" {
+        handoff.expect_lint(root.join("tree-qualify.events"));
+    }
+    std::thread::scope(|scope| {
+        if opts.mode == "qualify-before" {
+            let slices = scope.spawn(|| {
+                let _completed = SliceCompleted(&ended);
+                crate::buildplan::contention_slices(take, root, pool, false)
+            });
+            while !ended.load(Ordering::SeqCst)
+                && !crate::release_steps::slices_hold_memory(std::process::id())
+                && crate::interrupt::caught().is_none()
+            {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let tree = tree(repo, root, opts, pool);
+            let slices = slices.join().map_err(|_| "pilot slices panicked")?;
+            Ok((slices?, tree?))
+        } else {
+            let tree = scope.spawn(|| {
+                let mut completed = TreeCompleted {
+                    handoff: &handoff,
+                    passed: false,
+                };
+                let result = tree(repo, root, opts, pool);
+                completed.passed = result.is_ok();
+                result
+            });
+            let admitted = handoff.await_lint(
+                |path| {
+                    crate::check_record::events(path).is_ok_and(|e| e.whole() && e.lint_admitted)
+                },
+                || crate::interrupt::caught().is_some(),
+                || false,
+                || std::thread::sleep(Duration::from_secs(1)),
+            );
+            let slices = admitted
+                .and_then(|()| crate::buildplan::contention_slices(take, root, pool, false));
+            let tree = tree.join().map_err(|_| "pilot tree panicked")?;
+            Ok((slices?, tree?))
+        }
+    })
+}
+
+struct SliceCompleted<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SliceCompleted<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct TreeCompleted<'a> {
+    handoff: &'a crate::release_steps::TreeIndexHandoff,
+    passed: bool,
+}
+
+impl Drop for TreeCompleted<'_> {
+    fn drop(&mut self) {
+        use crate::release_steps::TreeIndexCompletion;
+        self.handoff.finish(if self.passed {
+            TreeIndexCompletion::Compile
+        } else {
+            TreeIndexCompletion::Stopped
+        });
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +717,46 @@ mod tests {
         assert!(require_series_grant("series", 18, 18).is_ok());
         assert!(require_series_grant("series", 18, 4).is_err());
         assert!(require_series_grant("alone", 18, 4).is_ok());
+        for slots in [1, 2] {
+            assert!(require_series_grant("qualify-series", 18, slots).is_err());
+        }
+        assert!(require_series_grant("qualify-series", 18, 3).is_ok());
+    }
+
+    #[test]
+    fn pilot_completion_is_published_on_unwind() {
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _completed = SliceCompleted(&ended);
+                panic!("controlled slice panic");
+            })
+            .is_err()
+        );
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let handoff = crate::release_steps::TreeIndexHandoff::default();
+        handoff.expect_lint(dir.path().join("events"));
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _completed = TreeCompleted {
+                    handoff: &handoff,
+                    passed: false,
+                };
+                panic!("controlled tree panic");
+            })
+            .is_err()
+        );
+        assert!(
+            handoff
+                .await_lint(
+                    |_| false,
+                    || false,
+                    || false,
+                    || panic!("a panicked tree must release the pilot waiter")
+                )
+                .is_err()
+        );
     }
     #[test]
     fn snapshotting_starts_under_a_live_reservation_and_failure_releases_it() {
@@ -737,7 +895,16 @@ mod tests {
     #[test]
     fn experimental_modes_require_an_explicit_verifier_and_reject_unknown_priorities() {
         let parse_words = |s: &str| parse(s.split_whitespace().map(str::to_owned));
-        for mode in ["alone", "shared", "chain", "tree", "series"] {
+        for mode in [
+            "alone",
+            "shared",
+            "chain",
+            "tree",
+            "series",
+            "qualify-before",
+            "qualify-after",
+            "qualify-series",
+        ] {
             let before = if mode == "series" {
                 " --before-verify /old"
             } else {
@@ -760,6 +927,28 @@ mod tests {
             ["alone", "shared", "chain", "chain", "shared", "tree"]
         );
         assert_eq!(order("shared"), ["shared"]);
+        assert_eq!(
+            order("qualify-series"),
+            [
+                "qualify-before",
+                "qualify-after",
+                "qualify-after",
+                "qualify-before"
+            ]
+        );
+        let parsed = aterm_verify::cli::parse(TreeWork::Qualify.arguments()).unwrap();
+        let actual: BTreeSet<_> = parsed
+            .wanted(|_| true)
+            .into_iter()
+            .map(|c| c.name())
+            .collect();
+        let expected: BTreeSet<_> = crate::check_record::Half::Tree
+            .checks()
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(!parsed.compile_only);
     }
     #[test]
     fn only_lower_priority_invocations_gain_nice_and_keep_the_original_program() {

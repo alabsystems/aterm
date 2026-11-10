@@ -5,8 +5,9 @@
 
 use super::{
     Capabilities, HANDOFF_GRANT_CHUNKS_TOKEN, HANDOFF_GRANT_DESK_TOKEN, HANDOFF_GRANT_EMPTY_TOKEN,
-    NATIVE_RECIPIENT_RECOVERY_TOKEN,
+    NATIVE_LEGACY_RECIPIENT_RECOVERY_TOKEN, NATIVE_RECIPIENT_RECOVERY_TOKEN,
 };
+use crate::NativeRecipientRecovery;
 use aterm_codec::xml::{Event, Reader, Tag};
 use std::collections::BTreeSet;
 
@@ -95,6 +96,21 @@ fn parse(text: &str) -> Option<Capabilities> {
             let Event::Start(value) = significant(&mut reader)? else {
                 return None;
             };
+            if key == "ATermNativeRecipientRecovery" {
+                result.recipient_recovery = if value.name == "string" {
+                    match scalar(&mut reader, &value)?.trim() {
+                        NATIVE_RECIPIENT_RECOVERY_TOKEN => NativeRecipientRecovery::BoundJournal,
+                        NATIVE_LEGACY_RECIPIENT_RECOVERY_TOKEN => {
+                            NativeRecipientRecovery::LegacyJournal
+                        }
+                        _ => NativeRecipientRecovery::Absent,
+                    }
+                } else {
+                    skip_value(&mut reader, &value)?;
+                    NativeRecipientRecovery::Absent
+                };
+                continue;
+            }
             let declaration = match key.as_str() {
                 "ATermHandoffGrantChunks" => {
                     Some((&mut result.grant_chunks, HANDOFF_GRANT_CHUNKS_TOKEN))
@@ -103,10 +119,6 @@ fn parse(text: &str) -> Option<Capabilities> {
                     Some((&mut result.grant_empty, HANDOFF_GRANT_EMPTY_TOKEN))
                 }
                 "ATermHandoffGrantDesk" => Some((&mut result.grant_desk, HANDOFF_GRANT_DESK_TOKEN)),
-                "ATermNativeRecipientRecovery" => Some((
-                    &mut result.recipient_recovery,
-                    NATIVE_RECIPIENT_RECOVERY_TOKEN,
-                )),
                 _ => None,
             };
             if let Some((declared, token)) = declaration
@@ -140,13 +152,13 @@ mod tests {
         let declarations = "<key>ATermHandoffGrantChunks</key><string>chunks1</string>\
             <key>ATermHandoffGrantEmpty</key><string>empty1</string>\
             <key>ATermHandoffGrantDesk</key><string>desk1</string>\
-            <key>ATermNativeRecipientRecovery</key><string>recipients5</string>";
+            <key>ATermNativeRecipientRecovery</key><string>bound-recipients5</string>";
         let wrap = |body: &str| format!("<plist version=\"1.0\"><dict>{body}</dict></plist>");
         let all = Capabilities {
             grant_chunks: true,
             grant_empty: true,
             grant_desk: true,
-            recipient_recovery: true,
+            recipient_recovery: NativeRecipientRecovery::BoundJournal,
         };
         assert_eq!(Capabilities::from_plist(&wrap(declarations)), all);
         for text in [
@@ -171,18 +183,61 @@ mod tests {
         for value in [
             "<string>recipients6</string>",
             "<string>Recipients5</string>",
+            "<string>bound-recipients6</string>",
+            "<string>Bound-recipients5</string>",
             "<true/>",
             "<string/>",
             "<string><string>recipients5</string></string>",
+            "<string><string>bound-recipients5</string></string>",
         ] {
             assert_eq!(
                 Capabilities::from_plist(&recovery(value)),
                 Capabilities::default()
             );
         }
-        assert!(
+        assert_eq!(
             Capabilities::from_plist(&recovery("<string> recipients&#53; </string>"))
-                .recipient_recovery
+                .recipient_recovery,
+            NativeRecipientRecovery::LegacyJournal
         );
+        assert_eq!(
+            Capabilities::from_plist(&recovery("<string> bound-recipients&#53; </string>"))
+                .recipient_recovery,
+            NativeRecipientRecovery::BoundJournal
+        );
+    }
+
+    #[test]
+    fn legacy_reader_evidence_never_becomes_bound_journal_support() {
+        for (token, expected) in [
+            (
+                NATIVE_LEGACY_RECIPIENT_RECOVERY_TOKEN,
+                NativeRecipientRecovery::LegacyJournal,
+            ),
+            (
+                NATIVE_RECIPIENT_RECOVERY_TOKEN,
+                NativeRecipientRecovery::BoundJournal,
+            ),
+            ("unknown", NativeRecipientRecovery::Absent),
+        ] {
+            let declaration =
+                format!("<key>ATermNativeRecipientRecovery</key><string>{token}</string>");
+            let text = format!("<plist><dict>{declaration}</dict></plist>");
+            assert_eq!(super::super::plist_recipient_recovery(&text), expected);
+            for body in [
+                format!(
+                    "{declaration}<key>ATermNativeRecipientRecovery</key><string>bound-recipients5</string>"
+                ),
+                format!("<key>nested</key><dict>{declaration}</dict>"),
+                format!("<!-- {declaration} -->"),
+            ] {
+                assert_eq!(
+                    super::super::plist_recipient_recovery(&format!(
+                        "<plist><dict>{body}</dict></plist>"
+                    )),
+                    NativeRecipientRecovery::Absent
+                );
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::{
     ffi::CString,
     io,
     net::{SocketAddr, TcpListener, TcpStream},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -78,6 +78,134 @@ pub(super) fn interface_generation() -> Option<u64> {
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+/// One listener's route and attachment notifications. This socket never sends a query or
+/// changes a route: readiness only asks the service to recheck its existing authority.
+pub(super) struct RouteChanges {
+    socket: Socket,
+    room: usize,
+}
+
+impl RouteChanges {
+    pub(super) fn open() -> io::Result<Self> {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "LAN route notifications are unavailable on this platform",
+            ))
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            #[cfg(target_os = "macos")]
+            let socket = Socket::new(libc::PF_ROUTE, 0)?;
+            #[cfg(target_os = "linux")]
+            let socket = {
+                let socket = Socket::new(libc::AF_NETLINK, libc::NETLINK_ROUTE)?;
+                // SAFETY: zero initializes sockaddr_nl, including its padding.
+                let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+                address.nl_family = libc::AF_NETLINK as _;
+                // Linux's rtnetlink UAPI groups: LINK, IPv4/IPv6 IFADDR and ROUTE, and both
+                // RULE groups (RTNLGRP_IPV6_RULE is group 19). No unicast lookup replies.
+                address.nl_groups = 0x1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | (1 << 18);
+                // SAFETY: address is readable for this exact size and socket owns its descriptor.
+                if unsafe {
+                    libc::bind(
+                        socket.0.as_raw_fd(),
+                        std::ptr::from_ref(&address).cast(),
+                        std::mem::size_of_val(&address) as _,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                socket
+            };
+            let _ = set_option(&socket.0, libc::SOL_SOCKET, libc::SO_RCVBUF, 64 * 1024);
+            let room = usize::try_from(option(&socket.0, libc::SOL_SOCKET, libc::SO_RCVBUF)?)
+                .ok()
+                .filter(|room| *room > 0)
+                .ok_or_else(|| refuse("invalid route notification receive room"))?;
+            Ok(Self { socket, room })
+        }
+    }
+
+    pub(super) fn fd(&self) -> BorrowedFd<'_> {
+        self.socket.0.as_fd()
+    }
+
+    /// Consume at most 4096 datagrams. Exhaustion, closed sockets and failed reads cannot
+    /// leave an idle service relying on a notification source that no longer works.
+    pub(super) fn drain(&self) -> io::Result<bool> {
+        let mut buffer = vec![0_u8; MAX_REPLY];
+        let mut changed = false;
+        let mut queued = 0_usize;
+        for _ in 0..4096 {
+            #[cfg(target_os = "linux")]
+            // SAFETY: zero initializes a writable sender address, including its padding.
+            let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            #[cfg(target_os = "linux")]
+            let mut length = std::mem::size_of_val(&sender) as libc::socklen_t;
+            // SAFETY: buffer is writable for its full size on this owned, nonblocking socket;
+            // Linux also supplies a live writable sender address and exact length.
+            let received = unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::recvfrom(
+                        self.socket.0.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        std::ptr::from_mut(&mut sender).cast(),
+                        &raw mut length,
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::recv(
+                        self.socket.0.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                }
+            };
+            let received = match usize::try_from(received) {
+                Ok(0) => return Err(refuse("route notification socket closed")),
+                Ok(received) if received <= buffer.len() => received,
+                Ok(_) => return Err(refuse("route notification was truncated")),
+                Err(_) => {
+                    let error = io::Error::last_os_error();
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            // Darwin may silently drop a message when this room fills.
+                            return Ok(changed || queued.saturating_mul(2) >= self.room);
+                        }
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(error),
+                    }
+                }
+            };
+            #[cfg(target_os = "linux")]
+            if length as usize != std::mem::size_of_val(&sender)
+                || sender.nl_family != libc::AF_NETLINK as _
+                || sender.nl_pid != 0
+            {
+                return Err(refuse("route notification is not from the kernel"));
+            }
+            queued = queued.saturating_add(received);
+            #[cfg(target_os = "macos")]
+            {
+                changed |= darwin::route_changed(&buffer[..received])?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                changed |= linux::route_changed(&buffer[..received])?;
+            }
+        }
+        Err(refuse("route notification drain exceeded its bound"))
     }
 }
 

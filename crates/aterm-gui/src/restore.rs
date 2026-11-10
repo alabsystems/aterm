@@ -1097,6 +1097,19 @@ fn carried_user_value(field: &str, value: &str) -> Option<String> {
 }
 
 /// Per-view native state.
+/// Presentation state belonging to the same Editor document and source buffer.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct MarkdownWorkspaceRestore {
+    pub mode: String,
+    pub focus: String,
+    pub source_anchor: usize,
+    pub visual_row: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_entry_anchor: Option<usize>,
+    pub selection: Option<RestoreSelection>,
+    pub split_per_mille: u16,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct NativeLeafRestore {
     pub restore_tag: String,
@@ -1106,6 +1119,8 @@ pub(crate) struct NativeLeafRestore {
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub config_editor: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<MarkdownWorkspaceRestore>,
     #[serde(default)]
     pub source_anchor: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1162,6 +1177,7 @@ impl NativeLeafRestore {
             route: Some(route),
             uri: None,
             config_editor: false,
+            markdown: None,
             source_anchor: 0,
             selection: None,
             editor_selections: Vec::new(),
@@ -1180,6 +1196,7 @@ impl NativeLeafRestore {
             route: None,
             uri: Some(uri),
             config_editor: false,
+            markdown: None,
             source_anchor: 0,
             selection: None,
             editor_selections: Vec::new(),
@@ -1225,6 +1242,14 @@ impl NativeLeafRestore {
     }
 
     fn validation_error(&self) -> Option<&'static str> {
+        if let Some(markdown) = &self.markdown
+            && (self.restore_tag != "editor"
+                || !matches!(markdown.mode.as_str(), "read" | "edit" | "split")
+                || !matches!(markdown.focus.as_str(), "editor" | "reader")
+                || !(200..=800).contains(&markdown.split_per_mille))
+        {
+            return Some("invalid Markdown workspace state");
+        }
         if self.restore_tag.is_empty()
             || self.restore_tag.len() > MAX_RESTORE_TAG_BYTES
             || self.restore_tag.contains('\0')
@@ -1677,10 +1702,29 @@ impl PaneLayout {
     }
 
     /// Every `Leaf` in this subtree in tree order (left-to-right / top-to-bottom).
+    #[cfg(test)]
     pub(crate) fn leaves(&self) -> Vec<&PaneLayout> {
         let mut out = Vec::with_capacity(self.leaf_count());
         self.collect_leaves(&mut out);
         out
+    }
+
+    /// Visit every `Leaf` in this subtree in tree order without allocating a `Vec`.
+    pub(crate) fn visit_leaves<'a>(&'a self, f: &mut impl FnMut(&'a PaneLayout)) {
+        let _ = self.all_leaves(&mut |leaf| {
+            f(leaf);
+            true
+        });
+    }
+
+    /// Test `f` against every `Leaf` in this subtree in tree order without allocating a `Vec`.
+    ///
+    /// Stops at the first leaf where `f` returns `false`.
+    pub(crate) fn all_leaves<'a>(&'a self, f: &mut impl FnMut(&'a PaneLayout) -> bool) -> bool {
+        match self {
+            PaneLayout::Leaf { .. } => f(self),
+            PaneLayout::Split { first, second, .. } => first.all_leaves(f) && second.all_leaves(f),
+        }
     }
 
     /// The first `Leaf` in this subtree in tree order without allocating a `Vec`.
@@ -1691,6 +1735,7 @@ impl PaneLayout {
         }
     }
 
+    #[cfg(test)]
     fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a PaneLayout>) {
         match self {
             PaneLayout::Leaf { .. } => out.push(self),

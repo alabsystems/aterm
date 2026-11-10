@@ -42,7 +42,11 @@
 //! Order: binaries with no history first (nothing says how long they take), at width
 //! `min(4, S, ceiling)` and planned to hold as much memory as the heaviest binary the history
 //! kept; then those whose last run was a FAIL, so a red shows early; then the rest; each group
-//! but the first longest predicted first, the first in cargo's order.
+//! but the first longest predicted first, the first in cargo's order. Known work then fills
+//! predicted CPU gaps: a later binary moves ahead of a blocked head only if it fits the spare
+//! charge and is predicted to finish before the running binaries release enough for that head.
+//! This preserves the head's predicted start, unlike unrestricted first-fit packing. Predictions
+//! change order only: execution still holds each binary's CPU and memory claims until it ends.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -186,11 +190,11 @@ pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak
             continue;
         }
         tried = Some(target);
-        let candidate = Plan {
+        let candidate = fill_gaps(Plan {
             share,
             target,
             order: at_target(&known, target, share, ceiling),
-        };
+        });
         let end = schedule(&candidate).end;
         // The targets rise, so of plans that end together the last tried is the narrowest.
         if best.as_ref().is_none_or(|(first, _)| end <= *first) {
@@ -217,6 +221,55 @@ pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak
         share,
         target,
         order,
+    }
+}
+
+/// Fill predicted CPU gaps without delaying the blocked head's predicted start. This runs only
+/// over known binaries, before unseen work is prepended. The resulting order is replayed by the
+/// ordinary dispatcher, so its memory claim is measured by the same schedule as every other
+/// plan. Actual durations are never deadlines: a prediction grants no admission or verdict.
+fn fill_gaps(mut plan: Plan) -> Plan {
+    let mut pending = std::mem::take(&mut plan.order);
+    let mut running: BinaryHeap<Reverse<(Duration, usize, u32)>> = BinaryHeap::new();
+    let mut now = Duration::ZERO;
+    let mut held = 0_u32;
+    loop {
+        while let Some(head) = pending.first() {
+            let fits = |b: &Planned| held.saturating_add(b.charge) <= plan.share;
+            let next = if fits(head) {
+                Some(0)
+            } else {
+                // Reserve the head's earliest start under the running jobs' predictions.
+                let mut endings: Vec<_> = running.iter().map(|r| r.0).collect();
+                endings.sort_unstable();
+                let mut remaining = held;
+                let reserved = endings.into_iter().find_map(|(end, _, charge)| {
+                    remaining -= charge;
+                    (remaining.saturating_add(head.charge) <= plan.share).then_some(end)
+                });
+                reserved.and_then(|reserved| {
+                    pending.iter().position(|b| {
+                        fits(b)
+                            && b.predicted
+                                .is_some_and(|wall| now.saturating_add(wall) <= reserved)
+                    })
+                })
+            };
+            let Some(next) = next else { break };
+            let b = pending.remove(next);
+            held += b.charge;
+            running.push(Reverse((
+                now.saturating_add(b.predicted.unwrap_or(plan.target)),
+                b.index,
+                b.charge,
+            )));
+            plan.order.push(b);
+        }
+        let Some(Reverse((end, _, charge))) = running.pop() else {
+            return plan;
+        };
+        now = end;
+        held -= charge;
     }
 }
 

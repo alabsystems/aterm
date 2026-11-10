@@ -15,6 +15,12 @@ pub(super) fn complete(prepare: &mut Prepare) {
     assert!(Request::prepare(prepare.clone()).encode().is_some());
 }
 
+pub(super) fn enrolled(paths: &Paths, prepare: &mut Prepare) {
+    complete(prepare);
+    prepare.custody = Some(recipient_custody::enroll_at(paths).unwrap().stamp().into());
+    prepare.rejection_domain = Some(rejection_domain_at(paths).unwrap());
+}
+
 #[test]
 fn complete_mode_cannot_enroll_or_write_through_a_legacy_api() {
     let (_home, paths, mut prepare, binding) = fixture();
@@ -47,7 +53,7 @@ fn complete_mode_cannot_enroll_or_write_through_a_legacy_api() {
 #[test]
 fn receipt_mode_changes_the_digest_and_legacy_records_cannot_satisfy_it() {
     let (_home, paths, mut prepare, binding) = fixture();
-    complete(&mut prepare);
+    enrolled(&paths, &mut prepare);
     let key = write_key(&paths).unwrap();
     let strict_digest = key.prepare(&prepare).unwrap();
     let mut unmarked = prepare.clone();
@@ -83,7 +89,8 @@ fn receipt_mode_changes_the_digest_and_legacy_records_cannot_satisfy_it() {
 #[test]
 fn marked_complete_history_stays_readable_but_cannot_be_reinterpreted_as_unmarked() {
     let (_home, paths, mut prepare, binding) = fixture();
-    complete(&mut prepare);
+    enrolled(&paths, &mut prepare);
+    reservation::reserve_at(&paths, &prepare, &binding, LIMITS).unwrap();
     recipients::append_fixture(
         &paths,
         &prepare,

@@ -7845,7 +7845,7 @@ struct ObserveRequest {
     /// A child ending only requests a reading while its current Repo stage is pending.
     pending_repositories: bool,
     /// A redundant post-pass refresh may retain a still-valid fact when its
-    /// private reader is not admitted. Other requests retire facts immediately.
+    /// private reader is not admitted. Other requests replace it with the new reading's result.
     refresh: bool,
 }
 
@@ -8483,7 +8483,16 @@ fn observe_rows(request: ObserveRequest) {
 /// require the page still in front when their native batch starts.
 #[cfg(target_os = "macos")]
 fn observe_initial_setup(plan: aterm_types::macos_setup::Plan) -> bool {
-    request_observation(Some(plan), aterm_types::macos_setup::Subject::all(), false)
+    // A focus or navigation refresh replaces readings in place. Actual source, device,
+    // choice and effect transitions still retire them through invalidate_setup_observations.
+    queue_observation(ObserveRequest {
+        plan: Some(plan),
+        choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
+        subjects: aterm_types::macos_setup::Subject::all(),
+        forced: false,
+        pending_repositories: false,
+        refresh: false,
+    })
 }
 
 /// The vault's materialization mark as of the last reading of the GitHub repositories row, or
@@ -13714,7 +13723,31 @@ mod initial_setup_result_tests {
             standing: Standing::NeedsYou,
             ..Observation::unknown(vault)
         };
+        change(|script| script.readings = [vec![accepted.clone()]].into());
+        assert!(observe_initial_setup(shown.clone()));
+        wait_until("the first accepted presentation is read", || {
+            script().reads.len() == 1 && observe_idle()
+        });
+        let before = setup_readings();
+        assert!(before.observed.contains(&accepted));
         change(|script| {
+            script.reads.clear();
+            script.hold = true;
+            script.readings = [vec![accepted.clone()]].into();
+        });
+        assert!(observe_initial_setup(shown.clone()));
+        wait_until("the returning page's fresh reading starts", || {
+            script().reads.len() == 1
+        });
+        let while_reading = setup_readings();
+        release_readings();
+        wait_until("the returning page's reading finishes", observe_idle);
+        assert_eq!(
+            while_reading, before,
+            "a same-plan focus refresh keeps the shown values until their replacement arrives"
+        );
+        change(|script| {
+            script.reads.clear();
             script.hold = true;
             script.readings = [vec![accepted.clone()], vec![accepted], vec![draft.clone()]].into();
         });

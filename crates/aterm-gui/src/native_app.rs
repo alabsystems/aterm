@@ -14,6 +14,12 @@ pub(crate) use crate::tab_model::{AppInstanceId, ViewId};
 use crate::document_store::DocumentId;
 use crate::native_ui::{ActionId, LogicalRect, UiKey, UiTree};
 
+mod markdown_workspace;
+pub(crate) use markdown_workspace::{
+    MarkdownPane, MarkdownWorkspaceMode, MarkdownWorkspaceView, is_markdown_uri,
+    resolve_markdown_link,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ServiceId(u64);
 
@@ -174,7 +180,6 @@ pub(crate) enum AppViewState {
     About(Box<crate::native_about::AboutViewState>),
     Settings(Box<crate::native_settings::SettingsViewState>),
     SystemState(Box<crate::system_state::SystemStateViewState>),
-    Markdown(MarkdownViewState),
     Editor(Box<EditorViewState>),
     Recovery(RecoveryViewState),
     Workers(Box<crate::native_workers::WorkersViewState>),
@@ -188,7 +193,6 @@ impl AppViewState {
             Self::About(_) => AppKind::About,
             Self::Settings(_) => AppKind::Settings,
             Self::SystemState(_) => AppKind::SystemState,
-            Self::Markdown(_) => AppKind::Markdown,
             Self::Editor(_) => AppKind::Editor,
             Self::Recovery(_) => AppKind::Recovery,
             Self::Workers(_) => AppKind::Workers,
@@ -202,7 +206,6 @@ impl AppViewState {
             Self::About(view) => &view.common,
             Self::Settings(view) => &view.common,
             Self::SystemState(view) => &view.common,
-            Self::Markdown(view) => &view.common,
             Self::Editor(view) => &view.common,
             Self::Recovery(view) => &view.common,
             Self::Workers(view) => &view.common,
@@ -223,7 +226,6 @@ impl AppViewState {
             Self::About(view) => &mut view.common,
             Self::Settings(view) => &mut view.common,
             Self::SystemState(view) => &mut view.common,
-            Self::Markdown(view) => &mut view.common,
             Self::Editor(view) => &mut view.common,
             Self::Recovery(view) => &mut view.common,
             Self::Workers(view) => &mut view.common,
@@ -268,6 +270,8 @@ pub(crate) struct MarkdownViewState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EditorViewState {
     pub(crate) common: CommonViewState,
+    /// Markdown is a presentation of this editor view, never another document or ticket.
+    pub(crate) markdown: Option<MarkdownWorkspaceView>,
     /// Canonical editor interaction state for this view.
     pub(crate) buffer: Option<crate::native_editor::EditorBufferView>,
     pub(crate) preedit: String,
@@ -536,8 +540,7 @@ pub(crate) enum NativeApp {
     /// Boxed: the one Settings controller carries every page's projection and dwarfs the document apps, which are the many instances (as its view state is boxed in [`AppViewState::Settings`]).
     Settings(Box<crate::native_settings::SettingsApp>),
     SystemState(Box<crate::system_state::SystemStateApp>),
-    Markdown(MarkdownApp),
-    Editor(EditorApp),
+    Editor(Box<EditorApp>),
     Recovery(RecoveryApp),
     Workers(Box<crate::native_workers::WorkersApp>),
 }
@@ -575,7 +578,6 @@ impl NativeApp {
             Self::About(_) => &about_vtable::VTABLE,
             Self::Settings(_) => &settings_vtable::VTABLE,
             Self::SystemState(_) => &system_state_vtable::VTABLE,
-            Self::Markdown(_) => &markdown_vtable::VTABLE,
             Self::Editor(_) => &editor_vtable::VTABLE,
             Self::Recovery(_) => &recovery_vtable::VTABLE,
             Self::Workers(_) => &workers_vtable::VTABLE,
@@ -589,7 +591,6 @@ impl NativeApp {
     pub(crate) const fn document_id(&self) -> Option<DocumentId> {
         match self {
             Self::Mail(_) | Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
-            Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
             Self::Recovery(_) | Self::Workers(_) | Self::Allocation(_) => None,
         }
@@ -771,13 +772,6 @@ define_app_vtable!(
     SystemState,
     AppKind::SystemState,
     "system-state"
-);
-define_app_vtable!(
-    markdown_vtable,
-    Markdown,
-    Markdown,
-    AppKind::Markdown,
-    "markdown"
 );
 define_app_vtable!(editor_vtable, Editor, Editor, AppKind::Editor, "editor");
 define_app_vtable!(
@@ -2479,6 +2473,11 @@ pub(crate) enum AppEffect {
     OpenDocumentEditor {
         document: DocumentId,
     },
+    /// One explicitly clicked local Markdown target, admitted by the host for this window.
+    OpenMarkdownDocument {
+        document: DocumentId,
+        destination: String,
+    },
     /// Open the host's native image picker for the terminal wallpaper.
     ChooseWallpaperImage,
     /// Open atpkg's `packages.log` (Settings ▸ Packages' "Open Log").
@@ -2716,6 +2715,13 @@ impl UpdateCx<'_> {
             .push(AppEffect::OpenDocumentEditor { document });
     }
 
+    fn open_markdown_document(&mut self, document: DocumentId, destination: String) {
+        self.effects.push(AppEffect::OpenMarkdownDocument {
+            document,
+            destination,
+        });
+    }
+
     pub(crate) fn choose_wallpaper_image(&mut self) {
         self.effects.push(AppEffect::ChooseWallpaperImage);
     }
@@ -2889,6 +2895,12 @@ impl NativeRuntime {
         if self.views.contains_key(&view) {
             return Err(RuntimeError::DuplicateView(view));
         }
+        if let (NativeApp::Editor(app), AppViewState::Editor(view)) = (app, &mut state)
+            && app.markdown.is_some()
+            && (view.markdown.is_none() || app.concealment().is_some())
+        {
+            view.markdown = Some(MarkdownWorkspaceView::new(MarkdownWorkspaceMode::Edit));
+        }
         let watch_status = self.config_watch_status.message();
         match &mut state {
             AppViewState::Settings(settings) => {
@@ -2901,7 +2913,6 @@ impl NativeRuntime {
             AppViewState::About(_)
             | AppViewState::Mail(_)
             | AppViewState::SystemState(_)
-            | AppViewState::Markdown(_)
             | AppViewState::Editor(_)
             | AppViewState::Recovery(_)
             | AppViewState::Allocation(_)
@@ -3262,7 +3273,6 @@ impl NativeRuntime {
             NativeApp::About(_)
             | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
@@ -3296,7 +3306,6 @@ impl NativeRuntime {
             NativeApp::About(_)
             | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
@@ -3320,7 +3329,6 @@ impl NativeRuntime {
             NativeApp::About(_)
             | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
@@ -3344,7 +3352,6 @@ impl NativeRuntime {
             NativeApp::About(_)
             | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
@@ -3384,6 +3391,59 @@ impl NativeRuntime {
         true
     }
 
+    /// Change a Markdown editor's presentation without changing its tab or document identity.
+    pub(crate) fn set_editor_markdown_mode(
+        &mut self,
+        instance: AppInstanceId,
+        view: ViewId,
+        mode: MarkdownWorkspaceMode,
+    ) -> bool {
+        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) =
+            (self.instances.get(&instance), self.views.get_mut(&view))
+        else {
+            return false;
+        };
+        let changed = app.set_markdown_mode(view, mode);
+        // Direct host changes must settle field identity before the next IME
+        // recipient is pinned, just as dispatch does after a semantic action.
+        view.common.sync_input_focus();
+        changed
+    }
+
+    /// Reveal the real source editor for an editing command, retaining an existing split.
+    pub(crate) fn focus_markdown_editor(&mut self, instance: AppInstanceId, view: ViewId) -> bool {
+        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) =
+            (self.instances.get(&instance), self.views.get_mut(&view))
+        else {
+            return false;
+        };
+        let changed = match app.markdown_mode(view) {
+            Some(MarkdownWorkspaceMode::Read) => {
+                app.set_markdown_mode(view, MarkdownWorkspaceMode::Edit)
+            }
+            Some(MarkdownWorkspaceMode::Split)
+                if view
+                    .markdown
+                    .as_ref()
+                    .is_some_and(MarkdownWorkspaceView::reader_focused) =>
+            {
+                app.markdown_action(
+                    view,
+                    &ActionInvocation {
+                        id: ActionId::new("editor/markdown/focus-editor"),
+                        value: None,
+                    },
+                );
+                view.markdown
+                    .as_ref()
+                    .is_some_and(MarkdownWorkspaceView::editor_focused)
+            }
+            _ => false,
+        };
+        view.common.sync_input_focus();
+        changed
+    }
+
     /// Refresh every controller derived from one canonical document.
     pub(crate) fn publish_document(
         &mut self,
@@ -3394,12 +3454,15 @@ impl NativeRuntime {
     ) {
         for app in self.instances.values_mut() {
             match app {
-                NativeApp::Markdown(markdown) if markdown.document == document => {
-                    markdown.parsed = crate::native_markdown::parse(source);
-                    markdown.dirty = dirty;
-                }
                 NativeApp::Editor(editor) if editor.document == document => {
                     editor.dirty = dirty;
+                    if let Some(reader) = editor.markdown.as_mut() {
+                        if editor.markdown_revision != Some(revision) {
+                            reader.parsed = crate::native_markdown::parse(source);
+                            editor.markdown_revision = Some(revision);
+                        }
+                        reader.dirty = dirty;
+                    }
                     if editor.config_editor && editor.config_analysis_revision != revision {
                         editor.config_analysis = None;
                         editor.config_analysis_revision = revision;
@@ -3425,6 +3488,8 @@ impl NativeRuntime {
                 && editor.document == document
             {
                 editor.config_editor = true;
+                editor.markdown = None;
+                editor.markdown_revision = None;
                 editor.config_analysis = None;
                 editor.config_analysis_revision = revision;
                 editor.config_host_requested_revision = None;
@@ -3433,6 +3498,19 @@ impl NativeRuntime {
             }
         }
         if enabled {
+            for state in self.views.values_mut() {
+                if let AppViewState::Editor(view) = state
+                    && view
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.document == document)
+                    && view.markdown.take().is_some()
+                {
+                    view.common.last_focus = Some(UiKey::new("editor/buffer"));
+                    view.common.retire_input();
+                    state.touch();
+                }
+            }
             self.synchronize_config_watch_status_views();
         }
         enabled
@@ -3515,7 +3593,6 @@ impl NativeRuntime {
                 AppViewState::About(_)
                 | AppViewState::Mail(_)
                 | AppViewState::SystemState(_)
-                | AppViewState::Markdown(_)
                 | AppViewState::Editor(_)
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
@@ -3540,7 +3617,6 @@ impl NativeRuntime {
                 AppViewState::About(_)
                 | AppViewState::Mail(_)
                 | AppViewState::SystemState(_)
-                | AppViewState::Markdown(_)
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
                 | AppViewState::Workers(_) => {}
@@ -3643,7 +3719,6 @@ impl NativeRuntime {
             | NativeApp::Mail(_)
             | NativeApp::About(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
@@ -3667,7 +3742,6 @@ impl NativeRuntime {
             | NativeApp::Mail(_)
             | NativeApp::About(_)
             | NativeApp::SystemState(_)
-            | NativeApp::Markdown(_)
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
@@ -3794,12 +3868,6 @@ impl NativeRuntime {
         self.instances
             .iter()
             .filter_map(|(instance, app)| match app {
-                NativeApp::Markdown(markdown) => Some((
-                    *instance,
-                    AppKind::Markdown,
-                    markdown.title.clone(),
-                    markdown.canonical_uri.clone(),
-                )),
                 NativeApp::Editor(editor) => Some((
                     *instance,
                     AppKind::Editor,
@@ -3823,9 +3891,6 @@ impl NativeRuntime {
             .instances
             .iter()
             .filter_map(|(instance, app)| match app {
-                NativeApp::Markdown(app) => {
-                    Some((*instance, app.base_title.clone(), app.canonical_uri.clone()))
-                }
                 NativeApp::Editor(app) => {
                     Some((*instance, app.base_title.clone(), app.canonical_uri.clone()))
                 }
@@ -3874,7 +3939,6 @@ impl NativeRuntime {
         let mut changed = Vec::new();
         for (instance, title) in desired {
             let current = match self.instances.get_mut(&instance) {
-                Some(NativeApp::Markdown(app)) => &mut app.title,
                 Some(NativeApp::Editor(app)) => &mut app.title,
                 _ => continue,
             };
@@ -3893,9 +3957,6 @@ impl NativeRuntime {
     ) {
         for app in self.instances.values_mut() {
             match app {
-                NativeApp::Markdown(markdown) if markdown.document == document => {
-                    markdown.recovery_status.clone_from(&status);
-                }
                 NativeApp::Editor(editor) if editor.document == document => {
                     editor.recovery_status.clone_from(&status);
                 }
@@ -4610,10 +4671,11 @@ pub(crate) struct MarkdownApp {
     pub(crate) document: DocumentId,
     pub(crate) parsed: crate::native_markdown::MarkdownDocument,
     pub(crate) title: String,
-    pub(crate) base_title: String,
     pub(crate) canonical_uri: String,
     pub(crate) dirty: bool,
     pub(crate) recovery_status: Option<String>,
+    /// The unified editor supplies the document toolbar above this reader pane.
+    embedded: bool,
 }
 
 impl MarkdownApp {
@@ -4636,11 +4698,11 @@ impl MarkdownApp {
         Self {
             document,
             parsed: crate::native_markdown::parse(source),
-            title: title.clone(),
-            base_title: title,
+            title,
             canonical_uri,
             dirty: false,
             recovery_status: None,
+            embedded: false,
         }
     }
 
@@ -4910,9 +4972,14 @@ impl MarkdownApp {
         width: f32,
         height: f32,
     ) -> (MarkdownReaderGeometry, MarkdownReaderHeader) {
-        let geometry = MarkdownReaderGeometry::new(view.mode, width, height);
+        let mut geometry = MarkdownReaderGeometry::new(view.mode, width, height);
         let header = self.reader_header(view, &geometry);
-        (geometry.with_header_height(header.height), header)
+        if self.embedded {
+            geometry.main_gap = 0.0;
+            (geometry.with_header_height(0.0), header)
+        } else {
+            (geometry.with_header_height(header.height), header)
+        }
     }
 
     fn outline_target(&self, view: &MarkdownViewState, delta: isize) -> Option<usize> {
@@ -4941,7 +5008,10 @@ impl MarkdownApp {
                     crate::native_markdown::local_anchor(&self.parsed, &link.destination).is_some()
                 }
                 LinkPolicy::ExplicitExternal => link.destination.len() <= 2_048,
-                LinkPolicy::LocalDocument | LinkPolicy::DeniedScheme => false,
+                LinkPolicy::LocalDocument => {
+                    resolve_markdown_link(&self.canonical_uri, &link.destination).is_ok()
+                }
+                LinkPolicy::DeniedScheme => false,
             })
     }
 }
@@ -5145,6 +5215,12 @@ impl NativeAppModel for MarkdownApp {
                         view.notice = Some("Opening link…".to_string());
                         view.common.presentation_revision =
                             view.common.presentation_revision.saturating_add(1);
+                    }
+                    LinkPolicy::LocalDocument
+                        if resolve_markdown_link(&self.canonical_uri, &link.destination)
+                            .is_ok() =>
+                    {
+                        cx.open_markdown_document(self.document, link.destination.clone());
                     }
                     LinkPolicy::LocalDocument
                     | LinkPolicy::DeniedScheme
@@ -5948,7 +6024,11 @@ impl NativeAppModel for MarkdownApp {
                 .gap(main_gap)
                 .clipped(),
         )
-        .children(vec![header, content]);
+        .children(if self.embedded {
+            vec![content]
+        } else {
+            vec![header, content]
+        });
 
         let mut shell_children = Vec::with_capacity(if wide_outline { 2 } else { 1 });
         if wide_outline {
@@ -6589,6 +6669,10 @@ pub(crate) struct EditorApp {
     pub(crate) base_title: String,
     pub(crate) canonical_uri: String,
     pub(crate) dirty: bool,
+    pub(crate) read_only: bool,
+    /// Formatted rendering of the same canonical editor document.
+    pub(crate) markdown: Option<Box<MarkdownApp>>,
+    markdown_revision: Option<u64>,
     pub(crate) checkpoint_pending: bool,
     /// The saver baseline no longer matches disk.
     pub(crate) disk_conflict: bool,
@@ -6636,13 +6720,17 @@ impl EditorApp {
     /// What this editor's toolbar holds beyond its fixed commands.
     pub(crate) fn toolbar(&self) -> crate::native_ui::EditorToolbar {
         crate::native_ui::EditorToolbar {
+            commands_hidden: self.markdown.is_some(),
             problem_navigation: self.config_editor
                 && self
                     .config_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.diagnostic_count() > 0),
-            reload: self.disk_conflict && self.dirty && self.disk_notice.is_none(),
-            edit_header: self.disk_notice.is_some(),
+            reload: self.markdown.is_none()
+                && self.disk_conflict
+                && self.dirty
+                && self.disk_notice.is_none(),
+            edit_header: self.markdown.is_none() && self.disk_notice.is_some(),
             grid: amacs::language::Language::detect(&self.canonical_uri, "")
                 .delimiter()
                 .map(|_| false),
@@ -6653,7 +6741,8 @@ impl EditorApp {
     pub(crate) fn toolbar_in(&self, view: &EditorViewState) -> crate::native_ui::EditorToolbar {
         let toolbar = self.toolbar();
         crate::native_ui::EditorToolbar {
-            edit_header: view.edit_header.is_some() || self.disk_notice.is_some(),
+            edit_header: self.markdown.is_none()
+                && (view.edit_header.is_some() || self.disk_notice.is_some()),
             grid: toolbar.grid.map(|_| {
                 view.buffer
                     .as_ref()
@@ -6673,12 +6762,21 @@ impl EditorApp {
     }
 
     pub(crate) fn new_with_uri(document: DocumentId, title: String, canonical_uri: String) -> Self {
+        let markdown = is_markdown_uri(&canonical_uri).then(|| {
+            let mut reader =
+                MarkdownApp::new_with_uri(document, title.clone(), canonical_uri.clone(), "");
+            reader.embedded = true;
+            Box::new(reader)
+        });
         Self {
             document,
             title: title.clone(),
             base_title: title,
             canonical_uri,
             dirty: false,
+            read_only: false,
+            markdown,
+            markdown_revision: None,
             checkpoint_pending: false,
             disk_conflict: false,
             disk_notice: None,
@@ -6762,7 +6860,12 @@ impl EditorApp {
             .as_ref()
             .and_then(crate::native_editor::EditorBufferView::grid_draft)
             .is_some_and(|draft| draft.text != draft.original);
-        (self.dirty || cell_changed)
+        !self.read_only
+            && !view
+                .edit_header
+                .as_ref()
+                .is_some_and(|header| header.read_only)
+            && (self.dirty || cell_changed)
             && !self.checkpoint_pending
             && !self.disk_conflict
             && config_valid
@@ -6862,14 +6965,49 @@ impl NativeAppModel for EditorApp {
         &mut self,
         view: &mut Self::ViewState,
         event: AppEvent,
-        _cx: &mut UpdateCx<'_>,
+        cx: &mut UpdateCx<'_>,
     ) -> EventResult {
+        if let AppEvent::Action(invocation) = &event
+            && self.markdown_action(view, invocation)
+        {
+            return EventResult::Handled;
+        }
         match event {
             AppEvent::FocusChanged(focus) => {
+                if view
+                    .markdown
+                    .as_ref()
+                    .is_some_and(MarkdownWorkspaceView::editor_focused)
+                    && (!view.preedit.is_empty()
+                        || view
+                            .buffer
+                            .as_ref()
+                            .is_some_and(|buffer| buffer.minibuffer_active()))
+                    && focus
+                        .as_ref()
+                        .is_none_or(|key| key.as_str() != "editor/buffer")
+                {
+                    return EventResult::Handled;
+                }
+                if let Some(workspace) = &mut view.markdown {
+                    if focus
+                        .as_ref()
+                        .is_some_and(|key| key.as_str() == "editor/buffer")
+                    {
+                        workspace.focus = MarkdownPane::Editor;
+                    } else if focus
+                        .as_ref()
+                        .is_some_and(|key| key.as_str().starts_with("markdown/"))
+                    {
+                        workspace.focus = MarkdownPane::Reader;
+                    }
+                }
                 view.common.last_focus = focus;
+                view.common.sync_input_focus();
                 EventResult::Handled
             }
-            AppEvent::DocumentChanged { document, .. } if document == self.document => {
+            AppEvent::DocumentChanged { document, revision } if document == self.document => {
+                self.reader_event(view, AppEvent::DocumentChanged { document, revision }, cx);
                 if view
                     .status
                     .as_deref()
@@ -6931,212 +7069,225 @@ impl NativeAppModel for EditorApp {
                 }
                 EventResult::Handled
             }
-            _ => EventResult::Bubble,
+            event => self.reader_event(view, event, cx),
         }
     }
 
     fn view(&self, view: &Self::ViewState, cx: &ViewCx<'_>) -> UiTree {
-        use crate::native_ui::{
-            ActionId, ButtonSpec, Control, ControlState, GroupSpec, Insets, Layout, Length,
-            SemanticRole, StyleRef, TextViewportSpec, UiContent, UiKey, UiNode,
-        };
-        let command_completion = view.buffer.as_ref().and_then(|buffer| {
-            let crate::native_editor::Minibuffer::Command { query, selected } = &buffer.minibuffer
-            else {
-                return None;
+        let source = |cx: &ViewCx<'_>| {
+            use crate::native_ui::{
+                ActionId, ButtonSpec, Control, ControlState, GroupSpec, Insets, Layout, Length,
+                SemanticRole, StyleRef, TextViewportSpec, UiContent, UiKey, UiNode,
             };
-            Some((
-                query.clone(),
-                crate::native_editor::command_completions(query),
-                *selected,
-            ))
-        });
-        let minibuffer_active = view
-            .buffer
-            .as_ref()
-            .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active);
-        let config_assist = (!minibuffer_active
-            && view
+            let command_completion = view.buffer.as_ref().and_then(|buffer| {
+                let crate::native_editor::Minibuffer::Command { query, selected } =
+                    &buffer.minibuffer
+                else {
+                    return None;
+                };
+                Some((
+                    query.clone(),
+                    crate::native_editor::command_completions(query),
+                    *selected,
+                ))
+            });
+            let minibuffer_active = view
                 .buffer
                 .as_ref()
-                .is_some_and(|buffer| !buffer.chord_pending()))
-        .then(|| {
-            let snapshot = cx.document?;
-            let caret = view.buffer.as_ref()?.primary_selection().head;
-            self.config_assist(snapshot, caret)
-        })
-        .flatten()
-        .filter(|(context, _)| view.config_completion_dismissed != Some(*context))
-        .map(|(context, mut assist)| {
-            let listed = assist.typed || view.config_completion_interaction == Some(context);
-            let waiting = !listed && !assist.completions.is_empty();
-            if !listed {
-                assist.completions.clear();
-                assist.help = assist.resting_help.take();
-            }
-            (context, assist, waiting, listed)
-        })
-        .filter(|(_, assist, _, _)| assist.help.is_some() || !assist.completions.is_empty());
-        let toolbar = self.toolbar_in(view);
-        // The config help line on the rows its text wraps to, in the panel's width.
-        let config_help = config_assist
-            .as_ref()
-            .filter(|_| command_completion.is_none())
-            .map(|(_, assist, _, listed)| {
-                crate::native_ui::editor_help_palette(
-                    cx.viewport,
-                    toolbar,
-                    listed.then(|| assist.completions.len().max(1)),
-                    config_assist_help(assist),
-                )
+                .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active);
+            let config_assist = (!minibuffer_active
+                && view
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| !buffer.chord_pending()))
+            .then(|| {
+                let snapshot = cx.document?;
+                let caret = view.buffer.as_ref()?.primary_selection().head;
+                self.config_assist(snapshot, caret)
+            })
+            .flatten()
+            .filter(|(context, _)| view.config_completion_dismissed != Some(*context))
+            .map(|(context, mut assist)| {
+                let listed = assist.typed || view.config_completion_interaction == Some(context);
+                let waiting = !listed && !assist.completions.is_empty();
+                if !listed {
+                    assist.completions.clear();
+                    assist.help = assist.resting_help.take();
+                }
+                (context, assist, waiting, listed)
+            })
+            .filter(|(_, assist, _, _)| assist.help.is_some() || !assist.completions.is_empty());
+            let toolbar = self.toolbar_in(view);
+            // The config help line on the rows its text wraps to, in the panel's width.
+            let config_help = config_assist
+                .as_ref()
+                .filter(|_| command_completion.is_none())
+                .map(|(_, assist, _, listed)| {
+                    crate::native_ui::editor_help_palette(
+                        cx.viewport,
+                        toolbar,
+                        listed.then(|| assist.completions.len().max(1)),
+                        config_assist_help(assist),
+                    )
+                });
+            let completion_count = match (&command_completion, &config_help) {
+                (Some((_, candidates, _)), _) => {
+                    crate::native_ui::EditorPalette::from(candidates.len().max(1))
+                }
+                (None, Some((palette, _))) => *palette,
+                (None, None) => crate::native_ui::EditorPalette::None,
+            };
+            let shell =
+                crate::native_ui::editor_shell_metrics(cx.viewport, completion_count, toolbar);
+            let outer_padding = shell.outer_padding;
+            let command_gap = shell.command_gap;
+            let command_bar_height = shell.command_bar_height;
+            let editor_gap = shell.content_gap;
+            let document_key = cx.document.map_or_else(
+                || format!("document:{}", self.document.get()),
+                |snapshot| format!("document:{}@{}", snapshot.id.get(), snapshot.seq.0),
+            );
+            let editor_rect = crate::native_ui::editor_text_viewport_rect_with_palette(
+                cx.viewport,
+                completion_count,
+                toolbar,
+            );
+            // The footer first: its rows are the body's to give, so the rows the document shows
+            // are counted under the footer this frame paints.
+            let footer = editor_footer(self, view, cx.document, editor_rect);
+            let editor_geometry =
+                crate::native_ui::text_viewport_geometry(editor_rect, footer.rows);
+            let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
+                cx.viewport,
+                completion_count,
+                toolbar,
+                footer.rows,
+            );
+            let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
+                / editor_geometry.cell_w)
+                .floor() as usize;
+            // A table's grid face draws its records in place of the text lines; its reading is what
+            // the window's accessibility tree gets of it, concealed cells hidden.
+            let concealed = self.concealment();
+            let (grid, grid_reading) = cx
+                .document
+                .and_then(|snapshot| {
+                    let buffer = view.buffer.as_ref()?;
+                    let table = self.grid_table(snapshot, buffer)?;
+                    let grid = crate::native_editor::project_grid(
+                        &snapshot.text,
+                        &table,
+                        buffer,
+                        line_capacity,
+                        column_capacity,
+                    );
+                    let reading = crate::native_editor::read_grid(
+                        &snapshot.text,
+                        &table,
+                        &grid,
+                        concealed.as_ref(),
+                    );
+                    Some((Some(grid), Some(reading)))
+                })
+                .unwrap_or((None, None));
+            let mut projection = cx.document.filter(|_| grid.is_none()).and_then(|snapshot| {
+                view.buffer.as_ref().map(|buffer| {
+                    let starts = self.line_index(snapshot);
+                    let lines = match starts.as_deref() {
+                        Some(starts) => {
+                            crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
+                        }
+                        None => crate::native_editor::EditorLines::scanning(&snapshot.text),
+                    };
+                    let mut effective = buffer.clone();
+                    effective.reconcile_viewport_with(&lines, line_capacity);
+                    crate::native_editor::project_viewport_with(
+                        &lines,
+                        &effective,
+                        line_capacity,
+                        column_capacity,
+                    )
+                })
             });
-        let completion_count = match (&command_completion, &config_help) {
-            (Some((_, candidates, _)), _) => {
-                crate::native_ui::EditorPalette::from(candidates.len().max(1))
+            if let (Some(projection), Some(analysis)) =
+                (projection.as_mut(), self.config_analysis.as_ref())
+            {
+                crate::native_config_language::decorate_projection(projection, analysis);
             }
-            (None, Some((palette, _))) => *palette,
-            (None, None) => crate::native_ui::EditorPalette::None,
-        };
-        let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count, toolbar);
-        let outer_padding = shell.outer_padding;
-        let command_gap = shell.command_gap;
-        let command_bar_height = shell.command_bar_height;
-        let editor_gap = shell.content_gap;
-        let document_key = cx.document.map_or_else(
-            || format!("document:{}", self.document.get()),
-            |snapshot| format!("document:{}@{}", snapshot.id.get(), snapshot.seq.0),
-        );
-        let editor_rect = crate::native_ui::editor_text_viewport_rect_with_palette(
-            cx.viewport,
-            completion_count,
-            toolbar,
-        );
-        // The footer first: its rows are the body's to give, so the rows the document shows
-        // are counted under the footer this frame paints.
-        let footer = editor_footer(self, view, cx.document, editor_rect);
-        let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect, footer.rows);
-        let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
-            cx.viewport,
-            completion_count,
-            toolbar,
-            footer.rows,
-        );
-        let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
-            / editor_geometry.cell_w)
-            .floor() as usize;
-        // A table's grid face draws its records in place of the text lines; its reading is what
-        // the window's accessibility tree gets of it, concealed cells hidden.
-        let concealed = self.concealment();
-        let (grid, grid_reading) = cx
-            .document
-            .and_then(|snapshot| {
-                let buffer = view.buffer.as_ref()?;
-                let table = self.grid_table(snapshot, buffer)?;
-                let grid = crate::native_editor::project_grid(
-                    &snapshot.text,
-                    &table,
-                    buffer,
-                    line_capacity,
-                    column_capacity,
-                );
-                let reading = crate::native_editor::read_grid(
-                    &snapshot.text,
-                    &table,
-                    &grid,
-                    concealed.as_ref(),
-                );
-                Some((Some(grid), Some(reading)))
-            })
-            .unwrap_or((None, None));
-        let mut projection = cx.document.filter(|_| grid.is_none()).and_then(|snapshot| {
-            view.buffer.as_ref().map(|buffer| {
-                let starts = self.line_index(snapshot);
-                let lines = match starts.as_deref() {
-                    Some(starts) => {
-                        crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
-                    }
-                    None => crate::native_editor::EditorLines::scanning(&snapshot.text),
-                };
-                let mut effective = buffer.clone();
-                effective.reconcile_viewport_with(&lines, line_capacity);
-                crate::native_editor::project_viewport_with(
-                    &lines,
-                    &effective,
-                    line_capacity,
-                    column_capacity,
+            let cursor_label = cx.document.and_then(|snapshot| {
+                if let Some(grid) = grid.as_ref() {
+                    return Some(editor_grid_cursor_label(grid));
+                }
+                view.buffer.as_ref().map(|buffer| {
+                    let starts = self.line_index(snapshot);
+                    let lines = match starts.as_deref() {
+                        Some(starts) => {
+                            crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
+                        }
+                        None => crate::native_editor::EditorLines::scanning(&snapshot.text),
+                    };
+                    editor_cursor_label_with(&lines, buffer)
+                })
+            });
+            let footer_width = crate::native_ui::editor_footer_text_width(editor_rect.width);
+            let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
+            let minibuffer_width = (footer_width - 1.0).max(0.0);
+            let (minibuffer, minibuffer_caret) =
+                view.buffer.as_ref().map_or((None, None), |buffer| {
+                    editor_minibuffer_projection(
+                        buffer,
+                        &view.preedit,
+                        view.preedit_caret,
+                        footer_chars,
+                        minibuffer_width,
+                    )
+                });
+            let EditorFooter {
+                semantic: semantic_status,
+                lines: footer_lines,
+                ..
+            } = footer;
+            let status = semantic_status.as_ref().map(|_| footer_lines.join("\n"));
+            let document_preedit = if view
+                .buffer
+                .as_ref()
+                .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active)
+            {
+                String::new()
+            } else {
+                view.preedit.clone()
+            };
+            // The whole title where the header holds it, the caret's place giving way first;
+            // shortened in the middle only where it does not fit alone, the unsaved mark
+            // included ([`crate::native_ui::editor_header_layout`]).
+            let title_px =
+                crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
+            let mark = if self.dirty {
+                crate::native_ui::EDITOR_DIRTY_MARK
+            } else {
+                ""
+            };
+            let whole = bounded_middle_label_from_graphemes(
+                &self.title.graphemes().collect::<Vec<_>>(),
+                96,
+            );
+            let header = crate::native_ui::editor_header_layout(
+                editor_rect,
+                &format!("{whole}{mark}"),
+                cursor_label.as_deref(),
+                self.checkpoint_pending,
+            );
+            let title_width = |title: &str| {
+                crate::tray_raster::ui_text_width_for(
+                    crate::widget::TextFace::UiBold,
+                    title,
+                    title_px,
                 )
-            })
-        });
-        if let (Some(projection), Some(analysis)) =
-            (projection.as_mut(), self.config_analysis.as_ref())
-        {
-            crate::native_config_language::decorate_projection(projection, analysis);
-        }
-        let cursor_label = cx.document.and_then(|snapshot| {
-            if let Some(grid) = grid.as_ref() {
-                return Some(editor_grid_cursor_label(grid));
-            }
-            view.buffer.as_ref().map(|buffer| {
-                let starts = self.line_index(snapshot);
-                let lines = match starts.as_deref() {
-                    Some(starts) => {
-                        crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
-                    }
-                    None => crate::native_editor::EditorLines::scanning(&snapshot.text),
-                };
-                editor_cursor_label_with(&lines, buffer)
-            })
-        });
-        let footer_width = crate::native_ui::editor_footer_text_width(editor_rect.width);
-        let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
-        let minibuffer_width = (footer_width - 1.0).max(0.0);
-        let (minibuffer, minibuffer_caret) = view.buffer.as_ref().map_or((None, None), |buffer| {
-            editor_minibuffer_projection(
-                buffer,
-                &view.preedit,
-                view.preedit_caret,
-                footer_chars,
-                minibuffer_width,
-            )
-        });
-        let EditorFooter {
-            semantic: semantic_status,
-            lines: footer_lines,
-            ..
-        } = footer;
-        let status = semantic_status.as_ref().map(|_| footer_lines.join("\n"));
-        let document_preedit = if view
-            .buffer
-            .as_ref()
-            .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active)
-        {
-            String::new()
-        } else {
-            view.preedit.clone()
-        };
-        // The whole title where the header holds it, the caret's place giving way first;
-        // shortened in the middle only where it does not fit alone, the unsaved mark
-        // included ([`crate::native_ui::editor_header_layout`]).
-        let title_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
-        let mark = if self.dirty {
-            crate::native_ui::EDITOR_DIRTY_MARK
-        } else {
-            ""
-        };
-        let whole =
-            bounded_middle_label_from_graphemes(&self.title.graphemes().collect::<Vec<_>>(), 96);
-        let header = crate::native_ui::editor_header_layout(
-            editor_rect,
-            &format!("{whole}{mark}"),
-            cursor_label.as_deref(),
-            self.checkpoint_pending,
-        );
-        let title_width = |title: &str| {
-            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, title, title_px)
-        };
-        let room = header.title_right - header.title_x;
-        let title =
-            if title_width(&format!("{whole}{mark}")) <= room + crate::native_ui::TEXT_FIT_SLACK {
+            };
+            let room = header.title_right - header.title_x;
+            let title = if title_width(&format!("{whole}{mark}"))
+                <= room + crate::native_ui::TEXT_FIT_SLACK
+            {
                 whole
             } else {
                 bounded_middle_label_to_width_for_face(
@@ -7146,287 +7297,299 @@ impl NativeAppModel for EditorApp {
                     crate::widget::TextFace::UiBold,
                 )
             };
-        let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
-        let buffer_ready = view.buffer.is_some();
-        let can_navigate_config_diagnostics = self.can_navigate_config_diagnostics(view);
-        let grid_rows_ready = editor_grid_rows_ready(view);
-        let command_button = |key: &'static str,
-                              visual_label: &'static str,
-                              width: f32,
-                              label: &'static str,
-                              action: &'static str,
-                              enabled: bool| {
-            UiNode::new(
-                key,
-                UiContent::Button(
-                    Control::new(
-                        ButtonSpec::new(label).visual_label(visual_label),
-                        ActionId::new(action),
-                    )
-                    .state(ControlState {
-                        enabled,
-                        busy: action == "editor/save" && self.checkpoint_pending,
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Secondary),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(width))
-                    .height(Length::Fill),
-            )
-        };
-        let button_for = |key: &'static str, words: &'static str, width: f32| {
-            let (label, action, enabled) = match key {
-                "editor/save-button" => (
-                    if cfg!(windows) {
-                        "Save buffer (C-s or C-x C-s)"
-                    } else {
-                        "Save buffer (Cmd-S or C-x C-s)"
-                    },
-                    "editor/save",
-                    self.can_save(view),
-                ),
-                "editor/undo-button" => (
-                    "Undo (Cmd-Z or C-/)",
-                    "editor/undo",
-                    buffer_ready && !minibuffer_active && self.can_undo,
-                ),
-                "editor/redo-button" => (
-                    "Redo (Cmd-Shift-Z)",
-                    "editor/redo",
-                    buffer_ready && !minibuffer_active && self.can_redo,
-                ),
-                "editor/find-button" => (
-                    if cfg!(windows) {
-                        "Find: incremental search (M-s)"
-                    } else {
-                        "Find: incremental search (C-s)"
-                    },
-                    "editor/find",
-                    view.buffer
-                        .as_ref()
-                        .is_some_and(crate::native_editor::EditorBufferView::can_start_search),
-                ),
-                "editor/goto-line-button" => (
-                    "Go to line (M-g g)",
-                    "editor/goto-line",
-                    buffer_ready && !minibuffer_active,
-                ),
-                "editor/revert-button" => (
-                    "Discard Changes and Reload from Disk",
-                    "editor/revert",
-                    buffer_ready && !minibuffer_active && !self.checkpoint_pending,
-                ),
-                "editor/config-problem-previous-button" => (
-                    "Prev Issue: the previous config problem (Shift-F8)",
-                    "editor/config-problem-previous",
-                    can_navigate_config_diagnostics,
-                ),
-                "editor/config-problem-next-button" => (
-                    "Next Issue: the next config problem (F8)",
-                    "editor/config-problem-next",
-                    can_navigate_config_diagnostics,
-                ),
-                "editor/grid-toggle-button" => (
-                    if toolbar.grid == Some(true) {
-                        "Text view: show the file's text (Cmd-E or C-c C-t)"
-                    } else {
-                        "Grid view: show the table's cells (Cmd-E or C-c C-t)"
-                    },
-                    "editor/grid-toggle",
-                    buffer_ready && !minibuffer_active,
-                ),
-                "editor/grid-insert-row-button" => (
-                    "Add Row: an empty row below this one (C-o)",
-                    "editor/grid-insert-row",
-                    grid_rows_ready,
-                ),
-                "editor/grid-delete-row-button" => (
-                    "Delete Row: this row (C-S-Backspace)",
-                    "editor/grid-delete-row",
-                    grid_rows_ready,
-                ),
-                _ => (
-                    "Commands: run a command by name (M-x)",
-                    "editor/commands",
-                    buffer_ready && !minibuffer_active,
-                ),
-            };
-            command_button(key, words, width, label, action, enabled)
-        };
-        let plan = crate::native_ui::plan_editor_toolbar(
-            &crate::native_ui::editor_toolbar_items(toolbar),
-            shell.command_bar_width,
-            command_gap,
-            shell.command_row_cap,
-        );
-        let part = |key: &'static str,
-                    words: &'static str,
-                    label: String,
-                    action: &'static str,
-                    enabled: bool| {
-            UiNode::new(
-                key,
-                UiContent::Button(
-                    Control::new(
-                        ButtonSpec::new(label).visual_label(words),
-                        ActionId::new(action),
-                    )
-                    .state(ControlState {
-                        enabled,
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Secondary),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(
-                        crate::native_ui::editor_toolbar_button_width(words),
-                    ))
-                    .height(Length::Fill),
-            )
-        };
-        let disk_notice_row = self.disk_notice.map(|notice| {
-            let enabled = buffer_ready && !minibuffer_active && !self.checkpoint_pending;
-            let mut parts = Vec::new();
-            if notice.offers_reload() {
-                parts.push(part(
-                    "editor/disk-reload",
-                    DISK_RELOAD_WORDS,
-                    DISK_RELOAD_LABEL.to_string(),
-                    "editor/revert",
-                    enabled,
-                ));
-            }
-            parts.push(part(
-                "editor/disk-keep",
-                DISK_KEEP_WORDS,
-                notice.keep_label().to_string(),
-                "editor/keep-local",
-                enabled,
-            ));
-            let parts_width: f32 = notice
-                .offers_reload()
-                .then_some(DISK_RELOAD_WORDS)
-                .into_iter()
-                .chain(std::iter::once(DISK_KEEP_WORDS))
-                .map(|words| command_gap + crate::native_ui::editor_toolbar_button_width(words))
-                .sum();
-            let words = notice.words();
-            let mut children = vec![
+            let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
+            let buffer_ready = view.buffer.is_some();
+            let can_navigate_config_diagnostics = self.can_navigate_config_diagnostics(view);
+            let grid_rows_ready = editor_grid_rows_ready(view);
+            let command_button = |key: &'static str,
+                                  visual_label: &'static str,
+                                  width: f32,
+                                  label: &'static str,
+                                  action: &'static str,
+                                  enabled: bool| {
                 UiNode::new(
-                    "editor/disk-notice-words",
-                    UiContent::Text(crate::native_ui::TextSpec {
-                        text: crate::native_ui::fit_native_status_label(
-                            words,
-                            (shell.command_bar_width - parts_width).max(0.0),
-                        ),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-            ];
-            children.extend(parts);
-            UiNode::new(
-                "editor/disk-notice",
-                UiContent::Group(GroupSpec::new(words)),
-            )
-            .layout(
-                Layout::row()
-                    .gap(command_gap)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(shell.command_button_height)),
-            )
-            .children(children)
-        });
-        let edit_header_row = view.edit_header.as_ref().map(|header| {
-            let mut parts = vec![part(
-                "editor/finish",
-                EDIT_DONE_WORDS,
-                header.done_label(),
-                "editor/finish",
-                buffer_ready && !minibuffer_active,
-            )];
-            if header.offers_abort() {
-                parts.push(part(
-                    "editor/abort",
-                    EDIT_ABORT_WORDS,
-                    header.abort_label(),
-                    "editor/abort",
-                    buffer_ready && !minibuffer_active && !self.checkpoint_pending,
-                ));
-            }
-            let parts_width: f32 = std::iter::once(EDIT_DONE_WORDS)
-                .chain(header.offers_abort().then_some(EDIT_ABORT_WORDS))
-                .map(|words| command_gap + crate::native_ui::editor_toolbar_button_width(words))
-                .sum();
-            let words = header.words();
-            let mut children = vec![
-                UiNode::new(
-                    "editor/edit-header-words",
-                    UiContent::Text(crate::native_ui::TextSpec {
-                        text: crate::native_ui::fit_native_status_label(
-                            &words,
-                            (shell.command_bar_width - parts_width).max(0.0),
-                        ),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-            ];
-            children.extend(parts);
-            UiNode::new(
-                "editor/edit-header",
-                UiContent::Group(GroupSpec::new(words)),
-            )
-            .layout(
-                Layout::row()
-                    .gap(command_gap)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(shell.command_button_height)),
-            )
-            .children(children)
-        });
-        // One header row: the disk notice while it stands (a Done could not
-        // save under it), the edit ticket's otherwise.
-        let command_rows: Vec<UiNode> = disk_notice_row
-            .or(edit_header_row)
-            .into_iter()
-            .chain(plan.rows.iter().enumerate().map(|(index, row)| {
-                UiNode::new(
-                    format!("editor/command-row-{index}"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    key,
+                    UiContent::Button(
+                        Control::new(
+                            ButtonSpec::new(label).visual_label(visual_label),
+                            ActionId::new(action),
+                        )
+                        .state(ControlState {
+                            enabled,
+                            busy: action == "editor/save" && self.checkpoint_pending,
+                            ..ControlState::default()
+                        })
+                        .style(StyleRef::Secondary),
+                    ),
                 )
                 .layout(
-                    Layout::row()
-                        .gap(command_gap)
-                        .width(Length::Fill)
-                        .height(Length::Fixed(shell.command_button_height)),
+                    Layout::default()
+                        .width(Length::Fixed(width))
+                        .height(Length::Fill),
                 )
-                .children(
-                    row.iter()
-                        .map(|&(key, words, width)| button_for(key, words, width))
-                        .collect(),
+            };
+            let button_for = |key: &'static str, words: &'static str, width: f32| {
+                let (label, action, enabled) = match key {
+                    "editor/save-button" => (
+                        if cfg!(windows) {
+                            "Save buffer (C-s or C-x C-s)"
+                        } else {
+                            "Save buffer (Cmd-S or C-x C-s)"
+                        },
+                        "editor/save",
+                        self.can_save(view),
+                    ),
+                    "editor/undo-button" => (
+                        "Undo (Cmd-Z or C-/)",
+                        "editor/undo",
+                        buffer_ready && !minibuffer_active && self.can_undo,
+                    ),
+                    "editor/redo-button" => (
+                        "Redo (Cmd-Shift-Z)",
+                        "editor/redo",
+                        buffer_ready && !minibuffer_active && self.can_redo,
+                    ),
+                    "editor/find-button" => (
+                        if cfg!(windows) {
+                            "Find: incremental search (M-s)"
+                        } else {
+                            "Find: incremental search (C-s)"
+                        },
+                        "editor/find",
+                        view.buffer
+                            .as_ref()
+                            .is_some_and(crate::native_editor::EditorBufferView::can_start_search),
+                    ),
+                    "editor/goto-line-button" => (
+                        "Go to line (M-g g)",
+                        "editor/goto-line",
+                        buffer_ready && !minibuffer_active,
+                    ),
+                    "editor/revert-button" => (
+                        "Discard Changes and Reload from Disk",
+                        "editor/revert",
+                        buffer_ready && !minibuffer_active && !self.checkpoint_pending,
+                    ),
+                    "editor/config-problem-previous-button" => (
+                        "Prev Issue: the previous config problem (Shift-F8)",
+                        "editor/config-problem-previous",
+                        can_navigate_config_diagnostics,
+                    ),
+                    "editor/config-problem-next-button" => (
+                        "Next Issue: the next config problem (F8)",
+                        "editor/config-problem-next",
+                        can_navigate_config_diagnostics,
+                    ),
+                    "editor/grid-toggle-button" => (
+                        if toolbar.grid == Some(true) {
+                            "Text view: show the file's text (Cmd-E or C-c C-t)"
+                        } else {
+                            "Grid view: show the table's cells (Cmd-E or C-c C-t)"
+                        },
+                        "editor/grid-toggle",
+                        buffer_ready && !minibuffer_active,
+                    ),
+                    "editor/grid-insert-row-button" => (
+                        "Add Row: an empty row below this one (C-o)",
+                        "editor/grid-insert-row",
+                        grid_rows_ready,
+                    ),
+                    "editor/grid-delete-row-button" => (
+                        "Delete Row: this row (C-S-Backspace)",
+                        "editor/grid-delete-row",
+                        grid_rows_ready,
+                    ),
+                    _ => (
+                        "Commands: run a command by name (M-x)",
+                        "editor/commands",
+                        buffer_ready && !minibuffer_active,
+                    ),
+                };
+                command_button(key, words, width, label, action, enabled)
+            };
+            let plan = crate::native_ui::plan_editor_toolbar(
+                &crate::native_ui::editor_toolbar_items(toolbar),
+                shell.command_bar_width,
+                command_gap,
+                shell.command_row_cap,
+            );
+            let part = |key: &'static str,
+                        words: &'static str,
+                        label: String,
+                        action: &'static str,
+                        enabled: bool| {
+                UiNode::new(
+                    key,
+                    UiContent::Button(
+                        Control::new(
+                            ButtonSpec::new(label).visual_label(words),
+                            ActionId::new(action),
+                        )
+                        .state(ControlState {
+                            enabled,
+                            ..ControlState::default()
+                        })
+                        .style(StyleRef::Secondary),
+                    ),
                 )
-            }))
-            .collect();
-        let command_bar = UiNode::new(
-            "editor/command-bar",
-            UiContent::Group(GroupSpec::new("Editor commands")),
-        )
-        .layout(
-            Layout::column()
-                .gap(command_gap)
-                .width(Length::Fill)
-                .height(Length::Fixed(command_bar_height)),
-        )
-        .children(command_rows);
-        let command_palette = command_completion.as_ref().and_then(
+                .layout(
+                    Layout::default()
+                        .width(Length::Fixed(
+                            crate::native_ui::editor_toolbar_button_width(words),
+                        ))
+                        .height(Length::Fill),
+                )
+            };
+            let disk_notice_row =
+                self.disk_notice
+                    .filter(|_| self.markdown.is_none())
+                    .map(|notice| {
+                        let enabled =
+                            buffer_ready && !minibuffer_active && !self.checkpoint_pending;
+                        let mut parts = Vec::new();
+                        if notice.offers_reload() {
+                            parts.push(part(
+                                "editor/disk-reload",
+                                DISK_RELOAD_WORDS,
+                                DISK_RELOAD_LABEL.to_string(),
+                                "editor/revert",
+                                enabled,
+                            ));
+                        }
+                        parts.push(part(
+                            "editor/disk-keep",
+                            DISK_KEEP_WORDS,
+                            notice.keep_label().to_string(),
+                            "editor/keep-local",
+                            enabled,
+                        ));
+                        let parts_width: f32 = notice
+                            .offers_reload()
+                            .then_some(DISK_RELOAD_WORDS)
+                            .into_iter()
+                            .chain(std::iter::once(DISK_KEEP_WORDS))
+                            .map(|words| {
+                                command_gap + crate::native_ui::editor_toolbar_button_width(words)
+                            })
+                            .sum();
+                        let words = notice.words();
+                        let mut children = vec![
+                            UiNode::new(
+                                "editor/disk-notice-words",
+                                UiContent::Text(crate::native_ui::TextSpec {
+                                    text: crate::native_ui::fit_native_status_label(
+                                        words,
+                                        (shell.command_bar_width - parts_width).max(0.0),
+                                    ),
+                                    role: SemanticRole::Status,
+                                    style: StyleRef::Quiet,
+                                }),
+                            )
+                            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                        ];
+                        children.extend(parts);
+                        UiNode::new(
+                            "editor/disk-notice",
+                            UiContent::Group(GroupSpec::new(words)),
+                        )
+                        .layout(
+                            Layout::row()
+                                .gap(command_gap)
+                                .width(Length::Fill)
+                                .height(Length::Fixed(shell.command_button_height)),
+                        )
+                        .children(children)
+                    });
+            let edit_header_row = view
+                .edit_header
+                .as_ref()
+                .filter(|_| self.markdown.is_none())
+                .map(|header| {
+                    let mut parts = vec![part(
+                        "editor/finish",
+                        EDIT_DONE_WORDS,
+                        header.done_label(),
+                        "editor/finish",
+                        buffer_ready && !minibuffer_active,
+                    )];
+                    if header.offers_abort() {
+                        parts.push(part(
+                            "editor/abort",
+                            EDIT_ABORT_WORDS,
+                            header.abort_label(),
+                            "editor/abort",
+                            buffer_ready && !minibuffer_active && !self.checkpoint_pending,
+                        ));
+                    }
+                    let parts_width: f32 = std::iter::once(EDIT_DONE_WORDS)
+                        .chain(header.offers_abort().then_some(EDIT_ABORT_WORDS))
+                        .map(|words| {
+                            command_gap + crate::native_ui::editor_toolbar_button_width(words)
+                        })
+                        .sum();
+                    let words = header.words();
+                    let mut children = vec![
+                        UiNode::new(
+                            "editor/edit-header-words",
+                            UiContent::Text(crate::native_ui::TextSpec {
+                                text: crate::native_ui::fit_native_status_label(
+                                    &words,
+                                    (shell.command_bar_width - parts_width).max(0.0),
+                                ),
+                                role: SemanticRole::Status,
+                                style: StyleRef::Quiet,
+                            }),
+                        )
+                        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                    ];
+                    children.extend(parts);
+                    UiNode::new(
+                        "editor/edit-header",
+                        UiContent::Group(GroupSpec::new(words)),
+                    )
+                    .layout(
+                        Layout::row()
+                            .gap(command_gap)
+                            .width(Length::Fill)
+                            .height(Length::Fixed(shell.command_button_height)),
+                    )
+                    .children(children)
+                });
+            // One header row: the disk notice while it stands (a Done could not
+            // save under it), the edit ticket's otherwise.
+            let command_rows: Vec<UiNode> = disk_notice_row
+                .or(edit_header_row)
+                .into_iter()
+                .chain(plan.rows.iter().enumerate().map(|(index, row)| {
+                    UiNode::new(
+                        format!("editor/command-row-{index}"),
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    )
+                    .layout(
+                        Layout::row()
+                            .gap(command_gap)
+                            .width(Length::Fill)
+                            .height(Length::Fixed(shell.command_button_height)),
+                    )
+                    .children(
+                        row.iter()
+                            .map(|&(key, words, width)| button_for(key, words, width))
+                            .collect(),
+                    )
+                }))
+                .collect();
+            let command_bar = UiNode::new(
+                "editor/command-bar",
+                UiContent::Group(GroupSpec::new("Editor commands")),
+            )
+            .layout(
+                Layout::column()
+                    .gap(command_gap)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(command_bar_height)),
+            )
+            .children(command_rows);
+            let command_palette = command_completion.as_ref().and_then(
             |(query, candidates, selected)| {
                 if shell.palette_visible_rows == 0 {
                     return None;
@@ -7556,7 +7719,7 @@ impl NativeAppModel for EditorApp {
                 )
             },
         );
-        let config_palette = config_assist.as_ref().and_then(|(context, assist, waiting, listed)| {
+            let config_palette = config_assist.as_ref().and_then(|(context, assist, waiting, listed)| {
             if shell.palette_height <= 0.0 {
                 return None;
             }
@@ -7818,60 +7981,63 @@ impl NativeAppModel for EditorApp {
                 .children(children),
             )
         });
-        // The toolbar where it stands: a completion list may take its place while it is open
-        // ([`crate::native_ui::editor_shell_metrics_at_scale`]).
-        let mut children: Vec<UiNode> = (shell.command_rows > 0)
-            .then_some(command_bar)
-            .into_iter()
-            .collect();
-        if let Some(command_palette) = command_palette {
-            children.push(command_palette);
-        } else if let Some(config_palette) = config_palette {
-            children.push(config_palette);
-        }
-        children.push(
-            UiNode::new(
-                "editor/buffer",
-                UiContent::TextViewport(TextViewportSpec {
-                    label: title,
-                    document_key,
-                    selectable: true,
-                    projection,
-                    grid: grid.map(Box::new),
-                    grid_reading: grid_reading.map(Box::new),
-                    concealed: concealed.is_some(),
-                    preedit: document_preedit,
-                    preedit_caret: view.preedit_caret,
-                    status,
-                    semantic_status,
-                    minibuffer,
-                    minibuffer_caret,
-                    cursor_label,
-                    dirty: self.dirty,
-                    saving: self.checkpoint_pending,
-                    focused,
-                    focus_visible: focused && view.common.focus_visible,
-                    action: Some(ActionId::new("editor/focus-buffer")),
-                }),
+            // The toolbar where it stands: a completion list may take its place while it is open
+            // ([`crate::native_ui::editor_shell_metrics_at_scale`]).
+            let mut children: Vec<UiNode> = (shell.command_rows > 0)
+                .then_some(command_bar)
+                .into_iter()
+                .collect();
+            if let Some(command_palette) = command_palette {
+                children.push(command_palette);
+            } else if let Some(config_palette) = config_palette {
+                children.push(config_palette);
+            }
+            children.push(
+                UiNode::new(
+                    "editor/buffer",
+                    UiContent::TextViewport(TextViewportSpec {
+                        label: title,
+                        document_key,
+                        selectable: true,
+                        projection,
+                        grid: grid.map(Box::new),
+                        grid_reading: grid_reading.map(Box::new),
+                        concealed: concealed.is_some(),
+                        preedit: document_preedit,
+                        preedit_caret: view.preedit_caret,
+                        status,
+                        semantic_status,
+                        minibuffer,
+                        minibuffer_caret,
+                        cursor_label,
+                        dirty: self.dirty,
+                        saving: self.checkpoint_pending,
+                        focused,
+                        focus_visible: focused && view.common.focus_visible,
+                        action: Some(ActionId::new("editor/focus-buffer")),
+                    }),
+                )
+                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            );
+            UiTree::new(
+                UiNode::new(
+                    "editor/app",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(
+                    Layout::column()
+                        .padding(Insets::all(outer_padding))
+                        .gap(editor_gap)
+                        .clipped(),
+                )
+                .children(children),
             )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-        );
-        UiTree::new(
-            UiNode::new(
-                "editor/app",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
-            )
-            .layout(
-                Layout::column()
-                    .padding(Insets::all(outer_padding))
-                    .gap(editor_gap)
-                    .clipped(),
-            )
-            .children(children),
-        )
+        };
+        markdown_workspace::render(self, view, cx, source)
     }
 
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
+        markdown_workspace::commands(self, view, out);
         let buffer_ready = view.buffer.is_some();
         let minibuffer_active = view
             .buffer
@@ -8318,7 +8484,7 @@ fn editor_status_forms(
             .filter(|status| status.contains("Save is blocked"))
             .unwrap_or(DISK_CONFLICT_RECOVERY);
         format!("Recovery · {recovery}")
-    } else if app.checkpoint_pending {
+    } else if app.checkpoint_pending && app.markdown.is_none() {
         "Saving…".to_string()
     } else if app.config_editor && app.config_analysis.is_none() {
         "Validating aterm.toml…".to_string()
@@ -8340,6 +8506,7 @@ fn editor_status_forms(
         return with_watcher(forms);
     } else if let Some(status) = view.status.as_deref().filter(|status| {
         !status.is_empty()
+            && !(app.markdown.is_some() && matches!(*status, "Saved" | "No unsaved changes" | "Draft autosaved"))
             && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
             // An open cell holds text no save or journal has yet: nothing may say it is saved.
             && !(grid.is_some_and(|grid| grid.editing)
@@ -8378,7 +8545,7 @@ fn editor_status_forms(
         }
         forms.push(place);
         return with_watcher(forms);
-    } else if app.dirty {
+    } else if app.dirty && app.markdown.is_none() {
         let save = if cfg!(windows) { "C-s" } else { "Cmd-S" };
         format!("Modified · {save} to save · {lines} {line_noun}")
     } else if empty {
@@ -8479,10 +8646,10 @@ mod markdown_reader_tests {
         );
         let mut runtime = NativeRuntime::new();
         let instance = runtime
-            .insert_instance(NativeApp::Editor(EditorApp::new(
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new(
                 document,
                 "aterm.toml".to_string(),
-            )))
+            ))))
             .unwrap();
         let view = ViewId::from_stored(7);
         runtime
@@ -8563,10 +8730,10 @@ mod markdown_reader_tests {
         );
         let mut runtime = NativeRuntime::new();
         let instance = runtime
-            .insert_instance(NativeApp::Editor(EditorApp::new(
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new(
                 document,
                 "aterm.toml".to_string(),
-            )))
+            ))))
             .unwrap();
         assert!(runtime.enable_config_editor(document, "theme = \"Default\"\n", 11));
         let mut analysis = crate::native_config_language::analyze("theme = \"Default\"\n");
@@ -8616,38 +8783,37 @@ mod markdown_reader_tests {
         let one = documents.open(one_uri.to_string(), "one".to_string());
         let two = documents.open(two_uri.to_string(), "two".to_string());
         let mut runtime = NativeRuntime::new();
-        let markdown_one = runtime
-            .insert_instance(NativeApp::Markdown(MarkdownApp::new_with_uri(
+        let second_view_one = runtime
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new_with_uri(
                 one,
                 "README.md".to_string(),
                 one_uri.to_string(),
-                "one",
-            )))
+            ))))
             .unwrap();
         let editor_one = runtime
-            .insert_instance(NativeApp::Editor(EditorApp::new_with_uri(
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new_with_uri(
                 one,
                 "README.md".to_string(),
                 one_uri.to_string(),
-            )))
+            ))))
             .unwrap();
         let editor_two = runtime
-            .insert_instance(NativeApp::Editor(EditorApp::new_with_uri(
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new_with_uri(
                 two,
                 "README.md".to_string(),
                 two_uri.to_string(),
-            )))
+            ))))
             .unwrap();
         let views = [
-            (ViewId::from_stored(101), markdown_one, AppKind::Markdown),
+            (ViewId::from_stored(101), second_view_one, AppKind::Editor),
             (ViewId::from_stored(102), editor_one, AppKind::Editor),
             (ViewId::from_stored(103), editor_two, AppKind::Editor),
         ];
         for (view, instance, kind) in views {
             let state = match kind {
-                AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
                 AppKind::Editor => AppViewState::Editor(Box::default()),
-                AppKind::Mail
+                AppKind::Markdown
+                | AppKind::Mail
                 | AppKind::About
                 | AppKind::Settings
                 | AppKind::SystemState
@@ -8678,7 +8844,7 @@ mod markdown_reader_tests {
                 .filter(|(_, _, _, uri)| uri == one_uri)
                 .count(),
             2,
-            "Markdown and Editor views of one canonical URI are not false duplicates"
+            "explicit views of one canonical URI are not false duplicates"
         );
         assert!(runtime.disambiguate_document_titles().is_empty());
 
@@ -8692,7 +8858,7 @@ mod markdown_reader_tests {
                 .iter()
                 .all(|(_, _, title, uri)| uri != one_uri || title == "README.md")
         );
-        assert_eq!(runtime.document_id(markdown_one), Some(one));
+        assert_eq!(runtime.document_id(second_view_one), Some(one));
         assert_eq!(runtime.document_id(editor_one), Some(one));
     }
 
@@ -8719,25 +8885,99 @@ mod markdown_reader_tests {
         assert!(bounded.contains('…'));
     }
 
-    fn markdown_runtime(source: &str) -> (NativeRuntime, AppInstanceId, ViewId) {
-        let mut runtime = NativeRuntime::new();
+    /// Exercise the reusable reader directly; document tabs are always Editor instances.
+    struct ReaderFixture {
+        app: MarkdownApp,
+        state: MarkdownViewState,
+        instance: AppInstanceId,
+        view: ViewId,
+        next_operation: u64,
+        service_generations: BTreeMap<ServiceId, u64>,
+    }
+
+    impl ReaderFixture {
+        fn check(&self, instance: AppInstanceId, view: ViewId) -> Result<(), RuntimeError> {
+            if instance != self.instance {
+                return Err(RuntimeError::UnknownInstance(instance));
+            }
+            if view != self.view {
+                return Err(RuntimeError::UnknownView(view));
+            }
+            Ok(())
+        }
+
+        fn app(&self, instance: AppInstanceId) -> Option<&MarkdownApp> {
+            (instance == self.instance).then_some(&self.app)
+        }
+
+        fn view_state(&self, view: ViewId) -> Option<&MarkdownViewState> {
+            (view == self.view).then_some(&self.state)
+        }
+
+        fn dispatch(
+            &mut self,
+            instance: AppInstanceId,
+            view: ViewId,
+            event: AppEvent,
+        ) -> Result<DispatchOutcome, RuntimeError> {
+            self.check(instance, view)?;
+            let mut cx = UpdateCx {
+                instance,
+                view,
+                view_generation: 1,
+                next_operation: &mut self.next_operation,
+                service_generations: &mut self.service_generations,
+                effects: Vec::new(),
+            };
+            let result = self.app.update(&mut self.state, event, &mut cx);
+            Ok(DispatchOutcome {
+                result,
+                effects: cx.effects,
+            })
+        }
+
+        fn commands(
+            &self,
+            instance: AppInstanceId,
+            view: ViewId,
+        ) -> Result<Vec<Command>, RuntimeError> {
+            self.check(instance, view)?;
+            let mut commands = Vec::new();
+            self.app.commands(&self.state, &mut commands);
+            Ok(commands)
+        }
+
+        fn render(
+            &self,
+            instance: AppInstanceId,
+            view: ViewId,
+            cx: &ViewCx<'_>,
+        ) -> Result<UiTree, RuntimeError> {
+            self.check(instance, view)?;
+            let mut tree = self.app.view(&self.state, cx);
+            tree.apply_interaction(
+                self.state.common.last_focus.as_ref(),
+                self.state.common.hovered.as_ref(),
+                self.state.common.pressed.as_ref(),
+                self.state.common.focus_visible,
+            );
+            Ok(tree)
+        }
+    }
+
+    fn markdown_runtime(source: &str) -> (ReaderFixture, AppInstanceId, ViewId) {
         let mut documents = crate::test_document_store();
         let document = documents.open("file:///Guide.md".to_string(), source.to_string());
-        let instance = runtime
-            .insert_instance(NativeApp::Markdown(MarkdownApp::new(
-                document,
-                "Guide.md".to_string(),
-                source,
-            )))
-            .unwrap();
+        let instance = AppInstanceId::from_stored(1);
         let view = ViewId::from_stored(1);
-        runtime
-            .attach_view(
-                view,
-                instance,
-                AppViewState::Markdown(MarkdownViewState::default()),
-            )
-            .unwrap();
+        let runtime = ReaderFixture {
+            app: MarkdownApp::new(document, "Guide.md".to_string(), source),
+            state: MarkdownViewState::default(),
+            instance,
+            view,
+            next_operation: 1,
+            service_generations: BTreeMap::new(),
+        };
         (runtime, instance, view)
     }
 
@@ -8926,10 +9166,8 @@ mod markdown_reader_tests {
                         assert_eq!(entry.0, total, "{context}: block {index} keeps its rows");
                         entry.1.extend(row..row + visible);
                     }
-                    let state = match runtime.view_state(view).unwrap() {
-                        AppViewState::Markdown(state) => (state.source_anchor, state.visual_row),
-                        _ => unreachable!(),
-                    };
+                    let reader = runtime.view_state(view).unwrap();
+                    let state = (reader.source_anchor, reader.visual_row);
                     if previous == Some(state) {
                         break;
                     }
@@ -9134,10 +9372,7 @@ mod markdown_reader_tests {
                 }),
             )
             .unwrap();
-        let state = match runtime.view_state(view).unwrap() {
-            AppViewState::Markdown(state) => state,
-            _ => panic!("Markdown view changed kind"),
-        };
+        let state = runtime.view_state(view).unwrap();
         assert_eq!(state.source_anchor, 0);
         let after_back = runtime.commands(instance, view).unwrap();
         assert!(!command(&after_back, "markdown/back").enabled);
@@ -9155,24 +9390,9 @@ mod markdown_reader_tests {
         let mut documents = crate::test_document_store();
         let document = documents.open("file:///Long.md".to_string(), source.clone());
         let snapshot = documents.snapshot(document).unwrap();
-        let mut runtime = NativeRuntime::new();
-        let instance = runtime
-            .insert_instance(NativeApp::Markdown(MarkdownApp::new(
-                document,
-                "Long.md".to_string(),
-                &source,
-            )))
-            .unwrap();
-        let view = ViewId::from_stored(1);
-        runtime
-            .attach_view(
-                view,
-                instance,
-                AppViewState::Markdown(MarkdownViewState::default()),
-            )
-            .unwrap();
+        let (mut runtime, instance, view) = markdown_runtime(&source);
 
-        let page = |runtime: &mut NativeRuntime, height: f32| {
+        let page = |runtime: &mut ReaderFixture, height: f32| {
             runtime
                 .dispatch(
                     instance,
@@ -9186,10 +9406,7 @@ mod markdown_reader_tests {
                 .unwrap();
         };
         page(&mut runtime, 320.0);
-        let short_page_row = match runtime.view_state(view).unwrap() {
-            AppViewState::Markdown(state) => state.visual_row,
-            _ => unreachable!(),
-        };
+        let short_page_row = runtime.view_state(view).unwrap().visual_row;
         runtime
             .dispatch(
                 instance,
@@ -9202,10 +9419,7 @@ mod markdown_reader_tests {
             )
             .unwrap();
         page(&mut runtime, 568.0);
-        let tall_page_row = match runtime.view_state(view).unwrap() {
-            AppViewState::Markdown(state) => state.visual_row,
-            _ => unreachable!(),
-        };
+        let tall_page_row = runtime.view_state(view).unwrap().visual_row;
         assert!(tall_page_row > short_page_row, "page size tracks resize");
 
         runtime
@@ -9219,10 +9433,7 @@ mod markdown_reader_tests {
                 },
             )
             .unwrap();
-        let preview_row = match runtime.view_state(view).unwrap() {
-            AppViewState::Markdown(state) => state.visual_row,
-            _ => unreachable!(),
-        };
+        let preview_row = runtime.view_state(view).unwrap().visual_row;
         assert!(
             preview_row > 100,
             "single paragraph has a reachable visual tail"
@@ -9316,10 +9527,7 @@ mod markdown_reader_tests {
                 AppEvent::TextInput(TextInputEvent::SelectAll),
             )
             .unwrap();
-        let state = match runtime.view_state(view).unwrap() {
-            AppViewState::Markdown(state) => state,
-            _ => panic!("Markdown view changed kind"),
-        };
+        let state = runtime.view_state(view).unwrap();
         assert_eq!(state.selection, Some(0..source.len()));
         let selected_commands = runtime.commands(instance, view).unwrap();
         assert!(command(&selected_commands, "markdown/copy").enabled);
@@ -9355,10 +9563,7 @@ mod markdown_reader_tests {
     fn markdown_source_mode_and_its_block_selection_are_real_view_state() {
         let source = "# **Guide**\n\nBody with ![local](assets/pic.png).\n";
         let (mut runtime, instance, view) = markdown_runtime(source);
-        let document = match runtime.app(instance).unwrap() {
-            NativeApp::Markdown(app) => app.document,
-            _ => unreachable!(),
-        };
+        let document = runtime.app(instance).unwrap().document;
         let snapshot = crate::document_store::DocumentSnapshot {
             id: document,
             seq: aterm_buffer::Seq(1),
@@ -9378,10 +9583,10 @@ mod markdown_reader_tests {
             .unwrap();
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(MarkdownViewState {
+            Some(MarkdownViewState {
                 mode: MarkdownViewMode::Source,
                 ..
-            }))
+            })
         ));
         let source_ui = runtime
             .render(instance, view, &cx(viewport, Some(&snapshot)))
@@ -9409,7 +9614,7 @@ mod markdown_reader_tests {
             .unwrap();
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(state)) if state.selection == Some(0..source.len())
+            Some(state) if state.selection == Some(0..source.len())
         ));
     }
 
@@ -9430,7 +9635,7 @@ mod markdown_reader_tests {
         assert!(local.effects.is_empty());
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(state))
+            Some(state)
                 if state.selection.as_ref().is_some_and(|range| &source[range.clone()] == "![local](assets/pic.png)")
         ));
 
@@ -9479,7 +9684,7 @@ mod markdown_reader_tests {
                 .unwrap();
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(state)) if state.source_anchor == next_anchor
+            Some(state) if state.source_anchor == next_anchor
         ));
 
         let local = runtime
@@ -9495,7 +9700,7 @@ mod markdown_reader_tests {
         assert!(local.effects.is_empty());
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(state)) if state.source_anchor == next_anchor
+            Some(state) if state.source_anchor == next_anchor
         ));
 
         let external = runtime
@@ -9678,7 +9883,7 @@ mod markdown_reader_tests {
             .collect::<String>();
         let (mut runtime, instance, view) = markdown_runtime(&source);
         let viewport = LogicalRect::new(0.0, 0.0, 800.0, 520.0);
-        let render = |runtime: &NativeRuntime| {
+        let render = |runtime: &ReaderFixture| {
             runtime
                 .render(instance, view, &cx(viewport, None))
                 .unwrap()
@@ -9713,7 +9918,7 @@ mod markdown_reader_tests {
             .unwrap();
         assert!(matches!(
             runtime.view_state(view),
-            Some(AppViewState::Markdown(state)) if state.source_anchor > 0
+            Some(state) if state.source_anchor > 0
         ));
         let advanced = render(&runtime);
         assert!(
@@ -9795,10 +10000,7 @@ mod markdown_reader_tests {
                             },
                         )
                         .unwrap();
-                    let actual = match runtime.view_state(view).unwrap() {
-                        AppViewState::Markdown(state) => MarkdownApp::location(state),
-                        _ => unreachable!(),
-                    };
+                    let actual = MarkdownApp::location(runtime.view_state(view).unwrap());
                     assert_eq!(
                         actual, expected,
                         "{mode:?}, {width}×{height}, direction {direction}"
@@ -10099,6 +10301,7 @@ mod markdown_reader_tests {
         let toolbars = [
             EditorToolbar::default(),
             EditorToolbar {
+                commands_hidden: false,
                 problem_navigation: true,
                 reload: true,
                 edit_header: false,
@@ -10106,6 +10309,7 @@ mod markdown_reader_tests {
             },
             // An `edit` ticket's header row (Done and Abort) left one row under M-x at 2x.
             EditorToolbar {
+                commands_hidden: false,
                 problem_navigation: false,
                 reload: false,
                 edit_header: true,

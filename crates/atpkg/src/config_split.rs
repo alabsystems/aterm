@@ -42,39 +42,81 @@ fn folder(xdg: Option<&OsStr>, home: &Path) -> Option<PathBuf> {
     aterm_types::dirs::resolve_aterm_config_dir(xdg, None, Some(home.as_os_str()))
 }
 
-/// Whether `a` and `b` are one folder: the same path, or the same folder once links resolve.
-fn same_folder(a: &Path, b: &Path) -> bool {
-    a == b
-        || std::fs::canonicalize(a)
-            .ok()
-            .zip(std::fs::canonicalize(b).ok())
-            .is_some_and(|(a, b)| a == b)
+/// Whether paths identify the same config location, including a shared missing suffix
+/// under aliased parent directories.
+fn same_folder(
+    a: &Path,
+    b: &Path,
+    exists: &impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<bool, String> {
+    if aterm_types::dirs::same_directory(a, b) {
+        return Ok(true);
+    }
+    if a.file_name() == b.file_name()
+        && !probe_exists(a, exists)?
+        && !probe_exists(b, exists)?
+        && let Some((a, b)) = a.parent().zip(b.parent())
+    {
+        return same_folder(a, b, exists);
+    }
+    Ok(false)
 }
 
 /// The split between this process's `XDG_CONFIG_HOME` (`here_xdg`) and launchd's (`app_xdg`)
-/// under `home`, or `None` when both read one folder.
-#[must_use]
-pub fn split(here_xdg: Option<&OsStr>, app_xdg: Option<&OsStr>, home: &Path) -> Option<Split> {
-    let here = folder(here_xdg, home)?;
-    let app = folder(app_xdg, home)?;
-    if same_folder(&here, &app) {
-        return None;
+/// under `home`, or `Ok(None)` when both read one folder.
+/// # Errors
+/// A configuration path cannot be resolved or its existence cannot be read.
+pub fn split(
+    here_xdg: Option<&OsStr>,
+    app_xdg: Option<&OsStr>,
+    home: &Path,
+) -> Result<Option<Split>, String> {
+    split_with(here_xdg, app_xdg, home, &directory_exists)
+}
+
+fn directory_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
-    let exists = |dir: &Path| std::fs::symlink_metadata(dir).is_ok();
-    let unify = match (exists(&here), exists(&app)) {
+}
+
+fn probe_exists(
+    path: &Path,
+    exists: &impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<bool, String> {
+    exists(path)
+        .map_err(|error| format!("read configuration directory {}: {error}", path.display()))
+}
+
+fn split_with(
+    here_xdg: Option<&OsStr>,
+    app_xdg: Option<&OsStr>,
+    home: &Path,
+    exists: &impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<Option<Split>, String> {
+    let here = folder(here_xdg, home)
+        .ok_or_else(|| "this process's configuration directory is unavailable".to_string())?;
+    let app = folder(app_xdg, home)
+        .ok_or_else(|| "the app's configuration directory is unavailable".to_string())?;
+    if same_folder(&here, &app, exists)? {
+        return Ok(None);
+    }
+    let unify = match (probe_exists(&here, exists)?, probe_exists(&app, exists)?) {
         (true, true) => None,
         (_, false) => Some((app.clone(), here.clone())),
         (false, true) => Some((here.clone(), app.clone())),
     };
     let differs = differing_keys(&here.join("aterm.toml"), &app.join("aterm.toml"));
-    Some(Split {
+    Ok(Some(Split {
         here,
         app,
         app_xdg: app_xdg.filter(|xdg| !xdg.is_empty()).map(PathBuf::from),
         compared: differs.is_some(),
         differs: differs.unwrap_or_default(),
         unify,
-    })
+    }))
 }
 
 /// The dotted keys whose values differ between two `aterm.toml` files; `None` unless both
@@ -168,7 +210,7 @@ fn launchd_value(out: std::process::Output) -> Result<Option<std::ffi::OsString>
 /// starts apps with the session's environment, and a test never asks the host's launchd.
 /// # Errors
 /// On macOS, the home directory cannot be resolved, or launchd's environment query fails
-/// or does not complete.
+/// or does not complete, or a configuration directory's existence cannot be read.
 pub fn of_process() -> Result<Option<Split>, String> {
     #[cfg(target_os = "macos")]
     {
@@ -179,7 +221,7 @@ pub fn of_process() -> Result<Option<Split>, String> {
             .ok_or_else(|| "the home directory is unavailable".to_string())?;
         let here = std::env::var_os("XDG_CONFIG_HOME");
         let app = launchd_xdg_config_home()?;
-        Ok(split(here.as_deref(), app.as_deref(), &home))
+        split(here.as_deref(), app.as_deref(), &home)
     }
     #[cfg(not(target_os = "macos"))]
     {

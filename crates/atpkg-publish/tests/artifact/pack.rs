@@ -2098,11 +2098,16 @@ fn a_pristine_checkout_checks_index_hints_in_active_submodules() {
 }
 
 #[test]
-fn a_release_line_is_major_minor_zero_and_a_dev_version_adds_the_short_sha() {
+fn a_product_release_line_is_historical_or_calendar_and_a_dev_version_adds_the_short_sha() {
     for (v, ok) in [
         ("0.1.0", true),
         ("1.20.0", true),
         ("0.0.0", true),
+        ("1.20261109.1", true),
+        ("1.20240229.2", true),
+        ("1.20261109.0", false),
+        ("1.20260229.1", false),
+        ("1.20261131.1", false),
         ("0.1.1", false),
         ("0.1", false),
         ("0.1.0.0", false),
@@ -2120,6 +2125,10 @@ fn a_release_line_is_major_minor_zero_and_a_dev_version_adds_the_short_sha() {
     assert_eq!(
         pack::dev_version("0.1.0", "abcdef012").expect("dev"),
         "0.1.0+gabcdef012"
+    );
+    assert_eq!(
+        pack::dev_version("1.20261109.2", "abcdef012").unwrap(),
+        "1.20261109.2+gabcdef012"
     );
     assert!(
         pack::dev_version("0.1.0", "abcdef01").is_err(),

@@ -1021,7 +1021,11 @@ pub fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
     show_utf8(git, "origin/main", LEDGER_FILE)
 }
 
-/// The release version is spliced into a tag name, a changelog heading, the DMG asset name and the ledger grammar, so it must be canonical `MAJOR.MINOR.PATCH` (a release is the workspace `MAJOR.MINOR.0`; see `VERSIONING.md`): three non-empty ASCII-digit components, no leading zero unless the component is `"0"`, so one version has one spelling. cli.rs applies the same check to version arguments up front.
+/// The recorded version is spliced into a tag, changelog heading, DMG asset name and ledger
+/// grammar, so it must be canonical `MAJOR.MINOR.PATCH`: three nonempty ASCII-digit components,
+/// no leading zero unless the component is `"0"`. Product release policy separately admits
+/// historical and calendar versions (see `VERSIONING.md`); old ledger records retain their
+/// original spelling. cli.rs applies this shape check to version arguments up front.
 pub fn check_version_shape(version: &str) -> Result<()> {
     let mut parts = version.split('.');
     let ok = matches!(

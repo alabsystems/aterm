@@ -552,7 +552,7 @@ fn routed_find_keys_keep_their_window_when_frontmost_has_changed() {
                         .document_id(instance)
                         .map(|document| (view, document))
                 })
-                .filter(|_| kind == Some(AppKind::Editor));
+                .filter(|_| matches!(kind, Some(AppKind::Editor | AppKind::Markdown)));
             let original =
                 editor.map(|(_, document)| app.document_store.snapshot(document).unwrap());
             app.install_window_state(b, crate::stub_session(99), 38, 132);
@@ -589,7 +589,7 @@ fn routed_find_keys_keep_their_window_when_frontmost_has_changed() {
             press(&mut app, a, code, key, mods);
             match kind {
                 None => assert!(app.windows[&a].search.is_some()),
-                Some(AppKind::Editor) => assert!(matches!(
+                Some(AppKind::Editor | AppKind::Markdown) => assert!(matches!(
                     app.native_runtime.view_state(editor.unwrap().0),
                     Some(AppViewState::Editor(state)) if state.buffer.as_ref().is_some_and(
                         |buffer| matches!(buffer.minibuffer, amacs::editor::Minibuffer::Search { .. })
@@ -602,9 +602,21 @@ fn routed_find_keys_keep_their_window_when_frontmost_has_changed() {
                 )),
                 _ => assert!(!app.can_find(a)),
             }
+            if kind == Some(AppKind::Markdown) {
+                let Some(AppViewState::Editor(state)) =
+                    app.native_runtime.view_state(editor.unwrap().0)
+                else {
+                    panic!("the Markdown workspace keeps its Editor view");
+                };
+                assert_eq!(
+                    state.markdown.as_ref().unwrap().mode,
+                    crate::native_app::MarkdownWorkspaceMode::Edit,
+                    "Find reveals the source search in the originating window"
+                );
+            }
             assert_eq!(other_search(&app), other_before);
 
-            if matches!(kind, None | Some(AppKind::Editor)) {
+            if matches!(kind, None | Some(AppKind::Editor | AppKind::Markdown)) {
                 if kind.is_none() {
                     app.search_edit_in(a, SearchEdit::Insert("needle".to_string()));
                 } else {
@@ -709,15 +721,15 @@ fn picker_path_opens_only_the_exact_local_document_grant() {
 
     let mut app = App::headless_for_test();
     let opened = app
-        .open_local_document_path(AppKind::Markdown, &chosen)
+        .open_local_document_path(&chosen)
         .expect("picker-approved file opens");
-    assert!(opened.starts_with("app markdown file://"), "{opened}");
+    assert!(opened.starts_with("app editor file://"), "{opened}");
     let (instance, _) = app
         .active_native_view(WindowId(0))
         .expect("Markdown became the active native tab");
     assert_eq!(
         app.native_runtime.app(instance).map(|app| app.kind()),
-        Some(AppKind::Markdown)
+        Some(AppKind::Editor)
     );
 
     let chosen_uri =
@@ -732,7 +744,7 @@ fn picker_path_opens_only_the_exact_local_document_grant() {
         None,
         "choosing one file must not acquire ambient directory authority"
     );
-    app.open_local_document_path(AppKind::Editor, &dir)
+    app.open_local_document_path(&dir)
         .expect("an explicitly chosen directory opens as a listing");
     let directory_uri =
         crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(&dir).unwrap())
@@ -889,8 +901,8 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
     let (_, view) = app.active_native_view(wid).expect("Markdown view");
     assert!(matches!(
         app.native_runtime.view_state(view),
-        Some(crate::native_app::AppViewState::Markdown(state))
-            if state.selection == Some(0..source.len())
+        Some(crate::native_app::AppViewState::Editor(state))
+            if state.markdown.as_ref().unwrap().reader.selection == Some(0..source.len())
     ));
     assert_eq!(app.native_selection_text(wid).as_deref(), Some(source));
 
@@ -910,8 +922,8 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
     );
     assert!(matches!(
         app.native_runtime.view_state(view),
-        Some(crate::native_app::AppViewState::Markdown(state))
-            if state.selection.is_none()
+        Some(crate::native_app::AppViewState::Editor(state))
+            if state.markdown.as_ref().unwrap().reader.selection.is_none()
     ));
     assert_eq!(app.native_selection_text(wid), None);
     let _ = fs::remove_dir_all(dir);

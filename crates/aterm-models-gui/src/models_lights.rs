@@ -7,14 +7,15 @@
 use aterm_spec::derive::*;
 
 /// One click on the permission chip (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, §3): it types
-/// nothing, but stands an ask in the window's memory to restart the tab's conversation on the line
-/// of the bit the chip did not show (`bit` 1 `yolo`, 0 `lame`), fixed at the click (`from`, `to`).
+/// nothing, but stands an ask in the window's memory to restart the tab's conversation on the
+/// bypass line (`bit` 1 yolo on, 0 off), fixed at the click (`from`, `to`). Only the off chip takes
+/// a click (owner, 2026-11-09: a click turns yolo on and never off): on the on chip none stands.
 /// The ask's lane (`lane` 1) looks at the tab at its pace until it may signal the restart (`lane`
 /// 2), which lands once and ends the ask, wherever the pill then reads. Before the signal a click on
 /// the standing ask takes it back; after it nothing can. A refusal ends it and is said; the tab
 /// closing or its conversation leaving it ends it quietly.
 ///
-/// The environment: the pill moves by Claude's own steps (`ToYolo`, `ToLame`); a box or a person's
+/// The environment: the pill moves by Claude's own steps (`ToYolo`, `ToOff`); a box or a person's
 /// hold makes the lane wait (`held`); a tab where no line can be made (`never`: a job with no
 /// shell, a claim, a coordinated record) can only be refused; a run of presses within a double
 /// click's interval (`run`) is one click until it ends (`Apart`); a refusal on show rests.
@@ -28,9 +29,9 @@ pub fn claude_permission_click_model() -> Model {
     aterm_spec::ty_model! {
         ClaudePermissionClick {
             const Buggy = 0;
-            var bit = 1;
-            var from = 1;
-            var to = 0;
+            var bit = 0;
+            var from = 0;
+            var to = 1;
             var stands = 0;
             var lane = 0;
             var conv = 1;
@@ -46,11 +47,17 @@ pub fn claude_permission_click_model() -> Model {
             var into_held = 0;
             var into_never = 0;
 
-            action Click when (stands == 0 && lane == 0 && tab == 1 && (run == 0 || Buggy == 3)) {
+            action Click when (
+                stands == 0
+                    && lane == 0
+                    && tab == 1
+                    && (bit == 0 || Buggy == 1)
+                    && (run == 0 || Buggy == 3)
+            ) {
                 stands = 1;
                 lane = 1;
                 from = bit;
-                to = if Buggy == 1 { bit } else { 1 - bit };
+                to = 1;
                 asked = conv;
                 run = 1;
                 ended = 0;
@@ -101,7 +108,7 @@ pub fn claude_permission_click_model() -> Model {
             action ToYolo when (bit == 0) {
                 bit = 1;
             }
-            action ToLame when (bit == 1) {
+            action ToOff when (bit == 1) {
                 bit = 0;
             }
             action Hold when (held == 0) {
@@ -121,7 +128,7 @@ pub fn claude_permission_click_model() -> Model {
                 said = 0;
             }
 
-            invariant AClickAsksTheOtherBit: stands == 0 || to + from == 1;
+            invariant AClickOnlyTurnsYoloOn: stands == 0 || from + 1 == to;
             invariant TheSignalKeepsItsAsk: lane <= 1 || stands == 1;
             invariant ADoubleClickIsOneClick: again == 0;
             invariant ARefusalIsSaid: ended == 0 || said == 1;

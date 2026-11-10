@@ -127,21 +127,7 @@ pub fn system_awake_since() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open("/proc/stat")
-            .ok()
-            .and_then(|f| {
-                let mut stat = String::with_capacity(4096);
-                f.take(256 * 1024).read_to_string(&mut stat).ok()?;
-                stat.lines()
-                    .find_map(|l| l.strip_prefix("btime "))
-                    .and_then(|s| crate::parse_uint::<u64>(s.trim()))
-            })
-            .unwrap_or(0)
+        aterm_uds::process::boot_s().unwrap_or(0)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

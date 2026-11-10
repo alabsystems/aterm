@@ -1110,7 +1110,7 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
     doc.set_entry(
         &Audience::Everyone,
         crate::SWARM_POLICY_ENTRY,
-        b"release_hosts = [\"m22\"]\n",
+        b"servers = []\n",
     )
     .expect("policy");
     admin_publish(m22, &admin, &doc).expect("publish");
@@ -1215,7 +1215,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
     doc.set_entry(
         &Audience::Everyone,
         crate::SWARM_POLICY_ENTRY,
-        b"release_hosts = [\"m22\"]\n",
+        b"servers = []\n",
     )
     .expect("policy");
     admin_publish(m22, &admin, &doc).expect("publish");

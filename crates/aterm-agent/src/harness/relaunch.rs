@@ -1123,8 +1123,8 @@ fn managed_twin_build(exe: &Path) -> Option<PathBuf> {
 }
 
 /// The build to type in place of `exe` ([`managed_twin_build`]), where `flags` hold nothing the
-/// twin reads as typed: it would add yolo, and a relaunch never enters bypass
-/// ([`with_permission_mode`]). A typed line with `--resume` or a mode written on it stays the
+/// twin reads as typed: it would add yolo, and a relaunch enters bypass only by a flag on its own
+/// line ([`with_permission_mode`]). A typed line with `--resume` or a mode written on it stays the
 /// twin's. [`Plan::command`] names what the line types, so a cold restart execs the same file.
 fn past_unmarked_twin(exe: &Path, flags: &[String]) -> Option<PathBuf> {
     let atpkg::yolo::Launch::Default(_) = atpkg::yolo::decide("claude", flags) else {
@@ -1466,10 +1466,43 @@ const PERMISSION_MODES: [&str; 7] = [
     "bypassPermissions",
 ];
 
-fn last_permission_mode(records: &Records, session: &str) -> Option<String> {
+/// The mode of `session`'s last turn head, by its transcript, where that says anything of the
+/// process started at `started` (Unix seconds; [`transcript_mode`]).
+fn last_permission_mode(records: &Records, session: &str, started: Option<u64>) -> Option<String> {
     let path = records.transcript(session)?;
+    let written = aterm_uds::regular_file::open(&path)
+        .ok()
+        .and_then(|(_, meta)| meta.modified().ok())
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_secs());
     let (tail, _) = tail_to_end(&path, TAIL_BYTES);
-    permission_mode_of(&tail)
+    transcript_mode(permission_mode_of(&tail), written, started)
+}
+
+/// WHAT A TRANSCRIPT'S LAST MODE ROW SAYS OF THE RUNNING PROCESS, where its pill cannot be read.
+/// Claude Code writes a `permission-mode` row with a turn's rows and as it ends, none as it
+/// starts (`docs/DESIGN-yolo-binary-2026-11-04.md` §9), so `row` can be the mode of the process
+/// this one replaced. Two readings are not this process's and name no mode, which leaves the
+/// line as it was launched ([`with_permission_mode`]):
+/// - a transcript last `written` no later than the second this process `started` in (both Unix
+///   seconds, both read): no row in it is this process's, and the line it was launched with is
+///   the newer word. A click's `--dangerously-skip-permissions` is such a line until its first
+///   turn, so a restart in that window keeps it rather than retype the mode the click left. The
+///   start is known to the second, and the second itself counts as before: a process writes
+///   nothing to a transcript in the second it was started in, and the process it replaced often
+///   ended in that second;
+/// - `bypassPermissions`: a row never takes a line INTO bypass, since the person may have left
+///   it since that row was written; only the pill does. A line launched in bypass stays as
+///   launched.
+pub(super) fn transcript_mode(
+    row: Option<String>,
+    written: Option<u64>,
+    started: Option<u64>,
+) -> Option<String> {
+    if matches!((written, started), (Some(written), Some(started)) if written <= started) {
+        return None;
+    }
+    row.filter(|mode| mode != "bypassPermissions")
 }
 
 /// [`last_permission_mode`]'s scan, pure.
@@ -1485,13 +1518,15 @@ pub(super) fn permission_mode_of(tail: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The permission mode to resume `session` in.
+/// The permission mode to resume `session` in: the pill's (`shown`), else what its transcript says
+/// of the process started at `started` ([`transcript_mode`]).
 pub(super) fn resume_mode(
     records: &Records,
     session: &str,
     shown: Option<String>,
+    started: Option<u64>,
 ) -> Option<String> {
-    shown.or_else(|| last_permission_mode(records, session))
+    shown.or_else(|| last_permission_mode(records, session, started))
 }
 
 fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
@@ -1518,32 +1553,49 @@ const fn mode_flag(mode: super::lights::Mode) -> &'static str {
     }
 }
 
-/// `flags` (the launch's, from [`upgrade::rewrite_argv`], resume pair last) resumed in permission `mode` ([`resume_mode`]).
+/// `flags` (the launch's, from [`upgrade::rewrite_argv`], resume pair last) resumed in permission
+/// `mode` ([`resume_mode`]); `None` is the line as launched.
+///
+/// - A mode other than bypass is written on the line, every other permission flag off it. A line
+///   that had bypass on its shift+tab ring (either bypass flag, or `--permission-mode
+///   bypassPermissions`) keeps it there by `--allow-dangerously-skip-permissions`:
+///   `--dangerously-skip-permissions` beside a mode would launch in bypass.
+/// - `bypassPermissions` (the pill's reading: [`transcript_mode`] names none) on such a ring line
+///   that would not itself launch in bypass (the allow flag beside a mode, as the arm above
+///   leaves it) becomes [`upgrade::BYPASS_FLAG`] alone, so yolo the person returned to outlives
+///   the restart and the flag is back on the recorded line. A line that already launches in
+///   bypass is returned as it is, and one with no bypass on its ring is never taken INTO it (the
+///   settings' own default lands there without a flag).
 pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<String> {
-    let Some(mode) = mode.filter(|m| *m != "bypassPermissions") else {
+    let Some(mode) = mode else {
         return flags;
     };
+    let to_bypass = mode == "bypassPermissions";
     let mode = if mode == "manual" { "default" } else { mode };
-    let spans = upgrade::parse_flag_spans(&flags);
     let mut out = Vec::with_capacity(flags.len() + 3);
     let mut tail = Vec::new();
     let mut in_tail = false;
     let mut bypass_in_cycle = false;
-    for (name, tokens) in spans {
+    let mut launches_in_bypass = false;
+    for (name, tokens) in upgrade::parse_flag_spans(&flags) {
         if in_tail {
             tail.extend(tokens);
             continue;
         }
         match name {
-            Some("--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions") => {
+            Some(upgrade::BYPASS_FLAG) => {
                 bypass_in_cycle = true;
+                launches_in_bypass = true;
             }
+            Some("--allow-dangerously-skip-permissions") => bypass_in_cycle = true,
             Some("--permission-mode") => {
-                bypass_in_cycle |= match tokens.as_slice() {
+                let bypass = match tokens.as_slice() {
                     [one] => one == "--permission-mode=bypassPermissions",
                     [_, m] => m == "bypassPermissions",
                     _ => false,
                 };
+                bypass_in_cycle |= bypass;
+                launches_in_bypass |= bypass;
             }
             Some("--resume") => {
                 in_tail = true;
@@ -1552,11 +1604,18 @@ pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Ve
             _ => out.extend(tokens),
         }
     }
-    if bypass_in_cycle {
-        out.push("--allow-dangerously-skip-permissions".to_string());
+    if to_bypass {
+        if launches_in_bypass || !bypass_in_cycle {
+            return flags;
+        }
+        out.push(upgrade::BYPASS_FLAG.to_string());
+    } else {
+        if bypass_in_cycle {
+            out.push("--allow-dangerously-skip-permissions".to_string());
+        }
+        out.push("--permission-mode".to_string());
+        out.push(mode.to_string());
     }
-    out.push("--permission-mode".to_string());
-    out.push(mode.to_string());
     out.extend(tail);
     out
 }
@@ -5607,7 +5666,12 @@ fn restart_locked(
         None => (
             snap.argv.clone(),
             snap.program.clone(),
-            resume_mode(&records, &session, tab_mode(opts, &tab)),
+            resume_mode(
+                &records,
+                &session,
+                tab_mode(opts, &tab),
+                super::upgrade_models::parse_lstart(&snap.start),
+            ),
         ),
     };
     if clicked.is_some() && !resume {
@@ -7778,7 +7842,7 @@ fn after_exit_as(
                 save(opts, &session, &st);
             }
         } else {
-            if in_flight_exit_proven(&st, alive(st.pid), kernel_start(st.pid).as_deref()) {
+            if in_flight_exit_proven(&st, alive, kernel_start) {
                 // A restart in flight when aterm ended (a stall's or an asked one) waits on
                 // its agent's exit: proven here by its kernel start, never by a pid that may
                 // name another process since (a reboot reuses them).
@@ -7866,7 +7930,12 @@ fn after_exit_as(
     } else {
         (None, None)
     };
-    let mode = resume_mode(&records, &session, tab_mode(opts, &snap.tab));
+    let mode = resume_mode(
+        &records,
+        &session,
+        tab_mode(opts, &snap.tab),
+        super::upgrade_models::parse_lstart(&snap.start),
+    );
     let launch = Launch {
         session: &session,
         resume,
@@ -8102,12 +8171,16 @@ fn launch_after_exit(
 
 /// Whether the in-flight restart `st` was waiting on its agent's exit and that agent is proven
 /// gone by the identity the record names ([`St::pid_start`], adopted from the snapshot of its
-/// pid where an earlier build recorded none): its pid `alive`, born `start_now`, as
-/// [`agent_exit`] judges. Only an Exiting record not yet stamped.
-pub(super) fn in_flight_exit_proven(st: &St, alive: bool, start_now: Option<&str>) -> bool {
+/// pid where an earlier build recorded none), as [`St::agent_exit_by`] judges it from `alive`
+/// and `start_of`, the kernel's answers for its pid. Only an Exiting record not yet stamped.
+pub(super) fn in_flight_exit_proven(
+    st: &St,
+    alive: impl Fn(u32) -> bool,
+    start_of: impl Fn(u32) -> Option<String>,
+) -> bool {
     matches!(st.phase, upgrade::Phase::Exiting { .. })
         && st.exited_at == 0
-        && agent_exit(&st.pid_start, alive, start_now) == AgentExit::Gone
+        && st.agent_exit_by(alive, start_of) == AgentExit::Gone
 }
 
 /// Whether an exit's relaunch is a typed plan no native authority gates

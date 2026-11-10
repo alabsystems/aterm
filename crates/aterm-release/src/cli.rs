@@ -18,7 +18,7 @@ USAGE
   targo --unverified ship input-check --base COMMIT
       Judge unreceipted source inputs with the release's per-check records.
       No release, credentials, build of the product or publication.
-  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series
+  targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|qualify-before|qualify-after|qualify-series
       Cold concurrent release slices, optionally beside test compilation and lint,
       with one Release jobserver and one-second descendant CPU/QoS/core samples.
       chain lowers tree CPU priority; tree inverts priority as a negative control.

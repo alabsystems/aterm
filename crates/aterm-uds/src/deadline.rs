@@ -276,6 +276,11 @@ pub fn poll_yield() {
 }
 
 #[cfg(any(test, debug_assertions))]
+mod released;
+#[cfg(any(test, debug_assertions))]
+pub use released::once_released;
+
+#[cfg(any(test, debug_assertions))]
 mod silent;
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 pub(crate) use silent::copy_regular_fresh;

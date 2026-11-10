@@ -536,7 +536,7 @@ const PERMISSION_FLAGS: &[&str] = &[
     "--permission-mode",
 ];
 
-/// The flag a click on `lame` puts on its line ([`PermissionTo::Bypass`]).
+/// The flag a click on the off chip (`○ yolo`) puts on its line ([`PermissionTo::Bypass`]).
 pub(super) const BYPASS_FLAG: &str = "--dangerously-skip-permissions";
 
 /// `argv` (`argv[0]` first) as a click on the chip relaunches it

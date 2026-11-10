@@ -115,7 +115,10 @@ pub trait Host {
         install: bool,
     ) -> Result<(PathBuf, bool), String>;
 
-    /// Download `url` into `dest`.
+    /// Download `url` into `dest`, at most `bytes`: a github.com release download URL through
+    /// the shared release-asset reader (the download host first, then GitHub's API asset route,
+    /// until one delivers or neither makes progress), any other URL on the shared downloader's
+    /// https-only lane.
     ///
     /// # Errors
     /// The download failed.
@@ -1030,6 +1033,9 @@ pub struct System {
     held: std::cell::RefCell<Vec<atpkg::prerequisite::HeldSet>>,
     #[cfg(test)]
     fetch_spawn: Option<std::sync::Arc<dyn aterm_update_core::github_rest::Spawn>>,
+    /// Tests: the loopback origins a release asset is read from, instead of github.com.
+    #[cfg(test)]
+    fetch_origins: Option<aterm_update_core::github_rest::Origins>,
 }
 
 impl System {
@@ -1042,6 +1048,8 @@ impl System {
             held: std::cell::RefCell::default(),
             #[cfg(test)]
             fetch_spawn: None,
+            #[cfg(test)]
+            fetch_origins: None,
         }
     }
 
@@ -1053,6 +1061,27 @@ impl System {
     ) -> Self {
         self.fetch_spawn = Some(spawn);
         self
+    }
+
+    /// Tests: read release assets from `origins` (a loopback fixture's) instead of github.com.
+    #[cfg(test)]
+    fn with_fetch_origins(mut self, origins: aterm_update_core::github_rest::Origins) -> Self {
+        self.fetch_origins = Some(origins);
+        self
+    }
+
+    /// The release-asset reader [`Host::fetch`] reads a release asset through: one per
+    /// read, so each read has the reader's whole patience.
+    fn release_reader(&self) -> aterm_update_core::release_asset::Reader {
+        #[cfg(test)]
+        if let Some(origins) = &self.fetch_origins {
+            return aterm_update_core::release_asset::Reader::loopback(
+                origins.clone(),
+                None,
+                std::time::Duration::from_secs(60),
+            );
+        }
+        aterm_update_core::release_asset::Reader::anonymous()
     }
 }
 
@@ -1086,6 +1115,12 @@ impl Host for System {
     }
 
     fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String> {
+        if let Some(asset) = aterm_update_core::release_asset::Asset::from_web_url(url) {
+            return self
+                .release_reader()
+                .to_file(&asset, dest, bytes)
+                .map_err(|e| format!("{url}: {e}"));
+        }
         #[cfg(test)]
         if let Some(spawn) = &self.fetch_spawn {
             return aterm_update_core::download_to_resumable_https_only_via(

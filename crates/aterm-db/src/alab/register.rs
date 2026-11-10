@@ -80,6 +80,9 @@ pub struct Me {
     pub uuid: String,
     /// The membership log's label, clash suffix included.
     pub label: Option<String>,
+    /// The label derived from a holder-signed number choice, its fallback during a conflict
+    /// included. Never an OS-name hint.
+    pub chosen: Option<String>,
     /// [`keys::hw_hint`] of this Mac's hardware under this network.
     pub hw_hint: String,
     /// When the vault's roster says this Mac was admitted, where it says.
@@ -108,7 +111,8 @@ pub enum Rule {
     Node,
     /// 2: the machine row names one of this Mac's host names.
     Host,
-    /// 3: a planned machine under this Mac's membership label or an alias.
+    /// 3: a planned machine under this Mac's membership label or an alias, or an unbound sheet
+    /// row answering its signed chosen number.
     Planned,
     /// 4: the machine's row was already this uuid's own birth.
     OwnBirth,
@@ -375,6 +379,56 @@ fn own_node(input: &Input<'_>, machines: &Projection, mac: &str) -> Result<Vec<C
     Ok(vec![automatic(&MACHINE, mac, "node", Value::from(node))?])
 }
 
+/// Follow the authenticated choice on this Mac's bound row. A nodeless sheet row may share
+/// the number until `merge` folds it in; another real holder always prevents the move.
+fn chosen_number(
+    input: &Input<'_>,
+    machines: &Projection,
+    facts: &OwnedRead,
+    mac: &str,
+) -> Result<Vec<Change>> {
+    let Some(label) = input.me.chosen.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let bound = bound_elsewhere(input, facts);
+    if machines.rows.iter().any(|(pk, row)| {
+        pk != mac
+            && row.live()
+            && (goes_by(row, label)
+                || row.fields.get("label").is_some_and(|field| {
+                    field
+                        .candidates_x()
+                        .iter()
+                        .any(|value| value.as_str() == Some(label))
+                }))
+            && (bound.contains(pk.as_str())
+                || ["node", "fleet_node"]
+                    .iter()
+                    .any(|col| row.get(col).is_some()))
+    }) {
+        return Err(Error::new(
+            "the chosen number belongs to another bound machine",
+        ));
+    }
+    if machines
+        .rows
+        .get(mac)
+        .is_some_and(|row| row.raw.contains("label"))
+    {
+        return Err(Error::new("the bound machine label needs a newer reader"));
+    }
+    if machines
+        .rows
+        .get(mac)
+        .and_then(|row| row.get("label"))
+        .and_then(Value::as_str)
+        == Some(label)
+    {
+        return Ok(Vec::new());
+    }
+    Ok(vec![automatic(&MACHINE, mac, "label", Value::from(label))?])
+}
+
 /// The first Mac to report an unseen model writes its key and what it knows; the owner fills in
 /// the rest.
 fn model_birth(cells: &Cells, probe: &Probe) -> Result<Vec<Change>> {
@@ -471,6 +525,12 @@ fn birth_label(input: &Input<'_>, machines: &Projection) -> Result<String> {
                 })
         })
     };
+    if let Some(chosen) = input.me.chosen.as_deref() {
+        if held(chosen) {
+            return Err(Error::new("the chosen number already names a registry row"));
+        }
+        return Ok(chosen.to_owned());
+    }
     if let Some(label) = input
         .probe
         .hosts
@@ -699,7 +759,8 @@ fn pick(
             .filter(|(pk, row)| {
                 !bound.contains(pk.as_str())
                     && no_other_node(row)
-                    && row.get("status").and_then(Value::as_str) == Some("planned")
+                    && (row.get("status").and_then(Value::as_str) == Some("planned")
+                        || me.chosen.as_deref() == Some(label))
                     && goes_by(row, label)
             })
             .map(|(pk, _)| pk)
@@ -744,17 +805,22 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             ));
         }
         let seen = own.value.get("seen").and_then(Value::as_u64).unwrap_or(0);
-        let node = own_node(input, &machines, mac)?;
-        let label = machines
-            .rows
-            .get(mac)
-            .filter(|row| {
-                row.fields
-                    .get("label")
-                    .is_some_and(|field| !field.conflicted())
-            })
-            .and_then(|row| row.get("label"))
-            .and_then(Value::as_str);
+        let mut node = own_node(input, &machines, mac)?;
+        let renamed = chosen_number(input, &machines, facts, mac)?;
+        let moves = !renamed.is_empty();
+        node.extend(renamed);
+        let label = input.me.chosen.as_deref().or_else(|| {
+            machines
+                .rows
+                .get(mac)
+                .filter(|row| {
+                    row.fields
+                        .get("label")
+                        .is_some_and(|field| !field.conflicted())
+                })
+                .and_then(|row| row.get("label"))
+                .and_then(Value::as_str)
+        });
         let row = stated(input, Some(&own.value), mac, None, label)?;
         // Host names move without the Mac changing (a Bonjour clash renames the local host), and a
         // change spends a record of a lifetime quota, so they ride the 30-day rewrite. The other
@@ -764,7 +830,15 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             .iter()
             .filter(|c| !matches!(c.name, "n" | "seen" | "at" | "hosts"))
             .any(|c| row.get(c.name) != own.value.get(c.name));
-        let due = seen.saturating_add(REFRESH_DAYS) <= today || (changed && seen < today);
+        let chosen_changed = input
+            .me
+            .chosen
+            .as_deref()
+            .is_some_and(|label| own.value.get("label").and_then(Value::as_str) != Some(label));
+        let due = moves
+            || chosen_changed
+            || seen.saturating_add(REFRESH_DAYS) <= today
+            || (changed && seen < today);
         if !due && node.is_empty() {
             return Ok(Plan::quiet(Outcome::Unchanged, Vec::new()));
         }
@@ -875,14 +949,17 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
         Some(label) => label.to_owned(),
         None => birth_label(input, &machines)?,
     };
-    let row = stated(input, None, &mac, predecessor.as_deref(), Some(&label))?;
+    let label = input.me.chosen.as_deref().unwrap_or(&label);
+    let row = stated(input, None, &mac, predecessor.as_deref(), Some(label))?;
     let mut changes = model_birth(cells, input.probe)?;
     if births.is_empty() {
         changes.extend(own_node(input, &machines, &mac)?);
-        if machines
-            .rows
-            .get(&mac)
-            .is_some_and(|row| !row.fields.contains_key("label"))
+        changes.extend(chosen_number(input, &machines, facts, &mac)?);
+        if input.me.chosen.is_none()
+            && machines
+                .rows
+                .get(&mac)
+                .is_some_and(|row| !row.fields.contains_key("label"))
         {
             changes.push(automatic(&MACHINE, &mac, "label", Value::from(label))?);
         }

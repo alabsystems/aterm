@@ -276,10 +276,10 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
                 .filter_map(Value::as_str)
                 .try_for_each(|name| guard::word(name).map_err(guard::Refusal::rule))
         }
-        Ty::Ref(_) => {
+        Ty::Key | Ty::Ref(_) => {
             let target = text()?;
             if !pk_grammar(target) {
-                return Err("a reference is a key");
+                return Err("this value is a key");
             }
             guard::word(target).map_err(guard::Refusal::rule)
         }
@@ -371,7 +371,9 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
         Ty::Enum(words) if !words.contains(&elem) => Err("this word is not one the column knows"),
         Ty::Label if !keys::is_label(elem) => Err("a machine label is m<N> or m<N>-xxxx"),
         _ if !pk_grammar(elem) => Err("a set element breaks the key grammar"),
-        Ty::Enum(_) | Ty::Label | Ty::Ref(_) => guard::word(elem).map_err(guard::Refusal::rule),
+        Ty::Enum(_) | Ty::Label | Ty::Key | Ty::Ref(_) => {
+            guard::word(elem).map_err(guard::Refusal::rule)
+        }
         _ => check(inner, &Value::String(elem.to_owned()), false),
     }
 }

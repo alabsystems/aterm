@@ -1946,10 +1946,6 @@ mod tests {
                 AppViewState::Editor(state) => Some(state.clone()),
                 _ => None,
             };
-            let before_markdown = match state {
-                AppViewState::Markdown(state) => Some(state.clone()),
-                _ => None,
-            };
             let before_settings = match state {
                 AppViewState::Settings(state) => Some((
                     state.route,
@@ -1977,7 +1973,6 @@ mod tests {
                 let unchanged = state.common() == &before_common
                     && match state {
                         AppViewState::Editor(state) => Some(state) == before_editor.as_ref(),
-                        AppViewState::Markdown(state) => Some(state) == before_markdown.as_ref(),
                         AppViewState::Settings(state) => before_settings.as_ref().is_some_and(
                             |(route, search, input, editing)| {
                                 state.route == *route

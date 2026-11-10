@@ -50,6 +50,30 @@ fn a_set_stop_wakes_every_sleeper_and_stays_set() {
         from.elapsed() < HANG,
         "a sleep on a set stop ends at once, not at its time"
     );
+
+    // Two setters race for one transition; exactly one owns it.
+    let raced = Arc::new(Stop::new());
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let setters: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = Arc::clone(&raced);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                stop.set()
+            })
+        })
+        .collect();
+    barrier.wait();
+    assert_eq!(
+        setters
+            .into_iter()
+            .map(|setter| setter.join().unwrap())
+            .filter(|first| *first)
+            .count(),
+        1
+    );
+    assert!(raced.is_set());
 }
 
 #[test]
@@ -106,6 +130,48 @@ fn a_stops_bell_rings_when_it_is_set_and_stays_rung() {
     assert!(
         rung(&late),
         "a bell first asked for after its stop was set is rung already"
+    );
+}
+
+/// [`Stop::wait_ready`] with no deadline ends on what it waits for and on nothing else: a
+/// descriptor gone readable ends it with that descriptor's index, and a stop set while it waits
+/// ends it with none. A wait the stop fails to end runs to the hang detector's minute (its own
+/// deadline), and reads as a wait that expired. Nothing is timed but that minute.
+///
+/// NEGATIVE CONTROL (2026-11-09): with the bell left out of the set `wait_ready` polls, the
+/// second wait reached the hang detector (`a set stop ends the wait`).
+#[cfg(unix)]
+#[test]
+fn a_wait_ready_ends_on_its_descriptor_or_its_stop() {
+    use std::io::Write as _;
+    use std::os::fd::AsFd as _;
+
+    let stop = Arc::new(Stop::new());
+    let (quiet, _keep) = std::io::pipe().unwrap();
+    let (readable, mut source) = std::io::pipe().unwrap();
+    source.write_all(b"r").unwrap();
+    assert_eq!(
+        stop.wait_ready(&[quiet.as_fd(), readable.as_fd()], None)
+            .unwrap(),
+        [1],
+        "a readable descriptor ends the wait"
+    );
+    let waiter = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let (quiet, _keep) = std::io::pipe().unwrap();
+            let entered = std::time::Instant::now();
+            let ready = stop
+                .wait_ready(&[quiet.as_fd()], Some(entered + HANG))
+                .unwrap();
+            (ready, entered.elapsed())
+        })
+    };
+    assert!(stop.set());
+    let (ready, waited) = waiter.join().unwrap();
+    assert!(
+        ready.is_empty() && waited < HANG,
+        "a set stop ends the wait ({ready:?} after {waited:?})"
     );
 }
 

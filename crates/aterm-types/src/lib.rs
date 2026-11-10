@@ -61,6 +61,7 @@ pub mod world;
 mod time;
 pub use time::duration_to_nanos;
 
+pub mod release_version;
 pub mod rfc3339;
 pub mod rust_lane;
 pub mod update_boundary;

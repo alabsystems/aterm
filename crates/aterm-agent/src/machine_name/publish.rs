@@ -376,7 +376,8 @@ impl Pending {
 /// 2. the fleet name in `state`, through `aterm fleet name set`'s checked writer
 ///    ([`crate::fleet_member::choose_machine_name_at`]), which reads the `[[fleet.peers]]` of
 ///    the aterm.toml at `config` among the machines that may already answer to it and checks
-///    the committed policy and number again under the fleet writer's lock;
+///    the committed policy and number again under the fleet writer's lock; then the holder's
+///    signed membership Name, under the same writer's canonical-number fence;
 /// 3. with `system`, macOS's three names: read, and where any does not read the number, set
 ///    under one approval and read again.
 ///
@@ -397,8 +398,31 @@ pub fn publish(
     system: Option<&dyn SystemNames>,
 ) -> Result<(), Pending> {
     publish_through(state, config, policy, system, || {
-        crate::fleet_member::choose_machine_name_at(state, config, policy.number).map(|_| ())
+        crate::fleet_member::choose_machine_name_at(state, config, policy.number)?;
+        if let Some(paths) = crate::fleet_vault::vault_paths_for(state) {
+            publish_log_label(state, config, policy.number, || {
+                aterm_secrets::client::publish_local_chosen_name(&paths, policy.number)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })?;
+        }
+        Ok(())
     })
+}
+
+/// Serialize the signature with set_name's book writer. A newer local choice cannot commit
+/// between the canonical-number fence and authoring the membership Name record.
+fn publish_log_label(
+    state: &Path,
+    config: &Path,
+    number: Number,
+    sign: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    aterm_net::fleet_member::write_held(state, aterm_net::fleet_member::Began::Here, |_| {
+        check_current(state, config, number).map_err(|pending| pending.why().to_owned())?;
+        sign()
+    })
+    .map_err(|error| error.to_string())?
 }
 
 /// [`publish`] with its fleet step given as `fleet`: the fleet name's checked write of

@@ -279,6 +279,28 @@ fn the_policy_is_written_only_over_its_own_snapshot_and_number() {
 }
 
 #[test]
+fn a_superseded_name_never_signs_a_membership_label() {
+    let scratch = fresh();
+    chosen(&scratch.state, 59);
+    let policy = Policy::read(&scratch.config, num(59)).unwrap();
+    write_policy(&scratch.state, &policy).unwrap();
+    let signed = Cell::new(0);
+    let sign = || {
+        signed.set(signed.get() + 1);
+        Ok(())
+    };
+    publish_log_label(&scratch.state, &scratch.config, num(59), sign).unwrap();
+    assert_eq!(signed.get(), 1);
+    chosen(&scratch.state, 60);
+    assert!(publish_log_label(&scratch.state, &scratch.config, num(59), sign).is_err());
+    assert_eq!(
+        signed.get(),
+        1,
+        "a superseded publication authored no record"
+    );
+}
+
+#[test]
 fn a_naming_hold_refuses_the_policy_read_that_comes_before_any_set() {
     let scratch = fresh();
     assert!(

@@ -3062,6 +3062,14 @@ mod tests {
         sink.note_master_nonblocking(true);
         drop(reader);
 
+        aterm_uds::deadline::once_released(|| {
+            if aterm_uds::hangup::fd_peer_closed(writer.as_raw_fd()) {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        });
+
         let (write, order) = sink.try_write_frame_immediate_with_receipt(b"closed");
         assert_eq!(write, ImmediateWrite::BusyZero);
         assert_eq!(order, None, "a minted-but-unaccepted token stays private");

@@ -3717,6 +3717,145 @@ impl App {
         })
     }
 
+    /// A Markdown workspace owns its inner pane focus and divider; neither is
+    /// a tab split, and changing either leaves document and edit-ticket ownership intact.
+    fn markdown_workspace_pointer(
+        &mut self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+        press: bool,
+    ) -> bool {
+        use crate::native_app::{AppViewState, MarkdownPane, NativeApp};
+        let Some((instance, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let Ok(viewport) = self.native_ui_viewport_for(wid, view) else {
+            return false;
+        };
+        let (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state))) = (
+            self.native_runtime.app(instance),
+            self.native_runtime.view_state(view),
+        ) else {
+            return false;
+        };
+        if state.markdown.is_none() {
+            return false;
+        }
+        let layout = editor.workspace_layout(state, viewport);
+        let dragging = state
+            .common
+            .pressed
+            .as_ref()
+            .is_some_and(|key| key.as_str() == "editor/markdown/divider");
+        // A drag stays owned by its original leaf outside that leaf's bounds.
+        // Retain its presented geometry and let resize_per_mille clamp either edge.
+        let target = if !press && dragging {
+            let artifact = match frame_plan {
+                Some(plan) => self.retained_native_pointer_artifact_from_plan(wid, view, plan),
+                None => self.retained_native_pointer_artifact(wid, view),
+            };
+            artifact.map(|artifact| {
+                let local_x = ((x - artifact.device_x as f64) / artifact.scale) as f32;
+                let local_y = ((y - artifact.device_y as f64) / artifact.scale) as f32;
+                (artifact, local_x, local_y)
+            })
+        } else {
+            self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)
+        };
+        let Some((artifact, x, y)) = target else {
+            return false;
+        };
+        if artifact.view != view
+            || artifact.instance != instance
+            || self.native_runtime.view_generation(view) != Some(artifact.generation)
+        {
+            return false;
+        }
+        if !press && dragging {
+            if layout.divider.is_some() {
+                let ratio = layout.resize_per_mille(x, y);
+                let _ = self.dispatch_native_event(
+                    wid,
+                    crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                        id: crate::native_ui::ActionId::new("editor/markdown/resize"),
+                        value: Some(crate::native_app::SemanticInput::Number(f64::from(ratio))),
+                    }),
+                );
+                self.request_redraw_all_windows();
+            }
+            return true;
+        }
+        if !press {
+            if layout.divider.is_some_and(|rect| rect.contains(x, y)) {
+                self.set_hover_cursor(
+                    wid,
+                    if layout.stacked {
+                        CursorIcon::RowResize
+                    } else {
+                        CursorIcon::ColResize
+                    },
+                    false,
+                    false,
+                );
+                return true;
+            }
+            return false;
+        }
+        let divider = layout.divider.is_some_and(|rect| rect.contains(x, y));
+        let focus = if layout.editor.is_some_and(|rect| rect.contains(x, y)) {
+            Some(MarkdownPane::Editor)
+        } else if layout.reader.is_some_and(|rect| rect.contains(x, y)) {
+            Some(MarkdownPane::Reader)
+        } else {
+            None
+        };
+        let focus_changed = focus.is_some_and(|focus| {
+            state
+                .markdown
+                .as_ref()
+                .is_some_and(|workspace| workspace.focus != focus)
+        });
+        if focus_changed
+            && focus == Some(MarkdownPane::Reader)
+            && (!state.preedit.is_empty()
+                || state
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.minibuffer_active()))
+        {
+            // The source field still owns this composition or minibuffer. Consume the
+            // press too, so a reader control cannot take its focus later in this event.
+            return true;
+        }
+        let divider_changed = divider && !dragging;
+        if (focus_changed || divider_changed)
+            && let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+        {
+            if focus_changed
+                && let (Some(workspace), Some(focus)) = (state.markdown.as_mut(), focus)
+            {
+                workspace.focus = focus;
+                state.common.last_focus = (focus == MarkdownPane::Editor)
+                    .then(|| crate::native_ui::UiKey::new("editor/buffer"));
+                state.common.retire_input();
+            }
+            if divider_changed {
+                state.common.pressed =
+                    Some(crate::native_ui::UiKey::new("editor/markdown/divider"));
+            }
+        }
+        if focus_changed || divider_changed {
+            self.invalidate_native_pointer_style(wid, view);
+            self.request_redraw_all_windows();
+        }
+        divider
+    }
+
     fn native_editor_pointer_target(
         &self,
         wid: WindowId,
@@ -4128,6 +4267,9 @@ impl App {
             || self.active_native_view(wid).is_some())
         .then(|| self.active_visible_leaf_plan(wid))
         .flatten();
+        if self.markdown_workspace_pointer(wid, x, y, motion_plan.as_ref(), false) {
+            return;
+        }
         let over_pane_header = self
             .pane_header_at_with_plan(wid, geom, x, y, motion_plan.as_ref())
             .is_some();
@@ -5661,6 +5803,9 @@ impl App {
                     return None;
                 }
                 let press_plan = input_plan.as_ref();
+                if self.markdown_workspace_pointer(wid, px, py, press_plan, true) {
+                    return native_press;
+                }
                 let editor_target = self.native_editor_pointer_target(wid, px, py, press_plan);
                 let grid_target = self.native_editor_grid_target(wid, px, py, press_plan);
                 let press = self
@@ -8485,6 +8630,7 @@ mod tests {
         )
     }
 
+    #[track_caller]
     fn prepare_presented_native(
         app: &mut crate::App,
         wid: crate::WindowId,
@@ -10086,6 +10232,203 @@ mod tests {
     }
 
     #[test]
+    fn markdown_divider_drag_outside_its_leaf_clamps_without_changing_document_identity() {
+        use crate::native_app::{AppKind, AppViewState, MarkdownWorkspaceMode, NativeApp};
+        use crate::{App, WindowId};
+
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("divider.md");
+        std::fs::write(&path, "# Heading\n\nA paragraph.\n").unwrap();
+        let wid = WindowId(0);
+        for (width, stacked) in [(1400, false), (500, true)] {
+            let mut app = App::headless_for_test();
+            app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(width, 900));
+            app.open_document_tab(AppKind::Markdown, &file_uri(&path))
+                .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            let generation = app.native_runtime.view_generation(view);
+            let tabs = app.windows[&wid].tab_set.len();
+            assert!(app.native_runtime.set_editor_markdown_mode(
+                instance,
+                view,
+                MarkdownWorkspaceMode::Split
+            ));
+            let viewport = app.native_ui_viewport_for(wid, view).unwrap();
+            let layout = match (
+                app.native_runtime.app(instance),
+                app.native_runtime.view_state(view),
+            ) {
+                (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state))) => {
+                    editor.workspace_layout(state, viewport)
+                }
+                _ => panic!("Markdown editor"),
+            };
+            assert_eq!(layout.stacked, stacked);
+            let divider = layout.divider.unwrap();
+            let center = (
+                divider.x + divider.width / 2.0,
+                divider.y + divider.height / 2.0,
+            );
+            let (x, y) = native_content_to_window(&mut app, wid, center.0, center.1);
+            assert!(app.markdown_workspace_pointer(wid, x, y, None, true));
+            for (outside, expected) in [
+                (-500.0, 200),
+                (viewport.width.max(viewport.height) + 500.0, 800),
+            ] {
+                let (x, y) = if stacked {
+                    native_content_to_window(&mut app, wid, center.0, outside)
+                } else {
+                    native_content_to_window(&mut app, wid, outside, center.1)
+                };
+                assert!(
+                    app.retained_native_leaf_at_pointer(wid, x, y).is_none(),
+                    "the pointer is outside every native leaf"
+                );
+                assert!(app.markdown_workspace_pointer(wid, x, y, None, false));
+                let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                    panic!("editor");
+                };
+                assert_eq!(state.markdown.as_ref().unwrap().split_per_mille, expected);
+                assert_eq!(app.active_native_view(wid), Some((instance, view)));
+                assert_eq!(app.native_runtime.view_generation(view), generation);
+                assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+                let after = app.document_store.snapshot(document).unwrap();
+                assert_eq!(
+                    (after.seq, after.text),
+                    (snapshot.seq, snapshot.text.clone())
+                );
+            }
+            app.settle_native_pointer_press(wid);
+            prepare_presented_native(&mut app, wid);
+            let layout = match (
+                app.native_runtime.app(instance),
+                app.native_runtime.view_state(view),
+            ) {
+                (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state))) => {
+                    editor.workspace_layout(state, viewport)
+                }
+                _ => panic!("Markdown editor"),
+            };
+            let source = layout.editor.unwrap();
+            let (x, y) = native_content_to_window(&mut app, wid, source.x + 2.0, source.y + 2.0);
+            let before = app.native_runtime.view_state(view).unwrap().common();
+            let epoch = before.content_epoch;
+            let lifetime = before.input_lifetime();
+            assert!(!app.markdown_workspace_pointer(wid, x, y, None, true));
+            let after = app.native_runtime.view_state(view).unwrap().common();
+            assert_eq!(
+                after.content_epoch, epoch,
+                "clicking the focused pane changes no workspace state"
+            );
+            assert!(std::sync::Arc::ptr_eq(&lifetime, &after.input_lifetime()));
+            let reader = layout.reader.unwrap();
+            let (x, y) = native_content_to_window(&mut app, wid, reader.x + 2.0, reader.y + 2.0);
+            assert!(!app.markdown_workspace_pointer(wid, x, y, None, true));
+            assert!(!std::sync::Arc::ptr_eq(
+                &lifetime,
+                &app.native_runtime
+                    .view_state(view)
+                    .unwrap()
+                    .common()
+                    .input_lifetime()
+            ));
+            assert!(
+                app.retained_native_pointer_artifact(wid, view).is_some(),
+                "changing pane focus preserves same-press hit geometry"
+            );
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    #[test]
+    fn markdown_reader_pointer_keeps_source_composition_until_it_commits() {
+        use crate::native_app::{
+            AppKind, AppViewState, MarkdownPane, MarkdownWorkspaceMode, NativeApp,
+        };
+        use crate::{App, WindowId};
+
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("composition.md");
+        std::fs::write(&path, "# Heading\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Markdown, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        assert!(app.native_runtime.set_editor_markdown_mode(
+            instance,
+            view,
+            MarkdownWorkspaceMode::Split
+        ));
+        app.on_ime_preedit(wid, "composed".into(), Some((8, 8)));
+        let viewport = app.native_ui_viewport_for(wid, view).unwrap();
+        let reader = match (
+            app.native_runtime.app(instance),
+            app.native_runtime.view_state(view),
+        ) {
+            (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state))) => {
+                assert!(
+                    !state.preedit.is_empty(),
+                    "the source owns an active composition"
+                );
+                editor.workspace_layout(state, viewport).reader.unwrap()
+            }
+            _ => panic!("Markdown editor"),
+        };
+        let (x, y) = native_content_to_window(&mut app, wid, reader.x + 2.0, reader.y + 2.0);
+        let lifetime = app
+            .native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .input_lifetime();
+        assert!(
+            app.markdown_workspace_pointer(wid, x, y, None, true),
+            "a blocked focus change consumes the whole reader press"
+        );
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor");
+        };
+        assert_eq!(state.markdown.as_ref().unwrap().focus, MarkdownPane::Editor);
+        assert!(std::sync::Arc::ptr_eq(
+            &lifetime,
+            &state.common.input_lifetime()
+        ));
+        app.on_ime_commit(wid, "composed".into());
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "composed# Heading\n"
+        );
+        app.compiled_native_ui(wid)
+            .expect("semantic tree after first IME commit");
+        prepare_presented_native(&mut app, wid);
+        assert!(!app.markdown_workspace_pointer(wid, x, y, None, true));
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor");
+        };
+        assert!(state.preedit.is_empty());
+        assert_eq!(state.markdown.as_ref().unwrap().focus, MarkdownPane::Reader);
+        app.compiled_native_ui(wid)
+            .expect("semantic tree after reader focus");
+        prepare_presented_native(&mut app, wid);
+        assert!(app.native_runtime.focus_markdown_editor(instance, view));
+        app.on_ime_preedit(wid, "next".into(), Some((4, 4)));
+        app.compiled_native_ui(wid)
+            .expect("semantic tree after second IME preedit");
+        prepare_presented_native(&mut app, wid);
+        app.on_ime_commit(wid, "next".into());
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "composednext# Heading\n",
+            "the host's source-focus helper settles input identity before the next composition"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
     fn markdown_pointer_selects_the_exact_authored_block_through_semantic_hit_testing() {
         use crate::native_app::{AppKind, AppViewState};
         use crate::native_ui::UiContent;
@@ -10129,10 +10472,13 @@ mod tests {
         app.on_cursor_moved(wid, x, y);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(view) else {
-            panic!("Markdown view changed kind");
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("Markdown workspace changed kind");
         };
-        assert_eq!(state.selection, Some(expected.clone()));
+        assert_eq!(
+            state.markdown.as_ref().unwrap().reader.selection,
+            Some(expected.clone())
+        );
         assert_eq!(&source[expected], "# **Heading**\n");
         let _ = std::fs::remove_dir_all(dir);
     }

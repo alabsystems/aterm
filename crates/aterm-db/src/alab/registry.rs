@@ -1085,10 +1085,11 @@ crate::att_collection!(
     /// collapses. `name` is a file name only. Version 2 adds the `fleet-db` kind (a replica's
     /// dump, one source per table) and `differs`: the cells this source stated differently from
     /// the registry when it was imported, by row key and column only, never a value, which the
-    /// table view shows until the owner settles them (one-mesh design §8).
+    /// table view shows until the owner settles them (one-mesh design §8). Version 3 types the
+    /// differing row and element as structural keys, including decimal-only digest tails.
     pub SOURCE = Collection {
         name: "source",
-        version: 2,
+        version: 3,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "sr",
@@ -1218,7 +1219,7 @@ pub const DIFFERS: &[Member] = &[
     },
     Member {
         name: "pk",
-        ty: Ty::Text(32),
+        ty: Ty::Key,
         null: false,
     },
     Member {
@@ -1228,7 +1229,7 @@ pub const DIFFERS: &[Member] = &[
     },
     Member {
         name: "elem",
-        ty: Ty::Text(64),
+        ty: Ty::Key,
         null: true,
     },
 ];

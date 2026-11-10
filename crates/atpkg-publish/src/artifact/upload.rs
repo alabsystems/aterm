@@ -329,7 +329,7 @@ pub(crate) fn reserve_pack_version(
         Err(HostError::NotFound) => {
             // Only independent reservation metadata precedes the archives. A racing
             // create or a lost response is reconciled by reading the actual release.
-            let made = host.create(
+            let made = host.create_draft(
                 owner,
                 tag,
                 &title,

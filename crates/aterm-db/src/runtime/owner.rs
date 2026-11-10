@@ -101,18 +101,21 @@ impl Drop for Lease {
 
 /// Shared advisory lock (`window.lock`) held by an interactive `aterm` runtime once its first
 /// LAN gate opens. `aterm node serve` yields observer and transport ownership while a ready
-/// window runs, and takes them back once the last such window exits.
+/// window runs, and takes them back once the last such window exits. Claims and probes
+/// retain the observer configuration identity and resolve its current state directory,
+/// so a history migration preserves the same held claim.
 pub(super) struct WindowClaim {
     file: File,
 }
 impl WindowClaim {
-    pub(super) fn acquire(dir: &Path) -> Result<Self> {
+    pub(super) fn acquire(config: &Path) -> Result<Self> {
+        let dir = crate::network_state::directory(config);
         // Only the observer prepares or migrates its directory. A pre-open claim
         // must not create a legacy directory beside a concurrently prepared fence.
-        private_file::check_private_dir(dir)?;
+        private_file::check_private_dir(&dir)?;
         aterm_secrets::fsx::write_new(&dir.join("window.lock"), b"", 0o600)
             .map_err(|_| Error::new("Commons window claim cannot be created"))?;
-        let (file, _) = aterm_uds::kept_out(|| private_file::open_private(dir, "window.lock"))
+        let (file, _) = aterm_uds::kept_out(|| private_file::open_private(&dir, "window.lock"))
             .map_err(|_| Error::new("Commons window claim is not private"))?;
         #[expect(
             clippy::disallowed_methods,
@@ -135,9 +138,10 @@ impl Drop for WindowProbe {
     }
 }
 
-/// Whether at least one local interactive `aterm` window holds [`WindowClaim`] in `dir`.
-pub(super) fn window_claimed(dir: &Path) -> bool {
-    let Ok((file, _)) = aterm_uds::kept_out(|| private_file::open_private(dir, "window.lock"))
+/// Whether a local interactive `aterm` window holds [`WindowClaim`] for `config`.
+pub(super) fn window_claimed(config: &Path) -> bool {
+    let dir = crate::network_state::directory(config);
+    let Ok((file, _)) = aterm_uds::kept_out(|| private_file::open_private(&dir, "window.lock"))
     else {
         return false;
     };
@@ -157,19 +161,61 @@ pub(super) fn window_claimed(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{WindowClaim, private_file, window_claimed};
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::MetadataExt as _;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn window_claim_follows_observer_migration_and_preserves_release_identity() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let legacy = config.with_file_name("network-state");
+        private_file::create_private_dir(&legacy).unwrap();
+        let claim = WindowClaim::acquire(&config).unwrap();
+        assert!(window_claimed(&config));
+        assert_eq!(crate::network_state::directory(&config), legacy);
+        let before = std::fs::metadata(legacy.join("window.lock")).unwrap();
+
+        let history = crate::network_state::Observer::open(
+            &config,
+            crate::network_state::ObservationHandle::default(),
+        )
+        .unwrap();
+        let current = crate::network_state::directory(&config);
+        assert_ne!(current, legacy);
+        assert!(legacy.is_file(), "the retired directory remains fenced");
+        let after = std::fs::metadata(current.join("window.lock")).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert!(
+            window_claimed(&config),
+            "migration keeps the held claim visible"
+        );
+
+        drop(claim);
+        assert!(!window_claimed(&config));
+        let claim = WindowClaim::acquire(&config).unwrap();
+        assert!(
+            window_claimed(&config),
+            "a new claim uses the migrated directory"
+        );
+        drop(claim);
+        assert!(!window_claimed(&config));
+        drop(history);
+    }
 
     #[test]
     fn a_window_claim_never_creates_the_observers_directory() {
         let root = aterm_tempfile::tempdir().unwrap();
-        let dir = root.path().join("network-state");
-        assert!(WindowClaim::acquire(&dir).is_err());
+        let config = root.path().join("config");
+        let dir = crate::network_state::directory(&config);
+        assert!(WindowClaim::acquire(&config).is_err());
         assert!(!dir.exists(), "the observer alone prepares its directory");
 
         private_file::create_private_dir(&dir).unwrap();
-        let claim = WindowClaim::acquire(&dir).unwrap();
-        assert!(window_claimed(&dir));
+        let claim = WindowClaim::acquire(&config).unwrap();
+        assert!(window_claimed(&config));
         drop(claim);
-        assert!(!window_claimed(&dir));
+        assert!(!window_claimed(&config));
     }
 }

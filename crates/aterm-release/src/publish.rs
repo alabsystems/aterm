@@ -26,7 +26,7 @@ use crate::{
 };
 
 #[path = "publish/draft.rs"]
-mod draft;
+pub(crate) mod draft;
 
 /// Every `cut` flag, parsed by `cli.rs`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -247,7 +247,7 @@ pub fn fmt_elapsed(start: Instant) -> String {
     }
 }
 
-/// Read the source tree's `[workspace.package]` `MAJOR.MINOR.0` version.
+/// Read the source tree's `[workspace.package]` product version.
 pub fn workspace_version(cargo_toml: &str) -> Result<String> {
     let mut in_pkg = false;
     for line in cargo_toml.lines() {
@@ -270,44 +270,25 @@ pub fn workspace_version(cargo_toml: &str) -> Result<String> {
     ))
 }
 
-fn version_components(version: &str) -> Result<(u64, u64, u64)> {
-    ledger::check_version_shape(version)?;
-    let mut parts = version.split('.').map(|p| {
-        p.parse::<u64>()
-            .map_err(|_| Error::new(format!("version {version:?} has an out-of-range component")))
-    });
-    let major = parts.next().expect("checked three components")?;
-    let minor = parts.next().expect("checked three components")?;
-    let patch = parts.next().expect("checked three components")?;
-    Ok((major, minor, patch))
-}
-
 /// The version a cut publishes.
 pub fn release_version_from_workspace(workspace: &str) -> Result<String> {
-    let (_, _, patch) = version_components(workspace).map_err(|error| {
-        Error::new(format!(
-            "Cargo.toml [workspace.package] version is not canonical MAJOR.MINOR.0: {error}"
-        ))
-    })?;
-    if patch != 0 {
-        return Err(Error::new(format!(
-            "Cargo.toml [workspace.package] version is {workspace}, and a release is \
-             MAJOR.MINOR.0 — the version every build reports, which `pub publish` only \
-             publishes with a 0 patch. Bump the MINOR (`pub bump aterm --minor --write`)."
-        )));
-    }
+    product_version(workspace)?;
     Ok(workspace.to_string())
 }
 
-/// The next release version after `release`.
-pub fn bump_minor_release(release: &str) -> Result<String> {
-    let (major, minor, _patch) = version_components(release)?;
-    let minor = minor.checked_add(1).ok_or_else(|| {
-        Error::new(format!(
-            "version {release:?} cannot bump MINOR without overflow"
-        ))
-    })?;
-    Ok(format!("{major}.{minor}.0"))
+fn product_version(version: &str) -> Result<aterm_types::release_version::ReleaseVersion> {
+    aterm_types::release_version::ReleaseVersion::parse(version).ok_or_else(|| Error::new(format!(
+        "version {version:?} is not a historical MAJOR.MINOR.0 or calendar 1.YYYYMMDD.N product release"
+    )))
+}
+
+/// Select a new cut identity from the committed product version at a fixed UTC time.
+/// Legacy sources keep their existing minor policy until a source claim adopts calendar form.
+pub fn allocate_release_after(release: &str, selected_at: u64) -> Result<String> {
+    product_version(release)?
+        .next_at(selected_at)
+        .map(|v| v.to_string())
+        .map_err(|e| Error::new(e.to_string()))
 }
 
 /// "owner/repo" from `[workspace.package] repository`.
@@ -6561,7 +6542,12 @@ fn discard_on_lost_race(
     if !lost {
         return error;
     }
-    let left = discard_signed(dist, version, build);
+    let left = discard_signed(
+        dist,
+        version,
+        build,
+        crate::release::SignedDiscard::LostReservation,
+    );
     Error::new(format!(
         "{error}. The copy signed, notarized and packaged privately as build {build} was \
          discarded{}; nothing of it was made public",
@@ -8097,13 +8083,29 @@ pub(crate) fn signed_copy_stands(
 
 /// Discard build `build`'s privately signed copy of `version` from `dist/`: its record, its
 /// staging directory, both containers, their stable twins and sidecars, and its provenance.
-/// Nothing of it was public. Returns what could not be removed (the next cut's staging prunes a
-/// staging directory a live process held).
-pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<String> {
+/// Cancellation retains a journaled draft and its bytes; only a lost reservation invalidates
+/// that copy. Returns what could not be removed (the next cut's staging prunes a staging
+/// directory a live process held).
+pub(crate) fn discard_signed(
+    dist: &Path,
+    version: &str,
+    build: u64,
+    reason: crate::release::SignedDiscard,
+) -> Vec<String> {
     let mut left = Vec::new();
-    if let Err(error) = draft::discard(dist, version, build) {
-        left.push(error.to_string());
-        return left;
+    let retain = match reason {
+        crate::release::SignedDiscard::CancelPreparation => draft::has_journal(dist),
+        crate::release::SignedDiscard::LostReservation => {
+            draft::discard(dist, version, build).map(|()| false)
+        }
+    };
+    match retain {
+        Ok(true) => return left,
+        Ok(false) => {}
+        Err(error) => {
+            left.push(error.to_string());
+            return left;
+        }
     }
     if let Err(error) = forget_signed_record(dist, build) {
         left.push(error.to_string());
@@ -8140,12 +8142,13 @@ pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<Stri
     left
 }
 
-pub(crate) fn discard_draft(dist: &Path, version: &str, build: u64) -> Vec<String> {
-    draft::discard(dist, version, build)
-        .err()
-        .into_iter()
-        .map(|e| e.to_string())
-        .collect()
+/// The private draft `cut --sign` journaled in `dist` for `version`: its release id, or why the
+/// journal cannot be read.
+pub(crate) fn journaled_draft(
+    dist: &Path,
+    version: &str,
+) -> std::result::Result<Option<u64>, String> {
+    draft::journaled_release(dist, version).map_err(|e| e.to_string())
 }
 
 /// The self-check of a copy `cut --sign` signed and the claim adopted: the manifest's `team` is
@@ -9204,13 +9207,22 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
             &format!("repos/{slug}/releases/{release_id}"),
             Some(&channel::head_patch_body()),
             || {
-                let current = release_object_by_id(slug, release_id)?;
+                let release = crate::github::get(&format!("repos/{slug}/releases/{release_id}"))?;
+                let current = parse_release_object_response(release.to_string().as_bytes())?;
                 validate_channel_release_capability(
-                    current.as_ref(),
+                    Some(&current),
                     release_id,
                     &ctx.tag,
                     expect_draft,
                 )?;
+                let missing = channel::source_attestation_findings(&release);
+                if !missing.is_empty() {
+                    return Err(Error::new(format!(
+                        "release ID {release_id} lacks a unique signed source manifest: {}; \
+                         finish pub sign-release aterm, then resume the cut",
+                        missing.join("; ")
+                    )));
+                }
                 ensure_ctx_release_lease(ctx)?;
                 Ok(())
             },
@@ -12016,7 +12028,15 @@ mod signed_copy_tests {
         .unwrap();
         assert!(prepared_record(&dist, &record.key).is_err());
         assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
-        assert!(discard_signed(&dist, VERSION, BUILD).is_empty());
+        assert!(
+            discard_signed(
+                &dist,
+                VERSION,
+                BUILD,
+                crate::release::SignedDiscard::CancelPreparation
+            )
+            .is_empty()
+        );
         assert!(prepared_record(&dist, &record.key).unwrap().is_none());
         assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
     }
@@ -12114,7 +12134,15 @@ mod signed_copy_tests {
         let (_dir, dist, _) = signed_dist();
         let kept = dist.join("notes-0.5.0.md");
         fs::write(&kept, b"notes").unwrap();
-        assert_eq!(discard_signed(&dist, VERSION, BUILD), Vec::<String>::new());
+        assert_eq!(
+            discard_signed(
+                &dist,
+                VERSION,
+                BUILD,
+                crate::release::SignedDiscard::LostReservation
+            ),
+            Vec::<String>::new()
+        );
         assert_eq!(read_signed_record(&dist, BUILD), Ok(None));
         assert!(!dist.join(bundle::staging_dir_name(BUILD)).exists());
         for name in [
@@ -12129,7 +12157,12 @@ mod signed_copy_tests {
         }
         assert!(kept.exists(), "what is not the copy's stays");
         assert_eq!(
-            discard_signed(&dist, VERSION, BUILD),
+            discard_signed(
+                &dist,
+                VERSION,
+                BUILD,
+                crate::release::SignedDiscard::LostReservation
+            ),
             Vec::<String>::new(),
             "a second discard finds nothing"
         );

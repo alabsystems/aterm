@@ -252,6 +252,21 @@ fn a_create_is_a_draft_uploaded_to_then_published_as_a_prerelease() {
             .len(),
         2
     );
+    let before = rig.fake.seen().len();
+    host.create_draft(&slug(), "reserved-pack", "pack", "notes", &files)
+        .expect("the draft reservation");
+    let (reserved, held) = rig.state("reserved-pack");
+    assert!(reserved.draft);
+    assert_eq!(held, assets);
+    let writes: Vec<_> = rig.fake.seen()[before..]
+        .iter()
+        .filter(|seen| seen.method != "GET")
+        .map(|seen| format!("{:?} {}", seen.origin, seen.method))
+        .collect();
+    assert_eq!(writes, ["Api POST", "Uploads POST", "Uploads POST"]);
+    host.publish_draft(&slug(), "reserved-pack")
+        .expect("the explicit publish");
+    assert!(!rig.state("reserved-pack").0.draft);
     rig.fake.assert_clean();
 }
 

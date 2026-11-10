@@ -165,17 +165,26 @@ fn me(
         .find(|binding| binding.actor() == actor)
         .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
     let paths = session.paths();
-    let logged = aterm_secrets::client::trusted_commons_log(paths, trust)
+    let log = aterm_secrets::client::trusted_commons_log(paths, trust)
         .ok()
         .flatten()
-        .and_then(|(log, _)| log.membership_ref().label(&actor).map(str::to_owned));
+        .map(|(log, _)| log);
+    let logged = log
+        .as_ref()
+        .and_then(|log| log.membership_ref().label(&actor).map(str::to_owned));
+    let chosen = log.as_ref().and_then(|log| {
+        log.membership_ref()
+            .label_after_choice(&actor)
+            .map(str::to_owned)
+    });
     let recipient = binding.recipient().to_bech32();
     let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
         .map_err(crate::table::failure)?;
     let (rostered, enrolled_ms) = roster_identity(roster.as_ref(), &recipient);
     Ok(Me {
         uuid: keys::uuid32(binding.machine()),
-        label: chosen_label(logged, rostered),
+        label: chosen.clone().or_else(|| chosen_label(logged, rostered)),
+        chosen,
         hw_hint: keys::hw_hint(&trust.network, &probe.platform_uuid),
         enrolled_ms,
     })

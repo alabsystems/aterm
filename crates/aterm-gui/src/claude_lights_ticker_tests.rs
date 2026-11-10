@@ -20,7 +20,7 @@ use crate::harness_glass::{Arrival, on_act, on_act_at};
 type Switch = (&'static str, fn(&mut App, bool));
 
 /// The chips at rest on a hosted bypass pane: Cruise's glyph and the bit.
-const CHIPS: &str = "\u{221e} yolo";
+const CHIPS: &str = "\u{221e} \u{25cf} yolo";
 
 fn ticker_app(cols: u16) -> (App, WindowId, u64, (Hosted, UnixStream)) {
     let (mut app, wid, session, reader) = app();
@@ -506,7 +506,7 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
                 || matches!(c.chip, HarnessChip::Switch | HarnessChip::Title)),
         "{chips:?}"
     );
-    assert_eq!(chips[1].label, "Permission mode: yolo.");
+    assert_eq!(chips[1].label, "Permission mode: yolo on.");
     let strip = usize::from(app.chrome_rows(wid));
     let (row, col) = hit(&app, wid, Chip::Autopilot);
     assert_eq!(
@@ -613,24 +613,28 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     use aterm_agent::harness::lights::Mode;
     use aterm_agent::harness::permission_click::Look;
     let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
-    // What a screen reader hears of the light in `mode`: what the bit means first (no
-    // permission prompts on yolo, not yolo on lame), naming no mode but the bit, and the bit a
-    // click asks last (`lame` from bypass, `yolo` from any other), as sentences with none of the
-    // hover's separators.
+    // What a screen reader hears of the light in `mode`: the mode in Claude's own words first,
+    // then what a press does: on the off chip it turns yolo on, on the on chip nothing (no press
+    // is offered, only what bypass means), as sentences with none of the hover's separators.
     let spoken = |description: Option<&str>, mode: Mode| {
         let said = description.unwrap_or_else(|| panic!("{mode:?}: a description"));
-        let (head, to) = if mode == Mode::Bypass {
-            ("No permission prompts.", "lame")
-        } else {
-            ("Not yolo.", "yolo")
+        let (head, last) = match mode {
+            Mode::Bypass => ("Bypass permissions on.", " No prompts."),
+            Mode::Plan => ("Plan mode on.", " Click to turn yolo on."),
+            _ => ("Manual mode on.", " Click to turn yolo on."),
         };
         assert!(
             said.starts_with(head),
-            "{mode:?}: what it means, first: {said:?}"
+            "{mode:?}: the mode, first: {said:?}"
         );
         assert!(
-            said.ends_with(&format!(" {to}.")),
-            "{mode:?}: where a press goes, last: {said:?}"
+            said.ends_with(last),
+            "{mode:?}: what a press does, last: {said:?}"
+        );
+        assert_eq!(
+            said.contains("Click"),
+            mode != Mode::Bypass,
+            "{mode:?}: a press is offered on the off chip alone: {said:?}"
         );
         assert!(
             !said.contains('\u{2014}') && !said.contains('\u{b7}'),
@@ -657,18 +661,27 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let strip = usize::from(app.chrome_rows(wid));
-    // The light says the bit: bypass reads `yolo`, its description says what it means and where a
-    // press goes, and a press clicks it, typing nothing, its restart landing at the lane's look.
+    // The light says the bit: bypass reads `yolo on`, its description says the mode and what it
+    // means, and a press on it does nothing: yolo is never turned off by a press, nothing is
+    // typed and no click stands.
     let yolo = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
-    assert_eq!(yolo.label, "Permission mode: yolo.");
+    assert_eq!(yolo.label, "Permission mode: yolo on.");
     spoken(yolo.description.as_deref(), Mode::Bypass);
-    clickable(&mut app, session, Look::Done);
+    clickable(
+        &mut app,
+        session,
+        Look::Waits(aterm_agent::harness::permission_click::Wait::Turn),
+    );
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
     assert!(
         pty(&mut reader, 0).is_empty(),
         "a press on yolo types nothing"
     );
-    assert!(standing(&app, session).is_none(), "its restart landed");
+    assert!(
+        standing(&app, session).is_none(),
+        "and stands no click: a press never turns yolo off"
+    );
+    clickable(&mut app, session, Look::Done);
     draw_claude(
         &app,
         session,
@@ -676,19 +689,22 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     );
     app.on_claude_footer_changed(session);
     frame(&mut app, wid);
-    let lame = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
+    let off = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
     assert_eq!(
-        lame.label, "Permission mode: lame.",
+        off.label, "Permission mode: yolo off.",
         "the painted word is in the name"
     );
-    spoken(lame.description.as_deref(), Mode::Manual);
+    spoken(off.description.as_deref(), Mode::Manual);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
     let light = of(&chips, HarnessChip::Mode).unwrap_or_else(|| panic!("{chips:?}"));
     let (row, col) = hit(&app, wid, MODE);
     assert_eq!((light.row, light.col), (row - strip, col));
-    assert_eq!(light.label, "Permission mode: lame.", "plan is not yolo");
+    assert_eq!(
+        light.label, "Permission mode: yolo off.",
+        "plan is not yolo"
+    );
     spoken(light.description.as_deref(), Mode::Plan);
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
     let label = crate::claude_footer::probe::harness_label(aterm_phase::CliHarness::ClaudeCode);
@@ -720,8 +736,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     let title = of(&app.claude_chips_a11y(wid), HarnessChip::Title).expect("the title slot");
     assert_eq!(title.row, row - strip);
     assert!(
-        title.label.starts_with("not yolo"),
-        "the title says what the bit means: {:?}",
+        title.label.starts_with("plan mode on"),
+        "the title says the mode: {:?}",
         title.label
     );
     assert!(

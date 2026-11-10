@@ -138,7 +138,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 fn publication_chain_refines_current_predecessor_and_retry_laws() {
     let model = aterm_models_db::publication_chain_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
+    // The global non_vacuity target sweeps this registered model.
     let mut checked = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

@@ -146,16 +146,6 @@ fn file_events(duration: std::time::Duration) -> ExitCode {
         }
         _ => None,
     };
-    let before = footprint();
-    let start = std::time::Instant::now();
-    let census = match aterm_sysprobe::file_events::capture(duration) {
-        Ok(census) => census,
-        Err(error) => {
-            eprintln!("file-events: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let elapsed = start.elapsed().as_secs_f64();
     let mut roots: Vec<_> = [
         aterm_types::dirs::aterm_config_dir(),
         aterm_types::dirs::account_state_dir(),
@@ -178,6 +168,20 @@ fn file_events(duration: std::time::Duration) -> ExitCode {
         .into_iter()
         .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
         .collect();
+    let before = footprint();
+    let start = std::time::Instant::now();
+    let census = match aterm_sysprobe::file_events::capture(
+        duration,
+        aterm_sysprobe::file_events::Granularity::Directories(&roots),
+        || {},
+    ) {
+        Ok(census) => census,
+        Err(error) => {
+            eprintln!("file-events: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elapsed = start.elapsed().as_secs_f64();
     println!(
         "file-events: delivered destinations, not writer attribution; seconds={elapsed:.3} dropped_markers={} overflow={}; fseventsd (pid,start_s,bytes) before={before:?} after={:?}",
         census.dropped,

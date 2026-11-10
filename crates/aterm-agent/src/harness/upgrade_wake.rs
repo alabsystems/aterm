@@ -559,7 +559,11 @@ fn wait_exit_inner(
             super::upgrade_drive::kernel_start(pid).is_some_and(|now| now != born)
         })
     };
-    let gone = || !super::upgrade_drive::alive(pid) || zombie(pid) || reborn();
+    // Gone by the one rule every reader of a process's life holds ([`super::upgrade_drive::alive`],
+    // `aterm_uds::process::process_presence`): an exited task with no other thread left, never a
+    // main thread that exited while its other threads run, so the exit this wait reports is the
+    // one [`super::upgrade_drive::St::agent_exit`] reads next.
+    let gone = || !super::upgrade_drive::alive(pid) || reborn();
     #[cfg(target_os = "macos")]
     if let Ok(kq) = kqueue() {
         use std::os::fd::AsRawFd as _;
@@ -604,38 +608,6 @@ fn wait_exit_inner(
         std::thread::sleep(Duration::from_millis(250));
     }
     (gone(), None)
-}
-
-/// Whether `pid` has exited and waits for its parent to reap it, which
-/// `kill(pid, 0)` still finds.
-#[cfg(target_os = "linux")]
-fn zombie(pid: u32) -> bool {
-    aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
-        .is_ok_and(|stat| stat_exited(&stat))
-}
-
-/// Whether one `/proc/<pid>/stat` line names a process that has exited: its
-/// state, the field after the command's last closing parenthesis (a command
-/// may hold one), is `Z` (a zombie) or `X` (dead).
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn stat_exited(stat: &str) -> bool {
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.trim_start().chars().next())
-        .is_some_and(|state| matches!(state, 'Z' | 'X'))
-}
-
-/// [`zombie`] on Apple kernels (`proc_pidinfo` `SZOMB` or off the live list).
-#[cfg(target_vendor = "apple")]
-fn zombie(pid: u32) -> bool {
-    i32::try_from(pid).is_ok_and(|p| {
-        aterm_uds::process::process_presence(p) == aterm_uds::process::ProcessPresence::Exited
-    })
-}
-
-/// [`zombie`] where the kernel names none (see there).
-#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-const fn zombie(_pid: u32) -> bool {
-    false
 }
 
 /// A kqueue of our own, close-on-exec, the trigger's user event registered
@@ -981,15 +953,6 @@ mod tests {
         );
         assert_eq!(calls, 1, "CONTROL: another errno is not waited again");
         assert_eq!(kq_wait_by(wait, |_, _| Ok(0)).unwrap(), None, "CONTROL");
-    }
-
-    #[test]
-    fn a_proc_stat_line_names_an_exited_process_by_its_state() {
-        assert!(stat_exited("4242 (claude) Z 4100 4242 4100 0 -1"));
-        assert!(stat_exited("4242 (claude) X 4100"));
-        assert!(!stat_exited("4242 (claude) S 4100 4242 4100 0 -1"));
-        assert!(!stat_exited("4242 (a) Z b) R 4100"));
-        assert!(!stat_exited(""));
     }
 
     const HANG: Duration = Duration::from_secs(60);
@@ -1436,7 +1399,6 @@ mod tests {
             0,
             "kill(pid, 0) still finds a zombie"
         );
-        assert!(zombie(pid), "a zombie reads as exited before reap");
         assert!(
             !super::super::upgrade_drive::alive(pid),
             "an unreaped zombie is not live"

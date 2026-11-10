@@ -1,13 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Evidence for a future split-journal protocol, not a production reservation writer.
+//! Shared-namespace exclusion and missing complete-history evidence.
 
 use super::*;
 
 fn recipes(paths: &Paths, mut marked: Prepare) -> (Prepare, Prepare) {
-    super::mode::complete(&mut marked);
-    marked.rejection_domain = Some(rejection_domain_at(paths).unwrap());
+    super::mode::enrolled(paths, &mut marked);
     let mut unmarked = marked.clone();
     unmarked.receipt_mode = None;
     assert!(Request::prepare(marked.clone()).encode().is_some());
@@ -15,7 +14,7 @@ fn recipes(paths: &Paths, mut marked: Prepare) -> (Prepare, Prepare) {
     (marked, unmarked)
 }
 
-fn reservation_body(
+pub(super) fn reservation_body(
     key: &Key,
     view: &View,
     marked: &Prepare,
@@ -31,12 +30,21 @@ fn reservation_body(
     )
 }
 
-fn append_reservation_fixture(paths: &Paths, marked: &Prepare, binding: &Binding, event: Event) {
+pub(super) fn append_reservation_fixture(
+    paths: &Paths,
+    marked: &Prepare,
+    binding: &Binding,
+    event: Event,
+) {
+    if event == Event::Prepare {
+        super::super::reservation::reserve_at(paths, marked, binding, LIMITS).unwrap();
+        return;
+    }
     let key = write_key(paths).unwrap();
     let (mut log, mut view) = open(paths, &key, LIMITS).unwrap();
     let body = reservation_body(&key, &view, marked, binding, event);
     // Exercise the existing parser's identity and transition checks before appending.
-    // Only this fixture bypasses the production writer's explicit mode refusal.
+    // Later lifecycle states remain a fixture until the protocol implements closure.
     view.ingest_bounded(&key, &body, LIMITS).unwrap();
     log.append(ISSUER_SUBJECT, body).unwrap();
 }
@@ -52,7 +60,7 @@ fn separate_journals_can_both_own_the_same_operation_without_a_shared_reservatio
     record_event_at(&legacy, &unmarked, &binding, Some(Event::Prepare)).unwrap();
     recipients::append_fixture(
         &complete,
-        &marked,
+        &unmarked,
         &binding,
         testing::RecipientAppend::Prepare,
     )
@@ -64,7 +72,7 @@ fn separate_journals_can_both_own_the_same_operation_without_a_shared_reservatio
         Closure::Exact(Recorded::Prepared)
     );
     assert!(
-        recipients::observe_at(&complete, &marked)
+        recipients::observe_at(&complete, &unmarked)
             .unwrap()
             .is_some()
     );
@@ -128,6 +136,7 @@ fn legacy_quarantine_cannot_be_inserted_after_another_recipe_owns_the_id() {
     let (_home, paths, prepare, binding) = fixture();
     let (marked, unmarked) = recipes(&paths, prepare);
     record_event_at(&paths, &unmarked, &binding, Some(Event::Prepare)).unwrap();
+    assert!(super::super::reservation::reserve_at(&paths, &marked, &binding, LIMITS).is_err());
     let key = existing_key(&paths).unwrap();
     let (_log, mut view) = open_existing(&paths, &key, LIMITS).unwrap();
     let body = reservation_body(&key, &view, &marked, &binding, Event::Prepare);
@@ -140,19 +149,13 @@ fn legacy_quarantine_cannot_be_inserted_after_another_recipe_owns_the_id() {
 
 #[test]
 fn a_legacy_reservation_does_not_replace_missing_complete_history() {
-    let (_legacy_home, legacy, prepare, binding) = fixture();
-    let (_complete_home, complete, _, _) = fixture();
-    let (marked, _) = recipes(&legacy, prepare);
-    append_reservation_fixture(&legacy, &marked, &binding, Event::Prepare);
+    let (_home, paths, prepare, binding) = fixture();
+    let (marked, _) = recipes(&paths, prepare);
+    append_reservation_fixture(&paths, &marked, &binding, Event::Prepare);
+    recipients::append_fixture(&paths, &marked, &binding, testing::RecipientAppend::Prepare)
+        .unwrap();
     recipients::append_fixture(
-        &complete,
-        &marked,
-        &binding,
-        testing::RecipientAppend::Prepare,
-    )
-    .unwrap();
-    recipients::append_fixture(
-        &complete,
+        &paths,
         &marked,
         &binding,
         testing::RecipientAppend::Forward(Recipient {
@@ -164,18 +167,17 @@ fn a_legacy_reservation_does_not_replace_missing_complete_history() {
     )
     .unwrap();
     assert!(
-        recipients::observe_at(&complete, &marked)
+        recipients::observe_at(&paths, &marked)
             .unwrap()
             .unwrap()
             .forward
             .is_some()
     );
 
-    std::fs::remove_file(directory(&complete).join("noexec.astream")).unwrap();
-    assert!(recipients::observe_at(&complete, &marked).is_err());
-    assert_eq!(
-        observe_closure_at(&legacy, &marked).unwrap(),
-        Closure::Other
-    );
-    assert!(contains_operation_at(&legacy, &marked.id).unwrap());
+    let missing = paths.dir.join("native-recipients/recipients.astream");
+    std::fs::remove_file(&missing).unwrap();
+    assert!(recipients::observe_at(&paths, &marked).is_err());
+    assert!(observe_closure_at(&paths, &marked).is_err());
+    assert!(!missing.exists());
+    assert!(contains_operation_at(&paths, &marked.id).unwrap());
 }

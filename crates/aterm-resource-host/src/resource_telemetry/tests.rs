@@ -22,8 +22,14 @@ fn host_lifeline_is_live_empty_before_sharing_and_eof_after_sole_writer_death() 
         io::ErrorKind::WouldBlock
     );
     drop(writer);
-    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-    assert_eq!(duplicate.read(&mut [0]).unwrap(), 0);
+    assert_eq!(
+        aterm_uds::deadline::once_released(|| reader.read(&mut [0])),
+        0
+    );
+    assert_eq!(
+        aterm_uds::deadline::once_released(|| duplicate.read(&mut [0])),
+        0
+    );
     // SAFETY: the same owned reader remains open; no descriptor was replaced.
     assert_eq!(
         unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },

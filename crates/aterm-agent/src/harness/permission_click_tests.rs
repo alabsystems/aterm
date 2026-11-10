@@ -444,7 +444,7 @@ fn a_record_retired_unissued_refuses_a_click() {
 
 /// A CLICK'S CLAIM NAMES ITS OWN CAUSE AND ASK, AND ITS LINE ITS OWN FLAG (design §3): the record names the click's own cause and ask, and
 /// its line is the launch's rid of every permission flag (here `--permission-mode plan`) and given
-/// the row's own: none toward `yolo`, `--dangerously-skip-permissions` once toward `lame`. The
+/// the row's own: none toward the settings' mode, `--dangerously-skip-permissions` once toward bypass. The
 /// agent is signalled for real and its relaunch is in flight after the look.
 #[test]
 fn a_clicks_claim_names_its_cause_and_ask_and_its_line_its_own_flag() {

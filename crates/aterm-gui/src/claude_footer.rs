@@ -11503,12 +11503,12 @@ mod tests {
             "autopilot: cruise \u{2014} {} \u{b7} click: land  ",
             crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
         );
-        let (lame_title, lame_short) = ("not yolo \u{b7} click: yolo  ", "not yolo  ");
+        let (off_title, off_short) = ("plan mode on \u{b7} click: yolo  ", "plan mode on  ");
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
             for chips in [1usize, 3, 6, 8, 10, 14] {
                 for (title, short) in [
                     ("", ""),
-                    (lame_title, lame_short),
+                    (off_title, off_short),
                     (cruise.as_str(), "autopilot: cruise  "),
                 ] {
                     let block = crate::claude_lights::Block::of_chips(

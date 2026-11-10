@@ -55,9 +55,8 @@ pub const SERVE_SWITCH: &str = serve_switch!();
 /// The most fleet members a download asks ([`fleet_peers`]), the most recently heard first.
 const FLEET_PEERS_MAX: usize = 16;
 
-/// How often a server looks at the person's off ([`share`], [`serve`]); [`share`]'s stop ends a
-/// wait at once.
-const ACCEPT_POLL: Duration = Duration::from_millis(250);
+/// Fallback sleep on an accept or readiness failure, or where no file-event or stop bell runs.
+const FALLBACK_POLL: Duration = Duration::from_millis(250);
 
 /// How long [`share`] waits to bind again while another server holds its port.
 const BIND_RETRY: Duration = Duration::from_secs(30);
@@ -783,10 +782,11 @@ fn links(_meta: &std::fs::Metadata) -> u64 {
 }
 
 /// The person's off (`serve-units --off`): record it ([`Layout::units_off`]), so every server
-/// of this store stops within [`ACCEPT_POLL`] and none starts, then remove `units/` and every
-/// build's kept unit, so the store keeps none. It stands until [`turn_on`]. A store not made
-/// yet has its prefix made for the record ([`Layout::ensure_dir`]), so an off a person writes
-/// before the first pass holds from that pass on.
+/// of this store stops once its watch hears it (or within [`FALLBACK_POLL`] where no file events
+/// run) and none starts, then remove `units/` and every build's kept unit, so the store keeps
+/// none. It stands until [`turn_on`]. A store not made yet has its prefix made for the record
+/// ([`Layout::ensure_dir`]), so an off a person writes before the first pass holds from that pass
+/// on.
 ///
 /// # Errors
 /// The prefix could not be made, the record could not be written, or the `units/` directory
@@ -843,7 +843,8 @@ pub fn turn_off(layout: &Layout) -> io::Result<()> {
 }
 
 /// Lift the person's off ([`turn_off`]): the process that runs the fleet listener serves this
-/// store's units again within [`ACCEPT_POLL`], and the store keeps them from then on.
+/// store's units again once its watch hears it (or within [`FALLBACK_POLL`] where no file events
+/// run), and the store keeps them from then on.
 ///
 /// # Errors
 /// The record could not be removed.
@@ -1088,8 +1089,7 @@ impl Sharing {
 pub struct Share<'a> {
     /// The address to listen on.
     pub listen: SocketAddr,
-    /// Set to stop: the listener closes within [`ACCEPT_POLL`], and a wait to bind again ends
-    /// at once.
+    /// Set to stop: the listener closes and a wait to bind again ends at once.
     pub stop: &'a Stop,
     /// The addresses whose connections are answered (this machine's fleet members'); a
     /// connection from any other is closed unread. Read at most once every
@@ -1111,6 +1111,14 @@ pub struct Share<'a> {
 /// what the store keeps. At most [`SERVE_CONNECTIONS`] are answered at once,
 /// [`SERVE_PER_SOURCE`] from one address, each held to [`SERVE_PACE`].
 pub fn share(layout: &Layout, how: &Share<'_>) {
+    share_counting(layout, how, None);
+}
+
+fn share_counting(
+    layout: &Layout,
+    how: &Share<'_>,
+    looks: Option<&std::sync::atomic::AtomicUsize>,
+) {
     let mut said = String::new();
     let mut say = |line: String| {
         if line != said {
@@ -1134,10 +1142,11 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
             .as_ref()
             .is_some_and(|(_, members)| members.contains(&ip))
     };
+    let mut off_watch = OffWatch::open(layout);
     while !how.stop.is_set() {
         if turned_off(layout) {
             say("LAN toolset sharing off (`aterm pkg serve-units --off`)".to_owned());
-            how.stop.sleep(ACCEPT_POLL);
+            wait_while_off(layout, how.stop, off_watch.as_mut(), looks);
             continue;
         }
         let listener = match open(layout, how.listen) {
@@ -1158,7 +1167,14 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
             "LAN toolset sharing: serving this {}'s toolset archives to its fleet members on {at}",
             aterm_types::machine_name::OS_NOUN
         ));
-        answer_until(&listener, layout, how.stop, &mut admits);
+        answer_until(
+            &listener,
+            layout,
+            how.stop,
+            off_watch.as_mut(),
+            looks,
+            &mut admits,
+        );
         drop(listener);
         clear_serving(layout);
     }
@@ -1187,7 +1203,15 @@ pub fn serve(
     let at = listener.local_addr()?;
     record_serving(layout, at);
     ready(at);
-    answer_until(&listener, layout, &Stop::new(), &mut |_| true);
+    let mut off_watch = OffWatch::open(layout);
+    answer_until(
+        &listener,
+        layout,
+        &Stop::new(),
+        off_watch.as_mut(),
+        None,
+        &mut |_| true,
+    );
     clear_serving(layout);
     Ok(())
 }
@@ -1238,12 +1262,187 @@ impl Slots {
     }
 }
 
+/// Watches [`Layout::units_off`] through [`aterm_uds::file_watch::FileWatch`] and signals a
+/// non-blocking pipe whenever the person's off flips, so [`share`] and [`serve`] sleep without
+/// timer wakeups at rest.
+#[cfg(unix)]
+struct OffWatch {
+    reader: std::io::PipeReader,
+    watch: aterm_uds::file_watch::FileWatch,
+    expected: Arc<AtomicBool>,
+    first: Arc<AtomicBool>,
+    armed_for: Option<bool>,
+}
+
+#[cfg(unix)]
+impl OffWatch {
+    fn open(layout: &Layout) -> Option<Self> {
+        use std::os::fd::AsRawFd as _;
+
+        let (reader, writer) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+            // SAFETY: `fd` is a freshly opened pipe descriptor owned here.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                return None;
+            }
+            // SAFETY: `F_SETFL` takes an integer flag word on the live owned pipe descriptor.
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return None;
+            }
+        }
+        let off_path = layout.units_off();
+        let expected = Arc::new(AtomicBool::new(false));
+        let first = Arc::new(AtomicBool::new(true));
+        let cb_expected = Arc::clone(&expected);
+        let cb_first = Arc::clone(&first);
+        let watch = aterm_uds::file_watch::FileWatch::platform(
+            "atpkg-units-off",
+            Box::new(move |_| {
+                if cb_first.swap(false, Ordering::AcqRel)
+                    && std::fs::symlink_metadata(&off_path).is_ok()
+                        == cb_expected.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let _ = (&writer).write(b".");
+            }),
+        )
+        .ok()?;
+        Some(Self {
+            reader,
+            watch,
+            expected,
+            first,
+            armed_for: None,
+        })
+    }
+
+    fn expect(&mut self, layout: &Layout, off: bool) {
+        if self.armed_for == Some(off) {
+            return;
+        }
+        self.expected.store(off, Ordering::Release);
+        self.first.store(true, Ordering::Release);
+        self.watch.watch(0, layout.units_off());
+        self.armed_for = Some(off);
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while (&self.reader).read(&mut buf).is_ok_and(|n| n > 0) {}
+    }
+}
+
+#[cfg(not(unix))]
+struct OffWatch;
+
+#[cfg(not(unix))]
+impl OffWatch {
+    const fn open(_layout: &Layout) -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn wait_any_readable(fds: &[std::os::fd::BorrowedFd<'_>]) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stack = [libc::pollfd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; 4];
+    let Some(slice) = stack.get_mut(..fds.len()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "readiness set too large",
+        ));
+    };
+    let count = libc::nfds_t::try_from(slice.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "readiness set too large"))?;
+    loop {
+        for (dst, src) in slice.iter_mut().zip(fds) {
+            *dst = libc::pollfd {
+                fd: src.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+        }
+        // SAFETY: `slice` holds `count` initialized pollfds naming borrowed descriptors kept open
+        // for the whole call.
+        let ready = unsafe { libc::poll(slice.as_mut_ptr(), count, -1) };
+        if ready >= 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn wait_while_off(
+    layout: &Layout,
+    stop: &Stop,
+    off_watch: Option<&mut OffWatch>,
+    looks: Option<&std::sync::atomic::AtomicUsize>,
+) {
+    if let Some(looks) = looks {
+        looks.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(unix)]
+    if let (Some(off), Ok(stop_bell)) = (off_watch, stop.bell()) {
+        use std::os::fd::AsFd as _;
+        off.expect(layout, true);
+        off.drain();
+        if stop.is_set() || !turned_off(layout) {
+            return;
+        }
+        if aterm_uds::ready::either(stop_bell, off.reader.as_fd()).is_ok() {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (layout, off_watch);
+    stop.sleep(FALLBACK_POLL);
+}
+
+fn wait_for_connection_or_end(
+    listener: &TcpListener,
+    layout: &Layout,
+    stop: &Stop,
+    off_watch: Option<&mut OffWatch>,
+    looks: Option<&std::sync::atomic::AtomicUsize>,
+) {
+    if let Some(looks) = looks {
+        looks.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(unix)]
+    if let (Some(off), Ok(stop_bell)) = (off_watch, stop.bell()) {
+        use std::os::fd::AsFd as _;
+        off.expect(layout, false);
+        off.drain();
+        if stop.is_set() || turned_off(layout) {
+            return;
+        }
+        if wait_any_readable(&[listener.as_fd(), stop_bell, off.reader.as_fd()]).is_ok() {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (listener, layout, off_watch);
+    stop.sleep(FALLBACK_POLL);
+}
+
 /// Answer `listener`'s connections from addresses `admits` takes until `stop` is set or
 /// the person turns sharing off, as [`Slots`] allow.
 fn answer_until(
     listener: &TcpListener,
     layout: &Layout,
     stop: &Stop,
+    mut off_watch: Option<&mut OffWatch>,
+    looks: Option<&std::sync::atomic::AtomicUsize>,
     admits: &mut dyn FnMut(IpAddr) -> bool,
 ) {
     let units = units_dir(layout);
@@ -1255,8 +1454,12 @@ fn answer_until(
             aterm_uds::AcceptedMode::Blocking,
         ) {
             Ok(accepted) => accepted,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_connection_or_end(listener, layout, stop, off_watch.as_deref_mut(), looks);
+                continue;
+            }
             Err(_) => {
-                stop.sleep(ACCEPT_POLL);
+                stop.sleep(FALLBACK_POLL);
                 continue;
             }
         };

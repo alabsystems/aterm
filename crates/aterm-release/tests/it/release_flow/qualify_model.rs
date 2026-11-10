@@ -178,18 +178,20 @@ fn agrees(r: &Replay, w: &World, case: &str) {
     );
     assert_eq!(r.var("public") == 1, w.count("publish") > 0, "{case}");
     assert_eq!(r.var("cut") == 1, w.cut.is_some(), "{case}");
-    // A staging run's export passed (or was skipped, R staged before) exactly where R is staged.
+    // The graph models export validation. Remote staging additionally requires that
+    // qualify accepted the whole graph; a local pass beside a refusal cannot attest it.
     if !case.contains("--qualify") {
         assert_eq!(
-            matches!(r.var("export"), 2 | 6),
+            matches!(r.var("export"), 2 | 6)
+                && r.taken.iter().any(|action| action == "QualifyPass"),
             w.attested.as_deref() == Some(commit.as_str()),
-            "{case}: R is staged where its export passed"
+            "{case}: R is staged only after the graph passes"
         );
     }
 }
 
 /// Every run's step 4 to 8 is a path of the model: a release that passes, a red that stops the
-/// rest before they start, a red beside a staging push in flight, a COULD NOT RUN that stops
+/// rest before they start, a red after private export validation, a COULD NOT RUN that stops
 /// nothing and its resume, a private qualification whose export is red while the tree and the
 /// build run, and a bundle half that could not run and its resume.
 #[test]
@@ -201,11 +203,12 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
             "build red before the tree starts",
             |w| {
                 w.build_claims_late = true;
+                w.records.insert((BUMP.into(), None, "lint".into()), "ok");
             },
             None,
         ),
         (
-            "tree red beside a staging push",
+            "tree red after private export validation",
             |w| {
                 w.verify_outcomes.insert("test", "FAIL");
                 w.verify_code = 1;

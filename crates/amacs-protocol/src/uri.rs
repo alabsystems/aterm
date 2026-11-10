@@ -52,7 +52,7 @@ pub fn file_uri_to_path(uri: &str) -> Result<PathBuf, UriError> {
     if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
         return Err(UriError::RemoteAuthority);
     }
-    let decoded = percent_decode(encoded_path)?;
+    let decoded = decode_uri_component(encoded_path)?;
     if decoded.contains('\0') {
         return Err(UriError::Malformed);
     }
@@ -82,7 +82,9 @@ pub fn windows_drive_path_text(decoded: &str) -> Result<String, UriError> {
     Ok(decoded.to_string())
 }
 
-fn percent_decode(value: &str) -> Result<String, UriError> {
+/// Decode one UTF-8 URI component with the same strict escapes as local file paths.
+/// Callers still apply the component's own policy (a fragment, for example, has no authority).
+pub fn decode_uri_component(value: &str) -> Result<String, UriError> {
     let bytes = value.as_bytes();
     if !bytes.contains(&b'%') {
         return Ok(value.to_string());

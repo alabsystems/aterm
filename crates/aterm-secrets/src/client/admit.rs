@@ -83,16 +83,14 @@ pub struct LogAdmission {
 
 /// What C11 keeps a newcomer's label off, from the entries this member reads (`by_audience`,
 /// every audience it opens): the labels it may not take (every label, alias, claim and
-/// deny-listed label in `aterm-swarm-roster`, each row's `[machines]` name with a leading `m<N>`,
-/// and the reserved ones: `m3`, the policy's reserved labels, release hosts and stewards, from
-/// whichever audience holds `aterm-swarm-policy`), and the labels it only counts toward "one above
-/// the highest" (each `m<N>` a fleet-accounts sheet names, as the approver's `next_free_number`
-/// counts them).
+/// deny-listed label in `aterm-swarm-roster` and each row's `[machines]` name with a leading
+/// `m<N>`: numbers Macs hold, and none for a role or a policy list, owner ruling 2026-11-09), and
+/// the labels it only counts toward "one above the highest" (each `m<N>` a fleet-accounts sheet
+/// names, as the approver's `next_free_number` counts them).
 pub(super) fn labels_taken(
     by_audience: &BTreeMap<Audience, BTreeMap<String, Entry>>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut taken =
-        BTreeSet::from([crate::swarm_roster::DEFAULT_RESERVED_RELEASE_LABEL.to_owned()]);
+    let mut taken = BTreeSet::new();
     let mut counted = BTreeSet::new();
     let canonical = |raw: &str| crate::swarm_roster::leading_m_label(raw).map(|(_, label)| label);
     let entries = || by_audience.values().flat_map(BTreeMap::values);
@@ -123,17 +121,6 @@ pub(super) fn labels_taken(
                 }
             }
             taken.extend(roster.deny_labels.iter().filter_map(|raw| canonical(raw)));
-        } else if entry.name == crate::SWARM_POLICY_ENTRY
-            && let Ok(policy) = crate::swarm_roster::SwarmPolicy::from_toml(text)
-        {
-            for raw in policy
-                .reserved_labels
-                .iter()
-                .chain(policy.release_hosts.iter())
-                .chain(policy.stewards.iter().map(|steward| &steward.label))
-            {
-                taken.extend(canonical(raw));
-            }
         } else if base == "fleet-accounts.toml"
             || (base.starts_with("fleet-accounts-") && base.ends_with(".toml"))
         {
@@ -1630,16 +1617,17 @@ mod tests {
     }
 
     /// The label an allowing member gives keeps off what the roster's approver keeps off: a
-    /// deny-listed label (a stolen Mac's, which `repair_half_done_revokes` moves off the members),
-    /// a `[machines]` name, and the policy's reserved labels wherever the policy lives (a host
-    /// list of the admins, as ALab keeps it). The fleet-accounts sheet's numbers are counted
-    /// toward "one above the highest" without holding a label by themselves.
+    /// deny-listed label (a stolen Mac's, which `repair_half_done_revokes` moves off the members)
+    /// and a `[machines]` name. No number is reserved (owner ruling, 2026-11-09): a policy that
+    /// names a steward `m50` holds nothing, and `m3` is free while no Mac holds it. The
+    /// fleet-accounts sheet's numbers are counted toward "one above the highest" without holding
+    /// a label by themselves.
     ///
-    /// NEGATIVE CONTROL: skip `deny_labels` and `vault_name` and read the policy from
-    /// `[everyone]` alone (the code before this fix): `m9`, `m40` and `m50` read free and the
-    /// first `taken` assert fails.
+    /// NEGATIVE CONTROL: skip `deny_labels` and `vault_name` (the code before C11's fix): `m9` and
+    /// `m40` read free and the first `taken` assert fails; seed `taken` with `m3` or read the
+    /// policy's stewards (the reservations this ruling removed) and the second assert fails.
     #[test]
-    fn a_newcomer_label_keeps_off_denied_reserved_and_machines_names_and_counts_the_sheet() {
+    fn a_newcomer_label_keeps_off_denied_and_machines_names_and_counts_the_sheet() {
         let roster = SwarmRoster {
             members: vec![
                 SwarmMember {
@@ -1674,10 +1662,12 @@ mod tests {
         };
         let policy = SwarmPolicy {
             network_id: None,
-            reserved_labels: vec!["m50".to_owned()],
-            release_hosts: Vec::new(),
             servers: Vec::new(),
-            stewards: Vec::new(),
+            stewards: vec![crate::swarm_roster::StewardPolicy {
+                label: "m50".to_owned(),
+                rank: 1,
+                always_on: true,
+            }],
         };
         let mut by_audience = BTreeMap::new();
         put(
@@ -1699,8 +1689,14 @@ mod tests {
             "[[account]]\nlabel = \"a\"\nmachines = [\"m70\"]\n",
         );
         let (taken, counted) = labels_taken(&by_audience);
-        for held in ["m9", "m40", "m50", "m41", "m42", "m3"] {
+        for held in ["m9", "m40", "m41", "m42"] {
             assert!(taken.contains(held), "{held} is taken: {taken:?}");
+        }
+        for free in ["m3", "m50"] {
+            assert!(
+                !taken.contains(free),
+                "no Mac holds {free}, so nothing reserves it: {taken:?}"
+            );
         }
         assert!(
             !taken.contains("m98") && !taken.contains("m99"),

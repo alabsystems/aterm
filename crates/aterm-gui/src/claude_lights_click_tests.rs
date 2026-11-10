@@ -230,20 +230,22 @@ fn check_click_transition(
     }
 }
 
-/// THE CLICK CONFORMS TO ITS MODEL, ITS RESTART ITS ONE END: a click on `yolo` types nothing and
-/// stands an ask for the settings' line (NEGATIVE CONTROL: the retired toggle, which typed
-/// shift+tab and stood nothing); its lane's look that signalled keeps it standing, a click on it
-/// then takes nothing back, and the look that found the restart landed ends it while the pill
-/// still reads bypass (a home whose settings choose it; NEGATIVE CONTROL: an ask kept until the
-/// pill moves, which would restart again). A click on `lame` from auto asks bypass (NEGATIVE
-/// CONTROL: the retired reading of auto as on, whose click asked the settings' line).
+/// THE CLICK CONFORMS TO ITS MODEL, ITS RESTART ITS ONE END, AND IT ONLY TURNS YOLO ON (owner,
+/// 2026-11-09: "it should go to yolo when I click"): a click on the off chip (`○ yolo`, here
+/// `auto`) types nothing and stands an ask for the bypass line (NEGATIVE CONTROLS: the retired
+/// toggle, which typed shift+tab and stood nothing; a click on the off chip that asks the
+/// settings' line); its lane's look that signalled keeps it standing, a click on it then takes
+/// nothing back, and the look that found the restart landed ends it while the pill still reads
+/// `auto` (a home that disables bypass; NEGATIVE CONTROL: an ask kept until the pill moves, which
+/// would restart again). A click on the on chip (`● yolo`) stands nothing, types nothing and says
+/// nothing: the model offers no `Click` there, so yolo is never turned off by a click.
 #[test]
 fn the_permission_click_conforms_to_its_model() {
     let model = aterm_models_gui::claude_permission_click_model();
     let (mut app, wid, session, mut reader, _host, script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, BYPASS);
+    draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
     let human = human_seq(&app, session);
@@ -263,8 +265,14 @@ fn the_permission_click_conforms_to_its_model() {
         Some(&[("stands", 0), ("lane", 0)][..]),
     );
     assert_eq!(
-        standing(&app, session).map(|s| s.click.to),
-        Some(PermissionTo::Settings)
+        project_permission_click(&app, wid, session, &tab, &state)["to"],
+        1,
+        "CONTROL: the projection reads the ask's line off the App"
+    );
+    assert_eq!(
+        standing(&app, session).map(|s| (s.from_yolo, s.click.to)),
+        Some((false, PermissionTo::Bypass)),
+        "auto is not yolo: a click asks bypass"
     );
     frame(&mut app, wid);
     assert!(
@@ -295,19 +303,42 @@ fn the_permission_click_conforms_to_its_model() {
     let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, AUTO);
+    draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let mut state = model.init_state();
-    check_click_transition(&app, at, "ToLame", &mut state, None);
-    hover_light(&mut app, wid);
-    drive_click_action("Click", || press_at(&mut app, wid, a_minute_ago()));
-    assert!(pty(&mut reader, 0).is_empty());
-    check_click_transition(&app, at, "Click", &mut state, Some(&[("to", 0)][..]));
-    assert_eq!(
-        standing(&app, session).map(|s| s.click.to),
-        Some(PermissionTo::Bypass),
-        "auto is not yolo: a click asks bypass"
+    check_click_transition(&app, at, "ToYolo", &mut state, None);
+    assert!(
+        model.successors("Click", &state).is_empty(),
+        "the model offers no click on the on chip"
     );
+    assert_eq!(
+        light_cells(&app, wid).1,
+        "\u{25cf} yolo",
+        "yolo on, at rest"
+    );
+    hover_light(&mut app, wid);
+    let human = human_seq(&app, session);
+    press_at(&mut app, wid, a_minute_ago());
+    app.click_permission(wid, session, Light::Mode);
+    assert!(
+        standing(&app, session).is_none(),
+        "a click on the on chip stands nothing: it never turns yolo off"
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "and types nothing");
+    assert_eq!(human_seq(&app, session), human, "no person's input");
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .refused
+            .is_none(),
+        "and is no refusal: nothing is said"
+    );
+    assert_eq!(
+        project_permission_click(&app, wid, session, &tab, &state),
+        state,
+        "the model's state, unmoved"
+    );
+    frame(&mut app, wid);
+    assert_eq!(light_cells(&app, wid).1, "\u{25cf} yolo", "still on");
 }
 
 /// A CLICK ON A STANDING CLICK TAKES IT BACK, AND THE ENDS ARE ITS OWN: a click past the double
@@ -322,7 +353,7 @@ fn the_permission_clicks_ends_conform_to_its_model() {
     let (mut app, wid, session, mut reader, _host, script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, BYPASS);
+    draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
     hover_light(&mut app, wid);
@@ -374,7 +405,7 @@ fn the_permission_clicks_ends_conform_to_its_model() {
     let (mut app, wid, session, _reader, _host, script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, BYPASS);
+    draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
     hover_light(&mut app, wid);
@@ -394,7 +425,7 @@ fn the_permission_clicks_ends_conform_to_its_model() {
     let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, BYPASS);
+    draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
     hover_light(&mut app, wid);
@@ -501,21 +532,21 @@ fn a_tab_with_no_snapshot_is_clicked_on_the_conversation_its_footer_read() {
     }
 }
 
-/// A RUN OF CLICKS ON YOLO STANDS ONE CLICK (review F1): the first press stands the ask; the
+/// A RUN OF CLICKS ON THE OFF CHIP STANDS ONE CLICK (review F1): the first press stands the ask; the
 /// double click's second press, at the interval's last instant, is the same gesture and takes
 /// nothing back; a slow triple click's third press, at the last instant of the interval after the
 /// second though past the first's, is the same run and does nothing either. A press a millisecond
 /// after the interval of the run's last press is a click of its own: the take-back.
 #[test]
-fn a_run_of_clicks_on_yolo_turns_it_over_once() {
+fn a_run_of_clicks_on_the_off_chip_stands_one_click() {
     let model = aterm_models_gui::claude_permission_click_model();
     let (mut app, wid, session, mut reader, _host, _script) = claude_app(120, true);
     let tab = sid_of(&app, session);
     let at = (wid, session, tab.as_str());
-    draw_claude(&app, session, BYPASS);
+    draw_claude(&app, session, AUTO);
     frame(&mut app, wid);
     let mut state = model.init_state();
-    assert_eq!(light_cells(&app, wid).1, "yolo", "yolo at rest");
+    assert_eq!(light_cells(&app, wid).1, "\u{25cb} yolo", "off at rest");
     hover_light(&mut app, wid);
     let first = a_minute_ago();
     drive_click_action("Click", || press_at(&mut app, wid, first));
@@ -555,7 +586,7 @@ fn a_run_of_clicks_on_yolo_turns_it_over_once() {
     frame(&mut app, wid);
     assert_eq!(
         light_cells(&app, wid).1,
-        "yolo",
+        "\u{25cb} yolo",
         "a click of its own takes it back"
     );
     assert!(pty(&mut reader, 0).is_empty());

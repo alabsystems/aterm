@@ -830,6 +830,31 @@ pub trait System: Sync {
         agh::wire::Endpoints,
     );
 
+    /// Read `url` into `dest`, at most `max` bytes, anonymously and over https only: a github.com
+    /// release download URL through the shared release-asset reader
+    /// (`aterm_update_core::release_asset::Reader`, the download host first, then GitHub's API
+    /// asset route, until one delivers or neither makes progress), any other URL from its own
+    /// host. The bytes land in `dest` whole or not at all. The default fails closed, as
+    /// `github_rest`'s does, so a test double never reads the network.
+    ///
+    /// # Errors
+    /// One line: absent, refused, or unavailable on every route.
+    fn download(&self, url: &str, _dest: &Path, _max: u64) -> Result<(), String> {
+        Err(format!(
+            "downloads are not implemented by this backend; {url} was not read"
+        ))
+    }
+
+    /// The body at `url`, at most `max` bytes, read as [`System::download`] reads.
+    ///
+    /// # Errors
+    /// As [`System::download`].
+    fn download_bytes(&self, url: &str, _max: u64) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "downloads are not implemented by this backend; {url} was not read"
+        ))
+    }
+
     /// Where agh.toml is for the `fleet` profile (machines 5b): `Live` answers
     /// `agh::config::Dirs::from_env()`; `Fake` answers the scratch `Dirs` `Fake::with_agh_dirs`
     /// gave it, else this default.
@@ -1526,6 +1551,9 @@ pub struct Live {
     /// What [`System::person_present`] reads, where the runner gives a reading of its own
     /// ([`Live::with_presence`]); otherwise yes, as its stage decided.
     presence: Option<fn() -> bool>,
+    /// The loopback origins [`System::download`] reads from in a test, instead of github.com.
+    #[cfg(test)]
+    release_origins: Option<aterm_update_core::github_rest::Origins>,
 }
 
 impl Live {
@@ -1536,7 +1564,23 @@ impl Live {
             agent_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent")),
             full_disk_access: None,
             presence: None,
+            #[cfg(test)]
+            release_origins: None,
         }
+    }
+
+    /// The release-asset reader [`System::download`] reads through: one per read, so each read
+    /// has the reader's whole patience.
+    fn release_reader(&self) -> aterm_update_core::release_asset::Reader {
+        #[cfg(test)]
+        if let Some(origins) = &self.release_origins {
+            return aterm_update_core::release_asset::Reader::loopback(
+                origins.clone(),
+                None,
+                Duration::from_secs(60),
+            );
+        }
+        aterm_update_core::release_asset::Reader::anonymous()
     }
 
     /// This port, reading `present` for [`System::person_present`], as the person step asks:
@@ -2017,6 +2061,18 @@ impl System for Live {
 
     fn agh_dirs(&self) -> Option<agh::config::Dirs> {
         agh::config::Dirs::from_env()
+    }
+
+    fn download(&self, url: &str, dest: &Path, max: u64) -> Result<(), String> {
+        self.release_reader()
+            .to_file_at(url, dest, max)
+            .map_err(|e| format!("{url}: {e}"))
+    }
+
+    fn download_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+        self.release_reader()
+            .bytes_at(url, max)
+            .map_err(|e| format!("{url}: {e}"))
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
@@ -3072,6 +3128,9 @@ mod fake {
 
     type Model = Arc<dyn Fn(&Fake, &Cmd) -> Option<Ran> + Send + Sync>;
 
+    /// What one scripted [`System::download`] delivers: the bytes, or why it failed.
+    type Downloaded = Result<Vec<u8>, String>;
+
     /// Scripted [`System`] implementation for unit tests.
     #[derive(Default)]
     pub struct Fake {
@@ -3086,6 +3145,9 @@ mod fake {
         replies: Mutex<BTreeMap<String, Vec<Result<Ran, RunFailed>>>>,
         broker_hellos: Mutex<Vec<Result<aterm_uds::lan::BrokerHello, String>>>,
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
+        /// What each [`System::download`] or [`System::download_bytes`] of a URL delivers, in
+        /// order, the last one standing ([`Fake::on_download`]).
+        downloads: Mutex<BTreeMap<String, Vec<Downloaded>>>,
         /// What each [`System::bonjour`] request hears, by its [`Bonjour::key`]
         /// ([`Fake::on_bonjour`]).
         bonjour_replies: Mutex<BTreeMap<String, Result<Vec<aterm_uds::lan::Event>, String>>>,
@@ -3745,6 +3807,32 @@ mod fake {
             self
         }
 
+        /// Script what a [`System::download`] or [`System::download_bytes`] of `url` delivers:
+        /// its bytes, or why it failed. Each read takes the next answer; the last one stands.
+        pub fn on_download(&self, url: &str, got: Result<&[u8], &str>) -> &Self {
+            self.downloads
+                .lock()
+                .unwrap()
+                .entry(url.to_owned())
+                .or_default()
+                .push(got.map(<[u8]>::to_vec).map_err(str::to_owned));
+            self
+        }
+
+        /// The next scripted answer for a read of `url`, at most `max` bytes.
+        fn downloaded(&self, url: &str, max: u64) -> Downloaded {
+            let mut downloads = self.downloads.lock().unwrap();
+            let got = match downloads.get_mut(url) {
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
+                _ => Err(format!("fake: no download was scripted for {url}")),
+            }?;
+            if u64::try_from(got.len()).unwrap_or(u64::MAX) > max {
+                return Err(format!("{url} is over its {max}-byte cap"));
+            }
+            Ok(got)
+        }
+
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
             self.on_result(key, Ok(reply))
@@ -4202,6 +4290,27 @@ mod fake {
             self.github
                 .clone()
                 .unwrap_or_else(super::fail_closed_github)
+        }
+
+        fn download(&self, url: &str, dest: &Path, max: u64) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("download {url} -> {} (max {max})", dest.display()));
+            let bytes = self.downloaded(url, max)?;
+            self.files
+                .lock()
+                .unwrap()
+                .insert(dest.to_owned(), (bytes, 0o600));
+            Ok(())
+        }
+
+        fn download_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("download {url} (max {max})"));
+            self.downloaded(url, max)
         }
 
         fn agh_dirs(&self) -> Option<agh::config::Dirs> {
@@ -6273,5 +6382,76 @@ mod tests {
                 .expect("a FIFO's read must not wait for a writer"),
             Err(true)
         );
+    }
+
+    /// A live port whose [`System::download`] reads `fake`'s loopback origins.
+    fn live_reading(fake: &agh_fake::FakeGithub) -> Live {
+        let ports = fake.ports();
+        Live {
+            release_origins: Some(aterm_update_core::github_rest::Origins::loopback(
+                ports.api,
+                ports.uploads,
+                ports.web,
+                ports.cdn,
+            )),
+            ..Live::new()
+        }
+    }
+
+    fn api_reads(fake: &agh_fake::FakeGithub) -> usize {
+        fake.seen()
+            .iter()
+            .filter(|s| s.origin == agh_fake::FakeOrigin::Api)
+            .count()
+    }
+
+    #[test]
+    fn a_live_download_reads_a_release_asset_on_the_api_route_while_the_download_host_fails() {
+        use agh_fake::{AssetSpec, FakeGithub, Fault, Match, ReleaseSpec, RepoSpec};
+        const ZIP: &[u8] = b"the release zip";
+        let fake = FakeGithub::start();
+        fake.add_repo(
+            "fixture-dev/app",
+            RepoSpec::public().push("fixture-dev-bot"),
+        );
+        let id = fake.add_release(
+            "fixture-dev/app",
+            ReleaseSpec::published("v1", "2026-10-01T00:00:00Z"),
+        );
+        fake.add_asset(id, AssetSpec::uploaded("app.zip", ZIP));
+        let live = live_reading(&fake);
+        let url = "https://github.com/fixture-dev/app/releases/download/v1/app.zip";
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+
+        // Negative control: while the download host serves, the API route is never asked.
+        live.download(url, &dest, 1 << 20).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), ZIP);
+        assert_eq!(api_reads(&fake), 0);
+
+        fake.fault_always(
+            Match::web("/fixture-dev/app/releases/"),
+            Fault::Status {
+                status: 504,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        std::fs::remove_file(&dest).unwrap();
+        live.download(url, &dest, 1 << 20).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), ZIP);
+        assert!(api_reads(&fake) >= 2, "the release, then the asset by id");
+        assert_eq!(live.download_bytes(url, 1 << 20).unwrap(), ZIP);
+
+        // An asset the release lacks is absent, not a stalled read of both routes.
+        let missing = "https://github.com/fixture-dev/app/releases/download/v1/other.zip";
+        let why = live
+            .download(missing, &dir.path().join("other"), 1 << 20)
+            .unwrap_err();
+        assert!(
+            why.ends_with("the API's release lists no asset of that name"),
+            "{why}"
+        );
+        assert!(!dir.path().join("other").exists());
     }
 }

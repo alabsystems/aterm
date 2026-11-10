@@ -838,13 +838,18 @@ fn drop_preparing(
     world.owner.recover().unwrap();
     world.settle();
     world.assert_settled(binding, memory, pid);
-    assert!(matches!(
-        atpkg::lease::reclaim(
+    aterm_uds::deadline::once_released(|| {
+        match atpkg::lease::reclaim(
             &layout.prefix,
-            &atpkg::lease::Subject::build("trust", 1).unwrap()
-        ),
-        atpkg::lease::Reclaim::Clear(_)
-    ));
+            &atpkg::lease::Subject::build("trust", 1).unwrap(),
+        ) {
+            atpkg::lease::Reclaim::Clear(guard) => Ok(guard),
+            atpkg::lease::Reclaim::Keep(atpkg::lease::Holders::Held(_)) => {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            other => panic!("settled SDK cannot be reclaimed: {other:?}"),
+        }
+    });
     assert_eq!(
         observed,
         (true, 1, CohortClaimState::Retained),

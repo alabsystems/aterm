@@ -4,6 +4,7 @@
 //! Deterministic corpora and helpers shared across `verify perf` benchmark harnesses.
 
 pub mod allocator;
+pub mod measurement_clock;
 
 /// Generate a trigram-diverse corpus of `lines` with a rotating 40-glyph body.
 #[must_use]

@@ -13,6 +13,17 @@ fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
     let meta = dir_fd
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    if !owned_dir(dir, &meta)? {
+        dir_fd
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    }
+    Ok(())
+}
+
+/// Whether the folder `meta` describes is `0700` (any other mode [`ensure_private_dir`] makes
+/// `0700`), refused where it is no folder or another user's, as [`ensure_private_dir`] refuses it.
+fn owned_dir(dir: &Path, meta: &std::fs::Metadata) -> crate::Result<bool> {
     if !meta.is_dir() {
         return Err(Error::new(format!("{}: not a directory", dir.display())));
     }
@@ -23,10 +34,30 @@ fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
             meta.uid()
         )));
     }
-    if meta.mode() & 0o7777 != 0o700 {
-        dir_fd
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    Ok(meta.mode() & 0o7777 == 0o700)
+}
+
+/// Whether [`ensure_private_dir`] would leave the existing `dir` as it is: a folder, no link,
+/// this user's, of mode exactly `0700` (its `lstat`).
+///
+/// # Errors
+/// `dir` is missing, a link or no folder, another user's, or of another mode, which
+/// [`ensure_private_dir`] would make `0700`.
+pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::new(format!(
+            "{}: is a symlink; refusing to keep secrets through it",
+            dir.display()
+        )));
+    }
+    if !owned_dir(dir, &meta)? {
+        return Err(Error::new(format!(
+            "{}: mode {:o}, which is made 0700",
+            dir.display(),
+            meta.mode() & 0o7777
+        )));
     }
     Ok(())
 }

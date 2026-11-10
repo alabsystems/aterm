@@ -2755,7 +2755,9 @@ mod tests {
         assert_eq!(stamps(&root), before);
         drop(child);
         assert_eq!(
-            ensure_root(&fx.layout, &build, Depth::Shallow).unwrap(),
+            aterm_uds::deadline::once_released(|| {
+                ensure_root(&fx.layout, &build, Depth::Shallow)
+            }),
             Ensured::Built
         );
         remove_program(&fx.layout, "trust").unwrap();

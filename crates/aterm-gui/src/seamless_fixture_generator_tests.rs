@@ -4343,7 +4343,8 @@ fn fx_engine_state_desk() -> FxDesk {
 
 fn fx_fold_desk() -> FxDesk {
     use crate::restore::{
-        NativeLeafRestore, RestoreManifest, RestoreSelection, RestoredSplitTree, RestoredView,
+        MarkdownWorkspaceRestore, NativeLeafRestore, RestoreManifest, RestoreSelection,
+        RestoredSplitTree, RestoredView,
     };
     let cwd = "/home/dev/src/aterm";
     let sessions = vec![fx_session(0, "zsh", fx_shell(ROWS, COLS, 12, cwd, 6))];
@@ -4373,6 +4374,32 @@ fn fx_fold_desk() -> FxDesk {
             editor.viewport_anchor = 6;
             editor.durable_seq = 3;
             editor
+        } else if n == 2 {
+            // The unified document carries independent source and formatted positions,
+            // including a reader selection and a divider the person moved.
+            let mut notes = NativeLeafRestore::document(
+                "editor",
+                format!("file:///home/dev/notes/week-{n:02}.md"),
+            );
+            notes.editor_selections = vec![RestoreSelection {
+                anchor: 24,
+                head: 36,
+            }];
+            notes.viewport_anchor = 16;
+            notes.durable_seq = 4;
+            notes.markdown = Some(MarkdownWorkspaceRestore {
+                mode: "split".to_string(),
+                focus: "reader".to_string(),
+                source_anchor: 128,
+                visual_row: 2,
+                reader_entry_anchor: Some(96),
+                selection: Some(RestoreSelection {
+                    anchor: 210,
+                    head: 288,
+                }),
+                split_per_mille: 620,
+            });
+            notes
         } else {
             let mut notes = NativeLeafRestore::document(
                 "markdown",
@@ -4380,7 +4407,7 @@ fn fx_fold_desk() -> FxDesk {
             );
             notes.source_anchor = 64 * n;
             notes.viewport_anchor = n;
-            if n == 2 {
+            if n == 3 {
                 notes.selection = Some(RestoreSelection {
                     anchor: 210,
                     head: 288,

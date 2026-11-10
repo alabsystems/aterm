@@ -380,7 +380,7 @@ mod tests {
             let _peer =
                 TcpStream::connect_timeout(&address, aterm_spec::wait::MUST_HAPPEN).unwrap();
             assert!(
-                crate::slots::wait_listener_readable(&listener, aterm_spec::wait::MUST_HAPPEN)
+                crate::slots::listener_pending_within(&listener, aterm_spec::wait::MUST_HAPPEN)
                     .unwrap()
             );
             let (stream, _) = aterm_uds::accept(

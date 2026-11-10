@@ -512,7 +512,7 @@ fn paint_quota_samples(
         fg: mix(blank.fg, blank.bg, 0.6),
         ..blank
     };
-    // The design's own samples (§1.2): Cruise's chip, `∞ yolo`, under Cruise's rainbow.
+    // The design's own samples (§1.2): Cruise's chip, `∞ ● yolo`, under Cruise's rainbow.
     let (glass, at) = scene_glass(CardPalette::Cruise, input.cols, rule, blank);
     let block = crate::claude_lights::Block::layout_scene(
         blank,
@@ -748,7 +748,7 @@ mod tests {
     /// it) is filled as a windowed one is, so `lab instance --scene harness-layouts --image`
     /// shows the samples headless too. NEGATIVE CONTROL (run once, restored): bounding the
     /// samples by `grid_bot_row` alone, as the scene did, leaves that frame unpainted and fails.
-    /// Each quota sample wears Cruise's chip (`∞ yolo`) under Cruise's rainbow, as §1.2 draws
+    /// Each quota sample wears Cruise's chip (`∞ ● yolo`) under Cruise's rainbow, as §1.2 draws
     /// it, and the worded-chips sample Land's under Land's sunset, so no chip contradicts its
     /// palette. NEGATIVE CONTROL: composing the Land sample with Cruise's glass leaves its words
     /// intact but gives `land` Cruise's letter ink, and fails the exact palette assertion.
@@ -784,7 +784,10 @@ mod tests {
                 row(23).contains("land"),
                 "the sample uses a worded Land chip"
             );
-            assert!(row(23).contains("lame"), "its permission chip follows it");
+            assert!(
+                row(23).contains("\u{25cb} yolo"),
+                "its permission chip follows it"
+            );
             assert!(
                 row(23).contains(" ─ "),
                 "worded chips are set apart by the rule"
@@ -832,7 +835,7 @@ mod tests {
             );
             for d in [30, 34, 38] {
                 assert!(
-                    row(d).contains("\u{221e} yolo") && !row(d).contains("land"),
+                    row(d).contains("\u{221e} \u{25cf} yolo") && !row(d).contains("land"),
                     "a quota sample wears Cruise's chip: {:?}",
                     row(d)
                 );

@@ -16,13 +16,26 @@ fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let seconds: u64 = args
         .next()
-        .ok_or("usage: file_events <seconds> [root ...]")?
+        .ok_or("usage: file_events <seconds> [--files] [root ...]")?
         .parse()
         .map_err(|_| "invalid seconds")?;
-    let roots: Vec<_> = args.map(std::path::PathBuf::from).collect();
+    let remaining: Vec<_> = args.collect();
+    let exact = remaining.first().is_some_and(|arg| arg == "--files");
+    let roots: Vec<_> = remaining
+        .iter()
+        .skip(usize::from(exact))
+        .map(std::path::PathBuf::from)
+        .collect();
     let before = footprint();
     let start = std::time::Instant::now();
-    let census = aterm_sysprobe::file_events::capture(std::time::Duration::from_secs(seconds))?;
+    let duration = std::time::Duration::from_secs(seconds);
+    let mode = if exact {
+        aterm_sysprobe::file_events::Granularity::Files(&roots)
+    } else {
+        aterm_sysprobe::file_events::Granularity::Directories(&roots)
+    };
+    let census =
+        aterm_sysprobe::file_events::capture(duration, mode, || eprintln!("sampling-ready"))?;
     let elapsed = start.elapsed().as_secs_f64();
     let after = footprint();
     println!(

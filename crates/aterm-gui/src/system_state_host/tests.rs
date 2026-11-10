@@ -2650,6 +2650,9 @@ mod observation_start {
 
     #[test]
     fn observation_focus_return_reads_the_unoccluded_page_once() {
+        use crate::native_app::TextInputEvent;
+        use aterm_types::macos_setup::{Observation, Standing, Subject};
+
         if !crate::test_alone::alone() {
             return;
         }
@@ -2657,6 +2660,79 @@ mod observation_start {
         app.window_focus_event(wid, true);
         tick(&mut app, Instant::now());
         assert_eq!(reads().as_slice(), std::slice::from_ref(&saved));
+
+        let mut reading = SetupStatus {
+            plan: Some(saved.clone()),
+            finished: true,
+            observed: vec![Observation {
+                standing: Standing::InPlace,
+                now: Some("first Dock reading".into()),
+                ..Observation::unknown(Subject::Setting(Setting::Dock))
+            }],
+            ..SetupStatus::default()
+        };
+        fresh(&mut app, reading.clone());
+        press(&mut app, wid, view, "system-state/line/mac/disclose");
+        type_into(
+            &mut app,
+            wid,
+            view,
+            "system-state/url",
+            "http://draft.invalid/v1/team",
+        );
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+        )
+        .unwrap();
+        app.dispatch_native_view_event(wid, view, AppEvent::TextInput(TextInputEvent::SelectAll))
+            .unwrap();
+        let render = |app: &App| {
+            app.native_runtime
+                .render(
+                    instance,
+                    view,
+                    &crate::native_app::ViewCx {
+                        viewport: crate::native_ui::LogicalRect::new(0.0, 0.0, 720.0, 124.0),
+                        animation_phase_ms: 0,
+                        motion: crate::native_app::ViewMotionCx::default(),
+                        terminal_font_px: 13.0,
+                        terminal_scale: 2.0,
+                        semantic_font: None,
+                        document: None,
+                    },
+                )
+                .unwrap();
+        };
+        render(&app);
+        app.dispatch_native_view_event(wid, view, AppEvent::ScrollPage(1))
+            .unwrap();
+        render(&app);
+        let presentation = |app: &App| {
+            let Some(crate::native_app::AppViewState::SystemState(state)) =
+                app.native_runtime.view_state(view)
+            else {
+                panic!("the original System State view remains attached")
+            };
+            let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+                panic!("the original System State controller remains attached")
+            };
+            let field = model.field_projection("system-state/url").unwrap();
+            (
+                state.open_line(),
+                state.list_scroll().0,
+                state.common.last_focus.clone(),
+                field,
+            )
+        };
+        let kept = presentation(&app);
+        assert_eq!(kept.0, Some("mac"));
+        assert!(kept.1 > 0.0, "the person has scrolled the list");
+        assert_eq!(
+            app.native_selection_text(wid).as_deref(),
+            Some("http://draft.invalid/v1/team")
+        );
 
         // System Settings can sit beside this page while the person changes
         // a preference. Losing focus never hides the page from its shown-view
@@ -2683,6 +2759,36 @@ mod observation_start {
             tick(&mut app, next);
         }
         assert_eq!(reads().len(), 2, "an unchanged focus is no new reading");
+        render(&app);
+        assert_eq!(
+            presentation(&app),
+            kept,
+            "focus preserves the view's choices"
+        );
+
+        app.switch_tab_in(wid, 0);
+        tick(&mut app, Instant::now());
+        assert!(app.open_system_state_tab_in_window(wid));
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(app.active_native_view(wid), Some((instance, view)));
+        render(&app);
+        assert_eq!(
+            presentation(&app),
+            kept,
+            "revisiting preserves the same view"
+        );
+        reading.observed[0].now = Some("fresh Dock reading".into());
+        reading.observed_generation += 1;
+        fresh(&mut app, reading);
+        render(&app);
+        assert_eq!(presentation(&app), kept, "fresh values update in place");
+        assert_eq!(
+            app.system_state_host.latest_status.observed[0]
+                .now
+                .as_deref(),
+            Some("fresh Dock reading")
+        );
     }
 
     #[test]

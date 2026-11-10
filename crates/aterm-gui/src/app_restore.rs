@@ -946,24 +946,14 @@ impl App {
                     route: state.route.path().to_string(),
                 })
             }
-            crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor => {
+            crate::native_app::AppKind::Editor => {
                 let document = app.document_id()?;
                 let uri = self.document_store.canonical_uri(document)?.to_string();
-                Some(match app.kind() {
-                    crate::native_app::AppKind::Markdown => {
-                        restore::NativeTabRestore::Markdown { uri }
-                    }
-                    crate::native_app::AppKind::Editor => restore::NativeTabRestore::Editor { uri },
-                    crate::native_app::AppKind::Mail
-                    | crate::native_app::AppKind::About
-                    | crate::native_app::AppKind::Settings
-                    | crate::native_app::AppKind::Allocation
-                    | crate::native_app::AppKind::SystemState => unreachable!(),
-                    crate::native_app::AppKind::Recovery => unreachable!(),
-                    crate::native_app::AppKind::Workers => unreachable!(),
-                })
+                Some(restore::NativeTabRestore::Editor { uri })
             }
-            crate::native_app::AppKind::Recovery | crate::native_app::AppKind::Workers => None,
+            crate::native_app::AppKind::Markdown
+            | crate::native_app::AppKind::Recovery
+            | crate::native_app::AppKind::Workers => None,
         }
     }
 
@@ -1242,15 +1232,6 @@ impl App {
                         crate::native_app::AppViewState::Settings(settings),
                     ) => restore::NativeLeafRestore::settings(settings.route.path().to_string()),
                     (
-                        crate::native_app::AppKind::Markdown,
-                        crate::native_app::AppViewState::Markdown(_),
-                    ) => restore::NativeLeafRestore::document(
-                        "markdown",
-                        self.document_store
-                            .canonical_uri(app.document_id()?)?
-                            .to_string(),
-                    ),
-                    (
                         crate::native_app::AppKind::Editor,
                         crate::native_app::AppViewState::Editor(_),
                     ) => restore::NativeLeafRestore::document(
@@ -1272,17 +1253,33 @@ impl App {
                             descriptor.settings_drafts = settings.carried_field_drafts().carried;
                         }
                     }
-                    crate::native_app::AppViewState::Markdown(markdown) => {
-                        descriptor.source_anchor = markdown.source_anchor;
-                        descriptor.viewport_anchor = markdown.visual_row;
-                        descriptor.selection = markdown.selection.as_ref().map(|selection| {
-                            restore::RestoreSelection {
-                                anchor: selection.start,
-                                head: selection.end,
+                    crate::native_app::AppViewState::Editor(editor) => {
+                        descriptor.markdown = editor.markdown.as_ref().map(|workspace| {
+                            use crate::native_app::{MarkdownPane, MarkdownWorkspaceMode};
+                            restore::MarkdownWorkspaceRestore {
+                                mode: match workspace.mode {
+                                    MarkdownWorkspaceMode::Read => "read",
+                                    MarkdownWorkspaceMode::Edit => "edit",
+                                    MarkdownWorkspaceMode::Split => "split",
+                                }
+                                .into(),
+                                focus: match workspace.focus {
+                                    MarkdownPane::Editor => "editor",
+                                    MarkdownPane::Reader => "reader",
+                                }
+                                .into(),
+                                source_anchor: workspace.reader.source_anchor,
+                                visual_row: workspace.reader.visual_row,
+                                reader_entry_anchor: workspace.reader_entry_anchor,
+                                selection: workspace.reader.selection.as_ref().map(|range| {
+                                    restore::RestoreSelection {
+                                        anchor: range.start,
+                                        head: range.end,
+                                    }
+                                }),
+                                split_per_mille: workspace.split_per_mille,
                             }
                         });
-                    }
-                    crate::native_app::AppViewState::Editor(editor) => {
                         descriptor.config_editor =
                             self.native_runtime.config_editor_enabled(native.instance);
                         if let Some(buffer) = editor.buffer.as_ref() {
@@ -1330,65 +1327,99 @@ impl App {
         let Some(app) = self.native_runtime.app(native.instance) else {
             return false;
         };
-        if app.vtable().restore_tag != restore.restore_tag {
+        let legacy_markdown =
+            restore.restore_tag == "markdown" && app.kind() == crate::native_app::AppKind::Editor;
+        if app.vtable().restore_tag != restore.restore_tag && !legacy_markdown {
             return false;
         }
         let document_text = app
             .document_id()
             .and_then(|document| self.document_store.snapshot(document))
             .map(|snapshot| snapshot.text);
-        let Some(state) = self.native_runtime.view_state_mut(view) else {
-            return false;
-        };
-        match state {
-            crate::native_app::AppViewState::About(_)
-            | crate::native_app::AppViewState::Mail(_)
-            | crate::native_app::AppViewState::Settings(_)
-            | crate::native_app::AppViewState::Allocation(_)
-            | crate::native_app::AppViewState::Workers(_)
-            | crate::native_app::AppViewState::SystemState(_) => true,
-            crate::native_app::AppViewState::Markdown(markdown) => {
-                let Some(text) = document_text.as_deref() else {
-                    return false;
-                };
-                markdown.source_anchor = clamp_boundary(text, restore.source_anchor);
-                markdown.visual_row = restore.viewport_anchor;
-                markdown.selection = restore.selection.map(|selection| {
-                    let anchor = clamp_boundary(text, selection.anchor);
-                    let head = clamp_boundary(text, selection.head);
-                    anchor.min(head)..anchor.max(head)
-                });
-                markdown
-                    .history
-                    .visit(crate::native_markdown::MarkdownLocation::new(
-                        markdown.source_anchor,
-                        markdown.visual_row,
-                    ));
-                true
-            }
-            crate::native_app::AppViewState::Editor(editor) => {
-                let (Some(text), Some(buffer)) = (document_text.as_deref(), editor.buffer.as_mut())
-                else {
-                    return false;
-                };
-                if !restore.editor_selections.is_empty() {
-                    buffer.selections = restore
-                        .editor_selections
-                        .iter()
-                        .map(|selection| crate::native_editor::Selection {
-                            anchor: clamp_boundary(text, selection.anchor),
-                            head: clamp_boundary(text, selection.head),
-                        })
-                        .collect();
-                    buffer.primary = restore
-                        .primary_selection
-                        .min(buffer.selections.len().saturating_sub(1));
+        self.native_runtime
+            .change_view_state(view, |state| match state {
+                crate::native_app::AppViewState::About(_)
+                | crate::native_app::AppViewState::Mail(_)
+                | crate::native_app::AppViewState::Settings(_)
+                | crate::native_app::AppViewState::Allocation(_)
+                | crate::native_app::AppViewState::Workers(_)
+                | crate::native_app::AppViewState::SystemState(_) => true,
+                crate::native_app::AppViewState::Editor(editor) => {
+                    let (Some(text), Some(buffer)) =
+                        (document_text.as_deref(), editor.buffer.as_mut())
+                    else {
+                        return false;
+                    };
+                    if !restore.editor_selections.is_empty() {
+                        buffer.selections = restore
+                            .editor_selections
+                            .iter()
+                            .map(|selection| crate::native_editor::Selection {
+                                anchor: clamp_boundary(text, selection.anchor),
+                                head: clamp_boundary(text, selection.head),
+                            })
+                            .collect();
+                        buffer.primary = restore
+                            .primary_selection
+                            .min(buffer.selections.len().saturating_sub(1));
+                    }
+                    if !legacy_markdown {
+                        buffer.viewport_anchor = clamp_boundary(text, restore.viewport_anchor);
+                    }
+                    if let Some(workspace) = editor.markdown.as_mut() {
+                        use crate::native_app::{MarkdownPane, MarkdownWorkspaceMode};
+                        let restored = restore.markdown.as_ref();
+                        if let Some(restored) = restored {
+                            workspace.mode = match restored.mode.as_str() {
+                                "read" => MarkdownWorkspaceMode::Read,
+                                "split" => MarkdownWorkspaceMode::Split,
+                                _ => MarkdownWorkspaceMode::Edit,
+                            };
+                            workspace.focus = match workspace.mode {
+                                MarkdownWorkspaceMode::Read => MarkdownPane::Reader,
+                                MarkdownWorkspaceMode::Edit => MarkdownPane::Editor,
+                                MarkdownWorkspaceMode::Split if restored.focus == "reader" => {
+                                    MarkdownPane::Reader
+                                }
+                                MarkdownWorkspaceMode::Split => MarkdownPane::Editor,
+                            };
+                            workspace.split_per_mille = restored.split_per_mille.clamp(200, 800);
+                            workspace.reader_entry_anchor = restored
+                                .reader_entry_anchor
+                                .map(|anchor| clamp_boundary(text, anchor));
+                        } else if legacy_markdown {
+                            workspace.mode = MarkdownWorkspaceMode::Read;
+                            workspace.focus = MarkdownPane::Reader;
+                        }
+                        if restored.is_some() || legacy_markdown {
+                            let source_anchor =
+                                restored.map_or(restore.source_anchor, |r| r.source_anchor);
+                            let visual_row =
+                                restored.map_or(restore.viewport_anchor, |r| r.visual_row);
+                            let selection = restored.map_or(restore.selection, |r| r.selection);
+                            workspace.reader.source_anchor = clamp_boundary(text, source_anchor);
+                            workspace.reader.visual_row = visual_row;
+                            workspace.reader.selection = selection.map(|selection| {
+                                let anchor = clamp_boundary(text, selection.anchor);
+                                let head = clamp_boundary(text, selection.head);
+                                anchor.min(head)..anchor.max(head)
+                            });
+                            workspace.reader.history.visit(
+                                crate::native_markdown::MarkdownLocation::new(
+                                    workspace.reader.source_anchor,
+                                    workspace.reader.visual_row,
+                                ),
+                            );
+                        }
+                        editor.common.last_focus = workspace
+                            .editor_focused()
+                            .then(|| crate::native_ui::UiKey::new("editor/buffer"));
+                        editor.common.retire_input();
+                    }
+                    true
                 }
-                buffer.viewport_anchor = clamp_boundary(text, restore.viewport_anchor);
-                true
-            }
-            crate::native_app::AppViewState::Recovery(_) => false,
-        }
+                crate::native_app::AppViewState::Recovery(_) => false,
+            })
     }
 
     fn pending_restored_agent(&self, id: u64, handoff: bool) -> Option<Box<restore::AgentRestore>> {
@@ -4439,36 +4470,42 @@ impl App {
         kind: crate::native_app::AppKind,
         uri: &str,
     ) -> Result<(), String> {
+        let read_intent = kind == crate::native_app::AppKind::Markdown;
+        if !matches!(
+            kind,
+            crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor
+        ) {
+            return Err("restore descriptor is not a document app".to_string());
+        }
+        let requested_kind = kind;
+        let kind = crate::native_app::AppKind::Editor;
         let existing = self.document_store.id_for_uri(uri).and_then(|document| {
             self.native_runtime
                 .instance_for_document(kind, document)
                 .map(|instance| (document, instance))
         });
         let Some((document, instance)) = existing else {
-            return self.open_document_tab_in_window(wid, kind, uri).map(|_| ());
+            return self
+                .open_document_tab_in_window(wid, requested_kind, uri)
+                .map(|_| ());
         };
-        let title = match self.native_runtime.app(instance) {
-            Some(crate::native_app::NativeApp::Markdown(app)) => app.title.clone(),
-            Some(crate::native_app::NativeApp::Editor(app)) => app.title.clone(),
+        let (title, markdown) = match self.native_runtime.app(instance) {
+            Some(crate::native_app::NativeApp::Editor(app)) => {
+                (app.title.clone(), app.markdown.is_some())
+            }
             _ => return Err("document restore instance changed kind".to_string()),
         };
-        let state = match kind {
-            crate::native_app::AppKind::Markdown => crate::native_app::AppViewState::Markdown(
-                crate::native_app::MarkdownViewState::default(),
-            ),
-            crate::native_app::AppKind::Editor => {
-                crate::native_app::AppViewState::Editor(Box::default())
-            }
-            crate::native_app::AppKind::Mail
-            | crate::native_app::AppKind::About
-            | crate::native_app::AppKind::Settings
-            | crate::native_app::AppKind::SystemState
-            | crate::native_app::AppKind::Recovery
-            | crate::native_app::AppKind::Allocation
-            | crate::native_app::AppKind::Workers => {
-                return Err("restore descriptor is not a document app".to_string());
-            }
-        };
+        let mut state = crate::native_app::EditorViewState::default();
+        if markdown {
+            state.markdown = Some(crate::native_app::MarkdownWorkspaceView::new(
+                if read_intent {
+                    crate::native_app::MarkdownWorkspaceMode::Read
+                } else {
+                    crate::native_app::MarkdownWorkspaceMode::Edit
+                },
+            ));
+        }
+        let state = crate::native_app::AppViewState::Editor(Box::new(state));
         let (tab, view) = self
             .install_native_tab(
                 wid,
@@ -4850,37 +4887,33 @@ impl App {
     }
 
     fn remove_restore_bootstrap_terminals(&mut self, wid: WindowId) {
-        let (tabs, sessions) = self.windows.get(&wid).map_or_else(
-            || (Vec::new(), Vec::new()),
-            |ws| {
-                let tabs = ws
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .filter(|tab| {
-                        matches!(
-                            self.view_store.get(tab.focus),
-                            Some(crate::tab_model::View::Terminal(_))
-                        )
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let sessions = ws
-                    .layouts
-                    .iter()
-                    .flat_map(pane::PaneTree::sessions)
-                    .collect::<Vec<_>>();
-                (tabs, sessions)
-            },
-        );
+        let mut removed_tabs = Vec::new();
+        let mut sessions = Vec::new();
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.layouts.clear();
+            let tab_ids: Vec<_> = ws
+                .tab_set
+                .tabs()
+                .iter()
+                .filter_map(|tab| {
+                    matches!(
+                        self.view_store.get(tab.focus),
+                        Some(crate::tab_model::View::Terminal(_))
+                    )
+                    .then_some(tab.id)
+                })
+                .collect();
+            for layout in ws.layouts.drain(..) {
+                layout.visit_sessions(&mut |session| sessions.push(session));
+            }
             ws.tabs = TabIndex::new(0, 0);
-            for tab in &tabs {
-                ws.tab_set.remove(tab.id);
+            removed_tabs.reserve(tab_ids.len());
+            for tab_id in tab_ids {
+                if let Some(tab) = ws.tab_set.remove(tab_id) {
+                    removed_tabs.push(tab);
+                }
             }
         }
-        for tab in &tabs {
+        for tab in &removed_tabs {
             self.remove_tab_views(tab);
         }
         for session in sessions {
@@ -4897,15 +4930,17 @@ impl App {
         let (rows, cols) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols))?;
         let cell_px = self.spawn_cell_px(wid);
         let proxy = self.proxy.clone()?;
-        let leaves = layout.leaves();
-        let mut ids: Vec<u64> = Vec::with_capacity(leaves.len());
+        let mut ids: Vec<u64> = Vec::with_capacity(layout.leaf_count());
         let mut fresh: Vec<Session> = Vec::new();
-        for (i, leaf) in leaves.iter().enumerate() {
+        let mut index = 0usize;
+        if !layout.all_leaves(&mut |leaf| {
+            let i = index;
+            index += 1;
             if i == 0
                 && let Some(keep) = reuse_first
             {
                 ids.push(keep);
-                continue;
+                return true;
             }
             let id = self.next_session_id;
             let adopt = take_handed_off_shell(&mut self.seamless_adopt, leaf.local_id());
@@ -4932,15 +4967,18 @@ impl App {
                     self.next_session_id += 1;
                     ids.push(id);
                     fresh.push(s);
+                    true
                 }
                 Err(e) => {
                     crate::logging::stderr_line!("aterm-gui: session restore: spawn failed: {e}");
                     self.post_message(crate::message_reporters::restored_tab_failed(
                         &e.to_string(),
                     ));
-                    return None;
+                    false
                 }
             }
+        }) {
+            return None;
         }
         let tree = pane::PaneTree::rebuild(layout, &ids)?;
         for s in fresh {

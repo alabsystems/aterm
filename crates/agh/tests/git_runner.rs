@@ -24,6 +24,8 @@ use agh_fake::{FakeGithub, FakeOrigin, RepoSpec};
 
 use crate::common;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod abrupt_stop_tests;
 mod commit_ancestry_tests;
 
 /// Exercise the real CLI entry and its signal-to-collector handoff. The fake Git waits for

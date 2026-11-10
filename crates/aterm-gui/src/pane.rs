@@ -135,6 +135,7 @@ impl PaneTree {
     }
 
     /// All leaf session IDs in tree order.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn sessions(&self) -> Vec<u64> {
         self.root.leaves()
@@ -607,13 +608,70 @@ mod tests {
             }
         }
         assert_eq!(structural(&rebuilt.to_layout(&meta2)), structural(&layout));
+        let rebuilt_layout = rebuilt.to_layout(&meta2);
         assert_eq!(
-            rebuilt.to_layout(&meta2).leaves()[0].local_id(),
+            rebuilt_layout.leaves()[0].local_id(),
             Some(10),
             "leaf local_id tracks the live session id"
         );
+        assert_eq!(
+            rebuilt_layout.first_leaf(),
+            rebuilt_layout.leaves()[0],
+            "first_leaf returns the first leaf in tree order without allocating"
+        );
+        let mut visited_leaves = Vec::new();
+        rebuilt_layout.visit_leaves(&mut |leaf| visited_leaves.push(leaf));
+        assert_eq!(visited_leaves, rebuilt_layout.leaves());
+        let mut prefix_ids = Vec::new();
+        assert!(!rebuilt_layout.all_leaves(&mut |leaf| {
+            prefix_ids.push(leaf.local_id());
+            leaf.local_id() != Some(11)
+        }));
+        assert_eq!(
+            prefix_ids,
+            vec![Some(10), Some(11)],
+            "all_leaves short-circuits on the first false leaf"
+        );
 
         assert!(PaneTree::rebuild(&layout, &[10, 11]).is_none());
+    }
+
+    #[test]
+    fn visit_sessions_and_matches_projected_preserve_order_and_reject_mismatches() {
+        let mut tree = PaneTree::new(10);
+        assert!(tree.split_focused(SplitDir::Vertical, 20));
+        assert!(tree.split_focused(SplitDir::Horizontal, 30));
+
+        let mut visited = Vec::new();
+        tree.visit_sessions(&mut |sid| visited.push(sid));
+        assert_eq!(visited, tree.sessions());
+
+        let exact = tree.map_sessions(Some);
+        assert!(tree.matches_projected(&exact, &|cell| cell));
+
+        let with_native = tree.map_sessions(|sid| (sid != 30).then_some(sid));
+        assert!(
+            !tree.matches_projected(&with_native, &|cell| cell),
+            "a non-terminal leaf (None) must not match a terminal PaneTree leaf"
+        );
+
+        let wrong_session = tree.map_sessions(|sid| Some(if sid == 20 { 99 } else { sid }));
+        assert!(!tree.matches_projected(&wrong_session, &|cell| cell));
+
+        let mut wrong_axis = exact.clone();
+        if let SplitTree::Split { axis, .. } = &mut wrong_axis {
+            *axis = SplitAxis::Vertical;
+        }
+        assert!(!tree.matches_projected(&wrong_axis, &|cell| cell));
+
+        let mut wrong_ratio = exact;
+        if let SplitTree::Split { ratio, .. } = &mut wrong_ratio {
+            *ratio = 0.6;
+        }
+        assert!(!tree.matches_projected(&wrong_ratio, &|cell| cell));
+
+        let single_leaf = SplitTree::Leaf(Some(10));
+        assert!(!tree.matches_projected(&single_leaf, &|cell| cell));
     }
 
     /// Cmd-D vertical split: two panes side by side across a 1-cell divider column, each

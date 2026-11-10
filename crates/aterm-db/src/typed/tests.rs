@@ -297,6 +297,27 @@ fn cell_keys_fit_the_grammar_and_never_hold_an_address() {
         .encode()
         .is_err()
     );
+
+    let decimal = concat!("ph-", "12345678", "90123456");
+    let decimal_key = json!(decimal);
+    assert!(cell::admissible(&Ty::Key, &decimal_key));
+    assert!(!cell::admissible(&Ty::Text(32), &decimal_key));
+    assert_eq!(
+        super::grid::read(&Ty::Key, &format!(" {decimal} ")).unwrap(),
+        decimal_key
+    );
+    assert_eq!(super::grid::show(&Ty::Key, &decimal_key, false), decimal);
+    for bad in [
+        "",
+        "row.with.dot",
+        "who@example.invalid",
+        "a key with spaces",
+        "01234567890123456789012345678",
+        concat!("ghp", "_fixture"),
+        concat!("JBSWY3DP", "EHPK3PXP"),
+    ] {
+        assert!(!cell::admissible(&Ty::Key, &json!(bad)), "{bad}");
+    }
 }
 
 /// Two concurrent edits to different columns of one row both survive; to one column they leave

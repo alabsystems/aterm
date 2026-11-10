@@ -11,28 +11,24 @@ use crate::items::apps::{
 };
 use crate::items::aterm::{BUNDLE_ID, TEAM_ID, is_version};
 use crate::model::Read;
-use crate::port::{Cmd, Scratch, System};
+use crate::port::{Scratch, System};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
 /// Public GitHub repository slug for official `aterm` releases.
 pub const RELEASE_REPO: &str = "alabsystems/aterm";
 
-/// Maximum artifact download size (`--max-filesize`).
+/// Maximum artifact download size: [`System::download`]'s cap.
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
 
-/// The largest appcast taken: a few dozen KiB in practice, and well under the port's 1 MiB
-/// of captured output, so a cut-off answer cannot parse as a whole one.
+/// The largest appcast taken: a few dozen KiB in practice. [`System::download_bytes`] refuses a
+/// longer body whole rather than cutting it, so a cut-off answer cannot parse as a whole one.
 const MAX_APPCAST_BYTES: u64 = 512 * 1024;
 
 /// The largest install.sh taken (install.sh's own bound on a manifest, 5 MB; the script
 /// is about 230 KB).
 const MAX_SCRIPT_BYTES: u64 = 5_000_000;
-
-/// The bound on one download: a hang detector over a slow link, not a latency budget.
-const DOWNLOAD_BUDGET: Duration = Duration::from_secs(3600);
 
 /// Serialize this process's cache lookup and publish decisions. Temporary allocations
 /// are exclusive across calls, including other processes.
@@ -107,41 +103,14 @@ pub fn needed(baseline: &Baseline) -> Vec<Needed> {
     out
 }
 
-/// `curl` of `url` to `out` (`-` for standard output), at most `max` bytes.
-fn curl(url: &str, out: &Path, max: u64) -> Cmd {
-    Cmd::new("/usr/bin/curl")
-        .args([
-            "-q",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--tlsv1.2",
-            "-fsSL",
-            "--connect-timeout",
-            "20",
-            "--max-filesize",
-        ])
-        .arg(max.to_string())
-        .arg("-o")
-        .arg(out)
-        .arg(url)
-        .budget(DOWNLOAD_BUDGET)
-}
-
-/// Download `url` into a temporary file `tmp` in the cache directory, bounded by `max`.
+/// Download `url` into a temporary file `tmp` in the cache directory, bounded by `max`, through
+/// [`System::download`]: a release asset by the shared release-asset reader (the download host,
+/// then GitHub's API asset route), any other URL from its own host.
 fn download(sys: &dyn System, url: &str, tmp: &Path, max: u64) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err(format!("{url} is not https://; refusing to download it"));
     }
-    let ran = sys
-        .run(&curl(url, tmp, max))
-        .map_err(|e| format!("curl {url}: {e}"))?;
-    if ran.success() {
-        Ok(())
-    } else {
-        Err(format!("curl {url}: {}", ran.describe()))
-    }
+    sys.download(url, tmp, max)
 }
 
 fn cache_scratch<'s>(
@@ -155,7 +124,8 @@ fn cache_scratch<'s>(
     Scratch::new_in(sys, &cache, label).map_err(|e| format!("cache scratch: {e}"))
 }
 
-/// Ensures `cache/<sha256>` holds a verified copy of `item`, downloading via `curl` if needed.
+/// Ensures `cache/<sha256>` holds a verified copy of `item`, downloading it ([`download`]) if
+/// needed.
 ///
 /// # Errors
 /// One line: not https, download failed, or the bytes do not hash to the pin (and then
@@ -287,19 +257,13 @@ pub fn parse_appcast(text: &str, want: Option<&str>) -> Result<Release, String> 
     })
 }
 
-/// `url`'s body as text, at most `max` bytes.
+/// `url`'s body as text, at most `max` bytes, read as [`download`] reads.
 fn fetch_text(sys: &dyn System, url: &str, max: u64) -> Result<String, String> {
     if !url.starts_with("https://") {
         return Err(format!("{url} is not https://; refusing to download it"));
     }
-    let ran = sys
-        .run(&curl(url, Path::new("-"), max))
-        .map_err(|e| format!("curl {url}: {e}"))?;
-    if ran.success() {
-        Ok(ran.out())
-    } else {
-        Err(format!("curl {url}: {}", ran.describe()))
-    }
+    let bytes = sys.download_bytes(url, max)?;
+    String::from_utf8(bytes).map_err(|e| format!("{url} is not UTF-8 text: {e}"))
 }
 
 /// The whole-file guard's last line in `text`: `main "$@"; }` in an install.sh whose
@@ -593,12 +557,6 @@ changelog = '''
         }
     }
 
-    fn curl_key(url: &str, out: &str, max: u64) -> String {
-        format!(
-            "/usr/bin/curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL --connect-timeout 20 --max-filesize {max} -o {out} {url}"
-        )
-    }
-
     fn part(label: &str, sequence: u64) -> String {
         Fake::scratch_path(Some(Path::new("/m/cache")), label, sequence)
             .join("payload")
@@ -690,31 +648,23 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
             sha256: sha.clone(),
         };
         let sys = Fake::root();
-        sys.on(
-            &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            ok(""),
-        );
-        sys.on_write(
-            &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            Path::new(&part("download", 0)),
-            bytes,
-        );
+        sys.on_download(url, Ok(bytes));
         let got = ensure(&sys, &paths(), &item).unwrap();
         assert_eq!(got, PathBuf::from(format!("/m/cache/{sha}")));
+        assert!(
+            sys.calls().contains(&format!(
+                "download {url} -> {} (max {MAX_ARTIFACT_BYTES})",
+                part("download", 0)
+            )),
+            "read into the cache's scratch through the port: {:?}",
+            sys.calls()
+        );
         assert_eq!(sys.written(&format!("/m/cache/{sha}")).unwrap(), bytes);
         let before = sys.calls().len();
         ensure(&sys, &paths(), &item).unwrap();
         assert_eq!(sys.calls().len(), before);
         let sys = Fake::root();
-        sys.on(
-            &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            ok(""),
-        );
-        sys.on_write(
-            &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            Path::new(&part("download", 0)),
-            b"tampered",
-        );
+        sys.on_download(url, Ok(b"tampered"));
         let why = ensure(&sys, &paths(), &item).unwrap_err();
         assert!(why.contains("the baseline pins"), "{why}");
         assert!(sys.written(&format!("/m/cache/{sha}")).is_none());
@@ -722,25 +672,24 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
     }
 
     #[test]
-    fn a_failed_download_says_curl_s_reason() {
+    fn a_failed_download_says_why_and_caches_nothing() {
         let sha = "0".repeat(64);
         let url = "https://example.com/x.dmg";
         let sys = Fake::root();
-        sys.on(
-            &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            err(22, "curl: (22) The requested URL returned error: 404"),
-        );
+        sys.on_download(url, Err("https://example.com/x.dmg: HTTP 404"));
         let why = ensure(
             &sys,
             &paths(),
             &Needed {
                 name: "app.X".into(),
                 url: url.into(),
-                sha256: sha,
+                sha256: sha.clone(),
             },
         )
         .unwrap_err();
-        assert!(why.contains("exit 22: curl: (22)"), "{why}");
+        assert_eq!(why, "app.X: https://example.com/x.dmg: HTTP 404");
+        assert!(sys.written(&format!("/m/cache/{sha}")).is_none());
+        assert!(sys.written(&part("download", 0)).is_none());
     }
 
     #[test]
@@ -796,20 +745,9 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
         let zip = b"the release zip";
         let zip_sha = sha_of(zip);
         let appcast = APPCAST.replace(ZIP_SHA, &zip_sha);
-        sys.on(
-            &curl_key(&appcast_url(None), "-", MAX_APPCAST_BYTES),
-            ok(&appcast),
-        );
+        sys.on_download(&appcast_url(None), Ok(appcast.as_bytes()));
         let zip_url = release_url("0.104.0", "aterm-0.104.0-mac.zip");
-        sys.on(
-            &curl_key(&zip_url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            ok(""),
-        );
-        sys.on_write(
-            &curl_key(&zip_url, &part("download", 0), MAX_ARTIFACT_BYTES),
-            Path::new(&part("download", 0)),
-            zip,
-        );
+        sys.on_download(&zip_url, Ok(zip));
         let verify = Fake::scratch_path(Some(Path::new("/m/cache")), "verify", 1)
             .to_string_lossy()
             .into_owned();
@@ -841,23 +779,7 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
         );
         let script = b"#!/usr/bin/env bash\nOFFICIAL_TEAM_ID=\"A66A9P66Z7\"\nmain \"$@\"\n";
         let script_sha = sha_of(script);
-        sys.on(
-            &curl_key(
-                &install_sh_url("0.104.0"),
-                &part("install-script", 2),
-                MAX_SCRIPT_BYTES,
-            ),
-            ok(""),
-        );
-        sys.on_write(
-            &curl_key(
-                &install_sh_url("0.104.0"),
-                &part("install-script", 2),
-                MAX_SCRIPT_BYTES,
-            ),
-            Path::new(&part("install-script", 2)),
-            script,
-        );
+        sys.on_download(&install_sh_url("0.104.0"), Ok(script));
         (zip_sha, script_sha, verify)
     }
 
@@ -867,6 +789,22 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
         let (zip_sha, script_sha, verify) = scripted_release(&sys);
         let text = "schema = 1\n\n# The lab runs the newest release.\n[aterm]\nowner = \"admin\" # owns /Applications/aterm.app\ntoolset = true\n";
         let out = resolve_aterm(&sys, &paths(), text).unwrap();
+        let calls = sys.calls();
+        for read in [
+            format!("download {} (max {MAX_APPCAST_BYTES})", appcast_url(None)),
+            format!(
+                "download {} -> {} (max {MAX_ARTIFACT_BYTES})",
+                release_url("0.104.0", "aterm-0.104.0-mac.zip"),
+                part("download", 0)
+            ),
+            format!(
+                "download {} -> {} (max {MAX_SCRIPT_BYTES})",
+                install_sh_url("0.104.0"),
+                part("install-script", 2)
+            ),
+        ] {
+            assert!(calls.contains(&read), "{read} in {calls:?}");
+        }
         assert!(out.starts_with("schema = 1\n\n# The lab runs the newest release.\n[aterm]\nowner = \"admin\" # owns /Applications/aterm.app\ntoolset = true\n"), "{out}");
         let b = crate::baseline::parse(&out).unwrap().aterm.unwrap();
         assert_eq!(b.version.as_deref(), Some("0.104.0"));
@@ -907,12 +845,24 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
     }
 
     #[test]
+    fn an_appcast_that_is_not_utf8_is_refused() {
+        let url = appcast_url(Some("0.104.0"));
+        let sys = Fake::root();
+        let mut body = APPCAST.as_bytes().to_vec();
+        body.extend_from_slice(b"# \xff\n");
+        sys.on_download(&url, Ok(&body));
+        let why = fetch_text(&sys, &url, MAX_APPCAST_BYTES).unwrap_err();
+        assert!(why.contains("is not UTF-8 text"), "{why}");
+        // Negative control: the same appcast without the stray byte is read whole.
+        let sys = Fake::root();
+        sys.on_download(&url, Ok(APPCAST.as_bytes()));
+        assert_eq!(fetch_text(&sys, &url, MAX_APPCAST_BYTES).unwrap(), APPCAST);
+    }
+
+    #[test]
     fn an_archive_pin_the_release_contradicts_is_refused() {
         let sys = Fake::root();
-        sys.on(
-            &curl_key(&appcast_url(Some("0.104.0")), "-", MAX_APPCAST_BYTES),
-            ok(APPCAST),
-        );
+        sys.on_download(&appcast_url(Some("0.104.0")), Ok(APPCAST.as_bytes()));
         let text = format!(
             "schema = 1\n[aterm]\nversion = \"0.104.0\"\narchive_sha256 = \"{}\"\n",
             "a".repeat(64)
@@ -924,22 +874,9 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
     #[test]
     fn an_install_sh_that_is_cut_off_or_unpinned_is_not_cached() {
         let sys = Fake::root();
-        sys.on(
-            &curl_key(
-                &install_sh_url("0.104.0"),
-                &part("install-script", 0),
-                MAX_SCRIPT_BYTES,
-            ),
-            ok(""),
-        );
-        sys.on_write(
-            &curl_key(
-                &install_sh_url("0.104.0"),
-                &part("install-script", 0),
-                MAX_SCRIPT_BYTES,
-            ),
-            Path::new(&part("install-script", 0)),
-            b"#!/usr/bin/env bash\nOFFICIAL_TEAM_ID=\"A66A9P66Z7\"\nmain() {\n",
+        sys.on_download(
+            &install_sh_url("0.104.0"),
+            Ok(b"#!/usr/bin/env bash\nOFFICIAL_TEAM_ID=\"A66A9P66Z7\"\nmain() {\n"),
         );
         let why = fetch_install_sh(&sys, &paths(), "0.104.0").unwrap_err();
         assert!(why.contains("main \"$@\""), "{why}");
@@ -949,13 +886,7 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
     /// Fetch `script` as release 0.104.0's install.sh on a fresh host.
     fn fetched(script: &[u8]) -> Result<String, String> {
         let sys = Fake::root();
-        let key = curl_key(
-            &install_sh_url("0.104.0"),
-            &part("install-script", 0),
-            MAX_SCRIPT_BYTES,
-        );
-        sys.on(&key, ok(""));
-        sys.on_write(&key, Path::new(&part("install-script", 0)), script);
+        sys.on_download(&install_sh_url("0.104.0"), Ok(script));
         fetch_install_sh(&sys, &paths(), "0.104.0")
     }
 

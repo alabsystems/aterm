@@ -26,6 +26,109 @@ const NODE: &str = "00112233445566778899aabbccddeeff";
 const OTHER_NODE: &str = "ffeeddccbbaa99887766554433221100";
 const KEY: [u8; 32] = [0x5a; 32];
 const ANN: &str = "ann@example.invalid";
+
+#[test]
+fn a_chosen_number_binds_its_sheet_row_despite_a_stale_label_clash() {
+    let own = "mc-3212e085d1b70b59";
+    let sheet = "mc-ce20a1499bba52af";
+    let other = "mc-f538a6db070c0f9b";
+    let node = "a20d9412c90c0be0";
+    let other_node = "0011223344556677";
+    let roster = BTreeMap::from([
+        ("m3".into(), BTreeMap::from([("node", node.into())])),
+        ("m87".into(), BTreeMap::from([("node", other_node.into())])),
+    ]);
+    let mut book = Book::new();
+    machine_row(
+        &mut book,
+        own,
+        "m87",
+        vec![put(&MACHINE, own, "node", json!(node))],
+    );
+    machine_row(
+        &mut book,
+        other,
+        "m87",
+        vec![put(&MACHINE, other, "node", json!(other_node))],
+    );
+    machine_row(
+        &mut book,
+        sheet,
+        "m3",
+        vec![elem(&MACHINE, sheet, "aliases", "m91")],
+    );
+    let only_choosing_mac =
+        BTreeMap::from([("m3".into(), BTreeMap::from([("node", node.into())]))]);
+    let by_node = plan_with(&book.cells(), &only_choosing_mac);
+    assert_eq!(
+        by_node.merges.len(),
+        1,
+        "the other real row's m87 need not be its roster number: {by_node:?}"
+    );
+    let first = plan_with(&book.cells(), &roster);
+    assert_eq!(first.merges.len(), 1, "{first:?}");
+    assert_eq!(first.merges[0].keep, own);
+    assert_eq!(first.merges[0].gone, [sheet]);
+    let cells = apply(&mut book, &first);
+    assert_eq!(row(&cells, own).get("label"), Some(&json!("m3")));
+    assert_eq!(row(&cells, other).get("label"), Some(&json!("m87")));
+    assert!(!row(&cells, own).fields["aliases"].has_member("m87"));
+    assert!(row(&cells, own).fields["aliases"].has_member("m91"));
+    assert!(!row(&cells, sheet).live());
+    assert!(plan_with(&cells, &roster).rows.is_empty());
+
+    // A real holder on the target row prevents binding it to a different Mac.
+    let mut book = Book::new();
+    machine_row(
+        &mut book,
+        own,
+        "m87",
+        vec![put(&MACHINE, own, "node", json!(node))],
+    );
+    machine_row(
+        &mut book,
+        sheet,
+        "m3",
+        vec![put(&MACHINE, sheet, "node", json!(other_node))],
+    );
+    assert!(plan_with(&book.cells(), &roster).merges.is_empty());
+}
+
+#[test]
+fn a_sheet_number_does_not_bypass_another_rows_node_binding() {
+    let own = "mc-3212e085d1b70b59";
+    let sheet = "mc-ce20a1499bba52af";
+    let other = "mc-f538a6db070c0f9b";
+    let mut book = Book::new();
+    machine_row(
+        &mut book,
+        own,
+        "m87",
+        vec![put(&MACHINE, own, "node", json!("a20d9412c90c0be0"))],
+    );
+    machine_row(&mut book, sheet, "m3", Vec::new());
+    machine_row(
+        &mut book,
+        other,
+        "m3",
+        vec![put(&MACHINE, other, "node", json!("0011223344556677"))],
+    );
+    let roster = BTreeMap::from([
+        (
+            "m3".into(),
+            BTreeMap::from([("node", "a20d9412c90c0be0".into())]),
+        ),
+        (
+            "m87".into(),
+            BTreeMap::from([("node", "0011223344556677".into())]),
+        ),
+    ]);
+    let plan = plan_with(&book.cells(), &roster);
+    assert!(
+        plan.merges.is_empty(),
+        "a bound row still holds m3: {plan:?}"
+    );
+}
 /// A hold's `why` and what writes its cause into a book, given the two keys its case names.
 type Shape = (&'static str, fn(&mut Book, &str, &str));
 
@@ -977,7 +1080,10 @@ fn what_it_cannot_decide_is_held() {
     .into();
     let plan = plan_with(&book.cells(), &stated);
     assert!(plan.merges.is_empty(), "{:?}", plan.merges);
-    assert_eq!(plan.held[0].why, "two-macs");
+    assert!(
+        plan.held.is_empty(),
+        "the signed node now names m55, so the rows share no name"
+    );
 
     // A node, a status or a label this build cannot read holds the rows, and what is not a name is
     // not reported as one.
@@ -1249,17 +1355,10 @@ fn with_no_roster_name_the_node_bound_row_keeps_its_label() {
     assert_eq!(kept.fields["aliases"].members(), BTreeSet::from(["m104"]));
 }
 
-/// A Mac the roster names otherwise than it registered keeps two rows that share no name: its own,
-/// bound to its node under the label it went by, and the row an import gave the roster's name. The
-/// roster ties them: the row with no node folds into the node-bound row, which takes the roster's
-/// name and keeps its own as an alias, and a plan over the result is empty. A named row holding a
-/// node of its own, a name two rows answer, or a node two rows hold, ties nothing.
-/// NEGATIVE CONTROL: with no roster ties: `left: 0 right: 1` at `merges.len()`. With a named row
-/// holding a node tied too, the pair is held: `Plan { merges: [], held: [Held { rows: [..], names:
-/// ["m164", "m91"], why: "two-macs" }], ..`. With the first of two rows answering the name tied, the
-/// merge folds both: `Plan { merges: [Merge { .., gone: ["mc-696c4977a99298d5",
-/// "mc-daa06bd2720cb8db"], ..`. With the first of two rows holding the node tied: `Plan { merges:
-/// [Merge { keep: "mc-1c9fe56a93607a37", ..`.
+/// The authenticated node-to-name binding joins every nodeless sheet row answering that name.
+/// The node-bound row stays and keeps its earlier nonclashing number as an alias; another node
+/// on the target row or two rows carrying the node prevents the merge. Without applying the
+/// node-to-name binding before grouping, the first merge is absent.
 #[test]
 fn a_mac_the_roster_names_otherwise_folds_its_two_rows() {
     let principal = "0011223344556677";
@@ -1311,7 +1410,7 @@ fn a_mac_the_roster_names_otherwise_folds_its_two_rows() {
     );
     let apart = plan_with(&book.cells(), &roster);
     assert!(
-        apart.merges.is_empty() && apart.held.is_empty(),
+        apart.merges.is_empty() && apart.held.iter().all(|held| held.why == "two-macs"),
         "{apart:?}"
     );
     let mut book = Book::new();
@@ -1324,10 +1423,9 @@ fn a_mac_the_roster_names_otherwise_folds_its_two_rows() {
         vec![elem(&MACHINE, &third, "aliases", "m164")],
     );
     let two = plan_with(&book.cells(), &roster);
-    assert!(
-        two.merges.is_empty() && two.held.iter().all(|held| !held.rows.contains(&own)),
-        "{two:?}"
-    );
+    assert_eq!(two.merges.len(), 1, "{two:?}");
+    assert_eq!(two.merges[0].keep, own);
+    assert_eq!(two.merges[0].gone.len(), 2);
     let mut book = Book::new();
     shape(&mut book);
     let twin = keys::machine_pk("m8");

@@ -179,6 +179,16 @@ fn interface_and_address_messages_move_the_interface_generation() {
     for kind in (0x1..=0xb).chain([0x14]) {
         assert!(!moves_interfaces(kind), "{kind:#x}");
     }
+    for kind in (0x1..=0x14).chain([0x40]) {
+        assert_eq!(
+            route_changed(&routing_message(kind)).unwrap(),
+            !matches!(kind, 0x4 | 0x14),
+            "listener validity must include route changes but not its own lookups: {kind:#x}"
+        );
+    }
+    for end in 0..HEADER {
+        assert!(route_changed(&routing_message(0xe)[..end]).is_err());
+    }
 }
 
 /// The routing socket opens with no privilege, so a Mac's rechecks get a generation.
@@ -278,6 +288,47 @@ fn a_drain_moves_the_generation_for_interface_messages_and_what_it_cannot_vouch_
     let mut watch = Watch::over(not_a_socket.into(), 64 * 1024);
     let before = watch.generation;
     assert_ne!(watch.drain(DRAIN), before, "a failed read");
+
+    #[cfg(target_os = "macos")]
+    {
+        let (kernel, socket) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let changes = super::super::RouteChanges {
+            socket: super::super::Socket(socket.into()),
+            room: 64 * 1024,
+        };
+        assert!(!changes.drain().unwrap());
+        kernel.send(&routing_message(0x4)).unwrap();
+        assert!(
+            !changes.drain().unwrap(),
+            "a route lookup cannot wake itself"
+        );
+        for kind in [0x1, 0x3, 0xc, 0xe] {
+            kernel.send(&routing_message(kind)).unwrap();
+            let mut ready = libc::pollfd {
+                fd: changes.fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: ready is one live initialized pollfd, and changes owns the descriptor.
+            assert_eq!(unsafe { libc::poll(&raw mut ready, 1, 0) }, 1);
+            assert!(changes.drain().unwrap());
+            assert!(!changes.drain().unwrap(), "the message was consumed");
+        }
+        kernel.send(&[0]).unwrap();
+        assert!(
+            changes.drain().is_err(),
+            "an unreadable notification is not quiet"
+        );
+        let not_a_socket = std::fs::File::open("/dev/null").unwrap();
+        let changes = super::super::RouteChanges {
+            socket: super::super::Socket(not_a_socket.into()),
+            room: 64 * 1024,
+        };
+        assert!(
+            changes.drain().is_err(),
+            "a failed event source cannot stay asleep"
+        );
+    }
 }
 
 /// The attachments a recheck reads (`crate::lan::local_attachments`, which every listener and

@@ -3690,9 +3690,10 @@ fn the_chips_write_no_rule_glyph() {
         let floor = crate::work_counts::take_footer_cells_written();
         let _ = pass_cost(&mut app, wid);
         let cells = crate::work_counts::take_footer_cells_written();
+        // The chips are `∞ ● yolo`, eight cells, and the blank on each side of them.
         let chips = cells.checked_sub(floor + line + arc);
         assert!(
-            chips.is_some_and(|c| (1..=8).contains(&c)),
+            chips.is_some_and(|c| (1..=10).contains(&c)),
             "pass {i}: {cells} cells written, the bare footer's {floor}, the line's {line} and \
              the arc's {arc}"
         );

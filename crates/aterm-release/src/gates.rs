@@ -2599,10 +2599,9 @@ fn tag_gate(
         .is_some()
     {
         return Err(Error::new(format!(
-            "tag {tag} is on origin: v{version} was cut. The next release is v{}: `pub bump \
-             aterm --minor --write` on main, commit and push, then `pub stage aterm` and `pub \
-             publish aterm`, then cut",
-            crate::publish::bump_minor_release(version)?
+            "tag {tag} is on origin: v{version} was cut. Start the next product release with \
+             `{} --bump`; it reserves the version through the source claim",
+            crate::release::RELEASE_COMMAND
         )));
     }
     if local.success() {
@@ -2815,11 +2814,35 @@ pub fn predecessor_release(
     version: &str,
     shipped: &dyn Fn(&str) -> bool,
 ) -> Result<Option<String>> {
+    recorded_release(ledger_text, &|candidate| candidate != version, shipped)
+}
+
+/// The newest recorded shipped release at or below a full three-component version.
+/// Unlike constructing a successor as a fence, this also inspects the greatest valid counter.
+pub(crate) fn release_through(
+    ledger_text: &str,
+    version: &str,
+    shipped: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>> {
+    let ceiling = version_triple(version)
+        .ok_or_else(|| Error::new(format!("cannot order product release {version}")))?;
+    recorded_release(
+        ledger_text,
+        &|candidate| version_triple(candidate).is_some_and(|key| key <= ceiling),
+        shipped,
+    )
+}
+
+fn recorded_release(
+    ledger_text: &str,
+    eligible: &dyn Fn(&str) -> bool,
+    shipped: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>> {
     let mut passed_over: Vec<&str> = Vec::new();
     let records = crate::ledger::parse(ledger_text)?;
     for record in records.iter().rev() {
         let candidate = record.version.as_str();
-        if candidate == version || passed_over.contains(&candidate) {
+        if !eligible(candidate) || passed_over.contains(&candidate) {
             continue;
         }
         if shipped(candidate) {
@@ -2993,7 +3016,9 @@ pub(crate) fn required_desks(guard: &str) -> Result<Vec<RequiredDesk>> {
         .collect()
 }
 
-fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
+/// The canonical product-release ordering key. Historical two-component ledger
+/// entries are not candidates for a current three-component release window.
+pub(crate) fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(str::parse::<u64>);
     let triple = (
         parts.next()?.ok()?,

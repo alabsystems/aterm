@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The `export-scan` check: the publication engine's content guards (forbidden content, private
-//! references, gitleaks), held in the dev set to what the change touched, so a red is found
-//! before a cut rather than in one (`docs/DESIGN-fast-build-release-2026-11-05.md`, B7). The
+//! references, dead Markdown links, gitleaks), held in the dev set to what the change touched,
+//! so a red is found before a cut rather than in one
+//! (`docs/DESIGN-fast-build-release-2026-11-05.md`, B7). The
 //! engine's half (its baseline and registry) is one commit of it ([`crate::engine`]); the scan
 //! itself reads no network.
 //!
@@ -14,6 +15,9 @@
 //! export when it changed how every file is exported or what it is held to, [`WIDENS`]); `-p`
 //! and `--all` scan the whole export. The engine still runs its own guards on every cut: this
 //! finds their reds first, it does not replace them.
+//! The dead-link pass reads shipping Markdown for inbound references, but judges only changed
+//! documents and links whose targets or traversed symlinks changed. It precedes package-key
+//! reuse because an excluded target is not an input of the shipping reader's package.
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -682,6 +686,51 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
             return;
         }
     };
+    // Link verdicts depend on targets outside a package's input key. Always judge
+    // them before reusing any content-guard receipt, including partial release input.
+    let links_started = std::time::Instant::now();
+    let mut link_cost = String::new();
+    match every_file(&ctx.root, &ctx.path_env)
+        .and_then(|paths| with_astream(&ctx.root, &ctx.path_env, paths))
+        .and_then(|paths| gitlinks(&ctx.root, &ctx.path_env).map(|links| (paths, links)))
+    {
+        Ok((paths, links)) => {
+            let gitlinks: Vec<_> = links.into_iter().map(|(path, _)| path).collect();
+            let listing = export_scan::Listing {
+                root: &ctx.root,
+                paths: &paths,
+                gitlinks: &gitlinks,
+                whole: true,
+                export: &|| Vec::new(),
+            };
+            let links = export_scan::links::scan(
+                &listing,
+                engine.as_ref().ok().map(|(_, engine)| engine),
+                (!listed.whole).then_some(listed.paths.as_slice()),
+            );
+            let label = format!(
+                "dead-link cone: {} shipping Markdown file(s), {} bytes read, {} target(s) judged, \
+                 {} upstream-dead (informational), {} ms offline namespace/link scan",
+                links.documents,
+                links.bytes,
+                links.targets,
+                links.upstream,
+                links_started.elapsed().as_millis()
+            );
+            link_cost = label.clone();
+            if !links.findings.is_empty() {
+                r.fail_with_findings(
+                    label,
+                    links
+                        .findings
+                        .iter()
+                        .map(|f| finding(f.guard, &f.path, f.line, &f.detail))
+                        .collect(),
+                );
+            }
+        }
+        Err(why) => r.cannot_run(format!("dead-link namespace — {why}")),
+    }
     let plans = if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
         input_plans(ctx, &listed).unwrap_or_default()
     } else {
@@ -695,7 +744,7 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
         .collect();
     if !plans.is_empty() && listed.paths.iter().all(|p| carried.contains(p)) && not_run.is_empty() {
         r.pass(format!(
-            "export-scan: {} paths reused by package input key",
+            "export-scan: {} paths reused by package input key; {link_cost}",
             carried.len()
         ));
         finish_inputs(ctx, r, &original, plans);
@@ -766,6 +815,9 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
         "export-scan: {} exported file(s) of {} held to {held}",
         scanned.files, listed.what
     );
+    if !link_cost.is_empty() {
+        label.push_str(&format!("; {link_cost}"));
+    }
     if scanned.cleared > 0 {
         label.push_str(&format!(
             ", {} hit(s) cleared as base64 copies of exported binaries",

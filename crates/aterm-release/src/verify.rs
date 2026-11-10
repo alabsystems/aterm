@@ -537,11 +537,10 @@ pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
     if s.published {
         return Err(Error::new(format!(
             "v{version} is already published, and it is the version the newest published \
-             source declares — publish the next one first: `pub bump aterm --minor --write` \
-             on main (the next release is v{}), commit and push, then `pub stage aterm` and \
-             `pub publish aterm`, then cut; or retire a bad build with `{} yank <build> \
+             source declares — start the next product release with `{} --bump`, which \
+             reserves its version through the source claim; or retire a bad build with `{} yank <build> \
              --release-credentials <profile.toml> --mac-only|--linux-artifacts DIRECTORY`",
-            publish::bump_minor_release(&version)?,
+            crate::release::RELEASE_COMMAND,
             publish::SHIP_COMMAND
         )));
     }

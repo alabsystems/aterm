@@ -881,14 +881,16 @@ fn help_full_catalog() -> String {
 #   open app settings /about              legacy About route inside Settings
 #   open app settings /updates            Software Update inside the Settings tab
 #   open app system-state                 System State: the setup plan and its progress
-#   open app markdown file:///abs/doc.md  read one bounded, local UTF-8 file
-#   open app editor file:///abs/doc.md    edit that file through a read/write grant
+#   open app markdown file:///abs/doc.md  open a local Markdown workspace in Read
+#   open app editor file:///abs/doc.md    open its source in Edit through a file grant
 #   inspect app/v1 tabs                   discover stable native view ids
 #   inspect app/v1 network                owner-only retained GUI network projection; no refresh
 #   inspect app/v1 view <id> text|controls|tree|audit
 #   act app/v1 view <id> <key> <action> [value]
 # A document is an absolute local file: URI (no remote host, no cloud-storage folder); the
 # grant covers that one file.
+# Markdown uses one amacs tab with Read / Edit / Split. Split edits the source and previews
+# unsaved text. Mode changes preserve the document and do not save or finish editor waits.
 #
 "#
     );
@@ -1069,7 +1071,7 @@ fn update_status_unreadable_line() -> String {
     #[cfg(target_os = "macos")]
     {
         format!(
-            "OK enabled=true outcome=\"can\u{2019}t read the update state: {}\"\n",
+            "OK enabled=unknown auto_apply=unknown outcome=\"can\u{2019}t read the update state: {}\"\n",
             aterm_update::ledger_unreadable_cause()
         )
     }
@@ -1085,7 +1087,9 @@ mod update_status_unreadable_tests {
     #[test]
     fn an_unreadable_ledger_says_why_not_no_updater() {
         let line = super::update_status_unreadable_line();
-        assert!(line.starts_with("OK enabled=true "), "{line}");
+        for field in ["enabled=unknown", "auto_apply=unknown"] {
+            assert!(line.split_whitespace().any(|word| word == field), "{line}");
+        }
         assert!(
             line.contains(&aterm_update::ledger_unreadable_cause()),
             "{line}"
@@ -1226,30 +1230,28 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         };
         format!("{}:{kind}", st.failing_checks)
     };
-    let stale_check = apply_snapshot.as_ref().map_or_else(String::new, |live| {
+    let last_check = apply_snapshot.as_ref().and_then(|live| {
         let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
-        match aterm_update::last_check_at(st.current_build, &source) {
-            Some(stamp)
-                if aterm_update::rfc3339_older_than(
-                    &stamp,
-                    aterm_update::STALE_CHECK_AFTER.as_secs(),
-                ) =>
-            {
-                format!(" stale_check={}", pct_encode(&stamp))
-            }
-            None if st.enabled && st.installable => " check_unrecorded=true".to_string(),
-            _ => String::new(),
-        }
+        aterm_update::last_check_at(st.current_build, &source)
     });
-    let checked_at = apply_snapshot
-        .as_ref()
-        .and_then(|live| {
-            let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
-            aterm_update::last_check_at(st.current_build, &source)
-        })
-        .map_or_else(String::new, |stamp| {
-            format!(" checked_at={}", pct_encode(&stamp))
-        });
+    let stale_check =
+        apply_snapshot
+            .as_ref()
+            .map_or_else(String::new, |_| match last_check.as_deref() {
+                Some(stamp)
+                    if aterm_update::rfc3339_older_than(
+                        stamp,
+                        aterm_update::STALE_CHECK_AFTER.as_secs(),
+                    ) =>
+                {
+                    format!(" stale_check={}", pct_encode(stamp))
+                }
+                None if st.enabled && st.installable => " check_unrecorded=true".to_string(),
+                _ => String::new(),
+            });
+    let checked_at = last_check.as_deref().map_or_else(String::new, |stamp| {
+        format!(" checked_at={}", pct_encode(stamp))
+    });
     let next_check = aterm_update::next_check_at().map_or_else(String::new, |stamp| {
         format!(" next_check={}", pct_encode(&stamp))
     });

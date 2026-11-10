@@ -308,8 +308,10 @@ fn a_read_the_hang_detector_cuts_is_unread() {
 /// A HOLD THAT COMES MID-READ STARTS NO MORE GIT: a hold on new starts that turns on before the
 /// record's `k`-th git, for every `k` its reads make, ends the read there, unread, after exactly
 /// the `k` gits before it: through the private index a first read refreshes (`repo_work`'s
-/// `private_index`), and through the one a later read finds. NEGATIVE CONTROL: with no hold the
-/// same repository is read whole, a later read with fewer gits than the first.
+/// `private_index`), and through the one a later read finds. The hold observes the admitted
+/// dispatch counter: checking it around native index bytes does not itself start a git.
+/// NEGATIVE CONTROL: with no hold the same repository is read whole, a later read with fewer
+/// gits than the first.
 #[test]
 fn a_hold_that_comes_mid_read_starts_no_more_git() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
@@ -330,14 +332,22 @@ fn a_hold_that_comes_mid_read_starts_no_more_git() {
             if cold {
                 anew(&work, k);
             }
-            let looks = Cell::new(0u32);
-            let held = || {
-                let n = looks.get();
-                looks.set(n + 1);
-                n >= k
+            let mut reads = Reads {
+                deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+                each: Some(PROBE_LIMIT),
+                home: &home,
+                xdg: None,
+                cut: Cell::new(false),
+                starts: Cell::new(0),
+                held: None,
+                refused: None,
             };
+            let starts = &reads.starts;
+            let held = || starts.get() >= k;
+            reads.held = Some(&held);
+            let read = work_reading(&work, &reads);
             assert_eq!(
-                counted(&work, &home, &held),
+                (read, reads.starts.get()),
                 (WorkRead::Unread, k),
                 "held from git {k} on, cold {cold}"
             );

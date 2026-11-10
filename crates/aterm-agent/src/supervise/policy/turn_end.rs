@@ -9871,10 +9871,12 @@ pub enum Restart {
 /// Which line a click on the chip asks for ([`Restart::Permission`], the design's §3 table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionTo {
-    /// A click on `yolo`: no permission flag on the line, so the session lands in the mode its
-    /// own settings choose.
+    /// No permission flag on the line, so the session lands in the mode its own settings choose.
+    /// No chip asks it (owner, 2026-11-09: a click only turns yolo on); the lane still makes the
+    /// line for a caller that names it.
     Settings,
-    /// A click on `lame`: `--dangerously-skip-permissions` on the line, so it lands in bypass.
+    /// A click on the off chip (`○ yolo`): `--dangerously-skip-permissions` on the line, so it
+    /// lands in bypass, and a later restart that reads the session in bypass retypes that flag.
     Bypass,
 }
 

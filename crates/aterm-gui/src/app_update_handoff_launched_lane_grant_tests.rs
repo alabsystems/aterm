@@ -259,7 +259,7 @@ fn a_worker_that_verifies_takes_the_grants_its_read_declared() {
                     grant_chunks,
                     grant_empty,
                     grant_desk,
-                    recipient_recovery: false,
+                    recipient_recovery: aterm_update::NativeRecipientRecovery::Absent,
                 })
             },
             |_, _| panic!("the full check reads the floor itself"),

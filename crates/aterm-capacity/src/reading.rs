@@ -24,7 +24,8 @@ pub struct Volume {
     pub total: u64,
     /// Bytes an unprivileged writer may still write (`f_bavail`).
     pub free: u64,
-    /// The floor the window's disk watch holds it to ([`crate::floor::Watch`]: the owner's knobs, raised to the room), or the emergency line where the owner turned that floor off ([`crate::floor::admission_floor`]): admission keeps free space above it.
+    /// The headroom admission retains ([`crate::floor::admission_floor`]): the emergency
+    /// line, or a nonzero floor the owner wrote, separate from the watch's cleanup target.
     pub floor: u64,
     /// The room the floor is raised to: the second-largest daily two-hour fall of free space the watch measured over a week ([`crate::room`]), or `disk.room_gib` where written.
     pub room: u64,
@@ -539,11 +540,10 @@ pub fn read_volume(path: &Path) -> Option<Volume> {
     let key = v.key.spelled();
     let room = watch.room(&key, v.total, now_s);
     Some(Volume {
-        floor: crate::floor::admission_floor(&crate::floor::lines(
+        floor: crate::floor::admission_floor(
             watch.knobs,
-            Some(v.total),
-            Some(room),
-        )),
+            &crate::floor::lines(watch.knobs, Some(v.total), Some(room)),
+        ),
         room,
         mount: v.mount,
         total: v.total,

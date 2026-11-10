@@ -1304,13 +1304,13 @@ fn a_large_git_path_listing_keeps_shared_paths() {
     assert_eq!(many.len(), 6001, "the listing is complete");
 }
 
-/// THE COMPOSE RULE: main moved during the run, its new commits touching none of the branch's
-/// files and the merge clean, so the pass is composed onto it without a run: one judgment, the
-/// landing's parents the judged commit and the new main, `Aterm-Composed-Onto` naming it.
-/// NEGATIVE CONTROL: main moved touching a file the branch changed (the merge still clean), so
-/// it is merged and the branch's delta from the moved main judged again, and nothing is composed.
+/// THE COMPOSE RULE: a clean merge with disjoint changes or exactly convergent entries
+/// composes the pass without another run: one judgment, the landing's parents the judged
+/// commit and the new main, `Aterm-Composed-Onto` naming it.
+/// NEGATIVE CONTROL: genuinely different shared entries are merged and judged again,
+/// even where the merge itself is clean.
 #[test]
-fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged() {
+fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
     let world = world();
     commit(&world.work, "a/x.txt", "a2\n");
     let moved = RefCell::new(None);
@@ -1371,6 +1371,174 @@ fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged()
     assert_eq!(
         git(&control.work, &["show", &format!("{landing}:shared.txt")]),
         "one\n2\n3\n4\n5\n6\n7\neight"
+    );
+
+    // Distinct commits may already agree on the complete overlapping entry.
+    for change in ["edit", "delete", "mode"] {
+        let world = self::world();
+        let converge = |dir: &Path, message: &str| {
+            git(dir, &["config", "core.filemode", "false"]);
+            match change {
+                "delete" => std::fs::remove_file(dir.join("shared.txt")).unwrap(),
+                "edit" => write(dir, "shared.txt", "converged\n"),
+                _ => {}
+            }
+            git(dir, &["add", "-A"]);
+            if change == "mode" {
+                git(dir, &["update-index", "--chmod=+x", "shared.txt"]);
+            }
+            git(dir, &["commit", "-qm", message]);
+            git(dir, &["rev-parse", "HEAD"])
+        };
+        let checked = converge(&world.work, "the branch's convergent change");
+        let moved = RefCell::new(None);
+        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+            if n == 0 {
+                git(&world.rival, &["fetch", "-q", "origin"]);
+                git(
+                    &world.rival,
+                    &["checkout", "-q", "-B", "main", "origin/main"],
+                );
+                let tip = converge(&world.rival, "main's convergent change");
+                assert_ne!(checked, tip, "the commits really diverged");
+                git(&world.rival, &["push", "-q", "origin", "main"]);
+                *moved.borrow_mut() = Some(tip);
+            }
+            green()
+        });
+        assert_eq!(code, exit::PASS, "{change}: {said:#?}");
+        let moved = moved.into_inner().unwrap();
+        let landing = origin_main(&world);
+        let entry = git(&world.work, &["ls-tree", &checked, "--", "shared.txt"]);
+        assert_eq!(
+            git(&world.work, &["ls-tree", &moved, "--", "shared.txt"]),
+            entry
+        );
+        assert_eq!(
+            git(&world.work, &["ls-tree", &landing, "--", "shared.txt"]),
+            entry
+        );
+        if change == "delete" {
+            assert!(entry.is_empty(), "all three entries are absent");
+        } else if change == "mode" {
+            assert!(entry.starts_with("100755 blob "));
+        }
+        assert_eq!(bases.len(), 1, "{change}: composed once: {said:#?}");
+        let receipt = stated(&world, &landing).unwrap();
+        assert_eq!(receipt.checked.len(), 1);
+        assert_eq!(receipt.composed_onto.as_deref(), Some(moved.as_str()));
+    }
+
+    // Object equality alone does not cover a different mode or kind of entry.
+    for mode in ["100755", "120000"] {
+        let world = self::world();
+        let base = origin_main(&world);
+        let checked = commit(&world.work, "shared.txt", "same object\n");
+        write(&world.rival, "shared.txt", "same object\n");
+        git(&world.rival, &["add", "-A"]);
+        let object = git(&world.rival, &["rev-parse", ":shared.txt"]);
+        git(
+            &world.rival,
+            &["update-index", "--cacheinfo", mode, &object, "shared.txt"],
+        );
+        git(&world.rival, &["commit", "-qm", "a different entry mode"]);
+        let main = git(&world.rival, &["rev-parse", "HEAD"]);
+        git(&world.rival, &["push", "-q", "origin", "main"]);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            git(
+                &world.work,
+                &["rev-parse", &format!("{checked}:shared.txt")]
+            ),
+            object
+        );
+        assert!(
+            git(&world.work, &["ls-tree", &checked, "--", "shared.txt"])
+                .starts_with("100644 blob ")
+        );
+        assert!(
+            git(&world.work, &["ls-tree", &main, "--", "shared.txt"])
+                .starts_with(&format!("{mode} blob "))
+        );
+        let plumbing = Git {
+            root: &world.work,
+            make: &git_cmd,
+        };
+        let different = plumbing
+            .paths(&[
+                "diff-tree",
+                "-r",
+                "-t",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                "--ignore-submodules=none",
+                &checked,
+                &main,
+            ])
+            .unwrap();
+        assert!(different.contains(b"shared.txt".as_slice()));
+        if let Some(tree) = plumbing.merge_tree(&main, &checked).unwrap() {
+            assert_eq!(
+                plumbing.independent_changes(&base, &main, &checked, &tree),
+                Ok(None),
+                "{mode}: a clean merge still differs from what was checked"
+            );
+        } else {
+            assert_eq!(mode, "120000", "the regular mode change merges cleanly");
+        }
+    }
+
+    // Recursive leaf diffs alone omit a newly present parent tree. Its complete
+    // entry still differs from the checked deletion, even if the merge is clean.
+    let shape = self::world();
+    let base = origin_main(&shape);
+    std::fs::remove_file(shape.work.join("shared.txt")).unwrap();
+    git(&shape.work, &["add", "-A"]);
+    git(&shape.work, &["commit", "-qm", "delete the old file"]);
+    let checked = git(&shape.work, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(shape.rival.join("shared.txt")).unwrap();
+    let main = commit(&shape.rival, "shared.txt/child", "a new tree\n");
+    git(&shape.rival, &["push", "-q", "origin", "main"]);
+    git(&shape.work, &["fetch", "-q", "origin"]);
+    let plumbing = Git {
+        root: &shape.work,
+        make: &git_cmd,
+    };
+    assert!(
+        plumbing
+            .files(&base, &main)
+            .unwrap()
+            .contains(b"shared.txt".as_slice())
+    );
+    assert!(
+        !plumbing
+            .files(&checked, &main)
+            .unwrap()
+            .contains(b"shared.txt".as_slice())
+    );
+    let tree_entries = plumbing
+        .paths(&[
+            "diff-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            &checked,
+            &main,
+        ])
+        .unwrap();
+    assert!(tree_entries.contains(b"shared.txt".as_slice()));
+    let tree = plumbing
+        .merge_tree(&main, &checked)
+        .unwrap()
+        .expect("the deletion and replacement directory merge cleanly");
+    assert_eq!(
+        plumbing.independent_changes(&base, &main, &checked, &tree),
+        Ok(None),
+        "an absent entry is not a directory"
     );
 
     // A product-version move does not change the branch's independent lock entry.

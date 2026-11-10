@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 description = "aterm performance harnesses (the examples `verify perf` runs)."
 
+[dependencies]
+# Shared thread clocks and process retired-work counters.
+libc = { workspace = true }
+
 [dev-dependencies]
 aterm-core = { workspace = true }
 # The resize/rewrap harness steps PendingScrollbackReflow directly.
@@ -29,9 +33,6 @@ aterm-tempfile = { workspace = true }
 aterm-types = { workspace = true }
 # The effects harness declares its thread user-interactive, the QoS the app's render thread has.
 aterm-pty = { workspace = true }
-# ...and reads the thread's CPU clock and the process's instructions retired (the effects lane's
-# measure of CPU work).
-libc = { workspace = true }
 # The Aos harness (the `aos` lane): checkpoints, the event log and shadow replay of the hosted
 # momentum glow, beside aterm-effects' `MomentumHost`.
 aterm-aos = { workspace = true }

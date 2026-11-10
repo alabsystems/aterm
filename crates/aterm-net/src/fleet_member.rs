@@ -2015,8 +2015,8 @@ fn read_book(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer
 }
 
 /// The state directories whose book files' parses are kept ([`KeptParse`]): the node's watch
-/// and each connection it admits read the book ([`Keyring::read`]), and a book nothing
-/// rewrote is opened and judged but not read or parsed again.
+/// and each connection it admits read the book ([`Keyring::read`]). Every use opens, judges and
+/// reads fresh bytes; identical bytes reuse their parse.
 const KEPT_BOOKS: usize = 4;
 
 /// The entries of a book's text other than copies ([`Via::IssuerBook`]), or the number of its
@@ -8972,7 +8972,9 @@ pub const SWARM_FACTS_DIR: &str = "swarm-facts";
 const MAX_PUSHED_FACTS_FILES: usize = 256;
 const MAX_PUSHED_FACTS_LINES: usize = 4096;
 const PUSHED_FACTS_MAGIC: &str = "aterm-pushed-facts-v1\n";
-const PUSHED_FACTS_MAX: usize = PUSHED_FACTS_MAGIC.len() + 65 + REPLY_MAX;
+/// A current record's head: its magic line and its key line (`-` or 64 hex digits).
+const PUSHED_FACTS_HEAD: usize = PUSHED_FACTS_MAGIC.len() + 65;
+const PUSHED_FACTS_MAX: usize = PUSHED_FACTS_HEAD + REPLY_MAX;
 const PUSHED_FACTS_LOCK: &str = ".write.lock";
 
 /// One atomic publication: its proved key and the payload whose receipt proved it.
@@ -9030,6 +9032,46 @@ fn pushed_facts_at(
                 payload,
                 received_at: metadata.modified().ok(),
             })
+        }
+        Err(_) => None,
+    }
+}
+
+/// The key `node`'s publication names, read from the record's head alone: pruning judges a
+/// record by its key, never by its payload, so a round reads a line of each record instead of
+/// the cache whole. A current record is authoritative as in [`pushed_facts_at`], and one that
+/// cannot be opened, or whose head is no current magic and key, is left unjudged (`None`); only
+/// its absence reads the legacy key, beside a legacy payload that opens. A record whose payload
+/// [`pushed_facts_at`] refuses (past the cap, or no UTF-8) is still judged by its key: no read
+/// admits it, and a denied key removes it.
+fn pushed_facts_key_at(
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+    node: &str,
+) -> Option<Option<NodeKey>> {
+    match judged.open(&format!("{node}.facts")) {
+        Ok((file, _metadata)) => {
+            let mut head = Vec::with_capacity(PUSHED_FACTS_HEAD);
+            (&file)
+                .take(PUSHED_FACTS_HEAD as u64)
+                .read_to_end(&mut head)
+                .ok()?;
+            let rest = head.strip_prefix(PUSHED_FACTS_MAGIC.as_bytes())?;
+            let key = &rest[..rest.iter().position(|b| *b == b'\n')?];
+            if key == b"-" {
+                Some(None)
+            } else {
+                Some(Some(NodeKey::from_hex(std::str::from_utf8(key).ok()?)?))
+            }
+        }
+        Err(PrivateFileError::Missing) => {
+            judged.open(&format!("{node}.txt")).ok()?;
+            Some(
+                judged
+                    .read(&format!("{node}.key"), 128)
+                    .ok()
+                    .and_then(|raw| String::from_utf8(raw).ok())
+                    .and_then(|raw| NodeKey::from_hex(raw.trim())),
+            )
         }
         Err(_) => None,
     }
@@ -9231,13 +9273,13 @@ fn prune_pushed_facts_using(
             remove_node_facts(&node);
             continue;
         }
-        let Some(facts) = judged
+        let Some(key) = judged
             .as_ref()
-            .and_then(|judged| pushed_facts_at(judged, &node))
+            .and_then(|judged| pushed_facts_key_at(judged, &node))
         else {
             continue;
         };
-        let effective_key = facts.key.or_else(|| keyring.bound(&node));
+        let effective_key = key.or_else(|| keyring.bound(&node));
         if let Some(key) = effective_key
             && (crate::fleet::is_denied_key(&key, denied_nodes)
                 || log.is_some_and(|l| l.holds_out(&key)))
@@ -9263,6 +9305,19 @@ pub fn read_pushed_facts(state_dir: &Path) -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|node| Some((node.clone(), pushed_facts_at(&judged, &node)?.payload)))
         .collect()
+}
+
+/// `node`'s payload as [`read_pushed_facts`] pairs it, read from its record alone: a heartbeat
+/// pushes only its own, so it reads one record and not the cache. `None` where `node` is no node
+/// id or its record is missing or refused.
+#[must_use]
+pub fn read_pushed_facts_of(state_dir: &Path, node: &str) -> Option<String> {
+    if !is_node_id(node) {
+        return None;
+    }
+    let dir = state_dir.join(SWARM_FACTS_DIR);
+    let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok()?;
+    pushed_facts_at(&judged, node).map(|facts| facts.payload)
 }
 
 /// One admitted cached survey, with the receive time of the same file that supplied its bytes.

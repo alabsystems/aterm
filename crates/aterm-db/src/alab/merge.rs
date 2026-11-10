@@ -240,11 +240,15 @@ fn unbound(keep: &str, keeper: &Row, facts: &Facts) -> bool {
 }
 
 /// The live rows that share a name with each other, transitively: each group of two or more.
-fn shared_names(machines: &Projection) -> Vec<BTreeSet<&str>> {
+fn shared_names<'a>(
+    machines: &'a Projection,
+    facts: &Facts,
+    roster: &Roster,
+) -> Vec<BTreeSet<&'a str>> {
     let mut by_name: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     let mut names_by_row: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (pk, row) in machines.rows.iter().filter(|(_, row)| row.live()) {
-        let names = names_of(row);
+        let names = effective_names(row, machines, facts, roster);
         for name in &names {
             by_name.entry(name.clone()).or_default().push(pk);
         }
@@ -277,8 +281,8 @@ fn shared_names(machines: &Projection) -> Vec<BTreeSet<&str>> {
 
 /// The rows to judge as one Mac's: those sharing a name, joined by each pair the roster ties (see
 /// [`roster_ties`]), in key order of their first row.
-fn groups<'a>(machines: &'a Projection, roster: &Roster) -> Vec<BTreeSet<&'a str>> {
-    let mut groups = shared_names(machines);
+fn groups<'a>(machines: &'a Projection, facts: &Facts, roster: &Roster) -> Vec<BTreeSet<&'a str>> {
+    let mut groups = shared_names(machines, facts, roster);
     for tie in roster_ties(machines, roster) {
         let (joined, mut apart): (Vec<_>, Vec<_>) = groups
             .into_iter()
@@ -389,9 +393,12 @@ pub fn plan(
     roster: &Roster,
 ) -> Result<Plan> {
     let mut plan = Plan::default();
-    for group in groups(machines, roster) {
+    for group in groups(machines, facts, roster) {
         let rows: Vec<(&str, &Row)> = group.iter().map(|&pk| (pk, &machines.rows[pk])).collect();
-        let names: BTreeSet<String> = rows.iter().flat_map(|(_, row)| names_of(row)).collect();
+        let names: BTreeSet<String> = rows
+            .iter()
+            .flat_map(|(_, row)| effective_names(row, machines, facts, roster))
+            .collect();
         match choose(&rows, preferences, facts, &names, roster) {
             Err(why) => plan.held.push(Held {
                 rows: rows.iter().map(|(pk, _)| (*pk).to_owned()).collect(),
@@ -399,6 +406,19 @@ pub fn plan(
                 why,
             }),
             Ok((keep, label)) => {
+                if machines.rows.iter().any(|(pk, row)| {
+                    row.live()
+                        && !group.contains(pk.as_str())
+                        && has_holder(pk, row, facts)
+                        && names_of(row).contains(&label)
+                }) {
+                    plan.held.push(Held {
+                        rows: rows.iter().map(|(pk, _)| (*pk).to_owned()).collect(),
+                        names: names.into_iter().collect(),
+                        why: "two-macs",
+                    });
+                    continue;
+                }
                 let waits = unbound(keep, &machines.rows[keep], facts);
                 merge_group(&mut plan, &rows, keep, label, &names, preferences, waits)?;
             }
@@ -624,6 +644,53 @@ fn other_mac(row: &Row, name: &str, roster: &Roster) -> bool {
     })
 }
 
+/// A real holder is established by either published node cell or its own facts.
+fn has_holder(pk: &str, row: &Row, facts: &Facts) -> bool {
+    facts.binds(pk)
+        || NODE_CELLS.iter().any(|column| {
+            row.fields
+                .get(*column)
+                .is_some_and(|field| field.candidates_x().iter().any(|x| !x.is_null()))
+        })
+}
+
+/// A bound Mac's current signed name connects its sheet rows. A stale number another bound
+/// Mac holds connects nothing and is not carried as an alias onto the renamed row.
+fn effective_names(
+    row: &Row,
+    machines: &Projection,
+    facts: &Facts,
+    roster: &Roster,
+) -> BTreeSet<String> {
+    let mut names = names_of(row);
+    let bound: Vec<_> = roster
+        .iter()
+        .filter(|(_, stated)| {
+            stated.iter().any(|(column, node)| {
+                value(row.fields.get(*column)).and_then(Value::as_str) == Some(node.as_str())
+            })
+        })
+        .collect();
+    if let [(label, _)] = bound.as_slice() {
+        names.retain(|name| {
+            name == *label
+                || ((!roster.contains_key(name) || !other_mac(row, name, roster))
+                    && !machines.rows.iter().any(|(pk, other)| {
+                        other.live()
+                            && has_holder(pk, other, facts)
+                            && !NODE_CELLS.iter().any(|column| {
+                                value(row.fields.get(*column)).is_some_and(|node| {
+                                    value(other.fields.get(*column)) == Some(node)
+                                })
+                            })
+                            && names_of(other).contains(name)
+                    }))
+        });
+        names.insert((*label).clone());
+    }
+    names
+}
+
 /// Whether what says which preference this is may be a newer build's.
 fn unreadable_preference(row: &Row) -> bool {
     PREFERENCE_IDENTITY
@@ -844,6 +911,14 @@ fn merge_group(
         }),
         _ => None,
     };
+    for name in held
+        .into_iter()
+        .flat_map(Field::members)
+        .filter(|name| !names.contains(*name))
+    {
+        last.push(owner_cell(keep, "aliases", Some(name), json!(false))?);
+        merge.aliases_removed.push(name.to_owned());
+    }
     for name in names {
         let member = held.is_some_and(|field| field.has_member(name));
         if *name == label {

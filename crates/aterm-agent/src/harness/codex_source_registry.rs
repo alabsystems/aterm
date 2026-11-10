@@ -2249,6 +2249,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fixture_connections_in_separate_registries_keep_independent_eof() {
+        let first_registry = Registry::default();
+        let second_registry = Registry::default();
+        let first = first_registry.connection(fixture_connection_id()).unwrap();
+        let second = second_registry.connection(fixture_connection_id()).unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(!first.same(&second));
+        let retained_first = first.clone();
+
+        first_registry.connection_closed(first.id);
+        assert!(!first.is_live());
+        assert!(!retained_first.is_live());
+        assert!(
+            second.is_live(),
+            "a peer fixture's EOF cannot close this token"
+        );
+        assert!(
+            second_registry.connection(second.id).unwrap().same(&second),
+            "the other socket tenure remains the same live token"
+        );
+        second_registry.connection_closed(second.id);
+        assert!(!second.is_live());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replaced_gate_reconnect_keeps_old_reader_custody_and_refuses_manager_retarget() {
         let home = aterm_tempfile::tempdir().unwrap();
         let mut reader =

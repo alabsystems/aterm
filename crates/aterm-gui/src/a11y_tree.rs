@@ -2816,8 +2816,8 @@ mod tests {
             toggled: None,
         };
         let chips = [
-            at(HarnessChip::Mode, "Permission mode: lame.", 2),
-            at(HarnessChip::Title, "not yolo \u{b7} click: yolo", 8),
+            at(HarnessChip::Mode, "Permission mode: yolo off.", 2),
+            at(HarnessChip::Title, "plan mode on \u{b7} click: yolo", 8),
             at(
                 HarnessChip::Link(crate::claude_card::GlassLink::Notice),
                 "https://alab.systems",

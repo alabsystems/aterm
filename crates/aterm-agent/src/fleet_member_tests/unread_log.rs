@@ -41,6 +41,98 @@ fn label_this_mac(lab: &Lab, label: &str) -> (aterm_db::alab::Registry, String) 
     (registry, mac)
 }
 
+#[test]
+fn a_holder_signed_choice_moves_roster_registry_and_host_resolution() {
+    use aterm_db::alab::register::Probe;
+    use aterm_types::machine_name::Number;
+    let lab = Lab::new("chosen-label-projection");
+    let (registry, mac) = label_this_mac(&lab, "m42");
+    let number = Number::parse("m43").unwrap();
+    let to = crate::machine_name::NameTo {
+        num: number,
+        nick: None,
+    };
+    crate::machine_name::set_name(
+        &lab.places.state,
+        &to,
+        || client::lab_labels(&lab.paths).map_err(std::io::Error::other),
+        member::name_record::ByKind::Agent,
+        || Ok(Some("m22".into())),
+        NOW_MS,
+        false,
+    )
+    .unwrap();
+    let policy = crate::machine_name::publish::Policy::read(&lab.places.config, number).unwrap();
+    crate::machine_name::publish::publish(&lab.places.state, &lab.places.config, &policy, None)
+        .unwrap();
+    assert!(
+        client::publish_local_chosen_name(&lab.paths, number)
+            .unwrap()
+            .is_none()
+    );
+    let roster = roster_of(&lab.paths).unwrap().unwrap();
+    let identity = client::machine_identity(&lab.paths).unwrap();
+    assert_eq!(
+        roster
+            .member_by_recipient(&identity.recipient().to_bech32())
+            .unwrap()
+            .label,
+        "m43"
+    );
+    let principal = member::node_principal(own_node().key());
+    registry
+        .register(
+            &lab.places.config,
+            &Probe {
+                hw_model: "Mac16,8".into(),
+                node: Some(principal[2..].to_owned()),
+                platform_uuid: "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43".into(),
+                ..Probe::default()
+            },
+            true,
+            NOW_MS,
+        )
+        .unwrap();
+    let target = registry_target(&lab.places, "m43").unwrap().unwrap();
+    assert_eq!(target.node, principal);
+    assert_eq!(target.transport, own_node().node());
+    assert_eq!(
+        registry
+            .view()
+            .unwrap()
+            .project(&aterm_db::alab::registry::MACHINE)
+            .rows[&mac]
+            .get("label"),
+        Some(&aterm_json::json!("m43"))
+    );
+    // A signed name must not take the other admitted Mac's seat.
+    assert!(client::publish_local_chosen_name(&lab.paths, Number::parse("m9").unwrap()).is_err());
+    let admin = client::admin_open(&lab.paths).unwrap();
+    let mut doc = admin.doc.clone();
+    let mut held = roster_of(&lab.paths).unwrap().unwrap();
+    held.members
+        .iter_mut()
+        .find(|row| row.label == "m9")
+        .unwrap()
+        .aliases
+        .push("m44".into());
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::SWARM_ROSTER_ENTRY,
+        held.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths, &admin, &doc).unwrap();
+    // The log has no m44 seat: the roster alias alone must still prevent signing it.
+    assert!(client::publish_local_chosen_name(&lab.paths, Number::parse("m44").unwrap()).is_err());
+    assert!(
+        client::publish_local_chosen_name(&lab.paths, Number::parse("m45").unwrap())
+            .unwrap()
+            .is_some(),
+        "the same writer can still sign a free number after the alias was published"
+    );
+}
+
 /// Write `label` into the registry row `mac`.
 fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
     use aterm_db::{

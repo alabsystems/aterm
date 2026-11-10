@@ -6,8 +6,8 @@
 //! Owner labels live in the registry. The historical roster lives in the
 //! reserved `[everyone]` vault entry [`ROSTER_ENTRY`] (`aterm-swarm-roster`),
 //! until D6 converts its denials to log removals. It never allocates labels;
-//! steward policy and reserved labels live in [`POLICY_ENTRY`]
-//! (`aterm-swarm-policy`).
+//! steward policy lives in [`POLICY_ENTRY`] (`aterm-swarm-policy`). No label is
+//! reserved: a number is held only by a Mac that holds it (owner ruling, 2026-11-09).
 
 use crate::text::{Audience, Document};
 use crate::{Error, Result};
@@ -17,14 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Reserved `[everyone]` vault entry carrying member labels, aliases, hints, and deny-lists.
 pub const ROSTER_ENTRY: &str = "aterm-swarm-roster";
 
-/// Reserved admin vault entry carrying steward policy, network id, and reserved labels.
+/// Reserved admin vault entry carrying steward policy, network id and the server list.
 pub const POLICY_ENTRY: &str = "aterm-swarm-policy";
 
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).
 pub const LEASE_ENTRY: &str = "aterm-swarm-lease";
-
-/// Default release Mac label that policy always reserves (`DESIGN-alab-swarm` §3.2).
-pub const DEFAULT_RESERVED_RELEASE_LABEL: &str = "m3";
 
 /// Extract a canonical `(N, "m<N>")` label ONLY when `name` starts with `m<N>` (`N >= 1`).
 ///
@@ -388,10 +385,6 @@ pub struct StewardPolicy {
 pub struct SwarmPolicy {
     /// Recorded ALab network identifier, if configured.
     pub network_id: Option<String>,
-    /// Explicit reserved `m<N>` labels (the approver never assigns these to newcomers).
-    pub reserved_labels: Vec<String>,
-    /// Labels of release hosts (e.g. `m3`, `m22`).
-    pub release_hosts: Vec<String>,
     /// Vault server URLs recorded in policy.
     pub servers: Vec<String>,
     /// Steward ranks and `always_on` marks.
@@ -404,8 +397,6 @@ impl SwarmPolicy {
         let table: Table = aterm_toml::from_str(text)
             .map_err(|e| Error::new(format!("invalid {POLICY_ENTRY}: {}", e.log_words())))?;
         let network_id = optional_str(&table, "network_id");
-        let reserved_labels = normalize_label_set(string_array(&table, "reserved_labels")?);
-        let release_hosts = normalize_label_set(string_array(&table, "release_hosts")?);
         let servers = string_array(&table, "servers")?;
         let mut stewards = Vec::new();
         if let Some(raw_stewards) = table.get("steward") {
@@ -442,8 +433,6 @@ impl SwarmPolicy {
         }
         Ok(Self {
             network_id,
-            reserved_labels,
-            release_hosts,
             servers,
             stewards,
         })
@@ -470,26 +459,6 @@ impl SwarmPolicy {
         if let Some(net) = &self.network_id {
             root.insert("network_id".to_owned(), Value::String(net.clone()));
         }
-        root.insert(
-            "reserved_labels".to_owned(),
-            Value::Array(
-                normalize_label_set(self.reserved_labels.clone())
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-        if !self.release_hosts.is_empty() {
-            root.insert(
-                "release_hosts".to_owned(),
-                Value::Array(
-                    normalize_label_set(self.release_hosts.clone())
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
         if !self.servers.is_empty() {
             root.insert(
                 "servers".to_owned(),
@@ -511,43 +480,6 @@ impl SwarmPolicy {
             root.insert("steward".to_owned(), Value::Array(rows));
         }
         aterm_toml::to_string(&Value::Table(root)).unwrap_or_default()
-    }
-
-    /// Compute the full set of reserved `m<N>` labels: always `m3` (the release Mac),
-    /// every policy `reserved_labels` / `release_hosts` / `stewards` label, and every
-    /// vault admin's `m<N>` label (`DESIGN-alab-swarm` §3.2).
-    #[must_use]
-    pub fn effective_reserved(
-        &self,
-        doc: &Document,
-        existing: Option<&SwarmRoster>,
-    ) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        out.insert(DEFAULT_RESERVED_RELEASE_LABEL.to_owned());
-        for raw in self
-            .reserved_labels
-            .iter()
-            .chain(self.release_hosts.iter())
-            .chain(self.stewards.iter().map(|s| &s.label))
-        {
-            if let Some((_, canonical)) = leading_m_label(raw) {
-                out.insert(canonical);
-            }
-        }
-        let machines = doc.machines();
-        for admin_name in doc.admins() {
-            if let Some((_, canonical)) = leading_m_label(&admin_name) {
-                out.insert(canonical);
-            }
-            if let Some(roster) = existing
-                && let Some(machine) = machines.iter().find(|m| m.name == admin_name)
-                && let Some(member) = roster.member_by_recipient(&machine.recipient)
-                && !roster.is_member_denied(member)
-            {
-                out.insert(member.label.clone());
-            }
-        }
-        out
     }
 
     /// True when `label` is marked `always_on = true` in `self.stewards` (§8.1).

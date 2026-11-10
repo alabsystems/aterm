@@ -119,7 +119,7 @@ pub const ALAB_GENESIS: Option<&str> =
 /// Reserved `[everyone]` vault entry carrying swarm labels, aliases, hints, and deny-lists.
 pub const SWARM_ROSTER_ENTRY: &str = swarm_roster::ROSTER_ENTRY;
 
-/// Reserved admin vault entry carrying steward policy, network id, and reserved labels.
+/// Reserved admin vault entry carrying steward policy, network id and the server list.
 pub const SWARM_POLICY_ENTRY: &str = swarm_roster::POLICY_ENTRY;
 
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).

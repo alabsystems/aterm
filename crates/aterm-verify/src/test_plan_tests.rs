@@ -34,6 +34,69 @@ fn planned(index: usize, charge: u32, peak: u64, wall: f64) -> Planned {
     }
 }
 
+/// A fitting short job uses the gap before a whole-share job without moving that job's start.
+/// The control changes only its measured duration: a job longer than the gap stays behind it.
+#[test]
+fn measured_short_work_fills_a_gap_without_delaying_its_head() {
+    let original = |short_wall| Plan {
+        share: 4,
+        target: secs(10.0),
+        order: vec![
+            planned(0, 3, 2 * GIB, 10.0),
+            planned(1, 4, 10 * GIB, 9.0),
+            planned(2, 1, 3 * GIB, short_wall),
+        ],
+    };
+    let base = original(8.0);
+    assert_eq!(schedule(&base).end, secs(27.0));
+    let filled = fill_gaps(base.clone());
+    assert_eq!(
+        filled.order.iter().map(|b| b.index).collect::<Vec<_>>(),
+        [0, 2, 1]
+    );
+    let learned = plan(
+        &[
+            Some(seen(10.0, 30.0, 1, 1)),
+            Some(seen(9.0, 36.0, 1, 1)),
+            Some(seen(8.0, 8.0, 1, 1)),
+        ],
+        4,
+        None,
+        0,
+    );
+    assert_eq!(
+        learned.order.iter().map(|b| b.index).collect::<Vec<_>>(),
+        [0, 2, 1]
+    );
+    assert_eq!(
+        schedule(&filled),
+        Schedule {
+            end: secs(19.0),
+            peak: 10 * GIB
+        }
+    );
+    // Every job keeps its width, charge, memory and predicted cost.
+    for b in &base.order {
+        assert_eq!(at(&filled, b.index), *b);
+    }
+    let too_long = original(11.0);
+    assert_eq!(fill_gaps(too_long.clone()), too_long);
+    let mut unknown = original(8.0);
+    unknown.order[2].predicted = None;
+    assert_eq!(fill_gaps(unknown.clone()), unknown);
+    // Runtime memory admission still refuses the fitting short job until room exists.
+    let mut memory_plan = filled.clone();
+    memory_plan.share = 5;
+    let mut limited = Dispatcher::new(&memory_plan, Some(10 * GIB));
+    assert_eq!(limited.next(0.0).map(|b| b.index), Some(0));
+    assert_eq!(limited.next(0.0).map(|b| b.index), Some(2));
+    assert_eq!(limited.next(0.0), None);
+    limited.finish(0).unwrap();
+    assert_eq!(limited.next(0.0), None, "the short job still holds 3 GiB");
+    limited.finish(2).unwrap();
+    assert_eq!(limited.next(0.0).map(|b| b.index), Some(1));
+}
+
 /// Binary `index` of plan `p`.
 fn at(p: &Plan, index: usize) -> Planned {
     p.order

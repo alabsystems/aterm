@@ -89,6 +89,30 @@ fn a_busy_vault_cannot_serve_or_poison_commons_access() {
     assert!(access.is_current(&vault.journal));
 }
 
+/// A remembered access is judged afresh once the device claim a node denial holds this Mac's
+/// device to is replaced (`Device::existing_binding_for_observation` reads it): the state a log
+/// observation stands on (`commons_log_state_digest`) names it, as it names the device key.
+/// NEGATIVE CONTROL (2026-11-10): with the digest naming no device claim, the replaced claim
+/// leaves it as it was (`a replaced device claim`).
+#[test]
+fn a_replaced_device_claim_moves_the_state_a_log_observation_stands_on() {
+    let vault = Vault::new();
+    let claim = vault.paths.dir.join("commons").join("device.claim");
+    let held = std::fs::read(&claim).expect("CONTROL: the vault holds a device claim");
+    let before = vault.digest();
+    assert_eq!(
+        vault.digest(),
+        before,
+        "CONTROL: a digest of a vault that stands"
+    );
+    let mut replaced = held.clone();
+    replaced[0] ^= 1;
+    let staged = claim.with_extension("replaced");
+    std::fs::write(&staged, &replaced).unwrap();
+    std::fs::rename(&staged, &claim).unwrap();
+    assert_ne!(vault.digest(), before, "a replaced device claim");
+}
+
 #[test]
 fn current_and_historical_key_callbacks_retain_the_vault_observation() {
     let vault = Vault::new();
@@ -681,6 +705,68 @@ fn a_session_look_with_no_observation_judges_as_its_own_calls() {
             ),
             "a look at a lock put away checks as its own calls"
         );
+        drop(writing);
+        drop(look);
+    });
+}
+
+/// A look standing on a Commons source read ([`client::CommonsSourceRead::into_look`]: `aterm-db`'s
+/// table-repair read batch's) observes the state lock no more than the read did and opens no look
+/// of its own (`client::test_looks_observed`), and its session's open and checks judge as a look
+/// of its own and as the asks' own calls do; once the read's lock file was put away and a writer
+/// holds the lock at the vault's path, they judge as those calls do under the writer (no access
+/// opened).
+/// NEGATIVE CONTROLS (2026-11-09): with `into_look` making a look of its own (`VaultLook::new`),
+/// the look observes the lock once more (`a source read look's observations`); with
+/// `VaultLook::standing_on` keeping no observation, its asks observe the lock on their own calls
+/// (`a source read look's observations`).
+#[test]
+fn a_source_read_look_judges_as_a_look_of_its_own() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.access, Ok(Some(_))), "{:?}", own.verdict());
+        let looked = a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        assert_eq!(looked.verdict(), own.verdict(), "a look of its own");
+        let source_read = || {
+            client::try_commons_source_read(&vault.paths)
+                .unwrap()
+                .expect("no writer holds the vault")
+        };
+
+        let (observations, looks) = (
+            client::lock_observations_of(&vault.paths),
+            client::test_looks_observed(),
+        );
+        let look = source_read().into_look(&vault.paths);
+        let judged = a_session_through(&vault, &look);
+        assert_eq!(
+            client::lock_observations_of(&vault.paths) - observations,
+            1,
+            "a source read look's observations"
+        );
+        assert_eq!(
+            client::test_looks_observed() - looks,
+            0,
+            "a source read look's own looks"
+        );
+        assert_eq!(judged.verdict(), own.verdict(), "a source read look");
+        drop(look);
+
+        let lock = vault.paths.dir.join(".lock");
+        let look = source_read().into_look(&vault.paths);
+        let put_away = lock.with_extension("put-away");
+        std::fs::rename(&lock, &put_away).unwrap();
+        std::fs::copy(&put_away, &lock).unwrap();
+        let writing = writer(&vault.paths).unwrap();
+        let judged = a_session_through(&vault, &look);
+        let own = a_session_on_own_calls(&vault);
+        assert_eq!(
+            judged.verdict(),
+            own.verdict(),
+            "a source read look at a lock put away"
+        );
+        assert!(own.access.is_err(), "{:?}", own.verdict());
         drop(writing);
         drop(look);
     });

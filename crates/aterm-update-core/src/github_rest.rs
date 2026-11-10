@@ -843,13 +843,19 @@ fn last_block(dump: &str) -> Vec<(String, String)> {
 }
 
 /// The REST lane's curl for `url`, with `args` before it: [`curl_command`]'s `/usr/bin/curl`
-/// (`-q` first, so no curlrc is read; `--` before the URL), with every variable that changes
-/// what curl reads or trusts ([`VENDOR_ENV_SCRUB`]) and the GitHub token's variables removed.
-/// The caller adds its stdio. Every GitHub request here is one, and so is each of the release's
-/// Firebase Hosting requests (`ship site`), whose bearer token rides stdin the same way.
+/// (`-q` first, so no curlrc is read; `--` before the URL), never negotiating below TLS 1.2
+/// (`--tlsv1.2`, the floor GitHub and Firebase hold; macOS's curl 8.7 would otherwise offer
+/// TLS 1.0), with every variable that changes what curl reads or trusts ([`VENDOR_ENV_SCRUB`])
+/// and the GitHub token's variables removed. The caller adds its stdio. Every GitHub request
+/// here is one (the REST API, and the release-asset reader's download route, API route and
+/// asset CDN), and so is each of the release's Firebase Hosting requests (`ship site`), whose
+/// bearer token rides stdin the same way.
 #[must_use]
 pub fn curl(args: &[&str], url: &str) -> Command {
-    let mut command = curl_command(args, url);
+    let mut argv: Vec<&str> = Vec::with_capacity(args.len().saturating_add(1));
+    argv.push("--tlsv1.2");
+    argv.extend_from_slice(args);
+    let mut command = curl_command(&argv, url);
     for var in VENDOR_ENV_SCRUB.iter().chain(&TOKEN_ENV) {
         command.env_remove(var);
     }

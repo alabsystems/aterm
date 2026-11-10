@@ -352,28 +352,6 @@ fn volume_reports_every_writer(f_flags: u32, fstype: &str) -> bool {
     f_flags & MNT_LOCAL != 0 && !ELSEWHERE.contains(&fstype.to_ascii_lowercase().as_str())
 }
 
-/// Whether this kernel sets the times of the files on the volume the open `file` is on, as it
-/// hears every change of them (`volume_reports_every_writer` on macOS,
-/// `volume_type_reports_every_writer` on Linux): a network, user-space or virtual machine's volume's
-/// times come from a clock elsewhere. `false` where the volume cannot be read, and on a system
-/// neither names.
-#[cfg(unix)]
-pub(crate) fn volume_times_are_this_kernels(file: &std::fs::File) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        crate::shared_write::filesystem_of(file).is_some_and(volume_type_reports_every_writer)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        kqueue::volume_hears_every_writer(file)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = file;
-        false
-    }
-}
-
 /// Whether a Linux volume of `statfs`'s `f_type` `magic` reports every writer's change to
 /// inotify, which hears only what this kernel's own calls do. One the shared-write rule counts as
 /// a network or FUSE one does not ([`crate::shared_write::REMOTE_FILESYSTEMS`]: NFS, SMB 2 and
@@ -1714,7 +1692,7 @@ mod kqueue {
 
     /// Whether the volume `file` is on reports every writer's change to this kqueue
     /// ([`super::volume_reports_every_writer`]); `false` where `fstatfs` refuses.
-    pub(super) fn volume_hears_every_writer(file: &std::fs::File) -> bool {
+    fn volume_hears_every_writer(file: &std::fs::File) -> bool {
         // SAFETY: `statfs` is integers and arrays: all-zero is a value.
         let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: a live descriptor and a writable `statfs`.

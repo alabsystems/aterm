@@ -120,10 +120,13 @@ fn a_closed_bell_is_a_failed_wait_not_an_endless_notification() {
     let routes = aterm_uds::network::RouteChanges::open().expect("network event socket");
     let (hear, ring) = std::io::pipe().unwrap();
     drop(ring);
-    assert_eq!(
-        poll_both(&routes, Some(hear.as_fd()), Duration::ZERO),
-        Woke::Failed
-    );
+    aterm_uds::deadline::once_released(|| {
+        if poll_both(&routes, Some(hear.as_fd()), Duration::ZERO) == Woke::Failed {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+    });
 }
 
 #[test]

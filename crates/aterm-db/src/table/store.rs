@@ -851,9 +851,10 @@ impl Store {
     ) -> Result<Self> {
         // Keep each admitted vault source stable through local replay. Live
         // authority is checked before replay, before finalization and before
-        // returning the store. Every record still authenticates its signed
-        // envelope and historical evidence. No guard escapes this open or
-        // crosses network I/O.
+        // returning the store; in a table-repair read batch each check judges
+        // the vault as its admission did (`Session::keep_look`). Every record
+        // still authenticates its signed envelope and historical evidence. No
+        // guard escapes this open or crosses network I/O.
         let sources = session.local_source_reads()?;
         if !read_only {
             session.mutation_guard()?;

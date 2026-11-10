@@ -1479,6 +1479,10 @@ fn mutant_only_actions() {}
 mod edit_ticket_conformance;
 
 #[cfg(test)]
+#[path = "markdown_workspace_tests.rs"]
+mod markdown_workspace_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

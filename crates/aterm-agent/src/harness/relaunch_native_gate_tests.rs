@@ -1940,7 +1940,7 @@ fn an_in_flight_exit_is_proven_only_for_its_own_agent_by_identity() {
     let mut st = legacy();
     let (snap, _) = exit_input(world.path(), &st);
     assert!(
-        !in_flight_exit_proven(&st, true, Some("another birth")),
+        !in_flight_exit_proven(&st, |_| true, |_| Some("another birth".into())),
         "no start: unproven"
     );
     st.adopt_start(snap.pid, &snap.start);
@@ -1949,12 +1949,17 @@ fn an_in_flight_exit_is_proven_only_for_its_own_agent_by_identity() {
         super::super::upgrade_drive::squash(&snap.start),
         "an earlier build's record takes its snapshot's start"
     );
-    assert!(in_flight_exit_proven(&st, true, Some("another birth")));
-    assert!(in_flight_exit_proven(&st, false, None));
+    assert!(in_flight_exit_proven(
+        &st,
+        |_| true,
+        |_| Some("another birth".into())
+    ));
+    assert!(in_flight_exit_proven(&st, |_| false, |_| None));
+    let born = st.pid_start.clone();
     assert!(!in_flight_exit_proven(
         &st,
-        true,
-        Some(st.pid_start.as_str())
+        |_| true,
+        |_| Some(born.clone())
     ));
     let mut other = legacy();
     other.adopt_start(snap.pid + 1, &snap.start);
@@ -1971,10 +1976,10 @@ fn an_in_flight_exit_is_proven_only_for_its_own_agent_by_identity() {
     );
     let mut stamped = st.clone();
     stamped.exited_at = 1;
-    assert!(!in_flight_exit_proven(&stamped, false, None));
+    assert!(!in_flight_exit_proven(&stamped, |_| false, |_| None));
     let mut relaunched = st;
     relaunched.phase = upgrade::Phase::Relaunched { at_s: 1 };
-    assert!(!in_flight_exit_proven(&relaunched, false, None));
+    assert!(!in_flight_exit_proven(&relaunched, |_| false, |_| None));
 }
 
 /// The `HostEndedRelaunch` step the code takes from `state` under `action`: an input action

@@ -2029,6 +2029,9 @@ pub(crate) fn editor_help_forms(help: &str) -> Vec<String> {
 /// What the editor's toolbar holds beyond its fixed commands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EditorToolbar {
+    /// A document workspace owns the primary toolbar; secondary editor commands remain in
+    /// its command palette. Geometry and painting omit the same row.
+    pub(crate) commands_hidden: bool,
     pub(crate) problem_navigation: bool,
     pub(crate) reload: bool,
     pub(crate) edit_header: bool,
@@ -2048,6 +2051,9 @@ pub(crate) struct EditorToolbarItem {
 
 /// The toolbar's buttons, in reading order.
 pub(crate) fn editor_toolbar_items(toolbar: EditorToolbar) -> Vec<EditorToolbarItem> {
+    if toolbar.commands_hidden {
+        return Vec::new();
+    }
     let item = |key, long, short, yields| EditorToolbarItem {
         key,
         long,
@@ -2264,7 +2270,7 @@ pub(crate) fn editor_shell_metrics_at_scale(
     // fewest the toolbar takes, which leave the file the most.
     let shed_toolbar = |palette: EditorPalette, natural: EditorShellMetrics| {
         let toolbar_rows = natural.command_rows - usize::from(toolbar.edit_header);
-        let fewest_rows = usize::from(!toolbar.edit_header);
+        let fewest_rows = usize::from(!toolbar.edit_header && !toolbar.commands_hidden);
         let mut fewest = natural;
         if rows(&natural) >= MINIMUM_EDITOR_DOCUMENT_ROWS {
             return natural;
@@ -2389,7 +2395,7 @@ fn editor_shell_layout(
     )
     .rows
     .len();
-    let command_rows = if command_row_cap == 0 {
+    let command_rows = if command_row_cap == 0 || toolbar.commands_hidden {
         0
     } else {
         toolbar_rows.max(1)
@@ -13970,6 +13976,7 @@ pub(crate) mod tests {
     #[test]
     fn the_editor_toolbar_plan_wraps_shortens_and_yields_in_order() {
         let toolbar = EditorToolbar {
+            commands_hidden: false,
             problem_navigation: true,
             reload: false,
             edit_header: false,
@@ -14051,6 +14058,7 @@ pub(crate) mod tests {
                 .into_iter()
                 .flat_map(move |problem_navigation| {
                     [false, true].map(|reload| EditorToolbar {
+                        commands_hidden: false,
                         problem_navigation,
                         reload,
                         edit_header,
@@ -14152,6 +14160,7 @@ pub(crate) mod tests {
         let toolbars = [
             EditorToolbar::default(),
             EditorToolbar {
+                commands_hidden: false,
                 problem_navigation: true,
                 reload: true,
                 edit_header: false,

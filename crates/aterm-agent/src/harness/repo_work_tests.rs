@@ -3177,33 +3177,80 @@ fn a_sweep_keeps_another_read_s_temporary_dated_as_its_source() {
     assert!(!earlier.exists(), "its own index's earlier copy");
 }
 
-/// An index whose last change is younger than the settle is read as it stands, no copy of it kept:
-/// a second change inside the same tick of the filesystem's clock could leave it the stamp a kept
-/// copy is named by ([`aterm_uds::private_file::stamp_settled`]). The answer is the same.
-/// NEGATIVE CONTROL: with no settle, the same index is copied.
+/// Replacing an index with the same bytes and modification time reuses the same refreshed copy,
+/// regardless of its new inode or change time. Changed bytes in that replacement are read before
+/// choosing a copy: an actual assume-unchanged flag must change the status as the original index
+/// does. A non-private cached copy is not used.
+/// NEGATIVE CONTROL: the old metadata key makes another copy after the equal-byte replacement;
+/// a path-only key answers the later edit from the earlier index.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn an_index_changed_within_the_settle_is_read_as_it_stands() {
+fn an_equal_index_replacement_reuses_a_copy_but_changed_bytes_do_not() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let work = repo(tmp.path(), false);
-    std::fs::write(work.join("b.txt"), "x\n").expect("b.txt");
+    // Normalize optional index extensions through the same real flag writer before
+    // capturing the baseline; the later flag change must preserve that index's length.
+    scratch_git(&work, &["update-index", "--assume-unchanged", "a.txt"]);
+    scratch_git(&work, &["update-index", "--no-assume-unchanged", "a.txt"]);
     let reads = reads_in(tmp.path());
     let table = aterm_sysprobe::volumes::table();
-    {
-        let _settle = index_seam::set_settle(Duration::from_secs(60 * 60));
-        assert!(
-            private_index(&work, &reads).is_none(),
-            "an index changed within the settle"
-        );
-        let (status, _) = work_status(&work, &table, &reads).expect("a read");
-        assert_eq!(status, "?? b.txt\0", "read as it stands");
-    }
-    assert!(
-        private_index(&work, &reads).is_some(),
-        "CONTROL: with no settle, it is copied"
+    let source = work.join(".git/index");
+    let original = std::fs::File::open(&source).expect("the source index");
+    let before = original.metadata().expect("the source identity");
+    let bytes = std::fs::read(&source).expect("the current index bytes");
+    let first = private_index(&work, &reads).expect("a private index");
+    let first_id = std::fs::metadata(&first.path).expect("the copy").ino();
+    let replacement = work.join(".git/index.replacement");
+    std::fs::write(&replacement, &bytes).expect("the same index bytes");
+    dated(
+        &replacement,
+        before.modified().expect("source modification time"),
+    );
+    std::fs::rename(&replacement, &source).expect("replace the index");
+    let replaced = std::fs::metadata(&source).expect("the replacement identity");
+    assert_ne!(
+        (before.dev(), before.ino()),
+        (replaced.dev(), replaced.ino()),
+        "the held original keeps its inode out of the replacement"
+    );
+    let same = private_index(&work, &reads).expect("the same content's private index");
+    assert_eq!(
+        same.path, first.path,
+        "equal bytes reuse the refreshed copy"
+    );
+    assert_eq!(std::fs::metadata(&same.path).unwrap().ino(), first_id);
+
+    std::fs::write(work.join("a.txt"), "changed\n").expect("an actual worktree edit");
+    scratch_git(&work, &["update-index", "--assume-unchanged", "a.txt"]);
+    let changed = std::fs::read(&source).expect("the changed index bytes");
+    assert_ne!(changed, bytes, "the actual index flag changed");
+    assert_eq!(changed.len(), bytes.len(), "the index retains its length");
+    let held = std::fs::File::open(&source).unwrap();
+    std::fs::write(&source, &bytes).unwrap();
+    dated(&source, before.modified().unwrap());
+    let old = private_index(&work, &reads).expect("a copy before the in-place edit");
+    let held_id = held.metadata().unwrap().ino();
+    std::fs::write(&source, &changed).unwrap();
+    dated(&source, before.modified().unwrap());
+    assert_eq!(held.metadata().unwrap().ino(), held_id);
+    let current = private_index(&work, &reads).expect("the changed content's copy");
+    assert_ne!(
+        current.path, old.path,
+        "changed source bytes select another copy"
     );
     let (status, _) = work_status(&work, &table, &reads).expect("a read");
-    assert_eq!(status, "?? b.txt\0", "CONTROL: the same answer");
+    assert_eq!(status, "", "the real assume-unchanged flag is honored");
+    assert_eq!(index_seam::copy_answered(), Some(true));
+    std::fs::set_permissions(&current.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (status, _) = work_status(&work, &table, &reads).expect("original-index fallback");
+    assert_eq!(status, "");
+    assert_eq!(
+        index_seam::copy_answered(),
+        Some(false),
+        "unsafe copy is refused"
+    );
+    assert!(!reads.cut.get());
 }
 
 /// A copy let go between its handing out and its status ([`PrivateIndex::stands`], as another

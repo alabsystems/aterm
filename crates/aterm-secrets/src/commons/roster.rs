@@ -1111,19 +1111,15 @@ fn commons_log_state_digest(
             hash.update([0]);
         }
     }
-    let node_dir = paths
-        .home
-        .join(".local")
-        .join("state")
-        .join("aterm")
-        .join("node");
+    // The files an access is judged by beside the log and the state: the vault and this Mac's
+    // identity, the device whose binding a node denial judges and the claim it is held to
+    // (`Device::existing_binding_for_observation`), and the fold mark that names the audience.
     for extra in [
         paths.dir.join("vault"),
         paths.dir.join("identity"),
         paths.dir.join("commons").join("device.age"),
+        paths.dir.join("commons").join("device.claim"),
         crate::commons::fold::mark(paths),
-        node_dir.join("node.key"),
-        node_dir.join("node.id"),
     ] {
         if let Some(meta) = crate::fsx::lstat_in(glance, &extra)? {
             hash.update([1]);

@@ -479,10 +479,14 @@ fn complete_mac_app(r: &Release, dmg: &str) -> bool {
         && r.named(dmg).is_some()
 }
 
-fn stable_minor_releases(releases: &[Release]) -> Vec<&Release> {
+fn stable_product_releases(releases: &[Release]) -> Vec<&Release> {
     stable(releases)
         .into_iter()
-        .filter(|r| r.version_key().is_some_and(|k| k.2 == 0))
+        .filter(|r| {
+            r.version_key()
+                .and_then(aterm_types::release_version::ReleaseVersion::from_components)
+                .is_some()
+        })
         .collect()
 }
 
@@ -531,7 +535,7 @@ pub fn elect_mac<'r>(
     if !valid_slug(slug) {
         return Err(Refused::BadSlug);
     }
-    let stable = stable_minor_releases(releases);
+    let stable = stable_product_releases(releases);
     elect_mac_from_stable(&stable, slug, notes)
 }
 
@@ -573,7 +577,7 @@ pub fn elect(
     if !valid_slug(slug) {
         return Err(Refused::BadSlug);
     }
-    let stable = stable_minor_releases(releases);
+    let stable = stable_product_releases(releases);
     let (mac, chosen) = elect_mac_from_stable(&stable, slug, notes)?;
     let probe = intel_probe_name(chosen.version());
     let intel_proof = chosen
@@ -722,6 +726,28 @@ mod tests {
             "https://github.com/alabsystems/aterm/releases/download/v0.64.0/aterm-0.64.0.dmg"
         );
         assert_eq!(mac.size_label().as_deref(), Some("31 MB"));
+    }
+
+    #[test]
+    fn calendar_releases_keep_full_order_and_reject_zero_counters_and_invalid_dates() {
+        let releases = vec![
+            app("0.194.0", Some(1)),
+            app("1.20261109.1", Some(1)),
+            app("1.20261109.2", Some(1)),
+            app("1.20261110.0", Some(1)),
+            app("1.20261301.1", Some(1)),
+        ];
+        let stable = stable_product_releases(&releases);
+        assert_eq!(
+            stable.iter().map(|r| r.version()).collect::<Vec<_>>(),
+            ["1.20261109.2", "1.20261109.1", "0.194.0"]
+        );
+        let (mac, _) = elect_mac(&releases, SLUG, &mut Vec::new()).unwrap();
+        assert_eq!(mac.tag, "v1.20261109.2");
+        assert_eq!(
+            mac.url,
+            "https://github.com/alabsystems/aterm/releases/download/v1.20261109.2/aterm-1.20261109.2.dmg"
+        );
     }
 
     #[test]

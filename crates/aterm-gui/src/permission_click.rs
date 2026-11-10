@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A person's click on a Claude Code tab's permission chip (`yolo`/`lame`), as the window holds
+//! A person's click on a Claude Code tab's off permission chip (`○ yolo`), as the window holds
 //! it (`docs/DESIGN-yolo-binary-2026-11-04.md` §2, §3): the App's table of standing asks, one a
 //! tab ([`Clicks`]), and the lane that looks at each on its own thread through the harness's one
 //! look ([`harness::look`]), paced as the ⬆️ press lane is. Nothing is typed and nothing is on
@@ -685,7 +685,7 @@ mod tests {
         Click {
             tab: tab.to_owned(),
             conversation: "c-1".to_owned(),
-            to: PermissionTo::Settings,
+            to: PermissionTo::Bypass,
             at: 1,
         }
     }
@@ -702,7 +702,7 @@ mod tests {
     fn a_take_back_past_the_fence_lands_unless_the_signal_went() {
         let clicks = Clicks::default();
         let now = Instant::now();
-        let id = clicks.stand(click("s-a"), true);
+        let id = clicks.stand(click("s-a"), false);
         assert!(clicks.stands("s-a", id), "the look's read before the hand");
         assert_eq!(
             clicks.shown("s-a"),
@@ -731,7 +731,7 @@ mod tests {
             "the look's wait ended it, and its lane with it"
         );
 
-        let id = clicks.stand(click("s-c"), true);
+        let id = clicks.stand(click("s-c"), false);
         assert!(clicks.stands("s-c", id));
         assert!(
             clicks.take_back("s-c").is_some(),
@@ -792,12 +792,12 @@ mod tests {
     #[test]
     fn a_standing_click_holds_the_loops_act_for_its_own_bound() {
         let clicks = Clicks::default();
-        let id = clicks.stand(click("s-h"), true);
+        let id = clicks.stand(click("s-h"), false);
         let now = Instant::now();
         assert!(clicks.holds("s-h", now), "from the first rest");
         clicks.run_hold_out("s-h");
         assert!(!clicks.holds("s-h", Instant::now()), "its bound");
-        let id2 = clicks.stand(click("s-h"), true);
+        let id2 = clicks.stand(click("s-h"), false);
         assert!(id2 > id, "a new ask");
         assert!(clicks.holds("s-h", Instant::now()));
         clicks.run_hold_out("s-h");
@@ -806,7 +806,7 @@ mod tests {
         clicks.run_hold_out("s-h");
         clicks.note("s-h", id2, &Look::Waits(Wait::Draft), Instant::now());
         assert!(!clicks.holds("s-h", Instant::now()), "a draft does not");
-        let gen3 = clicks.stand(click("s-h"), true);
+        let gen3 = clicks.stand(click("s-h"), false);
         let rest = Instant::now();
         assert!(clicks.holds("s-h", rest));
         clicks.note("s-h", gen3, &Look::Waits(Wait::Turn), rest);
@@ -820,7 +820,7 @@ mod tests {
         assert!(!clicks.holds("s-h", Instant::now()), "run out, out");
         clicks.note("s-h", gen3, &Look::Waits(Wait::Box), Instant::now());
         assert!(!clicks.holds("s-h", Instant::now()), "and out for this ask");
-        let gen4 = clicks.stand(click("s-h"), true);
+        let gen4 = clicks.stand(click("s-h"), false);
         clicks.note("s-h", gen4, &Look::Waits(Wait::Limit), Instant::now());
         assert!(!clicks.holds("s-h", Instant::now()), "a wall's own wait");
         clicks.note("s-h", gen4, &Look::Waits(Wait::Turn), Instant::now());
@@ -828,7 +828,7 @@ mod tests {
             clicks.holds("s-h", Instant::now()),
             "the turn after the wall: the next rest holds again"
         );
-        clicks.stand(click("s-h"), true);
+        clicks.stand(click("s-h"), false);
         assert!(clicks.take_back("s-h").is_some());
         assert!(!clicks.holds("s-h", Instant::now()), "nothing stands");
     }

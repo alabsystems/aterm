@@ -2153,6 +2153,81 @@ fn provision_fetch_retries_two_504s_but_never_a_404() {
 }
 
 #[test]
+fn provision_fetch_reads_a_release_asset_on_the_api_route_while_the_download_host_fails() {
+    use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+    const TARBALL: &[u8] = b"a pinned vendor tarball";
+    let fake = FakeGithub::start();
+    fake.add_repo(
+        "fixture-dev/tool",
+        RepoSpec::public().push("fixture-dev-bot"),
+    );
+    let id = fake.add_release(
+        "fixture-dev/tool",
+        ReleaseSpec::published("4.9.3", "2026-10-01T00:00:00Z"),
+    );
+    fake.add_asset(id, AssetSpec::uploaded("tool-4.9.3.tar.xz", TARBALL));
+    let ports = fake.ports();
+    let origins = aterm_update_core::github_rest::Origins::loopback(
+        ports.api,
+        ports.uploads,
+        ports.web,
+        ports.cdn,
+    );
+    let api_reads = || {
+        fake.seen()
+            .iter()
+            .filter(|s| s.origin == FakeOrigin::Api)
+            .count()
+    };
+    // The shared downloader's seam answers every request it is given, so a release URL that
+    // reached it would land its one byte instead of the asset.
+    let downloader = std::sync::Arc::new(FetchScript::new(std::iter::repeat_n(200, 8)));
+    let host = System::new(&repo())
+        .with_fetch_spawn(downloader.clone())
+        .with_fetch_origins(origins);
+    let url = "https://github.com/fixture-dev/tool/releases/download/4.9.3/tool-4.9.3.tar.xz";
+    let scratch = aterm_tempfile::tempdir().unwrap();
+
+    // Negative control: while the download host serves, the API route is never asked.
+    let dest = scratch.path().join("served");
+    host.fetch(url, &dest, 1024).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), TARBALL);
+    assert_eq!(api_reads(), 0);
+
+    fake.fault_always(
+        Match::web("/fixture-dev/tool/releases/"),
+        Fault::Status {
+            status: 504,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    let dest = scratch.path().join("rescued");
+    host.fetch(url, &dest, 1024).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), TARBALL);
+    assert!(api_reads() >= 2, "the release, then the asset by id");
+    assert_eq!(
+        downloader.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a release asset never goes to the https-only downloader"
+    );
+
+    // Any other URL stays on the https-only downloader and asks the reader's routes nothing.
+    let seen = fake.seen().len();
+    host.fetch(
+        "https://example.invalid/tool.tar.xz",
+        &scratch.path().join("other"),
+        1024,
+    )
+    .unwrap();
+    assert_eq!(
+        downloader.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(fake.seen().len(), seen);
+}
+
+#[test]
 fn a_translated_run_provisions_the_macs_own_rows() {
     assert_eq!(platform_of("macos", "x86_64", true), "macos-aarch64");
     assert_eq!(platform_of("macos", "x86_64", false), "macos-x86_64");

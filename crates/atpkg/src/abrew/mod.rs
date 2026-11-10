@@ -1136,12 +1136,54 @@ fn shell_fast_path(cmd: &str) -> bool {
     )
 }
 
+/// The end of the bundle-owned option region: `bundle exec`
+/// owns every token from its command onward, and `--` ends
+/// bundle options for every subcommand.
+fn bundle_option_boundary(rest: &[String]) -> usize {
+    let mut seen_subcommand = false;
+    let mut subcommand: Option<&str> = None;
+    let mut idx = 0;
+    while idx < rest.len() {
+        let arg = rest[idx].as_str();
+        if arg == "--" {
+            return idx;
+        }
+        if matches!(
+            arg,
+            "--file" | "--jobs" | "--upgrade-formulae" | "--upgrade-formula" | "--sandbox"
+        ) {
+            idx += 2;
+            continue;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            if !seen_subcommand {
+                seen_subcommand = true;
+                subcommand = Some(arg);
+            } else if subcommand == Some("exec") {
+                return idx;
+            }
+        }
+        idx += 1;
+    }
+    rest.len()
+}
+
 fn native_args(
     cmd: &str,
     rest: &[String],
 ) -> Result<(Option<Vec<bundle::BrewfileEntry>>, Vec<String>), InstallError> {
     let typed_rest = rest;
-    let canonical = canonical_kind_switches(rest);
+    let canonical = if cmd == "bundle" {
+        // The command given to `bundle exec` is not abrew input:
+        // preserve it and its arguments byte-for-byte instead of
+        // applying bundle's own kind-switch canonicalisation.
+        let boundary = bundle_option_boundary(rest);
+        let mut canonical = canonical_kind_switches(&rest[..boundary]);
+        canonical.extend(rest[boundary..].iter().cloned());
+        canonical
+    } else {
+        canonical_kind_switches(rest)
+    };
     let rest: &[String] = &canonical;
     // Brew warns on its deprecated wrapper envs, then reads
     // the disabled internal-API env while fetching API files;
@@ -1900,9 +1942,10 @@ fn native_args(
                     )));
                 }
             }
+            let boundary = bundle_option_boundary(rest);
             // Expand the validated abbreviations so the bundle
             // handlers below see canonical spellings.
-            for tok in bundle_expanded.iter_mut() {
+            for tok in bundle_expanded.iter_mut().take(boundary) {
                 let Some(long) = tok.strip_prefix("--") else {
                     continue;
                 };
@@ -1929,11 +1972,13 @@ fn native_args(
             }
         }
         let rest: &[String] = &bundle_expanded;
+        let option_rest: &[String] = &bundle_expanded[..bundle_option_boundary(&bundle_expanded)];
         // Brew's bundle type toggles: each enabled spelling
         // conflicts with the disabled, no-cleanup and no-dump
         // forms, registered in type order (extensions in
         // registration order), with --file/--global last.
-        let present_any = |spellings: &[&str]| spellings.iter().any(|s| has_flag_eq(rest, s));
+        let present_any =
+            |spellings: &[&str]| spellings.iter().any(|s| has_flag_eq(option_rest, s));
         let conflict = |a: &str, b: &str| {
             Err(InstallError::Failed(format!(
                 "Error: Invalid usage: Options {a} and {b} are mutually exclusive."
@@ -1976,7 +2021,7 @@ fn native_args(
             }
             for variant in ["--no-cleanup-", "--no-dump-"] {
                 let other = format!("{variant}{slug}");
-                if present_any(enabled_spellings) && has_flag_eq(rest, &other) {
+                if present_any(enabled_spellings) && has_flag_eq(option_rest, &other) {
                     return conflict(enabled, &other);
                 }
             }
@@ -1985,17 +2030,17 @@ fn native_args(
             "mas", "vscode", "go", "cargo", "uv", "flatpak", "winget", "krew", "npm",
         ] {
             let enabled = format!("--{ext}");
-            if !has_flag_eq(rest, &enabled) {
+            if !has_flag_eq(option_rest, &enabled) {
                 continue;
             }
             for variant in ["--no-", "--no-cleanup-", "--no-dump-"] {
                 let other = format!("{variant}{ext}");
-                if has_flag_eq(rest, &other) {
+                if has_flag_eq(option_rest, &other) {
                     return conflict(&enabled, &other);
                 }
             }
         }
-        if has_flag_eq(rest, "--file") && has_flag(rest, "--global", "-g") {
+        if has_flag_eq(option_rest, "--file") && has_flag(option_rest, "--global", "-g") {
             return conflict("--file", "--global");
         }
         // Brew's subcommand scope check: a switch declared for
@@ -2207,8 +2252,8 @@ fn native_args(
             }
         }
         if subcommand == "install"
-            && has_flag_eq(rest, "--zap")
-            && !has_flag_eq(rest, "--force-cleanup")
+            && has_flag_eq(option_rest, "--zap")
+            && !has_flag_eq(option_rest, "--force-cleanup")
             && !env_set("HOMEBREW_BUNDLE_INSTALL_CLEANUP")
         {
             return Err(InstallError::Failed(
@@ -3703,6 +3748,8 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
         Some("install" | "upgrade") | None => brewfile_args(rest.get(1..).unwrap_or(&[]), false),
         Some("check") => brewfile_args(rest.get(1..).unwrap_or(&[]), true),
         Some("env") => bundle_env_args(rest.get(1..).unwrap_or(&[])),
+        Some("exec") => bundle_exec_args(rest.get(1..).unwrap_or(&[]), false),
+        Some("sh") => bundle_exec_args(rest.get(1..).unwrap_or(&[]), true),
         Some("list") => bundle_list_args(rest.get(1..).unwrap_or(&[])),
         Some("cleanup") => {
             if rest.iter().any(|a| a == "--install") {
@@ -3937,6 +3984,117 @@ fn bundle_env_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>
         } else {
             return Err(unsupported());
         }
+    }
+    let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
+    let (entries, skipped) = bundle::parse_brewfile(&text);
+    if !skipped.is_empty() {
+        return Err(unsupported());
+    }
+    Ok(Some(entries))
+}
+
+/// `brew bundle exec` / `brew bundle sh` admission. The
+/// executable and every token after it are opaque: they are
+/// preserved exactly for dispatch and never interpreted as
+/// bundle flags, Brewfile rows or package names. Service
+/// supervision and Homebrew's sandbox remain refused before
+/// the environment is built or any process is launched.
+fn bundle_exec_args(
+    rest: &[String],
+    shell: bool,
+) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let unsupported =
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    let mut file = None;
+    let mut services = false;
+    let mut sandbox = false;
+    let mut deny_network = false;
+    let mut command_seen = false;
+    let mut idx = 0;
+    while idx < rest.len() {
+        let arg = rest[idx].as_str();
+        if arg == "--" {
+            command_seen = idx + 1 < rest.len();
+            break;
+        }
+        if arg == "--file" {
+            if file.is_some() {
+                return Err(unsupported());
+            }
+            let Some(path) = rest.get(idx + 1).filter(|s| !s.is_empty()) else {
+                return Err(unsupported());
+            };
+            file = Some(std::path::PathBuf::from(path));
+            idx += 2;
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--file=").filter(|s| !s.is_empty()) {
+            if file.is_some() {
+                return Err(unsupported());
+            }
+            file = Some(std::path::PathBuf::from(path));
+            idx += 1;
+            continue;
+        }
+        if arg == "--sandbox" {
+            sandbox = true;
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--sandbox=") {
+            sandbox = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--services" {
+            services = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--deny-network" {
+            deny_network = true;
+            idx += 1;
+            continue;
+        }
+        if matches!(
+            arg,
+            "--check"
+                | "--no-secrets"
+                | "--install"
+                | "--verbose"
+                | "-v"
+                | "--quiet"
+                | "-q"
+                | "--debug"
+                | "-d"
+        ) {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            return Err(unsupported());
+        }
+        command_seen = true;
+        break;
+    }
+    if shell && command_seen {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: This command does not take named arguments.".to_string(),
+        ));
+    }
+    if !shell && !command_seen {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: This command requires at least 1 named argument.".to_string(),
+        ));
+    }
+    if services
+        || sandbox
+        || deny_network
+        || std::env::var_os("HOMEBREW_BUNDLE_SERVICES").is_some_and(|v| !v.is_empty())
+    {
+        return Err(InstallError::Unsupported(
+            "bundle exec/sh services and sandbox execution are not native".to_owned(),
+        ));
     }
     let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
     let (entries, skipped) = bundle::parse_brewfile(&text);
@@ -4387,10 +4545,14 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     let dry_run = rest
         .iter()
         .any(|s| matches!(s.as_str(), "--dry-run" | "-n"));
+    let bundle_install_requested = cmd == "bundle"
+        && rest[..bundle_option_boundary(rest)]
+            .iter()
+            .any(|a| a == "--install");
     let read_only = (cmd == "bundle"
         && rest.first().is_some_and(|s| {
             matches!(s.as_str(), "check" | "status" | "dump")
-                || (s == "env" && !rest.iter().any(|a| a == "--install"))
+                || (matches!(s.as_str(), "env" | "exec" | "sh") && !bundle_install_requested)
         }))
         || (cmd == "tap" && rest.is_empty())
         || dry_run;
@@ -4403,7 +4565,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     if cmd == "bundle"
         && !rest.first().is_some_and(|s| {
             matches!(s.as_str(), "check" | "status" | "remove" | "dump")
-                || (s == "env" && !rest.iter().any(|a| a == "--install"))
+                || (matches!(s.as_str(), "env" | "exec" | "sh") && !bundle_install_requested)
         })
         && let Some(entries) = &prepared
     {
@@ -6001,6 +6163,50 @@ mod admission_tests {
         assert!(matches!(
             native_args("bundle", &argv(&["remove"])),
             Ok((None, _))
+        ));
+    }
+
+    #[test]
+    fn bundle_exec_child_tokens_are_opaque_values() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let file = temp.path().join("Brewfile");
+        std::fs::write(&file, "brew \"wget\"\n").unwrap();
+        let flag = format!("--file={}", file.to_str().unwrap());
+        let args = argv(&[
+            "exec",
+            &flag,
+            "--",
+            "/usr/bin/printf",
+            "token with spaces",
+            "--formulae",
+            "-vq",
+            "zzz-nonexist-000",
+        ]);
+        let (prepared, rest) = native_args("bundle", &args).unwrap();
+        assert!(prepared.is_some());
+        assert_eq!(rest, args);
+
+        let args = argv(&[
+            "exec",
+            &flag,
+            "/usr/bin/printf",
+            "--check",
+            "--install",
+            "-vq",
+        ]);
+        let (_, rest) = native_args("bundle", &args).unwrap();
+        assert_eq!(rest, args);
+        assert!(matches!(
+            native_args("bundle", &argv(&["exec", &flag, "--services", "/bin/echo"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert!(matches!(
+            native_args("bundle", &argv(&["sh", &flag, "--services"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert!(matches!(
+            native_args("bundle", &argv(&["exec", &flag])),
+            Err(InstallError::Failed(_))
         ));
     }
 

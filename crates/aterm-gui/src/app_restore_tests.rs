@@ -1574,6 +1574,149 @@ fn a_restored_harness_page_reads_the_ledgers_once() {
 }
 
 #[test]
+fn markdown_workspace_restore_keeps_modes_and_independent_pane_positions() {
+    use crate::native_app::{AppKind, AppViewState, MarkdownPane, MarkdownWorkspaceMode};
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("workspace.md");
+    std::fs::write(&path, "# Title\n\nFirst paragraph\n\nSecond paragraph\n").unwrap();
+    let wid = WindowId(0);
+    for mode in [
+        MarkdownWorkspaceMode::Read,
+        MarkdownWorkspaceMode::Edit,
+        MarkdownWorkspaceMode::Split,
+    ] {
+        let mut original = App::headless_for_test();
+        original
+            .open_document_tab(AppKind::Markdown, &file_uri(&path))
+            .unwrap();
+        let (_, view) = original.active_native_view(wid).unwrap();
+        let Some(AppViewState::Editor(editor)) = original.native_runtime.view_state_mut(view)
+        else {
+            panic!("Markdown opens in the editor workspace");
+        };
+        let buffer = editor.buffer.as_mut().unwrap();
+        buffer.selections = vec![crate::native_editor::Selection {
+            anchor: 10,
+            head: 14,
+        }];
+        buffer.viewport_anchor = 9;
+        let workspace = editor.markdown.as_mut().unwrap();
+        workspace.mode = mode;
+        workspace.focus = if mode == MarkdownWorkspaceMode::Edit {
+            MarkdownPane::Editor
+        } else {
+            MarkdownPane::Reader
+        };
+        workspace.reader.source_anchor = 26;
+        workspace.reader.visual_row = 3;
+        workspace.reader.selection = Some(26..32);
+        workspace.reader_entry_anchor = Some(9);
+        workspace.split_per_mille = 650;
+        let restore::RestoredView::Native(descriptor) =
+            original.view_restore_descriptor(view).unwrap()
+        else {
+            panic!("native descriptor");
+        };
+        assert_eq!(descriptor.restore_tag, "editor");
+        let manifest =
+            restore::RestoreManifest::new(vec![window_of(vec![native_leaf(descriptor.clone())])]);
+        let wire = manifest.to_toml().unwrap();
+        let parsed = restore::RestoreManifest::from_toml(&wire).unwrap();
+        assert_eq!(
+            parsed, manifest,
+            "workspace state survives the persisted wire format"
+        );
+        let mut restored = App::headless_for_test();
+        restored.restore_into_window(wid, parsed.windows.into_iter().next().unwrap());
+        let (instance, view) = restored.active_native_view(wid).unwrap();
+        assert_eq!(
+            restored.native_runtime.app(instance).unwrap().kind(),
+            AppKind::Editor
+        );
+        let restore::RestoredView::Native(captured) =
+            restored.view_restore_descriptor(view).unwrap()
+        else {
+            panic!("native descriptor");
+        };
+        assert_eq!(captured.markdown, descriptor.markdown);
+        assert_eq!(captured.editor_selections, descriptor.editor_selections);
+        assert_eq!(captured.viewport_anchor, descriptor.viewport_anchor);
+        assert!(restored.structural_invariants_ok());
+    }
+}
+
+#[test]
+fn restored_markdown_view_uses_the_existing_controllers_capability() {
+    use crate::native_app::{AppKind, AppViewState};
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("configuration.md");
+    let source = "theme = \"Default\"\n";
+    std::fs::write(&path, source).unwrap();
+    let uri = file_uri(&std::fs::canonicalize(&path).unwrap());
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    app.open_document_tab(AppKind::Editor, &uri).unwrap();
+    let (instance, original) = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(instance).unwrap();
+    // A config symlink may bind TOML semantics to a target whose suffix is .md.
+    assert!(app.native_runtime.enable_config_editor(document, source, 1));
+    app.stage_document_restore_view(wid, AppKind::Markdown, &uri)
+        .unwrap();
+    let (restored_instance, restored) = app.active_native_view(wid).unwrap();
+    assert_eq!(restored_instance, instance);
+    assert_ne!(restored, original);
+    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(restored) else {
+        panic!("editor");
+    };
+    assert!(
+        state.markdown.is_none(),
+        "a restore cannot add reader input to a source-only controller"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn legacy_markdown_restore_migrates_into_editor_read_without_reusing_reader_rows_as_source_bytes() {
+    use crate::native_app::{AppKind, AppViewState, MarkdownPane, MarkdownWorkspaceMode};
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("legacy.md");
+    std::fs::write(&path, "éx").unwrap();
+    let mut descriptor = restore::NativeLeafRestore::document("markdown", file_uri(&path));
+    descriptor.source_anchor = 1;
+    descriptor.viewport_anchor = 23;
+    descriptor.selection = Some(restore::RestoreSelection {
+        anchor: 1,
+        head: usize::MAX,
+    });
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.restore_into_window(wid, window_of(vec![native_leaf(descriptor)]));
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    assert_eq!(
+        app.native_runtime.app(instance).unwrap().kind(),
+        AppKind::Editor
+    );
+    assert!(
+        app.native_runtime
+            .instance_by_kind(AppKind::Markdown)
+            .is_none()
+    );
+    let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(view) else {
+        panic!("editor");
+    };
+    let workspace = editor.markdown.as_ref().unwrap();
+    assert_eq!(workspace.mode, MarkdownWorkspaceMode::Read);
+    assert_eq!(workspace.focus, MarkdownPane::Reader);
+    assert_eq!(workspace.reader.source_anchor, 0);
+    assert_eq!(workspace.reader.visual_row, 23);
+    assert_eq!(workspace.reader.selection, Some(0..3));
+    assert_eq!(editor.buffer.as_ref().unwrap().viewport_anchor, 0);
+    assert!(
+        matches!(app.view_restore_descriptor(view), Some(restore::RestoredView::Native(restore)) if restore.restore_tag == "editor" && restore.markdown.is_some())
+    );
+}
+
+#[test]
 fn recursive_editor_restore_clamps_utf8_view_offsets() {
     let dir = std::env::temp_dir().join(format!(
         "aterm-recursive-editor-restore-{}-{:?}",
@@ -5595,7 +5738,7 @@ fn the_successor_of_a_folded_layout_captures_a_layout_every_build_reads_whole() 
         assert_eq!(
             leaves_of(last),
             [
-                "Some(63)", "settings", "markdown", "settings", "markdown", "Some(64)"
+                "Some(63)", "settings", "editor", "settings", "editor", "Some(64)"
             ],
             "{label}: every tab, in the canonical tabs"
         );
@@ -5604,7 +5747,7 @@ fn the_successor_of_a_folded_layout_captures_a_layout_every_build_reads_whole() 
                 last.native_tabs.as_slice(),
                 [
                     restore::NativeTabRestore::Settings { .. },
-                    restore::NativeTabRestore::Markdown { .. }
+                    restore::NativeTabRestore::Editor { .. }
                 ]
             ),
             "{label}: one of each in the legacy mirror: {:?}",

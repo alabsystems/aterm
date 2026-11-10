@@ -260,6 +260,13 @@ fn lost_ack_keeps_actual_facts_and_piped_output_unknown_never_refused() {
         .unwrap();
     assert_eq!(output, "actual output");
     // Receiver closed: this must be EPIPE, never process-fatal SIGPIPE.
+    aterm_uds::deadline::once_released(|| {
+        if aterm_uds::hangup::peer_closed(&child.stdin.as_ref().unwrap().0) {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+    });
     assert!(child.stdin.as_mut().unwrap().write_all(b"closed").is_err());
 }
 #[test]

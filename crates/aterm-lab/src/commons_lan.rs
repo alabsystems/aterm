@@ -2038,6 +2038,13 @@ mod tests {
             (write_new(&report, b"replacement"), input)
         };
         assert!(result.is_err(), "the phase publication must fail");
+        aterm_uds::deadline::once_released(|| {
+            if aterm_uds::hangup::fd_peer_closed(std::os::fd::AsRawFd::as_raw_fd(&input)) {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        });
         assert!(
             input.write_all(b"still running?\n").is_err(),
             "the child must be stopped even though its stdin remains held"

@@ -89,8 +89,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Quit => spec("app.quit", S::Process, A::LocalUi, C::Any),
         M::NewWindow => spec("window.new", S::Process, A::LocalUi, C::Any),
         M::NewTab => spec("tab.new_terminal", S::Window, A::LocalUi, C::Any),
-        M::OpenMarkdown => spec("document.open_markdown", S::Window, A::DocumentRead, C::Any),
-        M::OpenEditor => spec("document.open_editor", S::Window, A::DocumentRead, C::Any),
+        M::OpenEditor => spec("document.open_file", S::Window, A::DocumentRead, C::Any),
         M::Save => spec("document.save", S::Document, A::DocumentWrite, C::Native),
         M::ReopenClosedTab => spec("tab.reopen_closed", S::Window, A::LocalUi, C::Any),
         M::ReopenClosedView => spec("view.reopen_closed", S::View, A::LocalUi, C::Any),
@@ -198,6 +197,17 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
     use ContentRequirement as C;
 
     let result = match action {
+        "editor/markdown/read" => spec("document.mode.read", S::View, A::LocalUi, C::Native),
+        "editor/markdown/edit" => spec("document.mode.edit", S::View, A::LocalUi, C::Native),
+        "editor/markdown/split" => spec("document.mode.split", S::View, A::LocalUi, C::Native),
+        "editor/markdown/toggle" => spec("document.mode.toggle", S::View, A::LocalUi, C::Native),
+        "editor/markdown/focus-editor" => {
+            spec("document.focus.editor", S::View, A::LocalUi, C::Native)
+        }
+        "editor/markdown/focus-reader" => {
+            spec("document.focus.reader", S::View, A::LocalUi, C::Native)
+        }
+        "editor/markdown/resize" => spec("document.split.resize", S::View, A::LocalUi, C::Native),
         "markdown/back" => spec("markdown.history.back", S::View, A::LocalUi, C::Native),
         "markdown/forward" => spec("markdown.history.forward", S::View, A::LocalUi, C::Native),
         "markdown/previous-section" => {

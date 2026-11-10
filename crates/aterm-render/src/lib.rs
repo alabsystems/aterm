@@ -450,6 +450,8 @@ mod color_chain_tests;
 #[cfg(all(test, feature = "embedded-font"))]
 mod combining_script_tests;
 #[cfg(test)]
+mod contrast_floor_tests;
+#[cfg(test)]
 mod dark_nudge_grid_tests;
 #[cfg(test)]
 mod face_identity_tests;
@@ -18825,19 +18827,37 @@ pub fn floor_selection_fg(fg: u32, selection_bg: u32) -> u32 {
     floor_fg_contrast(fg, selection_bg, 4.5)
 }
 
-/// Floor `fg`'s WCAG contrast against `bg` to at least `min`.
+#[inline]
+fn contrast_target(bg: u32) -> u32 {
+    let l = linear_luminance(bg);
+    if (l + 0.05) * (l + 0.05) >= 0.05 * 1.05 {
+        0x0000_0000
+    } else {
+        0x00ff_ffff
+    }
+}
+
+/// Whether [`floor_fg_contrast`] would change `fg`, including unattainable or NaN floors.
+#[inline]
+#[must_use]
+pub fn fg_contrast_would_change(fg: u32, bg: u32, min: f32) -> bool {
+    if contrast_ratio(fg, bg) >= min {
+        return false;
+    }
+    // An accepted candidate cannot equal the rejected input. If none is accepted,
+    // the floor returns this target, which may already be fg for an impossible floor.
+    contrast_target(bg) != fg
+}
+
+/// Raise `fg`'s WCAG contrast against `bg` toward `min`.
+/// If no tested mix meets the floor, return the higher-contrast black or white target.
 #[inline]
 #[must_use]
 pub fn floor_fg_contrast(fg: u32, bg: u32, min: f32) -> u32 {
     if contrast_ratio(fg, bg) >= min {
         return fg;
     }
-    let l = linear_luminance(bg);
-    let target: u32 = if (l + 0.05) * (l + 0.05) >= 0.05 * 1.05 {
-        0x0000_0000
-    } else {
-        0x00ff_ffff
-    };
+    let target = contrast_target(bg);
     let mix = |fg: u32, shift: u32, t: f32| -> u32 {
         let f = ((fg >> shift) & 0xff) as f32;
         let g = ((target >> shift) & 0xff) as f32;

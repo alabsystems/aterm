@@ -18,8 +18,9 @@
 //! status. The watcher is a grandchild of the tether, adopted by launchd, holding a kqueue watch on
 //! the parent's exit and exec (`NOTE_EXIT`, `NOTE_EXEC`) and on the child's exit. It leads a
 //! session of its own, made before it arms, so a listing of the child's group (a stage sweep's), a
-//! kill of that group and a hangup of the child's terminal never count or reach it; it still ends
-//! with the child by its exit watch. When the parent exits, or execs in its own place (an update's
+//! kill of that group and a hangup of the child's terminal never count or reach it (a group
+//! leader's group lists the watcher's anchor, a zombie, as below); it still ends with the child by
+//! its exit watch. When the parent exits, or execs in its own place (an update's
 //! cold lane) as Linux's spawners end at, the watcher ends the child through [`end_proven`]
 //! ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
 //! [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid still reads the
@@ -29,7 +30,17 @@
 //! held: the watcher reads it again every [`HELD_RECHECK`] until its thread has run, then ends
 //! it, or until it exits (`end_once_run`). The watcher exits after that end, which signals
 //! nothing when the proof does not hold (a moved unique id, or one that does not read), so such a
-//! child can run on. It also exits when the child exits first. The tether execs the child only
+//! child can run on. A child that leads its own process group when the tether forks the watcher
+//! (a spawn's `process_group(0)` or session) is a pipeline's root, whose descendants in that group
+//! would run on, adopted, once it alone ended. Its watcher holds the group by an anchor, a child
+//! of its own forked before it leaves the group, which exits at once and is never reaped, so the
+//! group id names the child's group and no other's while the watcher lives (`group`). When the
+//! parent exits or execs, the watcher ends the whole group, `SIGTERM` then `SIGKILL` rounds
+//! (`group::end_group`), then the child alone, as above, should it have left the group. When the
+//! child exits first, the watcher of a group leader stays while the group holds a live member,
+//! woken by each member's exit, and ends the group should the parent go first (`group::linger`);
+//! the watcher of any other child exits with it. Linux's parent-death signal reaches the child
+//! alone. The tether execs the child only
 //! once the watcher is armed and the parent is still its own parent; an exec of the parent before
 //! the watcher armed (on Linux, before the child set its signal) ends nothing. A kill by the
 //! parent's name passes the watcher by.
@@ -148,8 +159,23 @@ fn end_once_run(
     grace: Duration,
     control: &mut impl EndControl,
     mut proof: impl FnMut(i32) -> Option<Proof>,
-    mut exited: impl FnMut() -> bool,
+    exited: impl FnMut() -> bool,
 ) -> Option<Result<Ended, EndRefusal>> {
+    if held_until_exit(watched, control, &mut proof, exited) {
+        return None;
+    }
+    Some(end_watched(watched, grace, control, proof))
+}
+
+/// [`end_once_run`]'s wait: while the child is held before its first instruction, wait on its
+/// exit; `true` once it exited while held, `false` once anything else reads.
+#[cfg(any(target_vendor = "apple", test))]
+fn held_until_exit(
+    watched: Watched,
+    control: &mut impl EndControl,
+    mut proof: impl FnMut(i32) -> Option<Proof>,
+    mut exited: impl FnMut() -> bool,
+) -> bool {
     let held = Proof {
         uniqueid: watched.uniqueid,
         ran: false,
@@ -158,10 +184,10 @@ fn end_once_run(
         && proof(watched.pid) == Some(held)
     {
         if exited() {
-            return None;
+            return true;
         }
     }
-    Some(end_watched(watched, grace, control, proof))
+    false
 }
 
 /// An [`EndControl`] whose identity reads drop their pid version, for a token that has none. Its
@@ -542,6 +568,9 @@ fn hold(parent: i32) -> Result<(), String> {
     else {
         return Err("its watcher did not arm: this process did not read itself".to_string());
     };
+    // SAFETY: `getpgrp` takes nothing and cannot fail. The spawn put this process at the head of
+    // its own group (`process_group(0)`, or a session) before it ran, and the exec keeps it.
+    let leads = unsafe { libc::getpgrp() } == child;
     // SAFETY: `fork` takes nothing. This process has one thread, since its `main` calls `entry`
     // before anything that starts one, so no other thread holds a lock across the fork and the
     // forked branch may read, keep time and sleep as `end_proven` does. That branch never
@@ -559,6 +588,7 @@ fn hold(parent: i32) -> Result<(), String> {
                 watch(
                     parent,
                     watched,
+                    leads,
                     null.as_raw_fd(),
                     arming.as_raw_fd(),
                     armed.as_raw_fd(),
@@ -650,12 +680,26 @@ unsafe fn child_exited_within(kq: i32, child: i32) -> bool {
 /// tether had one thread, so no lock is held that the reads, the clock and the sleep would wait
 /// on.
 #[cfg(target_vendor = "apple")]
-unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i32) -> ! {
+unsafe fn watch(
+    parent: i32,
+    watched: Watched,
+    leads: bool,
+    null: i32,
+    arming: i32,
+    armed: i32,
+) -> ! {
     const BLANK: libc::kevent = watch_of(0, 0);
     let child = watched.pid;
     // SAFETY (whole body): the function's contract.
     unsafe {
-        // First, before it arms: out of the child's group and session. The watcher is the
+        // A group leader's group is held first, while the watcher is still in it: the anchor
+        // exits at once and stays a zombie until the watcher exits, since `SIGCHLD` is reset to
+        // its default (no automatic reap) and nothing here waits on it. `waitid`'s `WNOWAIT` sees
+        // it exited and leaves it unreaped. One that does not arm so exits the watcher unarmed.
+        if leads && !anchored() {
+            libc::_exit(1);
+        }
+        // Then, before it arms: out of the child's group and session. The watcher is the
         // tether's second fork, never a group leader, so `setsid` has no cause to refuse; if it
         // does, the watcher exits unarmed and the tether starts nothing.
         if libc::setsid() < 0 {
@@ -713,27 +757,94 @@ unsafe fn watch(parent: i32, watched: Watched, null: i32, arming: i32, armed: i3
                 libc::_exit(1);
             };
             let events = &events[..got.min(2)];
-            if noted(events, child, libc::NOTE_EXIT) {
-                libc::_exit(0);
-            }
+            // The parent first: a child that died of its parent's end (a pipe the parent held)
+            // can be noted beside it, and its group still has to end.
             if noted(events, parent, libc::NOTE_EXIT | libc::NOTE_EXEC) {
+                let proof = |pid| {
+                    Some(Proof {
+                        uniqueid: crate::process::read_lineage(pid)?.uniqueid,
+                        ran: crate::process::thread_ran(pid)?,
+                    })
+                };
+                let mut control = crate::process::EndControlLive;
+                if leads {
+                    // A child held before its first instruction gets no signal, by the group or
+                    // alone; one that exited so started nothing the group could hold.
+                    let _held_exit = held_until_exit(watched, &mut control, proof, || {
+                        child_exited_within(kq, child)
+                    });
+                    let _ended = group::end_group(
+                        child,
+                        crate::process::END_GRACE,
+                        &mut group::GroupLive { kq, parent },
+                    );
+                }
+                // The child alone, by its proof: any child of a watcher that did not lead its
+                // group, and a leader that left its group. One the group end ended reads as gone
+                // and gets nothing.
                 let _ended = end_once_run(
                     watched,
                     crate::process::END_GRACE,
-                    &mut crate::process::EndControlLive,
-                    |pid| {
-                        Some(Proof {
-                            uniqueid: crate::process::read_lineage(pid)?.uniqueid,
-                            ran: crate::process::thread_ran(pid)?,
-                        })
-                    },
+                    &mut control,
+                    proof,
                     || child_exited_within(kq, child),
                 );
+                libc::_exit(0);
+            }
+            if noted(events, child, libc::NOTE_EXIT) {
+                if leads && group::linger(child, &mut group::GroupLive { kq, parent }) {
+                    let _ended = group::end_group(
+                        child,
+                        crate::process::END_GRACE,
+                        &mut group::GroupLive { kq, parent },
+                    );
+                }
                 libc::_exit(0);
             }
         }
     }
 }
+
+/// The watcher's anchor in the group its child leads: a fork that exits at once, seen exited by
+/// `waitid`'s `WNOWAIT` and left unreaped, with `SIGCHLD` reset to its default so the kernel does
+/// not reap it either. `false` when it could not be made so.
+///
+/// # Safety
+/// As [`watch`]'s, before the watcher leaves the child's group.
+#[cfg(target_vendor = "apple")]
+unsafe fn anchored() -> bool {
+    // SAFETY (whole body): the function's contract; every pointer is to a live local.
+    unsafe {
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        if libc::sigaction(libc::SIGCHLD, &default, std::ptr::null_mut()) != 0 {
+            return false;
+        }
+        let anchor = libc::fork();
+        if anchor == 0 {
+            libc::_exit(0);
+        }
+        if anchor < 0 {
+            return false;
+        }
+        let Ok(id) = libc::id_t::try_from(anchor) else {
+            return false;
+        };
+        loop {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) == 0 {
+                return info.si_pid == anchor;
+            }
+            if *libc::__error() != libc::EINTR {
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+#[path = "tether_group.rs"]
+mod group;
 
 #[cfg(all(test, unix))]
 mod tests {

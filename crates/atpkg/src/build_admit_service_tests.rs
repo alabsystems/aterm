@@ -349,10 +349,10 @@ fn real_builds(world: &Path, seat: &Seat<'_>, d: &mut Driver) {
         .pair(Instant::now() + aterm_spec::wait::MUST_HAPPEN)
         .unwrap();
     drop(gone);
-    assert_eq!(
-        disconnected.step().unwrap(),
-        super::service::monitor::Progress::Complete
-    );
+    aterm_uds::deadline::once_released(|| match disconnected.step()? {
+        super::service::monitor::Progress::Complete => Ok(()),
+        super::service::monitor::Progress::Pending => Err(std::io::ErrorKind::WouldBlock.into()),
+    });
     assert!(d.done.is_empty());
     for path in &release.0 {
         std::fs::write(path.join("release"), b"host accepts progress").unwrap();

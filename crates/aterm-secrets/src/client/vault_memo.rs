@@ -87,7 +87,8 @@ pub(crate) fn observe_commons_now(paths: &Paths) -> crate::Result<crate::commons
 /// (`Bootstrap::revalidate_custody`), 24 times a round on each side of a loopback pair, and each
 /// check read and verified the vault, its log and this Mac's denial again: 14% of a quiet round's
 /// CPU (2026-11-08), and nearly half its reads of the vault, which on a fleet node holds a
-/// megabyte or more.
+/// megabyte or more. A table-repair replica judges by it, at each round's start, the bootstrap it
+/// keeps from round to round (`Bootstrap::stands`), where each round's open read the vault afresh.
 ///
 /// # Errors
 /// As [`observe_commons`](super::observe_commons).
@@ -328,6 +329,21 @@ pub fn swarm_roster_now_until(
 /// What [`swarm_roster_now_until`] and [`VaultLook::swarm_roster_until`] keep.
 static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inputs, true);
 
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// How many looks this thread opened on an observation of their own ([`VaultLook::new`]).
+    static LOOKS_OBSERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many looks this thread opened on an observation of their own ([`VaultLook::new`]); one
+/// standing on its caller's ([`super::CommonsSourceRead::into_look`]) adds none.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_looks_observed() -> usize {
+    LOOKS_OBSERVED.with(std::cell::Cell::get)
+}
+
 /// One look at this Mac's vault, for reads that stand for one moment of it: a shared observation
 /// of its state lock, held while the look lives ([`super::Observing`]), and one `lstat` of each
 /// file the memos it asks stamp ([`fsx::Glance`]). Each ask gives what its memo kept for the
@@ -353,7 +369,17 @@ static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inpu
 /// once after it (`aterm-db`'s `Replica::observe`): the open's custody
 /// (`Bootstrap::revalidate_custody_in`) and access (`Bootstrap::access_observed_in_look`), the
 /// currency of its peer and of its observation (`Access::is_current_in`), and its peer's roster
-/// ([`Self::swarm_roster_until`]).
+/// ([`Self::swarm_roster_until`]). A read batch's look is the batch's own source read of the
+/// vault ([`super::CommonsSourceRead::into_look`]), which holds the state lock shared from before
+/// the admission until the batch returns, and its session keeps it (`Session::keep_look`), so
+/// every currency, context and peer check the batch makes judges the vault as its admission did:
+/// each writer of the files the state lock guards takes it exclusively, so none of them changes
+/// within the batch, and what changes without it (the device age identity and claim, under the
+/// Commons custody locks; the fold mark, under none) is seen at the next admission, as the
+/// admission's look already saw them once. Custody digests,
+/// a record's keys and history, and a store read batch's opening and closing fences
+/// (`Session::read_context`) read afresh. A write batch's look observes the lock beside its
+/// source reads and ends before the batch runs, whose checks each observe the vault again.
 pub struct VaultLook<'a> {
     paths: &'a Paths,
     observation: Option<super::Observing>,
@@ -364,10 +390,23 @@ impl<'a> VaultLook<'a> {
     /// A look at the vault at `paths`, observing its state lock where no writer holds it.
     #[must_use]
     pub fn new(paths: &'a Paths) -> Self {
+        #[cfg(any(test, debug_assertions))]
+        LOOKS_OBSERVED.with(|looks| looks.set(looks.get() + 1));
         let observation = match StateLock::observe_classified(paths) {
             Ok(StateObservation::Held(lock)) => Some(super::Observing::new(lock, paths)),
             Ok(StateObservation::Absent | StateObservation::Busy) | Err(_) => None,
         };
+        Self::of(paths, observation)
+    }
+
+    /// A look at the vault at `paths` standing on `lock`, a shared observation of its state lock
+    /// its caller already holds ([`super::CommonsSourceRead::into_look`]), with no observation of
+    /// its own.
+    pub(super) fn standing_on(paths: &'a Paths, lock: StateLock) -> Self {
+        Self::of(paths, Some(super::Observing::new(lock, paths)))
+    }
+
+    fn of(paths: &'a Paths, observation: Option<super::Observing>) -> Self {
         Self {
             paths,
             observation,
@@ -1350,39 +1389,51 @@ mod tests {
         );
     }
 
-    /// An exclusive take of the state lock on a thread under its own look ([`VaultLook`]) panics
-    /// at once in a build with debug assertions rather than wait on the look's observation for
-    /// good, which flock(2) would.
+    /// An exclusive take of the state lock on a thread under its own look ([`VaultLook`]), one of
+    /// its own or one standing on a Commons source read
+    /// ([`super::super::CommonsSourceRead::into_look`]), panics at once in a build with debug
+    /// assertions rather than wait on the look's observation for good, which flock(2) would.
     ///
-    /// NEGATIVE CONTROL (2026-11-08): with `Observing::new` registering no lock file in
+    /// NEGATIVE CONTROLS (2026-11-09): with `Observing::new` registering no lock file in
     /// `OBSERVING`, the take waits on the look's observation and the hang detector fails "the
-    /// take refuses at once".
+    /// take refuses at once"; with `VaultLook::standing_on` keeping no observation, the read's
+    /// lock is let go, and the take under a source read's look succeeds ("the take under a look
+    /// that observes the lock panics").
     #[test]
     fn a_take_of_the_state_lock_under_a_look_panics_rather_than_wait_on_it() {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = vault(root.path());
         drop(StateLock::take(&paths).unwrap());
-        let (done, finished) = std::sync::mpsc::channel();
-        let looking = paths.clone();
-        std::thread::spawn(move || {
-            let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let look = VaultLook::new(&looking);
-                let observed = look.observation.is_some();
-                let _held = StateLock::take(&looking);
-                observed
-            }));
-            let _ = done.send(taken.map_err(|panic| panic.downcast_ref::<String>().cloned()));
-        });
-        let outcome = finished
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("the take refuses at once rather than wait on its own look");
-        let message = outcome
-            .expect_err("the take under a look that observes the lock panics")
-            .expect("a panic message");
-        assert!(
-            message.contains("under this thread's own observation"),
-            "{message}"
-        );
+        for on_source_read in [false, true] {
+            let (done, finished) = std::sync::mpsc::channel();
+            let looking = paths.clone();
+            std::thread::spawn(move || {
+                let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let look = if on_source_read {
+                        super::super::try_commons_source_read(&looking)
+                            .unwrap()
+                            .expect("no writer holds the vault")
+                            .into_look(&looking)
+                    } else {
+                        VaultLook::new(&looking)
+                    };
+                    let observed = look.observation.is_some();
+                    let _held = StateLock::take(&looking);
+                    observed
+                }));
+                let _ = done.send(taken.map_err(|panic| panic.downcast_ref::<String>().cloned()));
+            });
+            let outcome = finished
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the take refuses at once rather than wait on its own look");
+            let message = outcome
+                .expect_err("the take under a look that observes the lock panics")
+                .expect("a panic message");
+            assert!(
+                message.contains("under this thread's own observation"),
+                "{on_source_read}: {message}"
+            );
+        }
     }
 
     #[test]

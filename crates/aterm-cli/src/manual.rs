@@ -851,6 +851,14 @@ WHAT IT DOES
   keys (`C-x C-s` save, `C-x C-c` close, `C-c C-c` save+close, `C-c C-k` abort,
   `C-g` cancel, `M-x revert-buffer`).
 
+MARKDOWN
+  A Markdown document has Read, Edit and Split views in the same amacs tab.
+  Open File starts it in Read; `amacs FILE` starts in Edit at the requested
+  line. Split shows editable source beside its formatted preview, including
+  unsaved changes. `Cmd-E` switches Read and Edit; in Split it focuses the
+  editor. `Cmd-S` saves in every view. Changing views does not save, open
+  another tab or finish an `amacs --wait` / `$EDITOR` request.
+
 TABLES
   In an Editor tab a `.csv` or `.tsv` file opens as a grid: the arrows, Tab,
   Home and End move between cells; typing, Return or a double-click opens a
@@ -1747,14 +1755,21 @@ THE FOOTER
   landing while one is armed, and Harness settings…). `aterm ctl chrome` reports the
   chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds
   `title=`, the title its hover reads).
-  On Claude Code the permission chip beside it says one bit: `yolo` where Claude's pill
-  reads bypass permissions, `lame` in any other mode, `auto` included. Clicking it
-  restarts the conversation: from `yolo` with no permission flag, into the mode Claude
-  Code's own settings choose; from `lame` with `--dangerously-skip-permissions`. The
-  conversation, build, model and login stay, and background shells end (the hover says
-  how many: `· ends 1 shell`). A click waits as a press of ⬆️ does, for a turn, a box, a
-  draft, a held tab, a usage limit or a login, drawn `◐` with what it waits for on its
-  hover; a second click takes it back until the restart begins. Where no restart can be
+  On Claude Code the permission chip beside it says one bit: `● yolo` where Claude's
+  pill reads bypass permissions, a quiet `○ yolo` in any other mode, `auto` included.
+  Its hover names the mode in Claude Code's own words and what a click does
+  (`plan mode on · click: yolo`, `bypass permissions on · no prompts`). Clicking
+  `○ yolo` (or Return or Space with it selected) turns yolo on: it restarts the
+  conversation with `--dangerously-skip-permissions`, every other permission flag
+  taken off the line. A later restart or update resumes the mode the session is in,
+  so it keeps that flag while Claude's pill reads bypass permissions and puts it
+  back once the pill reads bypass again after a shift+tab away. Clicking
+  `● yolo` does nothing: a click never turns yolo off (shift+tab in Claude Code
+  changes its mode). The conversation, build, model and login stay, and background
+  shells end (the hover says how many: `· ends 1 shell`). A click waits as a press of
+  ⬆️ does, for a turn, a box, a draft, a held tab, a usage limit or a login, drawn
+  `◌ yolo` with what it waits for on its hover; a second click takes it back until the
+  restart begins. Where no restart can be
   made (not started from a shell, a shell other than zsh, bash or fish, a command line
   it cannot read or rewrite, another supervisor's tab, a credit claim's worker, or an
   agent that must end first) the click is refused and the hover says why. Only a bypass
@@ -2926,8 +2941,10 @@ LINUX
   aterm update rollback   go back to the previous executable, unless signed policy
                           forbids it
 
-  Checks run every 30 minutes while a window or an interactive session is open. A
-  verified update installs on disk by itself; running sessions keep running and new
+  Checks normally run every 30 minutes while a window or an interactive session is
+  open. A check that uses the metered API fallback waits an hour before the next;
+  failed checks can wait longer as they back off. A verified update installs on
+  disk by itself; running sessions keep running and new
   launches use it (`[update] auto_apply = false` downloads only; `apply` installs). A
   new executable stays on trial, and checks wait, until a start of it comes up
   healthy (a window that draws, --headless or a terminal session). After three starts
@@ -3763,8 +3780,8 @@ CHANGING THE NAME
   Type a number (`m86` or `86`), a nickname, or both into their two fields; a field you
   leave alone or empty keeps what this Mac has, so a nickname alone keeps the number.
   The line under the fields says, as you type, whether the number is free, this Mac's
-  own, or held, and by what: another machine's signed name, or a label, seat or role its
-  vault gives another Mac. Rename is unavailable while it is held; a number the line
+  own, or held, and by what: another machine's signed name, or a label or seat its vault
+  gives another Mac. Rename is unavailable while it is held; a number the line
   could not check stays available, and Rename checks it. A number
   this Mac shows but has not claimed yet leaves the Number field empty: type it to claim
   it. Change Nickname… changes only the nickname, and can draw a random noun.
@@ -3772,7 +3789,7 @@ CHANGING THE NAME
   From a shell, `aterm name set m86 --nick Marigold` chooses that number and nickname.
   Leave out `--nick` to keep the nickname. The number must be positive; `m0` means the
   machine has not been numbered. A number another known machine holds is refused, and so
-  is one its vault gives another Mac or role, with what holds it. `--dry-run` reports the
+  is one its vault gives another Mac, with what holds it. `--dry-run` reports the
   proposed name without changing it. A real change also updates the naming policy and
   checked fleet name. On macOS, one system-password prompt covers ComputerName,
   LocalHostName and HostName; Details shows the exact authorized operation. A failed

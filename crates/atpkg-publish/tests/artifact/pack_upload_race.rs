@@ -5,6 +5,7 @@
 //! data-only FakeHost operations, with no threads, clocks or publication service.
 
 use super::*;
+use atpkg_publish::host::fake::{FakeFail, FakeOp};
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace};
 use std::sync::Mutex;
 
@@ -75,6 +76,24 @@ impl ReleaseHost for BeforeUpload {
             }
         }
         self.inner.create(slug, tag, title, notes, files)
+    }
+
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<(), HostError> {
+        self.created_titles.lock().unwrap().push(title.to_string());
+        if self.before_create {
+            let once = self.once.lock().unwrap().take();
+            if let Some(once) = once {
+                once();
+            }
+        }
+        self.inner.create_draft(slug, tag, title, notes, files)
     }
 
     fn upload(
@@ -574,4 +593,51 @@ fn raw_managed_staging_is_guarded_and_other_raw_release_protocols_are_unchanged(
         );
         assert_eq!(w.host.asset(&slug, tag, upload::VERSION_RESERVATION), None);
     }
+}
+
+#[test]
+fn a_pack_reservation_stays_private_until_payload_upload_and_resumes_after_refusal() {
+    let w = world("draft-pack-reservation");
+    let (manifest, files) = pack_files(&w, "ready", "0.1.0+gaaaaaaaaa");
+    let slug = w.ctx.staging_slug("ay");
+    let tag = "atpkg-ay-9";
+    let host = Arc::clone(&w.host);
+    let selected = slug.clone();
+    let observed = Arc::new(Mutex::new(false));
+    let seen = Arc::clone(&observed);
+    let wrapper = BeforeUpload {
+        once: Mutex::new(Some(Box::new(move || {
+            let held = host.release_of(&selected, tag).unwrap();
+            assert!(
+                held.draft,
+                "reservation metadata must never make a pack public"
+            );
+            assert_eq!(
+                held.assets.keys().map(String::as_str).collect::<Vec<_>>(),
+                [upload::VERSION_RESERVATION]
+            );
+            assert!(host.published_releases(&selected).unwrap().is_empty());
+            *seen.lock().unwrap() = true;
+            host.fail_next(FakeOp::Upload, FakeFail::Refuse);
+        }))),
+        ..BeforeUpload::over(Arc::clone(&w.host))
+    };
+    let mut ctx = w.ctx.clone();
+    ctx.hosts.staging = Arc::new(wrapper);
+    assert!(matches!(
+        upload::publish(&ctx, "ay", tag, &manifest, &files, "ready"),
+        Err(Error::Refused(_))
+    ));
+    assert!(*observed.lock().unwrap());
+    assert!(w.host.release_of(&slug, tag).unwrap().draft);
+    assert!(w.host.published_releases(&slug).unwrap().is_empty());
+
+    upload::publish(&ctx, "ay", tag, &manifest, &files, "ready").unwrap();
+    let complete = w.host.release_of(&slug, tag).unwrap();
+    assert!(!complete.draft);
+    for file in &files {
+        let name = file.file_name().unwrap().to_str().unwrap();
+        assert_eq!(complete.assets[name], std::fs::read(file).unwrap());
+    }
+    assert_eq!(w.host.published_releases(&slug).unwrap().len(), 1);
 }

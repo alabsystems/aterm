@@ -1095,6 +1095,129 @@ fn a_claim_that_follows_a_label_does_not_relabel_its_holder() {
 }
 
 #[test]
+fn a_signed_chosen_number_relabels_only_its_holder() {
+    let mut lab = found(&[(A, "m117"), (B, "m87")]);
+    let record = sign(&lab, A, Body::Name { name: "m3".into() });
+    // The wire is the existing Name record: a pre-change decoder accepts it as a display name.
+    let decoded = Record::decode(record.bytes()).unwrap();
+    assert!(matches!(decoded.body(), Body::Name { name } if name == "m3"));
+    lab.keep(decoded);
+    assert_eq!(lab.membership().label(&A.id()), Some("m3"));
+    assert_eq!(lab.membership().label(&B.id()), Some("m87"));
+    assert_ne!(
+        lab.next_label("m3", &BTreeSet::new(), &BTreeSet::new())
+            .as_deref(),
+        Some("m3")
+    );
+    // A display nickname is not a number claim.
+    lab.keep(sign(
+        &lab,
+        B,
+        Body::Name {
+            name: "heron".into(),
+        },
+    ));
+    assert_eq!(lab.membership().label(&B.id()), Some("m87"));
+}
+
+#[test]
+fn a_chosen_number_never_takes_another_members_label() {
+    let mut lab = found(&[(A, "m117"), (B, "m3")]);
+    lab.keep(sign(&lab, A, Body::Name { name: "m3".into() }));
+    assert_eq!(lab.membership().label(&A.id()), Some("m117"));
+    assert_eq!(lab.membership().label(&B.id()), Some("m3"));
+
+    let mut lab = found(&[(A, "m117"), (B, "m87")]);
+    lab.keep(sign(&lab, A, Body::Name { name: "m3".into() }));
+    lab.keep(sign(&lab, B, Body::Name { name: "m3".into() }));
+    assert_eq!(lab.membership().label(&A.id()), Some("m3"));
+    assert_eq!(lab.membership().label(&B.id()), Some("m87"));
+}
+
+#[test]
+fn a_chosen_number_does_not_take_a_clashing_admissions_number() {
+    let lab = found(&[(A, "m117"), (B, "m87")]);
+    let mut one = lab.clone();
+    let mut two = lab.clone();
+    one.keep(admit(&one, A, X, "m3"));
+    two.keep(admit(&two, B, Y, "m3"));
+    heal(&mut one, &mut two);
+    assert_eq!(
+        one.membership().label(&X.id()),
+        Some(X.suffixed("m3").as_str())
+    );
+    assert_eq!(
+        one.membership().label(&Y.id()),
+        Some(Y.suffixed("m3").as_str())
+    );
+    one.keep(sign(&one, A, Body::Name { name: "m3".into() }));
+    assert_eq!(one.membership().label(&A.id()), Some("m117"));
+    assert_eq!(one.membership().chosen_label(&A.id()), None);
+    one.keep(sign(&one, A, Body::Name { name: "m4".into() }));
+    assert_eq!(one.membership().chosen_label(&A.id()), Some("m4"));
+}
+
+#[test]
+fn an_incumbent_can_choose_its_number_despite_an_invalid_contender() {
+    let lab = found(&[(A, "m3"), (B, "m87")]);
+    let mut one = lab.clone();
+    let mut two = lab.clone();
+    one.keep(sign(&one, A, Body::Name { name: "m3".into() }));
+    two.keep(sign(&two, B, Body::Name { name: "m3".into() }));
+    heal(&mut one, &mut two);
+    assert_eq!(one.membership().chosen_label(&A.id()), Some("m3"));
+    assert_eq!(one.membership().chosen_label(&B.id()), None);
+    assert_eq!(one.membership().label(&B.id()), Some("m87"));
+}
+
+#[test]
+fn a_chosen_number_needs_its_holders_signature() {
+    let mut lab = found(&[(A, "m117"), (B, "m87")]);
+    let signed = sign(&lab, A, Body::Name { name: "m3".into() });
+    let mut forged = signed.bytes().to_vec();
+    *forged.last_mut().unwrap() ^= 1;
+    assert!(Record::decode(&forged).is_err());
+    // B can sign its own name, but cannot relabel A.
+    lab.keep(sign(&lab, B, Body::Name { name: "m3".into() }));
+    assert_eq!(lab.membership().label(&A.id()), Some("m117"));
+    assert_eq!(lab.membership().label(&B.id()), Some("m3"));
+}
+
+#[test]
+fn concurrent_chosen_numbers_do_not_pick_a_holder_by_arrival_order() {
+    let lab = found(&[(A, "m117"), (B, "m87")]);
+    let mut one = lab.clone();
+    let mut two = lab.clone();
+    one.keep(sign(&one, A, Body::Name { name: "m3".into() }));
+    two.keep(sign(&two, B, Body::Name { name: "m3".into() }));
+    assert_eq!(one.membership().label_after_choice(&A.id()), Some("m3"));
+    assert_eq!(two.membership().label_after_choice(&B.id()), Some("m3"));
+    heal(&mut one, &mut two);
+    for log in [&one, &two] {
+        assert_eq!(log.membership().label(&A.id()), Some("m117"));
+        assert_eq!(log.membership().label(&B.id()), Some("m87"));
+        assert_eq!(log.membership().chosen_label(&A.id()), None);
+        assert_eq!(log.membership().label_after_choice(&A.id()), Some("m117"));
+        assert_eq!(log.membership().label_after_choice(&B.id()), Some("m87"));
+    }
+}
+
+#[test]
+fn a_number_released_by_a_chosen_name_is_available() {
+    let mut lab = found(&[(A, "m117"), (B, "m87")]);
+    lab.keep(sign(&lab, A, Body::Name { name: "m3".into() }));
+    lab.keep(sign(
+        &lab,
+        B,
+        Body::Name {
+            name: "m117".into(),
+        },
+    ));
+    assert_eq!(lab.membership().label(&A.id()), Some("m3"));
+    assert_eq!(lab.membership().label(&B.id()), Some("m117"));
+}
+
+#[test]
 fn a_removed_macs_admission_claims_no_label() {
     let mut lab = found(&[(A, "m1"), (B, "m2"), (X, "m3")]);
     let genesis = *lab.network();

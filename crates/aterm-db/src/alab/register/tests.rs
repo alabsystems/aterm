@@ -35,6 +35,129 @@ const ME: &str = "11111111111111111111111111111111";
 const OLD: &str = "22222222222222222222222222222222";
 
 #[test]
+fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
+    let own = keys::machine_pk(ME);
+    let other = keys::machine_pk(OLD);
+    let initial = vec![
+        machine(
+            &own,
+            &[
+                ("label", json!("m87")),
+                ("node", json!(NODE)),
+                ("row", json!("live")),
+            ],
+        ),
+        machine(
+            &other,
+            &[
+                ("label", json!("m87")),
+                ("node", json!(OTHER_NODE)),
+                ("row", json!("live")),
+            ],
+        ),
+    ];
+    let held = facts(&[(ME, old_row(&own, day_of(NOW)))]);
+    let chosen = Me {
+        label: Some("m3".into()),
+        chosen: Some("m3".into()),
+        ..me()
+    };
+    let plan = run(&chosen, &probe(), &[ME, OLD], true, &apply(&initial), &held);
+    assert!(matches!(plan.outcome, Outcome::Refreshed { .. }));
+    assert_eq!(written_row(&plan)["label"], json!("m3"));
+    let mut records = initial;
+    records.push(plan.changes);
+    let rows = cell::project(&MACHINE, &apply(&records));
+    assert_eq!(rows.rows[&own].get("label"), Some(&json!("m3")));
+    assert_eq!(rows.rows[&other].get("label"), Some(&json!("m87")));
+
+    let other_holds = apply(&[
+        machine(&own, &[("label", json!("m87")), ("row", json!("live"))]),
+        machine(
+            &other,
+            &[
+                ("label", json!("m3")),
+                ("node", json!(OTHER_NODE)),
+                ("row", json!("live")),
+            ],
+        ),
+    ]);
+    let live = [ME.to_owned(), OLD.to_owned()].into();
+    assert!(
+        super::plan(
+            &Input {
+                me: &chosen,
+                probe: &probe(),
+                live: &live,
+                heard: true,
+                now_ms: NOW
+            },
+            &other_holds,
+            &held
+        )
+        .is_err()
+    );
+    let mut future = rows;
+    future
+        .rows
+        .get_mut(&own)
+        .unwrap()
+        .raw
+        .insert("label".into());
+    assert!(
+        chosen_number(
+            &Input {
+                me: &chosen,
+                probe: &probe(),
+                live: &live,
+                heard: true,
+                now_ms: NOW,
+            },
+            &future,
+            &held,
+            &own
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_signed_choice_adopts_an_unbound_sheet_row_even_if_imported_active() {
+    let sheet = "mc-ce20a1499bba52af";
+    let cells = apply(&[machine(
+        sheet,
+        &[
+            ("label", json!("m3")),
+            ("status", json!("active")),
+            ("row", json!("live")),
+        ],
+    )]);
+    let chosen = Me {
+        label: Some("m3".into()),
+        chosen: Some("m3".into()),
+        ..me()
+    };
+    let plan = run(&chosen, &probe(), &[ME], true, &cells, &facts(&[]));
+    assert!(matches!(
+        plan.outcome,
+        Outcome::Adopted {
+            rule: Rule::Planned,
+            ..
+        }
+    ));
+    assert_eq!(written_row(&plan)["mac"], json!(sheet));
+    // Without a holder-signed choice, an active sheet row is not an adoption hint.
+    let unsigned = Me {
+        label: Some("m3".into()),
+        ..me()
+    };
+    assert!(matches!(
+        run(&unsigned, &probe(), &[ME], true, &cells, &facts(&[])).outcome,
+        Outcome::Born { .. }
+    ));
+}
+
+#[test]
 fn an_adopted_mac_publishes_its_node_once_and_keeps_an_owner_correction() {
     let identity = me();
     let probe = probe();
@@ -139,6 +262,7 @@ fn me() -> Me {
     Me {
         uuid: ME.into(),
         label: Some("m7".into()),
+        chosen: None,
         hw_hint: HINT.into(),
         enrolled_ms: None,
     }

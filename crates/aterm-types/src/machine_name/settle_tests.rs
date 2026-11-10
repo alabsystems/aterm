@@ -480,7 +480,14 @@ fn no_automatic_claim_lands_on_a_number_that_is_not_free() {
             node: node(9),
             last: gone,
         },
-        Kept::Reserved { lo: 7, hi: 8 },
+        Kept::Label {
+            num: m(7),
+            node: Some(node(2)),
+        },
+        Kept::Label {
+            num: m(8),
+            node: Some(node(2)),
+        },
         Kept::Label {
             num: m(9),
             node: Some(node(2)),
@@ -671,11 +678,6 @@ fn top_is_the_highest_signed_number_and_falls_only_under_a_cap() {
         "the cap bounds tops and retired entries"
     );
     assert_eq!(top(&v, &[], [m(60)], 0), 60, "never a label");
-    assert_eq!(
-        top(&v, &[Kept::Reserved { lo: 1, hi: 70 }], [], 0),
-        70,
-        "never a reservation"
-    );
 }
 
 #[test]
@@ -704,7 +706,6 @@ fn checks_name_the_holder_and_what_a_rename_would_do() {
             node: node(9),
             last: rec(Some(26), Class::Chosen, T0 - DAY),
         },
-        Kept::Reserved { lo: 27, hi: 27 },
         Kept::Row {
             num: m(28),
             node: None,
@@ -723,14 +724,13 @@ fn checks_name_the_holder_and_what_a_rename_would_do() {
     assert_eq!(at("m24"), Verdict::Unconfirmed { by: vec![node(6)] });
     assert_eq!(at("m25"), Verdict::EarlierName { of: node(7) });
     assert_eq!(at("m26"), Verdict::Retired { of: node(9) });
-    assert_eq!(at("m27"), Verdict::Reserved);
     assert_eq!(at("m28"), Verdict::Planned);
     assert!(matches!(at("m08"), Verdict::Grammar(_)));
     assert!(matches!(at("m0"), Verdict::Grammar(_)));
 }
 
 /// A number another Mac's vault label names refuses both a rename and a take, whether the label
-/// is a bound node's or kept for a Mac or role no record names; this machine's own label does
+/// is a bound node's or kept for a Mac no record names; this machine's own label does
 /// not, and a signed holder's class still speaks first.
 #[test]
 fn another_macs_vault_label_refuses_a_rename() {
@@ -828,7 +828,7 @@ fn a_second_node_and_a_stronger_sibling_refuse_a_rename() {
 }
 
 #[test]
-fn a_retired_number_is_the_last_name_a_tombstone_kept_whatever_the_order() {
+fn a_retired_number_is_the_last_name_a_tombstone_kept() {
     let mut last = rec(Some(30), Class::Seeded, 1);
     last.was = vec![Was {
         num: m(26),
@@ -839,19 +839,12 @@ fn a_retired_number_is_the_last_name_a_tombstone_kept_whatever_the_order() {
         node: node(9),
         last,
     };
-    let tomb_alone = tomb.clone();
-    let reserved = Kept::Reserved { lo: 26, hi: 30 };
     let v = view([(1, Entry::Record(rec(Some(8), Class::Auto, T0)))]);
     let s = settle(&v);
     let labels = BTreeMap::new();
-    for kept in [[tomb.clone(), reserved.clone()], [reserved, tomb]] {
-        let f = fleet(&v, &s, 30, &kept, &labels);
-        assert_eq!(check("m30", &f, node(1)), Verdict::Retired { of: node(9) });
-        assert_eq!(check("m26", &f, node(1)), Verdict::Reserved);
-        assert_eq!(taken(&f, &check("m26", &f, node(1))), None, "a plain claim");
-    }
-    let only = [tomb_alone];
+    let only = [tomb];
     let f = fleet(&v, &s, 30, &only, &labels);
+    assert_eq!(check("m30", &f, node(1)), Verdict::Retired { of: node(9) });
     assert_eq!(
         check("m26", &f, node(1)),
         Verdict::EarlierName { of: node(9) }

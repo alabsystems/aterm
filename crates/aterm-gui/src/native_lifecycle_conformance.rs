@@ -14,8 +14,7 @@ use aterm_spec::interp::{State, admits};
 use crate::conformance_support::assert_sole_transition as assert_transition;
 use crate::native_app::{
     AppEffect, AppEvent, AppKind, AppViewState, CompletionSink, ConfigPatch, ConfigPatchOutcome,
-    ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp, NativeRuntime, ReplyToken,
-    SemanticInput, WorkOwner,
+    EditorApp, ExternalOpenOutcome, NativeApp, NativeRuntime, ReplyToken, SemanticInput, WorkOwner,
 };
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue, VersionedConfigService,
@@ -293,22 +292,24 @@ impl AsyncHarness {
             .expect("Settings view");
 
         let mut documents = crate::test_document_store();
-        let document = documents.open("mem://async-conformance".into(), "alpha".into());
+        let uri = "file:///async-conformance.md";
+        let document = documents.open(uri.into(), "alpha".into());
         let markdown_instance = runtime
-            .insert_instance(NativeApp::Markdown(MarkdownApp::new(
+            .insert_instance(NativeApp::Editor(Box::new(EditorApp::new_with_uri(
                 document,
                 "Async.md".into(),
-                "alpha",
-            )))
-            .expect("Markdown instance");
+                uri.into(),
+            ))))
+            .expect("Markdown editor instance");
         let markdown_view = ViewId::from_stored(2);
         runtime
             .attach_view(
                 markdown_view,
                 markdown_instance,
-                AppViewState::Markdown(MarkdownViewState::default()),
+                AppViewState::Editor(Box::default()),
             )
-            .expect("Markdown view");
+            .expect("Markdown editor view");
+        runtime.publish_document(document, "alpha", 0, false);
 
         Self {
             runtime,

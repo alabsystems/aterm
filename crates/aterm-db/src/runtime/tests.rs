@@ -9,7 +9,7 @@ fn a_later_expired_push_cannot_replace_a_pending_table_or_acknowledge_it() {
     for wait in [Duration::ZERO, Duration::from_millis(100)] {
         let pusher = Pusher::default();
         let board = pusher.0.clone();
-        let _serving = board.serving();
+        let _serving = board.serving(None);
         let first = pusher.clone();
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let caller = thread::spawn(move || first.push_until([1; 32], deadline));
@@ -43,7 +43,7 @@ fn a_relay_ack_reaches_a_push_with_no_round() {
     for acked in [true, false] {
         let pusher = Pusher::default();
         let board = pusher.0.clone();
-        let _serving = board.serving();
+        let _serving = board.serving(None);
         let asked = Arc::new(Mutex::new(Vec::new()));
         let heard = asked.clone();
         pusher.relay(Arc::new(move |table, _deadline| {
@@ -82,11 +82,43 @@ fn next_push(board: &Board, deadline: Instant) -> Ask {
     }
 }
 
+/// A push asked of a serving owner rings the owner's doorbell ([`Board::serving`]), so the owner,
+/// asleep until something it waits on happens, takes the ask at once: the doorbell polls ready
+/// once the ask is made, and the ask it announced is there to take. A ring that never comes
+/// reaches the hang detector's minute.
+///
+/// NEGATIVE CONTROL (2026-11-09): with `push_by_rounds` leaving the bell unrung, the wait reached
+/// the minute (`a push rang the owner's doorbell`).
+#[test]
+fn a_push_rings_its_serving_owners_doorbell() {
+    let pusher = Pusher::default();
+    let board = pusher.0.clone();
+    let bell = Arc::new(aterm_uds::ready::Doorbell::new().unwrap());
+    let serving = board.serving(Some(bell.clone()));
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let caller = thread::spawn(move || pusher.push_until([3; 32], deadline));
+    assert_eq!(
+        aterm_uds::ready::any(&[bell.fd()], Some(deadline)).unwrap(),
+        [0],
+        "a push rang the owner's doorbell"
+    );
+    assert!(bell.clear());
+    let ask = board.take().expect("the ask the ring announced");
+    assert_eq!(ask.table, [3; 32]);
+    board.settle(ask.id, Pushed::Reached);
+    assert_eq!(caller.join().unwrap(), Pushed::Reached);
+    drop(serving);
+    assert!(
+        board.bell.lock_or_recover().is_none(),
+        "an owner that stopped serving keeps no doorbell"
+    );
+}
+
 #[test]
 fn concurrent_pushes_get_their_own_result_and_ignore_stale_completion() {
     let pusher = Pusher::default();
     let board = pusher.0.clone();
-    let _serving = board.serving();
+    let _serving = board.serving(None);
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let first = pusher.clone();
     let first_caller = thread::spawn(move || first.push_until([1; 32], deadline));
@@ -111,7 +143,7 @@ fn concurrent_pushes_get_their_own_result_and_ignore_stale_completion() {
 #[test]
 fn an_abandoned_push_round_releases_its_priority_after_a_later_caller_expires() {
     let board = Board::default();
-    let _serving = board.serving();
+    let _serving = board.serving(None);
     {
         let mut desk = board.desk.lock_or_recover();
         desk.asked = 1;
@@ -141,7 +173,7 @@ fn an_abandoned_push_round_releases_its_priority_after_a_later_caller_expires() 
 fn stopping_repair_wakes_every_push_caller() {
     let pusher = Pusher::default();
     let board = pusher.0.clone();
-    let serving = board.serving();
+    let serving = board.serving(None);
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let first = pusher.clone();
     let first_caller = thread::spawn(move || first.push_until([1; 32], deadline));
@@ -157,7 +189,7 @@ fn a_rapid_restart_cancels_unfinished_pushes_and_keeps_completed_results() {
     for stage in 0..3 {
         let pusher = Pusher::default();
         let board = pusher.0.clone();
-        let serving = board.serving();
+        let serving = board.serving(None);
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let first = pusher.clone();
         let caller = thread::spawn(move || first.push_until([1; 32], deadline));
@@ -1089,7 +1121,7 @@ fn a_configuration_refusal_stands_across_a_windows_claim_until_commons_is_switch
         }
     };
     assert_eq!(next(), configuration(false));
-    let claim = owner::WindowClaim::acquire(&crate::network_state::directory(&config)).unwrap();
+    let claim = owner::WindowClaim::acquire(&config).unwrap();
     until(Status::Waiting);
     drop(claim);
     assert_eq!(
@@ -1396,33 +1428,45 @@ fn advance(by: Duration) {
     SIMULATED.with(|now| now.set(Some(simulated() + by)));
 }
 
+/// A serving loop's wait ([`serve_paced`]) where nothing it waits on happens: the simulated clock
+/// moves to `until`, or to `floor` where `until` came before it, as [`rest`] waits.
+fn idle(_: &(), floor: Instant, until: Instant) {
+    let to = until.max(floor);
+    SIMULATED.with(|now| now.set(Some(to.max(simulated()))));
+}
+
 /// The polled rounds a serving loop ([`serve_paced`]) runs in a simulated minute whose rounds each
-/// take `round`, the loop's [`TICK`] waits advancing the same clock. Counted, never timed.
-fn rounds_in_a_minute(round: Duration) -> usize {
+/// take `round`, and the ticks it runs in all, each tick keeping `next` as its deadline from its
+/// start and nothing the loop waits on happening ([`idle`]). Counted, never timed.
+fn rounds_in_a_minute(round: Duration, next: Option<Duration>) -> (usize, usize) {
     let start = Instant::now();
     SIMULATED.with(|now| now.set(Some(start)));
-    let mut rounds = 0;
+    let (mut rounds, mut ticks) = (0, 0);
     let served: std::result::Result<(), Status> = serve_paced(
+        &mut (),
         simulated,
         || simulated() >= start + Duration::from_secs(60),
-        advance,
-        |_, due| {
+        idle,
+        |(), now, due| {
+            ticks += 1;
+            // A loop whose clock no longer moves spins: the count ends it, as a hang detector.
+            assert!(ticks <= 6_000, "the loop ticks without its clock moving");
             if due {
                 rounds += 1;
                 advance(round);
             }
-            Ok(Flow::Serve)
+            Ok(Flow::Serve(next.map(|next| now + next)))
         },
     );
     assert_eq!(served, Ok(()));
-    rounds
+    (rounds, ticks)
 }
 
 /// A serving loop rests a whole [`POLL`] after each polled round, by the loop itself
 /// ([`serve_paced`], which `serve_selected` and `serve_presence` run under), whatever the round
-/// took: over a simulated minute ticked every [`TICK`], instant rounds run 29 times, one per
-/// [`POLL`], and rounds of 3 s (a busy vault waited for, a slow interface read) 12 times, each 2 s
-/// after the last one ended. Counted on a simulated clock, never timed.
+/// took: over a simulated minute whose ticks each keep a deadline a [`TICK`] on, instant rounds
+/// run 29 times, one per [`POLL`], and rounds of 3 s (a busy vault waited for, a slow interface
+/// read) 12 times, each 2 s after the last one ended. Counted on a simulated clock, never timed.
 ///
 /// NEGATIVE CONTROLS (2026-11-06), each planted in `serve_paced`, the loop both serving functions
 /// run, not in a helper they call: with the rest left out (`due` never moved), every tick after
@@ -1431,12 +1475,36 @@ fn rounds_in_a_minute(round: Duration) -> usize {
 /// run back to back, one [`TICK`] apart (`left: 19, right: 12`).
 #[test]
 fn a_round_slower_than_the_poll_still_rests_after_it() {
-    assert_eq!(rounds_in_a_minute(Duration::ZERO), 29);
-    assert_eq!(rounds_in_a_minute(Duration::from_secs(3)), 12);
+    assert_eq!(rounds_in_a_minute(Duration::ZERO, Some(TICK)).0, 29);
+    assert_eq!(rounds_in_a_minute(Duration::from_secs(3), Some(TICK)).0, 12);
+}
+
+/// A serving loop wakes only for what it waits on and the deadlines its ticks keep: over a
+/// simulated minute where nothing happens, a loop whose ticks keep no deadline ticks once a
+/// [`POLL`] (30 ticks, its rounds and its first), one whose ticks keep a deadline 500 ms on (a
+/// dial's spacing) ticks at those deadlines, its rounds among them, and one whose ticks keep a deadline already
+/// due (work a tick left) still ticks at most once a [`TICK`], never more often (600, the old
+/// tick's count, not a spin). Counted on a simulated clock, never timed.
+///
+/// NEGATIVE CONTROLS (2026-11-09), each planted in `serve_paced`: with its wait's `until` a
+/// [`TICK`] on whatever the tick kept (the 100 ms tick this loop had), the idle loop ticked 600
+/// times (`left: (29, 600), right: (29, 30)`); with the floor the tick's start (`now`, not `now + TICK`), the
+/// loop whose deadline is always due never let the clock move, and the tick count's hang
+/// detector ended it (`the loop ticks without its clock moving`).
+#[test]
+fn an_idle_serving_loop_ticks_only_at_its_rounds_and_its_deadlines() {
+    assert_eq!(rounds_in_a_minute(Duration::ZERO, None), (29, 30));
+    assert_eq!(
+        rounds_in_a_minute(Duration::ZERO, Some(Duration::from_millis(500))),
+        (29, 120)
+    );
+    let (_, ticks) = rounds_in_a_minute(Duration::ZERO, Some(Duration::ZERO));
+    assert_eq!(ticks, 600, "a deadline always due ticks once a TICK");
 }
 
 /// A tick that ends a serving loop ends it there, with what it came to: [`Flow::End`] as
-/// `Ok(())`, a refusal as itself, and no wait or tick after it.
+/// `Ok(())`, a refusal as itself, and no wait or tick after it: the round that ends it is the
+/// second tick, after one idle wait.
 #[test]
 fn a_tick_that_ends_the_loop_ends_it_at_once() {
     for (ends, outcome) in [
@@ -1448,18 +1516,23 @@ fn a_tick_that_ends_the_loop_ends_it_at_once() {
         let mut ticks = 0;
         let mut waits = 0;
         let served = serve_paced(
+            &mut (),
             simulated,
             || false,
-            |rest| {
+            |state, floor, until| {
                 waits += 1;
-                advance(rest);
+                idle(state, floor, until);
             },
-            |_, due| {
+            |(), _, due| {
                 ticks += 1;
-                if due { ends.clone() } else { Ok(Flow::Serve) }
+                if due {
+                    ends.clone()
+                } else {
+                    Ok(Flow::Serve(None))
+                }
             },
         );
         assert_eq!(served, outcome);
-        assert_eq!((ticks, waits), (21, 20));
+        assert_eq!((ticks, waits), (2, 1));
     }
 }

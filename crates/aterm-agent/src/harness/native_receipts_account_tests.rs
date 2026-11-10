@@ -7,46 +7,15 @@ use crate::harness::accounts_pool::ExecutionIntent;
 #[path = "native_receipts_account_model_tests.rs"]
 mod model;
 
+#[path = "native_receipts_namespace_claim_tests.rs"]
+mod namespace_claims;
+
 struct World {
     _home: aterm_tempfile::TempDir,
     paths: Paths,
     parent: Prepare,
     binding: Binding,
     phase: ImagePhase,
-}
-
-#[test]
-fn complete_receipt_mode_cannot_claim_or_fence_a_legacy_account_relation() {
-    use crate::harness::native_act::{BootStamp, ReceiptMode};
-
-    for marked_parent in [false, true] {
-        let mut world = World::closed(ImagePhase::Forward);
-        let mut candidate = world.candidate(2);
-        let binding = candidate_binding(&candidate);
-        assert!(
-            world
-                .parent
-                .account_successor_recipe(&candidate, world.phase)
-        );
-        let before = world.bytes();
-        let marked = if marked_parent {
-            &mut world.parent
-        } else {
-            &mut candidate
-        };
-        marked.receipt_mode = Some(ReceiptMode::Recipients5);
-        marked.boot = Some(BootStamp {
-            host: format!("macos:{}", "12".repeat(16)),
-            boot: "34".repeat(16),
-        });
-        marked.custody = Some("56".repeat(32));
-        marked.rejection_domain = Some("78".repeat(32));
-        assert!(Request::prepare(marked.clone()).encode().is_some());
-        let relation = world.relation(&candidate);
-        assert!(account::claim_at(&world.paths, relation, &binding, LIMITS).is_err());
-        assert!(account::fence_at(&world.paths, relation, LIMITS).is_err());
-        assert_eq!(world.bytes(), before);
-    }
 }
 
 fn closure_phase_step(

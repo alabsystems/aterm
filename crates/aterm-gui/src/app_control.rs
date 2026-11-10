@@ -1138,6 +1138,12 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
 }
 
 fn markdown_view_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
+    if compiled
+        .semantic(&UiKey::new("editor/markdown/toolbar"))
+        .is_none()
+    {
+        return Vec::new();
+    }
     let blocks = compiled
         .paint
         .iter()
@@ -1146,47 +1152,10 @@ fn markdown_view_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             _ => None,
         })
         .collect::<Vec<_>>();
-    if blocks.is_empty()
-        && compiled
-            .semantics
-            .iter()
-            .all(|node| !node.key.as_str().starts_with("markdown/"))
-    {
-        return Vec::new();
-    }
-
-    let has = |key: &str| compiled.semantic(&UiKey::new(key)).is_some();
-    let mode = if has("markdown/split") {
-        "split"
-    } else if has("markdown/source") && !has("markdown/preview") {
-        "source"
-    } else {
-        "preview"
-    };
-    let status = compiled
-        .semantic(&UiKey::new("markdown/status"))
-        .map_or("Unavailable", |node| node.label.as_str());
-    let paging = |key: &str| {
-        compiled
-            .semantic(&UiKey::new(key))
-            .map_or((false, "-"), |node| {
-                (
-                    node.state.is_none_or(|state| state.enabled),
-                    node.action.as_ref().map_or("-", ActionId::as_str),
-                )
-            })
-    };
-    let (previous_enabled, previous_action) = paging("markdown/previous-page-button");
-    let (next_enabled, next_action) = paging("markdown/next-page-button");
-    let focused = compiled
-        .semantics
-        .iter()
-        .find(|node| node.state.is_some_and(|state| state.focused))
-        .map_or("-", |node| node.key.as_str());
-    let selected_mode = [
-        ("preview", "markdown/preview-mode"),
-        ("source", "markdown/source-mode"),
-        ("split", "markdown/split-mode"),
+    let mode = [
+        ("read", "editor/markdown/read"),
+        ("edit", "editor/markdown/edit"),
+        ("split", "editor/markdown/split"),
     ]
     .into_iter()
     .find(|(_, key)| {
@@ -1195,18 +1164,18 @@ fn markdown_view_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             .and_then(|node| node.state)
             .is_some_and(|state| state.selected)
     })
-    .map_or(mode, |(mode, _)| mode);
-
+    .map_or("-", |(mode, _)| mode);
+    let status = compiled
+        .semantic(&UiKey::new("editor/markdown/save-status"))
+        .map_or("-", |node| node.label.as_str());
+    let focused = compiled
+        .semantics
+        .iter()
+        .find(|node| node.state.is_some_and(|state| state.focused))
+        .map_or("-", |node| node.key.as_str());
     let mut lines = vec![format!(
-        "markdown-view mode={} selected-mode={} status={:?} focused-key={} previous-enabled={} previous-action={} next-enabled={} next-action={}",
-        mode,
-        selected_mode,
-        status,
-        focused,
-        previous_enabled,
-        previous_action,
-        next_enabled,
-        next_action,
+        "markdown-view mode={} selected-mode={} status={:?} focused-key={}",
+        mode, mode, status, focused,
     )];
     let source_start = blocks.iter().map(|(_, spec)| spec.source.start).min();
     let source_end = blocks.iter().map(|(_, spec)| spec.source.end).max();
@@ -1837,7 +1806,8 @@ mod tests {
     fn document_open_uses_host_grant_and_native_tab_path() {
         let mut app = App::headless_for_test();
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
-            window.rows = 12;
+            // The stacked Split needs room for both document panes below their chrome.
+            window.rows = 24;
         }
         let dir =
             std::env::temp_dir().join(format!("aterm-control-document-{}", std::process::id()));
@@ -1850,13 +1820,16 @@ mod tests {
             crate::native_document_host::path_to_file_uri(&path).expect("a file uri")
         );
         let opened = app.open_app(parse_open(&request).unwrap()).unwrap();
-        assert!(opened.starts_with("app markdown file://"));
+        assert!(opened.starts_with("app editor file://"));
         assert!(
             app.inspect_tabs_body()
                 .iter()
-                .any(|line| line.contains("app=markdown"))
+                .any(|line| line.contains("app=editor"))
         );
-        let (_, view) = app.active_native_view(WindowId(0)).unwrap();
+        let identity = app.active_native_view(WindowId(0)).unwrap();
+        let (instance, view) = identity;
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
         let audit = app
             .inspect_app(InspectRequest::View {
                 view,
@@ -1866,10 +1839,9 @@ mod tests {
         assert!(audit[1].contains("compiled-fingerprint="));
         assert!(audit.iter().any(|line| {
             line.starts_with("markdown-view ")
-                && line.contains("mode=preview")
-                && line.contains("selected-mode=preview")
-                && line.contains("previous-enabled=false")
-                && line.contains("next-enabled=false")
+                && line.contains("mode=read")
+                && line.contains("selected-mode=read")
+                && line.contains("status=\"Saved")
         }));
         assert!(audit.iter().any(|line| {
             line.starts_with("paint-markdown ")
@@ -1878,12 +1850,47 @@ mod tests {
         }));
         assert!(
             audit.iter().any(|line| {
-                line.starts_with("paint-node key=\"markdown/mode-compact\"")
+                line.starts_with("paint-node key=\"editor/markdown/read\"")
                     && line.contains("selected:true")
-                    && line.contains("action=markdown/mode/source")
+                    && line.contains("action=editor/markdown/read")
             }),
             "{audit:#?}"
         );
+        for mode in ["edit", "split", "read"] {
+            let key = format!("editor/markdown/{mode}");
+            app.act_app(ActRequest {
+                view,
+                ui_key: key.clone(),
+                action: key,
+                value: None,
+            })
+            .unwrap();
+            let text = app
+                .inspect_app(InspectRequest::View {
+                    view,
+                    projection: InspectionProjection::Text,
+                })
+                .unwrap();
+            assert!(text.iter().any(|line| {
+                line.starts_with(&format!("markdown-view mode={mode} selected-mode={mode} "))
+                    && line.contains("status=\"Saved")
+            }));
+            assert_eq!(
+                text.iter().any(|line| line.starts_with("editor-row ")),
+                mode != "read",
+                "{mode} source projection: {text:#?}"
+            );
+            assert_eq!(
+                text.iter().any(|line| line.starts_with("markdown-block ")),
+                mode != "edit",
+                "{mode} reader projection: {text:#?}"
+            );
+            assert_eq!(app.active_native_view(WindowId(0)), Some(identity));
+            assert_eq!(app.native_runtime.document_id(instance), Some(document));
+            let after = app.document_store.snapshot(document).unwrap();
+            assert_eq!(after.seq, original.seq);
+            assert_eq!(after.text, original.text);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2887,7 +2894,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("notes.md");
+        let path = dir.join("notes.txt");
         let original = "alpha needle\nbeta line\n";
         std::fs::write(&path, original).unwrap();
         let uri = crate::native_document_host::path_to_file_uri(&path).expect("a file uri");

@@ -276,7 +276,7 @@ impl FakeHost {
         self.state().calls.clone()
     }
 
-    /// How many writes (`create`, `upload`, `publish_draft`) changed what this host holds: a
+    /// How many writes (`create`, `create_draft`, `upload`, `publish_draft`) changed what this host holds: a
     /// write that finds every file already there with the same bytes changes nothing.
     #[must_use]
     pub fn changes(&self) -> usize {
@@ -359,8 +359,8 @@ impl FakeHost {
     /// only when it holds every file with the same bytes and is still a prerelease, as agh's
     /// publish guard converges only a release published as its patch would leave it. A draft
     /// is refused where a file has
-    /// other bytes; otherwise it gains the files it lacks and is published only when it then
-    /// holds no name the rerun did not bring, as agh's exact-set publish guard is. An armed
+    /// other bytes; otherwise it gains the files it lacks. Only a publishing create then
+    /// requires the exact set and publishes it, as agh's exact-set publish guard does. An armed
     /// write failure fires at the publish, so a call refused or converged before it leaves the
     /// arming for the next `create` that writes.
     fn complete_own(
@@ -368,6 +368,7 @@ impl FakeHost {
         slug: &Slug,
         tag: &str,
         incoming: Vec<(String, Vec<u8>)>,
+        publish: bool,
     ) -> Result<(), HostError> {
         let mut guard = self.state();
         let s = &mut *guard;
@@ -403,6 +404,9 @@ impl FakeHost {
         }
         let brought: BTreeSet<String> = incoming.iter().map(|(name, _)| name.clone()).collect();
         s.changes += usize::from(lands(&mut release.assets, incoming));
+        if !publish {
+            return Ok(());
+        }
         let extra: Vec<&str> = release
             .assets
             .keys()
@@ -532,6 +536,66 @@ impl FakeHost {
     }
 }
 
+impl FakeHost {
+    fn create_release(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        _title: &str,
+        notes: &str,
+        files: &[PathBuf],
+        publish: bool,
+    ) -> Result<(), HostError> {
+        self.log(format!(
+            "{} {slug} {tag}",
+            if publish { "create" } else { "create-draft" }
+        ));
+        self.reachable(slug)?;
+        let incoming = Self::read_files(files)?;
+        // An armed `Refuse` fires first, whatever is there. A release that is there decides
+        // next: another's is refused, as the unarmed create and agh's created-intent rule
+        // refuse it, writing nothing, so an armed write failure waits for the next create that
+        // writes, as agh-fake's fault on a request waits for that request; this host's own is
+        // completed, and an armed write failure fires at its publish.
+        if self.refuses(FakeOp::Create) {
+            return Err(refused_by_the_test());
+        }
+        let key = (slug.clone(), tag.to_string());
+        match self.release_of(slug, tag) {
+            None => {}
+            // agh's created-intent rule converges only a request that agrees with the intent
+            // that made the release, its body among it: other notes are another's create.
+            Some(_)
+                if self.state().own.contains(&key)
+                    && self.state().notes.get(&key).map(String::as_str) == Some(notes) =>
+            {
+                return self.complete_own(slug, tag, incoming, publish);
+            }
+            Some(_) => {
+                return Err(HostError::Refused(format!(
+                    "{slug} already has a release {tag}"
+                )));
+            }
+        }
+        match self.armed(FakeOp::Create) {
+            Some(FakeFail::KilledCreate) => {
+                self.lay_own(slug, tag, notes, true, incoming.into_iter().collect());
+                return Err(HostError::Unreachable("killed".into()));
+            }
+            Some(FakeFail::LostResponse) => {
+                self.lay_own(slug, tag, notes, !publish, incoming.into_iter().collect());
+                return Err(the_answer_was_lost());
+            }
+            Some(other) => panic!("fail_next: Create cannot be armed with {other:?}"),
+            None => {}
+        }
+        // Marked own as every create's release is, so a rerun converges as agh's created-intent
+        // rule converges it.
+        self.lay_own(slug, tag, notes, !publish, incoming.into_iter().collect());
+        Ok(())
+    }
+}
+
 impl ReleaseHost for FakeHost {
     fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
         self.log(format!("releases {slug}"));
@@ -617,54 +681,22 @@ impl ReleaseHost for FakeHost {
         &self,
         slug: &Slug,
         tag: &str,
-        _title: &str,
+        title: &str,
         notes: &str,
         files: &[PathBuf],
     ) -> Result<(), HostError> {
-        self.log(format!("create {slug} {tag}"));
-        self.reachable(slug)?;
-        let incoming = Self::read_files(files)?;
-        // An armed `Refuse` fires first, whatever is there. A release that is there decides
-        // next: another's is refused, as the unarmed create and agh's created-intent rule
-        // refuse it, writing nothing, so an armed write failure waits for the next create that
-        // writes, as agh-fake's fault on a request waits for that request; this host's own is
-        // completed, and an armed write failure fires at its publish.
-        if self.refuses(FakeOp::Create) {
-            return Err(refused_by_the_test());
-        }
-        let key = (slug.clone(), tag.to_string());
-        match self.release_of(slug, tag) {
-            None => {}
-            // agh's created-intent rule converges only a request that agrees with the intent
-            // that made the release, its body among it: other notes are another's create.
-            Some(_)
-                if self.state().own.contains(&key)
-                    && self.state().notes.get(&key).map(String::as_str) == Some(notes) =>
-            {
-                return self.complete_own(slug, tag, incoming);
-            }
-            Some(_) => {
-                return Err(HostError::Refused(format!(
-                    "{slug} already has a release {tag}"
-                )));
-            }
-        }
-        match self.armed(FakeOp::Create) {
-            Some(FakeFail::KilledCreate) => {
-                self.lay_own(slug, tag, notes, true, incoming.into_iter().collect());
-                return Err(HostError::Unreachable("killed".into()));
-            }
-            Some(FakeFail::LostResponse) => {
-                self.lay_own(slug, tag, notes, false, incoming.into_iter().collect());
-                return Err(the_answer_was_lost());
-            }
-            Some(other) => panic!("fail_next: Create cannot be armed with {other:?}"),
-            None => {}
-        }
-        // Marked own as every create's release is, so a rerun converges as agh's created-intent
-        // rule converges it.
-        self.lay_own(slug, tag, notes, false, incoming.into_iter().collect());
-        Ok(())
+        self.create_release(slug, tag, title, notes, files, true)
+    }
+
+    fn create_draft(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<(), HostError> {
+        self.create_release(slug, tag, title, notes, files, false)
     }
 
     fn upload(

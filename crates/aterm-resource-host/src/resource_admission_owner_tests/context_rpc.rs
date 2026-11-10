@@ -201,7 +201,9 @@ fn host() {
         .write(true)
         .open(path.join("runtime-output/lock"))
         .unwrap();
-    drop(RecordLock::try_lock(released, 0).unwrap());
+    drop(aterm_uds::deadline::once_released(|| {
+        RecordLock::try_lock(released.try_clone()?, 0).map_err(std::io::Error::from)
+    }));
     fs::remove_file(socket).unwrap();
 }
 

@@ -59,8 +59,8 @@ pub const LOCAL_BUILD_JSON: &str = "local-build.json";
 /// Bound on a [`LOCAL_BUILD_JSON`] receipt read.
 const MAX_LOCAL_BUILD_JSON_BYTES: usize = 64 * 1024;
 
-/// Whether `version` is a canonical harness version (`MAJOR.MINOR.0` or `MAJOR.MINOR.0+g<hex9..40>`,
-/// or strictly `+g`-stamped when `require_stamp` is true) and matches `source` when provided.
+/// Whether `version` has a historical or calendar product core, optionally `+g<hex9..40>`
+/// stamped (required when `require_stamp` is true), and matches `source` when provided.
 fn harness_version_valid(version: &str, source: Option<&str>, require_stamp: bool) -> bool {
     if version.is_empty() || version.len() > 128 || !version.bytes().all(|b| b.is_ascii_graphic()) {
         return false;
@@ -70,16 +70,7 @@ fn harness_version_valid(version: &str, source: Option<&str>, require_stamp: boo
         None if require_stamp || source.is_some() => return false,
         None => (version, None),
     };
-    let parts: Vec<&str> = base.split('.').collect();
-    if parts.len() != 3
-        || parts[2] != "0"
-        || !parts[..2].iter().all(|s| {
-            !s.is_empty()
-                && s.bytes().all(|b| b.is_ascii_digit())
-                && (s.len() == 1 || !s.starts_with('0'))
-                && s.parse::<u64>().is_ok()
-        })
-    {
+    if aterm_types::release_version::ReleaseVersion::parse(base).is_none() {
         return false;
     }
     if let Some(stamp) = stamp {
@@ -403,6 +394,33 @@ pub fn installed(layout: &crate::store::Layout) -> Vec<Installed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_harness_versions_keep_the_existing_source_stamp_binding() {
+        let source = format!("abcdef012{}", "0".repeat(31));
+        for version in [
+            "0.12.0+gabcdef012",
+            "1.20261109.1+gabcdef012",
+            "1.20240229.2+gabcdef012",
+        ] {
+            assert!(
+                harness_version_valid(version, Some(source.as_str()), true),
+                "{version}"
+            );
+        }
+        for version in [
+            "1.20261109.0+gabcdef012",
+            "1.20260229.1+gabcdef012",
+            "1.20261109.1+g123456789",
+            "1.20261109.1",
+        ] {
+            assert!(
+                !harness_version_valid(version, Some(source.as_str()), true),
+                "{version}"
+            );
+        }
+        assert!(harness_version_valid("1.20261109.1", None, false));
+    }
 
     /// THE FIVE HARNESSES ARE HARNESSES AND NOTHING ELSE IS: the vendor programs they wrap,
     /// codex (built from source, not a harness here), the toolchain programs and a bare
