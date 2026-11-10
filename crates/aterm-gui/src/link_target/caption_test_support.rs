@@ -4,7 +4,7 @@
 //! Retired-work readings shared by the paired caption probes.
 
 #[cfg(target_os = "macos")]
-pub(super) fn instructions() -> Option<u64> {
+pub(crate) fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     // SAFETY: the output has the size/alignment of RUSAGE_INFO_V4; read only on success.
     let rc = unsafe {
@@ -19,6 +19,6 @@ pub(super) fn instructions() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn instructions() -> Option<u64> {
+pub(crate) fn instructions() -> Option<u64> {
     None
 }

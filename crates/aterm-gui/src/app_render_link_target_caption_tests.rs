@@ -11,6 +11,9 @@ const PHISH: &[u8] =
 const LINK_COL: u16 = 6;
 const TARGET: &str = "https://evil.example/steal";
 
+#[path = "app_render_link_caption_placement_tests.rs"]
+mod placement;
+
 #[test]
 fn composed_disclosure_matches_the_complete_painted_caption() {
     let long_host = format!("https://{}.evil.example/x", "猫".repeat(40));

@@ -162,24 +162,30 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
         NOW
     ));
     if cli == Cli::Claude {
-        assert_eq!(
-            fleet_origin(
-                &accounts::Store::at(&bed.state),
-                Some(&bed.home),
-                Some(&bed.aterm_toml()),
-                &bed.roster(cli)
-            )
-            .source(),
-            Some(
-                if case == 1 || case == 3 {
-                    &primary
-                } else {
-                    &fallback
-                }
-                .display()
-                .to_string()
-            ),
+        let origin = fleet_origin(
+            &accounts::Store::at(&bed.state),
+            Some(&bed.home),
+            Some(&bed.aterm_toml()),
+            &bed.roster(cli),
         );
+        // A selected invalid file can refuse during alias validation, before
+        // an origin with a printable path exists. It must still refuse below
+        // without consuming a fallback or changing any retained record.
+        if !matches!(&origin, FleetOrigin::SourcePending(_)) || case <= 2 {
+            assert_eq!(
+                origin.source(),
+                Some(
+                    if case == 1 || case == 3 {
+                        &primary
+                    } else {
+                        &fallback
+                    }
+                    .display()
+                    .to_string()
+                ),
+                "{cli:?} {action} {variant} cold={cold}",
+            );
+        }
     }
     let paths = [
         bed.roster(cli),

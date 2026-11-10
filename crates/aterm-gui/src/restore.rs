@@ -1589,6 +1589,20 @@ impl RestoredSplitTree {
         }
     }
 
+    /// Test whether every terminal leaf in rebuild order satisfies `f`, short-circuiting on `false`.
+    pub(crate) fn all_terminals<'a>(
+        &'a self,
+        f: &mut impl FnMut(&'a TerminalLeafRestore) -> bool,
+    ) -> bool {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => f(terminal),
+            Self::Leaf { .. } => true,
+            Self::Split { first, second, .. } => first.all_terminals(f) && second.all_terminals(f),
+        }
+    }
+
     /// The first terminal leaf in rebuild order (first branch before second).
     pub(crate) fn first_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
         match self {
@@ -2486,24 +2500,18 @@ impl RestoreManifest {
 
     /// The exact set of live terminal ids a seamless-update layout carries, sorted and distinct.
     pub(crate) fn seamless_terminal_ids(&self) -> Option<Vec<u64>> {
-        fn collect(node: &RestoredSplitTree, ids: &mut Vec<u64>) -> Option<()> {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(terminal),
-                } => ids.push(terminal.local_id?),
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    collect(first, ids)?;
-                    collect(second, ids)?;
-                }
-            }
-            Some(())
-        }
-
         let mut ids = Vec::new();
         for window in &self.windows {
             for tab in &window.restored_tabs {
-                collect(&tab.root, &mut ids)?;
+                if !tab.root.all_terminals(&mut |terminal| {
+                    let Some(id) = terminal.local_id else {
+                        return false;
+                    };
+                    ids.push(id);
+                    true
+                }) {
+                    return None;
+                }
             }
         }
         ids.sort_unstable();
@@ -6782,50 +6790,23 @@ metadata = "opaque=copy-me"
     }
 
     fn numbered_sample() -> RestoreManifest {
-        fn number(node: &mut RestoredSplitTree, next: &mut u64) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(t),
-                } => {
-                    t.local_id = Some(*next);
-                    *next += 1;
-                }
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    number(first, next);
-                    number(second, next);
-                }
-            }
-        }
         let mut m = sample();
         let mut next = 0;
-        for w in &mut m.windows {
-            for t in &mut w.restored_tabs {
-                number(&mut t.root, &mut next);
-            }
-        }
+        m.fill_terminals(&mut |t| {
+            t.local_id = Some(next);
+            next += 1;
+        });
         m
     }
 
     #[test]
     fn a_hosted_agent_rides_its_leaf_through_the_codec() {
         fn agents(m: &RestoreManifest) -> Vec<Option<AgentRestore>> {
-            fn walk(node: &RestoredSplitTree, out: &mut Vec<Option<AgentRestore>>) {
-                match node {
-                    RestoredSplitTree::Leaf {
-                        view: RestoredView::Terminal(t),
-                    } => out.push(t.agent.as_deref().cloned()),
-                    RestoredSplitTree::Leaf { .. } => {}
-                    RestoredSplitTree::Split { first, second, .. } => {
-                        walk(first, out);
-                        walk(second, out);
-                    }
-                }
-            }
             let mut out = Vec::new();
             for w in &m.windows {
                 for t in &w.restored_tabs {
-                    walk(&t.root, &mut out);
+                    t.root
+                        .visit_terminals(&mut |t| out.push(t.agent.as_deref().cloned()));
                 }
             }
             out
@@ -6920,22 +6901,10 @@ metadata = "opaque=copy-me"
             tab: None,
         };
         fn leaves(m: &RestoreManifest) -> Vec<TerminalLeafRestore> {
-            fn walk(node: &RestoredSplitTree, out: &mut Vec<TerminalLeafRestore>) {
-                match node {
-                    RestoredSplitTree::Leaf {
-                        view: RestoredView::Terminal(t),
-                    } => out.push(t.clone()),
-                    RestoredSplitTree::Leaf { .. } => {}
-                    RestoredSplitTree::Split { first, second, .. } => {
-                        walk(first, out);
-                        walk(second, out);
-                    }
-                }
-            }
             let mut out = Vec::new();
             for w in &m.windows {
                 for t in &w.restored_tabs {
-                    walk(&t.root, &mut out);
+                    t.root.visit_terminals(&mut |t| out.push(t.clone()));
                 }
             }
             out
@@ -7098,21 +7067,22 @@ metadata = "opaque=copy-me"
     }
 
     fn first_agent_of(m: &RestoreManifest) -> Option<AgentRestore> {
-        fn walk(node: &RestoredSplitTree) -> Option<AgentRestore> {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(t),
-                } => t.agent.as_deref().cloned(),
-                RestoredSplitTree::Leaf { .. } => None,
-                RestoredSplitTree::Split { first, second, .. } => {
-                    walk(first).or_else(|| walk(second))
+        let mut found = None;
+        for w in &m.windows {
+            for t in &w.restored_tabs {
+                t.root.all_terminals(&mut |term| {
+                    if let Some(agent) = term.agent.as_deref() {
+                        found = Some(agent.clone());
+                        return false;
+                    }
+                    true
+                });
+                if found.is_some() {
+                    return found;
                 }
             }
         }
-        m.windows
-            .iter()
-            .flat_map(|w| &w.restored_tabs)
-            .find_map(|t| walk(&t.root))
+        found
     }
 
     #[test]

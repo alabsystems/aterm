@@ -953,16 +953,17 @@ impl AlabTcpAdvertiser {
         let now_secs = aterm_time::unix_secs();
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let eligible = should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
+        let identity = (cfg!(unix) || cfg!(target_os = "macos"))
+            .then_some(eligible)
+            .filter(|&eligible| eligible)
+            .and(self.state.as_ref())
+            .and_then(|state| {
+                aterm_net::fleet_member::read_node_identity(state)
+                    .ok()
+                    .flatten()
+            });
         #[cfg(unix)]
         {
-            let identity = eligible
-                .then_some(self.state.as_ref())
-                .flatten()
-                .and_then(|state| {
-                    aterm_net::fleet_member::read_node_identity(state)
-                        .ok()
-                        .flatten()
-                });
             let wanted = identity.as_ref().map(|node| (fleet_port, node.key()));
             if guard.lan.as_ref().map(|lan| (lan.port, lan.key)) != wanted
                 || guard
@@ -999,8 +1000,7 @@ impl AlabTcpAdvertiser {
         let wanted = eligible
             .then(|| {
                 if self.mesh {
-                    let state = self.state.as_ref()?;
-                    let node = aterm_net::fleet_member::read_node_identity(state).ok()??;
+                    let node = identity.as_ref()?;
                     Some(mesh_advert(&self.instance, node.node(), fleet_port))
                 } else {
                     Some(alab_tcp_advert(

@@ -739,18 +739,226 @@ fn resolve(program: &OsStr, path_var: Option<&OsStr>) -> io::Result<CString> {
     }))
 }
 
-#[cfg(target_vendor = "apple")]
-mod platform {
-    use super::{
-        BSHELL, ENOEXEC, ExecImage, F_GETFD, Image, Placement, Source, X_OK, access, c_string,
-        exec_dispatch, exec_now_us, fcntl,
-    };
-    use core::ffi::{CStr, c_char, c_void};
+/// The search a spawn makes for its program, shared by Darwin's `posix_spawnp` stand-in
+/// (`platform::spawnp`, `PreparedExec`) and the judgement of a tethered spawn's program before
+/// its tether runs it ([`findable`]: Darwin's, and a Linux group leader's by glibc `execvp`'s own
+/// loop).
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+mod program_search {
+    use super::{X_OK, access, c_string};
+    use core::ffi::CStr;
     use std::ffi::{CString, OsStr};
     use std::io;
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
+
+    /// The longest path the kernel takes, its NUL included.
+    #[cfg(target_vendor = "apple")]
+    const PATH_MAX: usize = 1024;
+    /// The longest path the kernel takes, its NUL included.
+    #[cfg(target_os = "linux")]
+    const PATH_MAX: usize = 4096;
+    /// The search with no `PATH`: `posix_spawnp`'s on Darwin, glibc `execvp`'s on Linux.
+    #[cfg(target_vendor = "apple")]
+    const NO_PATH: &[u8] = b"/usr/bin:/bin";
+    /// The search with no `PATH`: `posix_spawnp`'s on Darwin, glibc `execvp`'s on Linux.
+    #[cfg(target_os = "linux")]
+    const NO_PATH: &[u8] = b"/bin:/usr/bin";
+    const ENOENT: i32 = libc::ENOENT;
+    const EACCES: i32 = libc::EACCES;
+    const ENAMETOOLONG: i32 = libc::ENAMETOOLONG;
+
+    /// Whether the spawn's search would find `program` something to run (Darwin's
+    /// `platform::spawnp`), judged before the spawn of another program that runs it later (a
+    /// tethered child's tether, [`crate::tether`]): the same search over the same candidates, each
+    /// one runnable when `access(X_OK)` passes and it is no directory.
+    ///
+    /// # Errors
+    /// What that spawn would answer when no candidate is runnable: `access`'s error for a
+    /// `program` that names a path, else `ENOENT`, `EACCES` when a candidate that exists may not
+    /// be run, or `ENAMETOOLONG` for an entry the search ends at. An image the exec refuses
+    /// although `access` passes it fails later, in the program that runs it.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn findable(
+        program: &[u8],
+        search: Option<&OsStr>,
+        base: Option<&Path>,
+        long_entry_ends: bool,
+    ) -> io::Result<()> {
+        if program.contains(&b'/') {
+            return runnable(&rebase(program, base)?);
+        }
+        if program.is_empty() {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+        let mut eacces = false;
+        for candidate in candidates(program, search, base, long_entry_ends) {
+            let candidate = candidate?;
+            if !exists(&candidate) {
+                continue;
+            }
+            match runnable(&candidate) {
+                Ok(()) => return Ok(()),
+                Err(e) => eacces |= e.raw_os_error() == Some(EACCES),
+            }
+        }
+        Err(io::Error::from_raw_os_error(if eacces {
+            EACCES
+        } else {
+            ENOENT
+        }))
+    }
+
+    /// Whether glibc's `execvp` would find `program` something to run, judged before the spawn of
+    /// another program that runs it later (a Linux group leader's tether, [`crate::tether`]), by
+    /// its own loop (`__execvpe_common`, glibc 2.39), each candidate's `execve` answered as
+    /// `access(X_OK)` answers it, a directory refused as `execve` refuses one. Each entry of
+    /// `search` (the child's `PATH`, else [`NO_PATH`]; an empty entry is the working directory) is
+    /// joined to the name and tried. An entry at least as long as the whole of `search` and of
+    /// `PATH_MAX` bytes, one only a `PATH` longer than that holds, is passed over, and the working
+    /// directory tried in its place unless it was the last. A candidate answering `EACCES` is noted
+    /// and passed over, as is one answering `ENOENT`, `ENOTDIR`, `ESTALE`, `ENODEV` or `ETIMEDOUT`;
+    /// any other answer ends the search with it, a join longer than the kernel takes
+    /// (`ENAMETOOLONG`) and a link loop (`ELOOP`) among them.
+    ///
+    /// # Errors
+    /// What that spawn would answer when no candidate is runnable: `access`'s error for a
+    /// `program` that names a path, else the answer that ended the search, `EACCES` when a
+    /// candidate answered so, or `ENOENT`. An image the exec refuses although `access` passes it
+    /// fails later, in the program that runs it.
+    #[cfg(target_os = "linux")]
+    pub(super) fn findable(
+        program: &[u8],
+        search: Option<&OsStr>,
+        base: Option<&Path>,
+    ) -> io::Result<()> {
+        if program.contains(&b'/') {
+            return runnable(&rebase(program, base)?);
+        }
+        if program.is_empty() {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+        // What glibc reads as nothing to run there, so it tries the next entry.
+        const PASSED_OVER: [i32; 5] = [
+            ENOENT,
+            libc::ENOTDIR,
+            libc::ESTALE,
+            libc::ENODEV,
+            libc::ETIMEDOUT,
+        ];
+        let search = search.map_or(NO_PATH, OsStr::as_bytes);
+        let bound = search.len().min(PATH_MAX - 1) + 1;
+        let mut entries = search.split(|&b| b == b':').peekable();
+        let mut eacces = false;
+        while let Some(entry) = entries.next() {
+            let dir: &[u8] = if entry.len() < bound {
+                entry
+            } else if entries.peek().is_some() {
+                &[]
+            } else {
+                break;
+            };
+            let mut full = Vec::with_capacity(dir.len() + program.len() + 1);
+            if !dir.is_empty() {
+                full.extend_from_slice(dir);
+                full.push(b'/');
+            }
+            full.extend_from_slice(program);
+            let tried = if full.len() >= PATH_MAX {
+                Err(io::Error::from_raw_os_error(ENAMETOOLONG))
+            } else {
+                runnable(&rebase(&full, base)?)
+            };
+            match tried {
+                Ok(()) => return Ok(()),
+                Err(e) => match e.raw_os_error() {
+                    Some(EACCES) => eacces = true,
+                    Some(errno) if PASSED_OVER.contains(&errno) => {}
+                    _ => return Err(e),
+                },
+            }
+        }
+        Err(io::Error::from_raw_os_error(if eacces {
+            EACCES
+        } else {
+            ENOENT
+        }))
+    }
+
+    /// The paths a search for the bare name `program` tries, in order: each entry of `search`
+    /// (the child's `PATH`, else [`NO_PATH`]; an empty entry is `.`) joined to it and rebased on
+    /// `base`. An entry too long to join ends the search with `ENAMETOOLONG` when
+    /// `long_entry_ends` (posix_spawnp's rule for this process's own `PATH`), and is passed over
+    /// otherwise.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn candidates<'a>(
+        program: &'a [u8],
+        search: Option<&'a OsStr>,
+        base: Option<&'a Path>,
+        long_entry_ends: bool,
+    ) -> impl Iterator<Item = io::Result<CString>> + 'a {
+        search
+            .map_or(NO_PATH, OsStr::as_bytes)
+            .split(|&b| b == b':')
+            .filter_map(move |dir| {
+                let dir: &[u8] = if dir.is_empty() { b"." } else { dir };
+                if dir.len() + program.len() + 2 > PATH_MAX {
+                    return long_entry_ends
+                        .then(|| Err(io::Error::from_raw_os_error(ENAMETOOLONG)));
+                }
+                let mut full = Vec::with_capacity(dir.len() + program.len() + 1);
+                full.extend_from_slice(dir);
+                full.push(b'/');
+                full.extend_from_slice(program);
+                Some(rebase(&full, base))
+            })
+    }
+
+    /// Whether something is at `path`, a link followed.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn exists(path: &CStr) -> bool {
+        std::fs::metadata(OsStr::from_bytes(path.to_bytes())).is_ok()
+    }
+
+    /// Whether the exec could run the file at `path`: `access(X_OK)`, and no directory.
+    pub(super) fn runnable(path: &CStr) -> io::Result<()> {
+        // SAFETY: a NUL-terminated path; `access` reads it and retains nothing.
+        if unsafe { access(path.as_ptr(), X_OK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if std::fs::metadata(OsStr::from_bytes(path.to_bytes()))?.is_dir() {
+            return Err(io::Error::from_raw_os_error(EACCES));
+        }
+        Ok(())
+    }
+
+    /// `path`, a relative one taken in `base` (the child's working directory) when given.
+    pub(super) fn rebase(path: &[u8], base: Option<&Path>) -> io::Result<CString> {
+        match base {
+            Some(base) if path.first() != Some(&b'/') => {
+                let base = base.as_os_str().as_bytes();
+                let mut full = Vec::with_capacity(base.len() + path.len() + 1);
+                full.extend_from_slice(base);
+                full.push(b'/');
+                full.extend_from_slice(path);
+                c_string(&full)
+            }
+            _ => c_string(path),
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+mod platform {
+    use super::program_search::{candidates, exists, rebase, runnable};
+    use super::{
+        BSHELL, ENOEXEC, ExecImage, F_GETFD, Image, Placement, Source, exec_dispatch, exec_now_us,
+        fcntl,
+    };
+    use core::ffi::{CStr, c_char, c_void};
+    use std::ffi::CString;
+    use std::io;
+    use std::os::fd::AsRawFd;
 
     type Attr = *mut c_void;
     type Actions = *mut c_void;
@@ -772,7 +980,6 @@ mod platform {
     const O_WRONLY: i32 = 1;
     const SIGPIPE_BIT: u32 = 1 << (13 - 1);
     const SIGHUP_BIT: u32 = 1;
-    const PATH_MAX: usize = 1024;
     const ENOENT: i32 = 2;
     const E2BIG: i32 = 7;
     const ENOMEM: i32 = 12;
@@ -1163,105 +1370,6 @@ mod platform {
         } else {
             ENOENT
         }))
-    }
-
-    /// Whether [`spawnp`] would find `program` something to run, judged before the spawn of
-    /// another program that runs it later (a tethered child's tether, [`crate::tether`]): the
-    /// same search over the same candidates, each one runnable when `access(X_OK)` passes and it
-    /// is no directory.
-    ///
-    /// # Errors
-    /// What that spawn would answer when no candidate is runnable: `access`'s error for a
-    /// `program` that names a path, else `ENOENT`, `EACCES` when a candidate that exists may not
-    /// be run, or `ENAMETOOLONG` for an entry the search ends at. An image the exec refuses
-    /// although `access` passes it fails later, in the program that runs it.
-    pub(super) fn findable(
-        program: &[u8],
-        search: Option<&OsStr>,
-        base: Option<&Path>,
-        long_entry_ends: bool,
-    ) -> io::Result<()> {
-        if program.contains(&b'/') {
-            return runnable(&rebase(program, base)?);
-        }
-        if program.is_empty() {
-            return Err(io::Error::from_raw_os_error(ENOENT));
-        }
-        let mut eacces = false;
-        for candidate in candidates(program, search, base, long_entry_ends) {
-            let candidate = candidate?;
-            if !exists(&candidate) {
-                continue;
-            }
-            match runnable(&candidate) {
-                Ok(()) => return Ok(()),
-                Err(e) => eacces |= e.raw_os_error() == Some(EACCES),
-            }
-        }
-        Err(io::Error::from_raw_os_error(if eacces {
-            EACCES
-        } else {
-            ENOENT
-        }))
-    }
-
-    /// The paths a search for the bare name `program` tries, in order: each entry of `search`
-    /// (the child's `PATH`, else `/usr/bin:/bin`; an empty entry is `.`) joined to it and rebased
-    /// on `base`. An entry too long to join ends the search with `ENAMETOOLONG` when
-    /// `long_entry_ends` (posix_spawnp's rule for this process's own `PATH`), and is passed over
-    /// otherwise.
-    fn candidates<'a>(
-        program: &'a [u8],
-        search: Option<&'a OsStr>,
-        base: Option<&'a Path>,
-        long_entry_ends: bool,
-    ) -> impl Iterator<Item = io::Result<CString>> + 'a {
-        search
-            .map_or(&b"/usr/bin:/bin"[..], OsStr::as_bytes)
-            .split(|&b| b == b':')
-            .filter_map(move |dir| {
-                let dir: &[u8] = if dir.is_empty() { b"." } else { dir };
-                if dir.len() + program.len() + 2 > PATH_MAX {
-                    return long_entry_ends
-                        .then(|| Err(io::Error::from_raw_os_error(ENAMETOOLONG)));
-                }
-                let mut full = Vec::with_capacity(dir.len() + program.len() + 1);
-                full.extend_from_slice(dir);
-                full.push(b'/');
-                full.extend_from_slice(program);
-                Some(rebase(&full, base))
-            })
-    }
-
-    /// Whether something is at `path`, a link followed.
-    fn exists(path: &CStr) -> bool {
-        std::fs::metadata(OsStr::from_bytes(path.to_bytes())).is_ok()
-    }
-
-    /// Whether the exec could run the file at `path`: `access(X_OK)`, and no directory.
-    fn runnable(path: &CStr) -> io::Result<()> {
-        // SAFETY: a NUL-terminated path; `access` reads it and retains nothing.
-        if unsafe { access(path.as_ptr(), X_OK) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if std::fs::metadata(OsStr::from_bytes(path.to_bytes()))?.is_dir() {
-            return Err(io::Error::from_raw_os_error(EACCES));
-        }
-        Ok(())
-    }
-
-    fn rebase(path: &[u8], base: Option<&Path>) -> io::Result<CString> {
-        match base {
-            Some(base) if path.first() != Some(&b'/') => {
-                let base = base.as_os_str().as_bytes();
-                let mut full = Vec::with_capacity(base.len() + path.len() + 1);
-                full.extend_from_slice(base);
-                full.push(b'/');
-                full.extend_from_slice(path);
-                c_string(&full)
-            }
-            _ => c_string(path),
-        }
     }
 }
 
@@ -2026,11 +2134,15 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// signal and the watcher exits, so the child can run on. A child spawned at the head of its own
 /// process group (`process_group(0)`, or a session) has its group ended instead, `SIGTERM` then
 /// `SIGKILL` rounds, the group held as the child's by the watcher's anchor (a zombie it never
-/// reaps), so its descendants in that group end with it, even after the child itself exited;
-/// Linux's parent-death signal still reaches the child alone. In a
-/// process whose `main` never called
-/// [`crate::tether::entry`], or whose executable was replaced since ([`crate::tether::lost`]),
-/// the child starts untethered. Neither an exec nor a suspended start can be tethered.
+/// reaps), so its descendants in that group end with it, even after the child itself exited; on
+/// Linux such a spawn runs through this process's running image (`/proc/self/exe`) for that
+/// watcher, its signal set too, and its watcher sees an exec of this process from Linux 6.9 (its
+/// exit alone before); a kernel with no pidfd, or a seccomp filter that refuses one, a `/proc`
+/// that hides processes (`hidepid`) and a process whose pid is 1 tie it by its signal alone. In a
+/// process whose `main` never called [`crate::tether::entry`], the child starts untethered on
+/// Darwin and is tied by its signal alone on Linux. One whose executable was replaced since
+/// ([`crate::tether::lost`]) starts it untethered on Darwin, while Linux runs through the running
+/// image and is unaffected. Neither an exec nor a suspended start can be tethered.
 pub trait Tether {
     /// Tie the child to this process.
     fn tether(&mut self) -> &mut Self;

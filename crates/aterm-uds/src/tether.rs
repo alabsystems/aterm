@@ -15,14 +15,25 @@
 //! forked it. Darwin has none, so a tethered spawn there runs this process's own executable as
 //! [`VERB`] first, under [`NAME`], and that tether leaves a watcher behind as it execs the child in
 //! its own place: the parent's handle names the child itself, its pid, its signals and its exit
-//! status. The watcher is a grandchild of the tether, adopted by launchd, holding a kqueue watch on
-//! the parent's exit and exec (`NOTE_EXIT`, `NOTE_EXEC`) and on the child's exit. It leads a
-//! session of its own, made before it arms, so a listing of the child's group (a stage sweep's), a
-//! kill of that group and a hangup of the child's terminal never count or reach it (a group
-//! leader's group lists the watcher's anchor, a zombie, as below); it still ends with the child by
-//! its exit watch. When the parent exits, or execs in its own place (an update's
-//! cold lane) as Linux's spawners end at, the watcher ends the child through [`end_proven`]
-//! ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
+//! status. A Linux spawn whose child leads its own process group (below) runs so too, its signal
+//! set as well, through the running image itself (`/proc/self/exe`), which no file put at the
+//! executable's path since replaces (`route`). The watcher is a grandchild of the tether,
+//! adopted by launchd (on Linux by init, or the nearest subreaper), watching the parent's end and
+//! the child's exit: on Darwin by a kqueue watch on the parent's exit and exec (`NOTE_EXIT`,
+//! `NOTE_EXEC`) and on the child's exit; on Linux by pidfds (Linux 5.3), one of the thread that
+//! forked the tether, which ends at the parent's exit or exec as the signal's thread does
+//! (`THREAD_VAR`; `PIDFD_THREAD`, Linux 6.9; an older kernel watches the parent's own, readable
+//! at its exit alone), and one of the child. A Linux kernel with no pidfd, or a seccomp filter
+//! that refuses one, arms the watcher with nothing to watch, and the child is tied by its signal
+//! alone. A Linux `/proc` mounted with `hidepid` lists no group whole, so a watcher there could
+//! never tell its group had emptied: a spawn there routes nothing (`route`), nor does one of a
+//! process whose pid is 1, whose orphans it adopts itself. The watcher leads a session of its
+//! own, made before it arms, so a listing of the child's group (a stage sweep's), a kill of that
+//! group and a hangup of the child's terminal never count or reach it (a group leader's group
+//! holds the watcher's anchor, a zombie, as below, which Darwin's listing shows and Linux's passes
+//! by); it still ends with the child by its exit watch. When the parent exits, or execs in its own
+//! place (an update's cold lane) as Linux's spawners end at, the watcher ends the child through
+//! [`end_proven`] ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
 //! [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid still reads the
 //! birth and kernel unique id the tether read of itself before it forked the watcher
 //! ([`Watched`]), and its one thread has run ([`Proof`]). A child macOS's program check holds
@@ -34,16 +45,17 @@
 //! (a spawn's `process_group(0)` or session) is a pipeline's root, whose descendants in that group
 //! would run on, adopted, once it alone ended. Its watcher holds the group by an anchor, a child
 //! of its own forked before it leaves the group, which exits at once and is never reaped, so the
-//! group id names the child's group and no other's while the watcher lives (`group`). When the
+//! group id names the child's group and no other while the watcher lives (`group`). When the
 //! parent exits or execs, the watcher ends the whole group, `SIGTERM` then `SIGKILL` rounds
 //! (`group::end_group`), then the child alone, as above, should it have left the group. When the
 //! child exits first, the watcher of a group leader stays while the group holds a live member,
 //! woken by each member's exit, and ends the group should the parent go first (`group::linger`);
-//! the watcher of any other child exits with it. Linux's parent-death signal reaches the child
-//! alone. The tether execs the child only
-//! once the watcher is armed and the parent is still its own parent; an exec of the parent before
-//! the watcher armed (on Linux, before the child set its signal) ends nothing. A kill by the
-//! parent's name passes the watcher by.
+//! the watcher of any other child exits with it. Linux leaves a watcher for a group leader alone:
+//! any other tethered child there is tied by its signal alone. The tether execs the child only
+//! once the watcher is armed and the parent is still its own parent. An exec of the parent before
+//! the watcher armed ends nothing on Darwin; on Linux a forking thread gone by then leaves the
+//! watcher unarmed and the tether starts nothing, and a child with no watcher is tied from the
+//! moment it set its signal. A kill by the parent's name passes the watcher by.
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -58,11 +70,12 @@ use crate::process::{Birth, EndControl, EndRefusal, Ended, Identity, Lineage, en
 /// <argv0> [args…]`.
 pub const VERB: &str = "__tether";
 
-/// The `argv[0]` a tether runs under on Darwin, and so its watcher, a fork that never execs: not
-/// the parent's. macOS's `killall` and `pkill` name a process by its `argv[0]`'s last part, not by
-/// the kernel's name, which stays the executable's (measured on macOS 27.0), so a kill by the
-/// window's name (`killall -9 aterm`, `pkill -9 aterm`) ends the window and leaves the watcher to
-/// end the child. `aterm` is no part of it, as `pkill` matches a part.
+/// The `argv[0]` a tether runs under, and so its watcher, a fork that never execs: not the
+/// parent's. macOS's `killall` and `pkill` name a process by its `argv[0]`'s last part, not by the
+/// kernel's name, which stays the executable's (measured on macOS 27.0), so a kill by the window's
+/// name (`killall -9 aterm`, `pkill -9 aterm`) ends the window and leaves the watcher to end the
+/// child. Linux's `pkill` names a process by the kernel's name, so a Linux watcher takes this one
+/// as that name too (`KERNEL_NAME`). `aterm` is no part of it, as `pkill` matches a part.
 pub const NAME: &str = "tether";
 
 /// A tether's exit code when it started nothing: the pid it was given is not its parent (that
@@ -144,7 +157,7 @@ pub fn end_watched(
     })
 }
 
-/// How long a Darwin watcher waits on its child's exit before it reads a held child again.
+/// How long a watcher waits on its child's exit before it reads a held child again.
 pub const HELD_RECHECK: Duration = Duration::from_millis(250);
 
 /// The watcher's end of its child once the parent is gone, by its exit or by an exec in its
@@ -153,7 +166,7 @@ pub const HELD_RECHECK: Duration = Duration::from_millis(250);
 /// signal, and `exited` waits on it up to [`HELD_RECHECK`], answering `true` once it has exited;
 /// once anything else reads, it is ended as [`end_watched`] ends it. `None` when it exited while
 /// held, with no signal sent.
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 fn end_once_run(
     watched: Watched,
     grace: Duration,
@@ -169,7 +182,7 @@ fn end_once_run(
 
 /// [`end_once_run`]'s wait: while the child is held before its first instruction, wait on its
 /// exit; `true` once it exited while held, `false` once anything else reads.
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 fn held_until_exit(
     watched: Watched,
     control: &mut impl EndControl,
@@ -191,7 +204,7 @@ fn held_until_exit(
 }
 
 /// A query's positive original-child exit is distinct from a failed watch read.
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildExitNotice {
     Pending,
@@ -200,7 +213,7 @@ enum ChildExitNotice {
 }
 
 /// Positive point evidence, not permission retained across later signals.
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 fn group_readiness(
     watched: Watched,
     control: &mut impl EndControl,
@@ -241,7 +254,7 @@ fn group_readiness(
 
 /// The production parent-exit path: retain the initial held wait, then renew
 /// positive point readiness immediately before each owned-group signal.
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 fn end_group_once_ready(
     watched: Watched,
     mut exited: bool,
@@ -295,14 +308,23 @@ struct Through {
     exe: PathBuf,
     /// Its file's device and inode then; `None` when they did not read.
     file: Option<(u64, u64)>,
+    /// Whether it is this process's own image, as [`entry`] records it; a test's [`through`]
+    /// names another.
+    #[cfg(target_os = "linux")]
+    own: bool,
 }
 
 impl Through {
-    /// `exe`, with the file at its path now.
+    /// `exe`, another process's image, with the file at its path now.
     #[cfg(any(unix, test, debug_assertions))]
     fn of(exe: PathBuf) -> Self {
         let file = file_at(&exe);
-        Self { exe, file }
+        Self {
+            exe,
+            file,
+            #[cfg(target_os = "linux")]
+            own: false,
+        }
     }
 
     /// Its path, while the file there is still the one recorded.
@@ -327,7 +349,8 @@ fn file_at(path: &Path) -> Option<(u64, u64)> {
 
 /// Called in an executable's `main` before anything that starts a thread. Asked for [`VERB`], it
 /// serves it and answers the exit code. Otherwise it records this executable as the one this
-/// process's tethered spawns run through on Darwin, and answers `None`.
+/// process's tethered spawns run through (on Linux, a group leader's: `route`), and answers
+/// `None`.
 #[must_use = "return a handled tether command's exit status to the caller"]
 pub fn entry() -> Option<ExitCode> {
     #[cfg(unix)]
@@ -336,7 +359,13 @@ pub fn entry() -> Option<ExitCode> {
         if args.next().is_some_and(|first| first == VERB) {
             return Some(serve(&args.collect::<Vec<_>>()));
         }
-        let _ = THROUGH.get_or_init(|| std::env::current_exe().ok().map(Through::of));
+        let _ = THROUGH.get_or_init(|| {
+            std::env::current_exe().ok().map(|exe| Through {
+                #[cfg(target_os = "linux")]
+                own: true,
+                ..Through::of(exe)
+            })
+        });
     }
     None
 }
@@ -355,7 +384,9 @@ pub fn executable() -> Option<&'static Path> {
 /// ([`entry`]), or a test named an executable ([`through`]), but no unchanged executable is
 /// recorded now (an update or a rebuild put another file at its path, or none read when it was
 /// recorded), so on Darwin a tethered spawn starts its child untethered. `false` where nothing
-/// was recorded (a test binary's own spawns), and off Darwin, whose tie needs no executable.
+/// was recorded (a test binary's own spawns), and off Darwin, whose tie needs no executable: the
+/// parent-death signal, and a Linux group leader's tether run through the running image itself
+/// (`route`).
 #[must_use]
 pub fn lost() -> bool {
     cfg!(target_vendor = "apple") && lost_of(THROUGH.get())
@@ -373,24 +404,46 @@ pub fn through(exe: PathBuf) {
     let _ = THROUGH.set(Some(Through::of(exe)));
 }
 
-/// The tether's argv for `program` started from this process, after its `argv[0]` ([`NAME`]):
-/// [`VERB`], this pid, the program, its `argv[0]`, its arguments. `None` when this process records
-/// no executable to run through. The spawn judges the program's search first
-/// (`spawnfd::platform::findable`), since the tether runs it only after the spawn returned.
-#[cfg(target_vendor = "apple")]
+/// The tether's image and argv for `program` started from this process, after its `argv[0]`
+/// ([`NAME`]): [`VERB`], this pid, the program, its `argv[0]`, its arguments. The image is
+/// [`executable`]; on Linux, once this process's `main` served [`entry`], its running image itself
+/// (`/proc/self/exe`), which an update's or a rebuild's file at the executable's path does not
+/// replace, so such a tie is never lost there. `None` when this process records no executable to
+/// run through, on Linux where `/proc` hides processes (`hidepid`), and in a process whose pid is
+/// 1 (a container's first process, or a PID namespace's), a parent no tether takes
+/// ([`parent_pid`]), since its orphans are adopted by it: the child is then tied by Linux's signal
+/// alone, and starts untethered on Darwin. The spawn judges the program's search first
+/// (`spawnfd::program_search::findable`), since the tether runs it only after the spawn returned.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(crate) fn route(
     program: &std::ffi::OsStr,
     arg0: Option<&std::ffi::OsStr>,
     args: &[OsString],
 ) -> Option<(PathBuf, Vec<OsString>)> {
-    let exe = executable()?;
+    if std::process::id() == 1 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let exe = if THROUGH.get()?.as_ref()?.own {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        executable()?.to_path_buf()
+    };
+    // A `/proc` that hides processes lists no group whole, so the watcher could never tell the
+    // group had emptied (`group::linger`).
+    #[cfg(target_os = "linux")]
+    if !crate::process::group_listing_can_be_whole() {
+        return None;
+    }
+    #[cfg(target_vendor = "apple")]
+    let exe = executable()?.to_path_buf();
     let mut routed = Vec::with_capacity(args.len() + 4);
     routed.push(OsString::from(VERB));
     routed.push(OsString::from(std::process::id().to_string()));
     routed.push(program.to_owned());
     routed.push(arg0.unwrap_or(program).to_owned());
     routed.extend(args.iter().cloned());
-    Some((exe.to_path_buf(), routed))
+    Some((exe, routed))
 }
 
 /// [`VERB`]: tie this process to `parent`, then exec the program in its place.
@@ -411,15 +464,26 @@ fn serve(rest: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(UNTETHERED);
     }
-    // The spawn judged the search by the `PATH` it gave this tether, passing over an entry too
-    // long to join to the name, as the search of a `PATH` a spawn sets does
-    // (`spawnfd::platform::findable`): the exec searches it as that `PATH`, not as this process's
-    // own, whose search ends at such an entry.
-    let mut command = crate::spawnfd::command(program);
+    // The spawn judged the search by the `PATH` it gave this tether
+    // (`spawnfd::program_search::findable`), so the exec searches it as a `PATH` a spawn sets: on
+    // Darwin not as this process's own, whose search ends at an entry too long to join to the name.
+    // This tether holds the descriptors its spawn handed it and no others (every one it inherits
+    // for a transparent spawn, stdio alone otherwise), so the exec hands them on as they are.
+    let mut command = crate::spawnfd::transparent(program).into_command();
+    // The forking thread's id is the watcher's to read ([`THREAD_VAR`]), never the program's.
+    #[cfg(target_os = "linux")]
+    command.env_remove(THREAD_VAR);
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
-    let error = command.arg0(argv0).args(args).exec();
+    command.arg0(argv0).args(args);
+    // An image still open for writing (`ETXTBSY`) is tried again as a spawn tries it.
+    let error = match crate::spawnfd::spawn_past_text_busy(|| {
+        Err::<std::convert::Infallible, _>(command.exec())
+    }) {
+        Ok(never) => match never {},
+        Err(error) => error,
+    };
     eprintln!("aterm: {}: {error}", Path::new(program).display());
     ExitCode::from(NOT_RUN)
 }
@@ -447,14 +511,28 @@ fn parent_is(parent: i32) -> bool {
 }
 
 /// Tie this process to `parent` before its exec: Linux's parent-death signal, which the exec
-/// keeps.
+/// keeps, and for a process at the head of its own group (a spawn's `process_group(0)`, or a
+/// session) a watcher left behind ([`leave_watcher`]), which ends that group when the parent exits
+/// or execs (an exec from Linux 6.9, [`parent_end`]).
 #[cfg(target_os = "linux")]
 fn hold(parent: i32) -> Result<(), String> {
     bind(parent).map_err(|e| match e.raw_os_error() {
         Some(libc::ESRCH) => not_parent(parent),
         _ => format!("PR_SET_PDEATHSIG: {e}"),
-    })
+    })?;
+    // SAFETY: `getpgrp` and `getpid` take nothing and cannot fail.
+    if unsafe { libc::getpgrp() != libc::getpid() } {
+        return Ok(());
+    }
+    leave_watcher(parent)
 }
+
+/// The variable a Linux tethered spawn that runs through its tether ([`route`]) names the thread
+/// that forked it by, in decimal: that thread ends at this process's exit or exec, as the one the
+/// parent-death signal follows does ([`bind`]), so the tether's watcher watches it
+/// ([`parent_end`]). The tether takes it out of the program's environment.
+#[cfg(target_os = "linux")]
+pub(crate) const THREAD_VAR: &str = "ATERM_TETHER_THREAD";
 
 /// No death tie here: only a check that `parent` is still this process's parent.
 #[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
@@ -620,18 +698,25 @@ impl Spawners {
     }
 }
 
-/// Leave the watcher behind: read this process, the child it will exec into, as the watcher will
-/// know it ([`Watched`]; one that does not read arms nothing); fork, and fork again so launchd
-/// adopts the watcher (the child this process becomes has no child of its own to wait for); wait
-/// for it to arm, then check `parent` is still this process's parent, so the watch it armed is on
-/// the right process.
+/// Tie this process to `parent` before its exec: the check that `parent` is still this process's
+/// parent, then a watcher left behind ([`leave_watcher`]).
 #[cfg(target_vendor = "apple")]
 fn hold(parent: i32) -> Result<(), String> {
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
     if !parent_is(parent) {
         return Err(not_parent(parent));
     }
+    leave_watcher(parent)
+}
+
+/// Leave the watcher behind: read this process, the child it will exec into, as the watcher will
+/// know it ([`Watched`]; one that does not read arms nothing); fork, and fork again so launchd (on
+/// Linux, init or the nearest subreaper) adopts the watcher (the child this process becomes has
+/// no child of its own to wait for); wait for it to arm, then check `parent` is still this
+/// process's parent, so the watch it armed is on the right process.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn leave_watcher(parent: i32) -> Result<(), String> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
     let null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -907,13 +992,252 @@ unsafe fn watch(
     }
 }
 
+/// [`NAME`] as the kernel keeps a process's name (`PR_SET_NAME`): at most 15 bytes, then NUL.
+#[cfg(target_os = "linux")]
+const KERNEL_NAME: [u8; 16] = {
+    let mut name = [0_u8; 16];
+    let mut at = 0;
+    while at < NAME.len() && at < 15 {
+        name[at] = NAME.as_bytes()[at];
+        at += 1;
+    }
+    name
+};
+
+/// `pidfd_open(id, flags)`: a descriptor `poll(2)` reports readable once the process `id` names
+/// has exited (with `PIDFD_THREAD`, once that thread has), close-on-exec as every pidfd is.
+///
+/// # Errors
+/// The kernel's: `ESRCH` for no such process or thread, `EINVAL` for flags it does not know
+/// (`PIDFD_THREAD` before Linux 6.9), `ENOSYS` before Linux 5.3.
+#[cfg(target_os = "linux")]
+fn pidfd_open(id: i32, flags: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: `pidfd_open` takes a pid and flags and touches no memory of ours.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, id, flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = i32::try_from(fd).map_err(std::io::Error::other)?;
+    // SAFETY: a descriptor the call just made, which nothing else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// A descriptor readable once `parent` exits or execs in its own place: a pidfd of the thread
+/// [`THREAD_VAR`] names, which ends at either, as the parent-death signal's thread does, held
+/// once that thread reads as one of `parent`'s (`/proc/<parent>/task/<thread>`) with its pidfd
+/// open, so the descriptor names that thread. Where no thread is named, or the kernel opens no
+/// thread's pidfd (`EINVAL`, before Linux 6.9), the parent's own pidfd, readable at its exit
+/// alone.
+///
+/// # Errors
+/// [`pidfd_open`]'s, and `ESRCH` for a named thread that is not one of `parent`'s.
+#[cfg(target_os = "linux")]
+fn parent_end(parent: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    const PIDFD_THREAD: u32 = libc::O_EXCL.unsigned_abs();
+    if let Some(thread) = std::env::var_os(THREAD_VAR).as_deref().and_then(parent_pid) {
+        match pidfd_open(thread, PIDFD_THREAD) {
+            Ok(fd) if Path::new(&format!("/proc/{parent}/task/{thread}")).exists() => {
+                return Ok(fd);
+            }
+            Ok(_) => return Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    pidfd_open(parent, 0)
+}
+
+/// Waits on `exit`, the child's pidfd, up to [`HELD_RECHECK`] for its exit: `true` once it has
+/// exited, or when the wait itself fails (the watcher then gives up its watch, as on Darwin).
+#[cfg(target_os = "linux")]
+fn child_exited_within(exit: &std::os::fd::OwnedFd) -> bool {
+    !matches!(
+        child_exit_notice(exit, HELD_RECHECK),
+        ChildExitNotice::Pending
+    )
+}
+
+/// Typed read of the armed original child's exit on its pidfd `exit`, waiting up to `patience`:
+/// `Exited` once it reads readable, `Pending` at the timeout or an interrupted wait. A failed
+/// wait is `Unavailable`, which refuses execution evidence and never grants a group's positive
+/// Exited state.
+#[cfg(target_os = "linux")]
+fn child_exit_notice(exit: &std::os::fd::OwnedFd, patience: Duration) -> ChildExitNotice {
+    use std::os::fd::AsRawFd as _;
+    let mut fd = libc::pollfd {
+        fd: exit.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(patience.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one live `pollfd`, which `poll` reads and writes and does not retain.
+    match unsafe { libc::poll(&mut fd, 1, ms) } {
+        0 => ChildExitNotice::Pending,
+        1.. => ChildExitNotice::Exited,
+        _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+            ChildExitNotice::Pending
+        }
+        _ => ChildExitNotice::Unavailable,
+    }
+}
+
+/// The Linux watcher: Darwin's, pidfds in place of its kqueue. It holds a group leader's group by
+/// its anchor ([`anchored`]), leads a session of its own, takes [`NAME`] as its kernel name
+/// ([`KERNEL_NAME`]; Linux's `pkill` matches that name), puts stdio on `/dev/null`, opens a
+/// descriptor of the parent's end ([`parent_end`]) and a pidfd of the `watched` child, writes the
+/// arming byte, then waits. The parent's exit or exec ends a leader's group once the child reads
+/// started or exited ([`end_group_once_ready`]), then the child alone by its proof
+/// ([`end_once_run`]), with the live reads and `kill(2)`; the child's exit first leaves a
+/// leader's group watched while it holds a live member, and ends it should the parent end first
+/// (`group::linger`). A kernel with no pidfd (`ENOSYS`), or a seccomp filter that refuses one
+/// (`EPERM`), arms it with nothing to watch: it writes the byte and exits, and the child is tied
+/// by its parent-death signal alone. A forking thread gone by then, a parent already reaped, or a
+/// child whose pidfd does not open otherwise, leaves it unarmed. A parent that exited unreaped,
+/// watched by its own pidfd, arms it with its end already readable, so it ends the tether's group
+/// at once. Either way the tether starts nothing, as its parent check fails.
+///
+/// # Safety
+/// Only in a forked child of the tether, with `null`, `arming` and `armed` open, forked while the
+/// tether had one thread, so no lock is held that the reads, the clock and the sleep would wait
+/// on.
+#[cfg(target_os = "linux")]
+unsafe fn watch(
+    parent: i32,
+    watched: Watched,
+    leads: bool,
+    null: i32,
+    arming: i32,
+    armed: i32,
+) -> ! {
+    use std::os::fd::AsRawFd as _;
+    const PR_SET_NAME: i32 = 15;
+    unsafe extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+    let child = watched.pid;
+    // SAFETY (whole body): the function's contract; every pointer is to a live local or static.
+    unsafe {
+        // As on Darwin: the group held first, while the watcher is still in it, then out of the
+        // child's group and session before it arms.
+        let anchor = if leads {
+            match anchored() {
+                Some(anchor) => Some(anchor),
+                None => libc::_exit(1),
+            }
+        } else {
+            None
+        };
+        if libc::setsid() < 0 {
+            leave(anchor.as_ref(), 1);
+        }
+        prctl(PR_SET_NAME, KERNEL_NAME.as_ptr());
+        libc::close(armed);
+        for fd in 0..3 {
+            libc::dup2(null, fd);
+        }
+        if null > 2 {
+            libc::close(null);
+        }
+        let (gone, exit) = match (parent_end(parent), pidfd_open(child, 0)) {
+            (Ok(gone), Ok(exit)) => (gone, exit),
+            (Err(e), _) | (_, Err(e))
+                if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) =>
+            {
+                let armed = libc::write(arming, [1_u8].as_ptr().cast(), 1) == 1;
+                leave(anchor.as_ref(), i32::from(!armed));
+            }
+            _ => leave(anchor.as_ref(), 1),
+        };
+        if libc::write(arming, [1_u8].as_ptr().cast(), 1) != 1 {
+            leave(anchor.as_ref(), 1);
+        }
+        libc::close(arming);
+        let live = |anchor| group::GroupLive {
+            parent: gone.as_raw_fd(),
+            pgid: child,
+            anchor,
+        };
+        loop {
+            let mut fds = [gone.as_raw_fd(), exit.as_raw_fd()].map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            if libc::poll(fds.as_mut_ptr(), 2, -1) < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                leave(anchor.as_ref(), 1);
+            }
+            // The parent first, as on Darwin.
+            if fds[0].revents != 0 {
+                let proof = |pid| {
+                    Some(Proof {
+                        uniqueid: crate::process::read_lineage(pid)?.uniqueid,
+                        ran: crate::process::thread_ran(pid)?,
+                    })
+                };
+                let mut control = crate::process::EndControlLive;
+                if let Some(anchor) = &anchor {
+                    let _ended = end_group_once_ready(
+                        watched,
+                        fds[1].revents != 0,
+                        &mut control,
+                        proof,
+                        |patience| child_exit_notice(&exit, patience),
+                        &mut live(anchor),
+                    );
+                }
+                let _ended = end_once_run(
+                    watched,
+                    crate::process::END_GRACE,
+                    &mut control,
+                    proof,
+                    || child_exited_within(&exit),
+                );
+                leave(anchor.as_ref(), 0);
+            }
+            if fds[1].revents != 0 {
+                if let Some(anchor) = &anchor
+                    && group::linger(child, &mut live(anchor))
+                {
+                    let _ended = group::end_group_guarded(
+                        child,
+                        crate::process::END_GRACE,
+                        &mut live(anchor),
+                        || group::Readiness::Exited,
+                    );
+                }
+                leave(anchor.as_ref(), 0);
+            }
+        }
+    }
+}
+
+/// Ends the Linux watcher with `code`, its anchor reaped first: the watcher signals nothing
+/// after, and an anchor left a zombie would pass to the namespace's init with the watcher, which
+/// need not reap it (a container's `sleep` as its pid 1). The watcher itself is left to that
+/// init, as any daemon is.
+#[cfg(target_os = "linux")]
+fn leave(anchor: Option<&Anchor>, code: i32) -> ! {
+    if let Some(anchor) = anchor {
+        let mut status = 0;
+        // SAFETY: the watcher's own exited child, unreaped until this wait, which nothing else
+        // waits on; a live local status word.
+        unsafe { libc::waitpid(anchor.pid, &mut status, libc::WNOHANG) };
+    }
+    // SAFETY: `_exit` takes a status and returns to nothing.
+    unsafe { libc::_exit(code) }
+}
+
 /// The watcher's anchor in the group its child leads: a fork that exits at once, seen exited by
 /// `waitid`'s `WNOWAIT` and left unreaped, with `SIGCHLD` reset to its default so the kernel does
 /// not reap it either. `None` when it could not be made so.
 ///
 /// # Safety
 /// As [`watch`]'s, before the watcher leaves the child's group.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 unsafe fn anchored() -> Option<Anchor> {
     // SAFETY (whole body): the function's contract; every pointer is to a live local.
     unsafe {
@@ -935,18 +1259,22 @@ unsafe fn anchored() -> Option<Anchor> {
         loop {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             if libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) == 0 {
-                if terminal_anchor_wait(anchor, info.si_signo, info.si_pid, info.si_code) {
+                #[cfg(target_vendor = "apple")]
+                let pid = info.si_pid;
+                #[cfg(target_os = "linux")]
+                let pid = info.si_pid();
+                if terminal_anchor_wait(anchor, info.si_signo, pid, info.si_code) {
                     return Some(Anchor { pid: anchor });
                 }
                 // Darwin can report a stop despite WEXITED. This is still our
                 // actual, unreaped fork, but it is not an exited anchor. Refuse
                 // arming and clean up that owned child, never a listed pid.
-                if info.si_signo == libc::SIGCHLD && info.si_pid == anchor {
+                if info.si_signo == libc::SIGCHLD && pid == anchor {
                     retire_unarmed_anchor(anchor);
                 }
                 return None;
             }
-            if *libc::__error() != libc::EINTR {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 return None;
             }
         }
@@ -954,7 +1282,7 @@ unsafe fn anchored() -> Option<Anchor> {
 }
 
 /// A matching pid alone is insufficient: WEXITED may report a stopped Darwin child.
-#[cfg(any(target_vendor = "apple", all(test, unix)))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(test, unix)))]
 fn terminal_anchor_wait(expected: i32, signo: i32, pid: i32, code: i32) -> bool {
     signo == libc::SIGCHLD
         && pid == expected
@@ -967,7 +1295,7 @@ fn terminal_anchor_wait(expected: i32, signo: i32, pid: i32, code: i32) -> bool 
 ///
 /// # Safety
 /// The caller is the sole waiter of this actual, unreaped fork, as in `anchored()`.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 unsafe fn retire_unarmed_anchor(anchor: i32) {
     // SAFETY (whole body): that actual child remains unreaped until this sole
     // wait returns its pid. No signal is sent after the wait, even on error.
@@ -979,7 +1307,8 @@ unsafe fn retire_unarmed_anchor(anchor: i32) {
             let mut status = 0;
             let got = libc::waitpid(anchor, &mut status, libc::WNOHANG);
             if got == anchor && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
-                || got < 0 && *libc::__error() != libc::EINTR
+                || got < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
             {
                 return;
             }
@@ -994,12 +1323,12 @@ unsafe fn retire_unarmed_anchor(anchor: i32) {
 
 /// The watcher's actual exited child, never reaped while this native watch runs.
 /// Only `anchored()` constructs it after its own fork and successful WNOWAIT.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(super) struct Anchor {
     pid: i32,
 }
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
 #[path = "tether_group.rs"]
 mod group;
 

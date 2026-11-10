@@ -846,6 +846,18 @@ fn local_vms(tart: &str) -> Result<String, Fail> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Reuse an already prepared base without booting or changing an image to prepare one.
+///
+/// # Errors
+/// Tart's local image list could not be read.
+pub(crate) fn existing_prepared_base(tart: &str, image: &str) -> Result<Option<String>, Fail> {
+    let base = prep_name(image, &Prep::default());
+    Ok(local_vms(tart)?
+        .lines()
+        .any(|name| name.trim() == base)
+        .then_some(base))
+}
+
 /// The prepared base for `image` ([`base_name`]): the one here, else made now from a clone of the
 /// image (SIP on and, `fda`, the grant first) and kept stopped. `between` is called between the
 /// steps, so a build the caller runs meanwhile that failed ends the lane at once.
@@ -1173,7 +1185,7 @@ pub(crate) fn report_ended_lanes(tart: &str) {
     }
 }
 
-fn sip_on(status: &str) -> bool {
+pub(crate) fn sip_on(status: &str) -> bool {
     status.contains("status: enabled") && !status.contains("disabled")
 }
 

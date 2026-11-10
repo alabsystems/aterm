@@ -12942,6 +12942,14 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
         project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountManualReceipt",
+        action = "Commit",
+        project = "aterm_agent::harness::cli::tests::manual_receipt::transition"
+    )
+)]
 fn accounts_add_admitted(
     cli: Cli,
     env: &Env,
@@ -13029,10 +13037,12 @@ fn accounts_add_admitted(
         dir: Some(dir_text.to_owned()),
         ..asked.clone()
     };
-    let fleets = if source.is_some() {
-        Vec::new()
+    let plan = if source.is_some() {
+        None
     } else {
-        fleet_rows_for_write(cli, env, &path, &asked)?
+        Some(super::accounts_sync::ManualRosterPlan::capture(
+            cli, env, &path, &asked,
+        )?)
     };
     let rows = if listed_own {
         vec![own, asked]
@@ -13052,8 +13062,7 @@ fn accounts_add_admitted(
         }
     })?;
     let dir_held_files = accounts::login_made(&dir);
-    // The fleet first: a fleet that lists the row and a roster that does not yet is mended by
-    // the next sync, never the other way round.
+    super::accounts_sync::protect_manual_roster(cli, env, &path)?;
     store
         .transact_roster_prepared_held(
             &_held,
@@ -13064,12 +13073,35 @@ fn accounts_add_admitted(
                 before: before.as_deref(),
                 after: Some(&text),
                 mode: keep_mode,
-                fleet: None,
+                fleet: plan
+                    .as_ref()
+                    .and_then(|plan| plan.fleet.as_ref())
+                    .map(|edit| edit.target(&path)),
             },
-            false,
-            (source, || {
-                write_fleet_rows(&fleets).map_err(|why| format!("{why}; the roster is unchanged"))
-            }),
+            plan.as_ref()
+                .is_some_and(super::accounts_sync::ManualRosterPlan::retires_legacy),
+            (
+                source.or_else(|| {
+                    plan.as_ref()
+                        .and_then(super::accounts_sync::ManualRosterPlan::guard)
+                }),
+                || {
+                    #[cfg(test)]
+                    if let Some(plan) = &plan {
+                        plan.early_write_negative_control()?;
+                    }
+                    if !current() {
+                        return Err(
+                            "manual account creation was cancelled before publication".into()
+                        );
+                    }
+                    super::accounts_sync::protect_manual_roster(cli, env, &path)?;
+                    plan.as_ref().map_or(
+                        Ok(()),
+                        super::accounts_sync::ManualRosterPlan::check_current,
+                    )
+                },
+            ),
         )
         .map_err(SyncError::into_message)?;
     Ok(Added {
@@ -13077,7 +13109,12 @@ fn accounts_add_admitted(
         dir,
         listed_own,
         dir_held_files,
-        fleets: fleets.into_iter().map(|(fleet, _)| fleet).collect(),
+        fleets: plan
+            .into_iter()
+            .filter_map(|plan| plan.fleet)
+            .filter(|edit| edit.changed())
+            .map(|edit| edit.path)
+            .collect(),
     })
 }
 
@@ -13104,62 +13141,6 @@ fn creation_signin_guard(
         .map_err(|why| format!("{}: {why}", store.shared_dir().display()))?
         .map(|(turn, _)| turn)
         .ok_or_else(|| "manual sign-in cancelled; account metadata is unchanged".to_owned())
-}
-
-/// Where `accounts add` or `adopt-default` lists `asked` beside the roster at `path` so that the next sync keeps it
-/// ([`super::accounts_sync::fleet_origin`]): nowhere for a roster no fleet writes or another
-/// CLI's (its sync removes no row); each local fleet file of Claude Code's, with the text it then
-/// holds ([`super::accounts_sync::list_in_local_fleet`]).
-/// # Errors
-/// The roster is written from a source this machine reads and does not write (`[fleet]
-/// accounts_source`, the vault's files), which would drop the row at its next sync; or the
-/// local fleet refuses the row.
-fn fleet_rows_for_write(
-    cli: Cli,
-    env: &Env,
-    path: &Path,
-    asked: &accounts::Row,
-) -> Result<Vec<(PathBuf, String)>, String> {
-    use super::accounts_sync::{FleetOrigin, fleet_origin, list_in_local_fleet};
-    if cli != Cli::Claude {
-        return Ok(Vec::new());
-    }
-    let origin = fleet_origin(
-        &env.accounts_store(),
-        env.home.as_deref(),
-        env.config.as_deref(),
-        path,
-    );
-    let from = match &origin {
-        FleetOrigin::Roster | FleetOrigin::Alab => return Ok(Vec::new()),
-        FleetOrigin::AlabPending(why) | FleetOrigin::SourcePending(why) => return Err(why.clone()),
-        FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
-        FleetOrigin::Key(_) => "list the account there",
-        FleetOrigin::Vault(_) => {
-            "list the account where that file comes from (the vault's entry, on a Mac that \
-             edits the vault)"
-        }
-    };
-    Err(format!(
-        "this machine's accounts come from {}, which a sync writes {} from and this machine does \
-         not write, so a row listed here alone would be dropped at the next sync: {from} (its \
-         email, and this machine among its `machines`) before changing the local roster; \
-         nothing was written",
-        origin.words(),
-        path.display()
-    ))
-}
-
-/// Persist owned source metadata before its derived local roster. Individual files are
-/// atomic; if a later file fails, earlier source membership remains available for sync.
-/// Default-home and canonical-identity fields still depend on the local roster.
-fn write_fleet_rows(fleets: &[(PathBuf, String)]) -> Result<(), String> {
-    for (fleet, text) in fleets {
-        let (target, mode) = roster_target(fleet)?;
-        super::upgrade_models::write_atomic_mode(&target, text, mode)
-            .map_err(|why| format!("{}: {why}", target.display()))?;
-    }
-    Ok(())
 }
 
 fn ask_login(host: &dyn AccountsHost, dir: Option<&str>, made: bool) -> LoginCheck {
@@ -13996,6 +13977,14 @@ fn accounts_use_decided(
         project = "aterm_agent::harness::cli::tests::label_retention::creation_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountManualReceipt",
+        action = "Commit",
+        project = "aterm_agent::harness::cli::tests::manual_receipt::transition"
+    )
+)]
 fn run_accounts_adopt(
     cli: Cli,
     env: &Env,
@@ -14094,16 +14083,34 @@ fn run_accounts_adopt(
         }
         store.check_new_rows(std::slice::from_ref(row), &roster, env.now)?;
         let text = accounts::append_rows_for(cli, &existing, std::slice::from_ref(row))?;
-        let fleets = fleet_rows_for_write(cli, env, &path, row)?;
+        let plan = super::accounts_sync::ManualRosterPlan::capture(cli, env, &path, row)?;
         check_native()?;
-        store.transact_roster_prepared_held(&_held, env.now, &mut None, accounts::SyncTarget {
-            path: &write_to, before: before.as_deref(), after: Some(&text), mode: keep_mode, fleet: None,
-        }, false, (None, || {
-            write_fleet_rows(&fleets).map_err(|why| {
-                format!("{why}; the local roster is unchanged; any source files already written are retained for sync")
-            })?;
-            check_native()
-        })).map_err(SyncError::into_message)?;
+        store
+            .transact_roster_prepared_held(
+                &_held,
+                env.now,
+                &mut None,
+                accounts::SyncTarget {
+                    path: &write_to,
+                    before: before.as_deref(),
+                    after: Some(&text),
+                    mode: keep_mode,
+                    fleet: plan.fleet.as_ref().map(|edit| edit.target(&path)),
+                },
+                plan.retires_legacy(),
+                (plan.guard(), || {
+                    #[cfg(test)]
+                    plan.early_write_negative_control()?;
+                    if host.work_cancelled() || window_end_noted() {
+                        return Err(
+                            "manual account adoption was cancelled before publication".into()
+                        );
+                    }
+                    plan.check_current()?;
+                    check_native()
+                }),
+            )
+            .map_err(SyncError::into_message)?;
         Ok(path)
     })();
     match done {
@@ -14151,6 +14158,33 @@ pub fn account_adopt_identity_environment() {}
 )]
 #[doc(hidden)]
 pub fn account_adopt_source_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountManualReceipt",
+        action = "Operation",
+        reason = "Choose add or adoption."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountManualReceipt",
+        action = "Source",
+        reason = "Choose a local projection or equal legacy copy."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountManualReceipt",
+        action = "Cut",
+        reason = "Choose an intent or replay interruption."
+    )
+)]
+#[doc(hidden)]
+pub fn account_manual_receipt_environment() {}
 
 #[cfg_attr(
     any(test, debug_assertions),

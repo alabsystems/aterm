@@ -96,9 +96,22 @@ struct Told {
     /// several moves told meanwhile are one wake and a route move is the one a consumer that
     /// looks again only on a route move (the API reach probe) must not miss.
     route: u64,
+    /// A native wait generation, closed on the next move. Every waiter keeps its own Arc,
+    /// so one consumer cannot drain another's notification.
+    #[cfg(unix)]
+    wake: Option<Arc<aterm_uds::stop::Stop>>,
 }
 
 impl Told {
+    /// Arm while holding the same mutex as the event predicate.
+    #[cfg(unix)]
+    fn wake(&mut self) -> Arc<aterm_uds::stop::Stop> {
+        Arc::clone(
+            self.wake
+                .get_or_insert_with(|| Arc::new(aterm_uds::stop::Stop::new())),
+        )
+    }
+
     /// What a watch that heard up to move `seen` is told now: the route move where one came
     /// since, else the last move's source.
     const fn heard_since(&self, seen: u64) -> Woke {
@@ -138,6 +151,8 @@ impl Moved {
                 source: Woke::Timer,
                 due: None,
                 route: 0,
+                #[cfg(unix)]
+                wake: None,
             }),
             changed: Condvar::new(),
             spread,
@@ -172,6 +187,10 @@ impl Moved {
         told.due = due;
         if source == Woke::Route {
             told.route = told.count;
+        }
+        #[cfg(unix)]
+        if let Some(wake) = told.wake.take() {
+            wake.set();
         }
         drop(told);
         self.changed.notify_all();
@@ -222,6 +241,53 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
+    /// Wait for this watch's next due move, either stop, or the original absolute deadline.
+    /// A native wake only prompts another predicate check; it supplies no admission authority.
+    /// `None` means a stop, and a deadline leaves a move whose spread is not due queued.
+    ///
+    /// # Errors
+    /// A native bell or readiness wait failed. The caller retains its timed fallback.
+    #[cfg(unix)]
+    pub(crate) fn wait_until(
+        &mut self,
+        stops: &[&aterm_uds::stop::Stop],
+        deadline: Option<Instant>,
+    ) -> std::io::Result<Option<Woke>> {
+        loop {
+            if stops.iter().any(|stop| stop.is_set()) {
+                return Ok(None);
+            }
+            let (wake, until) = {
+                let mut told = self
+                    .moved
+                    .told
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let now = Instant::now();
+                let unheard = told.count != self.seen;
+                let due = told.due.filter(|_| self.spread && unheard);
+                if unheard && due.is_none_or(|due| now >= due) {
+                    let woke = told.heard_since(self.seen);
+                    self.seen = told.count;
+                    return Ok(Some(woke));
+                }
+                if deadline.is_some_and(|at| now >= at) {
+                    return Ok(Some(Woke::Timer));
+                }
+                let until = match (deadline, due) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                (told.wake(), until)
+            };
+            let bells = stops
+                .iter()
+                .map(|stop| stop.bell())
+                .collect::<std::io::Result<Vec<_>>>()?;
+            wake.wait_ready(&bells, until)?;
+        }
+    }
+
     /// Wait at most `most` for a move this watch was not told of, once it is due (this Mac's
     /// spread after it was told): the source of the latest one (several told meanwhile are one
     /// wake), a route move where one of them was ([`Told::heard_since`]), else [`Woke::Timer`],
@@ -1131,7 +1197,100 @@ pub(crate) mod tests {
         assert_eq!(two.take(), Some(Woke::Route));
         assert_eq!(one.take(), None, "told once");
         assert_eq!(moved.watch().take(), None, "a later watch was not told");
-        assert_eq!(one.wait(Duration::from_millis(1)), Woke::Timer);
+        assert_eq!(one.wait(Duration::ZERO), Woke::Timer);
+
+        #[cfg(unix)]
+        {
+            use aterm_uds::stop::Stop;
+
+            let moved = Arc::new(Moved::new());
+            let (mut one, mut two) = (moved.watch_at_once(), moved.watch_at_once());
+            let run_stop = Stop::new();
+            let generation_stop = Stop::new();
+            let stops = [&run_stop, &generation_stop];
+            let deadline = Instant::now() + HANG;
+
+            // A queued event wins without needing a native waiter to have been installed.
+            moved.tell(Woke::Route);
+            assert_eq!(
+                one.wait_until(&stops, Some(deadline)).unwrap(),
+                Some(Woke::Route)
+            );
+            assert_eq!(
+                two.wait_until(&stops, Some(deadline)).unwrap(),
+                Some(Woke::Route)
+            );
+
+            // Both native waiters borrow this same generation. The real broadcast must
+            // leave its descriptor ready for each, even when neither was polling yet.
+            let waiting = moved.told.lock().unwrap().wake();
+            let bell = waiting.bell().unwrap();
+            moved.tell(Woke::Place);
+            for _ in 0..2 {
+                assert_eq!(
+                    aterm_uds::ready::any_now(&[bell]).unwrap(),
+                    [0],
+                    "a native notification is retained for every waiter"
+                );
+            }
+            assert_eq!(
+                one.wait_until(&stops, Some(deadline)).unwrap(),
+                Some(Woke::Place)
+            );
+            assert_eq!(
+                two.wait_until(&stops, Some(deadline)).unwrap(),
+                Some(Woke::Place)
+            );
+            assert_eq!(
+                one.wait_until(&stops, Some(Instant::now())).unwrap(),
+                Some(Woke::Timer),
+                "a consumed native generation must not spin"
+            );
+
+            // A new move does not renew the caller's original maintenance deadline.
+            let due = Instant::now();
+            moved.tell(Woke::Beacon);
+            assert_eq!(
+                one.wait_until(&stops, Some(due)).unwrap(),
+                Some(Woke::Beacon)
+            );
+            assert_eq!(
+                one.wait_until(&stops, Some(due)).unwrap(),
+                Some(Woke::Timer)
+            );
+
+            // Either stop ends the same native wait without consuming a queued move.
+            for run in [false, true] {
+                let run_stop = Arc::new(Stop::new());
+                let generation_stop = Arc::new(Stop::new());
+                let mut watch = moved.watch_at_once();
+                let cancelled = if run { &run_stop } else { &generation_stop };
+                cancelled.set();
+                moved.tell(Woke::Route);
+                assert_eq!(
+                    watch
+                        .wait_until(&[&run_stop, &generation_stop], Some(deadline))
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(watch.take(), Some(Woke::Route));
+
+                let run_stop = Arc::new(Stop::new());
+                let generation_stop = Arc::new(Stop::new());
+                let (worker_run, worker_generation) =
+                    (Arc::clone(&run_stop), Arc::clone(&generation_stop));
+                let mut watch = moved.watch_at_once();
+                let worker = std::thread::spawn(move || {
+                    watch.wait_until(&[&worker_run, &worker_generation], Some(deadline))
+                });
+                if run {
+                    run_stop.set();
+                } else {
+                    generation_stop.set();
+                }
+                assert_eq!(worker.join().unwrap().unwrap(), None);
+            }
+        }
     }
 
     /// Joining a LAN tells a route move, and the `_alab._tcp` browse or a Commons beacon tells

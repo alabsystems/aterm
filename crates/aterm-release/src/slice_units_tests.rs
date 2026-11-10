@@ -9,8 +9,70 @@ const GIB: u64 = 1 << 30;
 const NATIVE: &str = "aarch64-apple-darwin";
 const COMPAT: &str = "x86_64-apple-darwin";
 
+/// A toolchain bump, or the first cut on a Mac, must admit both drivers beside the
+/// release's tree. The former whole-slice isolation fails before starting either.
 #[test]
-fn stale_compiler_and_rss_records_cannot_admit_an_unmeasured_link() {
+fn cold_and_changed_toolchains_start_both_slices_beside_the_tree() {
+    for old_records in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("units.json");
+        let mut records = Records::default();
+        if old_records {
+            for triple in [NATIVE, COMPAT] {
+                let mut old = key(triple, &last_unit());
+                old.variant = Some(format!("{triple} aterm bin prior-metric prior-toolchain"));
+                records.push(old, 35_506_777_064, 1);
+            }
+            records.save(&path).unwrap();
+        }
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading {
+            available: Some(89 * GIB / 2),
+            ..aterm_capacity::Reading::of_gib(64, 0, 14)
+        });
+        let tree = aterm_capacity::admit::try_admit_with(
+            &ledger,
+            &machine,
+            aterm_capacity::Need::new("qualify tree test").mem(39 * GIB / 10),
+        )
+        .unwrap()
+        .unwrap();
+        let units = Units::of(&path, &[NATIVE, COMPAT], 2);
+        let mut drivers = Vec::new();
+        for u in &units {
+            let need = slice_need(u.triple(), Some(u));
+            let claim = aterm_capacity::admit::try_admit_with(&ledger, &machine, need)
+                .unwrap()
+                .expect("slice driver starts while tree and sibling remain held");
+            assert!(claim.alone().is_none());
+            assert!(u.claims());
+            drivers.push(claim);
+            let link = unit_need(u.triple(), &records, &last_unit(), 2 * DRIVER);
+            assert_eq!(link.alone, !old_records);
+            if old_records {
+                assert_eq!(
+                    link.mem,
+                    40 * GIB,
+                    "largest prior unit plus the normal margin"
+                );
+            }
+            let cold = unit_need_on(
+                u.triple(),
+                &Records::default(),
+                &unit("aterm-gui", "aterm_gui lib"),
+                2 * DRIVER,
+                Some(64 * GIB),
+            );
+            assert!(!cold.alone);
+            assert_eq!(cold.mem, 20 * GIB);
+        }
+        assert_eq!(drivers.len(), 2);
+        drop((drivers, tree));
+    }
+}
+
+#[test]
+fn compiler_and_metric_changes_keep_estimates_without_renaming_measurements() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let record = dir.path().join("units.json");
     let mut records = Records::default();
@@ -38,39 +100,31 @@ fn stale_compiler_and_rss_records_cannot_admit_an_unmeasured_link() {
         );
         variants
     };
-    for variant in variants {
+    for (i, variant) in variants.into_iter().enumerate() {
         let mut stale = current.clone();
         stale.variant = Some(variant);
-        records.push(stale, GIB, 1);
+        records.push(stale, (u64::try_from(i).unwrap() + 1) * GIB, 1);
     }
     records.save(&record).unwrap();
     assert_eq!(peak(&records, NATIVE, &last_unit()), None);
     let units = Units::of(&record, &[NATIVE], 1);
-    assert!(!units[0].claims());
-    assert!(slice_need(NATIVE, Some(&units[0])).alone);
-    // Even if the driver's earlier decision enabled unit claims, the wrapper
-    // refuses before spawning a compiler against this stale book.
-    #[cfg(unix)]
-    {
-        let mut claiming = units[0].clone();
-        claiming.spare = Some(DRIVER);
-        let args = [
-            "/usr/bin/true",
-            "--crate-name",
-            "aterm",
-            "--crate-type",
-            "bin",
-        ]
-        .map(OsString::from);
-        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
-        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 18));
-        assert!(
-            wrap(&args, Some("aterm"), &claiming, &ledger, &machine)
-                .unwrap_err()
-                .contains("no matching toolchain footprint")
-        );
-        assert!(ledger.list().unwrap().is_empty());
+    assert!(units[0].claims());
+    assert!(!slice_need(NATIVE, Some(&units[0])).alone);
+    let prior = prior_peak(&records, NATIVE, &last_unit()).unwrap();
+    assert!(prior >= 2 * GIB);
+    assert!(!unit_need(NATIVE, &records, &last_unit(), DRIVER).alone);
+    for unrelated in [
+        key(COMPAT, &last_unit()),
+        key(NATIVE, &unit("aterm", "aterm bin_extra")),
+    ] {
+        records.push(unrelated, 99 * GIB, 1);
     }
+    assert_eq!(prior_peak(&records, NATIVE, &last_unit()), Some(prior));
+    assert_eq!(
+        peak(&records, NATIVE, &last_unit()),
+        None,
+        "an old metric is not a new physical-footprint measurement"
+    );
     // A matching measurement receives the margin, retaining the larger run
     // when a later successful link is lighter.
     records.push(current.clone(), 20 * GIB, 2);
@@ -201,8 +255,7 @@ fn unit(package: &str, kind: &str) -> UnitName {
     }
 }
 
-/// Matching records enable unit claims with margins and driver spare. Without
-/// both final links, the slices learn alone and wrappers only record.
+/// Drivers and per-unit admission remain enabled with an empty or partial book.
 #[test]
 fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit_its_own() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -215,12 +268,12 @@ fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit
             .collect::<Vec<_>>()
     };
     let empty = Units::of(&record, &slices, 2);
-    assert_eq!(spares(2), [None, None]);
-    assert!(slice_need(NATIVE, Some(&empty[0])).alone);
-    assert!(slice_need(COMPAT, Some(&empty[1])).alone);
+    assert_eq!(spares(2), [Some(2 * DRIVER), Some(2 * DRIVER)]);
+    assert!(!slice_need(NATIVE, Some(&empty[0])).alone);
+    assert!(!slice_need(COMPAT, Some(&empty[1])).alone);
     assert!(slice_need(COMPAT, None).alone);
     let wrapper = Path::new("/r/aterm-release");
-    assert!(!empty[0].env(wrapper).iter().any(|(k, _)| *k == CLAIMS));
+    assert!(empty[0].env(wrapper).iter().any(|(k, _)| *k == CLAIMS));
 
     let mut records = Records::default();
     records.push(key(NATIVE, &last_unit()), 417 * GIB / 10, 1);
@@ -232,8 +285,8 @@ fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit
     records.save(&record).unwrap();
     assert_eq!(
         spares(2),
-        [None, None],
-        "the compat slice's last unit is not on record"
+        [Some(2 * DRIVER), Some(2 * DRIVER)],
+        "a missing compat link cannot isolate either driver"
     );
     let mut records = Records::load(&record);
     records.push(key(COMPAT, &last_unit()), 228 * GIB / 10, 1);
@@ -253,7 +306,7 @@ fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit
     );
     let need = |u: &UnitName| unit_need(NATIVE, &records, u, 2 * DRIVER).mem;
     assert_eq!(need(&unit("aterm-gui", "aterm_gui lib")), 24 * GIB);
-    assert_eq!(need(&unit("aterm-cell", "aterm_cell lib")), 2 * FLOOR);
+    assert_eq!(need(&unit("aterm-cell", "aterm_cell lib")), 20 * GIB);
     let env = both[0].env(wrapper);
     let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
     assert_eq!(
@@ -331,8 +384,8 @@ fn the_wrapper_passes_the_compiler_the_descriptors_cargo_gave_it() {
 /// THE WRAPPER RUNS EACH COMPILER UNDER ITS UNIT'S CLAIM AND KEEPS A FINISHED ONE'S PEAK: a
 /// unit the record keeps gains this run's peak, exits as its compiler did, and its claim ends
 /// with it; a query (`--print`) compiles nothing and keeps nothing; a unit this host can never
-/// hold beside its spare runs ALONE. NEGATIVE CONTROLS: a light unit the record does not keep
-/// stays unkept; a compiler that fails exits as it did (1) and its peak, short of a finished
+/// hold beside its spare runs ALONE. A light unit keeps its peak too, avoiding another cold
+/// estimate. NEGATIVE CONTROLS: a compiler that fails exits as it did (1) and its peak, short of a finished
 /// compile's, is not kept; the alone unit's own need is one the ledger refuses outright.
 #[cfg(unix)]
 #[test]
@@ -371,7 +424,7 @@ fn the_wrapper_runs_each_compiler_under_its_claim_and_keeps_a_finished_ones_peak
     assert_eq!(peaks(&kept), Some(2));
     assert!(ledger.list().unwrap().is_empty(), "its claim ended with it");
     assert_eq!(run("/usr/bin/true", "light", &[], &roomy), Ok(0));
-    assert_eq!(peaks(&unit("fixture", "light lib")), None);
+    assert_eq!(peaks(&unit("fixture", "light lib")), Some(1));
     assert_eq!(run("/usr/bin/false", "kept", &[], &roomy), Ok(1));
     assert_eq!(peaks(&kept), Some(2), "a failed compile's peak is not kept");
     assert_eq!(

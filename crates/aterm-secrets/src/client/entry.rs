@@ -12,6 +12,8 @@ use super::*;
 
 mod admission;
 pub use admission::EntryAdmission;
+mod read_context;
+pub use read_context::{EntryRead, EntryReader};
 mod claim;
 pub use claim::{EntryClaim, EntryClaimRelation, MAX_ENTRY_CLAIM_BYTES};
 mod provenance;
@@ -886,6 +888,27 @@ fn read_entry_held(
     _observation: &StateLock,
     trusted: &mut Option<crate::membership_log::Log>,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    read_entry_held_observing(
+        paths,
+        expected,
+        name,
+        reading,
+        version,
+        (_observation, &mut false),
+        trusted,
+    )
+}
+
+/// Retain authenticated presence independently of materialization success.
+fn read_entry_held_observing(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    reading: Reading,
+    version: &mut Option<EntryVersion>,
+    (_observation, present): (&StateLock, &mut bool),
+    trusted: &mut Option<crate::membership_log::Log>,
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
     if matches!(reading, Reading::ClaudeToken) != crate::entry_class::claude_token(name) {
         return Err(Error::new("invalid or reserved secret entry name"));
     }
@@ -1016,6 +1039,7 @@ fn read_entry_held(
         log_ids: log_ids.clone(),
         mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
     });
+    *present = entry.is_some();
     let Some(entry) = entry else {
         *trusted = trusted_log;
         return Ok(None);

@@ -330,11 +330,12 @@ fn a_failed_group_listing_is_no_listing() {
     );
 }
 
-/// See the Apple twin: every `/proc/<pid>/stat` ([`super::stat_row`]), judged by
-/// [`super::procfs::group_of`]. A process gone by its read is skipped; any other failed read
-/// leaves the listing incomplete, and so does a `/proc` mounted with `hidepid`
-/// ([`group_listing_can_be_whole`]), which hides from its listing, or refuses the files of,
-/// another user's processes and this uid's non-dumpable ones.
+/// See the Apple twin: every `/proc/<pid>/stat` ([`super::stat_row`]), then the row of every
+/// id allocated behind that walk ([`super::process_row`]), judged by
+/// [`super::procfs::chased_group_of`], since a walk of `/proc` is no snapshot as Apple's
+/// listing is. A process gone by its read is skipped; any other failed read leaves the listing
+/// incomplete, and so do allocations it could not follow and a `/proc` that can show no whole
+/// listing ([`group_listing_can_be_whole`]).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn group_members(pgid: u32) -> Option<GroupMembers> {
@@ -342,6 +343,7 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
     if pgid <= 1 {
         return None;
     }
+    let from = super::last_pid();
     let rows = std::fs::read_dir("/proc").ok()?.filter_map(|entry| {
         let Ok(entry) = entry else {
             return Some((0, StatRead::Unreadable));
@@ -354,8 +356,12 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
             .ok()?;
         Some((pid, super::stat_row(&entry.path().join("stat"))))
     });
-    Some(super::procfs::group_of(
+    Some(super::procfs::chased_group_of(
         rows,
+        from,
+        super::last_pid,
+        super::pid_max,
+        super::process_row,
         pgid,
         group_listing_can_be_whole(),
     ))
@@ -363,8 +369,10 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
 
 /// Whether a [`group_members`] listing here can be complete: on Linux, whether `/proc` lists
 /// every process to every reader ([`super::procfs::shows_every_process`] over
-/// `/proc/self/mountinfo`); on Apple, whose kernel lists a group itself, it can; elsewhere
-/// nothing lists one.
+/// `/proc/self/mountinfo`), is this process's own pid namespace's
+/// ([`super::proc_is_this_namespaces`]), and reads the namespace's last allocated id
+/// (`ns_last_pid`), which a listing follows past its walk; on Apple, whose kernel lists a group
+/// itself, it can; elsewhere nothing lists one.
 #[must_use]
 pub fn group_listing_can_be_whole() -> bool {
     #[cfg(target_vendor = "apple")]
@@ -374,6 +382,8 @@ pub fn group_listing_can_be_whole() -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         super::proc_shows_every_process()
+            && super::proc_is_this_namespaces()
+            && super::last_pid().is_some()
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     {

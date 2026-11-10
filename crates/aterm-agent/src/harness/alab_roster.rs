@@ -1450,7 +1450,6 @@ pub(super) fn migrate_held(
             accounts::move_accounts(state, logins, &pairs)?;
             Ok(Vec::new())
         }),
-        || Ok(()),
     )?;
     Ok(planned)
 }

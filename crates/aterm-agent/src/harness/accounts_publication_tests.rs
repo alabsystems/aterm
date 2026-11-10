@@ -111,7 +111,6 @@ fn receipt_transition_with(state: &ModelState, action: &str, bypass: bool) -> Mo
             (!bypass).then_some(&source),
         ),
         (false, |_, _| Ok(Vec::new())),
-        || Ok(()),
     );
     CUT.set(None);
     if !bypass && matches!(scenario, 1 | 3 | 4) {

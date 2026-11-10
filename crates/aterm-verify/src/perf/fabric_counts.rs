@@ -30,15 +30,11 @@
 //! A count is exact or it is not judged here. The lane gives no ratio a ceiling and judges no
 //! time: `broker_batches_per_note`, `broker_batches_per_message` and the latencies depend on how
 //! the bridge's writes coalesce, which moves with the load, so each run prints them as measured.
-//! So does E04's count of paced notes whose sender snapshot lands between the delivery and its
-//! commit, 54-56 of 60 before E04: it moved, so it is no floor. Main's own ledger reads it at 0
-//! to 3 of 60 from run to run (`docs/measured/fabric/2026-11-05-fabric-6061` and `-6065` read 1,
-//! `-4106` 3), this lane's first three runs 3, 0 and 3 of 20, and a run with every `Fx::now` of
-//! the bridge slowed by 6 ms 20 of 20, where each judged count held its value
-//! (`docs/measured/fabric-counts-2026-11-05.md`).
+//! E04's count of paced notes whose sender snapshot lands between delivery and commit is also
+//! reported without a floor: it depends on scheduling rather than a structural bound.
 //!
-//! The judge reads a bench report ([`counts`]), so its unit tests run it over the committed
-//! ledger entry of the arm before each win, which it must fail on that win's law.
+//! The judge reads a bench report ([`counts`]). Its unit tests construct reports with positive
+//! controls and counterexamples for each law, independently of archived measurement files.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -684,14 +680,49 @@ fn measured(report: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A committed fabric ledger entry's report.
-    fn entry(name: &str) -> Value {
-        let path = super::super::workspace_root()
-            .join("docs/measured/fabric")
-            .join(format!("{name}.json"));
-        let text =
-            crate::read_regular_text(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    fn attach_report(eight: u64, thirty_two: u64) -> Value {
+        aterm_json::json!({"attach": {"tallies": {"rounds": [
+            {"group": "attach, 8 session(s)", "wait": {
+                "format": "wait-tally v=4", "rows": {
+                    "lane_sessions_status": {"count": 1}, "lane_meta": {"count": eight}
+                }
+            }},
+            {"group": "attach, 32 session(s)", "wait": {
+                "format": "wait-tally v=4", "rows": {
+                    "lane_sessions_status": {"count": 1}, "lane_meta": {"count": thirty_two}
+                }
+            }}
+        ]}}})
+    }
+
+    fn fleet_report(fast: u64, paced: u64) -> Value {
+        aterm_json::json!({"pingpong": {
+            "handlers": {"rows": {"inbox": {"count": 1}, "fleet_mail": {"count": fast}}},
+            "paced": {"handlers": {"rows": {"inbox": {"count": 1}, "fleet_mail": {"count": paced}}}}
+        }})
+    }
+
+    fn messaging_report(limited: bool) -> Value {
+        let spec = if limited {
+            "rate_limit=on"
+        } else {
+            "rate_limit=off"
+        };
+        aterm_json::json!({"spec": spec, "messaging": {
+            "latency": {"rate_limited": 0},
+            "burst": {"rate_limited": 0},
+            "paced_notes": {"rate_limited": 0}
+        }})
+    }
+
+    fn cold_report() -> Value {
+        aterm_json::json!({"attach": {"backlog": {
+            "records": 100_000, "resident_budget": 16_777_216,
+            "sizes": [
+                {"sessions": 8, "cold_reads_per_restart": [15, 7, 7]},
+                {"sessions": 32, "cold_reads_per_restart": [63, 31, 31]}
+            ]
+        }}})
     }
 
     fn findings(run: &LaneRun) -> Vec<String> {
@@ -730,12 +761,10 @@ mod tests {
         }
     }
 
-    /// E05's A arm (`2026-11-05-fabric-5051`, main before the meta batch): 16 `@<sid> meta` calls
-    /// a restart at 8 sessions and 64 at 32, ten restarts each. The judge fails it on E05's law;
-    /// E05's B arm (`-5052`) holds it.
+    /// E05 rejects per-session meta reads and accepts a status batch with none.
     #[test]
     fn the_judge_fails_e05s_a_arm_on_lane_meta() {
-        let before = counts(&entry("2026-11-05-fabric-5051")).expect("reads");
+        let before = counts(&attach_report(160, 640)).expect("reads");
         assert_eq!(value_of(&before, "attach_8_lane_meta"), 160);
         assert_eq!(value_of(&before, "attach_32_lane_meta"), 640);
         let failed = findings(&judge(&before, None));
@@ -746,17 +775,16 @@ mod tests {
                 .all(|f| f.contains("lane_meta") && f.contains("E05")),
             "{failed:?}"
         );
-        let after = counts(&entry("2026-11-05-fabric-5052")).expect("reads");
+        let after = counts(&attach_report(0, 0)).expect("reads");
+        assert_eq!(after.len(), 2);
         assert_eq!(value_of(&after, "attach_32_lane_meta"), 0);
         assert_eq!(judge(&after, None).status, Status::Pass);
     }
 
-    /// D01's A arm (`2026-11-03-fabric-80`, main before the stamp): 1,201 fleet-mailbox
-    /// transactions over 200 round trips and 301 over the 50 paced. The judge fails it on D01's
-    /// law; D01's B arm (`-81`) holds it.
+    /// D01 rejects fleet-mailbox transactions in both windows and accepts zero counts.
     #[test]
     fn the_judge_fails_d01s_a_arm_on_fleet_mail() {
-        let before = counts(&entry("2026-11-03-fabric-80")).expect("reads");
+        let before = counts(&fleet_report(1201, 301)).expect("reads");
         assert_eq!(value_of(&before, "pingpong_fleet_mail"), 1201);
         assert_eq!(value_of(&before, "pingpong_paced_fleet_mail"), 301);
         let failed = findings(&judge(&before, None));
@@ -767,18 +795,17 @@ mod tests {
                 .all(|f| f.contains("fleet_mail") && f.contains("D01")),
             "{failed:?}"
         );
-        let after = counts(&entry("2026-11-03-fabric-81")).expect("reads");
+        let after = counts(&fleet_report(0, 0)).expect("reads");
+        assert_eq!(after.len(), 2);
         assert_eq!(judge(&after, None).status, Status::Pass);
     }
 
-    /// No committed arm refused a publish for the rate (E06's off arm limits nothing), so the
-    /// control is E06's on arm (`2026-11-05-fabric-6061`) with one refusal written into its burst
-    /// window: the judge fails it on E06's law, and holds the arm as committed. Its `rate_limit=off`
-    /// sibling (`-6062`) yields no rate count at all.
+    /// E06 rejects a rate refusal only when the report enables the default rate limit.
     #[test]
     fn the_judge_fails_a_rate_refusal_and_reads_none_without_the_limit() {
-        let mut report = entry("2026-11-05-fabric-6061");
+        let mut report = messaging_report(true);
         let committed = counts(&report).expect("reads");
+        assert_eq!(committed.len(), 3);
         assert_eq!(value_of(&committed, "messaging_burst_rate_limited"), 0);
         assert_eq!(judge(&committed, None).status, Status::Pass);
         report
@@ -796,20 +823,17 @@ mod tests {
             failed[0].contains("messaging_burst_rate_limited") && failed[0].contains("E06"),
             "{failed:?}"
         );
-        let unlimited = counts(&entry("2026-11-05-fabric-6062")).expect("reads");
+        let unlimited = counts(&messaging_report(false)).expect("reads");
         assert!(
             unlimited.iter().all(|c| c.law != Law::RateLimited),
             "{unlimited:?}"
         );
     }
 
-    /// No committed arm read more than D10d's bounds (its no-budget arm reads none), so the
-    /// control is D10f's swap-set entry (`2026-11-05-fabric-7002`: 15 then 7 at 8 sessions, 63
-    /// then 31 at 32, exactly the bounds) with one more cold read written into each regime: the
-    /// judge fails both on D10d's laws.
+    /// D10d accepts its first and later bounds, then rejects one extra read in each regime.
     #[test]
     fn the_judge_holds_d10ds_cold_reads_to_their_bounds() {
-        let mut report = entry("2026-11-05-fabric-7002");
+        let mut report = cold_report();
         let committed = counts(&report).expect("reads");
         for (key, value) in [
             ("restart_8_cold_reads_first", 15),
@@ -876,7 +900,7 @@ mod tests {
     fn a_recording_refuses_a_broken_law_and_judges_what_it_wrote() {
         let dir = scratch();
         let path = dir.path().join(BASELINE_FILE);
-        let held = counts(&entry("2026-11-05-fabric-5052")).expect("reads");
+        let held = counts(&attach_report(0, 0)).expect("reads");
         let recorded = conclude_using(&held, true, &path, super::super::publication::publish);
         assert_eq!(recorded.status, Status::Recorded(path.clone()));
         let written = read_baseline(&path).expect("reads").expect("written");
@@ -889,7 +913,7 @@ mod tests {
             conclude_using(&held, false, &path, super::super::publication::publish).status,
             Status::Pass
         );
-        let broken = counts(&entry("2026-11-05-fabric-5051")).expect("reads");
+        let broken = counts(&attach_report(160, 640)).expect("reads");
         let refused = conclude_using(&broken, true, &path, super::super::publication::publish);
         assert!(
             findings(&refused)[0].starts_with("REFUSING to record"),
@@ -906,7 +930,7 @@ mod tests {
     /// judge refuses to read it rather than pass it at 0.
     #[test]
     fn a_tally_round_with_no_status_batch_is_refused() {
-        let mut report = entry("2026-11-05-fabric-5052");
+        let mut report = attach_report(0, 0);
         let rows = report
             .as_object_mut()
             .and_then(|r| r.get_mut("attach"))
@@ -927,9 +951,9 @@ mod tests {
         assert!(why.contains("sessions status"), "{why}");
     }
 
-    /// E05's B arm with its first tally round's `wait.format` set to `format` (`None` removes it).
+    /// A valid status-batch report with its first `wait.format` replaced or removed.
     fn with_wait_format(format: Option<&str>) -> Value {
-        let mut report = entry("2026-11-05-fabric-5052");
+        let mut report = attach_report(0, 0);
         let wait = report
             .as_object_mut()
             .and_then(|r| r.get_mut("attach"))
@@ -998,7 +1022,7 @@ mod tests {
     #[test]
     fn the_attach_world_reaches_the_cold_path() {
         assert!(u64::from(BACKLOG) * bench_spec::FILL_RECORD_BYTES as u64 > 16 * 1024 * 1024);
-        assert_eq!(cold_path_reached(&entry("2026-11-05-fabric-7002")), Ok(()));
+        assert_eq!(cold_path_reached(&cold_report()), Ok(()));
         let small: Value = aterm_json::from_str(
             "{\"attach\": {\"backlog\": {\"records\": 1, \"resident_budget\": 16777216}}}",
         )

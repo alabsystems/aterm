@@ -24,7 +24,6 @@ use super::app_state::ApplicationDelegate;
 use super::aterm_objc_seam::{self as seam, consts};
 use super::cursor::{cursor_from_icon, same_cursor};
 use super::monitor::{self, flip_window_screen_coordinates, get_display_id};
-use super::observer::RunLoop;
 use super::view::WinitView;
 use super::window::WinitWindow;
 use super::{Fullscreen, MonitorHandle, OsError, WindowId};
@@ -125,9 +124,8 @@ aterm_objc::declare_class! {
             };
             self.ivars().previous_scale_factor.set(scale_factor);
 
-            let mtm = self.mtm();
             let this = self.retained();
-            RunLoop::main(mtm).queue_closure(move || {
+            self.ivars().app_delegate.queue_handler_work(move |_| {
                 this.handle_scale_factor_changed(scale_factor);
             });
         }
@@ -531,7 +529,7 @@ impl WindowDelegate {
 
         if scale_factor != 1.0 {
             let delegate = delegate.clone_retained();
-            RunLoop::main(mtm).queue_closure(move || {
+            app_delegate.queue_handler_work(move |_| {
                 delegate.handle_scale_factor_changed(scale_factor);
             });
         }

@@ -12775,6 +12775,17 @@ fn header_only_pushed_facts_admission_and_batched_slice_pruning_match_full_admis
             .into_iter()
             .map(|r| r.node)
             .collect::<Vec<_>>(),
-        vec![n1]
+        vec![n1.clone()]
+    );
+
+    // `known_nodes_and_peer` matches `known_nodes` and `peer_of` from a single book read.
+    write_book(state.dir(), &peers);
+    assert_eq!(
+        known_nodes_and_peer(state.dir(), &n1),
+        (known_nodes(state.dir()), peer_of(state.dir(), &n1))
+    );
+    assert_eq!(
+        known_nodes_and_peer(state.dir(), &node_of(0x99)),
+        (known_nodes(state.dir()), None)
     );
 }

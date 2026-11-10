@@ -71,7 +71,7 @@ pub(crate) enum FactAct {
     Show(FactKind),
     /// Type Claude's own command (`crate::claude_slash`).
     Type(Slash),
-    /// Switch the session to Opus 5.5 at xhigh effort and back, as a click on the model does
+    /// Switch the session to its switch target and back, as a click on the model does
     /// ([`App::switch_model`]).
     SwitchModel,
     /// Switch/pin onto the account named by the displayed roster row.

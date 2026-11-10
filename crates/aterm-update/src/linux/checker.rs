@@ -111,6 +111,7 @@ fn spawn(generation: u64, args: Arc<Args>) -> std::io::Result<()> {
                             &crate::check_wake::SYSTEM_WOKE,
                             wake_seen.get(),
                             Duration::from_secs(crate::linux_notice::PASS_SECS),
+                            || WATCH.is_current(generation),
                         ),
                         crate::check_wake::Waited::Woke(_)
                     );

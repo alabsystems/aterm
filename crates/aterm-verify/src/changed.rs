@@ -2561,7 +2561,7 @@ checksum = "aaa"
         let services = "pub fn tester() -> &'static str {\n    \"tester\"\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names() {\n        assert_eq!(super::tester(), \"tester\");\n    }\n}\n";
         let untested = "#[cfg(test)]\nmod tests {}\n";
         let tested = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
-        let reader = "pub const PEEK: &str = include_str!(\"../../a/src/peek.rs\");\npub const NAMED: &str = \"crates/a/src/named.rs\";\n";
+        let reader = "pub const PEEK: &str = include_str!(\"../../a/src/peek.rs\");\npub const TEST_PEEK: &str = include_str!(\"../../a/tests/peek.rs\");\npub const NAMED: &str = \"crates/a/src/named.rs\";\n";
         for (dir, rest, files) in [
             (
                 "a",
@@ -2575,6 +2575,8 @@ checksum = "aaa"
                     ("src/lib_tests.rs", "#[test]\nfn one() {}\n"),
                     ("src/peek.rs", untested),
                     ("src/named.rs", untested),
+                    ("tests/integration.rs", "#[test]\nfn one() {}\n"),
+                    ("tests/peek.rs", "#[test]\nfn one() {}\n"),
                 ],
             ),
             (
@@ -2587,6 +2589,8 @@ checksum = "aaa"
             let package = root.join("crates").join(dir);
             std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
             for (path, text) in files {
+                std::fs::create_dir_all(package.join(path).parent().unwrap())
+                    .expect("fixture target dir");
                 std::fs::write(package.join(path), text).expect("fixture source");
             }
             std::fs::write(
@@ -2617,6 +2621,10 @@ checksum = "aaa"
         let tests = picked(checkout.change(&[("crates/a/src/services.rs", &test_hunk)]));
         let mounted =
             picked(checkout.change(&[("crates/a/src/lib_tests.rs", "#[test]\nfn two() {}\n")]));
+        let integration =
+            picked(checkout.change(&[("crates/a/tests/integration.rs", "#[test]\nfn two() {}\n")]));
+        let integration_reader =
+            picked(checkout.change(&[("crates/a/tests/peek.rs", "#[test]\nfn two() {}\n")]));
         let shipped = picked(checkout.change(&[(
             "crates/a/src/services.rs",
             &services.replace("    \"tester\"\n", "    \"probe\"\n"),
@@ -2635,6 +2643,8 @@ checksum = "aaa"
         let ac = paths(&["a", "c"]);
         assert_eq!(tests, (a.clone(), a.clone(), a.clone()));
         assert_eq!(mounted, (a.clone(), a.clone(), a.clone()));
+        assert_eq!(integration, (a.clone(), a.clone(), a.clone()));
+        assert_eq!(integration_reader, (ac.clone(), ac.clone(), a.clone()));
         assert_eq!(shipped, (a.clone(), ab.clone(), Vec::new()));
         assert_eq!(embedded, (ac.clone(), ac.clone(), a.clone()));
         assert_eq!(both, (ac.clone(), ac, a.clone()));

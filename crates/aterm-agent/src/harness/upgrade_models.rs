@@ -1611,6 +1611,80 @@ pub fn move_why(before: Option<&str>, to: &str) -> MoveWhy {
     }
 }
 
+/// The effort levels `/effort` takes, least first.
+pub const EFFORT_LADDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The effort taken for a model's top where no read catalog lists the model.
+pub const TOP_EFFORT_UNREAD: &str = "xhigh";
+
+/// The highest effort `baked` admits for `model` ([`EFFORT_LADDER`]), [`TOP_EFFORT_UNREAD`]
+/// where no catalog was read or it lists neither the model nor an effort for it.
+#[must_use]
+pub fn top_effort(model: &str, baked: Option<&Baked>) -> &'static str {
+    baked
+        .and_then(|b| b.model(model))
+        .and_then(|m| {
+            EFFORT_LADDER
+                .iter()
+                .rev()
+                .find(|level| m.efforts.iter().any(|e| e == **level))
+                .copied()
+        })
+        .unwrap_or(TOP_EFFORT_UNREAD)
+}
+
+/// Where a person's switch "to the top" goes on one Claude Code build: the best model of the
+/// priority list the build offers, at that model's highest effort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Top {
+    /// The model id (`claude-opus-5-5`).
+    pub model: String,
+    /// Its highest effort ([`top_effort`]).
+    pub effort: &'static str,
+    /// The build's own catalog, where one was read: what [`Self::effort_of`] another model reads.
+    pub baked: Option<Baked>,
+}
+
+impl Top {
+    /// The highest effort of `model` on this build ([`top_effort`]).
+    #[must_use]
+    pub fn effort_of(&self, model: &str) -> &'static str {
+        top_effort(model, self.baked.as_ref())
+    }
+}
+
+/// [`Top`] of `list` for the build `cc_version` whose catalog is `baked`. With a catalog: the
+/// list's first entry the build offers ([`offered`], [`list_target`]), else the first model the
+/// build offers at all. With none: the list's first entry. A family billed to usage credits
+/// where billing is unread ([`CREDITS_BILLED_UNREAD`]) is passed over while another stands.
+#[must_use]
+pub fn top(list: &Priority, cc_version: &str, baked: Option<Baked>) -> Top {
+    let ev = Evidence {
+        credits_billed: CREDITS_BILLED_UNREAD
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect(),
+        ..Evidence::default()
+    };
+    let on_offer = offered(list, cc_version, &ev, baked.as_ref(), None);
+    let model = list_target(list, &on_offer)
+        .or_else(|| on_offer.first().map(String::as_str))
+        .or_else(|| {
+            list.ids
+                .iter()
+                .map(String::as_str)
+                .find(|id| !billed_to_credits(id, &ev.credits_billed))
+        })
+        .or_else(|| list.ids.first().map(String::as_str))
+        .unwrap_or(SEED[0])
+        .to_string();
+    Top {
+        effort: top_effort(&model, baked.as_ref()),
+        model,
+        baked,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,6 +1707,58 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn the_top_is_the_list_s_best_the_build_offers_at_its_highest_effort() {
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let list = Priority {
+            ids: ids(&["claude-opus-6", "claude-opus-5-5", "claude-opus-5"]),
+            history: vec![],
+        };
+        let none = top(&list, "", None);
+        assert_eq!(
+            (none.model.as_str(), none.effort),
+            ("claude-opus-6", TOP_EFFORT_UNREAD),
+            "no catalog read: the list's first, at the unread top"
+        );
+        let mut b = baked(
+            &["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"],
+            &[("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5")],
+        );
+        b.models[0].efforts = ids(&["low", "medium", "high", "xhigh", "max"]);
+        b.models[1].efforts = ids(&["low", "medium", "high"]);
+        let old = top(&list, "2.1.300", Some(b.clone()));
+        assert_eq!(
+            (old.model.as_str(), old.effort),
+            ("claude-opus-5-5", "max"),
+            "a build that does not know the list's first goes to the next it offers"
+        );
+        assert_eq!(old.effort_of("claude-opus-5"), "high");
+        assert_eq!(
+            old.effort_of("claude-sonnet-5"),
+            TOP_EFFORT_UNREAD,
+            "a model with no effort listed"
+        );
+        let unlisted = Priority {
+            ids: ids(&["claude-opus-7"]),
+            history: vec![],
+        };
+        assert_eq!(
+            top(&unlisted, "2.1.300", Some(b)).model,
+            "claude-opus-5-5",
+            "nothing of the list on offer: the build's own newest"
+        );
+        let fable_first = Priority {
+            ids: ids(&["claude-fable-5-1", "claude-opus-5-5"]),
+            history: vec![],
+        };
+        assert_eq!(
+            top(&fable_first, "", None).model,
+            "claude-opus-5-5",
+            "a family billed to credits where billing is unread is passed over"
+        );
+        assert_eq!(top(&Priority::seed(0), "", None).model, SEED[0]);
     }
 
     #[test]

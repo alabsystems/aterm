@@ -4,8 +4,10 @@
 //! A helper a window tethers ends when the window is killed outright: it gets `SIGTERM` first,
 //! and on macOS one deaf to that gets `SIGKILL` after the grace, from a watcher that leads a
 //! session of its own, outside the helper's group, runs under a name a kill by the window's name
-//! passes by, and ends after its helper. One started plainly is adopted and runs on. A tethered
-//! spawn of a program that cannot run fails as a plain one does. The window is a stand-in: this
+//! passes by, and ends after its helper. A helper at the head of a group of its own has its
+//! group ended so, on Linux too, at the window's kill or exec (a Linux exec from Linux 6.9, whose
+//! thread pidfds let the watcher see it; before, the window's exit alone). One started plainly is
+//! adopted and runs on. A tethered spawn of a program that cannot run fails as a plain one does. The window is a stand-in: this
 //! test binary, re-run as [`PARENT`] or [`PARITY`], which spawns through `aterm_uds::spawnfd`
 //! with the front door as its tether executable, as a window's helpers run through the window's
 //! own.
@@ -48,7 +50,15 @@ const SESSION: &str = "session";
 /// its own place, each of the two ending at `SIGTERM`.
 const GROUP: &str = "group";
 
-/// The stand-in that spawns each of [`CASES`] plainly and tethered and says how each went.
+/// The variable that has [`PARENT`] exec in its own place once its helpers ran and a byte came on
+/// its stdin: this test binary again, as [`PARKED`].
+const THEN_EXEC: &str = "TETHER_THEN_EXEC";
+
+/// The stand-in a window that execs in its own place becomes: it waits for its own kill.
+const PARKED: &str = "tether-parked";
+
+/// The stand-in that spawns each of [`CASES`] plainly, tethered, and tethered at the head of a
+/// group of its own, and says how each went.
 const PARITY: &str = "tether-parity";
 
 /// The folder [`PARITY`]'s cases search, from the test.
@@ -120,6 +130,9 @@ fn play_if_asked() {
     match spec.as_str() {
         PARENT => play_parent(),
         PARITY => play_parity(),
+        PARKED => loop {
+            std::thread::park();
+        },
         _ => {
             standin::put(format!("unknown stand-in: {spec}\n").as_bytes());
             standin::exit(2);
@@ -127,7 +140,8 @@ fn play_if_asked() {
     }
 }
 
-/// The window: a tethered and a plain helper, their pids said, then a wait for its own kill.
+/// The window: a tethered and a plain helper, their pids said, then a wait for its own kill, or
+/// with [`THEN_EXEC`], once a byte came on its stdin, an exec in its own place, as [`PARKED`].
 fn play_parent() -> ! {
     let word = std::env::var(TETHERED).unwrap_or_default();
     let Some(script) = tethered_script(&word) else {
@@ -155,18 +169,30 @@ fn play_parent() -> ! {
     let tethered = spawn(true);
     let plain = spawn(false);
     standin::put(format!("tethered {}\nplain {}\n", tethered.id(), plain.id()).as_bytes());
+    if std::env::var_os(THEN_EXEC).is_some() {
+        use std::io::Read as _;
+        let _ = std::io::stdin().read(&mut [0_u8; 1]);
+        let error = aterm_uds::spawnfd::command(standin::exe())
+            .args(std::env::args_os().skip(1))
+            .env(standin::ENV, PARKED)
+            .env_remove(THEN_EXEC)
+            .exec();
+        standin::put(format!("exec: {error}\n").as_bytes());
+        standin::exit(4)
+    }
     loop {
         std::thread::park();
     }
 }
 
-/// Each case run plainly, then tethered: a line `<case> <plain> <tethered>`, each `exit <code>`
-/// or `refused <errno>`.
+/// Each case run plainly, tethered, then tethered at the head of a group of its own (which on
+/// Linux too runs through its tether): a line `<case> <plain> <tethered> <leader>`, each
+/// `exit <code>` or `refused <errno>`.
 fn play_parity() -> ! {
     let dir = std::env::var_os(PARITY_DIR).expect("the cases' folder");
     let tool = std::path::PathBuf::from(std::env::var_os(PARITY_TOOL).expect("the kept tool"));
     let tool_dir = tool.parent().expect("the tool's folder").as_os_str();
-    let run = |program: Option<&str>, search: Search, tethered: bool| {
+    let run = |program: Option<&str>, search: Search, tethered: bool, leads: bool| {
         let program = program.map_or_else(
             || tool.file_name().expect("the tool's basename"),
             std::ffi::OsStr::new,
@@ -176,6 +202,9 @@ fn play_parity() -> ! {
             .env("PATH", search.path(&dir, tool_dir));
         if tethered {
             cmd.tether();
+        }
+        if leads {
+            cmd.process_group(0);
         }
         match aterm_uds::deadline::output_until(&mut cmd, Instant::now() + MUST_HAPPEN) {
             Ok(out) => format!("exit {}", out.status.code().unwrap_or(-1)),
@@ -188,9 +217,10 @@ fn play_parity() -> ! {
     };
     for (case, program, search) in CASES {
         let line = format!(
-            "{case} {} {}\n",
-            run(program, search, false),
-            run(program, search, true)
+            "{case} {} {} {}\n",
+            run(program, search, false, false),
+            run(program, search, true, false),
+            run(program, search, true, true)
         );
         standin::put(line.as_bytes());
     }
@@ -312,17 +342,19 @@ struct Started {
     plain_exit: OwnedFd,
     /// The lines its stdout says from here on, its helpers' included.
     said: mpsc::Receiver<String>,
-    /// Its tethered helper's watcher; Linux has none.
-    #[cfg(target_os = "macos")]
-    watcher: Watcher,
+    /// Its tethered helper's watcher; Linux leaves one for a helper at the head of its own group
+    /// alone ([`SESSION`], [`GROUP`]).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    watcher: Option<Watcher>,
 }
 
-/// The tether's watcher of a stand-in window's tethered helper, found as it runs: launchd's
-/// child, born after the window, the front door's image with its thread run, serving the tether's
-/// verb for that window (`argv[1]`, `argv[2]`). Only such an image's arguments are read. On drop
-/// it is `SIGKILL`ed by pid while its pid still reads the unique id it was found with, so a
-/// failing run leaves no watcher behind.
-#[cfg(target_os = "macos")]
+/// The tether's watcher of a stand-in window's tethered helper, found as it runs: an orphan
+/// (launchd's child on macOS; on Linux, adopted by init or the nearest subreaper, not the
+/// window's), born after the window, the front door's image with its thread run, serving the
+/// tether's verb for that window (`argv[1]`, `argv[2]`). Only such an image's arguments are read.
+/// On drop it is `SIGKILL`ed by pid while its pid still reads the unique id it was found with, so
+/// a failing run leaves no watcher behind.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Watcher {
     pid: i32,
     /// Its kernel unique id as found, which no later process reads.
@@ -331,11 +363,11 @@ struct Watcher {
     exit: OwnedFd,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Watcher {
     /// The one watcher serving `window`. It leads a session of its own, with no terminal, and
     /// runs under a name a kill by the front door's name (`pkill aterm`, which matches the last
-    /// part of `argv[0]`) passes by.
+    /// part of `argv[0]` on macOS and the kernel's name on Linux) passes by.
     fn of(window: u32) -> Self {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -363,8 +395,20 @@ impl Watcher {
                                 .and_then(|path| std::fs::metadata(path).ok())
                                 .is_some_and(|meta| (meta.dev(), meta.ino()) == image)
                         };
-                        if lineage.parent != 1
-                            || lineage.uniqueid <= born_after
+                        // Linux's unique id is the start in clock ticks, which the window and
+                        // the watcher may share.
+                        let born_before = if cfg!(target_os = "linux") {
+                            lineage.uniqueid < born_after
+                        } else {
+                            lineage.uniqueid <= born_after
+                        };
+                        let adopted = if cfg!(target_os = "linux") {
+                            lineage.parent != window
+                        } else {
+                            lineage.parent == 1
+                        };
+                        if !adopted
+                            || born_before
                             || !front_door()
                             || process::thread_ran(pid) != Some(true)
                         {
@@ -401,6 +445,16 @@ impl Watcher {
             "the tether's watcher (pid {pid}) runs as {named:?}, which a kill by the name \
              {name:?} matches: {argv:?}"
         );
+        #[cfg(target_os = "linux")]
+        {
+            let kernel = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .expect("the watcher's kernel name");
+            assert!(
+                !kernel.contains(&*name.to_string_lossy()),
+                "the tether's watcher (pid {pid}) has the kernel name {kernel:?}, which Linux's \
+                 kill by the name {name:?} matches"
+            );
+        }
         Self {
             pid,
             uniqueid: lineage.uniqueid,
@@ -409,7 +463,7 @@ impl Watcher {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for Watcher {
     fn drop(&mut self) {
         if aterm_uds::process::read_lineage(self.pid).is_some_and(|l| l.uniqueid == self.uniqueid) {
@@ -420,6 +474,14 @@ impl Drop for Watcher {
 }
 
 impl Started {
+    /// Its tethered helper's watcher.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn watcher(&self) -> &Watcher {
+        self.watcher
+            .as_ref()
+            .expect("the tethered helper's watcher")
+    }
+
     /// Whether `line` is said within `hang`.
     fn says_within(&self, line: &str, hang: Duration) -> bool {
         let deadline = Instant::now() + hang;
@@ -437,13 +499,28 @@ impl Started {
 /// Start the stand-in window as the test `entry`, its tethered helper `helper` ([`TERMED`],
 /// [`DEAF`], [`SESSION`] or [`GROUP`]), and wait for both its helpers to say they ran.
 fn start_parent(entry: &str, helper: &str) -> Started {
+    start_parent_then(entry, helper, false)
+}
+
+/// [`start_parent`], the window exec'ing in its own place when `then_exec` ([`THEN_EXEC`]), once a
+/// byte comes on its piped stdin.
+fn start_parent_then(entry: &str, helper: &str, then_exec: bool) -> Started {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
-    let mut parent = aterm_uds::spawnfd::command(standin::exe())
+    let mut parent = aterm_uds::spawnfd::command(standin::exe());
+    parent
         .args(standin::argv(entry))
         .env(standin::ENV, PARENT)
-        .env(TETHERED, helper)
-        .stdin(Stdio::null())
+        .env(TETHERED, helper);
+    if then_exec {
+        parent.env(THEN_EXEC, "1");
+    }
+    let mut parent = parent
+        .stdin(if then_exec {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .process_group(0)
@@ -485,7 +562,11 @@ fn start_parent(entry: &str, helper: &str) -> Started {
     }
     let (tethered, plain) = (tethered.expect("its pid"), plain.expect("its pid"));
     #[cfg(target_os = "macos")]
-    let watcher = Watcher::of(parent.id());
+    let watcher = Some(Watcher::of(parent.id()));
+    #[cfg(target_os = "linux")]
+    let watcher = [SESSION, GROUP]
+        .contains(&helper)
+        .then(|| Watcher::of(parent.id()));
     Started {
         parent,
         group,
@@ -494,22 +575,24 @@ fn start_parent(entry: &str, helper: &str) -> Started {
         tethered_exit: aterm_uds::exitwatch::exit_fd(tethered).expect("watch the tethered helper"),
         plain_exit: aterm_uds::exitwatch::exit_fd(plain).expect("watch the plain helper"),
         said,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         watcher,
     }
 }
 
-/// Once the tethered helper has ended: its watcher ends too (macOS), the plain helper, the
-/// negative control, was adopted and runs on; end it, and see nothing the stand-in started is
+/// Once the tethered helper has ended: its watcher, where it has one, ends too, the plain helper,
+/// the negative control, was adopted and runs on; end it, and see nothing the stand-in started is
 /// left in its group. The watcher is in none of it: it leads a session of its own and ends with
 /// its helper by its exit watch.
 fn plain_ran_on(started: Started) {
-    #[cfg(target_os = "macos")]
-    assert!(
-        exits_within(&started.watcher.exit, MUST_HAPPEN),
-        "the tether's watcher (pid {}) outlived its helper by {MUST_HAPPEN:?}",
-        started.watcher.pid
-    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(watcher) = &started.watcher {
+        assert!(
+            exits_within(&watcher.exit, MUST_HAPPEN),
+            "the tether's watcher (pid {}) outlived its helper by {MUST_HAPPEN:?}",
+            watcher.pid
+        );
+    }
     let Started {
         group,
         plain,
@@ -569,8 +652,8 @@ fn a_tethered_helper_ends_with_its_sigkilled_starter() {
 /// grace (a bound below, not a budget) is a `SIGKILL` that came early or a helper that was not
 /// deaf. The window is killed only once the helper runs its last image with its thread run: it
 /// says it ran before it execs `/bin/sleep`, and the watcher signals no child whose thread has not
-/// run, so a kill in between would leave it no signal at all. Linux has no watcher: there such a
-/// helper runs on.
+/// run, so a kill in between would leave it no signal at all. Linux leaves a watcher for a helper
+/// at the head of its own group alone: there such a helper runs on.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_tethered_helper_deaf_to_sigterm_ends_after_the_grace() {
@@ -605,7 +688,7 @@ fn a_tethered_helper_deaf_to_sigterm_ends_after_the_grace() {
 
 /// Waits until `pid` runs `/bin/sleep`, the deaf helper's last image, and its thread has run
 /// ([`aterm_uds::process::thread_ran`]), as the watcher's proof reads it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn runs_sleep_with_its_thread_run(pid: u32) {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -629,10 +712,12 @@ fn runs_sleep_with_its_thread_run(pid: u32) {
 /// watcher's anchor alone, a zombie that holds the group's number while the watcher lives: the
 /// watcher leads a session of its own ([`Watcher::of`] reads it), so a listing of the helper's
 /// group (a stage sweep's), a kill of it or a hangup of its terminal never counts or reaches the
-/// watcher. NEGATIVE CONTROL: a watcher with no anchor lists the helper alone. The watcher still ends the helper when the stand-in window is `SIGKILL`ed, then ends
-/// itself, and the plain helper runs on. The window is killed only once the helper runs its last
-/// image with its thread run, as the watcher's proof reads it. Linux has no watcher.
-#[cfg(target_os = "macos")]
+/// watcher. macOS lists the anchor; Linux's listing passes a zombie by, so there the anchor is
+/// found as the watcher's exited child in the helper's group ([`zombies_of`]). NEGATIVE CONTROL:
+/// a watcher with no anchor has none. The watcher still ends the helper when the stand-in window
+/// is `SIGKILL`ed, then ends itself, and the plain helper runs on. The window is killed only once
+/// the helper runs its last image with its thread run, as the watcher's proof reads it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_watcher_leaves_its_helpers_group_and_session() {
     play_if_asked();
@@ -654,9 +739,11 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
         .copied()
         .filter(|&p| p != helper)
         .collect();
+    let watcher = started.watcher().pid;
+    #[cfg(target_os = "macos")]
     assert!(
         members.pids.contains(&helper)
-            && !members.pids.contains(&started.watcher.pid)
+            && !members.pids.contains(&watcher)
             && matches!(
                 others[..],
                 [anchor] if aterm_uds::process::process_presence(anchor)
@@ -665,6 +752,20 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
         "the tethered helper's group (pid {tethered}) holds the helper and its watcher's anchor, \
          an exited process, and not the watcher, which leads a session of its own: {members:?}"
     );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            members.pids == [helper] && others.is_empty(),
+            "the tethered helper's group (pid {tethered}) lists the helper alone, not the \
+             watcher (pid {watcher}), which leads a session of its own: {members:?}"
+        );
+        let anchors = zombies_of(watcher, helper);
+        assert!(
+            matches!(anchors[..], [_]),
+            "the watcher (pid {watcher}) holds the helper's group (pid {tethered}) by one anchor, \
+             an exited child of its own in that group: {anchors:?}"
+        );
+    }
     runs_sleep_with_its_thread_run(tethered);
     started.parent.kill().expect("SIGKILL the stand-in window");
     started.parent.wait().expect("reap it");
@@ -681,13 +782,32 @@ fn the_watcher_leaves_its_helpers_group_and_session() {
     plain_ran_on(started);
 }
 
+/// The pids of `parent`'s exited children in group `pgid`, read from every `/proc/<pid>/stat`
+/// (state `Z`, its parent and its group): a Linux group listing passes them by.
+#[cfg(target_os = "linux")]
+fn zombies_of(parent: i32, pgid: i32) -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .filter_map(|entry| {
+            let pid = entry.ok()?.file_name().to_str()?.parse::<i32>().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(')')?;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?;
+            let ppid = fields.next()?.parse::<i32>().ok()?;
+            let pgrp = fields.next()?.parse::<i32>().ok()?;
+            (state == "Z" && ppid == parent && pgrp == pgid).then_some(pid)
+        })
+        .collect()
+}
+
 /// A tethered helper at the head of a group of its own ends with its group: when the stand-in
 /// window is `SIGKILL`ed, its watcher signals the group the helper leads, so the `/bin/sleep` the
 /// helper started in it ends too, where a signal to the helper alone would leave that sleep
-/// adopted and running (Git's `fetch` leaves `remote-http`, `fetch-pack` and `index-pack` so). The
-/// window is killed only once both run `/bin/sleep` with their threads run. The plain helper, in
-/// the window's group, runs on. Linux's parent-death signal reaches the helper alone.
-#[cfg(target_os = "macos")]
+/// adopted and running (Git's `fetch` leaves `remote-http`, `fetch-pack` and `index-pack` so;
+/// Linux's parent-death signal reaches the helper alone). The window is killed only once both run
+/// `/bin/sleep` with their threads run. The plain helper, in the window's group, runs on.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
     play_if_asked();
@@ -695,6 +815,119 @@ fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
         "tether_live::a_tethered_group_leaders_group_ends_with_its_sigkilled_starter",
         GROUP,
     );
+    let (helpers_group, kid) = group_runs_sleep(&started);
+    started.parent.kill().expect("SIGKILL the stand-in window");
+    started.parent.wait().expect("reap it");
+    group_ended(&started, &helpers_group, kid);
+    plain_ran_on(started);
+}
+
+/// A tethered helper at the head of a group of its own ends with its group when the stand-in
+/// window execs in its own place, as at its exit: on macOS the watcher's kqueue notes the exec,
+/// and on Linux 6.9 and later the exec ends the thread that forked the tether, whose pidfd the
+/// watcher holds (the window's own pidfd stays unread across an exec). An older Linux kernel
+/// opens no thread's pidfd, so its watcher holds the window's own: the helper ends at its
+/// parent-death signal and the sleep it left runs on in its group until the window's exit, which
+/// ends it. The window execs this test binary again, parked ([`PARKED`]), once both run
+/// `/bin/sleep`, and is killed once the sleep has ended (on an older Linux, once the helper has);
+/// the helper, which the parked window never reaps, holds its group until then. The window's
+/// `SIGKILL` status shows it execed and ran on, parked: a failed exec exits it. The plain helper
+/// runs on. NEGATIVE CONTROL: a watcher on the window's own pidfd on Linux 6.9 sees only the
+/// helper's exit at its parent-death signal, and stays for the sleep it left (the hang detector
+/// fires).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_tethered_group_leaders_group_ends_at_its_starters_exec() {
+    play_if_asked();
+    let mut started = start_parent_then(
+        "tether_live::a_tethered_group_leaders_group_ends_at_its_starters_exec",
+        GROUP,
+        true,
+    );
+    let (helpers_group, kid) = group_runs_sleep(&started);
+    {
+        use std::io::Write as _;
+        let mut go = started
+            .parent
+            .stdin
+            .take()
+            .expect("the stand-in window's piped stdin");
+        go.write_all(b"exec\n")
+            .expect("tell the stand-in window to exec");
+    }
+    let tethered = started.tethered;
+    assert!(
+        exits_within(&started.tethered_exit, MUST_HAPPEN),
+        "the tethered group leader (pid {tethered}) outlived its parent's exec by {MUST_HAPPEN:?}"
+    );
+    let in_group = || aterm_uds::process::read_lineage(kid).is_some_and(|l| l.pgid == tethered);
+    if exec_seen() {
+        aterm_spec::wait::until_within(
+            MUST_HAPPEN,
+            &format!(
+                "the sleep the tethered group leader started in its group (pid {kid}) ended at \
+                 its parent's exec"
+            ),
+            || (!in_group()).then_some(()),
+        );
+    } else {
+        assert!(
+            in_group(),
+            "the sleep (pid {kid}) ran on in its group past the exec, which an older Linux \
+             kernel's watcher does not see"
+        );
+    }
+    started
+        .parent
+        .kill()
+        .expect("SIGKILL the parked stand-in window");
+    let status = started.parent.wait().expect("reap it");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "the stand-in window execed in its own place and ran on, parked, until its kill: {status:?}"
+    );
+    group_ended(&started, &helpers_group, kid);
+    plain_ran_on(started);
+}
+
+/// Whether a tether's watcher sees its parent's exec: on macOS by its kqueue, on Linux where the
+/// kernel opens a thread's pidfd (`PIDFD_THREAD`, Linux 6.9; `EINVAL` before).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn exec_seen() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: `gettid` takes nothing; `pidfd_open` takes a thread id and flags and touches no
+        // memory of ours.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_open,
+                libc::syscall(libc::SYS_gettid),
+                libc::O_EXCL,
+            )
+        };
+        let Ok(fd) = i32::try_from(fd) else {
+            return false;
+        };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: the descriptor the call just made, which nothing else owns.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+}
+
+/// Waits until the stand-in window's tethered helper ([`GROUP`]) and the `/bin/sleep` it started
+/// in its group both run `/bin/sleep` with their threads run, and answers the helper's group, held
+/// from while it holds the helper, and the sleep's pid.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn group_runs_sleep(started: &Started) -> (Group, i32) {
     let tethered = started.tethered;
     let helper = i32::try_from(tethered).expect("a pid");
     let helpers_group = Group::of(helper);
@@ -720,11 +953,17 @@ fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
         },
     );
     runs_sleep_with_its_thread_run(kid.unsigned_abs());
-    started.parent.kill().expect("SIGKILL the stand-in window");
-    started.parent.wait().expect("reap it");
+    (helpers_group, kid)
+}
+
+/// Waits until the stand-in window's tethered helper ([`GROUP`]) and the sleep `kid` it started in
+/// its group have ended, its group `helpers_group` empty.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn group_ended(started: &Started, helpers_group: &Group, kid: i32) {
+    let tethered = started.tethered;
     assert!(
         exits_within(&started.tethered_exit, MUST_HAPPEN),
-        "the tethered group leader (pid {tethered}) outlived its killed parent by {MUST_HAPPEN:?}"
+        "the tethered group leader (pid {tethered}) outlived its parent's end by {MUST_HAPPEN:?}"
     );
     aterm_spec::wait::until_within(
         MUST_HAPPEN,
@@ -733,7 +972,6 @@ fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
         ),
         || (!helpers_group.holds_any()).then_some(()),
     );
-    plain_ran_on(started);
 }
 
 /// A tethered helper at the head of a group of its own that ends first leaves its group watched:
@@ -741,7 +979,7 @@ fn a_tethered_group_leaders_group_ends_with_its_sigkilled_starter() {
 /// the `/bin/sleep` it started in its group runs on while the stand-in window lives, and ends when
 /// the window is `SIGKILL`ed, by the watcher that stayed for it. NEGATIVE CONTROL: a watcher that
 /// exits with its helper leaves the sleep adopted and running (the hang detector below fires).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter() {
     play_if_asked();
@@ -777,10 +1015,10 @@ fn a_tethered_leaders_group_left_behind_ends_with_its_sigkilled_starter() {
     );
     let kid_exit = aterm_uds::exitwatch::exit_fd(kid.unsigned_abs()).expect("watch the sleep");
     assert_eq!(
-        aterm_uds::process::process_presence(started.watcher.pid),
+        aterm_uds::process::process_presence(started.watcher().pid),
         aterm_uds::process::ProcessPresence::Present,
         "the watcher (pid {}) stays while its helper's group holds the sleep",
-        started.watcher.pid
+        started.watcher().pid
     );
     started.parent.kill().expect("SIGKILL the stand-in window");
     started.parent.wait().expect("reap it");
@@ -839,8 +1077,8 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
             .unwrap_or_else(|| panic!("{case}: no line in {said:?}"));
         assert_eq!(
             line.split_whitespace().skip(1).collect::<Vec<_>>(),
-            [plain, plain],
-            "{case}, plainly then tethered"
+            [plain, plain, plain],
+            "{case}, plainly, tethered, then tethered at the head of its group"
         );
     }
 }

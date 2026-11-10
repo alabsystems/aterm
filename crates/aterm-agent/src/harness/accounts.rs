@@ -141,8 +141,9 @@ mod sync_commit;
 pub(super) use sync_commit::CUT as SYNC_COMMIT_CUT;
 #[cfg(all(test, unix))]
 pub(super) use sync_commit::EARLY_ROSTER as SYNC_COMMIT_EARLY_ROSTER;
-pub(super) use sync_commit::SyncTarget;
-use sync_commit::usage_target;
+#[cfg(test)]
+pub(super) use sync_commit::REFUSE_BEFORE_INTENT as SYNC_COMMIT_REFUSE;
+pub(super) use sync_commit::{FleetTarget, SyncTarget, usage_target};
 
 #[path = "accounts_directory.rs"]
 mod directory;

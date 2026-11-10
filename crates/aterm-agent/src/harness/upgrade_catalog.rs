@@ -426,6 +426,28 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     facts.baked
 }
 
+/// The cached catalog of the build that says `version`, among [`baked_cached`]'s files under
+/// `cache_dir`: read, never written or scanned for. `None` where no cached build says it.
+#[must_use]
+pub fn cached_for_version(cache_dir: &Path, version: &str) -> Option<Baked> {
+    /// The most cache files looked at: the folder holds one per build seen.
+    const FILES_MAX: usize = 256;
+    std::fs::read_dir(cache_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .take(FILES_MAX)
+        .filter_map(|path| {
+            super::accounts::read_bounded(&path, 1024 * 1024)
+                .ok()
+                .flatten()
+        })
+        .filter_map(|text| parse_facts(&text))
+        .find(|facts| facts.version.as_deref() == Some(version) && facts.baked.is_some())
+        .and_then(|facts| facts.baked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +556,35 @@ mod tests {
             );
         }
         assert_eq!(version_triple("0.0.0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn a_cached_catalog_is_found_by_the_version_its_build_says() {
+        let dir = crate::supervise::ScratchDir::new("upgrade-catalog", "by-version");
+        let facts = |version: &str, id: &str| BuildFacts {
+            version: Some(version.to_string()),
+            baked: Some(Baked {
+                latest_per_family: vec![("opus".to_string(), id.to_string())],
+                models: vec![BakedModel {
+                    id: id.to_string(),
+                    family: "opus".to_string(),
+                    display_name: "Opus".to_string(),
+                    native_1m: false,
+                    efforts: vec!["high".to_string(), "max".to_string()],
+                }],
+            }),
+        };
+        for (name, f) in [
+            ("a.json", facts("2.1.300", "claude-opus-5")),
+            ("b.json", facts("2.1.321", "claude-opus-5-5")),
+        ] {
+            std::fs::write(dir.join(name), render_facts(&f)).expect("write");
+        }
+        std::fs::write(dir.join("c.json"), "not json").expect("write");
+        let found = cached_for_version(&dir, "2.1.321").expect("the build's catalog");
+        assert_eq!(found.latest("opus"), Some("claude-opus-5-5"));
+        assert_eq!(cached_for_version(&dir, "2.1.999"), None);
+        assert_eq!(cached_for_version(&dir.join("absent"), "2.1.321"), None);
     }
 
     #[test]

@@ -541,7 +541,7 @@ pub(crate) fn path_caption_row(
 mod path_caption_tests;
 
 #[cfg(test)]
-mod caption_test_support;
+pub(crate) mod caption_test_support;
 
 #[cfg(test)]
 mod url_caption_tests;

@@ -33,7 +33,12 @@ USAGE
       Builds only: no product execution or publication. Retains all evidence.
   targo --unverified ship profile-pilot --arm ARM [--arm ARM]... [--takes 2]
       Build cut-shaped profile arms in fresh roots, without executing the product.
-      ARM: fat1, fat1-lines, fat16, fat16-lines, thin16, thin16-lines.
+      ARM: fat1, fat1-lines, fat16, fat16-lines, thin1, thin16, thin16-lines, fat-gui16.
+      fat-gui16 changes only aterm-gui to 16 codegen units through a package override.
+      --resume DIR reuses hash-checked completed rows with identical source and compiler
+      inputs, preserving incomplete takes separately before rebuilding the missing rows.
+      --jobs N and --compat-jobs N fix native and x86 slice build jobs; admission waits
+      for that grant. Resume retains unmatched-job rows separately as exploratory evidence.
       Two takes run in forward/reverse order (ABBA for two arms).
       Each take retains Cargo's unit timeline in cargo-timings/ and one-second
       process-group observations in build-resources.jsonl (sampled, not accounting).
@@ -48,6 +53,8 @@ USAGE
       a regular take separately; product runtime rows use the macOS guest lane.
   targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
       Recheck a retained take's dSYM and a stripped private copy, without rebuilding.
+  targo --unverified ship profile-pilot --summary RETAINED-PILOT-DIRECTORY
+      Summarize GUI/executable LLVM windows and sampled single-core exposure offline.
 
   targo --unverified ship release status [--json | --fleet]
       Read this clone's current or latest release, unfinished verification stages,

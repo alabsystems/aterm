@@ -3504,6 +3504,13 @@ impl Drop for NodeOpened {
 }
 
 impl NodeOpenTable {
+    fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
     fn admit(
         self: &Arc<Self>,
         content: bool,
@@ -3780,20 +3787,48 @@ fn serve_one_node_generation(
                 let mut heartbeat =
                     HeartbeatClock::new(None, heartbeat_every(), crate::network_moved::watch());
                 let mut admission_network = crate::network_moved::watch_at_once();
+                // Keep the same finite cap as the stop-only sleep this wait replaces.
+                let tick_every = tick_every.min(Duration::from_secs(86_400 * 365));
+                let mut next_tick = Instant::now() + tick_every;
+                let mut wait_failed = false;
 
                 while !listener_stop.is_set() {
-                    stop.sleep(tick_every);
-                    if stop.is_set() {
+                    let moved = match admission_network.wait_until(
+                        &[stop.as_ref(), listener_stop.as_ref()],
+                        Some(next_tick),
+                    ) {
+                        Ok(woke) => {
+                            wait_failed = false;
+                            match woke {
+                                Some(crate::network_moved::Woke::Timer) => None,
+                                other => other,
+                            }
+                        }
+                        Err(error) => {
+                            if !wait_failed {
+                                aterm_log::warn!("node: the network wait failed: {error}; keeping its timed checks");
+                                wait_failed = true;
+                            }
+                            stop.sleep(next_tick.saturating_duration_since(Instant::now()));
+                            admission_network.take_at(Instant::now())
+                        }
+                    };
+                    if stop.is_set() || listener_stop.is_set() {
                         listener_stop.set();
                         return;
                     }
-                    if let Some(maintain) = &maintenance {
-                        maintain();
-                    }
-                    if admission_network.take_at(Instant::now()).is_some()
+                    if moved.is_some()
                         && let Some(automatic) = &automatic
                     {
                         automatic.refresh();
+                    }
+                    // Moves wake admission at once without renewing this independent deadline
+                    // or repeating unrelated upkeep before it is due.
+                    if Instant::now() < next_tick {
+                        continue;
+                    }
+                    if let Some(maintain) = &maintenance {
+                        maintain();
                     }
                     if aterm_agent::node_service::left_the_fleet(&state_dir) {
                         listener_stop.set();
@@ -3832,32 +3867,40 @@ fn serve_one_node_generation(
                         return;
                     }
 
-                    let serving = serving_watch();
-                    // The book is read at the first judgment that needs it, an open drive's
-                    // key, and once a tick at most: a tick with no drive open reads none, as the
-                    // window's listener does (`holds_now`, `fleet_listen.rs`).
-                    let book = std::cell::OnceCell::new();
-                    let keys =
-                        || book.get_or_init(|| aterm_net::fleet_member::Keyring::read(&state_dir));
                     let mut log = members_watch.as_ref().and_then(|members| members.keys());
                     if let Some(automatic) = &automatic {
                         automatic.observe_membership(log.as_ref());
                     }
                     let denied = denied_nodes_for(vault_paths.as_ref(), &denied_watch);
-                    // No deny list read yet: every open drive or content read is cut, as the
-                    // handshake refuses each new connection, until one is read.
-                    let unread = Serving {
-                        scope: FleetScope::Facts,
-                        grants: Vec::new(),
-                    };
-                    let _ = match denied.as_deref() {
-                        Some(denied) => open_watch.cut_unserved(
-                            &serving,
-                            &|n, key| holds_in(keys(), log.as_deref(), n, key),
-                            denied,
-                        ),
-                        None => open_watch.cut_unserved(&unread, &|_, _| false, &[]),
-                    };
+                    if !open_watch.is_empty() {
+                        // No deny list read yet: every open drive or content read is cut, as the
+                        // handshake refuses each new connection, until one is read.
+                        let unread = Serving {
+                            scope: FleetScope::Facts,
+                            grants: Vec::new(),
+                        };
+                        let _ = match denied.as_deref() {
+                            Some(denied) => {
+                                let serving = serving_watch();
+                                // The book is read at the first judgment that needs it, an open
+                                // drive's key, and once a tick at most: a tick with no drive open
+                                // reads none, as the window's listener does (`holds_now`,
+                                // `fleet_listen.rs`).
+                                let book = std::cell::OnceCell::new();
+                                let keys = || {
+                                    book.get_or_init(|| {
+                                        aterm_net::fleet_member::Keyring::read(&state_dir)
+                                    })
+                                };
+                                open_watch.cut_unserved(
+                                    &serving,
+                                    &|n, key| holds_in(keys(), log.as_deref(), n, key),
+                                    denied,
+                                )
+                            }
+                            None => open_watch.cut_unserved(&unread, &|_, _| false, &[]),
+                        };
+                    }
                     // A link to a key the log took out ends now, not at its next re-proof.
                     if let Some(table) = &neighbours_watch {
                         table.judge();
@@ -3955,6 +3998,7 @@ fn serve_one_node_generation(
                             }
                         }
                     }
+                    next_tick = Instant::now() + tick_every;
                 }
             })
     };
@@ -4168,7 +4212,7 @@ fn serve_one_node_generation(
                 let check_still_serves =
                     |content: bool, grant_ref: Option<&aterm_net::fleet::DriveGrant>| -> bool {
                         let now_serving = serving_fn();
-                        let now_keys = aterm_net::fleet_member::Keyring::read(&state_dir);
+                        let now_keys = std::cell::OnceCell::new();
                         let now_log = members.as_ref().and_then(|m| m.keys());
                         // No deny list read now: nothing is served.
                         denied_nodes_for(vault_paths.as_ref(), &denied_for_serve).is_some_and(
@@ -4176,7 +4220,12 @@ fn serve_one_node_generation(
                                 now_serving.serves(
                                     content,
                                     grant_ref,
-                                    &|n, key| holds_in(&now_keys, now_log.as_deref(), n, key),
+                                    &|n, key| {
+                                        let now_keys = now_keys.get_or_init(|| {
+                                            aterm_net::fleet_member::Keyring::read(&state_dir)
+                                        });
+                                        holds_in(now_keys, now_log.as_deref(), n, key)
+                                    },
                                     &now_denied,
                                 )
                             },
@@ -5468,13 +5517,18 @@ impl LinkServe {
         let driver_key = grant.key;
         let still = |content: bool, grant: Option<&aterm_net::fleet::DriveGrant>| -> bool {
             let now_serving = (self.serving)();
-            let now_keys = aterm_net::fleet_member::Keyring::read(&self.state_dir);
+            let now_keys = std::cell::OnceCell::new();
             let now_log = self.members.as_ref().and_then(|m| m.keys());
             denied_nodes_for(self.vault_paths.as_ref(), &self.denied).is_some_and(|now_denied| {
                 now_serving.serves(
                     content,
                     grant,
-                    &|n, key| holds_in(&now_keys, now_log.as_deref(), n, key),
+                    &|n, key| {
+                        let now_keys = now_keys.get_or_init(|| {
+                            aterm_net::fleet_member::Keyring::read(&self.state_dir)
+                        });
+                        holds_in(now_keys, now_log.as_deref(), n, key)
+                    },
                     &now_denied,
                 )
             })

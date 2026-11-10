@@ -564,7 +564,11 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
 
 #[test]
 fn the_model_and_effort_menus_offer_the_switch_a_click_makes() {
-    use crate::claude_facts::{ModelSwitch, switch_plan};
+    use crate::claude_facts::{ModelSwitch, SwitchTarget};
+    let unread = SwitchTarget::unread().expect("the seed's first id is a `/model` argument");
+    let switch_plan = |facts: &aterm_agent::harness::footer::FooterFacts, switch: &ModelSwitch| {
+        crate::claude_facts::switch_plan(facts, switch, unread)
+    };
     let shown = |model: &str, effort: &str| aterm_agent::harness::footer::FooterFacts {
         model: Some(model.into()),
         effort: Some(effort.into()),

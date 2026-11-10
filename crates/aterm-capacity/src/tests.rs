@@ -6461,6 +6461,61 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
     }
 }
 
+/// Isolation is the reason this numerically fitting need waits. The diagnostic
+/// must name the holder, rather than invent a zero-byte memory shortage.
+#[test]
+fn an_isolation_wait_names_its_holders_instead_of_zero_memory_shortfall() {
+    let reading = Reading {
+        available: Some(89 * GIB / 2),
+        ..Reading::of_gib(64, 0, 14)
+    };
+    let held = record(
+        30,
+        0,
+        Need::new("qualify tree test").mem(39 * GIB / 10),
+        Some(1),
+    );
+    let short = decide(
+        &Need::new("cold final link").mem_gib(2).alone(),
+        (1, 20, 0),
+        &reading,
+        &[Other {
+            record: &held,
+            used: TreeUse::default(),
+            credited: TreeUse::default(),
+        }],
+        1,
+    )
+    .expect_err("isolation still waits even with ample memory");
+    let line = short.to_string();
+    assert!(
+        line.contains("waits to run alone beside 1 holder"),
+        "{line}"
+    );
+    assert!(line.contains("qualify tree test"), "{line}");
+    assert!(!line.contains("short by"), "{line}");
+    assert_eq!(short.shorts, [Short::WantsAlone { holders: 1 }]);
+    let short = decide(
+        &Need::new("one byte short").mem_gib(2).margin(1),
+        (1, 20, 0),
+        &Reading {
+            available: Some(59 * GIB / 10),
+            ..reading
+        },
+        &[Other {
+            record: &held,
+            used: TreeUse::default(),
+            credited: TreeUse::default(),
+        }],
+        1,
+    )
+    .expect_err("a positive shortage cannot round down to zero");
+    assert!(
+        short.to_string().contains("memory short by 0.1 GiB"),
+        "{short}"
+    );
+}
+
 /// A JOB'S MEMORY MARGIN ([`Reading::memory_margin`]) is an eighth of the machine's available
 /// memory, held between 256 MiB and 8 GiB, and the floor where nothing available is read: 2 GiB
 /// on 16 GiB available, the floor on 1 GiB, the ceiling on 128 GiB. NEGATIVE CONTROL: the margin

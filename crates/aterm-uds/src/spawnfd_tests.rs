@@ -881,11 +881,14 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
     );
 }
 
-/// The search a tethered spawn judges before it routes (`platform::findable`) answers what the
-/// spawn itself answers: it passes exactly when a plain spawn of the program starts, and refuses
-/// with that spawn's own error, for a bare name on `PATH`, a relative path in the child's folder,
-/// an absolute path and an empty name.
-#[cfg(target_vendor = "apple")]
+/// The search a tethered spawn judges before it routes (`program_search::findable`) answers what
+/// the spawn itself answers: it passes exactly when a plain spawn of the program starts, and
+/// refuses with that spawn's own error, for a bare name on `PATH`, a relative path in the child's
+/// folder, an absolute path and an empty name; on Linux also where glibc's `execvp` loop parts
+/// from a plain walk of the candidates: an entry too long to join, which ends the search; one
+/// too long for glibc to copy, passed over for the working directory, unless it is the last; a
+/// link loop; and a folder this process may not search, which answers `EACCES`.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn a_search_judged_before_the_spawn_answers_what_the_spawn_answers() {
     use std::os::unix::fs::PermissionsExt;
@@ -900,7 +903,7 @@ fn a_search_judged_before_the_spawn_answers_what_the_spawn_answers() {
     let gone_first = format!("{here}/gone:{here}");
     let tool = format!("{here}/tool");
     let plain = format!("{here}/plain");
-    let cases: [(&str, &str, bool); 14] = [
+    let cases: Vec<(&str, &str, bool)> = vec![
         ("tool", &here, false),
         ("tool", &gone_first, false),
         ("plain", &here, false),
@@ -916,9 +919,46 @@ fn a_search_judged_before_the_spawn_answers_what_the_spawn_answers() {
         ("", &here, false),
         ("tool", "gone:.", true),
     ];
+    #[cfg(target_os = "linux")]
+    let (joined_too_long, copied_too_long_then_gone, gone_then_copied_too_long, looped, shut) = {
+        std::fs::create_dir(dir.join("loop")).expect("mkdir");
+        std::os::unix::fs::symlink("tool", dir.join("loop/tool")).expect("a link to itself");
+        // Listed but never searched, so the scratch folder's removal still empties it.
+        std::fs::create_dir(dir.join("shut")).expect("mkdir");
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        let joined = format!("/{}", "c".repeat(4093));
+        let copied = format!("/{}", "b".repeat(4100));
+        (
+            format!("{joined}:{here}"),
+            format!("{copied}:{here}/gone"),
+            format!("{here}/gone:{copied}"),
+            format!("{here}/loop:{here}"),
+            format!("{here}/shut"),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let cases = {
+        let mut cases = cases;
+        cases.extend([
+            ("tool", joined_too_long.as_str(), false),
+            ("tool", copied_too_long_then_gone.as_str(), true),
+            ("tool", gone_then_copied_too_long.as_str(), true),
+            ("tool", looped.as_str(), false),
+        ]);
+        // SAFETY: `geteuid` takes nothing and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            cases.push(("tool", shut.as_str(), false));
+        }
+        cases
+    };
     for (program, path, in_dir) in cases {
         let base = in_dir.then_some(dir);
-        let judged = platform::findable(program.as_bytes(), Some(OsStr::new(path)), base, false);
+        #[cfg(target_vendor = "apple")]
+        let judged =
+            program_search::findable(program.as_bytes(), Some(OsStr::new(path)), base, false);
+        #[cfg(target_os = "linux")]
+        let judged = program_search::findable(program.as_bytes(), Some(OsStr::new(path)), base);
         let mut cmd = command(program);
         cmd.env("PATH", path).stdin(Stdio::null());
         if in_dir {

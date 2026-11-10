@@ -39,7 +39,7 @@ fn fleet_text(label: &str, email: &str, opt_in: Option<&str>, shared: bool) -> S
     )
 }
 
-fn source_case(case: i64) -> (i64, i64, i64) {
+fn source_case(case: i64) -> (i64, i64, i64, i64) {
     let tmp = tmp_dir("adopt-source-policy");
     let env = env_at(&tmp);
     let config = env.config.as_ref().unwrap();
@@ -110,6 +110,8 @@ fn source_case(case: i64) -> (i64, i64, i64) {
                 } else {
                     ("work", "work@example.test")
                 };
+                // Matching accounts alone do not make a vault input a writable
+                // legacy copy. Both cases remain externally owned.
                 std::fs::write(&vault, fleet_text(name, address, Some("discovered"), false))
                     .unwrap();
                 sources.push(vault.clone());
@@ -221,7 +223,13 @@ fn source_case(case: i64) -> (i64, i64, i64) {
         .iter()
         .enumerate()
         .any(|(i, path)| std::fs::read(path).ok() != before[i + 3]);
-    (i64::from(success), retained, i64::from(granted))
+    let preserved = std::fs::read(&files[1]).ok() == before[1];
+    (
+        i64::from(success),
+        retained,
+        i64::from(granted),
+        i64::from(preserved),
+    )
 }
 
 pub(crate) fn adopt_transition(
@@ -234,11 +242,12 @@ pub(crate) fn adopt_transition(
             next.insert("case", state["case"] + 1);
         }
         "Adopt" => {
-            let (local, sources, granted) = source_case(state["case"]);
+            let (local, sources, granted, preserved) = source_case(state["case"]);
             next.insert("phase", 1);
             next.insert("local", local);
             next.insert("sources", sources);
             next.insert("granted", granted);
+            next.insert("preserved", preserved);
         }
         _ => unreachable!(),
     }
@@ -248,7 +257,7 @@ pub(crate) fn adopt_transition(
 #[test]
 fn default_adoption_conforms_to_source_authority() {
     let model = aterm_models_harness::account_adopt_source_model();
-    assert_eq!(model.mutant_dials(), (1..=17).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=18).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let mut checked = 0;
     for state in aterm_spec::interp::reachable_states(&model) {

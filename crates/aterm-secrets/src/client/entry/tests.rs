@@ -45,7 +45,7 @@ impl Fixture {
         read_verified_entry(&self.paths, &config(&self.paths).unwrap().unwrap(), "token").unwrap()
     }
 
-    fn tracked(&self) -> Vec<PathBuf> {
+    pub(super) fn tracked(&self) -> Vec<PathBuf> {
         vec![
             self.paths.state_file(),
             self.paths.source_file(),

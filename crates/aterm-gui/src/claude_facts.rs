@@ -4,11 +4,14 @@
 //! THE FOOTER'S FACTS, CLICKED.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::outlook;
 use aterm_agent::harness::quota_view::QuotaView;
 use aterm_agent::harness::session_usage::{self, UsageFacts};
+use aterm_agent::harness::{upgrade_drive, upgrade_models};
 
 use crate::claude_lights::Fact;
 use crate::{App, WindowId};
@@ -34,15 +37,133 @@ pub(crate) struct SessionFacts {
     pub(crate) top_seen: Option<i32>,
     /// Why a fact menu's typed row was refused, said in the menu reopened over it.
     pub(crate) menu_note: Option<(Fact, String)>,
-    /// The model fact's switch between the session's own model and [`SWITCH_MODEL`] at
-    /// [`SWITCH_EFFORT`] (per session, in memory only).
+    /// The model fact's switch between the session's own model and its [`SwitchTarget`] (per
+    /// session, in memory only).
     pub(crate) switch: ModelSwitch,
 }
 
-/// The model a click on the model fact or its effort switches to.
-pub(crate) const SWITCH_MODEL: &str = "claude-opus-5-5";
-/// The effort a click on the model fact or its effort switches to, with [`SWITCH_MODEL`].
-pub(crate) const SWITCH_EFFORT: &str = "xhigh";
+/// The model and effort a click on the model fact or its effort switches a session to: what
+/// `[claude_footer] switch_model` and `switch_effort` name, else the top of the harness's model
+/// priority list that the session's Claude Code build offers, at that model's highest effort
+/// ([`upgrade_models::Top`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SwitchTarget {
+    pub(crate) model: crate::claude_slash::ModelArg,
+    pub(crate) effort: &'static str,
+}
+
+impl SwitchTarget {
+    /// The target over `top`: `model` where it names a Claude model, by id
+    /// (`claude-opus-5-5`) or as the footer shows it (`Opus 5.5`), else `top`'s; `effort` where
+    /// it is a level `/effort` takes, else the chosen model's highest on `top`'s build. `auto`,
+    /// an empty word and a word that names neither are the automatic choice. `None` where
+    /// `top`'s model is no word `/model` takes, which no parsed list holds.
+    #[must_use]
+    pub(crate) fn of(
+        model: Option<&str>,
+        effort: Option<&str>,
+        top: &upgrade_models::Top,
+    ) -> Option<Self> {
+        use crate::claude_slash::ModelArg;
+        let model = model
+            .and_then(footer::model_id_of_display)
+            .and_then(|id| ModelArg::new(&id))
+            .or_else(|| ModelArg::new(&top.model))?;
+        let effort = effort
+            .map(str::trim)
+            .and_then(footer::effort_level)
+            .unwrap_or_else(|| top.effort_of(model.as_str()));
+        Some(Self { model, effort })
+    }
+
+    /// The target with no setting written and no list or catalog read: the seed list's first
+    /// model at the unread top effort.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unread() -> Option<Self> {
+        Self::of(None, None, &unread_top())
+    }
+}
+
+/// The top with nothing read: of the seed list, with no build's catalog.
+fn unread_top() -> upgrade_models::Top {
+    upgrade_models::top(&upgrade_models::Priority::seed(0), "", None)
+}
+
+/// How long a read top stands before the resolver reads it again.
+const TOP_RECHECK: Duration = Duration::from_secs(10);
+
+/// The most builds whose top is held: the sessions of one machine run a few.
+const TOPS_MAX: usize = 8;
+
+/// The top each Claude Code build's sessions switch to, as the footer's resolver thread last
+/// read it ([`note_switch_top`]): the main thread reads no file for a title or a click.
+#[derive(Default)]
+pub(crate) struct Tops(Vec<(Option<String>, Instant, Arc<upgrade_models::Top>)>);
+
+impl Tops {
+    /// Whether `version`'s top is unread, or has stood [`TOP_RECHECK`] at `now`.
+    #[must_use]
+    pub(crate) fn due(&self, version: Option<&str>, now: Instant) -> bool {
+        !self.0.iter().any(|(v, at, _)| {
+            v.as_deref() == version && now.saturating_duration_since(*at) < TOP_RECHECK
+        })
+    }
+
+    /// Hold `top` as `version`'s, read at `now`.
+    pub(crate) fn hold(&mut self, version: Option<&str>, now: Instant, top: upgrade_models::Top) {
+        self.0.retain(|(v, _, _)| v.as_deref() != version);
+        if self.0.len() >= TOPS_MAX {
+            self.0.remove(0);
+        }
+        self.0
+            .push((version.map(str::to_owned), now, Arc::new(top)));
+    }
+
+    /// The top last read for `version`.
+    #[must_use]
+    pub(crate) fn get(&self, version: Option<&str>) -> Option<Arc<upgrade_models::Top>> {
+        self.0
+            .iter()
+            .find(|(v, _, _)| v.as_deref() == version)
+            .map(|(_, _, top)| Arc::clone(top))
+    }
+}
+
+static TOPS: Mutex<Tops> = Mutex::new(Tops(Vec::new()));
+
+/// Read the top a session on Claude Code `version` switches to, off the main thread (the
+/// footer's resolver, after it read the session's facts) and at most every [`TOP_RECHECK`]: the
+/// harness's priority list and the build's cached catalog under its state
+/// ([`upgrade_drive::switch_top`]). No lock is held over the read.
+pub(crate) fn note_switch_top(version: Option<&str>, now: Instant) {
+    if cfg!(test) {
+        return;
+    }
+    let due = TOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .due(version, now);
+    if !due {
+        return;
+    }
+    let Some(state) = crate::harness_host::harness_state() else {
+        return;
+    };
+    let top = upgrade_drive::switch_top(&state, version);
+    TOPS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hold(version, now, top);
+}
+
+/// The top last read for `version`, [`unread_top`] before the resolver's first read.
+fn top_read_for(version: Option<&str>) -> Arc<upgrade_models::Top> {
+    let read = TOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(version);
+    read.unwrap_or_else(|| Arc::new(unread_top()))
+}
 
 /// A model and effort a switch types back to: `None` for each is Claude's own default
 /// (`/model default`, `/effort auto`).
@@ -71,8 +192,13 @@ impl Pick {
 /// that is answered, `/effort`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ModelSwitch {
-    /// What the session ran before its last switch to [`SWITCH_MODEL`]: where a click back goes.
+    /// What the session ran before its last switch to its [`SwitchTarget`]: where a click back
+    /// goes.
     pub(crate) back: Option<Pick>,
+    /// Where its last switch toward the [`SwitchTarget`] went, until a switch back: a session
+    /// that shows it is at its target although the target has since moved (a catalog read, the
+    /// priority list or the `[claude_footer]` setting changed), so a click still goes back.
+    pub(crate) to: Option<Pick>,
     /// The `/model` in flight and the `/effort` typed once it is answered.
     pub(crate) then: Option<(crate::claude_slash::Slash, crate::claude_slash::Slash)>,
     /// A switch began and its `/effort` has not been answered: the model shown may be the
@@ -85,11 +211,11 @@ pub(crate) struct ModelSwitch {
 pub(crate) struct SwitchPlan {
     pub(crate) model: crate::claude_slash::Slash,
     pub(crate) effort: crate::claude_slash::Slash,
-    /// What to remember as the session's own (a switch toward [`SWITCH_MODEL`]).
+    /// What to remember as the session's own (a switch toward the [`SwitchTarget`]).
     pub(crate) remember: Option<Pick>,
     /// Where it goes.
     pub(crate) to: Pick,
-    /// It goes back from [`SWITCH_MODEL`] at [`SWITCH_EFFORT`].
+    /// It goes back from the [`SwitchTarget`].
     pub(crate) back: bool,
 }
 
@@ -123,16 +249,29 @@ fn shown_model_id(facts: &FooterFacts) -> Option<String> {
         .or_else(|| footer::model_id_of_display(shown))
 }
 
-/// Where a click on the model fact or its effort switches `facts`' session: to [`SWITCH_MODEL`]
-/// at [`SWITCH_EFFORT`] (in the shown model's context variant), remembering the model and
-/// effort shown as the session's own, or, where those are shown, back to the remembered pick
-/// (Claude's defaults where none is).
+/// Where a click on the model fact or its effort switches `facts`' session: to `target` (in the
+/// shown model's context variant), remembering the model and effort shown as the session's own,
+/// or, where `target`'s are shown, back to the remembered pick (Claude's defaults where none is).
+/// A session still showing what its last switch went to ([`ModelSwitch::to`]) goes back too,
+/// wherever `target` has moved since: its own pick is not remembered over.
 #[must_use]
-pub(crate) fn switch_plan(facts: &FooterFacts, switch: &ModelSwitch) -> SwitchPlan {
+pub(crate) fn switch_plan(
+    facts: &FooterFacts,
+    switch: &ModelSwitch,
+    target: SwitchTarget,
+) -> SwitchPlan {
     use crate::claude_slash::{ModelArg, Slash};
     let effort = facts.effort.as_deref().and_then(footer::effort_level);
-    let at = facts.model.as_deref() == Some(footer::model_display(SWITCH_MODEL).as_str())
-        && effort == Some(SWITCH_EFFORT);
+    let shows = |model: crate::claude_slash::ModelArg, level: &'static str| {
+        facts.model.as_deref() == Some(footer::model_display(model.as_str()).as_str())
+            && effort == Some(level)
+    };
+    let at = shows(target.model, target.effort)
+        || switch.to.is_some_and(|to| {
+            to.model
+                .zip(to.effort)
+                .is_some_and(|(model, level)| shows(model, level))
+        });
     let slashes = |pick: Pick| {
         (
             Slash::Model(pick.model),
@@ -153,12 +292,11 @@ pub(crate) fn switch_plan(facts: &FooterFacts, switch: &ModelSwitch) -> SwitchPl
     let own = shown_model_id(facts);
     let long = own.as_deref().is_some_and(|id| id.ends_with(LONG_CONTEXT));
     let to = Pick {
-        model: if long {
-            ModelArg::new(&format!("{SWITCH_MODEL}{LONG_CONTEXT}"))
-        } else {
-            ModelArg::new(SWITCH_MODEL)
-        },
-        effort: Some(SWITCH_EFFORT),
+        model: (long && !target.model.as_str().ends_with(LONG_CONTEXT))
+            .then(|| ModelArg::new(&format!("{}{LONG_CONTEXT}", target.model.as_str())))
+            .flatten()
+            .or(Some(target.model)),
+        effort: Some(target.effort),
     };
     let (model, effort_slash) = slashes(to);
     let shown = Pick {
@@ -276,18 +414,20 @@ fn wall_clause(facts: &FooterFacts) -> Option<String> {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) -> (String, String) {
-    fact_title_with(facts, cwd, fact, Some(&ModelSwitch::default()))
+    let own = ModelSwitch::default();
+    let switch = SwitchTarget::unread().map(|target| (&own, target));
+    fact_title_with(facts, cwd, fact, switch)
 }
 
 /// What a fact's title says, whole and short, the model's and the effort's naming where a click
-/// switches the session ([`switch_plan`] of `switch`): `None` where the session is no Claude
-/// Code, whose model and effort a click hides.
+/// switches the session ([`switch_plan`] of `switch` and its target): `None` where the session
+/// is no Claude Code, whose model and effort a click hides.
 #[must_use]
 pub(crate) fn fact_title_with(
     facts: &FooterFacts,
     cwd: Option<&Path>,
     fact: Fact,
-    switch: Option<&ModelSwitch>,
+    switch: Option<(&ModelSwitch, SwitchTarget)>,
 ) -> (String, String) {
     // Each stub shows its own fact (`◆ Opus 5.5 off xhigh off` is two).
     if fact.kind().is_some_and(|kind| facts.off.has(kind)) {
@@ -300,7 +440,7 @@ pub(crate) fn fact_title_with(
     let switch = || {
         switch.map_or_else(
             || "click: hide".to_owned(),
-            |switch| format!("click: {}", switch_plan(facts, switch).words()),
+            |(switch, target)| format!("click: {}", switch_plan(facts, switch, target).words()),
         )
     };
     match fact {
@@ -500,7 +640,9 @@ pub(crate) fn fact_spoken_of(
     fact: Fact,
     restores: FactMask,
 ) -> (String, String) {
-    fact_spoken_with(facts, cwd, fact, restores, Some(&ModelSwitch::default()))
+    let own = ModelSwitch::default();
+    let switch = SwitchTarget::unread().map(|target| (&own, target));
+    fact_spoken_with(facts, cwd, fact, restores, switch)
 }
 
 /// [`fact_spoken_of`] for a session whose model switch stands at `switch` (`None`: no Claude
@@ -512,7 +654,7 @@ pub(crate) fn fact_spoken_with(
     cwd: Option<&Path>,
     fact: Fact,
     restores: FactMask,
-    switch: Option<&ModelSwitch>,
+    switch: Option<(&ModelSwitch, SwitchTarget)>,
 ) -> (String, String) {
     let name = match fact {
         Fact::Model => "Model",
@@ -528,8 +670,8 @@ pub(crate) fn fact_spoken_with(
     let switch = || {
         switch.map_or_else(
             || "Activate to hide it.".to_owned(),
-            |switch| {
-                let plan = switch_plan(facts, switch);
+            |(switch, target)| {
+                let plan = switch_plan(facts, switch, target);
                 let way = if plan.back { "back to" } else { "to" };
                 format!("Activate to switch {way} {}.", plan.to.words())
             },
@@ -730,7 +872,7 @@ impl App {
     }
 
     /// Where a click on `session`'s model or effort switches it ([`switch_plan`]); `None` where
-    /// it does not ([`Self::model_switch`]).
+    /// it does not ([`Self::model_switch`], [`Self::switch_target`]).
     #[must_use]
     pub(crate) fn switch_plan(&self, session: u64) -> Option<SwitchPlan> {
         let switch = self.model_switch(session)?;
@@ -738,7 +880,18 @@ impl App {
             .shown_facts(session)
             .map(|(facts, _)| facts)
             .unwrap_or_default();
-        Some(switch_plan(&facts, &switch))
+        Some(switch_plan(&facts, &switch, self.switch_target(&facts)?))
+    }
+
+    /// Where a click switches the session `facts` are of ([`SwitchTarget::of`]): the
+    /// `[claude_footer]` setting over the top last read for its Claude Code build.
+    #[must_use]
+    pub(crate) fn switch_target(&self, facts: &FooterFacts) -> Option<SwitchTarget> {
+        SwitchTarget::of(
+            self.config.claude_footer_switch_model(),
+            self.config.claude_footer_switch_effort(),
+            &top_read_for(facts.version.as_deref()),
+        )
     }
 
     /// THE MODEL SWITCH: type `session`'s [`switch_plan`]'s `/model` through the facts' one
@@ -758,6 +911,7 @@ impl App {
         if let Some(pick) = plan.remember {
             switch.back = Some(pick);
         }
+        switch.to = (!plan.back).then_some(plan.to);
         switch.then = Some((plan.model, plan.effort));
         switch.half = true;
         Ok(())
@@ -881,7 +1035,10 @@ impl App {
         }
         let switch = self.model_switch(session);
         self.shown_facts(session)
-            .map(|(facts, cwd)| fact_title_with(&facts, cwd.as_deref(), fact, switch.as_ref()))
+            .map(|(facts, cwd)| {
+                let switch = switch.as_ref().zip(self.switch_target(&facts));
+                fact_title_with(&facts, cwd.as_deref(), fact, switch)
+            })
             .unwrap_or_default()
     }
 
@@ -900,7 +1057,8 @@ impl App {
         let switch = self.model_switch(session);
         self.shown_facts(session)
             .map(|(facts, cwd)| {
-                fact_spoken_with(&facts, cwd.as_deref(), fact, restores, switch.as_ref())
+                let switch = switch.as_ref().zip(self.switch_target(&facts));
+                fact_spoken_with(&facts, cwd.as_deref(), fact, restores, switch)
             })
             .unwrap_or_default()
     }

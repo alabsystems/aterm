@@ -578,7 +578,7 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         code3: Code3::None,
         // A death by a signal is a crash in the window code the drive runs: a finding. Closing an answered NSAlert's glass child window at exit (aterm 0.110.0 on macOS 27.2) died by SIGSEGV in the exit turn's pool pop.
         no_status: Severity::GateFailed,
-        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — and the exit, in the turn a click answered a real NSAlert, closed only winit's own window and none of the alert's",
+        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — a focus callback raised inside a real NSAlert waited for its outer handler and was then delivered, and the exit, in the turn a click answered another real NSAlert, closed only winit's own window and none of the alert's",
     },
     ObjcDrive {
         example: "objc_event_drive",

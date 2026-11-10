@@ -160,6 +160,17 @@ pub fn current_os_symbol() -> String {
     }
 }
 
+/// Whether this process runs translated under Rosetta 2
+/// (`sysctl.proc_translated`), brew's `in_rosetta2?`.
+#[must_use]
+pub fn in_rosetta2() -> bool {
+    std::env::consts::ARCH == "x86_64"
+        && super::fetch::run_capture("/usr/sbin/sysctl", &["-n", "sysctl.proc_translated"])
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+}
+
 /// This host's arch as a brew simulation symbol.
 #[must_use]
 pub fn current_arch_symbol() -> &'static str {

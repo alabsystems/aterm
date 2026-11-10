@@ -28,7 +28,7 @@ fn admission_writer_probe_child() {
 
 /// Another process opens the real lock file and attempts the production
 /// nonblocking exclusive acquisition. No scheduling or elapsed-time assertion.
-fn writer_is_free(paths: &Paths) -> bool {
+pub(in crate::client::entry) fn writer_is_free(paths: &Paths) -> bool {
     let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     child
         .args([

@@ -3008,6 +3008,13 @@ fn resolve_and_post(
     );
     let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, asks);
     job.wake.after(session, &logged);
+    // The model switch's target for this build is read here, off the main thread.
+    let version = timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .claude_footer_shown()
+        .and_then(|facts| facts.version);
+    crate::claude_facts::note_switch_top(version.as_deref(), std::time::Instant::now());
     if identity.dir.is_some() {
         known.insert(session, identity);
     }

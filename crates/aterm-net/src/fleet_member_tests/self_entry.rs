@@ -509,3 +509,72 @@ fn heartbeat_recovers_a_higher_self_version_from_an_authenticated_peer() {
             .all(|peer| peer.node.as_deref() != Some(me.node()))
     );
 }
+
+#[test]
+fn committed_self_entry_skips_book_and_issuer_copy_migration_reads() {
+    let state = State::new("self-skip-book-floor");
+    let me = node_identity(state.dir()).unwrap();
+    let other = identity(&node_of(0x70), 0x70);
+    let valid = Peer::own(&me, ("old.local", 7100, "0.148.0"), 100);
+    let mut book_peers = vec![valid];
+    let mut copy_peers = Vec::new();
+    for i in 1..64_u8 {
+        let who = identity(&node_of(i), i);
+        let host = format!("m{i}.local");
+        book_peers.push(Peer::own(&who, (&host, 7100, "0.149.0"), u64::from(i)));
+        copy_peers.push(Peer {
+            via: Via::IssuerBook,
+            ..Peer::own(&who, (&host, 7100, "0.149.0"), u64::from(i))
+        });
+    }
+    copy_peers.push(Peer {
+        via: Via::IssuerBook,
+        ..Peer::own(&me, ("old.local", 7100, "0.148.0"), 200)
+    });
+    write_book(state.dir(), &book_peers);
+    keep_copy(state.dir(), other.node(), &copy_peers).unwrap();
+
+    let peers_path = state.dir().join(PEERS_FILE);
+    let copy_path = state.dir().join(ISSUER_BOOK_FILE);
+    let peers_bytes = std::fs::metadata(&peers_path).unwrap().len();
+    let copy_bytes = std::fs::metadata(&copy_path).unwrap().len();
+
+    // First call (`SELF_ENTRY_FILE` absent): reads migration floor from book + issuer copy (`200 -> 201`).
+    let first = self_entry_at(state.dir(), &me, ("m7.local", 7100, "0.149.0"), 1).unwrap();
+    assert_eq!(seq(&first), 201);
+    let self_entry_bytes = std::fs::metadata(state.dir().join(SELF_ENTRY_FILE))
+        .unwrap()
+        .len();
+
+    let t0 = Instant::now();
+    for tick in 2..=101 {
+        let entry = self_entry_at(state.dir(), &me, ("m7.local", 7100, "0.149.0"), tick).unwrap();
+        assert_eq!(seq(&entry), 201);
+    }
+    let after_100 = t0.elapsed();
+    eprintln!(
+        "empirical self_entry_at (64-peer book={peers_bytes}B + copy={copy_bytes}B, self_entry={self_entry_bytes}B): \
+         100 cached calls took {after_100:?} (avoids reading {}B of book+copy per call = {}B across 100 calls)",
+        peers_bytes + copy_bytes,
+        (peers_bytes + copy_bytes) * 100
+    );
+
+    // Make both `PEERS_FILE` and `ISSUER_BOOK_FILE` non-private (`0o644`) so any `judged.read` of
+    // either file fails. With `SELF_ENTRY_FILE` already committed for `me`, neither unchanged nor
+    // changed `self_entry_at` reads the book or issuer-book files.
+    mode(&peers_path, 0o644);
+    mode(&copy_path, 0o644);
+
+    let unchanged = self_entry_at(state.dir(), &me, ("m7.local", 7100, "0.149.0"), 2).unwrap();
+    assert_eq!(seq(&unchanged), 201);
+    let moved = self_entry_at(state.dir(), &me, ("m7.local", 7200, "0.149.0"), 3).unwrap();
+    assert_eq!(seq(&moved), 202);
+
+    // Negative control: once `SELF_ENTRY_FILE` is removed, `local_floor` must consult the book
+    // files for a migration floor and fails on the non-private `0o644` mode.
+    std::fs::remove_file(state.dir().join(SELF_ENTRY_FILE)).unwrap();
+    assert!(self_entry_at(state.dir(), &me, ("m7.local", 7200, "0.149.0"), 4).is_err());
+
+    mode(&peers_path, 0o600);
+    mode(&copy_path, 0o600);
+}

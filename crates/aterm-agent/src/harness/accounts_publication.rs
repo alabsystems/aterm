@@ -129,6 +129,10 @@ impl<'a> PreparedPublication<'a> {
     pub(super) fn persist(self) -> Result<Option<PendingPublication<'a>>, SyncError> {
         require_writer(self.store, self.held)?;
         #[cfg(test)]
+        if REFUSE_BEFORE_INTENT.get() {
+            return Err("injected refusal before intent persistence".into());
+        }
+        #[cfg(test)]
         let check_previous = MUTANT.get() != 3;
         #[cfg(not(test))]
         let check_previous = true;

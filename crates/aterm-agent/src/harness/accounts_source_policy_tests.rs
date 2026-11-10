@@ -8,6 +8,24 @@ const NOW: i64 = 1_790_000_000;
 const ROSTER: &str = "[[account]]\nlabel='new'\nclass='dedicated'\n";
 const FLEET: &str = "account=[]\n";
 
+#[cfg(unix)]
+#[test]
+fn absent_source_aliases_resolve_their_parent_but_ignore_dangling_leaves() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let real = root.path().join("real");
+    let linked = root.path().join("linked");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let input = real.join("absent.toml");
+    let output = linked.join("absent.toml");
+    assert!(super::source_policy::aliases(&output, &input).unwrap());
+    assert!(super::source_policy::aliases(&input, &output).unwrap());
+    assert!(!super::source_policy::aliases(&linked.join("other.toml"), &input).unwrap());
+    let dangling = real.join("dangling.toml");
+    std::os::unix::fs::symlink(real.join("removed.toml"), &dangling).unwrap();
+    assert!(!super::source_policy::aliases(&output, &dangling).unwrap());
+}
+
 #[test]
 fn recovery_requires_the_matching_store_writer() {
     let unrelated = Bed::new();
@@ -209,6 +227,8 @@ impl Bed {
                 .map(|_| ())
                 .map_err(SyncError::into_message)
         } else {
+            let fleet_path = fleet_target(&self.roster).unwrap().0;
+            let fleet_before = read(&fleet_path, MAX_FLEET).unwrap();
             self.store
                 .transact_sync_policy_held(
                     &held,
@@ -219,7 +239,12 @@ impl Bed {
                         before: None,
                         after: Some(ROSTER),
                         mode: None,
-                        fleet: (mode == 2).then_some((self.roster.as_path(), FLEET)),
+                        fleet: (mode == 2).then_some(FleetTarget {
+                            roster: &self.roster,
+                            path: &fleet_path,
+                            before: fleet_before.as_deref(),
+                            after: FLEET,
+                        }),
                     },
                     (true, |state, _| {
                         state.swarm_label = Some("m17".into());

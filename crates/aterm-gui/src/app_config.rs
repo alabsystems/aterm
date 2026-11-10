@@ -1668,6 +1668,8 @@ pub(crate) struct ClaudeFooterConfig {
     pub(crate) card: Option<bool>,
     pub(crate) acts: Option<bool>,
     pub(crate) agents: Option<bool>,
+    pub(crate) switch_model: Option<String>,
+    pub(crate) switch_effort: Option<String>,
 }
 
 /// The `[render]` table.
@@ -3434,6 +3436,22 @@ impl Config {
             .as_ref()
             .and_then(|c| c.agents)
             .unwrap_or(true)
+    }
+
+    /// The `[claude_footer] switch_model` word: `None` where it is unwritten, empty or `auto`
+    /// (`crate::claude_facts::SwitchTarget::of` reads it).
+    pub(crate) fn claude_footer_switch_model(&self) -> Option<&str> {
+        Self::switch_word(self.claude_footer.as_ref()?.switch_model.as_deref())
+    }
+
+    /// The `[claude_footer] switch_effort` word, as [`Self::claude_footer_switch_model`].
+    pub(crate) fn claude_footer_switch_effort(&self) -> Option<&str> {
+        Self::switch_word(self.claude_footer.as_ref()?.switch_effort.as_deref())
+    }
+
+    fn switch_word(word: Option<&str>) -> Option<&str> {
+        word.map(str::trim)
+            .filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("auto"))
     }
 
     /// `[harness.<agent>] enabled` as the supervisor's reader took it.

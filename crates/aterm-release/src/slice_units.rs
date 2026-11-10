@@ -7,19 +7,19 @@
 //! lifetime maxima, including the compiler's final counter read before reaping.
 //! RSS remains in the timeline for comparison, never as footprint history.
 //!
-//! A build with every slice's final link recorded claims only its drivers and
-//! admits units separately, leading. Otherwise each slice learns alone; no fixed
-//! link estimate or incompatible history supplies an unmeasured envelope.
+//! Slices claim their drivers and admit compilers separately. An exact footprint
+//! is preferred; a compiler or metric change falls back to the largest prior peak
+//! of that same target and unit. Only a final link with no history learns alone.
 //! See `docs/measured/slice-memory-claim-2026-11-10.md`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The slices' heavy units' record, under this account's aterm state directory.
+/// The slices' compiler-unit record, under this account's aterm state directory.
 pub(crate) const RECORD: &str = "release/slice-unit-memory.json";
 
-/// The least peak a unit's record starts from: 1 GiB, so it holds the heavy compilers only. A
-/// unit once kept keeps every later peak, so one grown lighter forgets its old peak after
+/// The least peak used for a measured unit's admission: 1 GiB. Every successful compiler
+/// keeps its peak, so light units need not repeat their cold claim. A unit grown lighter forgets its old peak after
 /// [`aterm_capacity::book::KEPT`] runs.
 pub(crate) const FLOOR: u64 = 1 << 30;
 
@@ -65,8 +65,9 @@ pub(crate) fn measure(root: &Path, takes: u8) -> Result<(), String> {
         eprintln!(
             "{}",
             aterm_json::json!({"event":"slice-memory-take", "take":take,
-            "record":units.record.display().to_string(), "measured":units.claims(),
-            "claim_bytes":units.claims().then_some(before.mem),
+            "record":units.record.display().to_string(),
+            "measured":peak(&records, triple, &last_unit()).is_some(),
+            "claim_bytes":(!before.alone).then_some(before.mem),
             "memory_identity":toolchain_key(triple)})
         );
         let _claim = aterm_capacity::admit(slice_need(triple, None), aterm_capacity::Admit::Wait)
@@ -130,17 +131,11 @@ pub(crate) struct Units {
 
 impl Units {
     /// The units of the slices one build runs, `triples`, `at_once` of them at a time, kept at
-    /// `record`. They claim only where it holds every one's last unit, `aterm`'s link
-    /// ([`last_unit`]): the slices' claims share a process, whose claims a child
-    /// compiler excludes from its admission. Mixing isolated training and unit
-    /// admission would therefore leave the training slice unprotected from the
-    /// other's compilers. Each unit leaves every concurrent driver spare.
+    /// `record`. Every compiler claims its own memory, including on a new toolchain.
+    /// Each unit leaves every concurrent driver spare; an unrecorded final link's
+    /// isolation belongs to that compiler, never to its whole slice.
     pub(crate) fn of(record: &Path, triples: &[&str], at_once: u64) -> Vec<Units> {
-        let records = aterm_capacity::book::Records::load(record);
-        let claims = triples
-            .iter()
-            .all(|triple| peak(&records, triple, &last_unit()).is_some());
-        let spare = claims.then(|| DRIVER.saturating_mul(at_once));
+        let spare = Some(DRIVER.saturating_mul(at_once));
         triples
             .iter()
             .map(|triple| Units {
@@ -183,8 +178,8 @@ impl Units {
     }
 }
 
-/// A measured slice claims its driver. An unmeasured slice learns in isolation:
-/// an RSS record or another compiler build cannot establish its memory envelope.
+/// A wrapped slice claims its driver even before its first measurement. An unwrapped
+/// diagnostic must isolate its whole process tree, since no compiler claims for it.
 pub(crate) fn slice_need(triple: &str, units: Option<&Units>) -> aterm_capacity::Need {
     let need = aterm_capacity::Need::new(format!("release slice {triple}"))
         .rank(aterm_capacity::Rank::Release)
@@ -261,7 +256,35 @@ fn peak(
         .and_then(|row| row.peaks.iter().map(|p| p.bytes).max())
 }
 
-/// What `unit`'s compiler in `triple`'s slice claims: its recorded peak, at least [`FLOOR`],
+/// A prior compiler or metric is an admission estimate, not a measurement of this
+/// compiler. Keep the largest peak for exactly this target and unit, never a prefix
+/// lookalike or another target. New measurements still use their exact identity.
+fn prior_peak(
+    records: &aterm_capacity::book::Records,
+    triple: &str,
+    unit: &aterm_verify::unitgraph::UnitName,
+) -> Option<u64> {
+    let prefix = format!("{triple} {}", unit.kind);
+    records
+        .rows()
+        .iter()
+        .filter(|row| {
+            row.key.stage == STAGE
+                && row.key.checkout.is_empty()
+                && row.key.crates.as_deref() == Some(std::slice::from_ref(&unit.package))
+                && row.key.variant.as_deref().is_some_and(|variant| {
+                    variant
+                        .strip_prefix(&prefix)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                })
+        })
+        .flat_map(|row| row.peaks.iter().map(|peak| peak.bytes))
+        .filter(|peak| *peak > 0)
+        .max()
+}
+
+/// What `unit`'s compiler in `triple`'s slice claims: its exact or largest prior peak,
+/// or the machine-sized cold estimate, at least [`FLOOR`],
 /// plus 20% (at least 1 GiB), rounded up to a GiB,
 /// leading, with `spare` (its build's drivers, [`Units::of`]) left spare.
 pub(crate) fn unit_need(
@@ -270,17 +293,37 @@ pub(crate) fn unit_need(
     unit: &aterm_verify::unitgraph::UnitName,
     spare: u64,
 ) -> aterm_capacity::Need {
-    let bytes = aterm_capacity::peak_claim(peak(records, triple, unit).unwrap_or(FLOOR).max(FLOOR))
-        .div_ceil(FLOOR)
-        .saturating_mul(FLOOR);
-    aterm_capacity::Need::new(format!(
+    unit_need_on(triple, records, unit, spare, None)
+}
+
+fn unit_need_on(
+    triple: &str,
+    records: &aterm_capacity::book::Records,
+    unit: &aterm_verify::unitgraph::UnitName,
+    spare: u64,
+    physical: Option<u64>,
+) -> aterm_capacity::Need {
+    let estimate = peak(records, triple, unit).or_else(|| prior_peak(records, triple, unit));
+    let bytes = aterm_capacity::peak_claim(
+        estimate
+            .unwrap_or_else(|| aterm_capacity::cold_claim(physical))
+            .max(FLOOR),
+    )
+    .div_ceil(FLOOR)
+    .saturating_mul(FLOOR);
+    let need = aterm_capacity::Need::new(format!(
         "release slice {triple} unit {} {}",
         unit.package, unit.kind
     ))
     .rank(aterm_capacity::Rank::Release)
     .mem(bytes)
     .margin(spare)
-    .leads()
+    .leads();
+    if estimate.is_none() && *unit == last_unit() {
+        need.alone()
+    } else {
+        need
+    }
 }
 
 /// Entry for Cargo's rustc wrapper: `None` unless this process is one ([`WRAPPER`]); else the
@@ -330,7 +373,7 @@ pub(crate) fn compiler(args: &[OsString]) -> Result<aterm_uds::spawnfd::Command,
 
 /// Run the compiler `args` names for the unit it compiles in `package`
 /// ([`aterm_verify::memory::unit_of`]): under its own claim where `units` claim, and its peak
-/// kept where it finished and is heavy or kept already. A query (`-vV`, `--print`) compiles
+/// kept where it finished successfully. A query (`-vV`, `--print`) compiles
 /// nothing and runs at once. A claim this host can never hold beside its spare asks to run ALONE
 /// ([`aterm_capacity::Need::alone`]), as verify's stages do: beside nothing else, the drivers
 /// have the rest of the machine.
@@ -359,13 +402,15 @@ fn wrap(
     let claim = match (&unit, units.spare) {
         (Some(unit), Some(spare)) => {
             let records = aterm_capacity::book::Records::load(&units.record);
-            // Recheck in the compiler's own working directory. A snapshot can
-            // carry a different lock from its orchestration checkout, or the
-            // book can have been replaced since the driver chose unit claims.
-            if peak(&records, &units.triple, &last_unit()).is_none() {
-                return Err("no matching toolchain footprint for the final link; rerun the slice alone to learn it".into());
-            }
-            let need = unit_need(&units.triple, &records, unit, spare);
+            // Re-read in the compiler's own working directory. A snapshot may use
+            // another toolchain; an absent/replaced book isolates only its final link.
+            let need = unit_need_on(
+                &units.triple,
+                &records,
+                unit,
+                spare,
+                machine.read(None).physical,
+            );
             let bytes = need.mem;
             let admit = |need| {
                 aterm_capacity::admit_with(
@@ -495,12 +540,8 @@ fn keep(units: &Units, unit: &aterm_verify::unitgraph::UnitName, peak: u64) -> s
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     aterm_capacity::book::Records::update(&units.record, |records| {
-        let kept = records.rows().iter().any(|row| row.key == key);
-        let keeps = peak >= FLOOR || kept;
-        if keeps {
-            records.push(key, peak, at_ms);
-        }
-        keeps
+        records.push(key, peak, at_ms);
+        true
     })
     .map(|_| ())
 }

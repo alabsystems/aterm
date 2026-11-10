@@ -99,9 +99,10 @@ pub use control_recovery::{
 };
 pub use enrollment::{admin_cached, admin_cached_until};
 pub use entry::{
-    EntryAdmission, EntryClaim, EntryClaimRelation, EntryObservation, EntryOrigin, EntrySnapshot,
-    EntryVersion, MAX_ENTRY_CLAIM_BYTES, PublicRosterPair, PublicRosterRead, VerifiedEntry,
-    current_public_roster, observe_verified_entry, read_account_bound_entry, read_verified_entry,
+    EntryAdmission, EntryClaim, EntryClaimRelation, EntryObservation, EntryOrigin, EntryRead,
+    EntryReader, EntrySnapshot, EntryVersion, MAX_ENTRY_CLAIM_BYTES, PublicRosterPair,
+    PublicRosterRead, VerifiedEntry, current_public_roster, observe_verified_entry,
+    read_account_bound_entry, read_verified_entry,
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
@@ -973,6 +974,11 @@ enum StateObservation {
     Held(StateLock),
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static STATE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(debug_assertions)]
 std::thread_local! {
     /// The state lock files this thread observes across reads that must see one state
@@ -1045,7 +1051,18 @@ impl StateLock {
     /// can take it until this drops. A writer's own take, or a lock that guards another file (one
     /// renamed away, another vault's), is not.
     pub(crate) fn observes(&self, paths: &Paths) -> bool {
-        self.shared && self.guards(&paths.lock_file())
+        self.observes_in(paths, None)
+    }
+
+    /// [`Self::observes`], the `lstat` of the lock's path `glance`'s where given: the look of the
+    /// check this judges for ([`fsx::Glance`]), whose first ask of the path stands for the rest of
+    /// its asks. An observation that guarded the lock at a look's first ask is taken to guard it
+    /// while that look lives: no writer takes the lock while this observes it, and a lock file
+    /// renamed or replaced meanwhile by something that does not hold the lock at the vault's path
+    /// is seen at the next look, as any file is that changes without the state lock
+    /// ([`VaultLook`]).
+    pub(crate) fn observes_in(&self, paths: &Paths, glance: Option<&fsx::Glance>) -> bool {
+        self.shared && self.guards_in(&paths.lock_file(), glance)
     }
 
     /// Panics where an exclusive take of the lock at `path` would wait on this thread's own
@@ -1113,11 +1130,34 @@ impl StateLock {
     /// on that file wakes holding a lock on the kept folder, which guards nothing at `path`. A
     /// take that finds that drops it and takes the file at `path` again.
     fn guards(&self, path: &Path) -> bool {
+        self.guards_in(path, None)
+    }
+
+    /// [`Self::guards`], the `lstat` of `path` `glance`'s where given and otherwise its own. The
+    /// file the descriptor holds is an observation's `idle_as`, which the `fstat` its observation
+    /// judged found, and otherwise its own `fstat`: an open descriptor's device and inode never
+    /// change.
+    fn guards_in(&self, path: &Path, glance: Option<&fsx::Glance>) -> bool {
         use std::os::unix::fs::MetadataExt as _;
-        self.file
-            .as_ref()
-            .and_then(|file| file.metadata().ok())
-            .is_some_and(|held| fsx::file_id(path) == Some((held.dev(), held.ino())))
+        let Some(file) = &self.file else {
+            return false;
+        };
+        let held = self
+            .idle_as
+            .or_else(|| file.metadata().ok().map(|held| (held.dev(), held.ino())));
+        let at = match glance {
+            Some(glance) => glance
+                .symlink_metadata(path)
+                .ok()
+                .flatten()
+                .map(|at| (at.dev(), at.ino())),
+            None => {
+                #[cfg(test)]
+                count_lock_use(LockUse::Judged, path);
+                fsx::file_id(path)
+            }
+        };
+        held.is_some_and(|held| at == Some(held))
     }
 
     fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
@@ -1366,6 +1406,8 @@ impl StateLock {
 
     /// Classify one nonblocking read without another filesystem probe or permission repair.
     fn observe_classified(paths: &Paths) -> crate::Result<StateObservation> {
+        #[cfg(test)]
+        STATE_OBSERVATIONS.set(STATE_OBSERVATIONS.get().saturating_add(1));
         Self::classify(paths, Self::open_observed(paths)?)
     }
 
@@ -1464,6 +1506,9 @@ enum LockUse {
     Opened,
     /// Observed it, by an open or an idle descriptor ([`StateLock::classify`]).
     Observed,
+    /// Judged on its own call whether a descriptor still holds the file at its path: an `lstat`
+    /// of the path that no look took ([`StateLock::guards`]).
+    Judged,
 }
 
 #[cfg(test)]
@@ -1499,6 +1544,14 @@ pub(crate) fn lock_opens_of(paths: &Paths) -> usize {
 #[cfg(test)]
 pub(crate) fn lock_observations_of(paths: &Paths) -> usize {
     lock_uses_of(LockUse::Observed, paths)
+}
+
+/// How many times this test process judged on its own call whether a descriptor still holds the
+/// state lock file of `paths` ([`StateLock::guards`]), a look's judgement through its glance
+/// apart.
+#[cfg(test)]
+pub(crate) fn lock_judgements_of(paths: &Paths) -> usize {
+    lock_uses_of(LockUse::Judged, paths)
 }
 
 #[cfg(test)]
@@ -1862,16 +1915,18 @@ fn start_over_as(
     making: crate::Making,
     now_secs: u64,
 ) -> crate::Result<Option<LabSetAside>> {
-    start_over_then(paths, making, now_secs, || {})
+    start_over_then(paths, making, now_secs, || {}, || {})
 }
 
-/// [`start_over_as`], running `before_identity` after the new folder's record is written and
-/// before its identity is made: a test's stand-in for another process that makes one there in
-/// that moment.
+/// [`start_over_as`], running `after_take` once its first take of the state lock returns, and
+/// `before_identity` after the new folder's record is written and before its identity is made: a
+/// test's stand-ins for another set-aside that moved the folder while this one waited on its lock,
+/// and for another process that makes an identity in the new folder in that moment.
 fn start_over_then(
     paths: &Paths,
     making: crate::Making,
     now_secs: u64,
+    after_take: impl FnOnce(),
     before_identity: impl FnOnce(),
 ) -> crate::Result<Option<LabSetAside>> {
     if crate::lab_identity(making).is_some() {
@@ -1887,14 +1942,33 @@ fn start_over_then(
         )));
     };
     let lock_path = paths.lock_file();
-    let lock = fsx::open_lock(&lock_path)?;
-    aterm_uds::file_lock::lock_exclusive_until(
-        &lock,
-        Instant::now() + LAB_SET_ASIDE_LOCK_WAIT,
-        "the vault folder's state lock is busy",
-    )
-    .map_err(|e| Error::new(format!("{}: {e}", lock_path.display())))?;
-    let lock = StateLock::exclusive(lock);
+    let deadline = Instant::now() + LAB_SET_ASIDE_LOCK_WAIT;
+    let mut after_take = Some(after_take);
+    // A set-aside that waited on a lock file another set-aside moved away with its folder wakes
+    // holding the kept folder's lock, which guards nothing at the vault's path: it takes the lock
+    // there instead, as `StateLock::take_at`, `take_at_until` and `try_take` do
+    // ([`StateLock::guards`]), so it renames a folder only while it holds that folder's lock, and
+    // none while another holds or observes it.
+    let lock = loop {
+        let file = fsx::open_lock(&lock_path)?;
+        aterm_uds::file_lock::lock_exclusive_until(
+            &file,
+            deadline,
+            "the vault folder's state lock is busy",
+        )
+        .map_err(|e| Error::new(format!("{}: {e}", lock_path.display())))?;
+        let lock = StateLock::exclusive(file);
+        if let Some(after_take) = after_take.take() {
+            after_take();
+        }
+        if lock.guards(&lock_path) {
+            break lock;
+        }
+        drop(lock);
+        if !matches!(read_identity_marked(paths)?, Some((_, Some(_)))) {
+            return Ok(None);
+        }
+    };
     // Under the lock, the folder at the vault's path is still the lab one: another process's
     // set-aside, which holds this lock while it renames, moved none, or this reads its new one.
     let Some((_, Some(mark))) = read_identity_marked(paths)? else {
@@ -3944,8 +4018,9 @@ impl CommonsSourceRead {
     /// observation of the state lock for as long as it held the read, rather than observing the
     /// lock again: `aterm-db`'s table-repair read batch, which holds its vault's source read from
     /// before its admission until its batch returns, judges the batch through it. `paths` must be
-    /// the vault this read was taken of ([`try_commons_source_read`]); each ask still judges only
-    /// while the observation guards the lock at that vault's path ([`StateLock::observes`]).
+    /// the vault this read was taken of ([`try_commons_source_read`]); whether the observation
+    /// guards the lock at that vault's path the look judges at its first ask, through its glance
+    /// ([`StateLock::observes_in`]).
     #[must_use]
     pub fn into_look(self, paths: &Paths) -> VaultLook<'_> {
         VaultLook::standing_on(paths, self.lock)

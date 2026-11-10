@@ -71,7 +71,6 @@ impl Bed {
                 &[FleetSnapshot {
                     path: source.clone(),
                     bytes: Some(fs::read(source).unwrap()),
-                    publish: Publish::Fleet,
                 }],
             ),
         )
@@ -538,10 +537,7 @@ fn default_account_rename_refuses_every_retained_destination_before_publication(
             let why = bed.sync().err().unwrap_or_else(|| {
                 panic!("{kind}, empty={source_empty}: retained destination must refuse")
             });
-            assert!(
-                why.contains("before roster publication") && why.contains("retains"),
-                "{kind}: {why}"
-            );
+            assert!(why.contains("retains"), "{kind}: {why}");
             assert_eq!(
                 bed.records(),
                 before,

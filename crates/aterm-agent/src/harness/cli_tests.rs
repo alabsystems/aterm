@@ -13335,6 +13335,8 @@ mod adopt_identity;
 
 #[path = "cli_adopt_source_tests.rs"]
 mod adopt_source;
+#[path = "cli_manual_receipt_tests.rs"]
+mod manual_receipt;
 
 #[path = "cli_attempt_generation_tests.rs"]
 mod attempt_generation;

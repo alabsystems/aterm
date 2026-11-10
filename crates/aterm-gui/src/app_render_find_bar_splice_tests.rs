@@ -540,7 +540,7 @@ fn a_band_painted_over_a_bidi_row_drops_its_map() {
         cols,
         &crate::chrome_band::band_colors(app.chrome_palette_theme()),
     );
-    app.splice_band_rows_at(wid, 4, vec![blank], cols, cell_h);
+    app.splice_band_rows_at(wid, 4, std::iter::once(blank), cols, cell_h);
     assert!(
         app.windows[&wid]
             .input_scratch

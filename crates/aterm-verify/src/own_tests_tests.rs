@@ -471,7 +471,6 @@ fn files_of_other_targets_and_no_source_keep_the_cone() {
         ("README.md", "# a\n"),
     ]);
     for (path, want) in [
-        ("tests/it.rs", Doubt::OtherTarget(join(DIR, "tests/it.rs"))),
         (
             "benches/b.rs",
             Doubt::OtherTarget(join(DIR, "benches/b.rs")),
@@ -497,9 +496,83 @@ fn files_of_other_targets_and_no_source_keep_the_cone() {
         ("src/inner_test.rs", "fn main() {}\n"),
     ])
     .with("src/inner_test.rs", Some("fn main() { let _ = 1; }\n"));
+    assert_eq!(change.judge(), Ok(()));
+}
+
+/// Integration targets and their modules are not linked into dependent crates. Negative
+/// controls mount the same file as shipped tokens, embed its bytes, or let the build script
+/// read it: its location must never hide any of those observations.
+#[test]
+fn integration_tests_are_confined_only_when_no_shipped_reader_observes_them() {
+    let base = Change::services(&[
+        ("tests/suite.rs", "mod cases;\n"),
+        (
+            "tests/cases/mod.rs",
+            "pub fn value() -> u8 { 1 }\n#[test]\nfn it() {}\n",
+        ),
+    ]);
+    let changed = |base: Change| base.edit("tests/cases/mod.rs", "{ 1 }", "{ 2 }");
+    let observing = |path: &str, text: &str| {
+        let mut observed = base.clone().with(path, Some(text));
+        observed.before = observed.now.clone();
+        observed
+    };
+    assert_eq!(changed(base.clone()).judge(), Ok(()));
+    for reader in [
+        "#[path = \"../tests/cases/mod.rs\"] mod cases;\n",
+        "include!(\"../tests/cases/mod.rs\");\n",
+        "const DATA: &str = include_str!(\"../tests/cases/mod.rs\");\n",
+        "const PATH: &str = \"tests/cases/mod.rs\";\n",
+    ] {
+        assert!(
+            changed(observing("src/lib.rs", reader)).judge().is_err(),
+            "shipped reader {reader} must keep dependents"
+        );
+    }
+    let build = "fn main() { println!(\"cargo::rerun-if-changed=tests\"); }\n";
+    assert!(changed(observing("build.rs", build)).judge().is_err());
+    // A test path can also be a binary root, even outside src/: both builds must be read.
+    let dual = format!("{MANIFEST}\n[[bin]]\nname='dual'\npath='tests/cases/mod.rs'\n");
+    let mut dual_base = base.clone();
+    dual_base.before.insert("Cargo.toml".into(), dual.clone());
+    dual_base.now.insert("Cargo.toml".into(), dual);
+    assert_eq!(changed(dual_base).judge(), shipped("tests/cases/mod.rs"));
+    // A file not reached by a test root remains unknown, rather than being trusted by folder.
+    let orphan = Change::services(&[("tests/cases/orphan.rs", "fn orphan() {}\n")]).edit(
+        "tests/cases/orphan.rs",
+        "fn orphan() {}",
+        "fn orphan() { panic!(); }",
+    );
+    assert_eq!(orphan.judge(), shipped("tests/cases/orphan.rs"));
+}
+
+/// With discovery disabled, folder placement is no evidence that Cargo owns a file as a test.
+/// An explicit test root restores that evidence, including for the modules it mounts.
+#[test]
+fn disabled_test_discovery_requires_an_explicit_root() {
+    let manifest = format!("{MANIFEST}autotests = false\n");
+    let base = Change::services(&[
+        ("Cargo.toml", &manifest),
+        ("tests/suite.rs", "mod cases;\n"),
+        ("tests/cases/mod.rs", "pub fn value() -> u8 { 1 }\n"),
+    ]);
     assert_eq!(
-        change.judge(),
-        Err(Doubt::OtherTarget(join(DIR, "src/inner_test.rs")))
+        base.clone()
+            .edit("tests/cases/mod.rs", "{ 1 }", "{ 2 }")
+            .judge(),
+        shipped("tests/cases/mod.rs")
+    );
+    let explicit = format!("{manifest}\n[[test]]\nname='suite'\npath='tests/suite.rs'\n");
+    let mut declared = base;
+    declared
+        .before
+        .insert("Cargo.toml".into(), explicit.clone());
+    declared.now.insert("Cargo.toml".into(), explicit);
+    assert_eq!(
+        declared
+            .edit("tests/cases/mod.rs", "{ 1 }", "{ 2 }")
+            .judge(),
+        Ok(())
     );
 }
 

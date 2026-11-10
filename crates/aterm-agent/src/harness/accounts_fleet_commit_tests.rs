@@ -60,6 +60,8 @@ impl Bed {
     ) -> Result<(), String> {
         let held = self.store.acquire().unwrap();
         let before = read(target, MAX_ROSTER_BYTES).unwrap();
+        let fleet_path = fleet_target(logical).unwrap().0;
+        let fleet_before = read(&fleet_path, MAX_FLEET).unwrap();
         CUT.with(|held| held.set(cut));
         let result = self.store.transact_sync_held(
             &held,
@@ -70,7 +72,12 @@ impl Bed {
                 before: before.as_deref(),
                 after: Some(ROSTER),
                 mode: None,
-                fleet: Some((logical, FLEET)),
+                fleet: Some(FleetTarget {
+                    roster: logical,
+                    path: &fleet_path,
+                    before: fleet_before.as_deref(),
+                    after: FLEET,
+                }),
             },
             |state, _| {
                 state.swarm_label = Some("m16".into());
@@ -81,6 +88,104 @@ impl Bed {
         CUT.with(|held| held.set(None));
         result.map(|_| ())
     }
+
+    fn publish_roster_to(
+        &self,
+        logical: &Path,
+        target: &Path,
+        cut: Option<usize>,
+    ) -> Result<bool, String> {
+        let held = self.store.acquire().unwrap();
+        let before = read(target, MAX_ROSTER_BYTES).unwrap();
+        let fleet_path = fleet_target(logical).unwrap().0;
+        let fleet_before = read(&fleet_path, MAX_FLEET).unwrap();
+        CUT.set(cut);
+        let result = self.store.transact_roster_held(
+            &held,
+            NOW,
+            &mut None,
+            SyncTarget {
+                path: target,
+                before: before.as_deref(),
+                after: Some(ROSTER),
+                mode: None,
+                fleet: Some(FleetTarget {
+                    roster: logical,
+                    path: &fleet_path,
+                    before: fleet_before.as_deref(),
+                    after: FLEET,
+                }),
+            },
+            false,
+        );
+        CUT.set(None);
+        result
+    }
+}
+
+#[test]
+fn metadata_fleet_commit_recovers_both_images_without_changing_account_records() {
+    for cut in 0..=6 {
+        let bed = Bed::new();
+        let records = [
+            bed.store.state_file(),
+            bed.store.logins_file(),
+            bed.store.ledger_path(),
+        ];
+        let before = records.each_ref().map(|path| std::fs::read(path).ok());
+        assert_eq!(
+            bed.publish_roster_to(&bed.roster, &bed.roster, Some(cut))
+                .unwrap_err(),
+            "injected interruption"
+        );
+        assert!(bed.store.recover_sync_within(&[], &bed.roster).unwrap());
+        assert_eq!(std::fs::read_to_string(&bed.roster).unwrap(), ROSTER);
+        assert_eq!(std::fs::read_to_string(bed.fleet()).unwrap(), FLEET);
+        assert_eq!(
+            records.each_ref().map(|path| std::fs::read(path).ok()),
+            before
+        );
+        assert!(!bed.store.recover_sync_within(&[], &bed.roster).unwrap());
+    }
+}
+
+#[test]
+fn metadata_fleet_scope_cannot_name_another_roster() {
+    let bed = Bed::new();
+    let other = bed.root.path().join("other/accounts.toml");
+    let state = std::fs::read(bed.store.state_file()).unwrap();
+    assert!(
+        bed.publish_roster_to(&other, &bed.roster, None)
+            .unwrap_err()
+            .contains("another account roster")
+    );
+    assert_eq!(std::fs::read(bed.store.state_file()).unwrap(), state);
+    assert!(!bed.roster.exists());
+    assert!(!bed.fleet().exists());
+    assert!(!bed.store.dir.join(RECEIPT).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_fleet_scope_keeps_the_logical_roster_sibling() {
+    let bed = Bed::new();
+    let target = bed.root.path().join("elsewhere/accounts.toml");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "# previous roster\n").unwrap();
+    std::fs::create_dir_all(bed.roster.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &bed.roster).unwrap();
+    bed.publish_roster_to(&bed.roster, &target, Some(0))
+        .unwrap_err();
+    assert!(bed.store.recover_sync_within(&[], &bed.roster).unwrap());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), ROSTER);
+    assert_eq!(std::fs::read_to_string(bed.fleet()).unwrap(), FLEET);
+    assert!(
+        !bed.root
+            .path()
+            .join("elsewhere")
+            .join(super::super::super::accounts_sync::FLEET_ROSTER_FILE)
+            .exists()
+    );
 }
 
 #[test]
@@ -286,6 +391,7 @@ fn first_roster_publication_creates_its_missing_ancestors_with_or_without_fleet(
         let target = bed.root.path().join("absent/nested/config/accounts.toml");
         assert!(!target.parent().unwrap().exists());
         let held = bed.store.acquire().unwrap();
+        let fleet_path = fleet_target(&target).unwrap().0;
         let result = bed.store.transact_sync_held(
             &held,
             NOW,
@@ -295,7 +401,12 @@ fn first_roster_publication_creates_its_missing_ancestors_with_or_without_fleet(
                 before: None,
                 after: Some(ROSTER),
                 mode: None,
-                fleet: with_fleet.then_some((target.as_path(), FLEET)),
+                fleet: with_fleet.then_some(FleetTarget {
+                    roster: &target,
+                    path: &fleet_path,
+                    before: None,
+                    after: FLEET,
+                }),
             },
             |state, _| {
                 state.swarm_label = Some("m16".into());

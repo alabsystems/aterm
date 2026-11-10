@@ -1536,7 +1536,7 @@ impl Command {
         if routed.is_some() {
             // The tether runs the program only after this spawn returned: one the search cannot
             // find or may not run fails the spawn here, as its own spawn would, not the tether.
-            super::platform::findable(
+            super::program_search::findable(
                 self.program.as_bytes(),
                 image.search.as_deref(),
                 base.as_deref(),
@@ -1810,14 +1810,16 @@ impl Command {
             );
         }
         match self.forked() {
-            Ok(mut command) => command.exec(),
+            Ok((mut command, _)) => command.exec(),
             Err(error) => error,
         }
     }
 
     fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
         super::note_spawn();
-        let mut command = self.forked()?;
+        let (mut command, routed) = self.forked()?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = routed;
         if self.stdin.is_none() && !needs_stdin {
             command.stdin(std::process::Stdio::null());
         }
@@ -1839,10 +1841,18 @@ impl Command {
             || {
                 let command = std::sync::Arc::clone(&command);
                 let fork = move || {
-                    command
+                    let mut command = command
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .spawn()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // The tether's watcher watches the thread that forks it, as the parent-death
+                    // signal follows it (`crate::tether::THREAD_VAR`).
+                    #[cfg(target_os = "linux")]
+                    if routed {
+                        // SAFETY: `gettid` takes nothing and cannot fail.
+                        let thread = unsafe { libc::syscall(libc::SYS_gettid) };
+                        command.env(crate::tether::THREAD_VAR, thread.to_string());
+                    }
+                    command.spawn()
                 };
                 #[cfg(target_os = "linux")]
                 if on_a_spawner {
@@ -1881,8 +1891,9 @@ impl Command {
     }
 
     /// The `std` command this one configures: its explicit descriptor policy first, then
-    /// the empty mask and session in one more hook.
-    fn forked(&self) -> io::Result<super::StdCommand> {
+    /// the empty mask and session in one more hook; and whether it runs through its tether
+    /// ([`Self::route`]).
+    fn forked(&self) -> io::Result<(super::StdCommand, bool)> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
         if self
@@ -1913,11 +1924,19 @@ impl Command {
                 "tethered commands do not forward explicit guards",
             ));
         }
+        #[cfg(target_os = "linux")]
+        let routed = self.route()?;
+        #[cfg(not(target_os = "linux"))]
+        let routed: Option<(std::path::PathBuf, Vec<OsString>)> = None;
         #[expect(
             clippy::disallowed_types,
             reason = "spawnfd's own Command, with its explicit descriptor policy installed before the native process hook"
         )]
-        let mut command = std::process::Command::new(&self.program);
+        let mut command = std::process::Command::new(
+            routed
+                .as_ref()
+                .map_or(self.program.as_os_str(), |(exe, _)| exe.as_os_str()),
+        );
         if self.inherit_all {
             // Trust's std strips every descriptor above stdio from a child unless told not to;
             // upstream's std hands on the whole non-close-on-exec table by itself.
@@ -1926,9 +1945,16 @@ impl Command {
         } else {
             command.inherit_nothing();
         }
-        command.args(&self.args);
-        if let Some(arg0) = &self.arg0 {
-            command.arg0(arg0);
+        match &routed {
+            Some((_, args)) => {
+                command.args(args).arg0(crate::tether::NAME);
+            }
+            None => {
+                command.args(&self.args);
+                if let Some(arg0) = &self.arg0 {
+                    command.arg0(arg0);
+                }
+            }
         }
         if self.env.clear {
             command.env_clear();
@@ -2012,7 +2038,39 @@ impl Command {
         if self.native_image {
             self.native_hook(&mut command)?;
         }
-        Ok(command)
+        Ok((command, routed.is_some()))
+    }
+
+    /// The tether a Linux tethered spawn runs through ([`crate::tether::route`]): one whose child
+    /// leads its own process group (`process_group(0)`, or a session), whose tether leaves a
+    /// watcher that ends that group, while this process records an image to run through (and
+    /// neither hides processes in `/proc` nor is pid 1). `None` for any other spawn, whose child
+    /// is tied by its parent-death signal alone. The tether runs the program only after this spawn
+    /// returned, so a program the search cannot find or may not run fails the spawn here, as its
+    /// own spawn would: glibc `execvp`'s loop over the child's `PATH`, a relative entry or path
+    /// taken in its working directory (`program_search::findable`).
+    #[cfg(target_os = "linux")]
+    fn route(&self) -> io::Result<Option<(std::path::PathBuf, Vec<OsString>)>> {
+        use std::os::unix::ffi::OsStrExt as _;
+        if !self.tether || !(self.setsid || self.group() == Some(0)) {
+            return Ok(None);
+        }
+        let Some(routed) = crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)
+        else {
+            return Ok(None);
+        };
+        let env = self.env.capture();
+        let search = env
+            .iter()
+            .find(|(key, _)| key.as_bytes() == b"PATH")
+            .map(|(_, value)| value.as_os_str());
+        let base = match &self.cwd {
+            Some(dir) if dir.is_absolute() => Some(dir.clone()),
+            Some(dir) => std::env::current_dir().ok().map(|here| here.join(dir)),
+            None => None,
+        };
+        super::program_search::findable(self.program.as_bytes(), search, base.as_deref())?;
+        Ok(Some(routed))
     }
 
     /// The last hook of a native-image spawn ([`super::NativeImage`]): the child `execve`s the

@@ -2206,6 +2206,14 @@ fn a_model_click_types_opus_then_xhigh_and_a_click_back_types_the_remembered_pic
         (switch.back, switch.then, switch.half),
         (Some(sonnet), None, false)
     );
+    assert_eq!(
+        switch.to,
+        Some(Pick {
+            model: ModelArg::new("claude-opus-5-5"),
+            effort: Some("xhigh"),
+        }),
+        "where the switch went is held while the session is there"
+    );
 
     claude_with(&app, session, "Opus 5.5", "xhigh");
     frame(&mut app, wid);
@@ -2227,6 +2235,11 @@ fn a_model_click_types_opus_then_xhigh_and_a_click_back_types_the_remembered_pic
         app.model_switch(session).and_then(|s| s.back),
         Some(sonnet),
         "kept"
+    );
+    assert_eq!(
+        app.model_switch(session).and_then(|s| s.to),
+        None,
+        "a switch back is at no target of its own"
     );
 }
 

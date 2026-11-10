@@ -163,7 +163,11 @@ fn sample_with(groups: &[i32], probe: &impl Probe) -> io::Result<u64> {
             )?;
             continue;
         };
-        if after.identity != before.identity
+        // The same process is its pid, birth and unique id, which a reused pid never keeps.
+        // Not its pid version: an exec moves that (Apple), and a member's exec right after
+        // its fork is ordinary workload, whose memory this read still covers.
+        if after.identity.pid != before.identity.pid
+            || after.identity.birth != before.identity.birth
             || after.uniqueid != before.uniqueid
             || after.pgid != before.pgid
         {

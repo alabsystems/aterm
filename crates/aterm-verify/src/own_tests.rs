@@ -8,13 +8,14 @@
 //! as it builds without `cfg(test)`; only the member's own test targets compile its test code.
 //!
 //! A changed file is confined when all of these hold:
-//! - It is a `.rs` file of the package's library or binary sources: not under `tests/`, `benches/`
-//!   or `examples/`, no `[[test]]`, `[[bench]]` or `[[example]]` path, not the build script.
+//! - It is a `.rs` file of the package's library, binary or integration-test sources: not under
+//!   `benches/` or `examples/`, no `[[bench]]` or `[[example]]` path, not the build script.
 //! - Either what a build without tests compiles of it is the same, token for token, each on the
 //!   same line after the same text, before and after (every hunk inside a test-only item,
 //!   [`aterm_census::items::Source::shipped`]); or no build without tests compiles it, before or
-//!   after: a module declaration in test code names it, none outside test code may, and no
-//!   `include!` outside test code may read it. A declaration is matched to files by name alone,
+//!   after: an integration-test root or a module declaration in test code names it, none outside
+//!   test code may, and no `include!` outside test code may read it. A declaration is matched to
+//!   files by name alone,
 //!   ignoring ASCII case as the Mac's file system does (`mod x;` may be any `x.rs` or `x/mod.rs` in
 //!   the package, `#[path = "…/y.rs"]` any `y.rs`), and one whose path or name this reader cannot
 //!   settle may be any file. A file no declaration names may be one a macro declares, so it is
@@ -62,8 +63,7 @@ pub trait Files {
 pub enum Doubt {
     /// It is no Rust source: a manifest, a fixture, a document.
     NotRust(String),
-    /// It is no file of the package's library or binaries: a test, bench or example target's, the
-    /// build script, or outside the package.
+    /// It is a bench or example target's file, the build script, or outside the package.
     OtherTarget(String),
     /// A file this reads does not read or lex, or the manifest does not parse.
     Unread(String),
@@ -158,7 +158,11 @@ pub fn confined(files: &dyn Files, dir: &str, changed: &[&str]) -> Result<(), Do
 struct Manifest {
     /// What a build without tests compiles from: the library's root and each binary's.
     roots: Vec<String>,
-    /// The `[[test]]`, `[[bench]]` and `[[example]]` paths.
+    /// The explicit `[[test]]` paths. Default integration-test roots are recognized separately.
+    tests: Vec<String>,
+    /// Whether Cargo discovers default integration-test roots.
+    autotests: bool,
+    /// The `[[bench]]` and `[[example]]` paths.
     others: Vec<String>,
     /// The build script's path (`build.rs` unless `build` names another), or empty for `build =
     /// false`.
@@ -174,7 +178,8 @@ impl Manifest {
             return None;
         };
         let path_of = |target: &Value| target.get("path").and_then(Value::as_str).map(normalize);
-        // A target with no `path` is at its default, which the roots and folders below hold.
+        // Without a literal path, default discovery below may establish the root; otherwise
+        // it remains unknown and keeps the conservative cone.
         let paths_of = |key: &str| match table.get(key) {
             None => Some(Vec::new()),
             Some(Value::Array(targets)) => Some(targets.iter().filter_map(path_of).collect()),
@@ -184,7 +189,7 @@ impl Manifest {
         roots.extend(table.get("lib").and_then(path_of));
         roots.extend(paths_of("bin")?);
         let mut others = Vec::new();
-        for key in ["test", "bench", "example"] {
+        for key in ["bench", "example"] {
             others.extend(paths_of(key)?);
         }
         let build = match table
@@ -210,19 +215,37 @@ impl Manifest {
                 });
         Some(Self {
             roots,
+            tests: paths_of("test")?,
+            autotests: match table.get("package").and_then(|p| p.get("autotests")) {
+                None => true,
+                Some(Value::Boolean(enabled)) => *enabled,
+                _ => return None,
+            },
             others,
             build,
             build_deps,
         })
     }
 
-    /// Whether the package-relative `rel` is a file of no library or binary.
+    /// Whether this target's location requires the conservative whole cone.
     fn other_target(&self, rel: &str) -> bool {
-        ["tests/", "benches/", "examples/"]
+        ["benches/", "examples/"]
             .iter()
             .any(|dir| rel.starts_with(dir))
             || self.others.iter().any(|other| other == rel)
             || rel == self.build
+    }
+
+    /// A Cargo integration-test root: an explicitly named path, or one discovered by Cargo.
+    fn test_root(&self, rel: &str) -> bool {
+        self.tests.iter().any(|test| test == rel)
+            || self.autotests
+                && rel.strip_prefix("tests/").is_some_and(|rest| {
+                    !rest.contains('/')
+                        || rest
+                            .strip_suffix("/main.rs")
+                            .is_some_and(|dir| !dir.contains('/'))
+                })
     }
 }
 
@@ -343,7 +366,11 @@ impl Reach {
             .cloned()
             .collect();
         // What test code of a shipped file brings in, and everything those files bring in.
-        let mut tested: Vec<String> = Vec::new();
+        let mut tested: Vec<String> = listed
+            .iter()
+            .filter(|path| within(dir, path).is_some_and(|rel| manifest.test_root(rel)))
+            .cloned()
+            .collect();
         while let Some(file) = queue.pop() {
             if reach.shipped.contains(&file) {
                 continue;

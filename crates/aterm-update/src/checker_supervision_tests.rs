@@ -58,6 +58,71 @@ fn run_to_exit(
 static UNPOSTED: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
 
 #[test]
+fn a_wake_during_network_settling_remains_pending() {
+    for during_settle in [false, true] {
+        let wake = crate::cadence::WakeSignal::new();
+        let seen = std::cell::Cell::new(0);
+        wake.post();
+        wake.post();
+        let mut cadence = crate::cadence::Cadence::new(Duration::from_secs(120));
+        cadence.failed();
+        let mut failures = crate::cadence::FailureLog::default();
+        failures.failure("unreachable");
+        let mut woke_at = None;
+        crate::settle_after_wake(
+            &mut cadence,
+            &mut failures,
+            &mut woke_at,
+            Duration::from_secs(5),
+            &wake,
+            &seen,
+            |delay| {
+                assert_eq!(delay, Duration::from_secs(5));
+                assert_eq!(seen.get(), 2);
+                if during_settle {
+                    wake.post();
+                }
+            },
+        );
+        assert_eq!(seen.get(), 2, "settling cannot acknowledge a later post");
+        assert_eq!(wake.wait_past(seen.get(), Duration::ZERO), during_settle);
+        assert_eq!(cadence.failures(), 0);
+        assert!(failures.success().is_none());
+        assert!(woke_at.is_some());
+    }
+}
+
+#[test]
+fn a_checker_retired_inside_its_wait_exits_without_a_network_wake() {
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    static WAKE: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
+    let generation = WATCH.register(1_000);
+    let retired = AtomicBool::new(false);
+    WAKE.set_network_probe(Box::new(move || {
+        if !retired.swap(true, Ordering::AcqRel) {
+            assert!(WATCH.supersede(generation).is_some());
+        }
+        false
+    }));
+    let mut loop_args = args(Arc::new(|| Some(source())));
+    loop_args.pause = Some(Duration::from_secs(86_400));
+    loop_args.wake = &WAKE;
+    let (exit, _) = run_to_exit(
+        &WATCH,
+        generation,
+        loop_args,
+        "a retired checker must leave its day-long wait",
+    );
+    assert_eq!(
+        exit,
+        CheckerExit::Superseded {
+            phase: CheckerPhase::Waiting
+        }
+    );
+    assert_eq!(WAKE.posts(), 0, "retirement is not a network wake");
+}
+
+#[test]
 fn concurrent_checker_startup_keeps_one_worker_and_its_exact_restart_arguments() {
     let (finished, completion) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

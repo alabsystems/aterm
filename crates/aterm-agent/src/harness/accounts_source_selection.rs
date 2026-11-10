@@ -20,8 +20,6 @@ pub(super) enum Selection {
     Pool(PathBuf),
     VaultFleet {
         path: PathBuf,
-        origin: FleetOrigin,
-        own_copy: bool,
     },
     Sheet {
         path: PathBuf,
@@ -41,13 +39,11 @@ impl Selection {
             Self::Pool(_) | Self::Key(_) => true,
             Self::Sheet { path } => sheet_names_this_machine(config, path),
             Self::Beside { path, opt_in } => {
-                *opt_in == Some(OptIn::Named)
+                opt_in.is_some_and(OptIn::opts_in_by_file)
                     && home.is_some_and(|home| {
-                        superseded_secrets_copy(
-                            home,
-                            &home.join(".secrets").join(FLEET_ROSTER_FILE),
-                            path,
-                        )
+                        let legacy = home.join(".secrets").join(FLEET_ROSTER_FILE);
+                        own_secrets_copy(home, &legacy, path)
+                            || superseded_secrets_copy(home, &legacy, path)
                     })
             }
             Self::VaultFleet { .. } | Self::Absent => false,
@@ -68,8 +64,9 @@ impl Selection {
     pub(super) fn origin(&self) -> FleetOrigin {
         match self {
             Self::Key(source) => FleetOrigin::Key(source.clone()),
-            Self::Pool(path) | Self::Sheet { path, .. } => FleetOrigin::Vault(path.clone()),
-            Self::VaultFleet { origin, .. } => origin.clone(),
+            Self::Pool(path) | Self::Sheet { path, .. } | Self::VaultFleet { path } => {
+                FleetOrigin::Vault(path.clone())
+            }
             Self::Beside { path, opt_in } => FleetOrigin::Local {
                 files: vec![path.clone()],
                 opt_in: *opt_in,
@@ -150,31 +147,20 @@ fn select_inner(
                     path: sheet.clone(),
                 };
             }
-            let local = read_local_source_text(&vault).ok().and_then(|text| {
-                let fleet = FleetRoster::from_toml(&text, &vault.display().to_string()).ok()?;
-                let opt_in = opt_in_of(&text);
-                (own || fleet_of_this_machine(opt_in, &fleet)).then_some(opt_in)
-            });
-            let origin = if let Some(opt_in) = local {
-                FleetOrigin::Local {
-                    files: beside
-                        .iter()
-                        .filter(|path| source_entry_present(path))
-                        .cloned()
-                        .chain([vault.clone()])
-                        .collect(),
-                    opt_in: if named { beside_opt_in } else { opt_in },
-                }
-            } else {
-                FleetOrigin::Vault(vault.clone())
-            };
-            return Selection::VaultFleet {
-                path: vault,
-                origin,
-                own_copy: own,
-            };
+            if own
+                && named
+                && let Some(path) = &beside
+            {
+                // Retire an equal legacy copy before discovery extends the
+                // projection, independently of filesystem timestamp precision.
+                return Selection::Beside {
+                    path: path.clone(),
+                    opt_in: beside_opt_in,
+                };
+            }
+            return Selection::VaultFleet { path: vault };
         }
-        if let Some(path) = sheet {
+        if let Some(path) = sheet.filter(|path| !named || sheet_names_this_machine(config, path)) {
             return Selection::Sheet { path };
         }
     }

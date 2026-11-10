@@ -1424,7 +1424,8 @@ fn development_proofs(text: &str, judged: &Judged) -> crate::testrun::Passed {
 }
 
 /// Build the checkout's nested verification command, owned by the calling land process.
-/// Its private group and parent-death tether also bound the bootstrap's descendants on Darwin.
+/// Its private group and parent-death tether also bound the bootstrap's descendants, on Darwin and
+/// on Linux where the tether's watcher runs (`aterm_uds::tether`).
 pub fn judgment_command(
     targo: &Path,
     root: &Path,
@@ -1435,7 +1436,7 @@ pub fn judgment_command(
 ) -> Command {
     let mut cmd = aterm_uds::spawnfd::command(targo);
     // The bootstrap and nested verifier belong to this land attempt, even when land
-    // dies without unwinding. Darwin's tether anchors this private group until it drains.
+    // dies without unwinding. The tether's watcher anchors this private group until it drains.
     cmd.tether();
     #[cfg(unix)]
     cmd.process_group(0);

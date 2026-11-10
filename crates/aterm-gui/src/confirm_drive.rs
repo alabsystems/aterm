@@ -25,15 +25,17 @@ pub(crate) const NOT_RUN: i32 = 2;
 pub(crate) const HUNG: i32 = 3;
 
 /// Drive the machine-name panel, or also the owner and menu confirmations when `rename_only`
-/// is false, and return the exit code above.
+/// is false, and return the exit code above. With `snapshots`, save the pending and synchronized
+/// naming fixtures' actual native content views before their answer.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn run_confirm_drive(rename_only: bool) -> i32 {
-    macos::run(crate::platform::Windowed::launch(), rename_only)
+pub fn run_confirm_drive(rename_only: bool, snapshots: Option<&std::path::Path>) -> i32 {
+    macos::run(crate::platform::Windowed::launch(), rename_only, snapshots)
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -90,10 +92,19 @@ mod macos {
         stuck: bool,
     }
 
-    pub(super) fn run(windowed: Windowed, rename_only: bool) -> i32 {
+    pub(super) fn run(windowed: Windowed, rename_only: bool, snapshots: Option<&Path>) -> i32 {
         if appkit::MainThread::new().is_none() {
             eprintln!("objc-confirm-drive: NOT RUN — not on the main thread");
             return NOT_RUN;
+        }
+        if let Some(dir) = snapshots
+            && let Err(why) = std::fs::create_dir_all(dir)
+        {
+            eprintln!(
+                "objc-confirm-drive: FINDING — snapshots {}: {why}",
+                dir.display()
+            );
+            return FINDING;
         }
         // SAFETY: on the main thread (checked above). `+sharedApplication` is `+(NSApplication *)`
         // (+0, never nil); `-setActivationPolicy:` is `-(BOOL)(NSInteger)` and `-finishLaunching`
@@ -172,7 +183,7 @@ mod macos {
                 }
             }
         }
-        if let Err(code) = rename::rounds(windowed, &mut findings) {
+        if let Err(code) = rename::rounds(windowed, &mut findings, snapshots) {
             return code;
         }
         if findings.is_empty() {
@@ -399,7 +410,7 @@ mod macos {
     /// its fields through their field editor, as typing does, hands the alert a read through the
     /// main queue, as the name writer does, and reads the line and Rename back.
     mod rename {
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Instant;
@@ -408,7 +419,7 @@ mod macos {
             InFleet, NameTo, RenamePreview, ensure, publish, rename_preview, set_name,
         };
         use aterm_net::fleet_member::name_record::ByKind;
-        use aterm_objc::{Id, class, sel};
+        use aterm_objc::{Id, Obj, class, sel};
         use aterm_secrets::client::{LabLabels, LabelHold};
         use aterm_types::machine_name::{Class, Nickname, Number};
 
@@ -532,7 +543,11 @@ mod macos {
         }
 
         /// Run each round; a hung helper is `Err` with the drive's exit code.
-        pub(super) fn rounds(windowed: Windowed, findings: &mut Vec<String>) -> Result<(), i32> {
+        pub(super) fn rounds(
+            windowed: Windowed,
+            findings: &mut Vec<String>,
+            snapshots: Option<&Path>,
+        ) -> Result<(), i32> {
             let Ok(root) = aterm_tempfile::tempdir() else {
                 findings.push("rename: no scratch state folder".to_owned());
                 return Ok(());
@@ -825,9 +840,14 @@ mod macos {
                     },
                 ),
             ];
-            for (name, preview, naming, primary, view, (number, nick), steps, want) in rounds {
+            for (index, (name, preview, naming, primary, view, (number, nick), steps, want)) in
+                rounds.into_iter().enumerate()
+            {
                 let press = sheet::begin();
                 let done = Arc::new(AtomicBool::new(false));
+                let snapshot = snapshots
+                    .filter(|_| naming.is_some())
+                    .map(|dir| dir.join(format!("rename-{index:02}.png")));
                 let helper = {
                     let (done, preview, naming, view) = (
                         Arc::clone(&done),
@@ -841,7 +861,7 @@ mod macos {
                             press,
                             &steps,
                             &preview,
-                            (naming.as_ref(), primary),
+                            (naming.as_ref(), primary, snapshot.as_deref()),
                             &view,
                             &done,
                         )
@@ -850,7 +870,7 @@ mod macos {
                 let got = sheet::ask(
                     press,
                     sheet::TITLE,
-                    "Rename drive",
+                    &crate::machine_title::rename_alert_body(None),
                     &view,
                     number.as_deref(),
                     nick.as_deref(),
@@ -892,7 +912,7 @@ mod macos {
             press: u64,
             steps: &[Step],
             preview: &RenamePreview,
-            (naming, primary): (Option<&NamingCase>, &'static str),
+            (naming, primary, snapshot_path): (Option<&NamingCase>, &'static str, Option<&Path>),
             view: &MachineView,
             done: &AtomicBool,
         ) -> Vec<String> {
@@ -921,7 +941,39 @@ mod macos {
                             || Snapshot::read(preview.clone()),
                             |naming| naming.snapshot(preview),
                         );
-                        aterm_objc::run_on_main(move |_| sheet::deliver(press, snapshot));
+                        let photograph = snapshot_path.is_some();
+                        let captured = aterm_objc::run_on_main(move |_| {
+                            sheet::deliver(press, snapshot);
+                            photograph.then(|| capture(windowed))
+                        });
+                        if let Some(captured) = captured
+                            && let Some(path) = snapshot_path
+                        {
+                            match captured.and_then(|(width, height, png)| {
+                                let (rgba, decoded_width, decoded_height) =
+                                    aterm_png::decode_rgba8(&png, 4096)
+                                        .ok_or("native snapshot is not a readable PNG")?;
+                                if (decoded_width, decoded_height) != (width, height)
+                                    || rgba.is_empty()
+                                {
+                                    return Err("native snapshot dimensions disagree".into());
+                                }
+                                let pixels = rgba.as_chunks::<4>().0;
+                                if pixels.iter().all(|pixel| *pixel == pixels[0]) {
+                                    return Err("native snapshot is blank".into());
+                                }
+                                std::fs::write(path, png).map_err(|why| why.to_string())?;
+                                Ok((width, height))
+                            }) {
+                                Ok((width, height)) => println!(
+                                    "objc-confirm-drive: snapshot {} {width}x{height}",
+                                    path.display()
+                                ),
+                                Err(why) => {
+                                    findings.push(format!("snapshot {}: {why}", path.display()))
+                                }
+                            }
+                        }
                         delivered = true;
                     }
                     Step::Fields(number, nick) => {
@@ -1039,6 +1091,81 @@ mod macos {
                 std::thread::sleep(STEP);
             }
             findings
+        }
+
+        /// Copy only this driver's own rename alert's native content on the main queue.
+        fn capture(windowed: Windowed) -> Result<(usize, usize, Vec<u8>), String> {
+            let seen = look(windowed, None).ok_or("no rename alert to capture")?;
+            if seen.fields != 2 || !seen.texts.iter().any(|text| text == sheet::TITLE) {
+                return Err("the modal window is not the rename panel".into());
+            }
+            aterm_objc::autoreleasepool(|_| {
+                // SAFETY: called only by the main-queue callback. The modal window and content
+                // view are this process's live NSAlert, retained here through the copy. The
+                // NSView caching pair returns a +0 NSBitmapImageRep, retained here, and PNG
+                // representation returns +0 NSData copied before this autorelease pool ends.
+                unsafe {
+                    let app =
+                        appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+                    let window = Obj::retain(appkit::send_id(app, sel!(modalWindow)))
+                        .ok_or("the rename alert ended before capture")?;
+                    let view = Obj::retain(appkit::send_id(window.id(), sel!(contentView)))
+                        .ok_or("the rename alert has no content view")?;
+                    let bounds = appkit::send_rect(view.id(), sel!(bounds));
+                    if !bounds.origin.x.is_finite()
+                        || !bounds.origin.y.is_finite()
+                        || !bounds.size.width.is_finite()
+                        || !bounds.size.height.is_finite()
+                        || bounds.size.width <= 0.0
+                        || bounds.size.height <= 0.0
+                    {
+                        return Err("the rename alert has invalid content bounds".into());
+                    }
+                    let bitmap = Obj::retain(appkit::send_id_rect(
+                        view.id(),
+                        sel!(bitmapImageRepForCachingDisplayInRect:),
+                        bounds,
+                    ))
+                    .ok_or("the rename alert could not allocate a bitmap")?;
+                    appkit::send_v_rect_id(
+                        view.id(),
+                        sel!(cacheDisplayInRect:toBitmapImageRep:),
+                        bounds,
+                        bitmap.id(),
+                    );
+                    let width = usize::try_from(appkit::send_isize(bitmap.id(), sel!(pixelsWide)))
+                        .map_err(|_| "the rename bitmap has an invalid width")?;
+                    let height = usize::try_from(appkit::send_isize(bitmap.id(), sel!(pixelsHigh)))
+                        .map_err(|_| "the rename bitmap has an invalid height")?;
+                    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+                        return Err("the rename bitmap exceeds its dimension bounds".into());
+                    }
+                    let properties =
+                        Obj::from_owned(appkit::send_id(class(c"NSDictionary").as_id(), sel!(new)))
+                            .ok_or("the rename bitmap could not allocate PNG properties")?;
+                    let data = appkit::send_id_usize_id(
+                        bitmap.id(),
+                        sel!(representationUsingType:properties:),
+                        appkit::consts::NS_BITMAP_IMAGE_FILE_TYPE_PNG,
+                        properties.id(),
+                    );
+                    if data.is_null() {
+                        return Err("the rename bitmap could not encode a PNG".into());
+                    }
+                    let length = appkit::send_usize(data, sel!(length));
+                    if length == 0 || length > 64 * 1024 * 1024 {
+                        return Err("the rename PNG exceeds its byte bounds".into());
+                    }
+                    let mut png = vec![0; length];
+                    appkit::send_v_ptr_usize(
+                        data,
+                        sel!(getBytes:length:),
+                        png.as_mut_ptr().cast(),
+                        length,
+                    );
+                    Ok((width, height, png))
+                }
+            })
         }
 
         /// The modal alert's texts, buttons, Rename's availability and editable fields, and the

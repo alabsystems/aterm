@@ -1197,6 +1197,27 @@ fn untrusted_load_error(
     )))
 }
 
+/// The refusal text (with `Error: ` prefix) without printing,
+/// for Result-shaped callers.
+fn untrusted_load_message(
+    prefix: &Prefix,
+    kind: super::trust::TrustType,
+    qualified: &str,
+) -> Option<String> {
+    if super::trust::trusted(prefix, kind, qualified) {
+        return None;
+    }
+    let (word, flag) = match kind {
+        super::trust::TrustType::Formula => ("formula", "--formula"),
+        super::trust::TrustType::Cask => ("cask", "--cask"),
+        _ => return None,
+    };
+    let tap = qualified.rsplit_once('/').map_or(qualified, |(tap, _)| tap);
+    Some(format!(
+        "Error: Refusing to load {word} {qualified} from untrusted tap {tap}.\nRun `brew trust {flag} {qualified}` or `brew trust {tap}` to trust it."
+    ))
+}
+
 /// Brew's `Formulary.factory` order for one name: the named
 /// tap for qualified references, else the core API record,
 /// else any tap's record — with the load trust gate brew
@@ -1251,6 +1272,27 @@ fn factory_cask(
             api.cask(short).ok()
         }),
     }
+}
+
+/// Brew's tap-cask loader miss for a qualified token: the
+/// error names the cask file path that does not exist.
+fn tap_cask_unavailable(prefix: &Prefix, name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let (user, repo) = tap::parse_tap_name(&format!("{}/{}", parts[0], parts[1]))?;
+    let file = prefix
+        .taps_dir()
+        .join(&user)
+        .join(format!("homebrew-{repo}"))
+        .join("Casks")
+        .join(format!("{}.rb", parts[2]));
+    Some(format!(
+        "Cask '{}' is unavailable: '{}' does not exist.",
+        parts[2],
+        file.display()
+    ))
 }
 
 /// Brew's factory trust gate on an already-resolved tap
@@ -3513,6 +3555,446 @@ fn keg_time(dir: &std::path::Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// A tap's git HEAD sha (`tap_git_head`), when it is a repo.
+fn tap_git_head(tap_path: &std::path::Path) -> Option<String> {
+    if !tap_path.join(".git").is_dir() {
+        return None;
+    }
+    super::fetch::run_capture(
+        "git",
+        &["-C", &tap_path.to_string_lossy(), "rev-parse", "HEAD"],
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// JSON-escape one string value (with quotes).
+fn jesc(s: &str) -> String {
+    aterm_json::to_string(&aterm_json::Value::String(s.to_string())).unwrap_or_default()
+}
+
+/// A JSON string-or-null for an optional text field.
+fn jopt(s: &str) -> String {
+    if s.is_empty() {
+        "null".to_string()
+    } else {
+        jesc(s)
+    }
+}
+
+/// A JSON array of strings.
+fn jarr(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| jesc(s)).collect();
+    format!("[{}]", inner.join(","))
+}
+
+/// Parse a synthesized JSON text into (Value, key order).
+fn synthesized_json(text: &str) -> Option<(aterm_json::Value, Order)> {
+    let value = aterm_json::from_str(text).ok()?;
+    let order = parse_order(text.as_bytes())?;
+    Some((value, order))
+}
+
+/// The tap and on-disk source of a qualified record name:
+/// (tap, ruby_source_path, source sha256).
+fn tap_source_parts(
+    prefix: &Prefix,
+    full_name: &str,
+    file: Option<std::path::PathBuf>,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    let parts: Vec<&str> = full_name.split('/').collect();
+    let tap_name = if parts.len() == 3 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        "homebrew/core".to_string()
+    };
+    let (mut source_path, mut checksum, mut git_head) = (None, None, None);
+    if parts.len() == 3
+        && let Some((user, repo)) = tap::parse_tap_name(&format!("{}/{}", parts[0], parts[1]))
+        && let Ok(root) = Ok::<_, ()>(
+            prefix
+                .taps_dir()
+                .join(&user)
+                .join(format!("homebrew-{repo}")),
+        )
+    {
+        git_head = tap_git_head(&root);
+        if let Some(file) = file
+            && let Ok(canon_root) = root.canonicalize()
+            && let Ok(canon_file) = file.canonicalize()
+            && let Ok(rel) = canon_file.strip_prefix(&canon_root)
+        {
+            source_path = Some(rel.display().to_string());
+            checksum = super::fetch::sha256_file(&file).ok();
+        }
+    }
+    (tap_name, source_path, checksum, git_head)
+}
+
+/// Brew's `Formula#to_hash` for a tap-loaded record (the API
+/// loader produces the same shape for core formulae, whose
+/// raw API value abrew passes through instead).
+fn tap_formula_json(prefix: &Prefix, f: &Formula) -> Option<(aterm_json::Value, Order)> {
+    let parts: Vec<&str> = f.full_name.split('/').collect();
+    let mut aliases: Vec<String> = Vec::new();
+    let mut file = None;
+    if parts.len() == 3
+        && let Some((user, repo)) = tap::parse_tap_name(&format!("{}/{}", parts[0], parts[1]))
+        && let Ok(path) = Ok::<_, ()>(
+            prefix
+                .taps_dir()
+                .join(&user)
+                .join(format!("homebrew-{repo}")),
+        )
+    {
+        let t = tap::Tap {
+            user: user.clone(),
+            repo: repo.clone(),
+            path: path.clone(),
+        };
+        file = tap::formula_file(&t, &f.name);
+        if let Ok(entries) = std::fs::read_dir(path.join("Aliases")) {
+            for e in entries.flatten() {
+                if let Ok(canon) = e.path().canonicalize()
+                    && canon.file_stem().and_then(|s| s.to_str()) == Some(f.name.as_str())
+                    && let Some(alias) = e.file_name().to_str()
+                {
+                    aliases.push(alias.to_string());
+                }
+            }
+        }
+        aliases.sort();
+    }
+    let (tap_name, source_path, checksum, git_head) = tap_source_parts(prefix, &f.full_name, file);
+    let dd = &f.deprecate_disable;
+    let darg = |reason: &Option<String>, date: &Option<String>| -> String {
+        match (reason, date) {
+            (None, None) => "null".to_string(),
+            _ => {
+                let mut fields = Vec::new();
+                if let Some(d) = date {
+                    fields.push(format!("\"date\": {}", jesc(d)));
+                }
+                if let Some(r) = reason {
+                    fields.push(format!("\"because\": {}", jesc(r)));
+                }
+                format!("{{{}}}", fields.join(", "))
+            }
+        }
+    };
+    let text = format!(
+        "{{\"name\": {}, \"full_name\": {}, \"tap\": {}, \"oldnames\": [], \"aliases\": {}, \
+\"versioned_formulae\": [], \"desc\": {}, \"license\": {}, \"homepage\": {}, \
+\"versions\": {{\"stable\": {}, \"head\": {}, \"bottle\": {}}}, \
+\"urls\": {{\"stable\": {{\"url\": {}, \"tag\": null, \"revision\": null, \"using\": null, \"checksum\": {}}}}}, \
+\"patches\": [], \"local_patch_checksums\": {{}}, \"revision\": {}, \"version_scheme\": {}, \
+\"compatibility_version\": null, \"autobump\": true, \"no_autobump_message\": null, \
+\"skip_livecheck\": false, \"bottle\": {{}}, \"pour_bottle_only_if\": null, \
+\"keg_only\": {}, \"keg_only_reason\": null, \"options\": [], \
+\"build_dependencies\": {}, \"dependencies\": {}, \"test_dependencies\": {}, \
+\"recommended_dependencies\": {}, \"optional_dependencies\": {}, \
+\"no_linkage_dependencies\": [], \"uses_from_macos\": [], \"uses_from_macos_bounds\": [], \
+\"requirements\": [], \"conflicts_with\": {}, \"conflicts_with_reasons\": [], \
+\"link_overwrite\": [], \"caveats\": {}, \"installed\": [], \"linked_keg\": null, \
+\"pinned\": false, \"outdated\": false, \
+\"deprecated\": {}, \"deprecation_date\": {}, \"deprecation_reason\": {}, \
+\"deprecation_replacement_formula\": null, \"deprecation_replacement_cask\": null, \
+\"deprecate_args\": {}, \
+\"disabled\": {}, \"disable_date\": {}, \"disable_reason\": {}, \
+\"disable_replacement_formula\": null, \"disable_replacement_cask\": null, \
+\"disable_args\": {}, \
+\"post_install_steps\": [], \"post_install_defined\": false, \"service\": null, \
+\"tap_git_head\": {}, \"ruby_source_path\": {}, \"ruby_source_checksum\": {}}}",
+        jesc(&f.name),
+        jesc(&f.full_name),
+        jesc(&tap_name),
+        jarr(&aliases),
+        jopt(&f.desc),
+        jopt(&f.license),
+        jopt(&f.homepage),
+        jopt(&f.version),
+        if f.head { "\"HEAD\"" } else { "null" },
+        !f.bottle_files.is_empty(),
+        jopt(&f.stable_url),
+        jopt(&f.stable_sha256),
+        f.revision,
+        f.version_scheme,
+        f.keg_only,
+        jarr(&f.build_dependencies),
+        jarr(&f.dependencies),
+        jarr(&f.test_dependencies),
+        jarr(&f.recommended_dependencies),
+        jarr(&f.optional_dependencies),
+        jarr(&f.conflicts),
+        jopt(&f.caveats),
+        f.deprecate,
+        dd.deprecation_date.as_deref().map_or("null".into(), jesc),
+        dd.deprecation_reason.as_deref().map_or("null".into(), jesc),
+        darg(&dd.deprecation_reason, &dd.deprecation_date),
+        f.disable,
+        dd.disable_date.as_deref().map_or("null".into(), jesc),
+        dd.disable_reason.as_deref().map_or("null".into(), jesc),
+        darg(&dd.disable_reason, &dd.disable_date),
+        git_head.as_deref().map_or("null".into(), jesc),
+        source_path.as_deref().map_or("null".into(), jesc),
+        checksum.map_or("null".into(), |sha| format!(
+            "{{\"sha256\": {}}}",
+            jesc(&sha)
+        )),
+    );
+    synthesized_json(&text)
+}
+
+/// One artifact's `to_h` object for a tap cask.
+fn tap_cask_artifact_json(a: &super::formula::Artifact) -> String {
+    use super::formula::Artifact;
+    let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
+    let with_target = |kind: &str, src: &str, target: String| {
+        format!(
+            "{{\"{kind}\": [{}], \"target\": {}}}",
+            jesc(src),
+            jesc(&target)
+        )
+    };
+    let plain = |kind: &str, src: &str| format!("{{\"{kind}\": [{}]}}", jesc(src));
+    match a {
+        Artifact::App(s, t) => with_target(
+            "app",
+            s,
+            format!("/Applications/{}", t.as_deref().unwrap_or(&base(s))),
+        ),
+        Artifact::Binary(s, t) => with_target(
+            "binary",
+            s,
+            format!("$HOMEBREW_PREFIX/bin/{}", t.as_deref().unwrap_or(&base(s))),
+        ),
+        Artifact::Font(s, t) => with_target(
+            "font",
+            s,
+            format!("/$HOME/Library/Fonts/{}", t.as_deref().unwrap_or(&base(s))),
+        ),
+        Artifact::Pkg(s) => plain("pkg", s),
+        Artifact::Manpage(s, t) => {
+            let b = base(s);
+            let section = b.rsplit('.').next().unwrap_or("1");
+            with_target(
+                "manpage",
+                s,
+                format!(
+                    "$HOMEBREW_PREFIX/share/man/man{section}/{}",
+                    t.as_deref().unwrap_or(&b)
+                ),
+            )
+        }
+        Artifact::Suite(s, t) => with_target(
+            "suite",
+            s,
+            format!("/Applications/{}", t.as_deref().unwrap_or(&base(s))),
+        ),
+        Artifact::Library(s, t, dir) => {
+            let root = if dir.starts_with("share/") {
+                format!("$HOMEBREW_PREFIX/{dir}")
+            } else {
+                format!("/$HOME/{dir}")
+            };
+            let kind = match dir.as_str() {
+                "Library/QuickLook" => "qlplugin",
+                "Library/ColorPickers" => "colorpicker",
+                "Library/Dictionaries" => "dictionary",
+                "Library/Input Methods" => "input_method",
+                "Library/Internet Plug-Ins" => "internet_plugin",
+                "Library/Spotlight" => "mdimporter",
+                "Library/Audio/Plug-Ins/Components" => "audio_unit_plugin",
+                "Library/Audio/Plug-Ins/VST" => "vst_plugin",
+                "Library/Audio/Plug-Ins/VST3" => "vst3_plugin",
+                "share/bash-completion/completions" => "bash_completion",
+                "share/zsh/site-functions" => "zsh_completion",
+                "share/fish/vendor_completions.d" => "fish_completion",
+                _ => "artifact",
+            };
+            with_target(
+                kind,
+                s,
+                format!("{root}/{}", t.as_deref().unwrap_or(&base(s))),
+            )
+        }
+        Artifact::KeyboardLayout(s, t) => with_target(
+            "keyboard_layout",
+            s,
+            format!(
+                "/Library/Keyboard Layouts/{}",
+                t.as_deref().unwrap_or(&base(s))
+            ),
+        ),
+        Artifact::ScreenSaver(s, t) => with_target(
+            "screen_saver",
+            s,
+            format!(
+                "/$HOME/Library/Screen Savers/{}",
+                t.as_deref().unwrap_or(&base(s))
+            ),
+        ),
+        Artifact::PrefPane(s, t) => with_target(
+            "prefpane",
+            s,
+            format!(
+                "/$HOME/Library/PreferencePanes/{}",
+                t.as_deref().unwrap_or(&base(s))
+            ),
+        ),
+        Artifact::Service(s, _) => plain("service", s),
+        Artifact::Generic(s, t) => match t {
+            Some(target) => with_target("artifact", s, target.clone()),
+            None => plain("artifact", s),
+        },
+        Artifact::Wrapper(name, _, _, _) => plain("command_wrapper", name),
+        Artifact::Other(s) => format!("{{\"other\": [{}]}}", jesc(s)),
+    }
+}
+
+/// Brew's `Cask#to_h` for a tap-loaded record.
+fn tap_cask_json(
+    prefix: &Prefix,
+    c: &super::formula::Cask,
+    qualified: &str,
+) -> Option<(aterm_json::Value, Order)> {
+    let parts: Vec<&str> = qualified.split('/').collect();
+    let mut file = None;
+    if parts.len() == 3
+        && let Some((user, repo)) = tap::parse_tap_name(&format!("{}/{}", parts[0], parts[1]))
+        && let Ok(path) = Ok::<_, ()>(
+            prefix
+                .taps_dir()
+                .join(&user)
+                .join(format!("homebrew-{repo}")),
+        )
+    {
+        let t = tap::Tap { user, repo, path };
+        file = tap::cask_file(&t, &c.token);
+    }
+    let (tap_name, source_path, checksum, git_head) = tap_source_parts(prefix, qualified, file);
+    let mut artifacts: Vec<String> = c.artifacts.iter().map(tap_cask_artifact_json).collect();
+    if c.zap_present {
+        let mut fields: Vec<String> = Vec::new();
+        if !c.zap_trash.is_empty() {
+            fields.push(format!("\"trash\": {}", jarr(&c.zap_trash)));
+        }
+        if !c.zap_delete.is_empty() {
+            fields.push(format!("\"delete\": {}", jarr(&c.zap_delete)));
+        }
+        if !c.zap_rmdir.is_empty() {
+            fields.push(format!("\"rmdir\": {}", jarr(&c.zap_rmdir)));
+        }
+        artifacts.push(format!("{{\"zap\": [{{{}}}]}}", fields.join(", ")));
+    }
+    if !c.uninstall_trash.is_empty() || !c.uninstall_rmdir.is_empty() {
+        let mut fields: Vec<String> = Vec::new();
+        if !c.uninstall_trash.is_empty() {
+            fields.push(format!("\"trash\": {}", jarr(&c.uninstall_trash)));
+        }
+        if !c.uninstall_rmdir.is_empty() {
+            fields.push(format!("\"rmdir\": {}", jarr(&c.uninstall_rmdir)));
+        }
+        artifacts.push(format!("{{\"uninstall\": [{{{}}}]}}", fields.join(", ")));
+    }
+    let mut dep_fields: Vec<String> = Vec::new();
+    if let Some(v) = &c.macos_min {
+        dep_fields.push(format!("\"macos\": {{\">=\": [{}]}}", jesc(v)));
+    } else if let Some(v) = &c.macos_exact {
+        dep_fields.push(format!("\"macos\": {{\"==\": [{}]}}", jesc(v)));
+    }
+    if !c.depends_cask.is_empty() {
+        dep_fields.push(format!("\"cask\": {}", jarr(&c.depends_cask)));
+    }
+    if !c.depends_formula.is_empty() {
+        dep_fields.push(format!("\"formula\": {}", jarr(&c.depends_formula)));
+    }
+    let dd = &c.deprecate_disable;
+    let text = format!(
+        "{{\"token\": {}, \"full_token\": {}, \"old_tokens\": [], \"tap\": {}, \
+\"name\": [{}], \"desc\": {}, \"homepage\": {}, \"url\": {}, \"url_specs\": {{}}, \
+\"version\": {}, \"autobump\": true, \"no_autobump_message\": null, \
+\"skip_livecheck\": false, \"installed\": null, \"installed_time\": null, \
+\"bundle_version\": null, \"bundle_short_version\": null, \"pinned\": false, \
+\"pinned_version\": null, \"outdated\": false, \"sha256\": {}, \
+\"artifacts\": [{}], \"caveats\": {}, \"caveats_rosetta\": null, \
+\"depends_on\": {{{}}}, \"conflicts_with\": {}, \"container\": {}, \
+\"rename\": [], \"auto_updates\": {}, \
+\"deprecated\": {}, \"deprecation_date\": {}, \"deprecation_reason\": {}, \
+\"deprecation_replacement_formula\": null, \"deprecation_replacement_cask\": null, \
+\"deprecate_args\": {}, \
+\"disabled\": {}, \"disable_date\": {}, \"disable_reason\": {}, \
+\"disable_replacement_formula\": null, \"disable_replacement_cask\": null, \
+\"disable_args\": {}, \
+\"tap_git_head\": {}, \"languages\": [], \"ruby_source_path\": {}, \
+\"ruby_source_checksum\": {}}}",
+        jesc(&c.token),
+        jesc(qualified),
+        jesc(&tap_name),
+        jesc(&c.name),
+        jopt(&c.desc),
+        jopt(&c.homepage),
+        jopt(&c.url),
+        jopt(&c.version),
+        c.sha256.as_deref().map_or("null".into(), jesc),
+        artifacts.join(", "),
+        jopt(&c.caveats),
+        dep_fields.join(", "),
+        if c.conflicts.is_empty() {
+            "null".to_string()
+        } else {
+            format!("{{\"cask\": {}}}", jarr(&c.conflicts))
+        },
+        if c.naked {
+            "{\"type\": \"naked\"}".to_string()
+        } else {
+            "null".to_string()
+        },
+        if c.auto_updates { "true" } else { "null" },
+        c.deprecated,
+        dd.deprecation_date.as_deref().map_or("null".into(), jesc),
+        dd.deprecation_reason.as_deref().map_or("null".into(), jesc),
+        match (&dd.deprecation_reason, &dd.deprecation_date) {
+            (None, None) => "null".to_string(),
+            _ => {
+                let mut f = Vec::new();
+                if let Some(d) = &dd.deprecation_date {
+                    f.push(format!("\"date\": {}", jesc(d)));
+                }
+                if let Some(r) = &dd.deprecation_reason {
+                    f.push(format!("\"because\": {}", jesc(r)));
+                }
+                format!("{{{}}}", f.join(", "))
+            }
+        },
+        c.disabled,
+        dd.disable_date.as_deref().map_or("null".into(), jesc),
+        dd.disable_reason.as_deref().map_or("null".into(), jesc),
+        match (&dd.disable_reason, &dd.disable_date) {
+            (None, None) => "null".to_string(),
+            _ => {
+                let mut f = Vec::new();
+                if let Some(d) = &dd.disable_date {
+                    f.push(format!("\"date\": {}", jesc(d)));
+                }
+                if let Some(r) = &dd.disable_reason {
+                    f.push(format!("\"because\": {}", jesc(r)));
+                }
+                format!("{{{}}}", f.join(", "))
+            }
+        },
+        git_head.as_deref().map_or("null".into(), jesc),
+        source_path.as_deref().map_or("null".into(), jesc),
+        checksum.map_or("null".into(), |sha| format!(
+            "{{\"sha256\": {}}}",
+            jesc(&sha)
+        )),
+    );
+    synthesized_json(&text)
+}
+
 fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value) {
     // brew's API loader substitutes the generation
     // placeholders in the whole record (Formula.deep_remove_placeholders);
@@ -3952,10 +4434,40 @@ fn info_json(
                         .unwrap_or(Order::Leaf);
                     formulae.push((v, order));
                 }
-                Err(_) if want_formula || installed => {
-                    return Err(format!("Error: {}", formula_unavailable(api, n)));
+                Err(_) => {
+                    // A tap record synthesizes the same shape;
+                    // the trust gate rides along.
+                    let tap_hit = if foreign_qualified(n) {
+                        foreign_formula(prefix, n)
+                    } else {
+                        tap::lookup(prefix, n)
+                    };
+                    match tap_hit {
+                        Some(f) => {
+                            if let Some(m) = untrusted_load_message(
+                                prefix,
+                                super::trust::TrustType::Formula,
+                                &f.full_name,
+                            ) {
+                                return Err(m);
+                            }
+                            match tap_formula_json(prefix, &f) {
+                                Some(pair) => {
+                                    resolved.insert(Formula::short_name(n).to_string());
+                                    formulae.push(pair);
+                                }
+                                None if want_formula || installed => {
+                                    return Err(format!("Error: {}", formula_unavailable(api, n)));
+                                }
+                                None => {}
+                            }
+                        }
+                        None if want_formula || installed => {
+                            return Err(format!("Error: {}", formula_unavailable(api, n)));
+                        }
+                        None => {}
+                    }
                 }
-                Err(_) => {}
             }
         }
     }
@@ -3980,15 +4492,36 @@ fn info_json(
                         .unwrap_or(Order::Leaf);
                     casks.push((v, order));
                 }
-                Err(e) => {
-                    if want_cask || installed {
-                        return Err(if e.contains("no such cask") {
-                            format!("Error: {}", cask_unavailable(short))
-                        } else {
-                            e
-                        });
+                Err(e) => match tap::lookup_cask(prefix, n) {
+                    Some((c, qualified)) => {
+                        if let Some(m) = untrusted_load_message(
+                            prefix,
+                            super::trust::TrustType::Cask,
+                            &qualified,
+                        ) {
+                            return Err(m);
+                        }
+                        match tap_cask_json(prefix, &c, &qualified) {
+                            Some(pair) => {
+                                resolved.insert(short.to_string());
+                                casks.push(pair);
+                            }
+                            None if want_cask || installed => {
+                                return Err(format!("Error: {}", cask_unavailable(short)));
+                            }
+                            None => {}
+                        }
                     }
-                }
+                    None => {
+                        if want_cask || installed {
+                            return Err(if e.contains("no such cask") {
+                                format!("Error: {}", cask_unavailable(short))
+                            } else {
+                                e
+                            });
+                        }
+                    }
+                },
             }
         }
     }
@@ -3997,7 +4530,11 @@ fn info_json(
             if !resolved.contains(Formula::short_name(n)) {
                 return Err(format!(
                     "Error: {}",
-                    if want_cask {
+                    if want_cask && let Some(m) = tap_cask_unavailable(prefix, n) {
+                        m
+                    } else if foreign_qualified(n) {
+                        foreign_unavailable(prefix, api, n, want_cask, !want_cask && want_formula)
+                    } else if want_cask {
                         cask_unavailable(Formula::short_name(n))
                     } else {
                         formula_unavailable(api, n)
@@ -5021,17 +5558,19 @@ fn info_sizes(prefix: &Prefix, api: &Api, rest: &[String], names: &[String]) -> 
         let mut failures = 0;
         for name in names {
             let short = Formula::short_name(name);
-            if !want_cask && api.formula(name).is_ok() {
-                let canon = canonical_installed_name(prefix, api, short, false);
-                let usage = prefix
-                    .installed_one(Kind::Formula, &canon)
-                    .map_or(0, |i| keg_usage(&i));
-                let shown = api
-                    .formula(name)
-                    .map(|f| f.full_name)
-                    .unwrap_or_else(|_| canon.clone());
-                formulae.push((shown, usage));
-                continue;
+            if !want_cask {
+                match factory_formula(prefix, api, name) {
+                    Ok(Some(f)) => {
+                        let canon = canonical_installed_name(prefix, api, short, false);
+                        let usage = prefix
+                            .installed_one(Kind::Formula, &canon)
+                            .map_or(0, |i| keg_usage(&i));
+                        formulae.push((f.full_name.clone(), usage));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(code) => return code,
+                }
             }
             if !want_formula && api.cask(name).is_ok() {
                 let token = super::api::canonical_cask_token(short);
@@ -5107,13 +5646,12 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
     }
     let names = operands(rest);
     // Foreign-qualified names resolve in their tap only; the
-    // JSON / sizes / github shapes share the factory failure.
-    if rest.iter().any(|a| {
-        matches!(
-            a.as_str(),
-            "--json" | "--json=v1" | "--json=v2" | "--sizes" | "--github"
-        )
-    }) {
+    // sizes / github shapes share the factory failure (JSON
+    // synthesizes tap records natively now).
+    if rest
+        .iter()
+        .any(|a| matches!(a.as_str(), "--sizes" | "--github"))
+    {
         for name in &names {
             if foreign_qualified(name) {
                 if foreign_formula(prefix, name).is_some() {
@@ -5246,7 +5784,11 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                     printed = true;
                 }
                 Ok(None) => {
-                    super::tty::onoe!("Error: {}", cask_unavailable(Formula::short_name(name)));
+                    super::tty::onoe!(
+                        "Error: {}",
+                        tap_cask_unavailable(prefix, name)
+                            .unwrap_or_else(|| cask_unavailable(Formula::short_name(name)))
+                    );
                     failures += 1;
                 }
                 Err(code) => return code,
@@ -8448,6 +8990,120 @@ fn has_log_files(dir: &std::path::Path) -> bool {
 
 /// brew `gist-logs`: without logs on disk the answer is brew's
 /// own error; uploading a gist is never native.
+/// The stderr lines one `Diagnostic.checks(type, fatal:)`
+/// group prints: `ofail` per finding when fatal, else `opoo`
+/// plus a blank line after a multiline finding.
+fn diagnostic_check_lines(findings: &[DoctorFinding], fatal: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for finding in findings {
+        let text = finding.render();
+        if fatal {
+            lines.push(format!("Error: {text}"));
+        } else {
+            lines.push(format!("Warning: {text}"));
+            if text.contains('\n') {
+                lines.push(String::new());
+            }
+        }
+    }
+    lines
+}
+
+/// Brew's `Diagnostic.checks`: print the group's findings
+/// and, when fatal and any fired, exit 1 before later groups.
+fn diagnostic_checks(prefix: &Prefix, api: &Api, checks: &[&str], fatal: bool) -> Option<ExitCode> {
+    let (findings, _infos, _unknown) = doctor_findings_for(prefix, api, checks, false);
+    for line in diagnostic_check_lines(&findings, fatal) {
+        eprintln!("{line}");
+    }
+    if fatal && !findings.is_empty() {
+        Some(ExitCode::FAILURE)
+    } else {
+        None
+    }
+}
+
+/// Brew's install-time `check_prefix` (macOS): the ARM
+/// default prefix refuses Intel and Rosetta processes.
+fn install_check_prefix(prefix: &Prefix) -> Option<ExitCode> {
+    if prefix.root != std::path::Path::new("/opt/homebrew") || std::env::consts::ARCH != "x86_64" {
+        return None;
+    }
+    if super::machine::in_rosetta2() {
+        return Some(failed(&format!(
+            "Error: Cannot install under Rosetta 2 in ARM default prefix ({})!\n\
+             To rerun under ARM use:\n    arch -arm64 brew install ...\n\
+             To install under x86_64, install Homebrew into /usr/local.",
+            prefix.root.display()
+        )));
+    }
+    Some(failed(&format!(
+        "Error: Cannot install on Intel processor in ARM default prefix ({})!",
+        prefix.root.display()
+    )))
+}
+
+/// Brew's `Install.perform_preinstall_checks` with the
+/// macOS check groups. `all_fatal` makes the supported-
+/// configuration group fatal (gist-logs); the untrusted-taps
+/// group is never fatal and the access-directories group
+/// always is. Brew also mkdirs `Keg.must_exist_directories`
+/// here; abrew creates prefix directories in the operations
+/// that use them.
+fn perform_preinstall_checks(prefix: &Prefix, api: &Api, all_fatal: bool) -> Option<ExitCode> {
+    if let Some(code) = install_check_prefix(prefix) {
+        return Some(code);
+    }
+    if let Some(code) = diagnostic_checks(
+        prefix,
+        api,
+        &[
+            "check_homebrew_prefix",
+            "check_for_nix_homebrew",
+            "check_for_unsupported_macos",
+        ],
+        all_fatal,
+    ) {
+        return Some(code);
+    }
+    let _ = diagnostic_checks(prefix, api, &["check_untrusted_taps"], false);
+    diagnostic_checks(prefix, api, &["check_access_directories"], true)
+}
+
+/// Brew's `Install.perform_build_from_source_checks` with
+/// the macOS groups.
+fn perform_build_from_source_checks(
+    prefix: &Prefix,
+    api: &Api,
+    all_fatal: bool,
+) -> Option<ExitCode> {
+    if let Some(code) = diagnostic_checks(
+        prefix,
+        api,
+        &[
+            "check_for_installed_developer_tools",
+            "check_xcode_license_approved",
+            "check_xcode_minimum_version",
+            "check_clt_minimum_version",
+            "check_if_xcode_needs_clt_installed",
+            "check_if_supported_sdk_available",
+        ],
+        true,
+    ) {
+        return Some(code);
+    }
+    diagnostic_checks(
+        prefix,
+        api,
+        &[
+            "check_for_installed_developer_tools",
+            "check_xcode_up_to_date",
+            "check_clt_up_to_date",
+        ],
+        all_fatal,
+    )
+}
+
 pub(super) fn cmd_gist_logs(
     prefix: &Prefix,
     api: &Api,
@@ -8457,6 +9113,14 @@ pub(super) fn cmd_gist_logs(
     let Some(name) = operands(rest).into_iter().next() else {
         return usage("gist-logs needs a formula");
     };
+    // Brew runs both install check passes fatally before
+    // resolving the formula.
+    if let Some(code) = perform_preinstall_checks(prefix, api, true) {
+        return code;
+    }
+    if let Some(code) = perform_build_from_source_checks(prefix, api, true) {
+        return code;
+    }
     let formula = if foreign_qualified(&name) {
         match foreign_formula(prefix, &name) {
             Some(f) => f,
@@ -9252,34 +9916,17 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
     ExitCode::SUCCESS
 }
 
-pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
-    let quiet = has_flag(rest, "--quiet", "-q");
-    let doctor_verbose = has_flag(rest, "--verbose", "-v");
-    let json = has_flag(rest, "--json", "");
-    if has_flag(rest, "--list-checks", "") {
-        for check in DOCTOR_CHECKS {
-            println!("{check}");
-        }
-        return ExitCode::SUCCESS;
-    }
-    let named = operands(rest);
-    let wanted: Vec<&str> = if named.is_empty() {
-        // Brew drops cask checks from a full run when no
-        // casks are installed, and runs the two slow checks
-        // last.
-        let slow = ["check_for_broken_symlinks", "check_missing_deps"];
-        let any_casks = !prefix.installed(Kind::Cask).is_empty();
-        let mut ordered: Vec<&str> = DOCTOR_CHECKS
-            .iter()
-            .copied()
-            .filter(|c| !slow.contains(c) && (any_casks || !c.starts_with("check_cask_")))
-            .collect();
-        ordered.extend(slow.iter().filter(|c| DOCTOR_CHECKS.contains(c)));
-        ordered
-    } else {
-        named.iter().map(String::as_str).collect()
-    };
-
+/// One `Diagnostic::Checks` pass over the named checks:
+/// returns the findings, the verbose info lines and whether
+/// any requested check was unknown. Shared by `brew doctor`
+/// and the install-time check groups.
+#[allow(clippy::too_many_lines)]
+fn doctor_findings_for(
+    prefix: &Prefix,
+    api: &Api,
+    wanted: &[&str],
+    doctor_verbose: bool,
+) -> (Vec<DoctorFinding>, Vec<String>, bool) {
     let formulae = prefix.installed(Kind::Formula);
     let casks = prefix.installed(Kind::Cask);
     // Index rows feed the deprecated/deleted checks; offline,
@@ -9300,7 +9947,7 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
     let mut findings: Vec<DoctorFinding> = Vec::new();
     let mut infos: Vec<String> = Vec::new();
     let mut unknown_check = false;
-    for check in wanted {
+    for check in wanted.iter().copied() {
         match check {
             "check_access_directories" => {
                 if prefix.ensure().is_err() {
@@ -11528,6 +12175,39 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
             }
         }
     }
+    (findings, infos, unknown_check)
+}
+
+pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    let quiet = has_flag(rest, "--quiet", "-q");
+    let doctor_verbose = has_flag(rest, "--verbose", "-v");
+    let json = has_flag(rest, "--json", "");
+    if has_flag(rest, "--list-checks", "") {
+        for check in DOCTOR_CHECKS {
+            println!("{check}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let named = operands(rest);
+    let wanted: Vec<&str> = if named.is_empty() {
+        // Brew drops cask checks from a full run when no
+        // casks are installed, and runs the two slow checks
+        // last.
+        let slow = ["check_for_broken_symlinks", "check_missing_deps"];
+        let any_casks = !prefix.installed(Kind::Cask).is_empty();
+        let mut ordered: Vec<&str> = DOCTOR_CHECKS
+            .iter()
+            .copied()
+            .filter(|c| !slow.contains(c) && (any_casks || !c.starts_with("check_cask_")))
+            .collect();
+        ordered.extend(slow.iter().filter(|c| DOCTOR_CHECKS.contains(c)));
+        ordered
+    } else {
+        named.iter().map(String::as_str).collect()
+    };
+
+    let (findings, infos, unknown_check) =
+        doctor_findings_for(prefix, api, &wanted, doctor_verbose);
 
     if named.is_empty()
         && let Some(_lock) = super::prefix::Lock::try_acquire(prefix)
@@ -11867,6 +12547,14 @@ pub(super) fn cmd_install(
             }
             None => plain_names.push(name.clone()),
         }
+    }
+    // Brew runs the preinstall check groups once something
+    // will actually be installed or upgraded (dry runs
+    // included); an all-blocked batch returns before them.
+    if !(plain_names.is_empty() && upgrade_names.is_empty())
+        && let Some(code) = perform_preinstall_checks(prefix, api, false)
+    {
+        return code;
     }
     if opts.dry_run {
         // Collect every plan first: a delegation anywhere hands the
@@ -13762,6 +14450,9 @@ pub(super) fn cmd_reinstall(
             }
         }
     }
+    if let Some(code) = perform_preinstall_checks(prefix, api, false) {
+        return code;
+    }
     if opts.dry_run {
         // Brew's reinstall has no dry run; abrew's extension reports
         // through the same grouped summary as install.
@@ -14843,6 +15534,13 @@ pub(super) fn cmd_upgrade(
             // Brew says nothing when there is nothing to do.
             return ExitCode::SUCCESS;
         }
+        // Brew's formula upgrade path runs the preinstall
+        // check groups before fetching (dry runs included).
+        if !rows.is_empty()
+            && let Some(code) = perform_preinstall_checks(prefix, api, false)
+        {
+            return code;
+        }
         // Dependency changes of the planned upgrades come too;
         // brew previews them before the upgrade table.
         let (dep_install_rows, dep_upgrade_rows) = {
@@ -15547,6 +16245,11 @@ fn upgrade_formula_names(
             .then_some(f)
         })
         .collect();
+    if !planned.is_empty()
+        && let Some(code) = perform_preinstall_checks(prefix, api, false)
+    {
+        return code;
+    }
     // Outdated dependents of the planned primaries upgrade with
     // them, prefetched under the same heading.
     let primary_names: std::collections::BTreeSet<String> =
@@ -24900,6 +25603,58 @@ mod tests {
     }
 
     #[test]
+    fn tap_json_builders_mirror_brew_shape() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let tap = p.taps_dir().join("searchtest").join("homebrew-probe");
+        std::fs::create_dir_all(tap.join("Formula")).expect("mkdir");
+        std::fs::create_dir_all(tap.join("Casks")).expect("mkdir");
+        std::fs::write(
+            tap.join("Formula/custool.rb"),
+            "class Custool < Formula\n  desc \"Probe tool\"\n  url \"https://example.com/x.tgz\"\n  version \"1.0\"\n  depends_on \"cmake\" => :build\n  depends_on \"zlib\"\nend\n",
+        )
+        .expect("write");
+        std::fs::write(
+            tap.join("Casks/custapp.rb"),
+            "cask \"custapp\" do\n  version \"1.0\"\n  url \"https://example.com/c.dmg\"\n  name \"CustApp\"\n  app \"CustApp.app\"\nend\n",
+        )
+        .expect("write");
+        let f = tap::lookup(&p, "custool").expect("formula");
+        assert_eq!(f.build_dependencies, ["cmake"]);
+        assert_eq!(f.dependencies, ["zlib"]);
+        let (value, order) = tap_formula_json(&p, &f).expect("formula json");
+        let text = jpretty(&JVal::Ordered(Box::new(value), order));
+        let name_at = text.find("\"name\": \"custool\"").expect("name");
+        let license_at = text.find("\"license\": null").expect("license");
+        let checksum_at = text.find("\"ruby_source_checksum\"").expect("checksum");
+        assert!(name_at < license_at && license_at < checksum_at, "{text}");
+        assert!(
+            text.contains("\"build_dependencies\": [\n    \"cmake\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"ruby_source_path\": \"Formula/custool.rb\""),
+            "{text}"
+        );
+        let (c, qualified) = tap::lookup_cask(&p, "custapp").expect("cask");
+        let (value, order) = tap_cask_json(&p, &c, &qualified).expect("cask json");
+        let text = jpretty(&JVal::Ordered(Box::new(value), order));
+        assert!(
+            text.contains("\"full_token\": \"searchtest/probe/custapp\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"target\": \"/Applications/CustApp.app\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"ruby_source_path\": \"Casks/custapp.rb\""),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn tap_cask_records_parse_and_resolve() {
         let text = r#"cask "custapp" do
   version "1.2.3"
@@ -25976,6 +26731,32 @@ end
             cmds.render(),
             "oops\n\nYou can solve this by running:\n  brew fix"
         );
+    }
+
+    #[test]
+    fn diagnostic_check_groups_print_brew_lines() {
+        // Brew Diagnostic.checks: non-fatal findings print via
+        // opoo plus a blank line after a multiline finding;
+        // fatal ones via ofail with no blank line.
+        let multi =
+            || DoctorFinding::new("The following taps are not trusted:\n  probeuser/probe\n");
+        let single = || DoctorFinding::new("one liner");
+        assert_eq!(
+            diagnostic_check_lines(&[multi(), single()], false),
+            [
+                "Warning: The following taps are not trusted:\n  probeuser/probe",
+                "",
+                "Warning: one liner",
+            ]
+        );
+        assert_eq!(
+            diagnostic_check_lines(&[multi(), single()], true),
+            [
+                "Error: The following taps are not trusted:\n  probeuser/probe",
+                "Error: one liner",
+            ]
+        );
+        assert!(diagnostic_check_lines(&[], true).is_empty());
     }
 
     #[test]

@@ -1855,7 +1855,6 @@ fn admit_proven_driver_at(
     grants: &[aterm_net::fleet::DriveGrant],
     denied: &[String],
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
-    use aterm_net::fleet_member::peer_of;
     let refused = |why: &str, ungranted| (why.to_owned(), ungranted);
     if proof.is_some_and(|proof| {
         aterm_net::fleet::is_denied_node(&proof.node, denied)
@@ -1867,8 +1866,10 @@ fn admit_proven_driver_at(
         ));
     }
     // Each node named by a head no other node this Mac knows shares.
-    let knows = aterm_net::fleet_member::known_nodes(state);
-    let node = node.map_err(|why| (why.said(&knows), why.ungranted()))?;
+    let node = node.map_err(|why| {
+        let knows = aterm_net::fleet_member::known_nodes(state);
+        (why.said(&knows), why.ungranted())
+    })?;
     let key = proof
         .filter(|proof| proof.node == node)
         .map(|proof| proof.key)
@@ -1880,11 +1881,8 @@ fn admit_proven_driver_at(
         key,
     };
     note_admitted_driver(&node, key);
-    let host = driver_name(
-        &node,
-        peer_of(state, &node).map(|peer| peer.host).as_deref(),
-        &knows,
-    );
+    let (knows, peer) = aterm_net::fleet_member::known_nodes_and_peer(state, &node);
+    let host = driver_name(&node, peer.map(|peer| peer.host).as_deref(), &knows);
     Ok((crate::fabric::Driver { node, host }, grant))
 }
 

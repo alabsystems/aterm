@@ -5,6 +5,8 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::fmt;
 use std::mem;
 use std::rc::Weak;
 use std::sync::OnceLock;
@@ -29,6 +31,79 @@ fn quit_confirm_allows() -> bool {
     QUIT_CONFIRM_HOOK.get().is_none_or(|hook| hook())
 }
 
+type HandlerWork = Box<dyn FnOnce(&ApplicationDelegate)>;
+
+/// Work that may enter the application event handler, in native-callback order.
+///
+/// A separate armed bit lets a nested run-loop block discover that the handler is still borrowed,
+/// disarm without removing the front item, and leave the outer handler's normal return path to arm
+/// one later block. Requeuing from the nested block itself could spin inside the modal loop. The
+/// in-progress bit keeps native callbacks behind the whole batch, including a multi-event unit
+/// such as a scale-factor change.
+struct PendingHandlerWork<T> {
+    queue: VecDeque<T>,
+    drain_armed: bool,
+    batch_in_progress: bool,
+}
+
+impl<T> PendingHandlerWork<T> {
+    const fn new() -> Self {
+        Self { queue: VecDeque::new(), drain_armed: false, batch_in_progress: false }
+    }
+
+    fn can_run_inline(&self) -> bool {
+        self.queue.is_empty() && !self.drain_armed && !self.batch_in_progress
+    }
+
+    fn push(&mut self, work: T) {
+        self.queue.push_back(work);
+    }
+
+    /// Marks one outer-loop delivery as pending. Whether the caller must schedule its block.
+    fn arm(&mut self) -> bool {
+        if self.drain_armed || self.batch_in_progress || self.queue.is_empty() {
+            false
+        } else {
+            self.drain_armed = true;
+            true
+        }
+    }
+
+    /// Begins an armed batch, retaining every item when another handler is active.
+    fn begin_batch(&mut self, handler_in_use: bool) -> usize {
+        if !self.drain_armed {
+            return 0;
+        }
+        self.drain_armed = false;
+        if handler_in_use {
+            return 0;
+        }
+        let len = self.queue.len();
+        self.batch_in_progress = len != 0;
+        len
+    }
+
+    fn pop_batch_item(&mut self) -> T {
+        debug_assert!(self.batch_in_progress, "only an active batch has items");
+        self.queue.pop_front().expect("the batch length fixes its original items")
+    }
+
+    fn finish_batch(&mut self) {
+        debug_assert!(self.batch_in_progress, "only a started handler batch can finish");
+        self.batch_in_progress = false;
+    }
+}
+
+impl<T> fmt::Debug for PendingHandlerWork<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingHandlerWork")
+            .field("queued", &self.queue.len())
+            .field("drain_armed", &self.drain_armed)
+            .field("batch_in_progress", &self.batch_in_progress)
+            .finish()
+    }
+}
+
 use super::aterm_objc_seam::consts::NS_APPLICATION_ACTIVATION_POLICY_REGULAR;
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
@@ -45,6 +120,8 @@ pub(super) struct AppState {
     activate_ignoring_other_apps: bool,
     run_loop: RunLoop,
     event_handler: EventHandler,
+    /// Native callbacks deferred until the current event handler and any nested modal loop return.
+    pending_handler_work: RefCell<PendingHandlerWork<HandlerWork>>,
     stop_on_launch: Cell<bool>,
     stop_before_wait: Cell<bool>,
     stop_after_wait: Cell<bool>,
@@ -114,6 +191,7 @@ impl ApplicationDelegate {
             activate_ignoring_other_apps,
             run_loop: RunLoop::main(mtm),
             event_handler: EventHandler::new(),
+            pending_handler_work: RefCell::new(PendingHandlerWork::new()),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
             stop_after_wait: Cell::new(false),
@@ -369,15 +447,56 @@ impl ApplicationDelegate {
     #[track_caller]
     fn maybe_queue_event(&self, event: Event<HandlePendingUserEvents>) {
         let origin = super::key_origin::capture();
-        if !self.ivars().event_handler.in_use() {
+        if !self.ivars().event_handler.in_use()
+            && self.ivars().pending_handler_work.borrow().can_run_inline()
+        {
             self.handle_event_with_origin(event, origin);
         } else {
-            tracing::debug!(?event, "had to queue event since another is currently being handled");
-            let this = self.retained();
-            self.ivars()
-                .run_loop
-                .queue_closure(move || this.handle_event_with_origin(event, origin));
+            tracing::debug!(?event, "deferred event behind active or pending handler work");
+            self.queue_handler_work(move |this| this.handle_event_with_origin(event, origin));
         }
+    }
+
+    /// Runs the FIFO snapshot pending at the start of an outer-loop block, never from inside an
+    /// active handler. Work appended by that batch waits for the next block.
+    ///
+    /// `window_delegate` also uses this for scale-factor work whose synchronous size writer means
+    /// the whole operation, rather than only its two events, has to wait for handler availability.
+    pub(super) fn queue_handler_work(&self, work: impl FnOnce(&ApplicationDelegate) + 'static) {
+        self.ivars().pending_handler_work.borrow_mut().push(Box::new(work));
+        self.arm_handler_work();
+    }
+
+    fn arm_handler_work(&self) {
+        if self.ivars().event_handler.in_use()
+            || !self.ivars().pending_handler_work.borrow_mut().arm()
+        {
+            return;
+        }
+
+        let this = self.retained();
+        self.ivars().run_loop.queue_closure(move || {
+            let batch_len = this
+                .ivars()
+                .pending_handler_work
+                .borrow_mut()
+                .begin_batch(this.ivars().event_handler.in_use());
+            if batch_len == 0 {
+                // A nested modal loop reached this block while another event was being handled.
+                // Its normal return tail below owns rearming; doing it here could spin.
+                return;
+            }
+            for _ in 0..batch_len {
+                let work = this.ivars().pending_handler_work.borrow_mut().pop_batch_item();
+                // Contain here, inside the block's own outer guard, so an Objective-C exception
+                // cannot skip the remaining snapshot or strand every later callback behind it.
+                let _ = aterm_objc::contain("queued event-handler work", || work(&this));
+            }
+            this.ivars().pending_handler_work.borrow_mut().finish_batch();
+            this.arm_handler_work();
+        });
+        // `CFRunLoopPerformBlock` does not itself wake a run loop that is about to sleep.
+        self.ivars().run_loop.wakeup();
     }
 
     #[track_caller]
@@ -401,6 +520,9 @@ impl ApplicationDelegate {
         } else {
             deliver();
         }
+        // `EventHandler::handle_event` released its RefCell borrow on the normal return above.
+        // A panic stops the app, so deliberately do not arm this from an unwind guard.
+        self.arm_handler_work();
     }
 
     /// Dispatches `NewEvents(Init)` and `Resumed`.
@@ -560,4 +682,40 @@ fn app() -> Id {
     // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication` and creates the instance on
     // first call.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingHandlerWork;
+
+    #[test]
+    fn pending_handler_work_waits_out_a_nested_handler_and_keeps_fifo_order() {
+        let mut pending = PendingHandlerWork::new();
+        pending.push(11);
+        pending.push(22);
+
+        assert!(pending.arm());
+        assert!(!pending.arm(), "only one run-loop block is armed");
+        assert_eq!(pending.begin_batch(true), 0, "a nested handler consumes nothing");
+        assert!(!pending.queue.is_empty());
+
+        assert!(pending.arm(), "the outer handler can rearm after it returns");
+        assert_eq!(pending.begin_batch(false), 2);
+        assert_eq!(pending.pop_batch_item(), 11);
+        pending.push(33);
+        assert!(!pending.can_run_inline(), "callbacks cannot overtake active handler work");
+        assert!(!pending.arm(), "active handler work cannot arm a nested delivery");
+        assert_eq!(pending.pop_batch_item(), 22);
+        pending.finish_batch();
+        assert!(pending.arm(), "work appended by a batch waits for the next block");
+        assert_eq!(pending.begin_batch(false), 1);
+        assert_eq!(pending.pop_batch_item(), 33);
+        assert!(
+            !pending.can_run_inline(),
+            "the last dequeued item remains active until it finishes"
+        );
+        pending.finish_batch();
+        assert!(!pending.arm(), "an empty FIFO arms no block");
+        assert!(pending.can_run_inline());
+    }
 }

@@ -238,7 +238,7 @@ pub(crate) fn wait(
         watch,
         generation,
         SystemTime::now(),
-        |delay| sleep_watching_for_wake(signal, seen, delay),
+        |delay| sleep_watching_for_wake(signal, seen, delay, || watch.is_current(generation)),
     )
 }
 
@@ -776,7 +776,11 @@ mod tests {
         let generation = watch.register(60);
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
         let base = Duration::from_secs(INTERVAL_SECS);
-        for waited in [Waited::Elapsed, Waited::Woke(Duration::from_secs(3600))] {
+        for waited in [
+            Waited::Elapsed,
+            Waited::Cancelled,
+            Waited::Woke(Duration::from_secs(3600)),
+        ] {
             let mut during = None;
             let (delay, outcome) =
                 wait_with(&Cadence::new(base), 0, &watch, generation, at, |delay| {
@@ -796,6 +800,34 @@ mod tests {
                 "cleared once the wait is over"
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_already_retired_checker_does_not_enter_a_long_wait() {
+        let watch = std::sync::Arc::new(crate::checker_watch::CheckerWatch::new());
+        let old = watch.register(1_000);
+        watch.supersede(old).unwrap();
+        let retained = std::sync::Arc::clone(&watch);
+        let (finished, completion) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let signal = WakeSignal::new();
+            let result = wait(
+                &Cadence::new(Duration::from_secs(86_400)),
+                &signal,
+                signal.posts(),
+                &retained,
+                old,
+            );
+            finished.send(result.1).unwrap();
+        });
+        assert_eq!(
+            completion
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
+            Waited::Cancelled
+        );
+        assert_eq!(watch.next_check_unix(), None);
     }
 
     #[test]
@@ -859,7 +891,7 @@ mod tests {
         signal.set_network_probe(Box::new(move || probe.swap(false, Ordering::AcqRel)));
         let seen = signal.posts();
         assert!(matches!(
-            sleep_watching_for_wake(&signal, seen, Duration::from_secs(60)),
+            sleep_watching_for_wake(&signal, seen, Duration::from_secs(60), || true),
             Waited::Woke(_)
         ));
         assert!(
@@ -1002,12 +1034,12 @@ mod tests {
         static SIGNAL: WakeSignal = WakeSignal::new();
         SIGNAL.post();
         assert_eq!(
-            sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::from_millis(50)),
+            sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::from_millis(50), || true),
             Waited::Elapsed,
             "an answered post is not this wait's wake"
         );
         assert_eq!(
-            sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::ZERO),
+            sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::ZERO, || true),
             Waited::Elapsed,
             "a zero wait ends at once"
         );
@@ -1018,6 +1050,7 @@ mod tests {
                 &SIGNAL,
                 seen,
                 Duration::from_secs(24 * 3600),
+                || true,
             ));
         });
         SIGNAL.post();

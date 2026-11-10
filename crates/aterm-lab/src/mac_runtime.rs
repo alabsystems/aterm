@@ -69,11 +69,16 @@ pub(crate) fn count_ranks(args: &[String]) -> Res {
 
 pub(crate) const USAGE: &str = "\
   runtime --app BUNDLE --record DIR [--lane measure|cursor|rewind|rewind-control|cat|compare|fabric|floors] [--image REF]
+      [--baseline BUNDLE]
       [--cpus N] [--memory-gib N] [--disk-gb N]
       [--display window|headless]
                 Q4: five takes of this committed checkout's verify measure --app BUNDLE, or a
                 perf lane, inside one disposable macOS guest. Copies the resolved Trust compiler
                 and builds the verifier in the guest; no release product runs on the host.
+                Uses the image's admin account without sudo; requires SIP on and performs no
+                privileged guest preparation. Inputs and builds stay in that account's home.
+                With --baseline, measure/cursor/cat warm both images and alternate their order
+                for five paired takes in the same guest, retaining each arm separately.
                 Default bounds: 8 vCPUs, 32 GiB RAM, 60 decimal GB disk; --cpus, --memory-gib
                 and --disk-gb name larger or smaller fixed bounds, recorded with every run.
                 The shipped fabric link needs --memory-gib 48 --disk-gb 80. The clone and builds are
@@ -90,7 +95,8 @@ pub(crate) const USAGE: &str = "\
                 with recording off in both arms, an A/A noise control with no recording verdict.
 ";
 
-const ROOT: &str = "/opt/aterm/.ubd/runtime.noindex";
+// The pinned image's login account owns all runtime inputs and build products.
+const ROOT: &str = "/Users//admin/.ubd/runtime.noindex";
 const TAKES: u32 = 5;
 const MEMORY_MIB: u32 = 32768;
 const CPUS: u32 = 8;
@@ -104,6 +110,7 @@ const TAKE: Duration = Duration::from_secs(3600);
 #[derive(Debug, PartialEq, Eq)]
 struct Ask {
     app: PathBuf,
+    baseline: Option<PathBuf>,
     record: PathBuf,
     lane: String,
     image: String,
@@ -115,6 +122,7 @@ struct Ask {
 
 fn parse(args: &[String]) -> Result<Ask, Fail> {
     let mut app = None;
+    let mut baseline = None;
     let mut record = None;
     let mut lane = "measure".to_owned();
     let mut image = std::env::var("LAB_MAC_IMAGE").unwrap_or_else(|_| IMAGE.into());
@@ -132,6 +140,7 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
         at += 1;
         match flag.as_str() {
             "--app" if app.is_none() => app = Some(PathBuf::from(value)),
+            "--baseline" if baseline.is_none() => baseline = Some(PathBuf::from(value)),
             "--record" if record.is_none() => record = Some(PathBuf::from(value)),
             "--lane"
                 if matches!(
@@ -175,8 +184,12 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
             }
         }
     }
+    if baseline.is_some() && !matches!(lane.as_str(), "measure" | "cursor" | "cat") {
+        return Err(Fail::usage("--baseline supports measure, cursor and cat"));
+    }
     Ok(Ask {
         app: app.ok_or_else(|| Fail::usage("runtime needs --app BUNDLE"))?,
+        baseline,
         record: record.ok_or_else(|| Fail::usage("runtime needs --record DIR"))?,
         lane,
         image,
@@ -345,10 +358,12 @@ fn spread(values: &[f64]) -> Value {
         "range": sorted[4] - sorted[0]})
 }
 
-fn experiment_exit(codes: &[Option<i32>]) -> i32 {
+fn experiment_exit(codes: &[Option<i32>], paired: bool) -> i32 {
     if codes.iter().any(|c| matches!(c, None | Some(1))) {
         1
-    } else if codes.len() != TAKES as usize + 1 || codes.iter().any(|c| *c != Some(0)) {
+    } else if codes.len() != (TAKES as usize + 1) * if paired { 2 } else { 1 }
+        || codes.iter().any(|c| *c != Some(0))
+    {
         3
     } else {
         0
@@ -365,7 +380,7 @@ fn disk_room(df: &str, disk_gb: u32) -> bool {
 fn verifier_log(stdout: &str) -> Option<&str> {
     stdout.lines().find_map(|line| {
         let path = line.strip_prefix("log: ")?;
-        let relative = path.strip_prefix(&format!("{ROOT}/target.noindex/verify/logs.noindex/"))?;
+        let relative = path.strip_prefix(&format!("{ROOT}/target.noindex/verify/"))?;
         if !relative_member(relative) {
             return None;
         }
@@ -539,6 +554,32 @@ fn environment(jobs: u32) -> String {
     )
 }
 
+fn take_order(paired: bool) -> Vec<(u32, &'static str)> {
+    (1..=TAKES)
+        .flat_map(|take| {
+            let arms = if !paired {
+                vec!["candidate"]
+            } else if take % 2 == 1 {
+                vec!["baseline", "candidate"]
+            } else {
+                vec!["candidate", "baseline"]
+            };
+            arms.into_iter().map(move |arm| (take, arm))
+        })
+        .collect()
+}
+
+fn arm_command(command: &str, arm: &str) -> String {
+    if arm == "baseline" {
+        command.replace(
+            &format!("{ROOT}/aterm.app"),
+            &format!("{ROOT}/baseline.app"),
+        )
+    } else {
+        command.to_owned()
+    }
+}
+
 /// Run the lane and retain a refusal as a record too: unavailable input is never a pass.
 pub(crate) fn run(args: &[String]) -> Res {
     if args == ["--help"] || args == ["help"] {
@@ -600,6 +641,16 @@ fn run_in(ask: &Ask) -> Res {
     let app = std::fs::canonicalize(&ask.app).map_err(|e| format!("{}: {e}", ask.app.display()))?;
     let bin = app.join("Contents/MacOS/aterm");
     let app_sha = crate::windows::sha256_file(&bin)?;
+    let baseline = ask
+        .baseline
+        .as_ref()
+        .map(|path| -> Result<_, Fail> {
+            let app =
+                std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let sha = crate::windows::sha256_file(&app.join("Contents/MacOS/aterm"))?;
+            Ok((app, sha))
+        })
+        .transpose()?;
     let source = checked("git", &["rev-parse".into(), "HEAD".into()], repo)?;
     let submodule = checked(
         "git",
@@ -646,8 +697,8 @@ fn run_in(ask: &Ask) -> Res {
         &ask.record.join("inputs.json"),
         &json!({
             "schema": "aterm-mac-runtime-v1", "source_commit": source, "astream_commit": submodule,
-            "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
-            "driver": "gui-launch-agent/App", "count_policy": "qualified",
+            "bundle_sha256": app_sha, "baseline_bundle_sha256": baseline.as_ref().map(|(_, sha)| sha), "image": ask.image, "lane": ask.lane,
+            "driver": "gui-launch-agent/App", "count_policy": "qualified", "privilege": "guest-user",
             "compiler": compiler.display().to_string(), "compiler_lock_override": tool.lock_override,
             "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics}
         }),
@@ -709,14 +760,21 @@ fn run_in(ask: &Ask) -> Res {
         ],
         repo,
     )?;
-    let base = crate::mac::prepared_base(
-        &tart,
-        &ask.image,
-        false,
-        scratch.path(),
-        &share,
-        &mut || Ok(()),
-    )?;
+    if let Some((app, _)) = &baseline {
+        checked(
+            "/usr/bin/ditto",
+            &[
+                "-c".into(),
+                "-k".into(),
+                "--keepParent".into(),
+                app.display().to_string(),
+                share.join("baseline.zip").display().to_string(),
+            ],
+            repo,
+        )?;
+    }
+    let base =
+        crate::mac::existing_prepared_base(&tart, &ask.image)?.unwrap_or_else(|| ask.image.clone());
     let df = checked(
         "/bin/df",
         &["-g".into(), "/System/Volumes/Data".into()],
@@ -751,12 +809,18 @@ fn run_in(ask: &Ask) -> Res {
         ],
         repo,
     )?;
-    crate::mac::boot_sip_on(&mut vm, &base)?;
+    vm.boot()?;
+    let sip = vm.sh("csrutil status", crate::mac::STEP)?;
+    if !crate::mac::sip_on(&sip) {
+        return Err(not_run(
+            "runtime requires a SIP-on image; it performs no privileged guest preparation",
+        ));
+    }
     if let Some(pid) = vm.pid() {
         admitted.credit("mac-runtime", &[pid]);
     }
-    let setup = format!(
-        "set -eu; sudo -n mkdir -p /opt/aterm/.ubd; sudo -n chown \"$(id -u)\" /opt/aterm/.ubd; mkdir -p {ROOT}/source {ROOT}/toolchain {ROOT}/tmp; \
+    let mut setup = format!(
+        "set -eu; test \"$HOME\" = /Users//admin; mkdir -p {ROOT}/source {ROOT}/toolchain {ROOT}/tmp; \
         tar -xf {share}/source.tar -C {ROOT}/source; \
         tar -xf {share}/astream.tar -C {ROOT}/source/vendor/astream; \
         tar -xf {share}/toolchain.tar -C {ROOT}/toolchain; \
@@ -777,6 +841,16 @@ fn run_in(ask: &Ask) -> Res {
             aterm_toolchain::build_cache::TARGET_BUILD_LEAF
         ))
     );
+    if let Some((app, sha)) = &baseline {
+        setup.push_str(&format!(
+            "ditto -x -k {share}/baseline.zip {ROOT}/baseline-unpack; \
+             mv {ROOT}/baseline-unpack/{name} {ROOT}/baseline.app; \
+             test \"$(shasum -a 256 {ROOT}/baseline.app/Contents/MacOS/aterm | cut -d ' ' -f 1)\" = {sha}; ",
+            share=q(crate::mac::GUEST_SHARE),
+            name=q(app.file_name().and_then(|name| name.to_str()).ok_or_else(|| Fail::usage("baseline bundle name is not UTF-8"))?),
+            sha=q(sha),
+        ));
+    }
     let setup_out = vm.exec(&setup, BUILD)?;
     write(&ask.record.join("setup.stdout"), &setup_out.stdout)?;
     write(&ask.record.join("setup.stderr"), &setup_out.stderr)?;
@@ -833,15 +907,28 @@ fn run_in(ask: &Ask) -> Res {
         "mac runtime: {} warm-up (not one of the five takes)",
         ask.lane
     );
-    let warm = app_exec(&vm, ask, "warmup", &untimed, BUILD)?;
-    write(&ask.record.join("warmup.stdout"), &warm.stdout)?;
-    write(&ask.record.join("warmup.stderr"), &warm.stderr)?;
-    let warm_artifacts = collect(&vm, ask, "warmup", &String::from_utf8_lossy(&warm.stdout))?;
-    write_json(
-        &ask.record.join("warmup.json"),
-        &json!({"exit": warm.status.code(), "success": warm.status.success()}),
-    )?;
-    let mut codes = vec![warm.status.code()];
+    let paired = baseline.is_some();
+    let mut codes = Vec::new();
+    let mut warmups = Vec::new();
+    for arm in if paired {
+        vec!["baseline", "candidate"]
+    } else {
+        vec!["candidate"]
+    } {
+        let name = if paired {
+            format!("warmup-{arm}")
+        } else {
+            "warmup".into()
+        };
+        let warm = app_exec(&vm, ask, &name, &arm_command(&untimed, arm), BUILD)?;
+        write(&ask.record.join(format!("{name}.stdout")), &warm.stdout)?;
+        write(&ask.record.join(format!("{name}.stderr")), &warm.stderr)?;
+        let artifacts = collect(&vm, ask, &name, &String::from_utf8_lossy(&warm.stdout))?;
+        let row = json!({"arm": arm, "exit": warm.status.code(), "success": warm.status.success(), "artifacts": artifacts});
+        write_json(&ask.record.join(format!("{name}.json")), &row)?;
+        warmups.push(row);
+        codes.push(warm.status.code());
+    }
     let invocation = format!(
         "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {command}",
         environment(admitted.jobs)
@@ -849,21 +936,31 @@ fn run_in(ask: &Ask) -> Res {
     let mut rows = Vec::new();
     let mut real = Vec::new();
     let mut cpu = Vec::new();
-    for take in 1..=TAKES {
+    for (take, arm) in take_order(paired) {
         stop::check()?;
+        let sha = if arm == "baseline" {
+            &baseline.as_ref().expect("paired baseline").1
+        } else {
+            &app_sha
+        };
+        let name = if paired {
+            format!("take-{take}-{arm}")
+        } else {
+            format!("take-{take}")
+        };
+        let selected = arm_command(&invocation, arm);
         println!(
-            "mac runtime: {} take {take}/{TAKES}, bundle {app_sha}",
+            "mac runtime: {} take {take}/{TAKES} {arm}, bundle {sha}",
             ask.lane
         );
-        let (out, loads) =
-            sampled(|| app_exec(&vm, ask, &format!("take-{take}"), &invocation, TAKE));
+        let (out, loads) = sampled(|| app_exec(&vm, ask, &name, &selected, TAKE));
         let out = out?;
         codes.push(out.status.code());
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let artifacts = collect(&vm, ask, &format!("take-{take}"), &stdout)?;
-        write(&ask.record.join(format!("take-{take}.stdout")), &out.stdout)?;
-        write(&ask.record.join(format!("take-{take}.stderr")), &out.stderr)?;
+        let artifacts = collect(&vm, ask, &name, &stdout)?;
+        write(&ask.record.join(format!("{name}.stdout")), &out.stdout)?;
+        write(&ask.record.join(format!("{name}.stderr")), &out.stderr)?;
         let resource = usage(&stderr);
         if let Some(n) = resource["real"].as_f64() {
             real.push(n);
@@ -872,21 +969,24 @@ fn run_in(ask: &Ask) -> Res {
             cpu.push(u + s);
         }
         rows.push(
-            json!({"take": take, "exit": out.status.code(), "success": out.status.success(),
+            json!({"take": take, "arm": arm, "bundle_sha256": sha, "command": selected, "exit": out.status.code(), "success": out.status.success(),
             "usage": resource, "artifacts": artifacts, "host_load_samples": loads, "host_max_load_1m": max_load(&loads),
             "stdout": stdout.as_ref(), "stderr": stderr.as_ref()}),
         );
         write_json(
-            &ask.record.join(format!("take-{take}.json")),
+            &ask.record.join(format!("{name}.json")),
             rows.last().expect("just pushed"),
         )?;
     }
-    let exit = experiment_exit(&codes);
+    let exit = experiment_exit(&codes, paired);
     write_json(
         &ask.record.join("rows.json"),
-        &json!({"schema": "aterm-mac-runtime-v1",
-        "complete": true, "all_exits_zero": exit == 0, "exit": exit, "warmup_exit": warm.status.code(), "warmup_artifacts": warm_artifacts, "source_commit": source, "astream_commit": submodule,
-        "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
+        &json!({"schema": if paired { "aterm-mac-runtime-paired-v1" } else { "aterm-mac-runtime-v1" },
+        "complete": true, "all_exits_zero": exit == 0, "exit": exit,
+        "warmup_exit": if paired { None } else { codes[0] },
+        "warmup_artifacts": if paired { Value::Null } else { warmups[0]["artifacts"].clone() },
+        "warmups": warmups, "takes_per_arm": TAKES, "source_commit": source, "astream_commit": submodule,
+        "bundle_sha256": app_sha, "baseline_bundle_sha256": baseline.as_ref().map(|(_, sha)| sha), "image": ask.image, "lane": ask.lane,
         "driver": "gui-launch-agent/App", "count_policy": "qualified",
         "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics},
         "granted_share": admitted.jobs,
@@ -899,6 +999,32 @@ fn run_in(ask: &Ask) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_takes_counterbalance_order_and_drive_distinct_supplied_images() {
+        let order = take_order(true);
+        assert_eq!(
+            &order[..4],
+            &[
+                (1, "baseline"),
+                (1, "candidate"),
+                (2, "candidate"),
+                (2, "baseline")
+            ]
+        );
+        for arm in ["baseline", "candidate"] {
+            assert_eq!(
+                order.iter().filter(|(_, name)| *name == arm).count(),
+                TAKES as usize
+            );
+        }
+        let command = lane_args("cat").join(" ");
+        let selected = arm_command(&command, "baseline");
+        assert_ne!(selected, arm_command(&command, "candidate"));
+        assert!(selected.contains(&format!("{ROOT}/baseline.app/Contents/MacOS/aterm")));
+        assert!(!selected.contains(&format!("{ROOT}/aterm.app")));
+        assert_eq!(take_order(false).len(), TAKES as usize);
+    }
 
     #[test]
     fn offline_rank_paths_belong_to_the_selected_checkout_not_the_runner_directory() {
@@ -1196,15 +1322,23 @@ mod tests {
             Some(8.)
         );
         assert_eq!(max_load(&["unavailable".into(), "NaN".into()]), None);
-        assert_eq!(experiment_exit(&[Some(0); 6]), 0);
-        assert_eq!(experiment_exit(&[Some(0); 5]), 3);
+        assert_eq!(experiment_exit(&[Some(0); 6], false), 0);
+        assert_eq!(experiment_exit(&[Some(0); 12], true), 0);
+        assert_eq!(experiment_exit(&[Some(0); 6], true), 3);
+        assert_eq!(experiment_exit(&[Some(0); 5], false), 3);
         // A red warm-up stays red even if all five pre-planned takes pass.
         assert_eq!(
-            experiment_exit(&[Some(1), Some(0), Some(0), Some(0), Some(0), Some(0)]),
+            experiment_exit(
+                &[Some(1), Some(0), Some(0), Some(0), Some(0), Some(0)],
+                false
+            ),
             1
         );
         assert_eq!(
-            experiment_exit(&[Some(3), Some(0), Some(0), Some(0), Some(0), Some(0)]),
+            experiment_exit(
+                &[Some(3), Some(0), Some(0), Some(0), Some(0), Some(0)],
+                false
+            ),
             3
         );
     }
@@ -1212,12 +1346,12 @@ mod tests {
     #[test]
     fn retained_rows_stay_under_the_guest_run_and_disk_units_match_tart() {
         let log =
-            format!("log: {ROOT}/target.noindex/verify/logs.noindex/runs.noindex/123-456.log");
+            format!("log: {ROOT}/target.noindex/verify/.ubd/logs.noindex/runs.noindex/123-456.log");
         assert!(verifier_log(&log).is_some());
         assert!(verifier_log("log: /etc/shadow").is_none());
         assert!(verifier_log(&log.replace("123-456.log", "../secret.log")).is_none());
         assert!(verifier_log(&log.replace("runs.noindex/", "runs.noindex/../")).is_none());
-        assert!(verifier_log(&log.replace("runs.noindex/", "/")).is_none());
+        assert!(verifier_log(&log.replace(".ubd/", "../../")).is_none());
         assert!(verifier_log(&log.replace("123-456.log", "123-pid.log")).is_none());
         assert!(verifier_log(&log.replace("runs.noindex/", "runs.noindex/next/")).is_some());
         assert!(ledger_member("docs/measured/fabric/take-1.json"));

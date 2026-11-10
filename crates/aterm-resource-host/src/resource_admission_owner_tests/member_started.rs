@@ -7,7 +7,8 @@ use super::*;
 
 struct PendingStart(std::sync::Arc<std::sync::Mutex<Option<member::Started>>>);
 impl member::MemberResources for PendingStart {
-    fn configure(&mut self, _: &mut spawnfd::Command) -> io::Result<()> {
+    fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        command.footprint_limit(spawnfd::FootprintLimit::new(512)?);
         Ok(())
     }
     fn bind_child(&mut self, _: u32) -> io::Result<()> {
@@ -31,7 +32,13 @@ impl member::MemberResources for PendingStart {
             monotonic_ns,
             unix_ns,
         };
-        commit(&started, None)?;
+        commit(
+            &started,
+            Some(member::RequestedStartLimits {
+                units: 1,
+                footprint_mib: 512,
+            }),
+        )?;
         *self.0.lock().unwrap() = Some(started);
         Ok(member::TargetStart::Pending { offered: false })
     }
@@ -96,6 +103,7 @@ fn durable_started_intent_keeps_the_known_member_recovery_phase_and_original_cla
             peer: Peer { pid, birth },
             proof: None,
             member: binding.attempt,
+            reserved_units: 1,
             loan: None,
         };
         let mut attempt = member::OwnedAttempt::launch(
@@ -117,6 +125,36 @@ fn durable_started_intent_keeps_the_known_member_recovery_phase_and_original_cla
                 aterm_json::json!({"pid":pid,"birth":birth}),
             )
             .unwrap();
+        let original_row = custody.journal.outstanding().unwrap();
+        let (monotonic_ns, unix_ns) = start::clocks().unwrap();
+        let candidate = member::Started {
+            pid,
+            birth,
+            monotonic_ns,
+            unix_ns,
+        };
+        for limits in [
+            member::RequestedStartLimits {
+                units: 2,
+                footprint_mib: 1,
+            },
+            member::RequestedStartLimits {
+                units: 1,
+                footprint_mib: u32::try_from(MEMORY / (1024 * 1024) + 1).unwrap(),
+            },
+        ] {
+            assert!(
+                member::MemberCustody::commit_started(
+                    &mut custody,
+                    &binding,
+                    &candidate,
+                    Some(limits),
+                )
+                .is_err()
+            );
+            assert_eq!(custody.journal.outstanding().unwrap(), original_row);
+            assert_eq!(attempt.identity(), Some((pid, birth)));
+        }
         assert_eq!(
             attempt.start(&mut custody).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -137,6 +175,8 @@ fn durable_started_intent_keeps_the_known_member_recovery_phase_and_original_cla
     assert_eq!(record["birth"].as_u64(), Some(started.birth));
     assert_eq!(record["monotonic_ns"].as_u64(), Some(started.monotonic_ns));
     assert_eq!(record["unix_ns"].as_u64(), Some(started.unix_ns));
+    assert_eq!(record["requested_units"].as_u64(), Some(1));
+    assert_eq!(record["requested_footprint_mib"].as_u64(), Some(512));
     world.owner.recover().unwrap();
     assert_eq!(world.owner.debt.reserved().unwrap(), 1);
     assert_ne!(
@@ -162,6 +202,7 @@ fn durable_started_intent_keeps_the_known_member_recovery_phase_and_original_cla
             peer: Peer { pid, birth },
             proof: None,
             member: binding.attempt,
+            reserved_units: 1,
             loan: None,
         };
         if attempt

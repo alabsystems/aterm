@@ -37,7 +37,9 @@ impl OriginalOutput {
             &self.descriptions.each_ref().map(AsFd::as_fd),
         )?;
         for fd in self.descriptions.iter() {
-            let original = std::fs::File::from(fd.try_clone()?);
+            // ACL inspection requires a File. Protect its fresh duplicate before
+            // any concurrent fork can inherit the original output custody.
+            let original = aterm_uds::kept_out(|| fd.try_clone().map(std::fs::File::from))?;
             trust_resource_provenance::require_no_acl_grants(&original)?;
             let metadata = original.metadata()?;
             if metadata.uid() != aterm_uds::peer::our_uid() || metadata.mode() & 0o022 != 0 {
@@ -58,10 +60,13 @@ impl OriginalOutput {
 
     pub(in crate::actor::owner) fn inherited(&self) -> io::Result<[OwnedFd; 2]> {
         self.check_current()?;
-        Ok([
-            self.descriptions[0].try_clone()?,
-            self.descriptions[1].try_clone()?,
-        ])
+        aterm_uds::kept_out(|| {
+            Ok((
+                self.descriptions[0].try_clone()?,
+                self.descriptions[1].try_clone()?,
+            ))
+        })
+        .map(|(directory, lock)| [directory, lock])
     }
 
     pub(in crate::actor::owner) fn attachment(&self) -> &wire::OutputAttachment {

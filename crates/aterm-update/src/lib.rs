@@ -3149,15 +3149,26 @@ fn run_checker(
     };
     let wait = |schedule: &cadence::Cadence| -> cadence::Waited {
         match args.pause {
-            Some(pause) => cadence::sleep_watching_for_wake(args.wake, wake_seen.get(), pause),
+            Some(pause) => {
+                cadence::sleep_watching_for_wake(args.wake, wake_seen.get(), pause, || {
+                    watch.is_current(generation)
+                })
+            }
             None => cadence::wait(schedule, args.wake, wake_seen.get(), watch, generation).1,
         }
     };
     let settle = |schedule: &mut cadence::Cadence,
                   failures: &mut cadence::FailureLog,
                   woke_at: &mut Option<std::time::Instant>| {
-        settle_after_wake(schedule, failures, woke_at, args.wake_settle);
-        wake_seen.set(args.wake.posts());
+        settle_after_wake(
+            schedule,
+            failures,
+            woke_at,
+            args.wake_settle,
+            args.wake,
+            &wake_seen,
+            std::thread::sleep,
+        );
     };
     let mut settings_misses = StreakLog::new(SETTINGS_MISS_LOG_EVERY);
     let mut deferrals = StreakLog::new(CHECKER_DEFERRAL_LOG_EVERY);
@@ -3604,13 +3615,18 @@ fn run_checker(
 
 /// After a wait that ended on a detected wake: clears the backoff and the failure log, dates
 /// the wake for [`cadence::after_wake`], and gives the network `settle` before the next check.
+/// Acknowledge only posts already present, so a wake during settling remains pending.
 #[cfg(target_os = "macos")]
 fn settle_after_wake(
     schedule: &mut cadence::Cadence,
     failures: &mut cadence::FailureLog,
     woke_at: &mut Option<std::time::Instant>,
     settle: std::time::Duration,
+    wake: &cadence::WakeSignal,
+    seen: &std::cell::Cell<u64>,
+    sleep: impl FnOnce(std::time::Duration),
 ) {
+    seen.set(wake.posts());
     log(&format!(
         "wake signal or network change; checking for updates in {}s",
         settle.as_secs()
@@ -3618,7 +3634,7 @@ fn settle_after_wake(
     schedule.woke();
     *failures = cadence::FailureLog::default();
     *woke_at = Some(std::time::Instant::now());
-    std::thread::sleep(settle);
+    sleep(settle);
 }
 
 /// The installed bundle's build number (`CFBundleVersion`).

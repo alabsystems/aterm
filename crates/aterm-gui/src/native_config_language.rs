@@ -1165,6 +1165,20 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "claude_footer.switch_model",
+        "Model a click on the footer's model switches to",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["claude", "footer", "model", "switch", "click", "opus"],
+        true,
+    ),
+    manual(
+        "claude_footer.switch_effort",
+        "Effort a click on the footer's model switches to",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["claude", "footer", "effort", "switch", "click", "xhigh"],
+        true,
+    ),
+    manual(
         "reroute",
         "Toolchain reroute",
         ConfigSchemaKind::Table,
@@ -2418,6 +2432,7 @@ fn manual_default_shown(key: &str) -> Option<String> {
         "claude_footer.card" => config.claude_footer_card().to_string(),
         "claude_footer.acts" => config.claude_footer_acts().to_string(),
         "claude_footer.agents" => config.claude_footer_agents().to_string(),
+        "claude_footer.switch_model" | "claude_footer.switch_effort" => "auto".to_string(),
         "reroute.strict" => atpkg::config::parse_reroute("").strict().to_string(),
         #[cfg(unix)]
         "fabric.hold_on_bridge_lost" => {
@@ -5853,6 +5868,12 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         "claude_footer.agents" => {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
+        }
+        "claude_footer.switch_model" => {
+            " · default auto: a click on a Claude Code session's model or effort in the footer switches it to the best model of the harness's priority list (`aterm harness upgrade models`) that the session's Claude Code build offers · a Claude model id (`claude-opus-5-5`) or the name the footer shows (`Opus 5.5`) switches to that model instead; any other word is auto · the hover names where the click goes · read live"
+        }
+        "claude_footer.switch_effort" => {
+            " · default auto: the switch goes to the highest effort the session's Claude Code build admits for the model it switches to (xhigh where its catalog is not read) · low, medium, high, xhigh or max switches to that effort instead; any other word is auto · read live"
         }
         "claude_footer.card" => {
             " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · alab.systems` (the site's name a link), and under Autopilot off the same card in white; banners over Claude Code's update notice and its startup announcement name and link alab.systems — glass only; false leaves the card bare · read live"

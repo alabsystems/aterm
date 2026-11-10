@@ -2786,6 +2786,17 @@ impl HeldBook<'_> {
         offered: impl IntoIterator<Item = fleet_seed::FleetSeed>,
         now_ms: u64,
     ) -> io::Result<Option<fleet_seed::FleetSeed>> {
+        self.adopt_relayed_seed_with_keys(me, mark, offered, now_ms, None)
+    }
+
+    fn adopt_relayed_seed_with_keys(
+        &self,
+        me: &NodeIdentity,
+        mark: FleetMark,
+        offered: impl IntoIterator<Item = fleet_seed::FleetSeed>,
+        now_ms: u64,
+        keys: Option<&Keyring>,
+    ) -> io::Result<Option<fleet_seed::FleetSeed>> {
         use fleet_seed::Judged;
         let mut offered = offered.into_iter().peekable();
         if offered.peek().is_none() {
@@ -2798,7 +2809,14 @@ impl HeldBook<'_> {
         };
         let own = name_record::node_of(me.node());
         let root = self.is_root(me);
-        let keys = Keyring::read(self.dir);
+        let owned_keys;
+        let keys = match keys {
+            Some(keys) => keys,
+            None => {
+                owned_keys = Keyring::read(self.dir);
+                &owned_keys
+            }
+        };
         let key_of = |seed: &fleet_seed::FleetSeed| {
             if Some(seed.minter()) == own {
                 Some(me.key())
@@ -3944,6 +3962,29 @@ pub fn peer_of(state_dir: &Path, node: &str) -> Option<Peer> {
         .find(|peer| peer.node.as_deref() == Some(node))
 }
 
+/// [`known_nodes`] and [`peer_of`] for `node` from one read of `state_dir`'s book and
+/// issuer-book copy.
+#[must_use]
+pub fn known_nodes_and_peer(state_dir: &Path, node: &str) -> (Vec<String>, Option<Peer>) {
+    let (mut peers, copies) = book_and_copies(state_dir);
+    let knows = read_node_id(state_dir)
+        .ok()
+        .flatten()
+        .into_iter()
+        .chain(
+            peers
+                .iter()
+                .chain(&copies)
+                .filter_map(|peer| peer.node.clone()),
+        )
+        .collect();
+    with_copies(&mut peers, copies);
+    let peer = peers
+        .into_iter()
+        .find(|peer| peer.node.as_deref() == Some(node));
+    (knows, peer)
+}
+
 /// The peers a key binds, gathered as [`Keyring::read`] gathers keys: each entry of the book
 /// in `state_dir`, then of the whole copy of the issuer's book, that names a node with the key
 /// the keyring binds it to, each node once and the book's entry first.
@@ -4808,7 +4849,7 @@ pub fn heartbeat_members_while(
     if ended.is_set() {
         return Ok(Vec::new());
     }
-    let keys = Keyring::read(state_dir);
+    let keys = Keyring::of(peers.iter().chain(&issuer_copies));
     let own = me.node();
     // A key the log names no way is judged by the book, as with no log ([`MemberKeys`]).
     let admits = |node: &str, key: &NodeKey| {
@@ -5038,7 +5079,11 @@ pub fn heartbeat_members_while(
                 }),
             )
             .map_err(|e| e.to_string())?;
-            book.update(|book| {
+            let current_issuer_copies = issuer
+                .as_deref()
+                .map(|node| read_issuer_book(state_dir, node))
+                .unwrap_or_default();
+            let updated_peers = book.update(|book| {
                 // A member this Mac's book dropped while the round was out (`aterm fleet peers
                 // rm`) stays dropped: a book fetched before its issuer dropped it too would bind
                 // it here again, and no later round takes an entry of this book out.
@@ -5060,7 +5105,13 @@ pub fn heartbeat_members_while(
                 if !fetched_slices.is_empty() {
                     prune_pushed_facts_peer_slices(state_dir, &fetched_slices, denied_nodes, log);
                 }
-                let copies = copied_keys(state_dir, book);
+                let copies = match issuer_of(book).and_then(|peer| peer.node.as_deref()) {
+                    Some(node) if Some(node) == issuer.as_deref() => {
+                        Keyring::of(&current_issuer_copies)
+                    }
+                    Some(node) => Keyring::of(&read_issuer_book(state_dir, node)),
+                    None => Keyring::default(),
+                };
                 for (done, fetched, proved_key) in &mut answered {
                     let fetched = fetched
                         .as_ref()
@@ -5096,7 +5147,7 @@ pub fn heartbeat_members_while(
                         slot.seen_ms = Some(now);
                     }
                 }
-                Ok(())
+                Ok(book.clone())
             })?;
             // What `aterm fleet peers` says this Mac is away from every member since, and which
             // members the next round passes over until they answer again.
@@ -5115,20 +5166,19 @@ pub fn heartbeat_members_while(
             // can be newer than the book this round fetched, and its barred rewrite starts from
             // the copy this round began with: that copy stays until the next round reads the
             // issuer again.
-            let kept_since = issuer
-                .as_deref()
-                .is_some_and(|node| read_issuer_book(state_dir, node) != issuer_copies);
+            let kept_since = issuer.is_some() && current_issuer_copies != issuer_copies;
             // The member this Mac joined through answered with its book, which is this Mac's copy
             // of it again: a member it recorded since binds here, and one it took out no more.
-            match answered
+            let effective_issuer_copies = match answered
                 .iter()
                 .find(|(done, _, _)| issuer.as_deref() == Some(done.node.as_str()))
             {
-                _ if kept_since => Ok(()),
+                _ if kept_since => Ok(current_issuer_copies),
                 Some((done, Some(fetched), _)) => {
                     let mut copies = copies_of(fetched, Some(own));
                     copies.retain(|copy| !is_barred(copy));
                     book.keep_issuer_book(Some((&done.node, &copies)))
+                        .map(|()| copies)
                         .map_err(|e| format!("{ISSUER_BOOK_FILE}: {e}"))
                 }
                 _ if issuer_copies.iter().any(is_barred) => {
@@ -5136,23 +5186,26 @@ pub fn heartbeat_members_while(
                         let mut copies = issuer_copies.clone();
                         copies.retain(|copy| !is_barred(copy));
                         book.keep_issuer_book(Some((issuer_node, &copies)))
+                            .map(|()| copies)
                             .map_err(|e| format!("{ISSUER_BOOK_FILE}: {e}"))
                     } else {
-                        Ok(())
+                        Ok(current_issuer_copies)
                     }
                 }
-                _ => Ok(()),
+                _ => Ok(current_issuer_copies),
             }?;
             // The seed a member's reply relays in its trailer, once this book, merged, binds its
             // minter (machine names §3.3). One not written now is offered again by the next
             // round's reads, so its failure stops none of this round's writes.
-            let _ = book.adopt_relayed_seed(
+            let updated_keys = Keyring::of(updated_peers.iter().chain(&effective_issuer_copies));
+            let _ = book.adopt_relayed_seed_with_keys(
                 me,
                 secret.mark(),
                 answered
                     .iter()
                     .filter_map(|(_, fetched, _)| fetched.as_ref()?.seed),
                 now,
+                Some(&updated_keys),
             );
             // A root holding none mints once its wait over rounds that read its members' books,
             // none of which relayed its seed, is over (machine names §3.3); the next round's
@@ -9291,10 +9344,10 @@ fn prune_pushed_facts_slices_using(
             }
         }
     }
-    let keyring = Keyring::read(state_dir);
     let Ok(nodes) = pushed_facts_nodes(&dir) else {
         return;
     };
+    let keyring = std::cell::OnceCell::new();
     let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
     for node in nodes {
         if crate::fleet::is_denied_node(&node, denied_nodes) {
@@ -9307,7 +9360,11 @@ fn prune_pushed_facts_slices_using(
         else {
             continue;
         };
-        let effective_key = key.or_else(|| keyring.bound(&node));
+        let effective_key = key.or_else(|| {
+            keyring
+                .get_or_init(|| Keyring::read(state_dir))
+                .bound(&node)
+        });
         if let Some(key) = effective_key
             && (crate::fleet::is_denied_key(&key, denied_nodes)
                 || log.is_some_and(|l| l.holds_out(&key)))
@@ -9334,7 +9391,7 @@ pub fn all_pushed_facts_admitted(
     let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(&dir) else {
         return true;
     };
-    let keyring = Keyring::read(state_dir);
+    let keyring = std::cell::OnceCell::new();
     let key_denied = |key: &NodeKey| {
         crate::fleet::is_denied_key(key, denied_nodes) || log.is_some_and(|log| log.holds_out(key))
     };
@@ -9347,7 +9404,11 @@ pub fn all_pushed_facts_admitted(
                 peer.node.as_deref() == Some(&node) && peer.key.as_ref().is_some_and(key_denied)
             })
             && !key
-                .or_else(|| keyring.bound(&node))
+                .or_else(|| {
+                    keyring
+                        .get_or_init(|| Keyring::read(state_dir))
+                        .bound(&node)
+                })
                 .as_ref()
                 .is_some_and(key_denied)
     })

@@ -68,6 +68,187 @@ struct SelectionObservation {
     selected: SelectedSource,
 }
 
+/// A manual metadata edit retains its source decision until receipt admission.
+/// Only the local fleet is writable; neither this plan nor its guard grants a login.
+pub(in crate::harness) struct ManualRosterPlan {
+    pub(in crate::harness) fleet: Option<LocalFleetEdit>,
+    captured: AutomaticSource,
+    protection: SourceProtection,
+    roster: PathBuf,
+    destination: PathBuf,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::harness) static MANUAL_EARLY_FLEET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn manual_protection(
+    cli: Cli,
+    env: &Env,
+    config: &Path,
+    image: Option<&str>,
+) -> Result<SourceProtection, String> {
+    let mut protection = SourceProtection {
+        home: env.home.clone(),
+        ..SourceProtection::default()
+    };
+    if let Some(home) = &env.home {
+        protection
+            .read_only
+            .push(home.join(".secrets").join(cli_fleet_file(cli)));
+    }
+    if let Some(source) = image.and_then(source_key_text)
+        && !source.starts_with("http://")
+        && !source.starts_with("https://")
+    {
+        let input = if let Some(relative) = source.strip_prefix("~/") {
+            source_path(
+                env.home.as_deref().ok_or("no home for account source")?,
+                Path::new(relative),
+            )?
+        } else {
+            let base = config
+                .parent()
+                .ok_or("account configuration has no parent")?;
+            source_path(
+                &std::path::absolute(base).map_err(|why| why.to_string())?,
+                Path::new(&source),
+            )?
+        };
+        protection.read_only.push(input);
+    }
+    Ok(protection)
+}
+
+/// Explicit native selection bypasses default source planning, never output protection.
+pub(in crate::harness) fn protect_manual_roster(
+    cli: Cli,
+    env: &Env,
+    roster: &Path,
+) -> Result<(), String> {
+    let config = env.config.clone().unwrap_or_else(|| config_beside(roster));
+    let image = read_config(&config)?;
+    let protection = manual_protection(cli, env, &config, image.as_deref())?;
+    let destination = accounts::usage_target(Some(roster))?.ok_or("missing account roster")?;
+    protection.check(&[roster, &destination])
+}
+
+impl ManualRosterPlan {
+    #[cfg(test)]
+    pub(in crate::harness) fn early_write_negative_control(&self) -> Result<(), String> {
+        if MANUAL_EARLY_FLEET.get()
+            && let Some(fleet) = &self.fleet
+        {
+            fs::write(&fleet.destination, &fleet.after).map_err(|why| why.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::harness) fn capture(
+        cli: Cli,
+        env: &Env,
+        roster: &Path,
+        row: &Row,
+    ) -> Result<Self, String> {
+        let store = env
+            .accounts_store_for(cli)
+            .ok_or_else(|| super::super::cli::no_home_for(cli))?;
+        let config = env.config.clone().unwrap_or_else(|| config_beside(roster));
+        let mut captured =
+            AutomaticSource::capture_requested(&config).map_err(SyncError::into_message)?;
+        let native = captured
+            .chosen(cli, roster, None)
+            .map_err(SyncError::into_message)?
+            .is_some();
+        if native {
+            captured.native_guard().map_err(SyncError::into_message)?;
+        }
+        let policy = store.source_policy()?;
+        let selected = if cli == Cli::Claude && !native {
+            Some(source_selection::select_observed(
+                env.home.as_deref(),
+                env.config.as_deref(),
+                Some(roster),
+                SourceScope::Init,
+                &policy,
+            )?)
+        } else {
+            None
+        };
+        let retire = native
+            || selected.as_ref().is_some_and(|selected| {
+                selected.retires_legacy(env.home.as_deref(), env.config.as_deref())
+            });
+        captured = captured.with_policy(policy, retire);
+        if let Some(selected) = &selected {
+            captured = captured.with_selection(env, roster, SourceScope::Init, selected.clone());
+        }
+        let protection = manual_protection(cli, env, &config, captured.config_image.as_deref())?;
+        let destination = accounts::usage_target(Some(roster))?.ok_or("missing account roster")?;
+        protection.check(&[roster, &destination])?;
+        let fleet = match selected.as_ref().map(SelectedSource::origin) {
+            Some(FleetOrigin::Local { files, .. }) => {
+                let [file] = files.as_slice() else {
+                    return Err("manual account publication needs exactly one local fleet".into());
+                };
+                protection.check(&[file])?;
+                Some(local_fleet_edit(env, file, row)?)
+            }
+            Some(origin @ (FleetOrigin::Key(_) | FleetOrigin::Vault(_))) => {
+                let from = if matches!(&origin, FleetOrigin::Key(_)) {
+                    "list the account there"
+                } else {
+                    "list the account where that file comes from (the vault's entry, on a Mac that edits the vault)"
+                };
+                return Err(format!(
+                    "this machine's accounts come from {}, which a sync writes {} from and this machine does not write, so a row listed here alone would be dropped at the next sync: {from} (its email, and this machine among its `machines`) before changing the local roster; nothing was written",
+                    origin.words(),
+                    roster.display()
+                ));
+            }
+            Some(FleetOrigin::AlabPending(why) | FleetOrigin::SourcePending(why)) => {
+                return Err(why);
+            }
+            Some(FleetOrigin::Roster | FleetOrigin::Alab) | None => None,
+        };
+        let plan = Self {
+            fleet,
+            captured,
+            protection,
+            roster: roster.to_owned(),
+            destination,
+        };
+        plan.check_current()?;
+        Ok(plan)
+    }
+
+    pub(in crate::harness) fn retires_legacy(&self) -> bool {
+        self.captured.retires_legacy()
+    }
+
+    pub(in crate::harness) fn guard(&self) -> Option<&ReceiptGuard> {
+        self.captured.receipt.as_ref()
+    }
+
+    /// Recheck outside native custody: validation opens the native capture once.
+    /// The retained native guard then fences the receipt save itself.
+    pub(in crate::harness) fn check_current(&self) -> Result<(), String> {
+        self.captured.validate().map_err(SyncError::into_message)?;
+        if accounts::usage_target(Some(&self.roster))?.as_ref() != Some(&self.destination) {
+            return Err("account roster destination changed after planning".into());
+        }
+        self.protection.check(&[&self.roster, &self.destination])?;
+        if let Some(fleet) = &self.fleet {
+            self.protection.check(&[&fleet.path, &fleet.destination])?;
+            if accounts::usage_target(Some(&fleet.path))?.as_ref() != Some(&fleet.destination) {
+                return Err("local fleet destination changed after planning".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl AutomaticSource {
     pub(super) fn capture(config: &Path) -> Result<Self, SyncError> {
         Self::capture_inner(config, true)
@@ -221,12 +402,6 @@ impl AutomaticSource {
             selected,
         });
         self
-    }
-
-    pub(super) fn legacy_retired(&self) -> bool {
-        self.policy
-            .as_ref()
-            .is_some_and(accounts::source_policy::Snapshot::retired)
     }
 
     pub(super) fn chosen(

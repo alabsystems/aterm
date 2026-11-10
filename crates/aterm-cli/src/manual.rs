@@ -1746,7 +1746,7 @@ VAULT TOKENS (Claude Code's pool, macOS)
 THE FOOTER
   A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓` land,
   `✓ landed`, `⤓ quiet`, `○` off, or `✋ you` while you hold it), the session's facts
-  and status lights. `[claude_footer]` keys, each true by default, switch its
+  and status lights. `[claude_footer]`'s switches, each true by default, turn on its
   extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just did,
   beside the chip), `card` (the decorated launch card, its line linking alab.systems,
   and the banners over Claude Code's update notice and startup announcement) and
@@ -1793,10 +1793,15 @@ THE FOOTER
   path, `⎇` the branch, `◐` the context and `Σ` the session's usage. As the rule
   narrows the model gives way last: the workspace facts first, then the account unit's
   forms, then the wall, then the effort. In Claude Code a click (or Enter or Space) on
-  the model or its effort switches the session to Opus 5.5 at xhigh effort, keeping a
+  the model or its effort switches the session to the best model of the harness's
+  priority list (`aterm harness upgrade models`) that its Claude Code build offers, at
+  the highest effort that build admits for it (the list's first model at xhigh where
+  the build's catalog is not read), keeping a
   1M-context variant the usage tap names, remembering what it ran as its own, and from
   there back to that (Claude's default model and auto effort where nothing is
-  remembered): aterm types `/model <id>` into an idle, empty composer and, once Claude
+  remembered). `[claude_footer] switch_model` (a model id such as `claude-opus-5-5`,
+  or the name the footer shows) and `switch_effort` (`low`, `medium`, `high`, `xhigh`
+  or `max`) name another target, each `auto` by default: aterm types `/model <id>` into an idle, empty composer and, once Claude
   answers, `/effort <level>`, refusing as the fact menus' typed rows do (the hover names
   where a click goes). Their right-click menus offer the same switch beside `Change
   model…` and `Effort slider…`. In any other program a click hides them. It names the account only where line E is not aterm's: 10 s

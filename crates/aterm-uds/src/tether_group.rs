@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A Darwin watcher's end of the process group its child leads ([`end_group`]), and its watch on
-//! that group once the child exits first ([`linger`]).
+//! A tether watcher's end of the process group its child leads ([`end_group`]), and its watch on
+//! that group once the child exits first ([`linger`]), on Darwin and Linux.
 //!
 //! A tethered child spawned at the head of its own group (`process_group(0)`, or a session) is a
 //! pipeline's root: Git's `fetch` runs `remote-http`, which runs `fetch-pack`, which runs
-//! `index-pack`, all in that group. Ending the root alone leaves the rest adopted by launchd and
-//! running on (Git ends none of them on a `SIGTERM`), so the watcher of a group leader signals the
-//! group, never a single member of it.
+//! `index-pack`, all in that group. Ending the root alone leaves the rest adopted (by launchd; on
+//! Linux by init, or the nearest subreaper) and running on (Git ends none of them on a
+//! `SIGTERM`), so the watcher of a group leader signals the group, never a single member of it.
 //!
 //! The group is the child's for as long as the watcher lives, by its anchor: before it leaves the
 //! child's group, the watcher forks a child of its own that exits at once and that it never reaps,
@@ -16,6 +16,9 @@
 //! is in it, and allocates no pid that names a live group, so the group id names the child's group
 //! and no other until the watcher exits and launchd reaps the anchor
 //! (`kill(-pgid, 0)` answers `EPERM` while only the anchor is left, `ESRCH` once it is reaped).
+//! Linux frees a pid only once no process holds it as its pid, its group's or its session's, a
+//! zombie included until it is reaped, so the same holds there (`kill(-pgid, 0)` answers `0`
+//! while only the anchor is left, as Linux signals a zombie).
 //! Every member a group signal reaches is therefore in the child's group: a member the watcher
 //! never saw, the leader's death before the watcher's first look, or a member forked unsignalled
 //! as a signal landed whose parent then died changes nothing. The watcher signals only before it
@@ -249,9 +252,11 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
 /// there: `false` once a fresh whole listing contains only its pinned exited anchor,
 /// `true` once the parent exits or execs first, when the caller ends the group ([`end_group`]).
 /// Each read follows a wake: a listed member's exit, or [`UNWATCHED_RECHECK`] when the listing
-/// did not establish that result. Other exited members conservatively keep this watch until
-/// reaped or the parent ends. A listed member's exit wakes another read, including when it
-/// forked after enumeration; an unread or changed membership uses the bounded recheck.
+/// did not establish that result. On Darwin, whose listing shows a zombie, other exited members
+/// conservatively keep this watch until reaped or the parent ends; Linux's lists none, and an
+/// exited member, which can fork nothing, is passed by. A listed member's exit wakes another
+/// read, including when it forked after enumeration; an unread or changed membership uses the
+/// bounded recheck.
 pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
     loop {
         let woke = match live(control, pgid) {
@@ -265,9 +270,29 @@ pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
     }
 }
 
+/// `sig` to every member of group `pgid` (`kill(2)` of the negated id); refused for an id that
+/// names no one group.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn live_signal(pgid: i32, sig: i32) -> std::io::Result<()> {
+    if pgid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{pgid} names no one process group"),
+        ));
+    }
+    // SAFETY: a plain syscall taking no pointer. `pgid` > 1, so it names one group, never
+    // this process's own (0) or every process (-1).
+    if unsafe { libc::kill(-pgid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// The kernel's [`GroupControl`]: [`read_lineage`](crate::process::read_lineage),
-/// [`group_members`](crate::process::group_members), `kill(2)` of the negated group id, the
-/// watcher's kqueue (`kq`, which watches `parent`'s exit and exec) and the thread's sleep.
+/// [`group_members`](crate::process::group_members), `kill(2)` of the negated group id
+/// ([`live_signal`]), the watcher's kqueue (`kq`, which watches `parent`'s exit and exec) and the
+/// thread's sleep.
 #[cfg(target_vendor = "apple")]
 pub(super) struct GroupLive<'a> {
     /// The watcher's kqueue.
@@ -294,19 +319,7 @@ impl GroupControl for GroupLive<'_> {
             .map(|listing| (listing.pids, listing.complete))
     }
     fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
-        if pgid <= 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{pgid} names no one process group"),
-            ));
-        }
-        // SAFETY: a plain syscall taking no pointer. `pgid` > 1, so it names one group, never
-        // this process's own (0) or every process (-1).
-        if unsafe { libc::kill(-pgid, sig) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        live_signal(pgid, sig)
     }
     fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
         const BLANK: libc::kevent = super::watch_of(0, 0);
@@ -370,6 +383,100 @@ impl GroupControl for GroupLive<'_> {
             self.parent,
             libc::NOTE_EXIT | libc::NOTE_EXEC,
         ) {
+            Woke::Parent
+        } else {
+            Woke::Other
+        }
+    }
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn nap(&mut self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// The kernel's [`GroupControl`] on Linux: Darwin's reads, with a pidfd of each member in place
+/// of the kqueue's watch, waited on beside `parent`, the watcher's descriptor of the parent's end
+/// (`super::parent_end`). Linux's listing passes every exited process by, a zombie included
+/// ([`group_members`](crate::process::group_members)), so each listing of the watched group here
+/// adds the anchor, which stays in it until it is reaped: it was forked there, and a zombie moves
+/// to no other group. Another exited member is passed by as that listing passes it; it can fork
+/// nothing more. One that forked before it exited, while the listing walked `/proc`, hides no
+/// member behind it: the listing reads every id allocated behind its walk, or is not whole.
+#[cfg(target_os = "linux")]
+pub(super) struct GroupLive<'a> {
+    /// The watcher's descriptor of the parent's end, readable once it exited, or execed (from
+    /// Linux 6.9, `super::parent_end`).
+    pub parent: i32,
+    /// The group the watched child led, whose members [`GroupControl::wait`] watches.
+    pub pgid: i32,
+    /// Borrowed native wait custody, never reconstructed from a listed pid.
+    pub anchor: &'a super::Anchor,
+}
+
+#[cfg(target_os = "linux")]
+impl GroupControl for GroupLive<'_> {
+    fn anchor(&self) -> i32 {
+        self.anchor.pid
+    }
+    fn group_of(&mut self, pid: i32) -> Option<i32> {
+        crate::process::read_lineage(pid).and_then(|lineage| i32::try_from(lineage.pgid).ok())
+    }
+    fn presence(&mut self, pid: i32) -> ProcessPresence {
+        crate::process::process_presence(pid)
+    }
+    fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
+        let listing = crate::process::group_members(u32::try_from(pgid).ok()?)?;
+        let mut pids = listing.pids;
+        if pgid == self.pgid {
+            pids.push(self.anchor.pid);
+        }
+        Some((pids, listing.complete))
+    }
+    fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
+        live_signal(pgid, sig)
+    }
+    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
+        use std::os::fd::AsRawFd as _;
+        let mut patience = patience;
+        let mut exits = Vec::with_capacity(members.len());
+        for &pid in members {
+            match super::pidfd_open(pid, 0) {
+                // The pidfd names the member listed while its pid still reads in the group with
+                // the pidfd open: a pid reused since by a process outside it reads otherwise, and
+                // the group is read again.
+                Ok(exit) => match self.group_of(pid) {
+                    Some(group) if group == self.pgid => exits.push(exit),
+                    Some(_) => return Woke::Other,
+                    None => match self.presence(pid) {
+                        ProcessPresence::Absent | ProcessPresence::Exited => return Woke::Other,
+                        ProcessPresence::Present | ProcessPresence::Unknown => {
+                            exits.push(exit);
+                            patience = Some(UNWATCHED_RECHECK);
+                        }
+                    },
+                },
+                // A member already gone: read the group again now.
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Woke::Other,
+                // One whose exit cannot be watched: read it again after a while.
+                Err(_) => patience = Some(UNWATCHED_RECHECK),
+            }
+        }
+        let mut fds: Vec<libc::pollfd> = std::iter::once(self.parent)
+            .chain(exits.iter().map(|exit| exit.as_raw_fd()))
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let timeout = patience.map_or(-1, |p| i32::try_from(p.as_millis()).unwrap_or(i32::MAX));
+        let count = libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX);
+        // SAFETY: `fds` is a live array of `count` pollfds, which `poll` reads and writes and
+        // does not retain.
+        let got = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+        if got > 0 && fds[0].revents != 0 {
             Woke::Parent
         } else {
             Woke::Other

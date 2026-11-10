@@ -6,6 +6,9 @@
 use crate::{buildplan, snapshot};
 use std::path::Path;
 
+#[path = "profile_pilot_summary.rs"]
+mod summary;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arm {
     Fat1,
@@ -14,12 +17,15 @@ pub(crate) enum Arm {
     Fat16Lines,
     Thin16,
     Thin16Lines,
+    Thin1,
+    FatGui16,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Trial {
     pub arm: Arm,
     pub anatomy: bool,
+    pub jobs: Option<u32>,
 }
 
 impl Arm {
@@ -31,13 +37,15 @@ impl Arm {
             Self::Fat16Lines => "fat16-lines",
             Self::Thin16 => "thin16",
             Self::Thin16Lines => "thin16-lines",
+            Self::Thin1 => "thin1",
+            Self::FatGui16 => "fat-gui16",
         }
     }
     pub(crate) fn environment(self) -> [(&'static str, &'static str); 3] {
         [
             (
                 "CARGO_PROFILE_RELEASE_LTO",
-                if matches!(self, Self::Thin16 | Self::Thin16Lines) {
+                if matches!(self, Self::Thin1 | Self::Thin16 | Self::Thin16Lines) {
                     "thin"
                 } else {
                     "fat"
@@ -45,7 +53,10 @@ impl Arm {
             ),
             (
                 "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
-                if matches!(self, Self::Fat1 | Self::Fat1Lines) {
+                if matches!(
+                    self,
+                    Self::Fat1 | Self::Fat1Lines | Self::Thin1 | Self::FatGui16
+                ) {
                     "1"
                 } else {
                     "16"
@@ -53,7 +64,7 @@ impl Arm {
             ),
             (
                 "CARGO_PROFILE_RELEASE_DEBUG",
-                if matches!(self, Self::Fat1 | Self::Fat16 | Self::Thin16) {
+                if !matches!(self, Self::Fat1Lines | Self::Fat16Lines | Self::Thin16Lines) {
                     "1"
                 } else {
                     "line-tables-only"
@@ -68,6 +79,10 @@ pub(crate) struct Options {
     arms: Vec<Arm>,
     takes: usize,
     inspect: Option<std::path::PathBuf>,
+    resume: Option<std::path::PathBuf>,
+    jobs: Option<u32>,
+    compat_jobs: Option<u32>,
+    summary: Option<std::path::PathBuf>,
     anatomy: bool,
 }
 
@@ -85,6 +100,10 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         arms: Vec::new(),
         takes: 2,
         inspect: None,
+        resume: None,
+        jobs: None,
+        compat_jobs: None,
+        summary: None,
         anatomy: false,
     };
     while let Some(flag) = args.next() {
@@ -102,6 +121,8 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                     "fat16-lines" => Arm::Fat16Lines,
                     "thin16" => Arm::Thin16,
                     "thin16-lines" => Arm::Thin16Lines,
+                    "thin1" => Arm::Thin1,
+                    "fat-gui16" => Arm::FatGui16,
                     _ => return Err(format!("unknown pilot arm {value}")),
                 };
                 if opts.arms.contains(&arm) {
@@ -114,8 +135,38 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                 opts.takes = value.parse().map_err(|_| "invalid --takes")?;
             }
             "--inspect" => opts.inspect = Some(value.into()),
+            "--resume" => opts.resume = Some(value.into()),
+            "--summary" => opts.summary = Some(value.into()),
+            "--jobs" | "--compat-jobs" => {
+                let jobs = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or("pilot jobs must be a positive integer")?;
+                if flag == "--jobs" {
+                    opts.jobs = Some(jobs);
+                } else {
+                    opts.compat_jobs = Some(jobs);
+                }
+            }
             _ => return Err(format!("unknown profile-pilot flag {flag}")),
         }
+    }
+    if opts.summary.is_some() {
+        if opts.inspect.is_some()
+            || opts.resume.is_some()
+            || !opts.arms.is_empty()
+            || opts.anatomy
+            || takes_named
+            || opts.jobs.is_some()
+            || opts.compat_jobs.is_some()
+        {
+            return Err("--summary takes only a retained pilot directory".into());
+        }
+        return Ok(opts);
+    }
+    if opts.inspect.is_some() && opts.resume.is_some() {
+        return Err("--inspect and --resume are exclusive".into());
     }
     if opts.anatomy {
         if opts.inspect.is_some() || takes_named {
@@ -377,6 +428,10 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err("profile-pilot requires macOS or native Linux".into());
     }
+    if let Some(dir) = &opts.summary {
+        let cache = snapshot::CacheRoot::for_repo(repo)?;
+        return summary::run(&retained_root(&cache.path().join(".ubd/pilot"), dir)?);
+    }
     let git = crate::ledger::GitCli::new(repo);
     let release = crate::release::release_dir(&git)?;
     let pid = std::process::id();
@@ -422,21 +477,91 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         None
     };
     let cache = snapshot::CacheRoot::for_repo(repo)?;
-    let root = cache
-        .path()
-        .join(".ubd/pilot")
-        .join(format!("{}-{pid}", commit.trim()));
-    std::fs::create_dir_all(root.parent().ok_or("pilot root has no parent")?)
-        .map_err(|e| e.to_string())?;
-    std::fs::create_dir(&root)
-        .map_err(|e| format!("create unique pilot run (existing evidence is retained): {e}"))?;
+    let pilot_cache = cache.path().join(".ubd/pilot");
+    let (root, mut rows) = if let Some(resume) = &opts.resume {
+        let root = retained_root(&pilot_cache, resume)?;
+        let report: aterm_json::Value = aterm_json::from_str(
+            &crate::durable::read_text(&root.join("report.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("pilot resume report: {e}"))?;
+        if report["commit"].as_str() != Some(commit.trim())
+            || report["source_digest"] != aterm_json::json!(take.snapshot.digest)
+            || report["build_inputs"] != aterm_json::json!(inputs)
+            || report["anatomy"] != aterm_json::json!(opts.anatomy)
+        {
+            return Err("pilot resume inputs differ from the retained comparison".into());
+        }
+        let rows = report["rows"]
+            .as_array()
+            .ok_or("pilot resume has no rows")?
+            .clone();
+        for row in &rows {
+            let binary = row["binary"]
+                .as_str()
+                .ok_or("pilot resume row has no binary")?;
+            let binary = std::path::Path::new(binary);
+            retained_root(&root, binary)?;
+            let (sha, bytes) = crate::dmg::sha256_and_size(binary)?;
+            if row["sha256"] != aterm_json::json!(sha)
+                || row["binary_bytes"] != aterm_json::json!(bytes)
+            {
+                return Err("pilot resume artifact changed".into());
+            }
+            if let Some(app) = row["runtime_app"].as_str() {
+                let image = Path::new(app).join("Contents/MacOS/aterm");
+                retained_root(&root, &image)?;
+                if row["runtime_app_sha256"] != aterm_json::json!(crate::dmg::sha256_file(&image)?)
+                {
+                    return Err("pilot resume runtime artifact changed".into());
+                }
+            }
+        }
+        (root, rows)
+    } else {
+        let root = pilot_cache.join(format!("{}-{pid}", commit.trim()));
+        std::fs::create_dir_all(root.parent().ok_or("pilot root has no parent")?)
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir(&root)
+            .map_err(|e| format!("create unique pilot run (existing evidence is retained): {e}"))?;
+        (root, Vec::new())
+    };
+    let hint = if opts.resume.is_some() {
+        let app = rows
+            .iter()
+            .find_map(|row| row["runtime_app"].as_str())
+            .ok_or("pilot resume needs a retained native runtime image for its frozen identity")?;
+        let image = crate::durable::read_file(&Path::new(app).join("Contents/MacOS/aterm"))
+            .map_err(|e| e.to_string())?;
+        let hint = crate::postlink::index_hint(&image)?;
+        (!hint.is_empty()).then_some(hint)
+    } else {
+        buildplan::index_hint_now()
+    };
+    if opts.resume.is_some() && (opts.jobs.is_some() || opts.compat_jobs.is_some()) {
+        let excluded: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                let jobs = if row["slice"].as_str() == Some("native") {
+                    opts.jobs
+                } else {
+                    opts.compat_jobs
+                };
+                jobs.is_some_and(|jobs| row["granted_cores"].as_u64() != Some(u64::from(jobs)))
+            })
+            .cloned()
+            .collect();
+        if !excluded.is_empty() {
+            crate::durable::write_fresh(&root.join(format!("exploratory-job-counts-{pid}.json")),
+                aterm_json::json!({"reason": "build job count differs from the fixed comparison", "rows": excluded}).to_string())
+                .map_err(|e| e.to_string())?;
+            rows.retain(|row| !excluded.contains(row));
+        }
+    }
     // Identity and network-derived metadata are frozen once, across every arm.
     let build = snapshot::git_text(repo, &["show", "-s", "--format=%ct", commit.trim()])?
         .trim()
         .parse()
         .map_err(|_| "commit has no timestamp")?;
-    let hint = buildplan::index_hint_now();
-    let mut rows = Vec::new();
     for (n, arm) in order(opts) {
         let targets = if cfg!(target_os = "macos") {
             vec![None, Some("x86_64-apple-darwin")]
@@ -444,10 +569,35 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             vec![None]
         };
         for target in targets {
-            let dir = root
+            let base = root
                 .join(arm.name())
                 .join(format!("take{}", n + 1))
                 .join(target.unwrap_or("native"));
+            let jobs = if target.is_some() {
+                opts.compat_jobs
+            } else {
+                opts.jobs
+            };
+            if rows.iter().any(|row| {
+                row["arm"] == aterm_json::json!(arm.name())
+                    && row["slice"] == aterm_json::json!(target.unwrap_or("native"))
+                    && row["binary"]
+                        .as_str()
+                        .is_some_and(|binary| Path::new(binary).starts_with(&base))
+            }) {
+                println!(
+                    "profile-pilot: retained {} take {} {:?}",
+                    arm.name(),
+                    n + 1,
+                    target
+                );
+                continue;
+            }
+            let dir = jobs.map_or_else(|| base.clone(), |jobs| base.join(format!("jobs-{jobs}")));
+            if dir.exists() {
+                std::fs::rename(&dir, dir.with_extension(format!("failed-{pid}")))
+                    .map_err(|e| format!("retain incomplete pilot take: {e}"))?;
+            }
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             println!("profile-pilot: {} take {} {:?}", arm.name(), n + 1, target);
             let row = if cfg!(target_os = "linux") {
@@ -456,6 +606,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                     Trial {
                         arm,
                         anatomy: opts.anatomy,
+                        jobs,
                     },
                     &dir,
                     build,
@@ -467,6 +618,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                     Trial {
                         arm,
                         anatomy: opts.anatomy,
+                        jobs,
                     },
                     &dir,
                     target,
@@ -577,9 +729,7 @@ fn retained_root(cache: &Path, requested: &Path) -> Result<std::path::PathBuf, S
     let cache = std::fs::canonicalize(cache).map_err(|e| e.to_string())?;
     let root = std::fs::canonicalize(requested).map_err(|e| e.to_string())?;
     if root == cache || !root.starts_with(&cache) {
-        return Err(
-            "--inspect accepts a retained take inside this clone's private pilot cache".into(),
-        );
+        return Err("pilot evidence must be inside its private retained root".into());
     }
     Ok(root)
 }
@@ -1043,6 +1193,13 @@ mod tests {
         );
         assert!(retained_root(cache.path(), outside.path()).is_err());
         assert!(retained_root(cache.path(), cache.path()).is_err());
+        assert!(retained_root(cache.path(), &take.join("../..")).is_err());
+        #[cfg(unix)]
+        {
+            let link = take.join("escape");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            assert!(retained_root(cache.path(), &link).is_err());
+        }
         assert!(
             parse(
                 ["--inspect", "take", "--arm", "fat1"]

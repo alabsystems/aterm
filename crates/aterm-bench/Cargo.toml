@@ -14,6 +14,7 @@ description = "aterm performance harnesses (the examples `verify perf` runs)."
 libc = { workspace = true }
 
 [dev-dependencies]
+aterm-json = { workspace = true }
 aterm-core = { workspace = true }
 # The resize/rewrap harness steps PendingScrollbackReflow directly.
 aterm-grid = { workspace = true }
@@ -75,4 +76,8 @@ test = true
 name = "vte_engine_harness"
 # Its unit tests (the interleave and the performance-core cycle count) run in
 # `targo --unverified test -p aterm-bench`.
+test = true
+
+[[example]]
+name = "crash_restore_harness"
 test = true

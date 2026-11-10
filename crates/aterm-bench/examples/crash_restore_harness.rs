@@ -24,6 +24,10 @@ const TAP_ITERS: usize = 49;
 const WARMUP: usize = 2;
 const PER_SAMPLE: usize = 64;
 
+#[path = "crash_restore_harness/samples.rs"]
+mod samples;
+use samples::{Batch, Keyframes, Pass, Snapshot};
+
 const WRITER: WriterIdentity<'static> = WriterIdentity {
     pid: 1,
     birth_us: 1,
@@ -110,11 +114,11 @@ fn tui() -> Terminal {
     term
 }
 
-fn keyframe_secs(term: &Terminal, bridge: usize) -> (f64, f64) {
+fn keyframe_secs(term: &Terminal, bridge: usize, diagnostics: bool) -> Keyframes {
     let mut writer = writer();
-    let mut whole = Vec::with_capacity(N_ITERS);
-    let mut capture = Vec::with_capacity(N_ITERS);
+    let mut passes = [Pass::default(); N_ITERS];
     for i in 0..WARMUP + N_ITERS {
+        let before = Snapshot::read(diagnostics && i >= WARMUP);
         let started = Instant::now();
         for _ in 0..PER_SAMPLE {
             let checkpoint = term.checkpoint_journal_marked(bridge, 512).expect("ground");
@@ -130,18 +134,22 @@ fn keyframe_secs(term: &Terminal, bridge: usize) -> (f64, f64) {
             };
             writer.write_keyframe(&input).expect("a keyframe fits");
         }
-        let per_keyframe = started.elapsed().as_secs_f64() / PER_SAMPLE as f64;
+        let keyframe_seconds = started.elapsed().as_secs_f64();
+        let between = Snapshot::read(diagnostics && i >= WARMUP);
         let started = Instant::now();
         for _ in 0..PER_SAMPLE {
             black_box(term.checkpoint_journal_marked(bridge, 512));
         }
-        let per_capture = started.elapsed().as_secs_f64() / PER_SAMPLE as f64;
+        let capture_seconds = started.elapsed().as_secs_f64();
+        let after = Snapshot::read(diagnostics && i >= WARMUP);
         if i >= WARMUP {
-            whole.push(per_keyframe);
-            capture.push(per_capture);
+            passes[i - WARMUP] = Pass {
+                whole: Batch::between(keyframe_seconds, before, between),
+                capture: Batch::between(capture_seconds, between, after),
+            };
         }
     }
-    (median(&mut whole), median(&mut capture))
+    Keyframes::new(passes)
 }
 
 fn export_us_per_line(term: &Terminal) -> f64 {
@@ -247,12 +255,27 @@ fn main() {
     let tail_tap_mbps = median(&mut tapped);
 
     let shell_term = shell(2000);
-    let (kf_shell, kf_shell_capture) = keyframe_secs(&shell_term, 0);
-    let (kf_tui, kf_tui_capture) = keyframe_secs(&tui(), 0);
-    let (kf_256, kf_256_capture) = keyframe_secs(&shell_term, 256);
-    let (kf_512, kf_512_capture) = keyframe_secs(&shell_term, 512);
+    let shell_samples = keyframe_secs(&shell_term, 0, true);
+    let tui_samples = keyframe_secs(&tui(), 0, true);
+    let bridge256_samples = keyframe_secs(&shell_term, 256, true);
+    let bridge512_samples = keyframe_secs(&shell_term, 512, true);
+    let (kf_shell, kf_shell_capture) = shell_samples.medians();
+    let (kf_tui, kf_tui_capture) = tui_samples.medians();
+    let (kf_256, kf_256_capture) = bridge256_samples.medians();
+    let (kf_512, kf_512_capture) = bridge512_samples.medians();
     let recover = recover_secs(&corpus);
     let export = export_us_per_line(&shell(20_000));
+
+    // Emit only after every benchmark is timed. The verifier forwards this prefix, so a
+    // failed lane keeps its actual samples without adding any gated or trended metric.
+    for (case, samples) in [
+        ("shell", &shell_samples),
+        ("tui", &tui_samples),
+        ("bridge256", &bridge256_samples),
+        ("bridge512", &bridge512_samples),
+    ] {
+        samples.emit(case);
+    }
 
     let us = |secs: f64| secs * 1e6;
     eprintln!(
@@ -294,4 +317,31 @@ fn main() {
         us(kf_512_capture),
         us(recover),
     );
+}
+
+#[test]
+#[ignore = "manual interleaved counter-on/off measurement; no timing verdict"]
+fn keyframe_counter_intrusion() {
+    let shell = shell(2000);
+    let tui = tui();
+    for round in 0..7 {
+        for (case, term, bridge) in [
+            ("shell", &shell, 0),
+            ("tui", &tui, 0),
+            ("bridge256", &shell, 256),
+            ("bridge512", &shell, 512),
+        ] {
+            for enabled in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let timing = keyframe_secs(black_box(term), bridge, black_box(enabled));
+                let (whole, capture) = timing.medians();
+                println!(
+                    "counter-intrusion round={round} case={case} enabled={enabled} whole_s={whole} capture_s={capture}"
+                );
+            }
+        }
+    }
 }

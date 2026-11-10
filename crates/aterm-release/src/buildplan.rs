@@ -747,16 +747,14 @@ fn build_slices(
             log.display()
         );
         let built = (|| {
-            let units = units.iter().find(|u| u.triple() == triple);
-            let need = crate::slice_units::slice_need(triple, units);
+            let units = units
+                .iter()
+                .find(|u| u.triple() == triple)
+                .ok_or("no account state directory for release compiler admission")?;
+            let need = crate::slice_units::slice_need(triple, Some(units));
             println!(
-                "==> [{triple}] memory: claims {} for {}",
+                "==> [{triple}] memory: claims {} for its driver; compilers claim recorded or cold bounds; only an unrecorded final link learns alone",
                 aterm_capacity::size(need.mem),
-                if units.is_some_and(crate::slice_units::Units::claims) {
-                    "its driver; each compiler claims its measured peak plus margin, leading"
-                } else {
-                    "its driver, alone while its compilers learn this toolchain's footprints"
-                }
             );
             let memory = aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
                 .map_err(|e| e.to_string())?;
@@ -775,7 +773,7 @@ fn build_slices(
                 build_number: plan.build_number,
                 index_hint: plan.index_hint.as_deref(),
                 static_crt: false,
-                units,
+                units: Some(units),
             };
             run_slice_profile(take, &run, Some(&log), None, Some(pool), false)
         })();
@@ -1143,6 +1141,24 @@ fn anatomy_args(mut args: Vec<OsString>, target: Option<&str>) -> Vec<OsString> 
     args
 }
 
+fn pilot_profile_args(
+    mut args: Vec<OsString>,
+    arm: crate::profile_pilot::Arm,
+    target: Option<&str>,
+) -> Vec<OsString> {
+    if arm == crate::profile_pilot::Arm::FatGui16 {
+        let at = usize::from(target.is_none());
+        args.splice(
+            at..at,
+            [
+                "--config".into(),
+                "profile.release.package.aterm-gui.codegen-units=16".into(),
+            ],
+        );
+    }
+    args
+}
+
 struct ReleaseEnv<'a> {
     /// The lane's toolchain directory first ([`release_tool_path`]).
     path: OsString,
@@ -1243,7 +1259,18 @@ const fn release_profile_debug() -> (&'static str, &'static str) {
 /// scratch: a waiter may wait for the claim's end where those writes could return enough room.
 fn pilot_need(arm: crate::profile_pilot::Arm, root: &Path, cores: u32) -> aterm_capacity::Need {
     aterm_capacity::Need::new(format!("profile-pilot {}", arm.name()))
-        .mem_gib(37)
+        .mem_gib(
+            if matches!(
+                arm,
+                crate::profile_pilot::Arm::Thin1
+                    | crate::profile_pilot::Arm::Thin16
+                    | crate::profile_pilot::Arm::Thin16Lines
+            ) {
+                37
+            } else {
+                50
+            },
+        )
         .cores(cores)
         .disk(30 * (1 << 30), root)
         .scratch()
@@ -1263,14 +1290,15 @@ pub(crate) fn contention_slices(
         let handles = [(ARM64, None), (X86_64, Some(X86_64))].map(|(triple, target)| {
             let units = units.iter().find(|u| u.triple() == triple);
             scope.spawn(move || {
+                let units = units.ok_or("no account state directory for release compiler admission")?;
                 let _memory = aterm_capacity::admit(
-                    crate::slice_units::slice_need(triple, units),
+                    crate::slice_units::slice_need(triple, Some(units)),
                     aterm_capacity::Admit::Wait,
                 ).map_err(|e| e.to_string())?;
                 let run = SliceRun {
                     verb: "build", pkg: "aterm", target,
                     target_dir: root.join(triple).join("build.noindex"),
-                    build_number: 0, index_hint: None, static_crt: false, units,
+                    build_number: 0, index_hint: None, static_crt: false, units: Some(units),
                 };
                 let started = Instant::now();
                 let usage = run_slice_profile(take, &run, Some(&root.join(format!("{triple}.log"))), None, Some(pool), demoted)?;
@@ -1304,11 +1332,27 @@ pub(crate) fn pilot_build(
         .map_err(|e| format!("fresh pilot target {}: {e}", target_dir.display()))?;
     let log = root.join("build.log");
     let waiting = Instant::now();
-    let claim = aterm_capacity::admit(
-        pilot_need(arm, root, aterm_capacity::cores()),
-        aterm_capacity::Admit::Wait,
-    )
-    .map_err(|e| e.to_string())?;
+    let mut previous_grant = None;
+    let claim = loop {
+        let claim = aterm_capacity::admit(
+            pilot_need(arm, root, trial.jobs.unwrap_or_else(aterm_capacity::cores)),
+            aterm_capacity::Admit::Wait,
+        )
+        .map_err(|e| e.to_string())?;
+        if trial.jobs.is_none_or(|jobs| claim.cores() >= jobs) {
+            break claim;
+        }
+        if previous_grant != Some(claim.cores()) {
+            println!(
+                "profile-pilot: waiting for fixed {} jobs; granted {}",
+                trial.jobs.unwrap_or_default(),
+                claim.cores()
+            );
+            previous_grant = Some(claim.cores());
+        }
+        drop(claim);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    };
     let waiting_s = waiting.elapsed().as_secs_f64();
     let load_before = aterm_sysprobe::load_average();
     let started = Instant::now();
@@ -1752,6 +1796,9 @@ fn run_slice_profile(
         target,
         run.static_crt,
     );
+    if let Some((trial, _)) = trial {
+        args = pilot_profile_args(args, trial.arm, target);
+    }
     if trial.is_some_and(|(trial, _)| trial.anatomy) {
         args = anatomy_args(args, target);
     }
@@ -1780,7 +1827,7 @@ fn run_slice_profile(
         },
     );
     if let Some((trial, cores)) = trial {
-        let crate::profile_pilot::Trial { arm, anatomy } = trial;
+        let crate::profile_pilot::Trial { arm, anatomy, .. } = trial;
         cmd.envs(arm.environment())
             .env("CARGO_BUILD_JOBS", cores.to_string())
             .arg("--timings");
@@ -3169,13 +3216,16 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
     #[test]
-    fn release_slice_memory_waits_instead_of_overriding_available_memory() {
+    fn an_unwrapped_slice_diagnostic_waits_for_isolation() {
         for triple in [super::ARM64, super::X86_64] {
             let dir = aterm_tempfile::tempdir().unwrap();
             let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
             let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 16));
             let need = crate::slice_units::slice_need(triple, None);
-            assert!(need.alone, "unmeasured slices learn in isolation");
+            assert!(
+                need.alone,
+                "unwrapped diagnostics have no per-compiler admission"
+            );
             let other = aterm_capacity::admit::try_admit_with(
                 &ledger,
                 &machine,
@@ -3247,7 +3297,7 @@ mod tests {
         let root = std::path::Path::new("/pilot");
         let need = super::pilot_need(crate::profile_pilot::Arm::Fat1, root, 7);
         assert_eq!(need.what, "profile-pilot fat1");
-        assert_eq!(need.mem, 37 * (1 << 30));
+        assert_eq!(need.mem, 50 * (1 << 30));
         assert_eq!(need.cores, 7);
         assert_eq!(need.disk, 30 * (1 << 30));
         assert_eq!(need.path.as_deref(), Some(root));
@@ -3785,13 +3835,17 @@ mod tests {
         let manifest = std::path::Path::new("/take/src/Cargo.toml");
         for target in [None, Some("x86_64-apple-darwin")] {
             let args = super::anatomy_args(
-                cargo_build_args("build", config, config, manifest, "aterm", target, false),
+                super::pilot_profile_args(
+                    cargo_build_args("build", config, config, manifest, "aterm", target, false),
+                    crate::profile_pilot::Arm::FatGui16,
+                    target,
+                ),
                 target,
             );
             let cut = args.iter().position(|arg| arg == "build").unwrap();
             assert_eq!(
                 args[..cut].iter().filter(|arg| *arg == "--config").count(),
-                3
+                4
             );
             assert!(!args[cut..].iter().any(|arg| arg == "--config"));
             assert_eq!(args.first().unwrap() == "--unverified", target.is_none());

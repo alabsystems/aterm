@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's sync from the lab's preferences on a scratch store; every address is synthetic.
+//! Account sync from the lab's preferences on a scratch store; every address is synthetic.
 
 use super::*;
 use crate::harness::accounts::rename_tests::{NOW, seed_reference};
@@ -1164,6 +1164,107 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
             !said.contains("on this machine's own login:"),
             "CONTROL: {said}"
         );
+    }
+}
+
+#[test]
+fn a_known_codex_default_enrolls_without_a_local_preference() {
+    for source in [None, Some("alab")] {
+        for case in ["ready", "unknown", "held", "missing", "keyring", "left"] {
+            if case == "left" && source.is_some() {
+                continue;
+            }
+            let root = aterm_tempfile::TempDir::new().unwrap();
+            let home = root.path().join("home");
+            let state = root.path().join("state");
+            let config = root.path().join("config/aterm.toml");
+            fs::create_dir_all(home.join(".codex")).unwrap();
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            crate::test_config::write(&config, "").unwrap();
+            if case == "keyring" {
+                fs::write(
+                    home.join(".codex/config.toml"),
+                    "cli_auth_credentials_store='keyring'\n",
+                )
+                .unwrap();
+            }
+            if case != "missing" {
+                let address = email(if case == "unknown" { "unknown" } else { "cid" });
+                let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                    Some(&address),
+                    "plus",
+                    NOW + 3600,
+                );
+                fs::write(
+                    home.join(".codex/auth.json"),
+                    aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+                )
+                .unwrap();
+            }
+            let store = accounts::Store::at_for(&state, Cli::Codex, &home);
+            if case == "left" {
+                let mut retained = accounts::State::default();
+                retained
+                    .accounts
+                    .insert("codex-cccccc".into(), accounts::Account::default());
+                store.save(&retained).unwrap();
+            }
+            let lab = Lab {
+                me: Some(test_machine("m16")),
+                settled: true,
+                accounts: vec![LabAccount {
+                    cli: Cli::Codex,
+                    joinable: case != "held",
+                    ..lab_account("cid", "codex-cccccc", &[("m3", Some(1))])
+                }],
+                ..Lab::default()
+            };
+            let auth = fs::read(home.join(".codex/auth.json")).ok();
+            alab_roster::with_lab(lab, || {
+                assert_eq!(
+                    cli_pools_due(&config, &state, &home, NOW).contains(&Cli::Codex),
+                    case == "ready",
+                    "{case}: {source:?}"
+                );
+                let env = quiet_env(&home, &state, &config, NOW);
+                let converge = || {
+                    let mut sources = ResyncSources::new(&env, &home, &read_local_source_text);
+                    read_cli_resync(Cli::Codex, &state, &config, NOW, &mut sources, &mut None)
+                        .due
+                        .unwrap()
+                };
+                assert_eq!(!converge().is_empty(), case == "ready");
+                let result = sync_cli_with(
+                    Cli::Codex,
+                    (&home, &state, &config),
+                    (source, None),
+                    NOW,
+                    (&|_, _| panic!("native sync fetches no file"), &[]),
+                )
+                .unwrap();
+                let roster = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
+                if case == "ready" {
+                    let CliSync::Synced(done) = result else {
+                        panic!("{case}: {source:?}: {result:?}");
+                    };
+                    assert_eq!(done.own_row.as_deref(), Some("codex-cccccc"));
+                    assert_eq!(done.added, ["codex-cccccc"]);
+                    let rows = Roster::load_for(Cli::Codex, &roster).unwrap().rows;
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].email.as_deref(), Some(email("cid").as_str()));
+                    assert_eq!(rows[0].dir, None);
+                    assert_eq!(rows[0].class, Class::Pool);
+                    assert!(!cli_pools_due(&config, &state, &home, NOW).contains(&Cli::Codex));
+                    assert!(converge().is_empty());
+                } else {
+                    assert!(!roster.exists(), "{case}: {source:?}: {result:?}");
+                    if case == "left" {
+                        assert!(matches!(result, CliSync::Left { .. }));
+                    }
+                }
+                assert_eq!(fs::read(home.join(".codex/auth.json")).ok(), auth);
+            });
+        }
     }
 }
 

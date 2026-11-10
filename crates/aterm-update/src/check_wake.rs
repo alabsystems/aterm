@@ -34,6 +34,8 @@ pub(crate) fn is_network_unreachable(message: &str) -> bool {
 pub(crate) enum Waited {
     /// Full delay elapsed normally.
     Elapsed,
+    /// The caller no longer owns this wait.
+    Cancelled,
     /// A wake signal, network change, or system sleep gap was detected; the
     /// duration is any observed wall-clock excess, zero when there was none.
     Woke(Duration),
@@ -119,23 +121,147 @@ pub(crate) static SYSTEM_WOKE: WakeSignal = WakeSignal::new();
 /// Maximum sleep slice used by [`sleep_watching_for_wake`].
 pub(crate) const WAKE_SLICE: Duration = Duration::from_secs(5);
 
-/// Sleep for `total` in [`WAKE_SLICE`] increments, returning early on `signal` or a wall-clock jump.
-pub(crate) fn sleep_watching_for_wake(signal: &WakeSignal, seen: u64, total: Duration) -> Waited {
-    let mut remaining = total;
-    while !remaining.is_zero() {
-        let slice = remaining.min(WAKE_SLICE);
-        let before = SystemTime::now();
-        let ran = Instant::now();
-        let posted = signal.wait_past(seen, slice);
-        let observed = before.elapsed().unwrap_or(slice);
-        if posted {
-            // The wall clock's lead over this thread's own running time, for the log.
-            return Waited::Woke(observed.saturating_sub(ran.elapsed()));
+/// Sleep for `total` in [`WAKE_SLICE`] increments, returning early on `signal`,
+/// a wall-clock jump, or lost ownership. Cancellation takes precedence over a wake.
+pub(crate) fn sleep_watching_for_wake(
+    signal: &WakeSignal,
+    seen: u64,
+    total: Duration,
+    keep_waiting: impl FnMut() -> bool,
+) -> Waited {
+    let started = Instant::now();
+    wait_slices(
+        total,
+        || started.elapsed(),
+        keep_waiting,
+        |slice| {
+            let before = SystemTime::now();
+            let ran = Instant::now();
+            let posted = signal.wait_past(seen, slice);
+            let observed = before.elapsed().unwrap_or(slice);
+            if posted {
+                // The wall clock's lead over this thread's own running time, for the log.
+                return Waited::Woke(observed.saturating_sub(ran.elapsed()));
+            }
+            if is_wake_gap(slice, observed) {
+                return Waited::Woke(observed.saturating_sub(slice));
+            }
+            Waited::Elapsed
+        },
+    )
+}
+
+/// Scheduling delays consume the same budget as the requested sleeps.
+fn wait_slices(
+    total: Duration,
+    mut elapsed: impl FnMut() -> Duration,
+    mut keep_waiting: impl FnMut() -> bool,
+    mut wait: impl FnMut(Duration) -> Waited,
+) -> Waited {
+    loop {
+        if !keep_waiting() {
+            return Waited::Cancelled;
         }
-        if is_wake_gap(slice, observed) {
-            return Waited::Woke(observed.saturating_sub(slice));
+        let remaining = total.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return Waited::Elapsed;
         }
-        remaining = remaining.saturating_sub(slice);
+        let outcome = wait(remaining.min(WAKE_SLICE));
+        if !keep_waiting() {
+            return Waited::Cancelled;
+        }
+        if matches!(outcome, Waited::Woke(_)) {
+            return outcome;
+        }
     }
-    Waited::Elapsed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn scheduler_delays_consume_the_wait_budget_instead_of_extending_it() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut slices = Vec::new();
+        let result = wait_slices(
+            Duration::from_secs(20),
+            || elapsed.get(),
+            || true,
+            |slice| {
+                slices.push(slice);
+                // The first five-second request resumes twelve seconds late, below
+                // the system-sleep gap detector's threshold.
+                elapsed.set(
+                    elapsed.get()
+                        + if slices.len() == 1 {
+                            Duration::from_secs(17)
+                        } else {
+                            slice
+                        },
+                );
+                Waited::Elapsed
+            },
+        );
+        assert_eq!(result, Waited::Elapsed);
+        assert_eq!(slices, [Duration::from_secs(5), Duration::from_secs(3)]);
+        assert_eq!(elapsed.get(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn an_expired_budget_does_not_wait_and_a_wake_still_ends_the_wait() {
+        assert_eq!(
+            wait_slices(
+                Duration::from_secs(20),
+                || Duration::from_secs(21),
+                || true,
+                |_| panic!("budget already expired")
+            ),
+            Waited::Elapsed
+        );
+        let mut calls = 0;
+        let woke = Waited::Woke(Duration::from_secs(150));
+        assert_eq!(
+            wait_slices(
+                Duration::from_secs(20),
+                || Duration::ZERO,
+                || true,
+                |slice| {
+                    calls += 1;
+                    assert_eq!(slice, WAKE_SLICE);
+                    woke
+                }
+            ),
+            woke
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn lost_ownership_cancels_before_sleep_and_before_reporting_a_wake() {
+        assert_eq!(
+            wait_slices(
+                Duration::from_secs(86_400),
+                || Duration::ZERO,
+                || false,
+                |_| panic!("retired wait slept")
+            ),
+            Waited::Cancelled
+        );
+        let current = Cell::new(true);
+        let mut calls = 0;
+        let result = wait_slices(
+            Duration::from_secs(86_400),
+            || Duration::ZERO,
+            || current.get(),
+            |_| {
+                calls += 1;
+                current.set(false);
+                Waited::Woke(Duration::ZERO)
+            },
+        );
+        assert_eq!(result, Waited::Cancelled);
+        assert_eq!(calls, 1);
+    }
 }

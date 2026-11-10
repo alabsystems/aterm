@@ -296,6 +296,7 @@ impl Member {
                         peer,
                         proof: None,
                         member: binding.attempt,
+                        reserved_units: 0,
                         loan: None,
                         journal: &owner.journal,
                     },
@@ -376,6 +377,7 @@ impl Member {
                     peer: self.peer,
                     proof: None,
                     member: self.binding.attempt,
+                    reserved_units: 0,
                     loan: None,
                     journal: &owner.journal,
                 };

@@ -64,7 +64,13 @@ pub(in crate::harness) fn aliases(left: &Path, right: &Path) -> Result<bool, Str
     // A removed target of an excluded legacy entry cannot alias a live input.
     // Do not resolve its dangling symlink and let it disable unrelated sources.
     match std::fs::metadata(right) {
-        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(why) if why.kind() == io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(right).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Ok(false);
+            }
+            // An absent leaf can still have the same destination through a
+            // linked parent. Compare those destinations before any creation.
+        }
         Err(why) => return Err(why.to_string()),
         Ok(_) => {}
     }

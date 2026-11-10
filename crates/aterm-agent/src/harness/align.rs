@@ -557,12 +557,14 @@ pub fn capture_bounded_until(
 /// [`capture_bounded`] for a child that must not outlive this call or this process, such as a
 /// renewal's `claude auth login`, which waits for ever at its paste prompt once nothing answers
 /// it. The child is tied to this process ([`tie`]): a quit, an exec in its place (an update's
-/// cold lane), a crash or a `SIGKILL` of this process ends it too, by its tether's watcher on
-/// macOS (`SIGTERM`, `SIGKILL` after the grace) or the parent-death signal on Linux (`SIGTERM`).
-/// That end reaches the child alone, as no watcher signals a group: what it left in its group
-/// ends by its own bound (a renewal's opener by its sign-in's, and the browser it drives with the
-/// opener's pipe). On macOS the tie runs through this process's executable, so where an update
-/// or a rebuild replaced that file the child is not started, and the answer says so. Every way
+/// cold lane), a crash or a `SIGKILL` of this process ends it too, with its whole group, the
+/// renewal's opener and the browser it drives included: the child leads its group, so its
+/// tether's watcher sends the group `SIGTERM`, then `SIGKILL` rounds after the grace. On Linux a
+/// kernel with no pidfd, a `/proc` that hides processes, or an exec before Linux 6.9 leaves the
+/// child to its parent-death signal (`SIGTERM`) alone, and what it left in its group ends by its
+/// own bound (a renewal's opener by its sign-in's, and the browser by the opener's pipe). On macOS
+/// the tie runs through this process's executable, so where an update or a rebuild replaced that
+/// file the child is not started, and the answer says so. Every way
 /// this call stops waiting while the child runs (the deadline, output it cannot read, an unwind)
 /// ends it first as that watcher would ([`end_owned`]), then the rest of its process group,
 /// before its reap. A child that exits by itself has ended: the call answers its exit then, with

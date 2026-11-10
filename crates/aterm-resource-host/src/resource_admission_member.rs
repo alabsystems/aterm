@@ -242,6 +242,10 @@ pub(super) struct OwnedAttempt<D> {
     resources: Option<D>,
     events: Events,
     timeout: Option<Duration>,
+    // Configuration evidence only. A profile that moves its selected command
+    // into a prelude must supply an actual policy witness before using Run;
+    // an absent value here cannot authorize a requested footprint.
+    configured_footprint_mib: Option<u32>,
     wake: fn(),
     retired: bool,
     scope_closed: bool,
@@ -263,6 +267,10 @@ impl<D: MemberResources> OwnedAttempt<D> {
         wake: fn(),
     ) -> Self {
         let prepared = resources.configure(&mut command);
+        #[cfg(target_os = "macos")]
+        let configured_footprint_mib = command.get_footprint_limit().map(|limit| limit.mib());
+        #[cfg(not(target_os = "macos"))]
+        let configured_footprint_mib = None;
         command.start_suspended(true);
         let mut this = Self {
             binding,
@@ -270,6 +278,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
             resources: Some(resources),
             events,
             timeout,
+            configured_footprint_mib,
             wake,
             retired: false,
             scope_closed: false,
@@ -423,6 +432,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
             let pid = bound.pid;
             let birth = bound.birth;
             let committed = &mut bound.committed_start;
+            let configured_footprint_mib = self.configured_footprint_mib;
             let dispatch = self
                 .resources
                 .as_mut()
@@ -437,7 +447,9 @@ impl<D: MemberResources> OwnedAttempt<D> {
                             || started.monotonic_ns == 0
                             || started.unix_ns == 0
                             || requested.is_some_and(|limits| {
-                                limits.units == 0 || limits.footprint_mib == 0
+                                limits.units == 0
+                                    || limits.footprint_mib == 0
+                                    || configured_footprint_mib != Some(limits.footprint_mib)
                             })
                         {
                             return Err(refused("member Start commitment changed or replayed"));

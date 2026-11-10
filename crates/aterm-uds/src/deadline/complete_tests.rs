@@ -259,7 +259,12 @@ fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
             .write_all(b"owned cancellation prefix\n")
             .unwrap();
         std::io::stdout().flush().unwrap();
-        std::fs::write(ready, std::process::id().to_string()).unwrap();
+        // Renamed into place whole: the parent polls the record, and a write in place can be
+        // read empty between its create and its write.
+        let ready = std::path::PathBuf::from(ready);
+        let partial = ready.with_extension("partial");
+        std::fs::write(&partial, std::process::id().to_string()).unwrap();
+        std::fs::rename(&partial, &ready).unwrap();
         // The parent keeps this private pipe open until the capture settles its child.
         std::io::stdin().read_exact(&mut [0]).unwrap();
         return;

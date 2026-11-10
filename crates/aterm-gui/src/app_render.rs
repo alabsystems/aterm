@@ -18859,7 +18859,7 @@ impl App {
         };
         let words = crate::link_target::row_words(&built);
         let cell_h = self.win_cell_size(wid).1;
-        self.splice_band_rows_at(wid, frame_row, vec![built], cols, cell_h);
+        self.splice_band_rows_at(wid, frame_row, std::iter::once(built), cols, cell_h);
         self.windows
             .get(&wid)
             .filter(|ws| frame_row < ws.input_scratch.cells.len())
@@ -18877,7 +18877,6 @@ impl App {
         hover: crate::link_target::LinkHover,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Option<(usize, bool)> {
-        let carets = self.visible_pane_caret_rows(plan);
         let ws = self.windows.get(&wid)?;
         let term_rows = usize::from(ws.rows);
         let nrows = ws.input_scratch.cells.len();
@@ -18886,22 +18885,27 @@ impl App {
         if ws.cols == 0 || nrows == 0 {
             return None;
         }
+        let carets = self.visible_pane_caret_hits(plan, [bottom, 0]);
         let caret = ws
             .input_scratch
             .cursor_visible
             .then_some(ws.input_scratch.cursor_row);
-        let free = |row: &usize| {
+        let free = |(row, occupied): &(usize, bool)| {
             usize::from(hover.window_row) != *row
                 && caret != Some(strip + row)
-                && !carets.contains(row)
+                && !occupied
                 && !chrome_owns_any_on_terminal_row_of(ws, *row)
         };
-        let term_row = [bottom, 0].into_iter().find(free)?;
+        let (term_row, _) = [bottom, 0].into_iter().zip(carets).find(free)?;
         Some((strip + term_row, term_row == bottom))
     }
 
-    fn visible_pane_caret_rows(&self, plan: &crate::tab_model::VisibleLeafPlan) -> Vec<usize> {
-        let mut rows = Vec::with_capacity(plan.leaves.len());
+    fn visible_pane_caret_hits(
+        &self,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        candidates: [usize; 2],
+    ) -> [bool; 2] {
+        let mut hits = [false; 2];
         for leaf in &plan.leaves {
             // Distinct branch.
             if leaf.focused {
@@ -18930,10 +18934,16 @@ impl App {
                 crate::term_lock_ui(&term, &ui_waiting, crate::metrics::TermWaitSite::Redraw)
                     .cursor_row_on_screen(pane_rows)
             {
-                rows.push(row_off + caret);
+                let row = row_off + caret;
+                for (hit, candidate) in hits.iter_mut().zip(candidates) {
+                    *hit |= candidate == row;
+                }
+                if hits == [true; 2] {
+                    break;
+                }
             }
         }
-        rows
+        hits
     }
 
     /// Whether window chrome took terminal row `row` in the frame being composed (i.e. the pointer on that row is over a band, not the grid).
@@ -18988,7 +18998,7 @@ impl App {
         cell_h: usize,
     ) {
         debug_assert_eq!(built.len(), panel_rows);
-        self.splice_band_rows_at(wid, 0, built, cols, cell_h);
+        self.splice_band_rows_at(wid, 0, built.into_iter(), cols, cell_h);
         self.note_band_covered(wid);
         self.evict_stale_glass_hover(wid);
         if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid)
@@ -19002,14 +19012,14 @@ impl App {
         &mut self,
         wid: WindowId,
         start: usize,
-        built: Vec<Vec<aterm_core::terminal::RenderCell>>,
+        built: impl ExactSizeIterator<Item = Vec<aterm_core::terminal::RenderCell>>,
         cols: usize,
         cell_h: usize,
     ) {
         let panel_rows = built.len();
         let bands = aterm_render::RowBands::new(self.win_pad_top(wid) + self.win_head(wid), cell_h);
         if let Some(ws) = self.windows.get_mut(&wid) {
-            for (offset, row) in built.into_iter().enumerate() {
+            for (offset, row) in built.enumerate() {
                 let r = start + offset;
                 if r >= ws.input_scratch.cells.len() {
                     break;

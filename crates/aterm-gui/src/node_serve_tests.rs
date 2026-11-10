@@ -2324,6 +2324,7 @@ fn node_open_table_cut_marks_wake_drive_cut_and_hangs_up_attached_window_stream(
     use aterm_uds::CtlStream;
 
     let table = Arc::new(NodeOpenTable::default());
+    assert!(table.is_empty(), "a fresh open table is empty");
     let revoked_node = "9a".repeat(16);
     let good_node = "9b".repeat(16);
     let revoked_grant =
@@ -2334,6 +2335,25 @@ fn node_open_table_cut_marks_wake_drive_cut_and_hangs_up_attached_window_stream(
         scope: FleetScope::Content,
         grants: vec![DriveGrant::from_word(ALL_MEMBERS).expect("all")],
     };
+
+    // A survey connection (`driver: None`) makes the table non-empty, but `cut_unserved` never
+    // calls `holds` (so `aterm-node-watch`'s lazy `OnceCell` keyring read is not triggered).
+    let (near_survey, _far_survey) = CtlStream::pair().expect("survey pair");
+    let open_survey = table
+        .admit(true, None, &near_survey, |_, _| true)
+        .expect("io")
+        .expect("survey admitted");
+    assert!(!table.is_empty());
+    assert_eq!(
+        table.cut_unserved(
+            &serving,
+            &|_, _| panic!("a survey entry (`driver: None`) must not evaluate `holds`"),
+            &[]
+        ),
+        0
+    );
+    drop(open_survey);
+    assert!(table.is_empty());
 
     let (near_revoked, mut far_revoked) = CtlStream::pair().expect("pair");
     let (win_revoked, mut win_revoked_peer) = CtlStream::pair().expect("win pair");
@@ -2384,6 +2404,11 @@ fn node_open_table_cut_marks_wake_drive_cut_and_hangs_up_attached_window_stream(
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )));
+    drop(open_good);
+    assert!(
+        table.is_empty(),
+        "once all open entries are cut or dropped, the table is empty again"
+    );
 }
 
 /// An `aterm.toml` whose `[swarm]` cannot be read holds sharing off

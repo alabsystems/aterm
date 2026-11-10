@@ -260,6 +260,18 @@ pub fn prove_stamp(bytes: &[u8], expected: &[(&str, &str)]) -> Result<(), String
     Ok(())
 }
 
+/// Read the frozen index hint from a retained native pilot image without executing it.
+pub(crate) fn index_hint(bytes: &[u8]) -> Result<String, String> {
+    let record = &bytes[layout(bytes)?.stamp];
+    let text = std::str::from_utf8(record).map_err(|e| e.to_string())?;
+    text.strip_prefix(aterm_stamp::HEADER)
+        .ok_or("invalid stamp header")?
+        .lines()
+        .find_map(|line| line.strip_prefix("index_hint="))
+        .map(str::to_owned)
+        .ok_or_else(|| "retained image has no index hint".to_owned())
+}
+
 /// Immutable linked slices are addressed by U before any reservation is stamped into them.
 /// These files are never executed; the build stamps a private copy.
 pub fn keep_unstamped(path: &Path, store: &Path) -> Result<std::path::PathBuf, String> {

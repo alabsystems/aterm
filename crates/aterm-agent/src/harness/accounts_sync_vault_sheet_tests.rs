@@ -309,7 +309,7 @@ fn a_local_list_without_a_legacy_input_does_not_retire_or_seed_a_retired_slot() 
             .unwrap()
             .retired()
     );
-    assert!(secrets.join(FLEET_ROSTER_FILE).exists());
+    assert!(!secrets.join(FLEET_ROSTER_FILE).exists());
     manual(&desk, None, &fetch_source_text).unwrap();
     assert!(
         !accounts::Store::at(&desk.state)
@@ -769,9 +769,8 @@ fn initial_fleet_precedence_does_not_make_delivery_bookkeeping_a_reactivation_gr
     );
 }
 
-/// A list found on this Mac is still copied into `~/.secrets`, and a sheet the vault delivers
-/// later that gives this machine rows outranks that copy, whose sync retires it and takes the
-/// sheet's rows.
+/// A preserved copy from an older aterm yields to a later sheet that gives this
+/// machine rows. The current sync does not create the copy.
 #[test]
 fn a_copy_of_a_list_found_here_yields_to_a_sheet_delivered_later() {
     let desk = Desk::new("m27");
@@ -784,6 +783,8 @@ fn a_copy_of_a_list_found_here_yields_to_a_sheet_delivered_later() {
     let secrets = secrets_dir(&desk);
     let copy = secrets.join(FLEET_ROSTER_FILE);
     sync(&desk, NOW);
+    assert!(!copy.exists());
+    fs::copy(desk.fleet_file(), &copy).unwrap();
     assert_eq!(
         fleet_file_opt_in(&desk.fleet_file()),
         Some(OptIn::Discovered)
@@ -823,19 +824,26 @@ fn a_mac_the_sheet_does_not_name_keeps_the_list_found_on_it() {
     );
     sync(&desk, NOW);
     let found = fs::read(desk.fleet_file()).unwrap();
+    assert!(!copy.exists());
+    fs::write(&copy, &found).unwrap();
     assert_eq!(fs::read(&copy).unwrap(), found, "CONTROL: aterm's copy");
     let roster = fs::read(desk.roster()).unwrap();
 
     fs::write(&sheet, "email,computer,claude\nb1@example.test,m28,1\n").unwrap();
-    assert!(!needs_sync(&desk, NOW + 1));
+    assert!(
+        needs_sync(&desk, NOW + 1),
+        "the legacy copy still needs retirement"
+    );
     sync(&desk, NOW + 2);
+    assert!(!needs_sync(&desk, NOW + 2));
+    assert!(desk.store().source_policy().unwrap().retired());
     assert_eq!(fs::read(&copy).unwrap(), found, "the copy stays");
     assert_eq!(fs::read(desk.fleet_file()).unwrap(), found);
     assert_eq!(fs::read(desk.roster()).unwrap(), roster);
     assert_eq!(
         origin(&desk),
         FleetOrigin::Local {
-            files: vec![desk.fleet_file(), copy.clone()],
+            files: vec![desk.fleet_file()],
             opt_in: Some(OptIn::Discovered),
         }
     );

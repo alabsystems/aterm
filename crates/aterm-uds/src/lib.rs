@@ -502,7 +502,7 @@ pub mod stop;
 pub mod sudo;
 /// A Cargo test binary's own per-user root, under which [`control_socket_dir`] and `aterm_types::dirs` answer in a test, so no test reaches the person's live socket, state, logs or config.
 pub mod test_binary;
-/// A child that ends with the process that started it, killed outright included: Linux's parent-death signal, and on Darwin this executable's [`tether::VERB`], which leaves a watcher behind as it execs the child ([`spawnfd::Tether`]).
+/// A child that ends with the process that started it, killed outright included: Linux's parent-death signal, and this executable's [`tether::VERB`] (every tethered spawn on Darwin, a group leader's on Linux), which leaves a watcher behind as it execs the child ([`spawnfd::Tether`]).
 pub mod tether;
 /// A zone's offset from UTC at an instant, read in this process: the local clock's by
 /// `localtime_r`, a named zone's from its TZif file, never `date +%z`. See [`zone`].

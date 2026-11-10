@@ -3650,6 +3650,26 @@ pub(crate) fn spawn(
                 }
             );
             crate::identity_claim::settle_transferred();
+            #[cfg(not(test))]
+            if interactive_browser {
+                let live = Arc::downgrade(&store);
+                let _ = crate::qos::spawn_lane_thread(
+                    "aterm-window-presence",
+                    crate::qos::Role::Background,
+                    move || {
+                        let Ok(env) = aterm_agent::harness::cli::Env::from_process() else {
+                            return;
+                        };
+                        while live.strong_count() != 0 {
+                            if let Some(now) = aterm_time::unix_secs() {
+                                let _ =
+                                    aterm_agent::survey_facts::record_window_last(&env.state, now);
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(60));
+                        }
+                    },
+                );
+            }
             if crate::build_info::binary_signature_reads_the_file() {
                 let _ = crate::qos::spawn_lane_thread(
                     "aterm-build-signature",

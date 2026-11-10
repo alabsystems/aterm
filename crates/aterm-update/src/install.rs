@@ -246,19 +246,19 @@ pub(crate) fn bundle_transfer_failure(
     status: std::process::ExitStatus,
     stderr: &str,
 ) -> String {
-    let full = stderr.lines().rev().map(str::trim).find(|line| {
-        ["No space left on device", "Disc quota exceeded"]
-            .iter()
-            .any(|words| line.contains(words))
+    let full = stderr.lines().rev().map(str::trim).find_map(|line| {
+        let (_, reason) = line.rsplit_once(": ")?;
+        matches!(reason, "No space left on device" | "Disc quota exceeded")
+            .then_some((line, reason))
     });
-    let Some(line) = full else {
+    let Some((line, reason)) = full else {
         return ditto_failure(what, status, stderr);
     };
     crate::warn(&format!(
         "{what} ({status}): {}",
         crate::quote_tool_output(line)
     ));
-    if line.contains("Disc quota exceeded") {
+    if reason == "Disc quota exceeded" {
         return crate::verify::mark_passing(format!(
             "this user's disk quota ran out while preparing the update at {}; \
              {FREE_SPACE_REMEDY}",

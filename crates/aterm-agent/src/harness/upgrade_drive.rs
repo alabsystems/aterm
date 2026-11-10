@@ -3814,6 +3814,31 @@ fn user_settings(home: &Path) -> models::UserModelSettings {
         .unwrap_or_default()
 }
 
+/// Where a person's switch "to the top" goes for a session on Claude Code `version`
+/// ([`models::top`]): of the priority list under `state` (the seed where none is written) and
+/// that build's cached catalog (`None` where no sweep has read the build, or `version` is not
+/// known). It reads, and writes nothing.
+#[must_use]
+pub fn switch_top(state: &Path, version: Option<&str>) -> models::Top {
+    let list = check_upgrade_tree(state, None)
+        .ok()
+        .flatten()
+        .and_then(|dir| {
+            crate::harness::accounts::read_bounded(&dir.join("models.json"), 1024 * 1024)
+                .ok()
+                .flatten()
+        })
+        .and_then(|text| Priority::parse(&text))
+        .unwrap_or_else(|| Priority::seed(i64::try_from(now_s()).unwrap_or(0)));
+    let baked = version.and_then(|version| {
+        check_upgrade_tree(state, Some("builds"))
+            .ok()
+            .flatten()
+            .and_then(|dir| catalog::cached_for_version(&dir, version))
+    });
+    models::top(&list, version.unwrap_or_default(), baked)
+}
+
 /// `aterm harness upgrade models`.
 #[must_use]
 pub fn models_report(opts: &Opts) -> String {

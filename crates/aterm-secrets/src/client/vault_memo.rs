@@ -290,11 +290,11 @@ pub fn trusted_commons_log_now(
 /// nearly every step of a repair round, and each ask opened, observed and closed that
 /// lock again: with this Mac's own denial check under the same access
 /// ([`local_recipient_denied_under`]), 7.8% of a sustained quiet round's samples over a long log
-/// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation
-/// that still guards the lock at the vault's path ([`StateLock::observes`]), it is the observation
-/// the memo would take, so what it kept is given without another. A writer's own take, or a lock
-/// that guards another file, is [`trusted_commons_log_now`]'s call. It looks up what it kept
-/// through the caller's check's look, `glance` ([`fsx::Glance`]); a miss reads as
+/// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation that guards the
+/// lock at the vault's path as `glance` saw that path ([`StateLock::observes_in`]), it is the
+/// observation the memo would take, so what it kept is given without another. A writer's own
+/// take, or a lock that guards another file, is [`trusted_commons_log_now`]'s call. It looks up
+/// what it kept through the caller's check's look, `glance` ([`fsx::Glance`]); a miss reads as
 /// [`trusted_commons_log_now`] does, stamping afresh.
 ///
 /// # Errors
@@ -368,9 +368,13 @@ pub fn test_looks_observed() -> usize {
 /// file that changes all the same (a write that takes no lock, a test's own) keeps the stamps the
 /// look first took of it until the look ends, and the next look stamps it afresh. A look taken
 /// while a writer holds the lock, or where the lock cannot be observed, observes nothing, and each
-/// ask is its memo's own call, which meets that writer as it always did. Drop it before network
-/// I/O or any vault mutation: an exclusive take of the lock on this thread under it would wait for
-/// good, and in a build with debug assertions panics.
+/// ask is its memo's own call, which meets that writer as it always did. Whether its observation
+/// guards the lock at the vault's path it judges once too, at its first ask, through its glance
+/// ([`StateLock::observes_in`]): no writer takes the lock while the look observes it, and a lock
+/// file renamed or replaced by something that does not hold the lock at the vault's path is seen
+/// at the next look, as any such file is. Drop it before network I/O or any vault mutation: an
+/// exclusive take of the lock on this thread under it would wait for good, and in a build with
+/// debug assertions panics.
 ///
 /// A Commons peer check takes one for each stage's reads, as its kernel's model reads each view
 /// at its own stage (`aterm-db`'s `peer_check`): the roster and its deny list, every record this
@@ -441,15 +445,16 @@ impl<'a> VaultLook<'a> {
         self.paths
     }
 
-    /// The shared observation of the state lock this look holds, while it still guards the lock
-    /// at the vault's path ([`StateLock::observes`]), and the look at each file it takes: what a
-    /// read under its caller's observation takes ([`trusted_commons_log_under`],
-    /// [`local_recipient_denied_under`]). `None` where the look observes nothing.
+    /// The shared observation of the state lock this look holds, while it guards the lock at the
+    /// vault's path as the look first saw that path ([`StateLock::observes_in`], through its
+    /// glance), and the look at each file it takes: what a read under its caller's observation
+    /// takes ([`trusted_commons_log_under`], [`local_recipient_denied_under`]). `None` where the
+    /// look observes nothing.
     pub(crate) fn held(&self) -> Option<(&StateLock, &fsx::Glance)> {
         self.observation
             .as_ref()
             .map(super::Observing::lock)
-            .filter(|lock| lock.observes(self.paths))
+            .filter(|lock| lock.observes_in(self.paths, Some(&self.glance)))
             .map(|lock| (lock, &self.glance))
     }
 
@@ -1112,8 +1117,8 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
     }
 
     /// [`Memo::read_keyed`] for a caller that holds `lock`. While that is a shared observation of
-    /// the state lock that still guards the lock at the vault's path ([`StateLock::observes`]), no
-    /// writer holds that lock and none can write until the caller drops it: a quiet memo takes it
+    /// the state lock that guards the lock at the vault's path as `glance` saw it
+    /// ([`StateLock::observes_in`]), no writer holds that lock and none can write until the caller drops it: a quiet memo takes it
     /// for the one `read_keyed` takes before its stamps, and any memo gives what it kept under the
     /// stamps of `glance`, the look of the caller's check, which stamps each file once for every
     /// memo the check asks ([`fsx::Glance`]). Anything else, a miss included, is `read_keyed`'s,
@@ -1126,7 +1131,7 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
         glance: &fsx::Glance,
         read: impl FnOnce(&Paths) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        if lock.observes(paths)
+        if lock.observes_in(paths, Some(glance))
             && let Some(stamps) = self.stamps(paths, Some(glance))
             && let Some(answer) = self.kept(paths, key, &stamps)
         {
@@ -2017,9 +2022,10 @@ mod tests {
     /// another was renamed over while a writer holds the new one, the memo reads afresh, as
     /// `read_keyed` meets that writer, and keeps nothing.
     ///
-    /// NEGATIVE CONTROLS (2026-11-08): with `StateLock::observes` taking any lock (no `shared`),
-    /// the writer's own check is given the answer kept from before its take (`left: 1, right:
-    /// 3`, `a writer's own take reads afresh`); with it taking a shared one without `guards`, the
+    /// NEGATIVE CONTROLS (2026-11-08, run again on `StateLock::observes_in` 2026-11-10): with
+    /// `StateLock::observes_in` taking any lock (no `shared`), the writer's own check is given the
+    /// answer kept from before its take (`left: 1, right: 3`, `a writer's own take reads afresh`);
+    /// with it taking a shared one without its guard check (`StateLock::guards_in`), the
     /// observation of the lock renamed away is given the answer kept under the new lock while its
     /// writer holds it (`left: 4, right: 5`, `a lock renamed away guards nothing`).
     #[test]

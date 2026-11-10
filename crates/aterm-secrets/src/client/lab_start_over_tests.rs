@@ -260,9 +260,15 @@ fn a_lock_on_the_set_aside_folder_guards_nothing_at_the_vaults_path() {
 #[test]
 fn a_lab_identity_made_in_the_new_folder_first_is_reported_and_set_aside_next() {
     let (_home, paths, _) = lab_home();
-    let refused = start_over_then(&paths, release(), NOW, || {
-        machine_identity_as(&paths, debug_build()).expect("a debug build's identity");
-    })
+    let refused = start_over_then(
+        &paths,
+        release(),
+        NOW,
+        || {},
+        || {
+            machine_identity_as(&paths, debug_build()).expect("a debug build's identity");
+        },
+    )
     .expect_err("not a new Mac");
     let kept = paths.dir.with_file_name("secrets.lab-2026-11-05");
     assert!(
@@ -283,6 +289,93 @@ fn a_lab_identity_made_in_the_new_folder_first_is_reported_and_set_aside_next() 
         read_identity_marked(&paths).expect("read").expect("made").1,
         None
     );
+}
+
+/// A set-aside that waited on a lock file another set-aside moved away with its folder takes the
+/// lock at the vault's path before it renames anything ([`StateLock::guards`]): where a debug
+/// build's process made a lab identity in a new folder and observes that folder's lock, the
+/// set-aside waits for it, renames nothing while it waits, and once the observation ends sets that
+/// folder aside in the same call, holding its lock; where nothing at the path holds a lab
+/// identity, it sets nothing aside.
+///
+/// NEGATIVE CONTROLS (2026-11-10): with the set-aside keeping the lock it woke holding, it renames
+/// the new folder at once, under the observation (`a set-aside renames only a folder whose lock it
+/// holds`); refusing busy where its lock guards nothing, it never takes the new folder's lock (`a
+/// set-aside renames only a folder whose lock it holds`); and with no read of the path before it
+/// takes the lock again, the set-aside with nothing at the path fails to open a lock there
+/// (`nothing to set aside`).
+#[test]
+fn a_set_aside_that_woke_on_a_moved_lock_renames_only_a_folder_whose_lock_it_holds() {
+    use std::{cell::Cell, cell::RefCell, rc::Rc};
+    let (_home, paths, _) = lab_home();
+    let kept = paths.dir.with_file_name("secrets.lab-2026-11-05");
+    let next = paths.dir.with_file_name("secrets.lab-2026-11-05-2");
+    let observed: Rc<RefCell<Option<StateLock>>> = Rc::default();
+    // Whether the new folder was renamed when the set-aside first met the observation.
+    let waited: Rc<Cell<Option<bool>>> = Rc::default();
+    let set = aterm_uds::file_lock::with_lock_wait_observer(
+        {
+            let (observed, waited, next) = (observed.clone(), waited.clone(), next.clone());
+            move |_| {
+                if waited.get().is_none() {
+                    waited.set(Some(next.exists()));
+                }
+                drop(observed.borrow_mut().take());
+            }
+        },
+        || {
+            start_over_then(
+                &paths,
+                release(),
+                NOW,
+                || {
+                    // Another set-aside moved the folder, and the lock this took, while this
+                    // waited; a debug build's process made a lab identity in a new folder, whose
+                    // lock it observes.
+                    std::fs::rename(&paths.dir, &kept).expect("aside");
+                    machine_identity_as(&paths, debug_build()).expect("a debug build's identity");
+                    drop(
+                        StateLock::try_take(&paths)
+                            .expect("take")
+                            .expect("the new folder's lock is free"),
+                    );
+                    *observed.borrow_mut() = Some(
+                        StateLock::observe(&paths)
+                            .expect("observe")
+                            .expect("no writer"),
+                    );
+                },
+                || {},
+            )
+        },
+    );
+    assert_eq!(
+        waited.get(),
+        Some(false),
+        "a set-aside renames only a folder whose lock it holds"
+    );
+    let set = set
+        .expect("set aside")
+        .expect("the debug build's identity is set aside");
+    assert_eq!(set.kept, next);
+    assert_eq!(set.mark, crate::LabMark::DebugBuild);
+    assert_eq!(
+        read_identity_marked(&paths).expect("read").expect("made").1,
+        None
+    );
+
+    let (_home, paths, _) = lab_home();
+    let kept = paths.dir.with_file_name("secrets.lab-2026-11-05");
+    let none = start_over_then(
+        &paths,
+        release(),
+        NOW,
+        || std::fs::rename(&paths.dir, &kept).expect("aside"),
+        || {},
+    );
+    assert!(matches!(none, Ok(None)), "nothing to set aside: {none:?}");
+    assert!(!paths.dir.exists());
+    assert!(kept.join("identity").exists());
 }
 
 /// `aterm secrets status` names the set-aside and its folder, and no key.

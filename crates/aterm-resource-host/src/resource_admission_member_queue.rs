@@ -713,7 +713,9 @@ impl Owner {
                                 }
                             }
                         }
-                        Ok(Some(prepared)) => self.launch_member(job, *pending, prepared, None),
+                        Ok(Some(prepared)) => {
+                            self.launch_member(job, slot.units, *pending, prepared, None)
+                        }
                         Err(_) => {
                             refuse_pending(*pending, "member descriptors refused before launch")
                         }
@@ -750,9 +752,13 @@ impl Owner {
                         )
                     } else {
                         match result {
-                            Ok(Ok(command)) => {
-                                self.launch_member(job, *pending, scheduling, Some(command))
-                            }
+                            Ok(Ok(command)) => self.launch_member(
+                                job,
+                                slot.units,
+                                *pending,
+                                scheduling,
+                                Some(command),
+                            ),
                             Ok(Err(error)) => {
                                 let detail = error
                                     .to_string()
@@ -778,7 +784,7 @@ impl Owner {
                 }
             }
             State::Active(mut active) => {
-                self.poll_member(job, &slot.binding, &mut active);
+                self.poll_member(job, &slot.binding, slot.units, &mut active);
                 if active.settled && active.retired && active.drained {
                     return true;
                 }
@@ -838,6 +844,7 @@ impl Owner {
     fn launch_member(
         &mut self,
         job: &mut Job,
+        reserved_units: u32,
         mut pending: Pending,
         mut prepared: Prepared,
         metadata: Option<metadata::Command>,
@@ -942,6 +949,7 @@ impl Owner {
                 peer,
                 proof: proof.as_ref(),
                 member: request.member.binding.attempt,
+                reserved_units,
                 loan,
                 journal: &self.journal,
             },
@@ -974,7 +982,13 @@ impl Owner {
             drained: false,
         }))
     }
-    fn poll_member(&mut self, job: &mut Job, binding: &Binding, active: &mut Active) {
+    fn poll_member(
+        &mut self,
+        job: &mut Job,
+        binding: &Binding,
+        reserved_units: u32,
+        active: &mut Active,
+    ) {
         let cause = if self.faulted {
             Some(CompletionCause::HostFault)
         } else {
@@ -995,6 +1009,7 @@ impl Owner {
             peer: active.peer,
             proof: active.proof.as_ref(),
             member: binding.attempt,
+            reserved_units,
             loan: active.loan,
             journal: &self.journal,
         };

@@ -1722,6 +1722,56 @@ fn stat_row(path: &std::path::Path) -> procfs::StatRead {
     stat_read(read_proc_text(path))
 }
 
+/// This pid namespace's last allocated id (`/proc/sys/kernel/ns_last_pid`), which every fork
+/// and thread here or in a namespace below moves; `None` where it does not read (a kernel built
+/// without checkpoint and restore, a `/proc/sys` a sandbox withholds).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_pid() -> Option<u32> {
+    read_proc_text(std::path::Path::new("/proc/sys/kernel/ns_last_pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The namespace's highest id plus one (`/proc/sys/kernel/pid_max`), where its ids wrap.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pid_max() -> Option<u32> {
+    read_proc_text(std::path::Path::new("/proc/sys/kernel/pid_max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether `/proc` is this process's own pid namespace's: `/proc/self` names this process's
+/// pid. A `/proc` mounted for another namespace (`unshare --pid` with no `--mount-proc`) names
+/// it by another number or none, and every pid it lists is that namespace's.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_is_this_namespaces() -> bool {
+    std::fs::read_link("/proc/self")
+        .ok()
+        .and_then(|link| link.to_str()?.parse::<u32>().ok())
+        == Some(std::process::id())
+}
+
+/// The row of id `id` that a group listing reads after its walk ([`procfs::chased_group_of`]):
+/// its `stat` ([`stat_read`]) when its `status` names it its own thread group's, and gone for
+/// another process's thread, whose process is listed on a row of its own. `/proc/<tid>` reads
+/// though no walk lists it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_row(id: i32) -> procfs::StatRead {
+    let read = |name: &str| read_proc_text(std::path::Path::new(&format!("/proc/{id}/{name}")));
+    match read("status") {
+        Ok(status) => match procfs::thread_group(&status) {
+            Some(group) if group == id => stat_read(read("stat")),
+            Some(_) => procfs::StatRead::Gone,
+            None => procfs::StatRead::Unreadable,
+        },
+        Err(why) => stat_read(Err(why)),
+    }
+}
+
 /// A `/proc/<pid>/stat` read as a group listing and a descriptor table take it: its text, gone
 /// (`ENOENT`, `ESRCH`), or unreadable (any other error). Under a `hidepid=1` mount another
 /// user's `/proc/<pid>` is listed and its files answer `EPERM`, so such a row is unreadable and
@@ -2098,6 +2148,91 @@ pub mod procfs {
             }
         }
         members
+    }
+
+    /// How many rounds [`chased_group_of`] follows the ids allocated behind its walk.
+    pub const CHASE_ROUNDS: usize = 64;
+
+    /// How many allocated ids [`chased_group_of`] reads, over all its rounds.
+    pub const CHASE_LIMIT: usize = 4096;
+
+    /// The ids a pid namespace allocated between two reads of its last id (`ns_last_pid`),
+    /// `from` and then `to`, in the order it allocated them. The kernel hands out the next free
+    /// id at or past its cursor, wrapping below `pid_max` to its low ids, so every id allocated
+    /// between the reads lies after `from` and at or before `to`, cyclically. `None` for a wrap
+    /// with no `pid_max`, or more than `limit` ids.
+    #[must_use]
+    pub fn allocated_after(
+        from: u32,
+        to: u32,
+        pid_max: Option<u32>,
+        limit: usize,
+    ) -> Option<Vec<i32>> {
+        let ids: Vec<u32> = if to >= from {
+            if usize::try_from(to - from).ok()? > limit {
+                return None;
+            }
+            (from + 1..=to).collect()
+        } else {
+            let top = pid_max?;
+            let above = top.saturating_sub(from.saturating_add(1));
+            if usize::try_from(above.saturating_add(to)).ok()? > limit {
+                return None;
+            }
+            (from.saturating_add(1)..top).chain(1..=to).collect()
+        };
+        ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
+    }
+
+    /// [`group_of`] over a walk of `/proc` and then every id allocated behind it. A walk is no
+    /// snapshot: a member it read live can fork and exit before the listing is judged, and one
+    /// whose row is read after it forked can be a zombie by then, its child forked after the
+    /// directory was read and so never listed. `from` is the namespace's last id read before the
+    /// walk (`ns_last_pid`); each round then reads it again (`last_pid`) and reads the row of each
+    /// id allocated since ([`allocated_after`], `pid_max` read on a wrap) that the walk did not
+    /// list, until a round allocated none. Every process the group held when that round ended was
+    /// there when the walk read the directory, or was allocated after and read after its birth,
+    /// so the listing is as whole as a snapshot. It is complete only when that round came, within
+    /// [`CHASE_ROUNDS`] and [`CHASE_LIMIT`], `shows_every` holds, and [`group_of`] finds it whole.
+    #[cfg(any(unix, windows))]
+    #[must_use]
+    pub fn chased_group_of(
+        walked: impl IntoIterator<Item = (i32, StatRead)>,
+        from: Option<u32>,
+        mut last_pid: impl FnMut() -> Option<u32>,
+        mut pid_max: impl FnMut() -> Option<u32>,
+        mut row: impl FnMut(i32) -> StatRead,
+        pgid: u32,
+        shows_every: bool,
+    ) -> super::GroupMembers {
+        let mut rows: Vec<(i32, StatRead)> = walked.into_iter().collect();
+        let mut listed: std::collections::BTreeSet<i32> =
+            rows.iter().map(|(pid, _)| *pid).collect();
+        let mut settled = false;
+        if let Some(mut at) = from {
+            let mut left = CHASE_LIMIT;
+            for _ in 0..CHASE_ROUNDS {
+                let Some(now) = last_pid() else {
+                    break;
+                };
+                if now == at {
+                    settled = true;
+                    break;
+                }
+                let top = if now < at { pid_max() } else { None };
+                let Some(ids) = allocated_after(at, now, top, left) else {
+                    break;
+                };
+                left -= ids.len();
+                for id in ids {
+                    if listed.insert(id) {
+                        rows.push((id, row(id)));
+                    }
+                }
+                at = now;
+            }
+        }
+        group_of(rows, pgid, shows_every && settled)
     }
 
     /// Whether the `/proc` a `/proc/self/mountinfo` text mounts at `/proc` lists every process
@@ -3487,6 +3622,119 @@ mod start_tests {
             None
         );
         assert_eq!(procfs::thread_group("Tgid:\t+500\n"), None);
+    }
+
+    /// A member that forks and exits while the walk reads `/proc` leaves its child unlisted, so
+    /// the listing follows every id allocated behind it: a relayed member is listed, and
+    /// allocations it cannot follow leave the listing incomplete.
+    /// Negative control: return [`procfs::group_of`] over the walk alone from
+    /// [`procfs::chased_group_of`], and the relayed member is missed in a complete listing.
+    #[test]
+    fn a_linux_group_listing_follows_the_ids_allocated_behind_its_walk() {
+        use procfs::StatRead;
+        let row = |pid: i32, state: char, pgrp: u32| {
+            StatRead::Text(format!(
+                "{pid} (sh) {state} 1 {pgrp} {pgrp} 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 \
+                 51832760 7032832 463 18446744073709551615 0 0 0 0 0 0 0 128 0 1 0 0 17 0 0 0\n"
+            ))
+        };
+        // The walk read the relaying member 501 a zombie; it forked 103 first, which forked 105,
+        // and 104 is another process's thread.
+        let walked = || vec![(100, row(100, 'S', 600)), (501, row(501, 'Z', 500))];
+        let chased = |id: i32| match id {
+            103 => row(103, 'Z', 500),
+            104 => StatRead::Gone,
+            105 => row(105, 'S', 500),
+            _ => StatRead::Gone,
+        };
+        let reads = |seq: Vec<Option<u32>>| {
+            let mut seq = seq.into_iter();
+            move || seq.next().flatten()
+        };
+        let listed = procfs::chased_group_of(
+            walked(),
+            Some(102),
+            reads(vec![Some(104), Some(105), Some(105)]),
+            || None,
+            chased,
+            500,
+            true,
+        );
+        assert_eq!(listed.pids, [105], "{listed:?}");
+        assert!(listed.complete, "{listed:?}");
+        let mut last = 102_u32;
+        let moving = procfs::chased_group_of(
+            walked(),
+            Some(102),
+            move || {
+                last += 1;
+                Some(last)
+            },
+            || None,
+            chased,
+            500,
+            true,
+        );
+        assert!(
+            !moving.complete,
+            "ids still allocated after every round: {moving:?}"
+        );
+        let unread =
+            procfs::chased_group_of(walked(), None, || Some(102), || None, chased, 500, true);
+        assert!(!unread.complete, "no last id before the walk: {unread:?}");
+        let wrapped = procfs::chased_group_of(
+            walked(),
+            Some(4_194_302),
+            reads(vec![Some(301)]),
+            || None,
+            chased,
+            500,
+            true,
+        );
+        assert!(!wrapped.complete, "a wrap with no pid_max: {wrapped:?}");
+        assert_eq!(
+            procfs::allocated_after(4_194_301, 2, Some(4_194_304), 8),
+            Some(vec![4_194_302, 4_194_303, 1, 2])
+        );
+        assert_eq!(procfs::allocated_after(7, 7, None, 8), Some(Vec::new()));
+        assert_eq!(procfs::allocated_after(7, 9, None, 8), Some(vec![8, 9]));
+        assert_eq!(
+            procfs::allocated_after(7, 20, None, 8),
+            None,
+            "past the limit"
+        );
+    }
+
+    /// An id a listing follows past its walk is read as a process only when it leads its thread
+    /// group: this process's id reads, and a thread of it reads as gone, its process listed on a
+    /// row of its own. Negative control: drop the `Tgid` match from [`process_row`], and the
+    /// thread reads as a process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_id_followed_past_the_walk_is_read_as_a_process_only_when_it_leads_its_group() {
+        let me = i32::try_from(std::process::id()).expect("a pid");
+        assert!(
+            matches!(super::process_row(me), procfs::StatRead::Text(_)),
+            "this process reads"
+        );
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: `gettid` takes nothing and touches no memory.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            tid_tx
+                .send(i32::try_from(tid).expect("a tid"))
+                .expect("send the tid");
+            done_rx.recv().ok();
+        });
+        let tid = tid_rx.recv().expect("the thread's id");
+        assert_ne!(tid, me);
+        assert!(
+            matches!(super::process_row(tid), procfs::StatRead::Gone),
+            "a thread is no process row"
+        );
+        done_tx.send(()).expect("release the thread");
+        thread.join().expect("the thread ends");
     }
 
     /// `/proc` lists every process only under a `proc` mount at `/proc` with no `hidepid`, or

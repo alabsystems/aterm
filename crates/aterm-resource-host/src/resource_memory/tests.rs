@@ -159,20 +159,26 @@ fn owned_memory_omits_only_positive_exit_and_never_missing_memory() {
 }
 
 #[test]
-fn owned_memory_refuses_identity_reuse_exec_or_group_change() {
+fn owned_memory_refuses_identity_reuse_or_group_change_and_counts_exec() {
     for changed in 0..4 {
         let mut fake = Fake::default();
         fake.member(11, 10, 7);
         let mut after = lineage(11, 10);
         match changed {
             0 => after.identity.birth = Birth(18),
-            1 => after.identity.idversion = Some(2),
-            2 => after.uniqueid = 18,
+            1 => after.uniqueid = 18,
+            2 => after.identity.pid = 12,
             _ => after.pgid = 20,
         }
         fake.lineage.get_mut().get_mut(&11).unwrap()[1] = Some(after);
         assert!(sample_with(&[10], &fake).is_err());
     }
+    let mut fake = Fake::default();
+    fake.member(11, 10, 7);
+    let mut after = lineage(11, 10);
+    after.identity.idversion = Some(2);
+    fake.lineage.get_mut().get_mut(&11).unwrap()[1] = Some(after);
+    assert_eq!(sample_with(&[10], &fake).unwrap(), 7);
     let mut fake = Fake::default();
     fake.member(11, 10, 7);
     fake.lineage.get_mut().get_mut(&11).unwrap()[0] = Some(lineage(11, 20));
@@ -221,6 +227,73 @@ fn owned_memory_samples_one_actual_small_native_group() {
     assert!(sample(&[group, group]).unwrap() > 0);
     child.1.take();
     assert!(child.0.wait().unwrap().success());
+}
+
+/// The native probe, whose member execs between the two lineage reads that bracket its memory
+/// read: the kernel's pid version moves, its birth, unique id and group do not. The cat's
+/// stdin is kept open so it stays live for the reads after.
+struct ExecsDuringRead(
+    RefCell<spawnfd::Child>,
+    RefCell<Option<std::process::ChildStdin>>,
+);
+
+impl Probe for ExecsDuringRead {
+    fn members(&self, group: u32) -> Option<GroupMembers> {
+        Native.members(group)
+    }
+    fn group_presence(&self, group: u32) -> ProcessPresence {
+        Native.group_presence(group)
+    }
+    fn lineage(&self, pid: i32) -> Option<Lineage> {
+        Native.lineage(pid)
+    }
+    fn memory(&self, pid: u32) -> io::Result<u64> {
+        use std::io::Write as _;
+        let mut child = self.0.borrow_mut();
+        if child.stdin.is_some() {
+            // `read go` takes this line; the shell then execs cat, which echoes the next one.
+            child.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+            *self.1.borrow_mut() = Some(aterm_uds::deadline::cat_echoes(&mut child));
+        }
+        Native.memory(pid)
+    }
+    fn presence(&self, pid: i32) -> ProcessPresence {
+        Native.presence(pid)
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn owned_memory_counts_a_member_that_execs_during_its_read() {
+    let attempt = spawnfd::BirthAttempt::new().unwrap();
+    let born = spawnfd::command("/bin/sh")
+        .args(["-c", "read go; exec /bin/cat"])
+        .stdin(spawnfd::Stdio::piped())
+        .stdout(spawnfd::Stdio::piped())
+        .spawn_cohort(attempt)
+        .unwrap();
+    let child = born.into_child();
+    let group = i32::try_from(child.id()).unwrap();
+    let before = process::read_lineage(group).unwrap();
+    let probe = ExecsDuringRead(RefCell::new(child), RefCell::new(None));
+    let sampled = sample_with(&[group], &probe);
+    let after = process::read_lineage(group).unwrap();
+    let (child, input) = (probe.0.into_inner(), probe.1.into_inner());
+    let mut child = Child(child, input);
+    child.1.take();
+    assert!(child.0.wait().unwrap().success());
+    assert_eq!(
+        (after.identity.birth, after.uniqueid, after.pgid),
+        (before.identity.birth, before.uniqueid, before.pgid),
+        "an exec keeps the process"
+    );
+    if process::KEEPS_PID_VERSIONS {
+        assert_ne!(after.identity.idversion, before.identity.idversion);
+    }
+    assert!(
+        sampled.unwrap() > 0,
+        "an exec is not a lost or reused member"
+    );
 }
 
 #[test]

@@ -7821,7 +7821,6 @@ impl Drop for SetupReadbackOwner {
                 subjects: missing,
                 forced: false,
                 pending_repositories: false,
-                refresh: true,
             });
         }
     }
@@ -7846,9 +7845,6 @@ struct ObserveRequest {
     forced: bool,
     /// A child ending only requests a reading while its current Repo stage is pending.
     pending_repositories: bool,
-    /// A redundant post-pass refresh may retain a still-valid fact when its
-    /// private reader is not admitted. Other requests replace it with the new reading's result.
-    refresh: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -7885,13 +7881,11 @@ impl ObserveQueue {
                 // An old request can add rows to read, but cannot restore its
                 // plan or its broader personal/network scope.
                 pending.include_subjects(request.subjects);
-                pending.refresh &= request.refresh;
                 return;
             }
             if request.choices > pending.choices {
                 // A person's newer choice retires both pending intents.
                 for previous in self.take_pending().into_iter().flatten() {
-                    request.refresh &= previous.refresh;
                     request.include_subjects(previous.subjects);
                 }
             }
@@ -7903,7 +7897,6 @@ impl ObserveQueue {
         };
         if let Some(previous) = slot.take() {
             request.pending_repositories &= previous.pending_repositories;
-            request.refresh &= previous.refresh;
             if request.plan.is_none() {
                 request.plan = previous.plan;
             }
@@ -7916,7 +7909,6 @@ impl ObserveQueue {
                 .is_some_and(|next| request.compatible_plan(next))
             {
                 let next = self.next.take().unwrap();
-                request.refresh &= next.refresh;
                 if request.plan.is_none() {
                     request.plan = next.plan;
                 }
@@ -7932,7 +7924,6 @@ impl ObserveQueue {
                 check.plan = request.plan;
             }
             check.include_subjects(request.subjects);
-            check.refresh &= request.refresh;
         } else {
             self.next = Some(request);
         }
@@ -8151,7 +8142,6 @@ fn request_observation(
         subjects,
         forced,
         pending_repositories: false,
-        refresh: false,
     })
 }
 
@@ -8166,7 +8156,6 @@ fn refresh_observation(subjects: Vec<aterm_types::macos_setup::Subject>) -> bool
         subjects,
         forced: false,
         pending_repositories: false,
-        refresh: true,
     })
 }
 
@@ -8182,7 +8171,6 @@ fn observe_pending_repositories() {
         )],
         forced: false,
         pending_repositories: true,
-        refresh: false,
     });
 }
 
@@ -8425,7 +8413,6 @@ fn observe_rows(request: ObserveRequest) {
                 subjects: request.subjects,
                 forced: false,
                 pending_repositories: request.pending_repositories,
-                refresh: false,
             });
             return;
         }
@@ -8441,8 +8428,11 @@ fn observe_rows(request: ObserveRequest) {
         let mut wake = rows.access_steps != access_steps;
         rows.access_steps = access_steps;
         // A reading taken while its own stage or Restore ran may be half of a change.
+        // Admission skips carry no new evidence, including on the launch's first
+        // read. Keep an existing reading, or leave the subject pending until its
+        // reader is admitted when the page is shown.
         for seen in read.rows.into_iter().filter(|seen| {
-            !(request.refresh && !forced && read.not_admitted.contains(&seen.subject))
+            !read.not_admitted.contains(&seen.subject)
                 && !activity.subjects.contains(&seen.subject)
                 && !(activity.input_readback
                     && seen.subject
@@ -8493,7 +8483,6 @@ fn observe_initial_setup(plan: aterm_types::macos_setup::Plan) -> bool {
         subjects: aterm_types::macos_setup::Subject::all(),
         forced: false,
         pending_repositories: false,
-        refresh: false,
     })
 }
 
@@ -12007,6 +11996,64 @@ mod initial_setup_result_tests {
         );
     }
 
+    /// A hidden launch and a page refresh both skip private readers without publishing
+    /// failure-shaped Unknown rows. A subsequent admitted read can still replace the row.
+    #[test]
+    fn skipped_private_checks_preserve_evidence_until_an_admitted_read() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        let _io = TestIo::install();
+        let plan = Plan::default();
+        let dock = Subject::Setting(Setting::Dock);
+        let ready = Observation {
+            standing: Standing::InPlace,
+            now: Some("verified".into()),
+            ..Observation::unknown(dock)
+        };
+        for forced in [false, true] {
+            for previous in [None, Some(ready.clone())] {
+                {
+                    let mut rows = OBSERVED_ROWS.lock().unwrap();
+                    rows.plan = Some(plan.clone());
+                    rows.rows = previous.clone().into_iter().collect();
+                }
+                change(|script| {
+                    script.readings.push_back(vec![Observation {
+                        note: Some("Not read in the background".into()),
+                        ..Observation::unknown(dock)
+                    }]);
+                    script.not_admitted = vec![dock];
+                });
+                let choices = OBSERVED_ROWS.lock().unwrap().choices;
+                let request = || ObserveRequest {
+                    plan: Some(plan.clone()),
+                    choices,
+                    subjects: vec![dock],
+                    forced,
+                    pending_repositories: false,
+                };
+                observe_rows(request());
+                assert_eq!(
+                    OBSERVED_ROWS.lock().unwrap().rows,
+                    previous.into_iter().collect::<Vec<_>>()
+                );
+                change(|script| script.readings.push_back(vec![ready.clone()]));
+                observe_rows(request());
+                assert_eq!(OBSERVED_ROWS.lock().unwrap().rows, vec![ready.clone()]);
+                change(|script| {
+                    script.readings.push_back(vec![Observation::unknown(dock)]);
+                });
+                observe_rows(request());
+                assert_eq!(
+                    OBSERVED_ROWS.lock().unwrap().rows,
+                    vec![Observation::unknown(dock)],
+                    "an attempted read still replaces previous evidence"
+                );
+            }
+        }
+    }
+
     /// A completed run starts no apply pass to refresh its readings. Its launch still reads
     /// the current checklist without opening the page, replaying settings, or widening the
     /// scope of an ordinary refresh. An unread answer remains unread after publication.
@@ -12314,7 +12361,6 @@ mod initial_setup_result_tests {
                 subjects: vec![Subject::Setting(Setting::Repositories)],
                 forced: false,
                 pending_repositories: true,
-                refresh: false,
             });
             assert_eq!(script().reads.len(), reads, "{name}");
             assert_eq!(SETUP_WAKES.marks().all != seen.all, wakes, "{name}");
@@ -12348,7 +12394,6 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
-            refresh: false,
         });
         assert!(
             script().reads.is_empty(),
@@ -12393,7 +12438,6 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
-            refresh: false,
         });
         wait_until("the retired completion requeue ends", observe_idle);
         assert_eq!(
@@ -12420,7 +12464,6 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
-            refresh: false,
         };
         queue.enqueue(pending());
         queue.enqueue(ObserveRequest {
@@ -12464,7 +12507,6 @@ mod initial_setup_result_tests {
                 subjects,
                 forced,
                 pending_repositories: false,
-                refresh: false,
             });
             assert_eq!(std::mem::take(&mut script().vault_looks), looks, "{forced}");
             assert_eq!(std::mem::take(&mut script().read_checks), [forced]);
@@ -13330,7 +13372,6 @@ mod initial_setup_result_tests {
                         subjects,
                         forced,
                         pending_repositories: false,
-                        refresh: false,
                     }),
                     || 0,
                     |_| {
@@ -13353,7 +13394,6 @@ mod initial_setup_result_tests {
                         subjects,
                         forced,
                         pending_repositories: false,
-                        refresh: false,
                     }),
                     || 0,
                     |_| panic!("another request must not bypass the failed-start backoff"),
@@ -13493,7 +13533,6 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: true,
             pending_repositories: false,
-            refresh: false,
         };
         let mut second = None;
         let started = dispatch_observation_with(
@@ -13503,7 +13542,6 @@ mod initial_setup_result_tests {
                 subjects: vec![Subject::Setting(Setting::Dock)],
                 forced: false,
                 pending_repositories: false,
-                refresh: false,
             }),
             || 0,
             |_| {
@@ -13635,7 +13673,6 @@ mod initial_setup_result_tests {
                     subjects: vec![preference, personal],
                     forced: false,
                     pending_repositories: false,
-                    refresh: false,
                 },
                 |job| {
                     worker = Some(std::thread::spawn(job));
@@ -13654,7 +13691,6 @@ mod initial_setup_result_tests {
                     subjects: vec![repositories],
                     forced: true,
                     pending_repositories: false,
-                    refresh: false,
                 },
                 |_| panic!("the current worker owns the queued Check"),
             ));
@@ -13937,7 +13973,6 @@ mod initial_setup_result_tests {
                 subjects: Subject::all(),
                 forced: true,
                 pending_repositories: false,
-                refresh: false,
             };
             let mut reviewed = left_as_is();
             reviewed.vault_url = "http://newer-vault.local:7484/v1/team".into();
@@ -14063,7 +14098,6 @@ mod initial_setup_result_tests {
                 subjects: requested,
                 forced: true,
                 pending_repositories: false,
-                refresh: false,
             });
         })));
         wait_until("the old Check's reading starts", || {
@@ -14190,7 +14224,6 @@ mod initial_setup_result_tests {
                 subjects: Vec::new(),
                 forced: false,
                 pending_repositories: false,
-                refresh: false,
             });
             change(|script| {
                 script.reads.clear();
@@ -14224,7 +14257,6 @@ mod initial_setup_result_tests {
                             subjects: vec![preference, independent],
                             forced: false,
                             pending_repositories: false,
-                            refresh: false,
                         });
                     }));
                     wait_until("the mid-stage reading starts", || script().reads.len() == 1);
@@ -14361,7 +14393,6 @@ mod initial_setup_result_tests {
                     subjects: vec![preference, independent],
                     forced: false,
                     pending_repositories: false,
-                    refresh: false,
                 });
             })));
             wait_until("the preference read starts", || script().reads.len() == 1);
@@ -14591,7 +14622,6 @@ mod initial_setup_result_tests {
                     subjects: vec![caps],
                     forced,
                     pending_repositories: false,
-                    refresh: true,
                 });
                 let rows = OBSERVED_ROWS.lock().unwrap();
                 assert_eq!(
@@ -14670,7 +14700,6 @@ mod initial_setup_result_tests {
                                 subjects: vec![caps],
                                 forced: false,
                                 pending_repositories: false,
-                                refresh: false,
                             });
                             change(|script| script.panic_read = false);
                         }
@@ -14925,7 +14954,6 @@ mod initial_setup_result_tests {
                     subjects: vec![caps],
                     forced: false,
                     pending_repositories: false,
-                    refresh: false,
                 });
                 let mid_write = setup_readings();
                 change(|script| {
@@ -14939,7 +14967,6 @@ mod initial_setup_result_tests {
                         subjects: vec![caps],
                         forced: false,
                         pending_repositories: false,
-                        refresh: false,
                     });
                 })));
                 wait_until("the reading begins inside the activation lease", || {
@@ -15105,7 +15132,6 @@ mod initial_setup_result_tests {
             subjects: vec![access],
             forced: false,
             pending_repositories: false,
-            refresh: false,
         });
         {
             let rows = OBSERVED_ROWS.lock().unwrap();
@@ -15122,7 +15148,6 @@ mod initial_setup_result_tests {
             subjects: vec![repositories],
             forced: false,
             pending_repositories: false,
-            refresh: false,
         });
         let rows = OBSERVED_ROWS.lock().unwrap();
         assert!(rows.rows.contains(&kept));

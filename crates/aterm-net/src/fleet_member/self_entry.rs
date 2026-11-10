@@ -187,7 +187,14 @@ fn local_floor(
     me: &NodeIdentity,
     cached: Option<&Peer>,
 ) -> io::Result<Option<Peer>> {
-    let mut candidates: Vec<Peer> = cached.into_iter().cloned().collect();
+    if let Some(peer) = cached.filter(|peer| {
+        peer.node.as_deref() == Some(me.node())
+            && peer.key == Some(me.key())
+            && peer.signature_holds()
+    }) {
+        return Ok(Some(peer.clone()));
+    }
+    let mut candidates: Vec<Peer> = Vec::new();
     for file in [PEERS_FILE, ISSUER_BOOK_FILE] {
         let bytes = match judged.read(file, PEERS_FILE_MAX) {
             Ok(bytes) => bytes,

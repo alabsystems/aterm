@@ -252,8 +252,9 @@ fn looks_during(
 /// ([`crate::fsx::lstat_in`], through one [`crate::fsx::Glance`]): this Mac's recipient, the
 /// membership log's memo, this Mac's own denial and the state the log stands on name many of the
 /// same files, and the call stamps each once; the next call looks again. The state lock's own
-/// looks at its folder and file (`StateLock::open_observed`, `StateLock::guards`) are no stamps
-/// and are not counted here.
+/// looks at its folder and file (`StateLock::open_observed`, and `StateLock::guards` on its own
+/// call) are no stamps and are not counted here; a check's judgement of its observation through
+/// its glance (`StateLock::observes_in`) is, as one look at the lock file.
 /// NEGATIVE CONTROLS (2026-11-08): with `log_observation_is_current`'s log memo stamping through
 /// a look of its own, a check takes two `lstat`s of the identity, the state, the source and the
 /// envelope (`a check's looks`); with `Bootstrap::access_in_observed`'s log
@@ -366,6 +367,49 @@ fn a_warm_look_looks_at_each_file_once_and_opens_none() {
             }),
             looked,
             "the next look looks again"
+        );
+    });
+}
+
+/// A look judges whether its observation guards the lock at the vault's path once, through its
+/// glance ([`client::StateLock::observes_in`]): a warm look's memo asks (`Memo::read_keyed_under`)
+/// and an access's currency checks through it (`VaultLook::held`, then the memo ask under it),
+/// each of which judges it before it reads under the look, take one `lstat` of the lock's path,
+/// the look's, and judge it on their own calls no more than the look's own observation did
+/// (`client::lock_judgements_of`), where the asks' own calls each judge their own.
+/// NEGATIVE CONTROLS (2026-11-10): with `VaultLook::held` judging on its own call
+/// (`StateLock::observes`), or `Memo::read_keyed_under`, a look's asks judge the lock on their own
+/// calls (`a look's own lock judgements`).
+#[test]
+fn a_look_judges_the_lock_it_observes_once() {
+    let vault = Vault::new();
+    let home = vault.paths.home.clone();
+    let lock = vault.paths.dir.join(".lock");
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let asks = || {
+        let look = client::VaultLook::new(&vault.paths);
+        look.swarm_roster_until(std::time::Instant::now()).unwrap();
+        look.records().unwrap();
+        assert!(access.is_current_in(&vault.journal, &look));
+        assert!(access.is_current_in(&vault.journal, &look));
+    };
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        asks();
+        let judged = client::lock_judgements_of(&vault.paths);
+        let looked = looks_during(&home, asks);
+        assert_eq!(
+            client::lock_judgements_of(&vault.paths) - judged,
+            1,
+            "a look's own lock judgements"
+        );
+        assert_eq!(looked.get(&lock), Some(&1), "a look's looks at its lock");
+
+        let judged = client::lock_judgements_of(&vault.paths);
+        client::swarm_roster_now_until(&vault.paths, std::time::Instant::now()).unwrap();
+        client::records_now(&vault.paths).unwrap();
+        assert!(
+            client::lock_judgements_of(&vault.paths) - judged >= 2,
+            "CONTROL: the asks' own calls judge their own"
         );
     });
 }

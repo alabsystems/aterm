@@ -296,14 +296,16 @@ struct DeferredStart {
 struct SealedStart {
     resources: Resources,
     owner: crate::solver_bootstrap::Owner,
-    limit: spawnfd::FootprintLimit,
+    limit: Option<spawnfd::FootprintLimit>,
     start: Option<(Started, Instant)>,
 }
 #[cfg(target_os = "macos")]
 impl MemberResources for SealedStart {
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         self.resources.configure(command)?;
-        command.footprint_limit(self.limit);
+        if let Some(limit) = self.limit {
+            command.footprint_limit(limit);
+        }
         command.append_guards_at(vec![self.owner.extra(9)?])?;
         Ok(())
     }
@@ -371,6 +373,13 @@ fn sealed_bootstrap_uses_actor_start_commit_before_original_target_work() {
     ) {
         return;
     }
+    for configured in [Some(512), Some(256), None] {
+        sealed_start_with_configured_limit(configured);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sealed_start_with_configured_limit(configured: Option<u32>) {
     let mut fixture = Fixture::new();
     let root = fixture._scratch.path();
     let marker = root.join("work");
@@ -400,7 +409,7 @@ fn sealed_bootstrap_uses_actor_start_commit_before_original_target_work() {
         SealedStart {
             resources: Resources(dropped.clone(), None),
             owner,
-            limit,
+            limit: configured.map(|mib| spawnfd::FootprintLimit::new(mib).unwrap()),
             start: None,
         },
         events,
@@ -414,9 +423,21 @@ fn sealed_bootstrap_uses_actor_start_commit_before_original_target_work() {
         assert!(member.poll(&mut fixture, None).ready_to_start);
         assert!(!marker.exists());
         match member.start(&mut fixture) {
-            Ok(started) => break started,
+            Ok(started) => {
+                assert_eq!(configured, Some(512), "mismatched policy reached Run");
+                break started;
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) if configured != Some(512) => {
+                assert!(fixture.starts.is_empty());
+                assert!(!marker.exists());
+                let progress = done(&mut member, &mut fixture);
+                assert!(progress.retired);
+                assert!(!marker.exists());
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                return;
             }
             Err(error) => panic!("actual sealed dispatch: {error}"),
         }

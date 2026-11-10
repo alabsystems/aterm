@@ -19,6 +19,8 @@ mod verified_entry;
 pub use verified_entry::verified_entry_model;
 mod entry_admission;
 pub use entry_admission::entry_admission_model;
+mod entry_read_context;
+pub use entry_read_context::entry_read_context_model;
 mod entry_provenance;
 pub use entry_provenance::entry_provenance_model;
 mod host_carry;

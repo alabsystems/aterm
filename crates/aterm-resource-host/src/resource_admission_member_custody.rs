@@ -88,8 +88,7 @@ impl ProducerInputs {
             return Err(refused("contained producer requires original FIFO pair"));
         }
         for fd in self.gnu.descriptions() {
-            let file = std::fs::File::from(fd.try_clone()?);
-            let metadata = file.metadata()?;
+            let metadata = spawnfd::descriptor_metadata(fd.as_raw_fd())?;
             if metadata.dev() != expected.device || metadata.ino() != expected.inode {
                 return Err(refused("contained producer differs from original GNU FIFO"));
             }
@@ -103,8 +102,7 @@ impl ProducerInputs {
             return Err(refused("producer GNU population differs"));
         }
         for (index, fd) in self.gnu.descriptions().iter().enumerate() {
-            let file = std::fs::File::from(fd.try_clone()?);
-            let metadata = file.metadata()?;
+            let metadata = spawnfd::descriptor_metadata(fd.as_raw_fd())?;
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
             let expected = if self.gnu.descriptions().len() == 1 {
                 libc::O_RDWR
@@ -334,6 +332,8 @@ pub(super) struct Borrowed<'a> {
     pub peer: Peer,
     pub proof: Option<&'a crate::resource_producer::TransportProof>,
     pub member: [u8; 16],
+    /// This member's still-retained queue reservation, not the Root ceiling.
+    pub reserved_units: u32,
     pub loan: Option<parent_loan::Edge>,
     pub journal: &'a journal::Journal,
 }
@@ -452,7 +452,12 @@ impl member::MemberCustody for Borrowed<'_> {
             || started.birth == 0
             || started.monotonic_ns == 0
             || started.unix_ns == 0
-            || requested.is_some_and(|limits| limits.units == 0 || limits.footprint_mib == 0)
+            || requested.is_some_and(|limits| {
+                limits.units == 0
+                    || limits.units > self.reserved_units
+                    || limits.footprint_mib == 0
+                    || u64::from(limits.footprint_mib) * 1024 * 1024 > self.job.memory_limit
+            })
         {
             return Err(refused("member Started journal binding changed"));
         }

@@ -56,6 +56,12 @@ fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
     ));
     assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
     assert!(refusal.contains("Resources/q: "), "{refusal}");
+    for name in ["No space left on device", "Disc quota exceeded"] {
+        let refusal = unpack(&format!(
+            "ditto: /mnt/A.app/Contents/Resources/{name}: Permission denied\n"
+        ));
+        assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+    }
     let plain = unpack("ditto: /mnt/A.app/./Contents/MacOS/A: Permission denied\n");
     assert!(plain.ends_with("MacOS/A: Permission denied"), "{plain}");
 }

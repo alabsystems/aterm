@@ -35,8 +35,18 @@ pub(in crate::harness) struct SyncTarget<'a> {
     pub before: Option<&'a str>,
     pub after: Option<&'a str>,
     pub mode: Option<u32>,
-    /// The logical roster and local fleet image, never an arbitrary extra destination.
-    pub fleet: Option<(&'a Path, &'a str)>,
+    pub fleet: Option<FleetTarget<'a>>,
+}
+
+/// A local fleet image bound to the bytes the caller planned from.
+#[derive(Clone, Copy)]
+pub(in crate::harness) struct FleetTarget<'a> {
+    /// The logical roster determines the sibling; it is not a free output path.
+    pub roster: &'a Path,
+    /// The resolved destination observed before rendering the new image.
+    pub path: &'a Path,
+    pub before: Option<&'a str>,
+    pub after: &'a str,
 }
 
 enum WakeRule {
@@ -256,7 +266,7 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
     std::path::absolute(path).map_err(|why| why.to_string())
 }
 
-pub(super) fn usage_target(path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+pub(in crate::harness) fn usage_target(path: Option<&Path>) -> Result<Option<PathBuf>, String> {
     path.map(|path| {
         let (path, _) = super::super::cli::roster_target(path)?;
         let path = absolute(&path)?;
@@ -669,14 +679,29 @@ fn prepare_fleet_image(
     roster: &Path,
     text: &str,
 ) -> Result<(PathBuf, FleetImage), String> {
+    prepare_fleet_image_with_before(store, roster, text, None)
+}
+
+fn prepare_fleet_image_with_before(
+    store: &Store,
+    roster: &Path,
+    text: &str,
+    expected: Option<(&Path, Option<&str>)>,
+) -> Result<(PathBuf, FleetImage), String> {
     let (path, mode) = fleet_target(roster)?;
+    if expected.is_some_and(|(observed, _)| observed != path.as_path()) {
+        return Err("local fleet destination changed after planning".into());
+    }
     validate_external_target(store, &path)?;
     super::super::accounts_sync::FleetRoster::from_toml_for(store.cli, text, "local fleet")?;
     let image = FleetImage {
         path: path.to_str().ok_or("fleet path is not UTF-8")?.to_owned(),
         mode,
         image: Image {
-            before: read(&path, MAX_FLEET)?,
+            before: match expected {
+                Some((_, before)) => before.map(str::to_owned),
+                None => read(&path, MAX_FLEET)?,
+            },
             after: Some(text.to_owned()),
         },
     };
@@ -948,7 +973,8 @@ impl Store {
         self.transact_roster_prepared_held(held, now, note, target, retire, (source, || Ok(())))
     }
 
-    /// Validate and encode before performing optional local source publication.
+    /// Validate and encode before the caller's final admission check. Every file
+    /// mutation belongs to the retained receipt rather than that callback.
     pub(in crate::harness) fn transact_roster_prepared_held(
         &self,
         held: &Lock,
@@ -1017,14 +1043,26 @@ impl Store {
                         )
                     }
                     StateTarget::Roster(target, _) => {
-                        if target.fleet.is_some() {
-                            return Err(
-                                "provider roster-state publication cannot carry a fleet target"
-                                    .to_owned(),
-                            );
-                        }
                         let path =
                             usage_target(Some(target.path))?.ok_or("missing roster target")?;
+                        let fleet = target
+                            .fleet
+                            .map(|fleet| {
+                                if usage_target(Some(fleet.roster))?.as_deref()
+                                    != Some(path.as_path())
+                                {
+                                    return Err(
+                                        "local fleet scope names another account roster".to_owned()
+                                    );
+                                }
+                                prepare_fleet_image_with_before(
+                                    self,
+                                    fleet.roster,
+                                    fleet.after,
+                                    Some((fleet.path, fleet.before)),
+                                )
+                            })
+                            .transpose()?;
                         (
                             path,
                             target.mode,
@@ -1032,7 +1070,7 @@ impl Store {
                                 before: target.before.map(str::to_owned),
                                 after: target.after.map(str::to_owned),
                             },
-                            None,
+                            fleet,
                         )
                     }
                 };
@@ -1114,9 +1152,13 @@ impl Store {
                 policy_changed
                     || auth_changed
                     || events.iter().any(Event::wakes)
-                    || target
-                        .as_ref()
-                        .is_some_and(|target| target.roster.before != target.roster.after),
+                    || target.as_ref().is_some_and(|target| {
+                        target.roster.before != target.roster.after
+                            || target
+                                .fleet
+                                .as_ref()
+                                .is_some_and(|(_, fleet)| fleet.image.before != fleet.image.after)
+                    }),
             ),
             fleet: target
                 .as_ref()
@@ -1844,8 +1886,9 @@ impl Store {
         .map_err(SyncError::into_message)
     }
 
-    /// Plan outside native custody, retain only the receipt under that custody,
-    /// and replay its images after every source guard has been released.
+    /// Plan outside source custody, retain only the receipt under that custody,
+    /// and replay its images after every source guard has been released. This
+    /// entry point accepts no auxiliary source-writing callback.
     pub(in crate::harness) fn transact_sync_source_held(
         &self,
         held: &Lock,
@@ -1859,7 +1902,6 @@ impl Store {
             bool,
             impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, SyncError>,
         ),
-        auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<Event>, SyncError> {
         self.transact_sync_publication_held(
             held,
@@ -1874,7 +1916,7 @@ impl Store {
                 source,
             },
             edit,
-            auxiliary,
+            || Ok(()),
         )
     }
 
@@ -1946,11 +1988,16 @@ impl Store {
         let fleet = target
             .as_ref()
             .and_then(|target| target.fleet)
-            .map(|(logical, text)| {
-                if roster != usage_target(Some(logical))? {
+            .map(|fleet| {
+                if roster != usage_target(Some(fleet.roster))? {
                     return Err("local fleet scope names another account roster".to_owned());
                 }
-                prepare_fleet_image(self, logical, text)
+                prepare_fleet_image_with_before(
+                    self,
+                    fleet.roster,
+                    fleet.after,
+                    Some((fleet.path, fleet.before)),
+                )
             })
             .transpose()?;
         let (mut state, state_note, machine_kept) = self.state_as_stored(now)?;
@@ -2250,6 +2297,7 @@ thread_local! {
     /// pending, as a process killed there would leave it.
     pub(in crate::harness) static CUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(in crate::harness) static EARLY_ROSTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(in crate::harness) static REFUSE_BEFORE_INTENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg_attr(

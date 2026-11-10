@@ -1048,11 +1048,56 @@ pub fn parse_rb_as_data(text: &str, full_name: &str) -> Formula {
         if f.version.is_empty() {
             f.version = quoted("version").unwrap_or_default();
         }
+        if f.license.is_empty() {
+            f.license = quoted("license").unwrap_or_default();
+        }
+        if !f.head && line.starts_with("head") {
+            f.head = true;
+            f.head_url = quoted("head").unwrap_or_default();
+        }
+        if line.starts_with("keg_only") {
+            f.keg_only = true;
+        }
+        if line.starts_with("deprecate!") || line.starts_with("disable!") {
+            let disable = line.starts_with("disable!");
+            let date = line
+                .split("date:")
+                .nth(1)
+                .and_then(|s| cask_quoted(s.trim_start(), ""));
+            let because = line.split("because:").nth(1).map(|s| {
+                let s = s.trim().trim_matches(|ch| ch == '"' || ch == ',');
+                s.strip_prefix(':').unwrap_or(s).to_string()
+            });
+            if disable {
+                f.disable = true;
+                f.deprecate_disable.disable_date = date;
+                f.deprecate_disable.disable_reason = because;
+            } else {
+                f.deprecate = true;
+                f.deprecate_disable.deprecation_date = date;
+                f.deprecate_disable.deprecation_reason = because;
+            }
+        }
         if let Some(dep) = quoted("depends_on")
             && !dep.is_empty()
             && !dep.contains(' ')
         {
-            f.dependencies.push(dep);
+            if line.contains(":build") {
+                f.build_dependencies.push(dep);
+            } else if line.contains(":test") {
+                f.test_dependencies.push(dep);
+            } else if line.contains(":recommended") {
+                f.recommended_dependencies.push(dep);
+            } else if line.contains(":optional") {
+                f.optional_dependencies.push(dep);
+            } else {
+                f.dependencies.push(dep);
+            }
+        }
+        if let Some(conflict) = quoted("conflicts_with")
+            && !conflict.is_empty()
+        {
+            f.conflicts.push(conflict);
         }
     }
     if f.version.is_empty() {

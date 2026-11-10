@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::ai::connector::Cli;
 use crate::harness::accounts;
@@ -15,7 +15,6 @@ use crate::harness::cli::{Env, PoolMoves, SurveyPool};
 use crate::harness::repo_work::home::{self as repo_home, HomeRepo, HomeRepos};
 
 const WINDOW_LAST_FILE: &str = "window-last";
-const WINDOW_LAST_FLUSH_SECS: u64 = 60;
 const SSH_PUBKEY_MAX: usize = 16 << 10;
 
 /// Per-account health, enrollment, usage and last-use observation carried in survey facts (§6.6).
@@ -242,7 +241,7 @@ impl SwarmSurveyFacts {
         ssh_host_key: Option<String>,
     ) -> Self {
         let now_u64 = u64::try_from(env.now.max(0)).unwrap_or(0);
-        let window_last = touch_or_read_window_last(&env.state, window, now_u64);
+        let window_last = read_window_last(&env.state, window, now_u64);
         let resolved_label = resolve_machine_label_checked(env);
         let roster_unread = resolved_label.is_err();
         let label = resolved_label.ok().flatten();
@@ -684,39 +683,31 @@ fn parse_server_heard_line(fields: &[(String, String)]) -> Result<ServerHeardFac
     Ok(ServerHeardFact { vault, subject, at })
 }
 
-fn touch_or_read_window_last(state_dir: &Path, window: bool, now: u64) -> Option<u64> {
-    static LAST_FLUSHED: Mutex<Option<(std::path::PathBuf, u64)>> = Mutex::new(None);
+fn read_window_last(state_dir: &Path, window: bool, now: u64) -> Option<u64> {
+    if window {
+        return Some(now);
+    }
     let path = state_dir.join(WINDOW_LAST_FILE);
-    let stored = crate::harness::accounts::read_bounded(&path, 256)
+    crate::harness::accounts::read_bounded(&path, 256)
         .ok()
         .flatten()
-        .and_then(|s| crate::parse_uint::<u64>(s.trim()));
-    if !window {
-        return stored;
-    }
-    let effective = stored.map_or(now, |prev| prev.max(now));
-    let flush_due = {
-        let guard = LAST_FLUSHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match guard.as_ref() {
-            Some((dir, last))
-                if dir == state_dir && effective.saturating_sub(*last) < WINDOW_LAST_FLUSH_SECS =>
-            {
-                stored.is_none()
-            }
-            _ => stored.is_none_or(|prev| effective.saturating_sub(prev) >= WINDOW_LAST_FLUSH_SECS),
-        }
-    };
-    if flush_due
-        && crate::harness::upgrade_models::write_atomic(&path, &format!("{effective}\n")).is_ok()
-    {
-        let mut guard = LAST_FLUSHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some((state_dir.to_path_buf(), effective));
-    }
-    Some(effective)
+        .and_then(|s| crate::parse_uint::<u64>(s.trim()))
+        .filter(|at| *at <= now)
+}
+
+/// Record advisory window liveness from the window's background heartbeat, never a survey
+/// request. Losing this hint on power loss is acceptable; it grants no authority and a live
+/// window reports its current clock directly.
+/// # Errors
+/// The state directory could not be created, or the atomic publication failed.
+pub fn record_window_last(state_dir: &Path, now: u64) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    aterm_uds::atomic_file::write_flushed(
+        &state_dir.join(WINDOW_LAST_FILE),
+        format!("{now}\n").as_bytes(),
+        0o600,
+        None,
+    )
 }
 
 #[cfg(unix)]
@@ -1543,21 +1534,23 @@ mod tests {
     }
 
     #[test]
-    fn window_last_persists_from_windowed_to_headless_collect() {
+    fn window_last_reads_do_not_publish_and_the_heartbeat_persists_for_headless_readers() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let state = dir.path().join("state");
+        assert_eq!(read_window_last(&state, false, 1_793_160_000), None);
         assert_eq!(
-            touch_or_read_window_last(&state, false, 1_793_160_000),
-            None
-        );
-        assert_eq!(
-            touch_or_read_window_last(&state, true, 1_793_160_000),
+            read_window_last(&state, true, 1_793_160_000),
             Some(1_793_160_000)
         );
+        assert!(!state.exists(), "a live survey must not create state");
+        let flushes = aterm_durable::seam::Recording::start();
+        record_window_last(&state, 1_793_160_000).expect("heartbeat");
+        assert!(flushes.take().is_empty(), "an advisory hint needs no flush");
         assert_eq!(
-            touch_or_read_window_last(&state, false, 1_793_160_300),
+            read_window_last(&state, false, 1_793_160_300),
             Some(1_793_160_000)
         );
+        assert_eq!(read_window_last(&state, false, 1_793_159_999), None);
     }
 
     /// When a row's figures were read crosses the wire, and an older member, which sends no such

@@ -138,10 +138,8 @@ fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() 
         Scope::Init,
     );
     assert_eq!(selected.source(), Some(vault.display().to_string()));
-    // Editing goes to the local copy; assignment reads must still use the selected input.
-    assert!(
-        matches!(selected.origin(), FleetOrigin::Local { files, .. } if files.first() == Some(&desk.fleet_file()))
-    );
+    // A one-machine input is still read-only; row contents cannot grant write authority.
+    assert_eq!(selected.origin(), FleetOrigin::Vault(vault));
     let env = quiet_env(&desk.home, &desk.state, &config, NOW);
     let Assigning::Names(fleet, _) = assigning_source(Cli::Claude, &env) else {
         panic!("the selected source must supply the assignments");
@@ -163,4 +161,84 @@ fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() 
         &fx
     ));
     assert_eq!(desk.rows().rows[0].label, "selected");
+}
+
+#[test]
+fn a_legacy_copy_directs_edits_only_to_the_local_projection() {
+    use super::super::login_tests::{Desk, NOW};
+    let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
+    let desk = Desk::new("m27");
+    let config = desk.config.join("aterm.toml");
+    let secrets = desk.home.join(".secrets");
+    fs::create_dir(&secrets).unwrap();
+    let copy = secrets.join(FLEET_ROSTER_FILE);
+    let text = FleetRoster::from_toml(
+        "[[account]]\nlabel='old'\nemail='old@example.test'\nmachines=['m27']\n",
+        "legacy fixture",
+    )
+    .unwrap()
+    .to_toml_for(Some(OptIn::Discovered));
+    fs::write(&copy, &text).unwrap();
+    fs::write(desk.fleet_file(), &text).unwrap();
+    let selected = select(
+        Some(&desk.home),
+        Some(&config),
+        Some(&desk.roster()),
+        Scope::Init,
+    );
+    let FleetOrigin::Local { files, .. } = selected.origin() else {
+        panic!("the legacy copy must retain a local editing destination");
+    };
+    assert_eq!(files, [desk.fleet_file()]);
+    let env = quiet_env(&desk.home, &desk.state, &config, NOW);
+    let edit = local_fleet_edit(
+        &env,
+        &files[0],
+        &Row {
+            label: "new".into(),
+            email: Some("new@example.test".into()),
+            ..Row::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(edit.path, desk.fleet_file());
+    assert!(edit.after.contains("new@example.test"));
+    assert_eq!(edit.before, text);
+    assert_eq!(fs::read_to_string(copy).unwrap(), text);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_edit_targets_cannot_alias_a_vault_input() {
+    use super::super::login_tests::{Desk, NOW};
+    for hard in [false, true] {
+        let desk = Desk::new("m27");
+        let secrets = desk.home.join(".secrets");
+        fs::create_dir(&secrets).unwrap();
+        let source = secrets.join(FLEET_ROSTER_FILE);
+        let text = "[[account]]\nlabel='old'\nemail='old@example.test'\nmachines=['m27']\n";
+        fs::write(&source, text).unwrap();
+        if hard {
+            fs::hard_link(&source, desk.fleet_file()).unwrap();
+        } else {
+            std::os::unix::fs::symlink(&source, desk.fleet_file()).unwrap();
+        }
+        let env = quiet_env(
+            &desk.home,
+            &desk.state,
+            &desk.config.join("aterm.toml"),
+            NOW,
+        );
+        let result = local_fleet_edit(
+            &env,
+            &desk.fleet_file(),
+            &Row {
+                label: "new".into(),
+                email: Some("new@example.test".into()),
+                ..Row::default()
+            },
+        );
+        assert!(result.unwrap_err().contains("aliases"));
+        assert_eq!(fs::read_to_string(source).unwrap(), text);
+    }
 }

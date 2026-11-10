@@ -30,6 +30,7 @@ fn main() -> std::process::ExitCode {
 mod macos {
     use std::time::{Duration, Instant};
 
+    use aterm_objc::cf::{CFRunLoopRunInMode, kCFRunLoopDefaultMode};
     use aterm_objc::{
         Bool, Id, Obj, Sel, WeakObj, WeakSlot, autoreleasepool, checked_msg, class, ns_string, sel,
     };
@@ -444,6 +445,9 @@ mod macos {
         posted_cmd_key_up: bool,
         /// What a click on the stage-16 alert's button made `-runModal` answer.
         alert_answer: Option<isize>,
+        /// Focus events delivered before the modal-reentry stage makes the winit window resign key
+        /// while its `about_to_wait` handler is inside an alert's nested modal run loop.
+        modal_focus_before: Option<usize>,
         /// The windows in `-[NSApp windows]` when the loop was told to exit, by class name.
         windows_at_exit: Vec<String>,
         /// The answered alert's own panel was one of [`Self::windows_at_exit`], by identity.
@@ -570,12 +574,23 @@ mod macos {
                         el.exit();
                     }
                 }
+                16 => self.stage_modal_event_reentry(delegate),
                 _ => {
                     self.report.check(
                         self.proxy_events == [17, 29],
                         &format!(
                             "the surviving proxy delivers each event once in order: {:?}",
                             self.proxy_events
+                        ),
+                    );
+                    let focus_before = self.modal_focus_before.unwrap_or(self.focused.len());
+                    self.report.check(
+                        self.focused.len() > focus_before,
+                        &format!(
+                            "the focus callback raised inside the alert was delivered after its \
+                             outer handler returned ({} before, {} after)",
+                            focus_before,
+                            self.focused.len()
                         ),
                     );
                     self.stage_alert_answered_in_the_exit_turn();
@@ -1328,6 +1343,99 @@ mod macos {
                 .note("posted a Cmd-modified keyUp to [NSApp sendEvent:]; checked after the pump");
         }
 
+        /// Drives the exact nested-loop shape that used to deliver a queued focus event while the
+        /// outer `about_to_wait` callback still held the event handler's mutable borrow.
+        fn stage_modal_event_reentry(&mut self, delegate: Id) {
+            println!("\n[15c] a focus callback inside an NSAlert's nested modal loop");
+            let (Some(message), Some(continue_button), Some(mode)) = (
+                ns_string("Exercise nested event delivery"),
+                ns_string("Continue"),
+                ns_string("NSModalPanelRunLoopMode"),
+            ) else {
+                self.report.check(
+                    false,
+                    "Foundation accepts the modal-reentry alert's strings",
+                );
+                return;
+            };
+            // SAFETY: `+new` is `@16#0:8`; the setters have their declared AppKit signatures;
+            // the alert owns its button and both are retained across `-runModal`.
+            let made = unsafe {
+                let new: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                let add: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+                Obj::from_owned(new(class(c"NSAlert").as_id(), sel!(new))).and_then(|alert| {
+                    set(alert.id(), sel!(setMessageText:), message.id());
+                    let button = Obj::retain(add(
+                        alert.id(),
+                        sel!(addButtonWithTitle:),
+                        continue_button.id(),
+                    ))?;
+                    Some((alert, button))
+                })
+            };
+            let Some((alert, button)) = made else {
+                self.report
+                    .check(false, "AppKit makes the modal-reentry alert");
+                return;
+            };
+
+            // SAFETY: these are the same selector signatures and live objects documented by the
+            // exit-alert stage below. The delayed sends are restricted to the alert's modal mode;
+            // `windowDidResignKey:` ignores its notification argument, so nil is sufficient.
+            let answer = unsafe {
+                let one: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+                let later: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id) = checked_msg();
+                let run: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
+                let cancel: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let modes = one(class(c"NSArray").as_id(), sel!(arrayWithObject:), mode.id());
+                let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
+                self.modal_focus_before = Some(self.focused.len());
+                later(
+                    delegate,
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(windowDidResignKey:),
+                    Id::NIL,
+                    0.1,
+                    modes,
+                );
+                later(
+                    button.id(),
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(performClick:),
+                    Id::NIL,
+                    0.2,
+                    modes,
+                );
+                later(
+                    app,
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(abortModal),
+                    Id::NIL,
+                    BUDGET.as_secs_f64(),
+                    modes,
+                );
+                let answer = run(alert.id(), sel!(runModal));
+                // A person's gesture can turn the default mode before the outer handler returns.
+                // Do so deterministically: the old queue re-entered the handler at this point.
+                let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 1);
+                cancel(
+                    class(c"NSObject").as_id(),
+                    sel!(cancelPreviousPerformRequestsWithTarget:),
+                    app,
+                );
+                answer
+            };
+            self.report.check(
+                answer == NS_ALERT_FIRST_BUTTON_RETURN,
+                &format!("a click answered the modal-reentry alert ({answer}) without re-entry"),
+            );
+            // Guarantee another outer turn in which the deferred focus event can precede the
+            // exit-alert stage.
+            self.w().request_redraw();
+        }
+
         /// A real `NSAlert` answered by a click in the turn that then exits the loop, as a Quit
         /// confirmation is: the exit (`crates/aterm-window`'s `notify_windows_of_exit`) must close
         /// only winit's own windows. The answered alert's panel (and, on macOS 27, its
@@ -1558,6 +1666,7 @@ mod macos {
             key_ups: 0,
             posted_cmd_key_up: false,
             alert_answer: None,
+            modal_focus_before: None,
             windows_at_exit: Vec::new(),
             alert_panel_listed: false,
             closed_at_exit: std::rc::Rc::default(),

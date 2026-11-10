@@ -354,6 +354,11 @@ pub enum Short {
         /// What it is.
         what: String,
     },
+    /// This waiter explicitly requests isolation and other memory claims precede it.
+    WantsAlone {
+        /// Claims holding or reserving memory ahead of it.
+        holders: usize,
+    },
     /// Another waiter held the admissions' lock at this look.
     Turn {
         /// Its pid, where it wrote one.
@@ -375,6 +380,7 @@ impl Short {
                 | Short::Quiet { .. }
                 | Short::Reserved { .. }
                 | Short::Alone { .. }
+                | Short::WantsAlone { .. }
         )
     }
 
@@ -431,7 +437,7 @@ impl fmt::Display for Short {
                 write!(
                     f,
                     "memory short by {}: needs {}, {} available less {} reserved",
-                    gib(need.saturating_add(*margin).saturating_sub(room)),
+                    gib_up(need.saturating_add(*margin).saturating_sub(room)),
                     mem_and_margin(*need, *margin),
                     gib(*available),
                     gib(*reserved)
@@ -504,6 +510,11 @@ impl fmt::Display for Short {
                 f,
                 "pid {pid} (\"{what}\") holds the machine's memory alone: no memory claim is \
                  admitted beside it until it ends"
+            ),
+            Short::WantsAlone { holders } => write!(
+                f,
+                "waits to run alone beside {holders} {}",
+                if *holders == 1 { "holder" } else { "holders" }
             ),
             Short::Turn { holder: Some(pid) } => write!(f, "pid {pid} holds the ledger's lock"),
             Short::Turn { holder: None } => f.write_str("another waiter holds the ledger's lock"),
@@ -672,8 +683,18 @@ impl fmt::Display for Shortfall {
         if self.holders.is_empty() {
             write!(f, "; no claim holds it: other work on {HOST}")
         } else {
-            for h in &self.holders {
-                write!(f, "; {h}")?;
+            for (index, h) in self.holders.iter().enumerate() {
+                let separator = if index == 0
+                    && self
+                        .shorts
+                        .iter()
+                        .any(|s| matches!(s, Short::WantsAlone { .. }))
+                {
+                    ":"
+                } else {
+                    ";"
+                };
+                write!(f, "{separator} {h}")?;
             }
             Ok(())
         }
@@ -1635,12 +1656,21 @@ pub(crate) fn decide(
                 });
             } else if !fits {
                 want_mem = true;
-                shorts.push(Short::Memory {
-                    need: need.mem,
-                    margin: need.margin,
-                    available,
-                    reserved,
-                    passes: turn.may(),
+                shorts.push(if need.alone {
+                    Short::WantsAlone {
+                        holders: ahead
+                            .iter()
+                            .filter(|o| o.record.need.mem > 0 && !sibling(o))
+                            .count(),
+                    }
+                } else {
+                    Short::Memory {
+                        need: need.mem,
+                        margin: need.margin,
+                        available,
+                        reserved,
+                        passes: turn.may(),
+                    }
                 });
             }
         }
