@@ -173,7 +173,7 @@ fn native_object_original_parent_actor() {
     let mut guards: Vec<_> = originals.into_iter().zip(3..=9).collect();
     guards.push(extra);
     prelude.inherit_guards_at(guards).unwrap();
-    owner.configured(&prelude).unwrap();
+    owner.configured(&mut prelude).unwrap();
     let mut child = Child(prelude.spawn().unwrap());
     drop(prelude);
     while !owner

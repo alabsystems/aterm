@@ -3,6 +3,8 @@
 
 //! The update checker's heartbeat.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -14,6 +16,8 @@ pub enum CheckerPhase {
     Starting,
     /// The OS refused to create this generation's thread; no worker can stamp it.
     StartFailed,
+    /// The active worker returned or unwound; no worker remains for this generation.
+    Stopped,
     /// Asking the host for the current channel and policy, or pausing after it did not answer.
     Settings,
     /// Reading the bundle under this executable and verifying its signature when newer.
@@ -37,6 +41,7 @@ impl CheckerPhase {
             Self::Checking => 5,
             Self::Waiting => 6,
             Self::StartFailed => 7,
+            Self::Stopped => 8,
         }
     }
 
@@ -49,6 +54,7 @@ impl CheckerPhase {
             5 => Self::Checking,
             6 => Self::Waiting,
             7 => Self::StartFailed,
+            8 => Self::Stopped,
             _ => Self::Starting,
         }
     }
@@ -65,6 +71,7 @@ impl CheckerPhase {
             Self::Checking => "checking",
             Self::Waiting => "waiting",
             Self::StartFailed => "start-failed",
+            Self::Stopped => "stopped",
         }
     }
 
@@ -80,7 +87,14 @@ impl CheckerPhase {
             Self::Checking => "checking for a new version",
             Self::Waiting => "waiting between checks",
             Self::StartFailed => "waiting to retry a failed thread start",
+            Self::Stopped => "waiting to replace an exited checker",
         }
+    }
+
+    /// Whether the host has positive evidence that this generation has no worker.
+    #[must_use]
+    pub const fn worker_absent(self) -> bool {
+        matches!(self, Self::StartFailed | Self::Stopped)
     }
 }
 
@@ -99,10 +113,10 @@ pub const STALL_SLACK: Duration = Duration::from_secs(5 * 60);
 /// How long a stale verdict must stand before the watchdog acts.
 pub const STALL_CONFIRM: Duration = STALL_SLACK;
 
-/// How many replacement threads one process may start.
+/// Maximum extra checker workers that may remain outstanding beside one worker.
 pub const MAX_RESPAWNS: u64 = 3;
 
-/// Backoff after the OS refused a checker thread, without spending a live-worker slot.
+/// Backoff after a refused thread start or an observed worker exit.
 pub const START_RETRY: Duration = Duration::from_secs(5);
 
 /// The process-wide monotonic anchor every stamp is measured from.
@@ -181,6 +195,10 @@ pub struct CheckerBeat {
     pub max_interval_secs: u64,
     /// Replacement threads this process has started.
     pub respawns: u64,
+    /// Started or reserved workers that have not exited or failed to start.
+    pub workers: usize,
+    /// Changes when a worker slot is returned, allowing a capacity refusal to retry.
+    pub worker_epoch: u64,
     /// Consecutive cycles deferred to an unresponsive `checker.lock` holder (`0` while active).
     pub deferrals: u64,
     /// Consecutive times the host did not answer the settings query.
@@ -242,7 +260,7 @@ pub enum CheckerVerdict {
 #[must_use]
 pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
     match phase {
-        CheckerPhase::StartFailed => START_RETRY.as_secs(),
+        CheckerPhase::StartFailed | CheckerPhase::Stopped => START_RETRY.as_secs(),
         CheckerPhase::LockWait => CHECKER_LOCK_WAIT.as_secs(),
         CheckerPhase::Checking => CHECK_PHASE_BUDGET.as_secs(),
         CheckerPhase::Starting => {
@@ -255,11 +273,11 @@ pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
 }
 
 /// The running-second age past which a stamp in `phase` is a stall. A known
-/// failed start uses only its retry backoff, without late-heartbeat slack.
+/// failed start or observed exit uses only its retry backoff, without late-heartbeat slack.
 #[inline]
 #[must_use]
 pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
-    if phase == CheckerPhase::StartFailed {
+    if phase.worker_absent() {
         return START_RETRY.as_secs();
     }
     phase_budget_secs(phase, max_interval_secs)
@@ -273,15 +291,14 @@ pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 
 pub fn classify(beat: &CheckerBeat, now_secs: u64) -> CheckerVerdict {
     let age = now_secs.saturating_sub(beat.at_secs);
     let threshold = stall_threshold_secs(beat.phase, beat.max_interval_secs);
-    if age > threshold || (beat.phase == CheckerPhase::StartFailed && age == threshold) {
+    if age > threshold || (beat.phase.worker_absent() && age == threshold) {
         CheckerVerdict::Stalled {
             for_secs: age,
             phase: beat.phase,
         }
     } else {
         CheckerVerdict::Fresh {
-            stale_in_secs: (threshold - age)
-                .saturating_add(u64::from(beat.phase != CheckerPhase::StartFailed)),
+            stale_in_secs: (threshold - age).saturating_add(u64::from(!beat.phase.worker_absent())),
         }
     }
 }
@@ -296,7 +313,7 @@ pub fn standing_stall(beat: &CheckerBeat, now_secs: u64) -> Option<(u64, Checker
         .map(|holder| (now_secs.saturating_sub(holder.at_secs), holder.phase))
 }
 
-/// Atomic heartbeat state for the update checker.
+/// Atomic heartbeat and serialized worker reservations for the update checker.
 pub struct CheckerWatch {
     /// `generation << 48 | phase << 40 | running secs`.
     beat: AtomicU64,
@@ -305,6 +322,7 @@ pub struct CheckerWatch {
     /// Registered cadence ceiling, inherited unchanged by every replacement.
     max_interval: AtomicU64,
     respawns: AtomicU64,
+    workers: Mutex<Workers>,
     /// Generation-prefixed count, saturated to [`COUNT_MASK`].
     deferrals: AtomicU64,
     /// Generation-prefixed count, saturated to [`COUNT_MASK`].
@@ -315,6 +333,16 @@ pub struct CheckerWatch {
     next_check: AtomicU64,
     /// Optional host event-loop wake invoked on phase transitions.
     phase_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+struct Workers {
+    generations: BTreeMap<u64, Worker>,
+    epoch: u64,
+}
+
+struct Worker {
+    started: bool,
+    replacement: bool,
 }
 
 impl Default for CheckerWatch {
@@ -332,6 +360,10 @@ impl CheckerWatch {
             lane: AtomicU64::new(0),
             max_interval: AtomicU64::new(0),
             respawns: AtomicU64::new(0),
+            workers: Mutex::new(Workers {
+                generations: BTreeMap::new(),
+                epoch: 0,
+            }),
             deferrals: AtomicU64::new(0),
             settings_misses: AtomicU64::new(0),
             checks: AtomicU64::new(0),
@@ -348,6 +380,10 @@ impl CheckerWatch {
 
     /// Register a checker thread, stamped `Starting` now, and return its generation.
     pub fn register(&self, max_interval_secs: u64) -> u64 {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.max_interval
             .store(max_interval_secs, Ordering::Relaxed);
         let now = now_secs();
@@ -358,7 +394,32 @@ impl CheckerWatch {
                 next = generation_of(word) + 1;
                 Some(pack(next, CheckerPhase::Starting, now))
             });
+        workers.generations.insert(
+            next,
+            Worker {
+                started: false,
+                replacement: false,
+            },
+        );
         next
+    }
+
+    /// Retain a reserved slot until this thread exits, including during unwinding.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn worker(&self, generation: u64) -> Option<WorkerMark<'_>> {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker = workers.generations.get_mut(&generation)?;
+        if worker.started {
+            return None;
+        }
+        worker.started = true;
+        Some(WorkerMark {
+            watch: self,
+            generation,
+        })
     }
 
     /// Stamp `phase` for `generation`, now.
@@ -469,6 +530,10 @@ impl CheckerWatch {
     /// The heartbeat as it stands; `None` when no checker was ever registered here.
     #[must_use]
     pub fn snapshot(&self) -> Option<CheckerBeat> {
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let word = self.beat.load(Ordering::Acquire);
         let generation = generation_of(word);
         let lane = self.lane.load(Ordering::Acquire);
@@ -478,6 +543,8 @@ impl CheckerWatch {
             at_secs: word & SECS_MASK,
             max_interval_secs: self.max_interval.load(Ordering::Relaxed),
             respawns: self.respawns.load(Ordering::Relaxed),
+            workers: workers.generations.len(),
+            worker_epoch: workers.epoch,
             deferrals: read_count(&self.deferrals, generation),
             settings_misses: read_count(&self.settings_misses, generation),
             lane: (generation_of(lane) != 0).then(|| LaneHolder {
@@ -491,7 +558,14 @@ impl CheckerWatch {
 
     /// Retire `stalled` and return its replacement's generation, stamped `Starting` now.
     pub fn supersede(&self, stalled: u64) -> Option<u64> {
-        if stalled == 0 || self.respawns.load(Ordering::Acquire) >= MAX_RESPAWNS {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stalled == 0
+            || stalled >= u64::from(u16::MAX)
+            || workers.generations.len() as u64 > MAX_RESPAWNS
+        {
             return None;
         }
         let now = now_secs();
@@ -508,27 +582,85 @@ impl CheckerWatch {
                 (generation_of(word) == stalled).then_some(last)
             });
         self.respawns.fetch_add(1, Ordering::AcqRel);
+        workers.generations.insert(
+            next,
+            Worker {
+                started: false,
+                replacement: true,
+            },
+        );
         Some(next)
     }
 
     /// No thread started for this generation. Retain retirement of its predecessor,
     /// return any replacement slot, and wake the host for a bounded retry.
     pub fn unstarted(&self, generation: u64) {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let word = self.beat.load(Ordering::Acquire);
+        if generation_of(word) == generation && phase_of(word) != CheckerPhase::Starting {
+            return;
+        }
+        let Some(worker) = workers.generations.get(&generation) else {
+            return;
+        };
+        if worker.started {
+            return;
+        }
+        let replacement = worker.replacement;
+        workers.generations.remove(&generation);
+        workers.epoch += 1;
         let now = now_secs();
-        if self
+        let changed = self
             .beat
             .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
                 (generation_of(word) == generation && phase_of(word) == CheckerPhase::Starting)
                     .then(|| pack(generation, CheckerPhase::StartFailed, now))
             })
-            .is_err()
-        {
-            return;
+            .is_ok();
+        if replacement {
+            let _ = self
+                .respawns
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         }
-        let _ = self
-            .respawns
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        if let Some(wake) = self.phase_wake.get() {
+        drop(workers);
+        if (changed || !self.is_current(generation))
+            && let Some(wake) = self.phase_wake.get()
+        {
+            wake();
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) struct WorkerMark<'a> {
+    watch: &'a CheckerWatch,
+    generation: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl Drop for WorkerMark<'_> {
+    fn drop(&mut self) {
+        let mut workers = self
+            .watch
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = workers.generations.remove(&self.generation).is_some();
+        if removed {
+            workers.epoch += 1;
+            let _ = self
+                .watch
+                .beat
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                    (generation_of(word) == self.generation)
+                        .then(|| pack(self.generation, CheckerPhase::Stopped, now_secs()))
+                });
+        }
+        drop(workers);
+        if removed && let Some(wake) = self.watch.phase_wake.get() {
             wake();
         }
     }
@@ -645,6 +777,8 @@ mod tests {
             at_secs: at,
             max_interval_secs: max_interval,
             respawns: 0,
+            workers: 1,
+            worker_epoch: 0,
             deferrals: 0,
             settings_misses: 0,
             lane: None,
@@ -815,6 +949,138 @@ mod tests {
     }
 
     #[test]
+    fn exited_workers_return_capacity_without_resetting_generation_or_history() {
+        let watch = CheckerWatch::new();
+        let mut current = watch.register(100);
+        let mut worker = watch.worker(current);
+        for count in 1..=20 {
+            let next = watch.supersede(current).unwrap();
+            let next_worker = watch.worker(next);
+            assert_eq!(watch.snapshot().unwrap().workers, 2);
+            drop(worker);
+            let beat = watch.snapshot().unwrap();
+            assert_eq!(beat.workers, 1);
+            assert_eq!(beat.worker_epoch, count);
+            assert_eq!(beat.respawns, count);
+            assert_eq!(beat.generation, next);
+            assert!(!watch.beat(current, CheckerPhase::Checking));
+            current = next;
+            worker = next_worker;
+        }
+        drop(worker);
+        assert_eq!(watch.snapshot().unwrap().workers, 0);
+    }
+
+    #[test]
+    fn capacity_is_returned_only_by_the_exact_exited_or_unstarted_worker() {
+        let watch = CheckerWatch::new();
+        let first = watch.register(100);
+        let first_worker = watch.worker(first);
+        assert!(first_worker.is_some());
+        assert!(
+            watch.worker(first).is_none(),
+            "a slot cannot be claimed twice"
+        );
+        let mut current = first;
+        let mut workers = Vec::new();
+        for _ in 0..MAX_RESPAWNS {
+            current = watch.supersede(current).unwrap();
+            workers.push(watch.worker(current));
+        }
+        assert!(watch.supersede(current).is_none());
+        watch.unstarted(first);
+        watch.unstarted(current);
+        assert!(
+            watch.supersede(current).is_none(),
+            "live workers retain their slots"
+        );
+        drop(first_worker);
+        let reserved = watch.supersede(current).unwrap();
+        assert!(watch.supersede(reserved).is_none());
+        let latest = watch.snapshot().unwrap();
+        watch.unstarted(reserved);
+        watch.unstarted(reserved);
+        let failed = watch.snapshot().unwrap();
+        assert_eq!(failed.workers, latest.workers - 1);
+        assert_eq!(failed.worker_epoch, latest.worker_epoch + 1);
+        assert_eq!(failed.respawns, latest.respawns - 1);
+        assert!(watch.supersede(reserved).is_some());
+    }
+
+    #[test]
+    fn retired_worker_unwind_and_late_spawn_failure_release_only_their_own_slots() {
+        let watch = CheckerWatch::new();
+        let first = watch.register(100);
+        let next = watch.supersede(first).unwrap();
+        watch.unstarted(first);
+        assert_eq!(watch.snapshot().unwrap().workers, 1);
+        assert_eq!(watch.snapshot().unwrap().generation, next);
+        assert_eq!(watch.snapshot().unwrap().phase, CheckerPhase::Starting);
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _worker = watch.worker(next);
+            panic!("worker exit");
+        }));
+        assert!(stopped.is_err());
+        assert_eq!(watch.snapshot().unwrap().workers, 0);
+        assert_eq!(watch.snapshot().unwrap().generation, next);
+        let registered = watch.register(100);
+        watch.unstarted(registered);
+        assert_eq!(
+            watch.snapshot().unwrap().respawns,
+            1,
+            "initial registration cannot refund a replacement"
+        );
+    }
+
+    #[test]
+    fn a_worker_exit_is_observed_without_waiting_for_its_last_heartbeat_to_stale() {
+        for unwind in [false, true] {
+            let watch = CheckerWatch::new();
+            let first = watch.register(10_000);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _worker = watch.worker(first).unwrap();
+                assert!(watch.beat(first, CheckerPhase::Checking));
+                if unwind {
+                    panic!("worker escaped the cycle guard");
+                }
+            }));
+            assert_eq!(result.is_err(), unwind);
+            let stopped = watch.snapshot().unwrap();
+            assert_eq!(stopped.phase, CheckerPhase::Stopped);
+            assert_eq!(stopped.workers, 0);
+            assert_eq!(
+                classify(&stopped, stopped.at_secs + START_RETRY.as_secs() - 1),
+                CheckerVerdict::Fresh { stale_in_secs: 1 }
+            );
+            assert!(matches!(
+                classify(&stopped, stopped.at_secs + START_RETRY.as_secs()),
+                CheckerVerdict::Stalled {
+                    phase: CheckerPhase::Stopped,
+                    ..
+                }
+            ));
+            let next = watch.supersede(first).unwrap();
+            let current = watch.worker(next).unwrap();
+            assert!(watch.beat(next, CheckerPhase::Checking));
+            drop(current);
+            assert_eq!(watch.snapshot().unwrap().phase, CheckerPhase::Stopped);
+        }
+        let watch = CheckerWatch::new();
+        let first = watch.register(10_000);
+        let old = watch.worker(first).unwrap();
+        let next = watch.supersede(first).unwrap();
+        assert!(watch.beat(next, CheckerPhase::Checking));
+        let before = watch.snapshot().unwrap();
+        drop(old);
+        let after = watch.snapshot().unwrap();
+        assert_eq!(
+            (after.generation, after.phase, after.at_secs),
+            (before.generation, before.phase, before.at_secs)
+        );
+        assert!(!after.phase.worker_absent());
+    }
+
+    #[test]
     fn a_retired_publish_cannot_restore_old_failure_counts() {
         let watch = CheckerWatch::new();
         let old = watch.register(100);
@@ -946,6 +1212,7 @@ mod tests {
         for phase in [
             CheckerPhase::Starting,
             CheckerPhase::StartFailed,
+            CheckerPhase::Stopped,
             CheckerPhase::Settings,
             CheckerPhase::BundleProbe,
             CheckerPhase::LockWait,

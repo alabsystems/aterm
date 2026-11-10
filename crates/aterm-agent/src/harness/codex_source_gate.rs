@@ -18,6 +18,17 @@ struct Held {
     path: PathBuf,
 }
 
+/// Let go of whatever claim the description holds by `LOCK_UN` before the close: an flock lives
+/// on the open file description, so a close alone leaves the claim held in every child forked
+/// meanwhile until its `exec` (clippy.toml: the flock release rule). A description that took no
+/// claim has none to let go, and no other description's claim is touched.
+impl Drop for Held {
+    fn drop(&mut self) {
+        // A failed unlock leaves only the close, which lets go once the last copy closes.
+        let _ = self.file.unlock();
+    }
+}
+
 // A captured identity may inspect or lock only its existing private inode.
 // open_private_rw creates a missing file, so it belongs only to initial creation.
 fn existing_gate_file(directory: &Path) -> Result<File, &'static str> {
@@ -317,12 +328,6 @@ impl PublicationLock {
         Self::try_for_home(home)?.ok_or(BUSY)
     }
 
-    /// The lock, once its last holder's release has come through ([`released`]).
-    #[cfg(test)]
-    pub(crate) fn released_for_home(home: &Path) -> Self {
-        released("the publication lock", || Self::try_for_home(home).unwrap())
-    }
-
     /// Only actual kernel contention is retryable; namespace and I/O failures
     /// remain errors and never become an indefinite admission wait.
     pub(crate) fn try_for_home(home: &Path) -> Result<Option<Self>, &'static str> {
@@ -345,28 +350,6 @@ impl PublicationLock {
     }
 }
 
-/// What `take` claims once its last holder's release has come through: a test that dropped
-/// every holder of a gate lock must find it free, but an `flock` lives with its open file
-/// description, and a child another test forks at that moment holds a copy of the descriptor
-/// until its `exec` closes it, so the claim can read busy for a moment after the drop (more so
-/// on a loaded Mac). The wait is a one-minute hang detector: a lock still held then is a leaked
-/// holder, and fails naming `what`.
-#[cfg(test)]
-pub(crate) fn released<T>(what: &str, mut take: impl FnMut() -> Option<T>) -> T {
-    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
-    let started = std::time::Instant::now();
-    loop {
-        if let Some(taken) = take() {
-            return taken;
-        }
-        assert!(
-            started.elapsed() < HANG_DETECTOR,
-            "{what} stayed held {HANG_DETECTOR:?} after its holders dropped"
-        );
-        aterm_uds::deadline::poll_yield();
-    }
-}
-
 #[path = "codex_source_gate_family.rs"]
 mod family;
 pub use family::{FamilyExclusive, FamilySource, FamilyWork, SourceBorrow};
@@ -375,6 +358,24 @@ pub(in crate::harness) use family::{ReservationFamilyExclusive, TargetFamilyLeas
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A child parked between fork and exec holds a copy of every descriptor: a gate claim let go
+    /// by a close alone would stay held in it. Exclusive and shared claims both let go at once.
+    #[test]
+    fn a_dropped_claim_is_free_while_a_forked_child_holds_its_descriptor() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let publication = PublicationLock::for_home(home.path()).unwrap();
+        let parked = aterm_uds::fork_window::Parked::park();
+        drop(publication);
+        let work = SourceWorkLease::for_home(home.path())
+            .expect("an exclusive claim dropped beside a forked child is let go");
+        drop(work);
+        assert!(
+            PublicationLock::for_home(home.path()).is_ok(),
+            "a shared claim dropped beside a forked child is let go"
+        );
+        assert!(parked.release().success());
+    }
 
     #[test]
     fn captured_gate_probes_never_create_a_missing_inode() {
@@ -419,7 +420,7 @@ mod tests {
                 .is_none()
         );
         drop(existing);
-        let publication = PublicationLock::released_for_home(home.path());
+        let publication = PublicationLock::for_home(home.path()).unwrap();
         assert!(publication.current().is_ok());
     }
 
@@ -432,7 +433,7 @@ mod tests {
         drop(first);
         assert!(PublicationLock::for_home(home.path()).is_err());
         drop(second);
-        let publication = PublicationLock::released_for_home(home.path());
+        let publication = PublicationLock::for_home(home.path()).unwrap();
         assert!(SourceWorkLease::for_home(home.path()).is_err());
         publication.current().unwrap();
         let path = publication.0.path.clone();
@@ -460,7 +461,7 @@ mod tests {
         std::os::unix::fs::symlink(&home, &alias).unwrap();
         assert!(identity.matches_home(&alias));
         drop(work);
-        let _publication = PublicationLock::released_for_home(&home);
+        let _publication = PublicationLock::for_home(&home).unwrap();
         // Namespace validation performs no hidden shared acquisition, even
         // while this actual gate is exclusively held.
         assert!(identity.matches_home(&home));

@@ -256,6 +256,8 @@ pub fn acknowledged_commons_log_now(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<super::CommonsLog> {
+    #[cfg(any(test, debug_assertions))]
+    LOGS_READ.with(|reads| reads.set(reads.get() + 1));
     ACKNOWLEDGED.read_keyed(paths, &trust, |paths| {
         super::acknowledged_commons_log(paths, trust)
     })
@@ -333,6 +335,20 @@ static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inpu
 std::thread_local! {
     /// How many looks this thread opened on an observation of their own ([`VaultLook::new`]).
     static LOOKS_OBSERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread asked for the acknowledged log on its own call
+    /// ([`acknowledged_commons_log_now`]).
+    static LOGS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread asked for the acknowledged Commons log on its own call
+/// ([`acknowledged_commons_log_now`], [`trusted_commons_log_now`]), whether its memo answered or
+/// read it; an ask under a caller's observation or through a look
+/// ([`trusted_commons_log_under`], [`VaultLook::acknowledged_commons_log`]) adds none.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_logs_read() -> usize {
+    LOGS_READ.with(std::cell::Cell::get)
 }
 
 /// How many looks this thread opened on an observation of their own ([`VaultLook::new`]); one
@@ -376,9 +392,14 @@ pub fn test_looks_observed() -> usize {
 /// each writer of the files the state lock guards takes it exclusively, so none of them changes
 /// within the batch, and what changes without it (the device age identity and claim, under the
 /// Commons custody locks; the fold mark, under none) is seen at the next admission, as the
-/// admission's look already saw them once. Custody digests,
-/// a record's keys and history, and a store read batch's opening and closing fences
-/// (`Session::read_context`) read afresh. A write batch's look observes the lock beside its
+/// admission's look already saw them once. As the batch decodes a record and probes the history
+/// it needs, the record's history and its key judge through it too: the lease of the log's
+/// history, its membership check and its read of the log (`Bootstrap::historicals_in`,
+/// `Bootstrap::holds_histories_in`), and the key's check as the batch takes it
+/// (`Historical::with_key_in`); a handoff a basis falls back to opens on its own calls, as it did.
+/// Custody digests, a store read batch's
+/// opening and closing fences (`Session::read_context`) and its closing check of the keys it
+/// reused (`ReadBatch::revalidate`) read afresh. A write batch's look observes the lock beside its
 /// source reads and ends before the batch runs, whose checks each observe the vault again.
 pub struct VaultLook<'a> {
     paths: &'a Paths,
@@ -430,6 +451,11 @@ impl<'a> VaultLook<'a> {
             .map(super::Observing::lock)
             .filter(|lock| lock.observes(self.paths))
             .map(|lock| (lock, &self.glance))
+    }
+
+    /// [`Self::held`] where this look is at the vault at `paths`; `None` at another vault.
+    pub(crate) fn held_at(&self, paths: &Paths) -> Option<(&StateLock, &fsx::Glance)> {
+        self.held().filter(|_| self.paths == paths)
     }
 
     /// [`observe_commons_quiet`] through this look: a table session's check of its custody at its
@@ -491,6 +517,19 @@ impl<'a> VaultLook<'a> {
         self.ask(&ACKNOWLEDGED, &trust, |paths| {
             super::acknowledged_commons_log(paths, trust)
         })
+    }
+
+    /// [`trusted_commons_log_now`] for `trust` through this look: a table-repair read batch's
+    /// probe of the log's Commons and fold epochs (`aterm-db`'s `Session::history_needs`).
+    ///
+    /// # Errors
+    /// As [`trusted_commons_log`](super::trusted_commons_log).
+    pub fn trusted_commons_log(
+        &self,
+        trust: crate::commons::journal::Trust,
+    ) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
+        self.acknowledged_commons_log(trust)
+            .map(super::CommonsLog::trusted)
     }
 
     /// [`local_swarm_roster_for_log_now`] for `log` through this look.

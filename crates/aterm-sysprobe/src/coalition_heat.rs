@@ -4,34 +4,36 @@
 //! The heat words of a resource coalition's usage record
 //! (`docs/DESIGN-stats-deck-instruments-2026-11-06.md` §4, M-COAL): CPU energy, the Super
 //! (performance) cores' share of CPU time, cycles and instructions, the Neural Engine's time and
-//! energy, and the GPU's energy; and the self-check that recognises them on the running kernel.
+//! energy, and the GPU's energy; and the record half of the self-check that recognises them on the
+//! running kernel.
 //!
 //! The words are xnu-private (`struct coalition_resource_usage`, `bsd/sys/coalition.h`) with no SDK
 //! header to hold them to, so the layout is recognised by invariants, never trusted:
 //!
 //! - a record decodes ([`decode`]) only with the QoS count [`crate::coalitions`] reads, every word
 //!   read written, and its Super cycles and instructions within their wholes;
-//! - a reading's change ([`moved`]) is summed over the coalitions both reads answered, by id, plus
-//!   those born since; a counter of one that ran backwards refuses the reading;
-//! - a reading is judged ([`judge`]): Super cycles and instructions within their wholes again; its
-//!   CPU time and Super time against the busy core time the per-core ticks gave ([`Busy`]); every
-//!   core's cycles ÷ time and the Super cores' within the chip's clock range; instructions per
-//!   cycle and CPU watts per busy core; GPU and Neural Engine watts and the Neural Engine's busy
-//!   share each in a plausible range.
+//! - the coalition read's own copy loop decodes each record as the kernel copies it out and sums
+//!   them there ([`CoalHeat`], carried by [`crate::coalitions::CoalitionRead::heat`]): one record
+//!   that does not decode refuses the read's heat;
+//! - the change between two reads, and the judgement of it against the chip and the machine (the
+//!   busy core time, the clock range, instructions per cycle, watts), are the model's
+//!   (`aterm_vitals::heat::change`, `aterm_vitals::heat::judge`), so one engine judges them.
 //!
 //! A reading that fails any of them reads as unread, never as a shifted value.
 //!
 //! The record's times are three accounts, not one: `cpu_time` (word 3), `cpu_ptime` (word 22) and
 //! the effective-QoS times (words 24–30). On xnu-13432 (macOS 27.0.1) a coalition's lifetime
 //! `cpu_ptime` read above its `cpu_time`, and the QoS times sum above both, so Super time is never
-//! held within either whole, and the Efficiency clock ((cycles − Super cycles) ÷ (whole − Super
-//! time)) is given over both wholes ([`Judged::e_mhz`], [`Judged::e_qos_mhz`]), each refused alone
-//! past its table's range without refusing the reading.
+//! held within either whole; `cpu_time` undercounts the busy cores (0.926 p50 in N1), and the
+//! QoS-time sum matches them (0.995).
+//!
+//! [`HeatRead`] and [`moved`] give the change by coalition id, as a pass after the read: the
+//! oracle the copy loop's folded form is held to, and N1's measured separate pass
+//! (`examples/coal_clocks.rs`), never the reading's path.
 
 use crate::coalitions::{
     CPU_TIME, EQOS, EQOS_LEN, QOS_CLASSES, RecordRead, UNWRITTEN, USAGE_WORDS,
 };
-use crate::procs::ticks_to_ns;
 
 /// CPU energy, nanojoules (`energy`).
 pub const ENERGY: usize = 11;
@@ -66,40 +68,8 @@ pub const WORDS: [usize; 10] = [
     GPU_ENERGY,
 ];
 
-/// Thread time under which a reading's clocks, IPC and CPU watts are not judged or given: a few
-/// ticks' rounding would decide them.
-pub const MIN_CLOCK_NS: u64 = 10_000_000;
-
-/// How far under a table's bottom a derived clock may read and still be the clock.
-pub const BELOW_BOTTOM: f64 = 0.5;
-
-/// How far over a table's top a derived clock may read and still be the clock.
-pub const OVER_TOP: f64 = 1.02;
-
-/// Instructions per cycle no core retires at or past.
-pub const MAX_IPC: f64 = 16.0;
-
-/// Instructions per cycle under which the words are not instructions and cycles.
-pub const MIN_IPC: f64 = 0.01;
-
-/// CPU watts per busy core (nanojoules per nanosecond of CPU time) a reading may give.
-pub const CPU_W_PER_CORE: (f64, f64) = (0.01, 25.0);
-
-/// GPU watts a reading may give.
-pub const MAX_GPU_W: f64 = 200.0;
-
-/// Neural Engine watts a reading may give.
-pub const MAX_ANE_W: f64 = 50.0;
-
-/// Neural Engine busy share (its time ÷ the window) a reading may give: two engines, and slack.
-pub const MAX_ANE_BUSY: f64 = 2.1;
-
-/// How far a reading's CPU time, and its Super time, may stray from the busy core time the
-/// per-core ticks gave ([`Busy`]): a time word that moved to a neighbour reads near 0 or many
-/// times the busy time.
-pub const BUSY_RATIO: (f64, f64) = (0.5, 1.5);
-
-const COUNTERS: usize = 11;
+/// How many heat counters a record gives ([`Heat::words`]); the model's `heat::COUNTERS`.
+pub const COUNTERS: usize = 11;
 
 /// One coalition's heat counters, as one record gave them (or a sum, or a change, of them).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -129,7 +99,10 @@ pub struct Heat {
 }
 
 impl Heat {
-    fn counters(self) -> [u64; COUNTERS] {
+    /// The counters as words, in field order: the order `aterm_vitals::heat::Counters::from_words`
+    /// reads (held by this crate's tests against the model's names).
+    #[must_use]
+    pub const fn words(self) -> [u64; COUNTERS] {
         [
             self.cpu_ticks,
             self.qos_ticks,
@@ -145,7 +118,9 @@ impl Heat {
         ]
     }
 
-    fn of_counters(c: [u64; COUNTERS]) -> Self {
+    /// The counters back from [`Self::words`].
+    #[must_use]
+    pub const fn of_words(c: [u64; COUNTERS]) -> Self {
         Self {
             cpu_ticks: c[0],
             qos_ticks: c[1],
@@ -164,28 +139,28 @@ impl Heat {
     /// Each counter's change from `then`; `None` where one ran backwards.
     #[must_use]
     pub fn since(self, then: Self) -> Option<Self> {
-        let (now, then) = (self.counters(), then.counters());
+        let (now, then) = (self.words(), then.words());
         let mut out = [0; COUNTERS];
         for (o, (n, t)) in out.iter_mut().zip(now.iter().zip(then)) {
             *o = n.checked_sub(t)?;
         }
-        Some(Self::of_counters(out))
+        Some(Self::of_words(out))
     }
 
     /// Each counter's sum with `other`'s, saturating.
     #[must_use]
     pub fn plus(self, other: Self) -> Self {
-        let (a, b) = (self.counters(), other.counters());
+        let (a, b) = (self.words(), other.words());
         let mut out = [0; COUNTERS];
         for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b)) {
             *o = x.saturating_add(y);
         }
-        Self::of_counters(out)
+        Self::of_words(out)
     }
 
     /// Whether the Super cycles and instructions lie within their wholes (one account each).
     #[must_use]
-    pub fn super_within_whole(self) -> bool {
+    pub const fn super_within_whole(self) -> bool {
         self.p_cycles <= self.cycles && self.p_instructions <= self.instructions
     }
 }
@@ -318,154 +293,68 @@ pub fn moved(then: &HeatRead, now: &HeatRead) -> Result<Moved, &'static str> {
     Ok(out)
 }
 
-/// The chip's clock range: each core kind's DVFS table bottom and top, MHz.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockRange {
-    /// Super cores' bottom and top.
-    pub p_mhz: (f64, f64),
-    /// Efficiency cores' bottom and top.
-    pub e_mhz: (f64, f64),
+/// One read's heat counters as its copy loop leaves them: each record decoded where the kernel
+/// copied it out, kept by id in the kernel's order and summed as it goes (M-COAL's `totals24`:
+/// the start counter's 24-byte task rows stay as they are, and no pass after the read runs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoalHeat {
+    /// The Mach timebase `(numer, denom)` the read's times tick at.
+    pub timebase: (u32, u32),
+    /// Each record that decoded: its coalition id and [`Heat::words`], in the kernel's order.
+    pub by_id: Vec<(u64, [u64; COUNTERS])>,
+    /// The words summed; the first refusal where a record did not decode, or `overflow` where a
+    /// sum would pass `u64` (bounded by the machine's counts since boot, it has not been seen),
+    /// after which the loop keeps nothing more.
+    pub total: Result<[u64; COUNTERS], &'static str>,
 }
 
-/// The busy core time the machine's per-core ticks gave over a reading's window, nanoseconds of
-/// core: every core's and the Super cores'.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Busy {
-    /// Every core's busy time.
-    pub all_ns: u64,
-    /// The Super cores' busy time.
-    pub p_ns: u64,
+impl Default for CoalHeat {
+    fn default() -> Self {
+        Self {
+            timebase: (1, 1),
+            by_id: Vec::new(),
+            total: Err("not_read"),
+        }
+    }
 }
 
-/// A judged reading ([`judge`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Judged {
-    /// CPU time (`cpu_time`), seconds of core.
-    pub cpu_s: f64,
-    /// CPU time by effective QoS, seconds of core.
-    pub qos_s: f64,
-    /// CPU time on Super cores, seconds of core.
-    pub p_s: f64,
-    /// Every core's cycles ÷ `cpu_time`, MHz; `None` under [`MIN_CLOCK_NS`].
-    pub mhz: Option<f64>,
-    /// Super cycles ÷ Super time, MHz; `None` under [`MIN_CLOCK_NS`].
-    pub p_mhz: Option<f64>,
-    /// (cycles − Super cycles) ÷ (`cpu_time` − Super time), MHz; `None` under [`MIN_CLOCK_NS`]
-    /// or past the Efficiency table's range ([`Judged::e_refused`]).
-    pub e_mhz: Option<f64>,
-    /// Whether [`Judged::e_mhz`] read past its table's range and was refused.
-    pub e_refused: bool,
-    /// (cycles − Super cycles) ÷ (QoS time − Super time), MHz, refused as [`Judged::e_mhz`] is.
-    pub e_qos_mhz: Option<f64>,
-    /// Whether [`Judged::e_qos_mhz`] read past its table's range and was refused.
-    pub e_qos_refused: bool,
-    /// Instructions per cycle; `None` under [`MIN_CLOCK_NS`].
-    pub ipc: Option<f64>,
-    /// CPU watts over the window.
-    pub cpu_w: f64,
-    /// GPU watts over the window.
-    pub gpu_w: f64,
-    /// Neural Engine watts over the window.
-    pub ane_w: f64,
-    /// Neural Engine time ÷ the window.
-    pub ane_busy: f64,
-}
+impl CoalHeat {
+    /// An empty read at `timebase`, room kept for `records`.
+    #[must_use]
+    pub fn with_capacity(records: usize, timebase: (u32, u32)) -> Self {
+        Self {
+            timebase,
+            by_id: Vec::with_capacity(records),
+            total: Ok([0; COUNTERS]),
+        }
+    }
 
-/// Judges a reading's change `m` over a `window_ns` window at the Mach `timebase` against the
-/// chip's clock `range` and, where given, the `busy` core time of the same window (the module's
-/// invariants).
-///
-/// # Errors
-/// The first invariant that failed: `window`, `super_over_whole`, `busy_time`, `busy_p_time`,
-/// `clock_range`, `p_clock_range`, `ipc`, `energy`, `gpu_energy`, `ane`.
-pub fn judge(
-    m: &Heat,
-    window_ns: u64,
-    (numer, denom): (u32, u32),
-    range: &ClockRange,
-    busy: Option<Busy>,
-) -> Result<Judged, &'static str> {
-    if window_ns == 0 {
-        return Err("window");
-    }
-    if !m.super_within_whole() {
-        return Err("super_over_whole");
-    }
-    let ns = |ticks: u64| ticks_to_ns(ticks, numer, denom);
-    let (cpu_ns, qos_ns, p_ns) = (ns(m.cpu_ticks), ns(m.qos_ticks), ns(m.p_ticks));
-    let strays = |time: u64, busy: u64| {
-        (busy >= MIN_CLOCK_NS || time >= MIN_CLOCK_NS)
-            && !(BUSY_RATIO.0..=BUSY_RATIO.1).contains(&(time as f64 / busy.max(1) as f64))
-    };
-    if let Some(busy) = busy {
-        if strays(cpu_ns, busy.all_ns) {
-            return Err("busy_time");
-        }
-        if strays(p_ns, busy.p_ns) {
-            return Err("busy_p_time");
+    /// Notes coalition `id`'s record `raw`, as the copy loop copies it out: decoded, kept and
+    /// summed, or, where it does not decode or its sum would pass `u64` (`overflow`), the read's
+    /// heat refused with why.
+    pub fn note(&mut self, id: u64, raw: &[u64; USAGE_WORDS]) {
+        let Ok(total) = self.total else {
+            return;
+        };
+        let summed = decode(raw).and_then(|heat| {
+            let words = heat.words();
+            let mut sum = total;
+            for (t, w) in sum.iter_mut().zip(words) {
+                *t = t.checked_add(w).ok_or("overflow")?;
+            }
+            Ok((sum, words))
+        });
+        match summed {
+            Ok((sum, words)) => {
+                self.total = Ok(sum);
+                self.by_id.push((id, words));
+            }
+            Err(why) => {
+                self.total = Err(why);
+                self.by_id.clear();
+            }
         }
     }
-    let mhz =
-        |cycles: u64, ns: u64| (ns >= MIN_CLOCK_NS).then_some(cycles as f64 * 1e3 / ns as f64);
-    let within = |v: f64, (lo, hi): (f64, f64)| v >= lo * BELOW_BOTTOM && v <= hi * OVER_TOP;
-    let whole = (
-        range.p_mhz.0.min(range.e_mhz.0),
-        range.p_mhz.1.max(range.e_mhz.1),
-    );
-    let all = mhz(m.cycles, cpu_ns);
-    if all.is_some_and(|v| !within(v, whole)) {
-        return Err("clock_range");
-    }
-    let p = mhz(m.p_cycles, p_ns);
-    if p.is_some_and(|v| !within(v, range.p_mhz)) {
-        return Err("p_clock_range");
-    }
-    let e_cycles = m.cycles - m.p_cycles;
-    let efficiency = |whole_ns: u64| {
-        let e = mhz(e_cycles, whole_ns.saturating_sub(p_ns));
-        let refused = e.is_some_and(|v| !within(v, range.e_mhz))
-            || (e_cycles > 0 && whole_ns <= p_ns && cpu_ns >= MIN_CLOCK_NS);
-        (e.filter(|_| !refused), refused)
-    };
-    let (e, e_refused) = efficiency(cpu_ns);
-    let (e_qos, e_qos_refused) = efficiency(qos_ns);
-    let ipc =
-        (cpu_ns >= MIN_CLOCK_NS && m.cycles > 0).then_some(m.instructions as f64 / m.cycles as f64);
-    if ipc.is_some_and(|v| !(MIN_IPC..MAX_IPC).contains(&v)) {
-        return Err("ipc");
-    }
-    if cpu_ns >= MIN_CLOCK_NS {
-        let per_core = m.energy_nj as f64 / cpu_ns as f64;
-        if !(CPU_W_PER_CORE.0..=CPU_W_PER_CORE.1).contains(&per_core) {
-            return Err("energy");
-        }
-    }
-    let window = window_ns as f64;
-    let gpu_w = m.gpu_energy_nj as f64 / window;
-    if gpu_w > MAX_GPU_W {
-        return Err("gpu_energy");
-    }
-    let ane_w = m.ane_energy_nj as f64 / window;
-    let ane_busy = ns(m.ane_ticks) as f64 / window;
-    if ane_w > MAX_ANE_W || ane_busy > MAX_ANE_BUSY {
-        return Err("ane");
-    }
-    Ok(Judged {
-        cpu_s: cpu_ns as f64 / 1e9,
-        qos_s: qos_ns as f64 / 1e9,
-        p_s: p_ns as f64 / 1e9,
-        mhz: all,
-        p_mhz: p,
-        e_mhz: e,
-        e_refused,
-        e_qos_mhz: e_qos,
-        e_qos_refused,
-        ipc,
-        cpu_w: m.energy_nj as f64 / window,
-        gpu_w,
-        ane_w,
-        ane_busy,
-    })
 }
 
 #[cfg(test)]

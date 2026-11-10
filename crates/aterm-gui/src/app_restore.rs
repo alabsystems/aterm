@@ -600,21 +600,22 @@ pub(crate) fn leaf_program(
     root: &RootAnswer,
     named: Option<(i32, &str)>,
 ) -> Option<String> {
-    let name_for = |pgid: i32| {
-        named
-            .filter(|(at, _)| pgid > 0 && *at == pgid)
-            .map(|(_, name)| name.to_string())
-    };
     if crate::quit_safety::foreground_is_job(group, root_pid) {
-        return Some(name_for(group).unwrap_or_default());
+        return Some(
+            named
+                .filter(|(at, _)| group > 0 && *at == group)
+                .map_or_else(String::new, |(_, name)| name.to_string()),
+        );
     }
     match root {
         RootAnswer::Unasked => None,
         RootAnswer::Read(None) => Some(String::new()),
         RootAnswer::Read(Some(root)) if !crate::quit_safety::is_shell_name(&root.comm) => Some(
-            name_for(root_pid)
-                .filter(|name| !crate::quit_safety::is_shell_name(name))
-                .unwrap_or_default(),
+            named
+                .filter(|(at, name)| {
+                    root_pid > 0 && *at == root_pid && !crate::quit_safety::is_shell_name(name)
+                })
+                .map_or_else(String::new, |(_, name)| name.to_string()),
         ),
         RootAnswer::Read(Some(root)) => (!root.children.is_empty()).then(String::new),
     }
@@ -1112,15 +1113,30 @@ impl App {
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
                 let (cwd, title) = self.restore_session_meta(terminal.session);
-                let user_meta = self
+                let (user_meta, (sid, lineage, log_ep), claim) = self
                     .pool
                     .get(terminal.session)
                     .map(|s| {
-                        s.ctx
+                        let user_meta = s
+                            .ctx
                             .meta
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .sanitized()
+                            .sanitized();
+                        let (lineage, log_ep) = {
+                            let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                            (tl.slog().lineage(), tl.slog().log().ep())
+                        };
+                        let sid = s.ctx.self_id.as_str();
+                        let ids = (
+                            restore::carried_sid(sid).then(|| sid.to_string()),
+                            lineage
+                                .filter(|l| l.as_str() != sid && restore::carried_sid(l.as_str()))
+                                .map(|l| l.as_str().to_string()),
+                            Some(log_ep),
+                        );
+                        let claim = crate::harness_host::credit_claim::claim_worker(&s.ctx);
+                        (user_meta, ids, claim)
                     })
                     .unwrap_or_default();
                 let owed = if carry_drafts {
@@ -1128,28 +1144,11 @@ impl App {
                 } else {
                     None
                 };
-                let (sid, lineage, log_ep) = self
-                    .pool
-                    .get(terminal.session)
-                    .map(|s| {
-                        let (lineage, log_ep) = {
-                            let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                            (tl.slog().lineage(), tl.slog().log().ep())
-                        };
-                        let sid = s.ctx.self_id.as_str();
-                        (
-                            Some(sid.to_string()).filter(|sid| restore::carried_sid(sid)),
-                            lineage
-                                .map(|l| l.as_str().to_string())
-                                .filter(|l| l != sid && restore::carried_sid(l)),
-                            Some(log_ep),
-                        )
-                    })
-                    .unwrap_or_default();
-                let claim = self
-                    .pool
-                    .get(terminal.session)
-                    .and_then(|s| crate::harness_host::credit_claim::claim_worker(&s.ctx));
+                let supervised = if carry_drafts && owed.is_none() {
+                    self.hosted_agent(terminal.session).map(Box::new)
+                } else {
+                    None
+                };
                 // Marked from the agent the leaf carries here (a handoff's owed one), and again
                 // once a desk's agents are filled in (`fill_desk_agents`).
                 let mut leaf = restore::TerminalLeafRestore {
@@ -1169,12 +1168,8 @@ impl App {
                     theme: self
                         .kept_session_theme(terminal.session)
                         .map(|theme| theme.selector.clone()),
-                    agent: owed.clone(),
-                    supervised: if carry_drafts && owed.is_none() {
-                        self.hosted_agent(terminal.session).map(Box::new)
-                    } else {
-                        None
-                    },
+                    agent: owed,
+                    supervised,
                     lost: if carry_drafts {
                         self.hosted_lost_word(terminal.session).map(Box::new)
                     } else {
@@ -1657,27 +1652,17 @@ impl App {
         &self,
         manifest: &restore::RestoreManifest,
     ) -> Vec<crate::crash_journal::LeafProgram> {
-        fn leaves(node: &restore::RestoredSplitTree, out: &mut Vec<(u64, bool)>) {
-            match node {
-                restore::RestoredSplitTree::Leaf {
-                    view: restore::RestoredView::Terminal(leaf),
-                } => out.extend(leaf.local_id.map(|id| (id, leaf.agent.is_some()))),
-                restore::RestoredSplitTree::Leaf { .. } => {}
-                restore::RestoredSplitTree::Split { first, second, .. } => {
-                    leaves(first, out);
-                    leaves(second, out);
-                }
-            }
-        }
         let mut programs = Vec::new();
         let mut captured: Vec<u64> = Vec::new();
         for (window, layout) in manifest.windows.iter().enumerate() {
             for (tab, restored) in layout.restored_tabs.iter().enumerate() {
-                let mut ids = Vec::new();
-                leaves(&restored.root, &mut ids);
-                for (id, agent) in ids {
+                restored.root.visit_terminals(&mut |leaf| {
+                    let Some(id) = leaf.local_id else {
+                        return;
+                    };
+                    let agent = leaf.agent.is_some();
                     let Some(session) = self.pool.get(id) else {
-                        continue;
+                        return;
                     };
                     if session.pid <= 0
                         || session.master < 0
@@ -1685,29 +1670,31 @@ impl App {
                             .child_reaped
                             .load(std::sync::atomic::Ordering::Relaxed)
                     {
-                        continue;
+                        return;
                     }
                     let group = crate::quit_safety::foreground_pgrp(session.master);
                     #[cfg(unix)]
                     let root = RootAnswer::Read(crate::quit_safety::session_root(session.pid));
                     #[cfg(not(unix))]
                     let root = RootAnswer::Unasked;
-                    let named = {
+                    let Some(program) = ({
                         let timeline = session
                             .ctx
                             .timeline
                             .lock()
                             .unwrap_or_else(|p| p.into_inner());
                         let agent = timeline.agent();
-                        agent.program.clone().map(|name| (agent.program_pgid, name))
-                    };
-                    let Some(program) = leaf_program(
-                        group,
-                        session.pid,
-                        &root,
-                        named.as_ref().map(|(pgid, name)| (*pgid, name.as_str())),
-                    ) else {
-                        continue;
+                        leaf_program(
+                            group,
+                            session.pid,
+                            &root,
+                            agent
+                                .program
+                                .as_deref()
+                                .map(|name| (agent.program_pgid, name)),
+                        )
+                    }) else {
+                        return;
                     };
                     programs.push(crate::crash_journal::LeafProgram {
                         window: u32::try_from(window).unwrap_or(u32::MAX),
@@ -1717,7 +1704,7 @@ impl App {
                         again: captured.contains(&id),
                     });
                     captured.push(id);
-                }
+                });
             }
         }
         programs

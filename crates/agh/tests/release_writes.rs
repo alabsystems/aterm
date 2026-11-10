@@ -1189,6 +1189,8 @@ impl World {
     }
 }
 
+/// An edit sends the fields it changes, and a draft's tag besides: GitHub drops a draft's tag
+/// when an edit names none.
 #[test]
 fn edit_sends_only_what_differs() {
     let world = world("rw-edit");
@@ -1208,7 +1210,7 @@ fn edit_sends_only_what_differs() {
             .last()
             .and_then(|b| b.json.clone())
             .as_deref(),
-        Some(r#"{"name":"v1 final"}"#)
+        Some(r#"{"name":"v1 final","tag_name":"v1"}"#)
     );
     let again = world
         .releases()

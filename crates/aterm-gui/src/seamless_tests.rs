@@ -766,7 +766,7 @@ fn stamp_and_take_held(
         &[],
         &mut 0,
         dir,
-        nonce,
+        &OutgoingAttemptName::live(nonce),
         (0, 0),
         &mut Vec::new(),
     );

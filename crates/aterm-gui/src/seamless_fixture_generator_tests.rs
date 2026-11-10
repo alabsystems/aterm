@@ -48,9 +48,169 @@ fn fx_generator_in_child(output: &str) -> bool {
 }
 
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
+const FX_PRODUCER_PID: u32 = 42_424;
+const FX_PROOF_FD_BASE: i32 = 200;
+#[cfg(target_os = "macos")]
+const FX_RENDEZVOUS_DEVICE_BASE: i32 = 30_000;
+
+/// Process-local facts which are protocol inputs in production but must be
+/// explicit inputs to a release fixture. They are derived from the release
+/// stamp where time is meaningful, rather than from the generator process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FixtureIdentity {
+    producer_pid: u32,
+    wall_unix_ms: u64,
+    wall_offset_s: i64,
+    #[cfg(target_os = "macos")]
+    parent_birth: ProcessBirth,
+}
+
+thread_local! {
+    static FX_LOG_EPOCHS: std::cell::RefCell<Option<std::sync::Arc<crate::session_log::Epochs>>> =
+        const { std::cell::RefCell::new(None) };
+    static FX_MONOTONIC_BASE: std::cell::Cell<Option<aterm_time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static FX_PROCESS_NEXT_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn fx_reset_process_identity() {
+    FX_LOG_EPOCHS.with(|epochs| {
+        *epochs.borrow_mut() = Some(std::sync::Arc::new(crate::session_log::Epochs::new()));
+    });
+    let base = aterm_core::terminal::ClockReading::now().monotonic;
+    FX_MONOTONIC_BASE.with(|slot| slot.set(Some(base)));
+    FX_PROCESS_NEXT_MS.with(|next| next.set(0));
+}
+
+fn fx_log_epochs() -> std::sync::Arc<crate::session_log::Epochs> {
+    FX_LOG_EPOCHS.with(|epochs| {
+        let mut epochs = epochs.borrow_mut();
+        std::sync::Arc::clone(
+            epochs.get_or_insert_with(|| std::sync::Arc::new(crate::session_log::Epochs::new())),
+        )
+    })
+}
+
+impl FixtureIdentity {
+    fn for_release() -> Self {
+        let release_seconds = crate::running_build_number();
+        Self {
+            producer_pid: FX_PRODUCER_PID,
+            wall_unix_ms: release_seconds.saturating_mul(1_000),
+            wall_offset_s: 0,
+            #[cfg(target_os = "macos")]
+            parent_birth: ProcessBirth::fixture(release_seconds, 424_242)
+                .expect("the fixed microsecond term is valid"),
+        }
+    }
+
+    fn app(self) -> crate::App {
+        let mut app = crate::App::headless_for_test();
+        app.messages_wall = crate::messages_host::WallClock::Pinned {
+            unix_ms: self.wall_unix_ms,
+            offset_s: self.wall_offset_s,
+        };
+        app
+    }
+
+    fn attempt(self, nonce: &str) -> OutgoingAttemptName {
+        OutgoingAttemptName::fixture(self.producer_pid, nonce)
+            .expect("the fixture producer identity and nonce are nonzero")
+    }
+
+    fn proof_identities(sessions: &[FxSession]) -> Vec<crate::seamless::SessionIdentity> {
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                (
+                    session.record.local_id,
+                    FX_PROOF_FD_BASE
+                        + i32::try_from(index).expect("fixture session index fits i32"),
+                    40_000 + i32::try_from(index).expect("fixture session index fits i32"),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rendezvous_terms(sessions: &[(u64, i32)]) -> Vec<crate::seamless::SessionIdentity> {
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(index, (local_id, pid))| {
+                (
+                    *local_id,
+                    FX_RENDEZVOUS_DEVICE_BASE
+                        + i32::try_from(index).expect("fixture session index fits i32"),
+                    *pid,
+                )
+            })
+            .collect()
+    }
+
+    fn resource_boot() -> [u8; 16] {
+        [0x42; 16]
+    }
+
+    fn resource_root(self) -> aterm_vitals::delegated::ProcessKey {
+        aterm_vitals::delegated::ProcessKey {
+            pid: self.producer_pid,
+            start: crate::running_build_number(),
+        }
+    }
+}
+
 fn fx_target_build() -> u64 {
     crate::running_build_number() + FX_SUCCESSOR_AFTER_SECS
 }
+
+fn fx_process_at(terminal: &mut Terminal, input: &[u8], offset_ms: u64) {
+    let offset_ms = FX_PROCESS_NEXT_MS.with(|next| {
+        let offset = next.get().max(offset_ms);
+        next.set(offset.saturating_add(1));
+        offset
+    });
+    let monotonic = FX_MONOTONIC_BASE.with(|slot| {
+        let base = slot.get().unwrap_or_else(|| {
+            let base = aterm_core::terminal::ClockReading::now().monotonic;
+            slot.set(Some(base));
+            base
+        });
+        base + std::time::Duration::from_millis(offset_ms)
+    });
+    let clock = aterm_core::terminal::ClockReading {
+        monotonic,
+        wall_ms: Some(
+            FixtureIdentity::for_release()
+                .wall_unix_ms
+                .saturating_add(offset_ms),
+        ),
+    };
+    terminal.process_at(input, clock);
+}
+
+trait FixtureProcess {
+    fn fx_process(&mut self, input: &[u8]);
+}
+
+impl FixtureProcess for Terminal {
+    fn fx_process(&mut self, input: &[u8]) {
+        fx_process_at(self, input, 0);
+    }
+}
+
+fn fx_say(app: &mut FakeApp, terminal: &mut Terminal, lines: impl IntoIterator<Item = String>) {
+    let (rows, cols) = (terminal.rows(), terminal.cols());
+    for (index, line) in lines.into_iter().enumerate() {
+        app.doc.push(line);
+        if index % 2 == 1 {
+            terminal.fx_process(&app.frame(rows, cols));
+        }
+    }
+    terminal.fx_process(&app.frame(rows, cols));
+}
+
 const FX_SUCCESSOR_AFTER_SECS: u64 = 86_400;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
 fn fx_successor_version() -> String {
@@ -313,7 +473,9 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
 }
 
 fn fx_timeline() -> Arc<Mutex<crate::session_timeline::SessionTimeline>> {
-    let mut timeline = crate::session_timeline::SessionTimeline::default();
+    let identity = FixtureIdentity::for_release();
+    let at = aterm_slog::Stamp::new(identity.wall_unix_ms, 1_000);
+    let mut timeline = crate::session_timeline::SessionTimeline::for_fixture(fx_log_epochs(), at);
     let at = timeline.slog().now();
     timeline.slog_mut().open_session(None, None, at);
     timeline.record("spawned");
@@ -570,7 +732,7 @@ fn fx_window(
 }
 
 fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
-    let mut app = crate::App::headless_for_test();
+    let mut app = FixtureIdentity::for_release().app();
     if installing {
         app.post_message(crate::update_words::installing(&fx_successor_version()));
     }
@@ -598,7 +760,7 @@ fn fx_shell(rows: u16, cols: u16, lines: usize, cwd: &str, flavour: u8) -> Termi
     let mut t = Terminal::new(rows, cols);
     t.set_alt_archive_enabled(true);
     t.set_alt_archive_origin(0x5eed_0100 + u64::from(flavour));
-    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    t.fx_process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
     for i in 0..lines {
         let row = match (i + usize::from(flavour)) % 9 {
             0 => format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % make test-{i}\r\n"),
@@ -622,19 +784,19 @@ fn fx_shell(rows: u16, cols: u16, lines: usize, cwd: &str, flavour: u8) -> Termi
                 i % 60
             ),
         };
-        t.process(row.as_bytes());
+        t.fx_process(row.as_bytes());
     }
-    t.process(format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ").as_bytes());
+    t.fx_process(format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ").as_bytes());
     t
 }
 
 fn fx_editor(rows: u16, cols: u16, flavour: u8) -> Terminal {
     let mut t = fx_shell(rows, cols, 40, "/home/dev/src", flavour);
-    t.process(b"vim notes.md\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    t.fx_process(b"vim notes.md\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
     for r in 1..rows {
-        t.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+        t.fx_process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
     }
-    t.process(
+    t.fx_process(
         format!("\x1b[1;1H# notes {flavour}\x1b[{rows};1H\x1b[7m notes.md \x1b[0m\x1b[2;1H")
             .as_bytes(),
     );
@@ -647,15 +809,15 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
     t.set_alt_archive_enabled(true);
     t.set_alt_archive_origin(ORIGIN + local_id);
     for i in 0..before {
-        t.process(format!("$ command {i}\r\n").as_bytes());
+        t.fx_process(format!("$ command {i}\r\n").as_bytes());
     }
-    t.process(b"$ claude");
-    t.process(b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
-    t.process(&app.frame(rows, cols));
+    t.fx_process(b"$ claude");
+    t.fx_process(b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
+    t.fx_process(&app.frame(rows, cols));
     let mut ledger = TurnLedger::default();
     let arch = ArchMark::of(&t);
-    app.say(&mut t, [format!("\u{276f} {TURN_TEXT}")]);
-    app.say(&mut t, numbered(1..=24));
+    fx_say(&mut app, &mut t, [format!("\u{276f} {TURN_TEXT}")]);
+    fx_say(&mut app, &mut t, numbered(1..=24));
     ledger.push(TurnRecord {
         id: 41,
         started_ms: 100,
@@ -1226,7 +1388,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         desk.name
     );
     let resources = (desk.name == "carried-state").then(|| {
-        crate::resource_jobs::live_fixture_carry(&records.first().expect("carried session").sid)
+        let identity = FixtureIdentity::for_release();
+        crate::resource_jobs::fixture_carry(
+            &records.first().expect("carried session").sid,
+            FixtureIdentity::resource_boot(),
+            identity.resource_root(),
+        )
     });
     let mut manifest = SessionHandoff {
         resources,
@@ -1312,6 +1479,8 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         desk.name
     );
     let nonce = format!("{:032x}", desk.nonce_seed);
+    let fixture_identity = FixtureIdentity::for_release();
+    let attempt = fixture_identity.attempt(&nonce);
     let layout_wire = layout
         .to_toml()
         .ok()
@@ -1350,13 +1519,13 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             fx_target_build(),
         ),
     );
-    let verdicts = crate::handoff_history::stamp_manifest(
+    let verdicts = crate::handoff_history::stamp_fixture_manifest(
         &mut manifest,
         screens,
         &capture.heads,
         results,
         &dir,
-        &nonce,
+        &attempt,
     );
     assert_eq!(verdicts.len(), desk.sessions.len(), "{}", desk.name);
     for (local_id, joined) in &verdicts {
@@ -1416,7 +1585,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         );
     }
     let held = &capture.held;
-    let outgoing = write_outgoing_with_held(
+    let outgoing = write_fixture_outgoing_with_held(
         &manifest,
         &fds,
         screens,
@@ -1425,7 +1594,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         &controls,
         held,
         held_history,
-        &nonce,
+        &attempt,
     )
     .expect("this release's writer publishes this desk");
     assert_eq!(
@@ -1445,13 +1614,18 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let layout = layout_wire_digest(&layout_wire).unwrap();
     assert_eq!(Some(layout), layout_digest(&folded));
     assert_eq!(layout, committed_layout);
+    // The live descriptors above prove the writer and receiver against the
+    // actual transport below. The checked-in compatibility record commits a
+    // fixed representative identity set, because descriptor numbers belong to
+    // the isolated generator process rather than to the protocol fixture.
+    let fixture_proof_identities = FixtureIdentity::proof_identities(&desk.sessions);
     let proof = adoption_proof(
         &nonce,
         fx_target_build(),
         FIXTURE_TARGET_COMMIT,
         &layout,
         &outgoing.screen_digest,
-        &fds.entries,
+        &fixture_proof_identities,
     )
     .unwrap();
 
@@ -1712,8 +1886,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         }
         session_rows.push('\n');
     }
-    let identities = fds
-        .entries
+    let identities = fixture_proof_identities
         .iter()
         .map(|(id, fd, pid)| format!("[{id}, {fd}, {pid}]"))
         .collect::<Vec<_>>()
@@ -2219,9 +2392,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 .shell_integration_nonce
                 .map_or_else(String::new, |nonce| format!(";id={}", nonce.to_hex()));
             if successor.is_alternate_screen() {
-                successor.process(b"\x1b[?1049l");
+                successor.fx_process(b"\x1b[?1049l");
             }
-            successor.process(format!("\x1b]133;D;0{sign}\x07").as_bytes());
+            successor.fx_process(format!("\x1b]133;D;0{sign}\x07").as_bytes());
             assert_eq!(
                 successor.completed_command_seq(),
                 source.completed_command_seq() + 1,
@@ -2345,7 +2518,7 @@ fn fx_incident_desk() -> FxDesk {
         let mut t = claude.term.lock().unwrap();
         t.resize(55, 149);
         let frame = FakeApp::new().frame(55, 149);
-        t.process(&frame);
+        t.fx_process(&frame);
         let cp = t.checkpoint_carry(256).expect("Ground");
         let meta = CheckpointMeta::from_checkpoint(&cp);
         assert_eq!(meta.rows, 55);
@@ -2427,9 +2600,9 @@ fn fx_claude_desk() -> FxDesk {
 fn fx_history_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut h0 = fx_shell(40, 120, 1200, "/home/dev/src/aterm", 3);
-    h0.process(b"\x1b[?2004h\x1b[>1u\x1b[5 q");
+    h0.fx_process(b"\x1b[?2004h\x1b[>1u\x1b[5 q");
     let mut h1 = fx_shell(40, 119, 900, "/home/dev/logs", 4);
-    h1.process(b"\x1b[3g\x1b[1;9H\x1bH\x1b[1;17H\x1bH\x1b[40;1H\x1b[5;35r\x1b[35;1H");
+    h1.fx_process(b"\x1b[3g\x1b[1;9H\x1bH\x1b[1;17H\x1bH\x1b[40;1H\x1b[5;35r\x1b[35;1H");
     let h2 = fx_shell(24, 80, 10, "/home/dev", 5);
     let mut sessions = vec![
         fx_session(0, "zsh", h0),
@@ -2561,9 +2734,10 @@ fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8
     t.authorize_shell_integration(nonce);
     t.set_require_shell_integration_nonce(true);
     let id = fx_hex(&nonce);
-    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    t.fx_process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
     for i in 0..(20 + usize::from(flavour) * 7) {
-        t.process(
+        fx_process_at(
+            &mut t,
             format!(
                 "\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]633;E;make test-{i};id={id}\x07\
                  \x1b]133;B;id={id}\x07make test-{i}\r\n\x1b]133;C;id={id}\x07\
@@ -2571,10 +2745,13 @@ fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8
                 i % 3
             )
             .as_bytes(),
+            u64::try_from(i).unwrap().saturating_mul(10),
         );
     }
-    t.process(
+    fx_process_at(
+        &mut t,
         format!("\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]133;B;id={id}\x07").as_bytes(),
+        10_000,
     );
     t
 }
@@ -2583,7 +2760,7 @@ fn fx_shell_integration_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let a = fx_signed_shell(30, 100, [0x94; 32], "/home/dev/src/aterm", 1);
     let mut b = fx_signed_shell(30, 99, [0x49; 32], "/home/dev/notes", 2);
-    b.process(b"vim notes.md\r\n\x1b[?1049h\x1b[H\x1b[2J# notes\x1b[30;1H\x1b[7m notes.md \x1b[0m\x1b[2;1H");
+    b.fx_process(b"vim notes.md\r\n\x1b[?1049h\x1b[H\x1b[2J# notes\x1b[30;1H\x1b[7m notes.md \x1b[0m\x1b[2;1H");
     let mut sessions = vec![fx_session(0, "zsh", a), fx_session(1, "vim", b)];
     for session in &mut sessions {
         session.record.rekey = true;
@@ -2616,11 +2793,11 @@ fn fx_history_carry_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView, SplitKind};
     let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
     let mut paged = fx_shell(40, 119, 1000, "/home/dev/logs", 7);
-    paged.process(b"less build.log\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    paged.fx_process(b"less build.log\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
     for r in 1..40 {
-        paged.process(format!("\x1b[{r};1Hbuild.log line {r:03}").as_bytes());
+        paged.fx_process(format!("\x1b[{r};1Hbuild.log line {r:03}").as_bytes());
     }
-    paged.process(b"\x1b[40;1H\x1b[7mbuild.log lines 1-39\x1b[0m");
+    paged.fx_process(b"\x1b[40;1H\x1b[7mbuild.log lines 1-39\x1b[0m");
     let mut sessions = vec![fx_session(0, "zsh", deep), fx_session(1, "less", paged)];
     for session in &mut sessions {
         session.record.rekey = true;
@@ -2688,20 +2865,22 @@ fn fx_marked_shell(
         }
         None => String::new(),
     };
-    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
-    t.process(theme);
+    t.fx_process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    t.fx_process(theme);
     for i in 0..commands {
         let command = format!("cargo test -p crate{i}");
-        t.process(
+        fx_process_at(
+            &mut t,
             format!(
                 "\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \
                  \x1b]633;E;{command}{sign}\x07\x1b]133;B{sign}\x07{command}\r\n\
                  \x1b]133;C{sign}\x07"
             )
             .as_bytes(),
+            u64::try_from(i).unwrap().saturating_mul(10),
         );
         for j in 0..(1 + (i + usize::from(flavour)) % 6) {
-            t.process(
+            t.fx_process(
                 format!(
                     "\x1b[32mok\x1b[0m  crate{i}::case_{j:02} \x1b[2m({} ms)\x1b[0m\r\n",
                     i * 7 + j
@@ -2710,13 +2889,19 @@ fn fx_marked_shell(
             );
         }
         let code = if i % 5 == 4 { 101 } else { 0 };
-        t.process(format!("\x1b]133;D;{code}{sign}\x07").as_bytes());
+        fx_process_at(
+            &mut t,
+            format!("\x1b]133;D;{code}{sign}\x07").as_bytes(),
+            u64::try_from(i).unwrap().saturating_mul(10) + 5,
+        );
     }
-    t.process(
+    fx_process_at(
+        &mut t,
         format!(
             "\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \x1b]133;B{sign}\x07"
         )
         .as_bytes(),
+        u64::try_from(commands).unwrap().saturating_mul(10) + 9,
     );
     (t, sign)
 }
@@ -2744,34 +2929,38 @@ fn fx_colour_and_shell_desk() -> FxDesk {
         "/home/dev/src/aterm",
         1,
     );
-    build.process(
+    fx_process_at(
+        &mut build,
         format!(
             "\x1b]633;E;cargo build --release{sign}\x07cargo build --release\r\n\
              \x1b]133;C{sign}\x07"
         )
         .as_bytes(),
+        20_000,
     );
     for k in 0..12 {
-        build.process(
+        build.fx_process(
             format!(
                 "\x1b[1;32m   Compiling\x1b[0m crate{k} v0.1.0 (/home/dev/src/aterm/crates/crate{k})\r\n"
             )
             .as_bytes(),
         );
     }
-    build.process(b"\x1b[1;36m    Building\x1b[0m [=====>        ] 12/40: crate12");
+    build.fx_process(b"\x1b[1;36m    Building\x1b[0m [=====>        ] 12/40: crate12");
 
     let (mut edit, _) = fx_marked_shell(42, 119, None, false, b"", 40, "/home/dev/notes", 2);
-    edit.process(
+    fx_process_at(
+        &mut edit,
         b"\x1b]633;E;vim notes.md\x07vim notes.md\r\n\x1b]133;C\x07\
           \x1b[?1049h\x1b[?1h\x1b=\x1b]30001\x07\
           \x1b]11;rgb:1d/20/21\x07\x1b]12;rgb:fa/bd/2f\x07\x1b]17;rgb:50/49/45\x07\
           \x1b[H\x1b[2J",
+        20_100,
     );
     for r in 2..42 {
-        edit.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+        edit.fx_process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
     }
-    edit.process(b"\x1b[1;1H# notes\x1b[42;1H\x1b[7m notes.md [+] \x1b[0m\x1b[1;8H");
+    edit.fx_process(b"\x1b[1;1H# notes\x1b[42;1H\x1b[7m notes.md [+] \x1b[0m\x1b[1;8H");
 
     let mut sessions = vec![fx_session(0, "cargo", build), fx_session(1, "vim", edit)];
     sessions[0].record.rekey = true;
@@ -2802,13 +2991,13 @@ fn fx_colour_and_shell_desk() -> FxDesk {
 fn fx_stalled_sequence_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut title = fx_shell(30, 100, 300, "/home/dev/src/aterm", 8);
-    title.process(b"printf '\\e]0;building'\r\n\x1b]0;building");
+    title.fx_process(b"printf '\\e]0;building'\r\n\x1b]0;building");
     assert_eq!(title.partial_sequence_state(), Some("OscString"));
     let mut ssh = fx_shell(30, 99, 120, "/home/dev", 0);
-    ssh.process(b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ \x1b[38;5;");
+    ssh.fx_process(b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ \x1b[38;5;");
     assert_eq!(ssh.partial_sequence_state(), Some("CsiParam"));
     let mut image = fx_editor(30, 200, 3);
-    image.process(b"\x1b[5;10H\x1b_Gf=100,a=T,i=7,m=1;iVBORw0KGgoAAAANSUhEUgAA");
+    image.fx_process(b"\x1b[5;10H\x1b_Gf=100,a=T,i=7,m=1;iVBORw0KGgoAAAANSUhEUgAA");
     assert_eq!(image.partial_sequence_state(), Some("SosPmApcString"));
     let sessions = vec![
         fx_session(0, "zsh", title),
@@ -2864,44 +3053,46 @@ fn fx_link_dense_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
     let mut runs = fx_shell(32, 110, 100, "/home/dev/src/aterm", 5);
-    runs.process(b"gh run view 4242 --log-links\r\n");
-    runs.process(
+    runs.fx_process(b"gh run view 4242 --log-links\r\n");
+    runs.fx_process(
         "\x1b[1mRun 4242\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes(),
     );
-    runs.process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
-    runs.process(b"\r\n");
+    runs.fx_process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
+    runs.fx_process(b"\r\n");
     for step in 0..40 {
-        runs.process(
+        runs.fx_process(
             format!("  \x1b[32m\u{2713}\x1b[0m step {step:02}: cargo test -p crate{step}\r\n")
                 .as_bytes(),
         );
     }
-    runs.process(
+    runs.fx_process(
         format!(
             "{}gh run view 4243 --log-links\r\n",
             prompt("/home/dev/src/aterm")
         )
         .as_bytes(),
     );
-    runs.process("\x1b[1mRun 4243\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes());
-    runs.process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
-    runs.process(b"\r\n");
-    runs.process(fx_link_row(2, 8192, "docs.example.test", "doc").as_bytes());
-    runs.process(b"\r\n");
-    runs.process(prompt("/home/dev/src/aterm").as_bytes());
+    runs.fx_process(
+        "\x1b[1mRun 4243\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes(),
+    );
+    runs.fx_process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
+    runs.fx_process(b"\r\n");
+    runs.fx_process(fx_link_row(2, 8192, "docs.example.test", "doc").as_bytes());
+    runs.fx_process(b"\r\n");
+    runs.fx_process(prompt("/home/dev/src/aterm").as_bytes());
 
     let mut notes = fx_shell(32, 109, 600, "/home/dev/notes", 6);
-    notes.process(
+    notes.fx_process(
         b"curl -s https://ci.example.test/api/runs/4242 | jq -r '.jobs[].log' | linkify\r\n",
     );
-    notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
-    notes.process(b"\r\n");
-    notes.process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
-    notes.process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    notes.fx_process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
+    notes.fx_process(b"\r\n");
+    notes.fx_process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
+    notes.fx_process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
     for r in 4..32 {
-        notes.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+        notes.fx_process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
     }
-    notes.process(
+    notes.fx_process(
         b"\x1b[1;1H# CI runs\x1b[2;1H- 4242: green\x1b[3;1H- 4243: \x1b[31mred\x1b[0m\
           \x1b[32;1H\x1b[7m ci.md [+] \x1b[0m\x1b[3;9H",
     );
@@ -2940,14 +3131,14 @@ fn fx_link_dense_history_desk() -> FxDesk {
     };
     let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
     let mut runs = fx_shell(32, 110, 300, "/home/dev/src/aterm", 7);
-    runs.process(b"gh run view 4250 --log-links\r\n");
-    runs.process(
+    runs.fx_process(b"gh run view 4250 --log-links\r\n");
+    runs.fx_process(
         "\x1b[1mRun 4250\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes(),
     );
-    runs.process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
-    runs.process(b"\r\n");
+    runs.fx_process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
+    runs.fx_process(b"\r\n");
     for step in 0..400 {
-        runs.process(
+        runs.fx_process(
             format!(
                 "  \x1b[32m\u{2713}\x1b[0m step {step:03}: cargo test -p crate{} -- case_{step:03} \x1b[2m({} ms)\x1b[0m\r\n",
                 step % 40,
@@ -2956,20 +3147,22 @@ fn fx_link_dense_history_desk() -> FxDesk {
             .as_bytes(),
         );
     }
-    runs.process(
+    runs.fx_process(
         format!(
             "{}gh run view 4251 --log-links\r\n",
             prompt("/home/dev/src/aterm")
         )
         .as_bytes(),
     );
-    runs.process("\x1b[1mRun 4251\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes());
-    runs.process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
-    runs.process(b"\r\n");
-    runs.process(fx_link_row(2, 8192, "docs.example.test", "doc").as_bytes());
-    runs.process(b"\r\n");
+    runs.fx_process(
+        "\x1b[1mRun 4251\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes(),
+    );
+    runs.fx_process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
+    runs.fx_process(b"\r\n");
+    runs.fx_process(fx_link_row(2, 8192, "docs.example.test", "doc").as_bytes());
+    runs.fx_process(b"\r\n");
     for line in 0..60 {
-        runs.process(
+        runs.fx_process(
             format!(
                 "\x1b[31merror\x1b[0m[E0308]: mismatched types in crate{} at line {line}\r\n",
                 line % 7
@@ -2977,18 +3170,18 @@ fn fx_link_dense_history_desk() -> FxDesk {
             .as_bytes(),
         );
     }
-    runs.process(prompt("/home/dev/src/aterm").as_bytes());
+    runs.fx_process(prompt("/home/dev/src/aterm").as_bytes());
 
     let mut notes = fx_shell(32, 109, 500, "/home/dev/notes", 8);
-    notes.process(
+    notes.fx_process(
         b"curl -s https://ci.example.test/api/runs/4251 | jq -r '.jobs[].log' | linkify\r\n",
     );
-    notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
-    notes.process(b"\r\n");
+    notes.fx_process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
+    notes.fx_process(b"\r\n");
     // Past the 256 lines the screen carry holds of the saved primary, so the line crosses in the
     // history sidecar, whose import strips its links.
     for line in 0..320 {
-        notes.process(
+        notes.fx_process(
             format!(
                 "- job {line:02}: \x1b[32mpassed\x1b[0m in {}s\r\n",
                 30 + line % 50
@@ -2996,12 +3189,12 @@ fn fx_link_dense_history_desk() -> FxDesk {
             .as_bytes(),
         );
     }
-    notes.process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
-    notes.process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    notes.fx_process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
+    notes.fx_process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
     for r in 4..32 {
-        notes.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+        notes.fx_process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
     }
-    notes.process(
+    notes.fx_process(
         b"\x1b[1;1H# CI runs\x1b[2;1H- 4250: green\x1b[3;1H- 4251: \x1b[31mred\x1b[0m\
           \x1b[32;1H\x1b[7m ci.md [+] \x1b[0m\x1b[3;9H",
     );
@@ -3065,22 +3258,24 @@ fn fx_building_shell(
         "/home/dev/src/aterm",
         flavour,
     );
-    build.process(
+    fx_process_at(
+        &mut build,
         format!(
             "\x1b]633;E;cargo build --release{sign}\x07cargo build --release\r\n\
              \x1b]133;C{sign}\x07"
         )
         .as_bytes(),
+        20_000,
     );
     for k in 0..6 {
-        build.process(
+        build.fx_process(
             format!(
                 "\x1b[1;32m   Compiling\x1b[0m crate{k} v0.1.0 (/home/dev/src/aterm/crates/crate{k})\r\n"
             )
             .as_bytes(),
         );
     }
-    build.process(b"\x1b[1;36m    Building\x1b[0m [==>           ] 6/40: crate6");
+    build.fx_process(b"\x1b[1;36m    Building\x1b[0m [==>           ] 6/40: crate6");
     build
 }
 
@@ -3130,7 +3325,7 @@ fn fx_policy_repaint_desk() -> FxDesk {
     let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
     let editor = fx_editor(40, 119, 4);
     let mut stalled = fx_shell(40, 120, 200, "/home/dev/src", 8);
-    stalled.process(b"printf '\\e]0;deploying'\r\n\x1b]0;deploying");
+    stalled.fx_process(b"printf '\\e]0;deploying'\r\n\x1b]0;deploying");
     assert_eq!(stalled.partial_sequence_state(), Some("OscString"));
     let mut sessions = vec![
         fx_session(0, "zsh", deep),
@@ -3175,18 +3370,18 @@ fn fx_policy_repaint_desk() -> FxDesk {
 fn fx_held_pane_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut make = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", 4);
-    make.process(b"make test\r\n");
+    make.fx_process(b"make test\r\n");
     for i in 0..6 {
-        make.process(
+        make.fx_process(
             format!("   Compiling crate-{i} v0.1.0 (/home/dev/src/aterm/crates/crate-{i})\r\n")
                 .as_bytes(),
         );
     }
-    make.process(
+    make.fx_process(
         b"see \x1b]8;;https://ci.example.invalid/run/4521/log\x1b\\the log\x1b]8;;\x1b\\ for details\r\n",
     );
-    make.process(b"\x1b[1;31merror\x1b[0m: test failed, to rerun pass `-p crate-3 --lib`\r\n");
-    make.process(b"make: *** [test] Error 2\r\n");
+    make.fx_process(b"\x1b[1;31merror\x1b[0m: test failed, to rerun pass `-p crate-3 --lib`\r\n");
+    make.fx_process(b"make: *** [test] Error 2\r\n");
     let vim = fx_editor(ROWS, COLS, 6);
     FxDesk {
         name: "held-pane",
@@ -3257,6 +3452,17 @@ struct FxMailbox {
     mirror_served: bool,
 }
 
+fn fx_mailbox_handle(local_id: u64) -> crate::session_store::SessionHandle {
+    let at = aterm_slog::Stamp::new(FixtureIdentity::for_release().wall_unix_ms, 2_000);
+    crate::session_store::test_handle_identified(
+        local_id,
+        aterm_session::SessionId::new(format!("s-{local_id:020x}")),
+        aterm_session::LaunchNonce::from_bytes([u8::try_from(local_id + 1).unwrap(); 16]),
+        fx_log_epochs(),
+        at,
+    )
+}
+
 fn fx_mailbox() -> FxMailbox {
     use crate::fabric::{
         CARRY_MAIL_BYTES, RING_CAP, bridge_attached, cmd_deliver, cmd_hello, cmd_inbox_seen,
@@ -3265,7 +3471,7 @@ fn fx_mailbox() -> FxMailbox {
     use crate::session_store::{ExitActor, ExitReason};
     crate::fabric::with_link_reset(|| {
         let store = crate::session_store::new_store();
-        let h = crate::session_store::test_handle(0);
+        let h = fx_mailbox_handle(0);
         let sid = h.sid.as_str().to_string();
         let ctx = h.ctx.clone();
         store.write().unwrap().register(h);
@@ -3346,7 +3552,7 @@ fn fx_mailbox() -> FxMailbox {
             );
             assert!(reply.starts_with("OK "), "{reply}");
         }
-        let closed = crate::session_store::test_handle(9);
+        let closed = fx_mailbox_handle(9);
         let closed_ctx = closed.ctx.clone();
         store.write().unwrap().register(closed);
         {
@@ -3431,12 +3637,12 @@ fn fx_worker(local_id: u64, rows: u16, cols: u16) -> (FxSession, u64) {
     let mut t = Terminal::new(rows, cols);
     t.set_alt_archive_enabled(true);
     t.set_alt_archive_origin(ORIGIN + local_id);
-    t.process(b"$ claude");
-    t.process(b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
-    t.process(&app.frame(rows, cols));
+    t.fx_process(b"$ claude");
+    t.fx_process(b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
+    t.fx_process(&app.frame(rows, cols));
     let manager_mark = ArchMark::of(&t);
-    app.say(&mut t, [format!("\u{276f} {TURN_TEXT}")]);
-    app.say(&mut t, numbered(1..=24));
+    fx_say(&mut app, &mut t, [format!("\u{276f} {TURN_TEXT}")]);
+    fx_say(&mut app, &mut t, numbered(1..=24));
     let manager = TurnRecord {
         id: 41,
         started_ms: 100,
@@ -3451,8 +3657,8 @@ fn fx_worker(local_id: u64, rows: u16, cols: u16) -> (FxSession, u64) {
         carried: false,
     };
     let pressed_mark = ArchMark::of(&t);
-    app.say(&mut t, ["\u{276f} keep going".to_string()]);
-    app.say(&mut t, numbered(25..=40));
+    fx_say(&mut app, &mut t, ["\u{276f} keep going".to_string()]);
+    fx_say(&mut app, &mut t, numbered(25..=40));
     let pressed = TurnRecord {
         id: 42,
         started_ms: 4_100,
@@ -3467,7 +3673,7 @@ fn fx_worker(local_id: u64, rows: u16, cols: u16) -> (FxSession, u64) {
         carried: false,
     };
     let top = app.doc.len() - (usize::from(rows) - 5) - 8;
-    t.process(&app.frame_from(top, rows, cols));
+    t.fx_process(&app.frame_from(top, rows, cols));
     let mut adopted = crate::handoff_carry::ControlCarry {
         turns: vec![manager],
         unheld_below: 0,
@@ -3702,7 +3908,7 @@ fn fx_carried_state_desk() -> FxDesk {
     );
     sessions[1].record.parent = Some(sessions[0].record.sid.clone());
 
-    let mut app = crate::App::headless_for_test();
+    let mut app = FixtureIdentity::for_release().app();
     let reset = app.default_font_size;
     assert!(app.set_font_size_with(reset + 2.0 * crate::FONT_ZOOM_STEP, |_| true));
     let zoom = app.handoff_font_zoom();
@@ -3730,11 +3936,7 @@ fn fx_carried_state_desk() -> FxDesk {
             "20 failed checks in a row since {}: release manifests exist but cannot be \
              downloaded.",
             aterm_types::rfc3339::format_rfc3339(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("after the epoch")
-                    .as_secs()
-                    - 3_600
+                FixtureIdentity::for_release().wall_unix_ms / 1_000 - 3_600
             )
         ),
     ));
@@ -4087,13 +4289,13 @@ fn fx_held_history_desk(failed: bool) -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let cwd = "/home/dev/src/aterm";
     let mut make = fx_shell(ROWS, COLS, 90, cwd, 2);
-    make.process(b"make check\r\n");
+    make.fx_process(b"make check\r\n");
     for i in 0..40 {
-        make.process(
+        make.fx_process(
             format!("   Compiling crate-{i} v0.1.0 ({cwd}/crates/crate-{i})\r\n").as_bytes(),
         );
     }
-    make.process(
+    make.fx_process(
         b"\x1b[1;31merror\x1b[0m: could not compile `crate-39`\r\nmake: *** [check] Error 101\r\n",
     );
     let (ceiling, name, nonce_seed) = if failed {
@@ -4152,19 +4354,19 @@ fn fx_card(n: u8) -> Vec<u8> {
 fn fx_two_drawers(flavour: u8) -> Terminal {
     use aterm_core::terminal::{CutKind, HolderCut};
     let mut t = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", flavour);
-    t.process(b"claude\r\n");
+    t.fx_process(b"claude\r\n");
     t.note_holder_cut(HolderCut {
         to: Some(0x00c1_a0de_0001),
         kind: CutKind::Group,
         from_alive: false,
     });
-    t.process(&fx_card(0));
+    t.fx_process(&fx_card(0));
     t.note_holder_cut(HolderCut {
         to: None,
         kind: CutKind::Group,
         from_alive: true,
     });
-    t.process(
+    t.fx_process(
         b"\r\n[1]+  Stopped                 claude\r\ndev@devhost aterm % claude --continue\r\n",
     );
     t.note_holder_cut(HolderCut {
@@ -4172,7 +4374,7 @@ fn fx_two_drawers(flavour: u8) -> Terminal {
         kind: CutKind::Group,
         from_alive: false,
     });
-    t.process(&fx_card(1));
+    t.fx_process(&fx_card(1));
     t
 }
 
@@ -4182,17 +4384,19 @@ fn fx_engine_state_desk() -> FxDesk {
     let mut shells: Vec<(&str, Terminal, &str)> = Vec::new();
 
     let mut ssh = fx_shell(ROWS, COLS, 40, "/home/dev", 2);
-    ssh.process(b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ ls\r\n\x1b[38:2::120:200:3");
+    ssh.fx_process(
+        b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ ls\r\n\x1b[38:2::120:200:3",
+    );
     assert_eq!(ssh.partial_sequence_state(), Some("CsiParam"));
     shells.push(("ssh", ssh, "/home/dev"));
 
     let mut vim = fx_editor(ROWS, COLS, 4);
-    vim.process(b"\x1b[2 ");
+    vim.fx_process(b"\x1b[2 ");
     assert_eq!(vim.partial_sequence_state(), Some("CsiIntermediate"));
     shells.push(("vim", vim, "/home/dev/src"));
 
     let mut vsplit = fx_shell(ROWS, COLS, 6, cwd, 7);
-    vsplit.process("vim -O a b\r\n\x1b[?1049h\x1b[?69h\x1b[51;100s\x1b[1;50H│".as_bytes());
+    vsplit.fx_process("vim -O a b\r\n\x1b[?1049h\x1b[?69h\x1b[51;100s\x1b[1;50H│".as_bytes());
     assert!(
         vsplit.grid().cursor_follows_glyph(),
         "the bar vim drew up to its split's margin is still the glyph before the cursor"
@@ -4200,58 +4404,58 @@ fn fx_engine_state_desk() -> FxDesk {
     shells.push(("vim", vsplit, cwd));
 
     let mut imgcat = fx_shell(ROWS, COLS, 40, cwd, 5);
-    imgcat.process(b"imgcat plot.png\r\n\x1b]1337;File=name=cGxvdC5wbmc=;size=6144;inline=1:");
-    imgcat.process("iVBORw0KGgo".repeat(500).as_bytes());
+    imgcat.fx_process(b"imgcat plot.png\r\n\x1b]1337;File=name=cGxvdC5wbmc=;size=6144;inline=1:");
+    imgcat.fx_process("iVBORw0KGgo".repeat(500).as_bytes());
     assert_eq!(imgcat.partial_sequence_state(), Some("OscString"));
     assert!(imgcat.partial_sequence_swallows_picture());
     shells.push(("imgcat", imgcat, cwd));
 
     let mut cat = fx_shell(ROWS, COLS, 40, cwd, 6);
-    cat.process("cat README.ja.md\r\n日本語の説明\r\n日本".as_bytes());
-    cat.process(&"語".as_bytes()[..2]);
+    cat.fx_process("cat README.ja.md\r\n日本語の説明\r\n日本".as_bytes());
+    cat.fx_process(&"語".as_bytes()[..2]);
     shells.push(("cat", cat, cwd));
 
     let mut screen = fx_shell(ROWS, COLS, 40, "/home/dev", 7);
-    screen.process("screen -r build\r\n\x1b_build ✓ deploy ".as_bytes());
-    screen.process(&"✓".as_bytes()[..2]);
+    screen.fx_process("screen -r build\r\n\x1b_build ✓ deploy ".as_bytes());
+    screen.fx_process(&"✓".as_bytes()[..2]);
     assert_eq!(screen.partial_sequence_state(), Some("SosPmApcString"));
     shells.push(("screen", screen, "/home/dev"));
 
     let mut tmux = fx_shell(ROWS, COLS, 40, cwd, 8);
-    tmux.process(b"tmux attach -t work\r\n\x1bPtmux;\x1b\x1b_Gf=100,a=T,m=1;iVBORw0KGgo");
+    tmux.fx_process(b"tmux attach -t work\r\n\x1bPtmux;\x1b\x1b_Gf=100,a=T,m=1;iVBORw0KGgo");
     assert!(tmux.partial_sequence_state().is_some());
     shells.push(("tmux", tmux, cwd));
 
     let mut sixel = fx_shell(ROWS, COLS, 40, cwd, 0);
-    sixel.process(b"img2sixel plot.png\r\n\x1bP0;1;8");
+    sixel.fx_process(b"img2sixel plot.png\r\n\x1bP0;1;8");
     assert_eq!(sixel.partial_sequence_state(), Some("DcsParam"));
     shells.push(("img2sixel", sixel, cwd));
 
     let mut mc = fx_shell(ROWS, COLS, 40, "/home/dev", 1);
     mc.set_allow_palette_reconfigure(true);
-    mc.process(
+    mc.fx_process(
         b"mc\r\n\x1b]4;1;rgb:cc/24/1d\x07\x1b]4;4;rgb:45/85/88\x07\x1b]10;rgb:eb/db/b2\x07\
           \x1b]11;rgb:28/28/28\x07\x1b]12;rgb:fe/80/19\x07\x1b]17;rgb:50/49/45\x07\
           \x1b]19;rgb:fb/f1/c7\x07\x1b]30001\x07\x1b]19;rgb:ff/ff/ff\x07",
     );
-    mc.process(b"\x1b-A\x1b.F\x1b/L");
-    mc.process(b"\x1b]1;\x07\x1b]2;mc [dev@devhost]:~\x07\x1b[22;0t\x1b]9;4;1;42\x07");
-    mc.process(b"\x1b[?1000h\x1b[?1000s");
-    mc.process(b"\x1b[?1049h\x1b[>1u\x1b[58:2::255:128:0m\x1b[5;7H\x1b7\x1b[?1049l");
-    mc.process(b"\x1b[58:2::255:128:0m\x1b[1\"q\x1b[#{");
-    mc.process(b"\x1b]8;id=mc-help;https://example.invalid/mc/help\x1b\\help ");
-    mc.process("\u{1F469}\u{200D}".as_bytes());
+    mc.fx_process(b"\x1b-A\x1b.F\x1b/L");
+    mc.fx_process(b"\x1b]1;\x07\x1b]2;mc [dev@devhost]:~\x07\x1b[22;0t\x1b]9;4;1;42\x07");
+    mc.fx_process(b"\x1b[?1000h\x1b[?1000s");
+    mc.fx_process(b"\x1b[?1049h\x1b[>1u\x1b[58:2::255:128:0m\x1b[5;7H\x1b7\x1b[?1049l");
+    mc.fx_process(b"\x1b[58:2::255:128:0m\x1b[1\"q\x1b[#{");
+    mc.fx_process(b"\x1b]8;id=mc-help;https://example.invalid/mc/help\x1b\\help ");
+    mc.fx_process("\u{1F469}\u{200D}".as_bytes());
     shells.push(("mc", mc, "/home/dev"));
 
     let mut htop = fx_shell(ROWS, COLS, 40, cwd, 3);
-    htop.process(b"htop\r\n\x1b[?1049h\x1b[H\x1b[2J");
+    htop.fx_process(b"htop\r\n\x1b[?1049h\x1b[H\x1b[2J");
     for r in 1..=ROWS {
         let row = format!(
             "  {:>5} dev   20   0  412M  38M S  0.{r}  0.4  0:0{}.12 /home/dev/.local/bin/aterm --sock /tmp/s{r}",
             4100 + u32::from(r),
             r % 10
         );
-        htop.process(format!("\x1b[{r};1H{row:-<99}").as_bytes());
+        htop.fx_process(format!("\x1b[{r};1H{row:-<99}").as_bytes());
     }
     htop.resize(ROWS, COLS - 20);
     assert!(htop.render_debt().owed(), "htop has not redrawn since");
@@ -4262,11 +4466,11 @@ fn fx_engine_state_desk() -> FxDesk {
     shells.push(("zsh", short, "/home/dev"));
 
     let mut vt52 = fx_shell(ROWS, COLS, 40, "/home/dev", 5);
-    vt52.process(b"./vt52-menu\r\n\x1b[?2l\x1bY%");
+    vt52.fx_process(b"./vt52-menu\r\n\x1b[?2l\x1bY%");
     shells.push(("vt52-menu", vt52, "/home/dev"));
 
     let mut codex = fx_shell(ROWS, COLS, 12, cwd, 2);
-    codex.process(
+    codex.fx_process(
         b"codex\r\n\x1b]7501;state=working:app=codex\x1b\\\
           \x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
     );
@@ -4280,7 +4484,8 @@ fn fx_engine_state_desk() -> FxDesk {
     let rev_nonce = [0xa1; 32];
     let rev_id = fx_hex(&rev_nonce);
     let mut rev = fx_signed_shell(ROWS, COLS, rev_nonce, cwd, 3);
-    rev.process(
+    fx_process_at(
+        &mut rev,
         format!(
             "cd ../notes\r\n\x1b]133;C;id={rev_id}\x07\x1b]133;D;0;id={rev_id}\x07\
              \x1b]633;P;AtermIntegration=0123456789abcdef;id={rev_id}\x07\
@@ -4289,35 +4494,42 @@ fn fx_engine_state_desk() -> FxDesk {
              \x1b]133;A;id={rev_id}\x07dev@devhost notes % \x1b]133;B;id={rev_id}\x07"
         )
         .as_bytes(),
+        30_000,
     );
     shells.push(("zsh", rev, "/home/dev/src/notes"));
 
     let mut job = fx_signed_shell(ROWS, COLS, [0xa2; 32], cwd, 4);
-    job.process(b"\x1b]7;file://devhost/home/dev/tmp\x07");
+    job.fx_process(b"\x1b]7;file://devhost/home/dev/tmp\x07");
     job.set_foreground_job(true);
-    job.process(b"\x1b]7;file://devhost/home/dev/src/aterm/crates\x07");
+    job.fx_process(b"\x1b]7;file://devhost/home/dev/src/aterm/crates\x07");
     shells.push(("zsh", job, cwd));
 
     let stale_nonce = [0xa3; 32];
     let mut stale = fx_shell(ROWS, COLS, 30, cwd, 6);
     stale.set_require_shell_integration_nonce(true);
     stale.authorize_shell_integration_on_first_mark(stale_nonce);
-    stale.process(format!("\x1b]133;D;0;id={}\x07", fx_hex(&stale_nonce)).as_bytes());
+    fx_process_at(
+        &mut stale,
+        format!("\x1b]133;D;0;id={}\x07", fx_hex(&stale_nonce)).as_bytes(),
+        30_100,
+    );
     shells.push(("zsh", stale, cwd));
 
     let (mut cleared, sign) = fx_marked_shell(ROWS, COLS, Some([0xa4; 32]), false, b"", 6, cwd, 3);
-    cleared.process(
+    fx_process_at(
+        &mut cleared,
         format!(
             "clear\r\n\x1b]133;C{sign}\x07\x1b[H\x1b[2J\x1b]133;D;0{sign}\x07\
              \x1b]133;A{sign}\x07dev@devhost aterm % \x1b]133;B{sign}\x07\x1b]133;D;0{sign}\x07"
         )
         .as_bytes(),
+        30_200,
     );
     shells.push(("zsh", cleared, cwd));
 
     shells.push(("claude", fx_two_drawers(2), cwd));
     let mut restored = Terminal::from_checkpoint(&fx_two_drawers(5).checkpoint());
-    restored.process(b"\r\n\x1b[2mresuming\x1b[0m\r\n");
+    restored.fx_process(b"\r\n\x1b[2mresuming\x1b[0m\r\n");
     shells.push(("claude", restored, cwd));
 
     let mut sessions = Vec::new();
@@ -4470,36 +4682,36 @@ fn fx_variants_desk() -> FxDesk {
 
     let mut nrcs = fx_shell(ROWS, COLS, 6, cwd, 1);
     nrcs.set_color_scheme(aterm_types::Appearance::Light);
-    nrcs.process(b"./nrcs-demo\r\n");
-    nrcs.process(b"\x1b(R\x1b)Q\x1b*K\x1b+Y\x1bn\x1b~\x1b[?1049h");
-    nrcs.process(b"\x1b(E\x1b)Z\x1b*H\x1b+=\x1bo\x1b|\x1b7\x1b[?1049l");
-    nrcs.process(b"\x1b(0\x1b)A\x1b*4\x1b+C\x0e");
-    nrcs.process(b"\x1b[2 q\x1b[?9h\x1b[?1005h\x1b]9;4;0\x07\x1b[1 k\x1b[8l\x1b[61\"p\x1bN");
+    nrcs.fx_process(b"./nrcs-demo\r\n");
+    nrcs.fx_process(b"\x1b(R\x1b)Q\x1b*K\x1b+Y\x1bn\x1b~\x1b[?1049h");
+    nrcs.fx_process(b"\x1b(E\x1b)Z\x1b*H\x1b+=\x1bo\x1b|\x1b7\x1b[?1049l");
+    nrcs.fx_process(b"\x1b(0\x1b)A\x1b*4\x1b+C\x0e");
+    nrcs.fx_process(b"\x1b[2 q\x1b[?9h\x1b[?1005h\x1b]9;4;0\x07\x1b[1 k\x1b[8l\x1b[61\"p\x1bN");
     assert_eq!(nrcs.mouse_mode(), aterm_core::terminal::MouseMode::X10);
 
     let mut latin = fx_shell(ROWS, COLS, 6, cwd, 2);
     let mut config = aterm_core::config::TerminalConfig::default();
     config.bidi.mode = aterm_core::config::BiDiMode::Disabled;
     latin.apply_config(&config);
-    latin.process(b"less --charset=latin2 notes.txt\r\n");
-    latin.process(b"\x1b(<\x1b-B\x1b.M\x1b[3 q\x1b[?1002h\x1b[?1006h\x1b]9;4;2;75\x07");
-    latin.process(b"\x1b[2 k\x1b[62\"p\x1bO");
+    latin.fx_process(b"less --charset=latin2 notes.txt\r\n");
+    latin.fx_process(b"\x1b(<\x1b-B\x1b.M\x1b[3 q\x1b[?1002h\x1b[?1006h\x1b]9;4;2;75\x07");
+    latin.fx_process(b"\x1b[2 k\x1b[62\"p\x1bO");
     assert_eq!(
         latin.mouse_mode(),
         aterm_core::terminal::MouseMode::ButtonEvent
     );
 
     let mut vt320 = fx_shell(ROWS, COLS, 6, cwd, 3);
-    vt320.process(b"./mouse-demo --any\r\n");
-    vt320.process(b"\x1b[4 q\x1b[?1003h\x1b[?1015h\x1b]9;4;3\x07\x1b[63\"p");
+    vt320.fx_process(b"./mouse-demo --any\r\n");
+    vt320.fx_process(b"\x1b[4 q\x1b[?1003h\x1b[?1015h\x1b]9;4;3\x07\x1b[63\"p");
     assert_eq!(
         vt320.mouse_mode(),
         aterm_core::terminal::MouseMode::AnyEvent
     );
 
     let mut vt520 = fx_shell(ROWS, COLS, 6, cwd, 4);
-    vt520.process(b"./mouse-demo --pixels\r\n");
-    vt520.process(b"\x1b[6 q\x1b[?1000h\x1b[?1016h\x1b]9;4;4;10\x07\x1b[65\"p");
+    vt520.fx_process(b"./mouse-demo --pixels\r\n");
+    vt520.fx_process(b"\x1b[6 q\x1b[?1000h\x1b[?1016h\x1b]9;4;4;10\x07\x1b[65\"p");
     assert_eq!(
         vt520.mouse_encoding(),
         aterm_core::terminal::MouseEncoding::SgrPixel
@@ -4600,6 +4812,114 @@ fn fx_variants_desk() -> FxDesk {
 }
 
 #[test]
+fn fixture_identity_negative_controls_move_committed_surfaces() {
+    let identity = FixtureIdentity::for_release();
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let attempt = identity.attempt(nonce);
+    let changed_attempt = OutgoingAttemptName::fixture(identity.producer_pid + 1, nonce).unwrap();
+    assert_ne!(
+        attempt.stem(),
+        changed_attempt.stem(),
+        "producer pid is named"
+    );
+    let live_attempt = OutgoingAttemptName::live(nonce);
+    assert_eq!(
+        live_attempt.stem(),
+        format!("seamless-{}-{nonce}", std::process::id()),
+        "the product wrapper preserves the old live-producer spelling"
+    );
+    assert_eq!(
+        live_attempt.manifest_name(),
+        format!("seamless-{}-{nonce}.toml", std::process::id()),
+        "the product manifest path preserves the old spelling"
+    );
+
+    let layout = [0x11; 32];
+    let screen = [0x22; 32];
+    let proof = |identities: &[crate::seamless::SessionIdentity]| {
+        adoption_proof(
+            nonce,
+            fx_target_build(),
+            FIXTURE_TARGET_COMMIT,
+            &layout,
+            &screen,
+            identities,
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        proof(&[(1, FX_PROOF_FD_BASE, 40_000)]),
+        proof(&[(1, FX_PROOF_FD_BASE + 1, 40_000)]),
+        "the representative descriptor identity is in the parent proof"
+    );
+
+    let mut app = identity.app();
+    let first_wall = app.carried_messages().captured_unix_ms;
+    app.messages_wall = crate::messages_host::WallClock::Pinned {
+        unix_ms: identity.wall_unix_ms + 1,
+        offset_s: identity.wall_offset_s,
+    };
+    assert_ne!(
+        first_wall,
+        app.carried_messages().captured_unix_ms,
+        "the fixture wall is in the carried window"
+    );
+
+    fx_reset_process_identity();
+    let mut first = Terminal::new(8, 40);
+    fx_process_at(&mut first, b"\x1b]133;A\x07prompt", 7);
+    let first_shell = first.checkpoint().shell;
+    fx_reset_process_identity();
+    let mut changed = Terminal::new(8, 40);
+    fx_process_at(&mut changed, b"\x1b]133;A\x07prompt", 8);
+    assert_ne!(
+        first_shell,
+        changed.checkpoint().shell,
+        "the injected terminal wall is in shell marks"
+    );
+
+    let resources = crate::resource_jobs::fixture_carry(
+        "s-00000000000000000001",
+        FixtureIdentity::resource_boot(),
+        identity.resource_root(),
+    );
+    let mut changed_root = identity.resource_root();
+    changed_root.start += 1;
+    assert_ne!(
+        resources,
+        crate::resource_jobs::fixture_carry(
+            "s-00000000000000000001",
+            FixtureIdentity::resource_boot(),
+            changed_root,
+        ),
+        "the explicit process identity is in the resource carry"
+    );
+
+    fx_reset_process_identity();
+    let first_log = fx_timeline().lock().unwrap().handoff_log_ids();
+    let second_log = fx_timeline().lock().unwrap().handoff_log_ids();
+    assert_ne!(
+        first_log, second_log,
+        "one fixture process still issues distinct log epochs"
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let changed_birth = ProcessBirth::fixture(identity.parent_birth.seconds, 424_243).unwrap();
+        assert_ne!(
+            identity.parent_birth.to_wire(),
+            changed_birth.to_wire(),
+            "the parent birth is an explicit fixture input"
+        );
+        assert_ne!(
+            proof(&FixtureIdentity::rendezvous_terms(&[(1, 40_000)])),
+            proof(&[(1, FX_RENDEZVOUS_DEVICE_BASE + 1, 40_000)]),
+            "the representative device term is in the rendezvous proof"
+        );
+    }
+}
+
+#[test]
 fn generate_handoff_fixtures() {
     if !fx_generator_in_child("ATERM_HANDOFF_FIXTURE_OUT") {
         return;
@@ -4607,6 +4927,7 @@ fn generate_handoff_fixtures() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_env();
     fx_install_release_stamp();
+    fx_reset_process_identity();
     let scratch =
         std::env::temp_dir().join(format!("aterm-handoff-fixture-gen-{}", std::process::id()));
     for desk in [
@@ -4817,11 +5138,8 @@ mod rendezvous_generator {
             "ATERM_BUILD_GIT_COMMIT set to the release's 12-digit commit, not {commit:?}"
         );
         let target_value = crate::seamless::encode_target_identity(build, commit);
-        let parent_birth_value = crate::seamless::outgoing_parent_env()
-            .into_iter()
-            .find(|(key, _)| *key == crate::seamless::ENV_PARENT_BIRTH.name())
-            .and_then(|(_, value)| value.into_string().ok())
-            .expect("the kernel's birth record for this process");
+        let identity = super::FixtureIdentity::for_release();
+        let parent_birth_value = identity.parent_birth.to_wire();
 
         let ptys = RZ_SESSIONS
             .iter()
@@ -4832,12 +5150,21 @@ mod rendezvous_generator {
             .zip(&ptys)
             .map(|((local_id, pid), (master, _))| (*local_id, *master, *pid))
             .collect::<Vec<_>>();
-        let terms = crate::handoff_rendezvous::proof_identities_in_device_terms(&identities)
+        let live_terms = crate::handoff_rendezvous::proof_identities_in_device_terms(&identities)
             .expect("every master answers fstat");
+        assert_eq!(
+            live_terms
+                .iter()
+                .map(|(local_id, _, pid)| (*local_id, *pid))
+                .collect::<Vec<_>>(),
+            RZ_SESSIONS.to_vec(),
+            "live PTY conversion preserves every session identity"
+        );
         for (master, slave) in ptys {
             aterm_pty::close_fd(master);
             aterm_pty::close_fd(slave);
         }
+        let terms = super::FixtureIdentity::rendezvous_terms(&RZ_SESSIONS);
         let layout = [0x11u8; 32];
         let screen = [0x22u8; 32];
         let proof =

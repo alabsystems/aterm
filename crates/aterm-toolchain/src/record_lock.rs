@@ -91,9 +91,19 @@ impl RecordLock {
     /// Existing independent `File` duplicates must likewise not explicitly unlock it.
     #[cfg(unix)]
     #[must_use]
-    pub fn into_close_only(mut self) -> CloseOnlyLock {
+    pub fn into_close_only(self) -> CloseOnlyLock {
+        self.into_sole_close_only().offered_out()
+    }
+
+    /// [`Self::into_close_only`] for a description this process opened and locked itself, no
+    /// copy of which exists outside this guard: its last guard's drop lets it go by `LOCK_UN`
+    /// unless a copy was offered out since ([`CloseOnlyLock::try_clone_fd`]).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn into_sole_close_only(mut self) -> CloseOnlyLock {
         CloseOnlyLock {
             file: self.file.take().expect("a live record guard owns its file"),
+            custody: std::sync::Arc::new(Custody::default()),
         }
     }
 }
@@ -124,12 +134,43 @@ impl Drop for RecordLock {
 /// Unix close-only custody of an actual transferred record-lock description.
 ///
 /// This type has no path-only constructor or unlock method, and does not dereference to `File`.
-/// Its ordinary drop only closes its descriptor; duplicates keep the same kernel lock
-/// until their final close. It provides no resource admission or Timing evidence.
+/// A description that may have copies outside these guards ([`RecordLock::into_close_only`],
+/// [`Self::try_clone_fd`], or one adopted from a sender by [`Self::adopt_inherited`]) is only
+/// closed at a drop: its duplicates keep the same kernel lock until their final close. One in
+/// sole custody ([`RecordLock::into_sole_close_only`]) and never offered out is let go by
+/// `LOCK_UN` at its last guard's drop, because a close alone leaves the lock held in every child another
+/// thread forked meanwhile until its `exec` (clippy.toml: the flock release rule). It provides
+/// no resource admission or Timing evidence.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct CloseOnlyLock {
     file: File,
+    /// Shared by every in-process guard of this description ([`Self::try_clone`]).
+    custody: std::sync::Arc<Custody>,
+}
+
+/// What every in-process guard of one description knows: whether a copy left their custody.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct Custody {
+    offered_out: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(unix)]
+impl Drop for CloseOnlyLock {
+    fn drop(&mut self) {
+        // Unique custody means no other guard of this description is alive in this process;
+        // two guards dropping at once both see a shared one and leave the release to the close.
+        let last = std::sync::Arc::get_mut(&mut self.custody).is_some();
+        if last
+            && !self
+                .custody
+                .offered_out
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -248,7 +289,18 @@ impl CloseOnlyLock {
     /// # Errors
     /// The OS could not duplicate the held descriptor.
     pub fn try_clone(&self) -> std::io::Result<Self> {
-        self.file.try_clone().map(|file| Self { file })
+        self.file.try_clone().map(|file| Self {
+            file,
+            custody: std::sync::Arc::clone(&self.custody),
+        })
+    }
+
+    /// Mark the description as possibly held outside these guards.
+    fn offered_out(self) -> Self {
+        self.custody
+            .offered_out
+            .store(true, std::sync::atomic::Ordering::Release);
+        self
     }
 
     /// Duplicate this actual description as an owned close-on-exec descriptor for explicit
@@ -256,7 +308,11 @@ impl CloseOnlyLock {
     /// # Errors
     /// The OS could not duplicate the held descriptor.
     pub fn try_clone_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
-        std::os::fd::AsFd::as_fd(&self.file).try_clone_to_owned()
+        let fd = std::os::fd::AsFd::as_fd(&self.file).try_clone_to_owned()?;
+        self.custody
+            .offered_out
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(fd)
     }
 }
 
@@ -346,6 +402,42 @@ mod tests {
         let file = File::from(fd);
         assert_eq!(identity(file.metadata().unwrap()), expected);
         file.into()
+    }
+
+    /// A child parked between fork and exec holds a copy of every descriptor: a close-only lock
+    /// never offered out is let go by `LOCK_UN` at its last guard's drop, so it is free at once.
+    #[test]
+    fn an_undelegated_close_only_lock_is_free_at_its_last_drop_beside_a_forked_child() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let path = world.path().join("own.lock");
+        let held = RecordLock::try_lock(create(&path), 0)
+            .unwrap()
+            .into_sole_close_only();
+        let twin = held.try_clone().unwrap();
+        let parked = aterm_uds::fork_window::Parked::park();
+        drop(held);
+        assert_blocked(&path);
+        drop(twin);
+        assert!(
+            RecordLock::try_lock(open(&path), 0).is_ok(),
+            "the last guard of a description never offered out unlocks"
+        );
+        assert!(parked.release().success());
+    }
+
+    /// A description offered out keeps its lock in the copy: no guard's drop unlocks it.
+    #[test]
+    fn an_offered_close_only_lock_stays_held_by_its_copy() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let path = world.path().join("offered-copy.lock");
+        let held = RecordLock::try_lock(create(&path), 0)
+            .unwrap()
+            .into_sole_close_only();
+        let copy = held.try_clone_fd().unwrap();
+        drop(held);
+        assert_blocked(&path);
+        drop(copy);
+        drop(reacquire_after_final_close(&path));
     }
 
     #[test]

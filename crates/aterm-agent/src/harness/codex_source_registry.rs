@@ -2341,7 +2341,7 @@ mod tests {
         assert!(reconnected.reader());
         assert!(!reconnected.manager());
         drop(reconnected); // same owned-state drop as explicit member retirement
-        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
     #[cfg(unix)]
@@ -2375,7 +2375,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn manager_and_policy_readiness_cannot_be_relabelled_as_direct_reader() {
-        let home = aterm_tempfile::tempdir().unwrap();
         for role in [
             ReadyRole::PolicyUnavailable,
             ReadyRole::Manager(AuthState {
@@ -2385,6 +2384,7 @@ mod tests {
                 login: 17,
             }),
         ] {
+            let home = aterm_tempfile::tempdir().unwrap();
             let mut readiness =
                 SourceReadiness::preload(SourceWorkLease::for_home(home.path()).unwrap(), None)
                     .unwrap();
@@ -2392,7 +2392,9 @@ mod tests {
             readiness.complete(role).unwrap();
             assert!(!readiness.reader());
             assert!(readiness.complete(ReadyRole::ReaderLoaded).is_err());
-            drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+            assert!(
+                super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok()
+            );
         }
     }
 
@@ -2442,7 +2444,7 @@ mod tests {
         assert!(reservation.native_usage_source(&scope).is_err());
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         drop(borrowed);
-        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
     #[cfg(unix)]
@@ -2480,7 +2482,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         unclaimed.revoke_unclaimed().unwrap();
         let publication =
-            super::super::codex_source_gate::PublicationLock::released_for_home(home.path());
+            super::super::codex_source_gate::PublicationLock::for_home(home.path()).unwrap();
         assert!(
             !registry
                 .state
@@ -2494,7 +2496,7 @@ mod tests {
         assert_eq!(claimed.revoke_unclaimed(), Err(Error::Denied));
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         registry.state.lock().unwrap().launches.clear();
-        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
     #[cfg(unix)]
@@ -2552,7 +2554,7 @@ mod tests {
                 ._scope
                 .is_none()
         );
-        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
         assert_eq!(
             registry
                 .complete_unrelated(
@@ -2683,7 +2685,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_err());
         assert_eq!(registry.revoke_cancelled_unclaimed().unwrap(), 0);
         registry.state.lock().unwrap().launches.clear();
-        drop(super::super::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
     #[test]

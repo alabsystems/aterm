@@ -258,7 +258,8 @@ fn property(entry: u32, name: &CStr) -> Option<Cf> {
 }
 
 /// Read the documented M1–M4 table layout. Unrecognized chips keep raw states
-/// and activity but no guessed frequency. The ordinal association is labelled.
+/// and activity but no guessed frequency. The ordinal association is labelled,
+/// so a table out of order maps nothing.
 fn frequency_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
     let brand = crate::machine_words().cpu.unwrap_or_default();
     let named = |prefix: &str| {
@@ -266,16 +267,31 @@ fn frequency_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
             .strip_prefix(prefix)
             .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
     };
-    let scale = if ["Apple M1", "Apple M2", "Apple M3"]
+    if !["Apple M1", "Apple M2", "Apple M3", "Apple M4"]
         .iter()
         .any(|p| named(p))
     {
-        1_000_000.0
-    } else if named("Apple M4") {
-        1000.0
-    } else {
         return (None, None);
-    };
+    }
+    let (e, p) = pmgr_tables();
+    (e.and_then(ordinal), p.and_then(ordinal))
+}
+
+/// The chip's DVFS range: each table's lowest and highest state ([`super::DvfsRange`]). It
+/// needs no order, so it reads chips the ordinal map refuses (M5's Super table repeats a
+/// lower state: 4428 then 4416 MHz).
+pub(super) fn dvfs_range() -> Result<super::DvfsRange, &'static str> {
+    let (e, p) = pmgr_tables();
+    Ok(super::DvfsRange {
+        e_mhz: span(&e.ok_or("pmgr_e_table")?),
+        p_mhz: span(&p.ok_or("pmgr_p_table")?),
+    })
+}
+
+/// The power manager's DVFS tables, MHz, as written: Efficiency (`voltage-states1-sram`), then
+/// Super (`voltage-states5-sram`); `None` for a table it does not give or that does not decode
+/// ([`decode_table`]).
+fn pmgr_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
     // SAFETY: an absolute NUL-terminated registry path, +1 result or zero.
     let entry = unsafe { iokit::IORegistryEntryFromPath(0, c"IODeviceTree:/arm-io/pmgr".as_ptr()) };
     if entry == 0 {
@@ -284,7 +300,7 @@ fn frequency_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
     let read = |key| {
         property(entry, key).and_then(|v| {
             // SAFETY: v remains live until the bytes have been copied/decoded.
-            decode_table(unsafe { cf_bytes(v.0) }?, scale)
+            decode_table(unsafe { cf_bytes(v.0) }?)
         })
     };
     let result = (read(c"voltage-states1-sram"), read(c"voltage-states5-sram"));
@@ -293,17 +309,36 @@ fn frequency_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
     result
 }
 
-fn decode_table(bytes: &[u8], scale: f64) -> Option<Vec<f64>> {
+/// A table's states, MHz: 8-byte rows whose first four bytes are the frequency, in Hz on M1–M3
+/// and kHz on M4 and M5, told apart by magnitude (a top over 10^8 is Hz: no core clocks at
+/// 100 GHz, nor under 100 MHz). `None` for an empty, misshapen or oversized table, or a zero row.
+fn decode_table(bytes: &[u8]) -> Option<Vec<f64>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(8) || bytes.len() > 128 * 8 {
         return None;
     }
-    let values: Vec<_> = bytes
+    let raw: Vec<_> = bytes
         .as_chunks::<8>()
         .0
         .iter()
-        .map(|v| f64::from(u32::from_le_bytes(v[..4].try_into().expect("four bytes"))) / scale)
+        .map(|v| f64::from(u32::from_le_bytes(v[..4].try_into().expect("four bytes"))))
         .collect();
-    (values.iter().all(|v| *v > 0.0) && values.windows(2).all(|w| w[0] < w[1])).then_some(values)
+    let top = raw.iter().copied().fold(0.0, f64::max);
+    let scale = if top > 1e8 { 1e6 } else { 1e3 };
+    raw.iter()
+        .all(|v| *v > 0.0)
+        .then(|| raw.iter().map(|v| v / scale).collect())
+}
+
+/// A table whose states rise with their ordinal, as the ordinal map needs.
+fn ordinal(table: Vec<f64>) -> Option<Vec<f64>> {
+    table.windows(2).all(|w| w[0] < w[1]).then_some(table)
+}
+
+/// A decoded table's lowest and highest state.
+fn span(table: &[f64]) -> (f64, f64) {
+    table
+        .iter()
+        .fold((f64::INFINITY, 0.0), |(lo, hi), v| (lo.min(*v), hi.max(*v)))
 }
 
 fn sysctl(name: &CStr) -> Reading<u64> {
@@ -405,21 +440,60 @@ pub(super) fn controls() -> Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rows(states: &[u32]) -> Vec<u8> {
+        states
+            .iter()
+            .flat_map(|f| f.to_le_bytes().into_iter().chain([0; 4]))
+            .collect()
+    }
+
     #[test]
     fn dvfs_table_rejects_missing_partial_or_nonmonotonic_data() {
-        assert_eq!(decode_table(&[], 1.0), None);
-        assert_eq!(decode_table(&[0; 7], 1.0), None);
-        assert_eq!(decode_table(&[0; 8], 1.0), None);
-        let table: Vec<_> = [1_020_000_000u32, 2_000_000_000]
-            .into_iter()
-            .flat_map(|f| f.to_le_bytes().into_iter().chain([0; 4]))
-            .collect();
-        assert_eq!(
-            decode_table(&table, 1_000_000.0),
-            Some(vec![1020.0, 2000.0])
-        );
+        assert_eq!(decode_table(&[]), None);
+        assert_eq!(decode_table(&[0; 7]), None);
+        assert_eq!(decode_table(&[0; 8]), None);
+        let table = rows(&[1_020_000_000, 2_000_000_000]);
+        assert_eq!(decode_table(&table), Some(vec![1020.0, 2000.0]));
         let mut wrong = table.clone();
         wrong.extend_from_slice(&table[..8]);
-        assert_eq!(decode_table(&wrong, 1_000_000.0), None);
+        let out_of_order = decode_table(&wrong).expect("decodes");
+        assert_eq!(ordinal(out_of_order), None);
+        assert_eq!(
+            ordinal(decode_table(&table).expect("decodes")),
+            Some(vec![1020.0, 2000.0])
+        );
+    }
+
+    /// A table in Hz (M1–M3) and one in kHz (M4, M5) read the same MHz, and the range takes each
+    /// table's lowest and highest state whatever their order: M5's Super table (N1) repeats a
+    /// lower state near its top. CONTROL: its ordinal map refuses that table.
+    #[test]
+    fn the_range_reads_hz_or_khz_tables_in_any_order() {
+        assert_eq!(
+            decode_table(&rows(&[972_000, 3_048_000])),
+            decode_table(&rows(&[972_000_000, 3_048_000_000]))
+        );
+        let m5_super = decode_table(&rows(&[
+            1_308_000, 1_608_000, 1_932_000, 2_220_000, 2_508_000, 2_820_000, 3_072_000, 3_300_000,
+            3_516_000, 3_720_000, 3_876_000, 4_020_000, 4_176_000, 4_248_000, 4_272_000, 4_332_000,
+            4_428_000, 4_416_000, 4_464_000,
+        ]))
+        .expect("decodes");
+        assert_eq!(span(&m5_super), (1308.0, 4464.0));
+        assert_eq!(ordinal(m5_super), None, "control");
+    }
+
+    /// This Mac's power manager gives both tables, each a range a core clocks within.
+    #[test]
+    fn this_macs_dvfs_range_reads_or_says_why() {
+        match dvfs_range() {
+            Ok(r) => {
+                for (lo, hi) in [r.e_mhz, r.p_mhz] {
+                    assert!((100.0..hi).contains(&lo) && hi < 10_000.0, "{r:?}");
+                }
+            }
+            // An Intel Mac has no pmgr tables.
+            Err(why) => assert!(why.starts_with("pmgr"), "{why}"),
+        }
     }
 }

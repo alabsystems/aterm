@@ -65,6 +65,9 @@ pub struct CoalitionRead {
     pub truncated: bool,
     /// The counters of each listed coalition that answered.
     pub rows: Vec<CoalitionUsage>,
+    /// The same records' heat counters, decoded in the same copy loop
+    /// ([`crate::coalition_heat::CoalHeat`]).
+    pub heat: crate::coalition_heat::CoalHeat,
 }
 
 /// Every resource coalition and its counters; `None` where the list cannot be read, and off macOS.
@@ -270,7 +273,8 @@ pub(crate) fn list_room(need: i64) -> Option<usize> {
     Some((entries + LIST_HEADROOM).min(MAX_COALITIONS))
 }
 
-/// The read of the `listed` coalitions.
+/// The read of the `listed` coalitions: each record the kernel copies out (`usage`) decoded into
+/// its counters and, in the same loop, its heat counters ([`crate::coalition_heat::CoalHeat`]).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn read_of(
     listed: &[(u64, u32)],
@@ -278,14 +282,21 @@ pub(crate) fn read_of(
     usage: impl Fn(u64) -> Option<[u64; USAGE_WORDS]>,
     timebase: (u32, u32),
 ) -> CoalitionRead {
+    let mut heat = crate::coalition_heat::CoalHeat::with_capacity(listed.len(), timebase);
+    let rows = listed
+        .iter()
+        .filter_map(|&(id, _)| {
+            let raw = usage(id)?;
+            heat.note(id, &raw);
+            decode_usage(id, &raw, timebase)
+        })
+        .collect();
     CoalitionRead {
         listed: u32::try_from(listed.len()).unwrap_or(u32::MAX),
         newest: listed.iter().map(|&(id, _)| id).max(),
         truncated,
-        rows: listed
-            .iter()
-            .filter_map(|&(id, _)| decode_usage(id, &usage(id)?, timebase))
-            .collect(),
+        rows,
+        heat,
     }
 }
 

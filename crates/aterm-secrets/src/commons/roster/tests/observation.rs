@@ -772,6 +772,231 @@ fn a_source_read_look_judges_as_a_look_of_its_own() {
     });
 }
 
+/// A record's history and its key judged through a look at the vault (a table-repair read
+/// batch's: `aterm-db`'s `Session::decode_envelope` and `Session::history_needs`) answer as their
+/// own calls do, and observe the state lock no more than the look did: no roster observation of
+/// their own (`client::test_roster_observations`), no read of the log on its own call
+/// (`client::test_logs_read`), through a look of its own and through one standing on a source
+/// read. Once the look's lock file was put away and a writer holds the lock at the vault's path,
+/// they answer as their own calls do under the writer.
+/// NEGATIVE CONTROLS (2026-11-10): with `Access::with_log_history_in`'s membership check on its
+/// own call whatever its look, or with `Bootstrap::historicals_in` or
+/// `Bootstrap::holds_histories_in` leasing with no look, a history's asks make roster
+/// observations of their own (`a history's own roster observations`); with its read of the log
+/// on its own call, they read the
+/// log (`a history's own log reads`); with `Historical::with_key_in` on its own call whatever its
+/// look, the key's check makes one (`a key's own roster observations`); with it asking the log on its
+/// own call, or taking a source read of its own, under a held look, it reads the log (`a key's own
+/// log reads`) or observes the lock (`a key's lock observations`); and with
+/// `VaultLook::held_at` giving the look's observation whether or not it guards the lock at the
+/// vault's path, a key taken under the writer answers (`a history through a look at a lock put
+/// away`).
+#[test]
+fn a_record_history_through_a_look_judges_as_its_own_calls() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let basis = *access.basis();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own_key = vault
+            .bootstrap
+            .historical(&vault.journal, &access, basis)
+            .expect("CONTROL: its history opens")
+            .with_key(&vault.journal, |key| *key)
+            .expect("CONTROL: its key");
+        // The history, whether this device holds it, and whether its key is the own call's.
+        let history = |look: Option<&client::VaultLook<'_>>| {
+            vault
+                .bootstrap
+                .historical_in(&vault.journal, &access, basis, look)
+                .map(|history| {
+                    (
+                        *history.source(),
+                        history.generation(),
+                        history.members().len(),
+                    )
+                })
+                .map_err(kind_of)
+        };
+        let holds = |look: Option<&client::VaultLook<'_>>| {
+            vault
+                .bootstrap
+                .holds_histories_in(&vault.journal, &access, &[basis], look)
+        };
+        let asked = || {
+            (
+                client::lock_observations_of(&vault.paths),
+                client::test_roster_observations(),
+                client::test_logs_read(),
+            )
+        };
+        let own = (history(None), holds(None));
+        let before = asked();
+        assert_eq!(
+            history(None),
+            own.0,
+            "CONTROL: a history's own call answers again"
+        );
+        let own_asked = asked();
+        assert!(
+            own_asked.1 > before.1 && own_asked.2 > before.2,
+            "CONTROL: a history's own calls ask on their own"
+        );
+        let source_read = || {
+            client::try_commons_source_read(&vault.paths)
+                .unwrap()
+                .expect("no writer holds the vault")
+        };
+        for (look, which) in [
+            (client::VaultLook::new(&vault.paths), "its own"),
+            (source_read().into_look(&vault.paths), "a source read's"),
+        ] {
+            let look = Some(&look);
+            let before = asked();
+            let judged = (history(look), holds(look));
+            let after = asked();
+            assert_eq!(
+                after.1 - before.1,
+                0,
+                "a history's own roster observations (a look of {which})"
+            );
+            assert_eq!(
+                after.2 - before.2,
+                0,
+                "a history's own log reads (a look of {which})"
+            );
+            assert_eq!(
+                after.0 - before.0,
+                0,
+                "a history's lock observations (a look of {which})"
+            );
+            assert_eq!(judged, own, "a history through a look of {which}");
+            let history = vault
+                .bootstrap
+                .historical(&vault.journal, &access, basis)
+                .unwrap();
+            let before = asked();
+            let judged = history
+                .with_key_in(&vault.journal, look, |key| *key == own_key)
+                .map_err(kind_of);
+            let after = asked();
+            assert_eq!(
+                after.1 - before.1,
+                0,
+                "a key's own roster observations (a look of {which})"
+            );
+            assert_eq!(
+                after.2 - before.2,
+                0,
+                "a key's own log reads (a look of {which})"
+            );
+            assert_eq!(
+                after.0 - before.0,
+                0,
+                "a key's lock observations (a look of {which})"
+            );
+            assert_eq!(judged, Ok(true), "a key through a look of {which}");
+        }
+
+        let kept = vault
+            .bootstrap
+            .historical(&vault.journal, &access, basis)
+            .unwrap();
+        let lock = vault.paths.dir.join(".lock");
+        let look = source_read().into_look(&vault.paths);
+        let put_away = lock.with_extension("put-away");
+        std::fs::rename(&lock, &put_away).unwrap();
+        std::fs::copy(&put_away, &lock).unwrap();
+        let writing = writer(&vault.paths).unwrap();
+        let key = |look: Option<&client::VaultLook<'_>>| {
+            kept.with_key_in(&vault.journal, look, |key| *key == own_key)
+                .map_err(kind_of)
+        };
+        let own = (history(None), holds(None), key(None));
+        assert!(
+            own.0.is_err() && own.2.is_err(),
+            "CONTROL: under the writer: {own:?}"
+        );
+        assert_eq!(
+            (history(Some(&look)), holds(Some(&look)), key(Some(&look))),
+            own,
+            "a history through a look at a lock put away"
+        );
+        drop(writing);
+        drop(look);
+    });
+}
+
+/// A record's history and a kept key judged through a look refuse as their own calls do once the
+/// access they stand on is no longer current: after this Mac's identity was put in another's
+/// place, the next look (one that observes the state lock) finds a key kept from before no longer
+/// current and leases no history, each as its own call refuses.
+/// NEGATIVE CONTROLS (2026-11-10): with `Historical::with_key_in` giving the key under a held look
+/// unjudged, it answers (`a kept key through the next look`); with
+/// `Access::with_log_history_in` leasing under one without its membership check, the history
+/// opens (`a history through the next look`).
+#[test]
+fn the_next_look_refuses_a_record_history_no_longer_current() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let basis = *access.basis();
+    let kept = vault
+        .bootstrap
+        .historical(&vault.journal, &access, basis)
+        .unwrap();
+    let other = aterm_tempfile::tempdir().unwrap();
+    let other = client::Paths::for_home(other.path());
+    client::machine_identity(&other).unwrap();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        assert!(
+            kept.with_key(&vault.journal, |_| ()).is_ok(),
+            "CONTROL: the key stands"
+        );
+        crate::fsx::write_atomic(
+            &vault.paths.dir.join("identity"),
+            &std::fs::read(other.dir.join("identity")).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let look = client::VaultLook::new(&vault.paths);
+        assert!(
+            look.held_at(&vault.paths).is_some(),
+            "CONTROL: the look observes the lock"
+        );
+        let own = (
+            kept.with_key(&vault.journal, |_| ()).map_err(kind_of),
+            vault
+                .bootstrap
+                .historical(&vault.journal, &access, basis)
+                .map(|_| ())
+                .map_err(kind_of),
+        );
+        assert!(
+            own.0.is_err() && own.1.is_err(),
+            "CONTROL: their own calls refuse: {own:?}"
+        );
+        assert_eq!(
+            kept.with_key_in(&vault.journal, Some(&look), |_| ())
+                .map_err(kind_of),
+            own.0,
+            "a kept key through the next look"
+        );
+        assert_eq!(
+            vault
+                .bootstrap
+                .historical_in(&vault.journal, &access, basis, Some(&look))
+                .map(|_| ())
+                .map_err(kind_of),
+            own.1,
+            "a history through the next look"
+        );
+    });
+}
+
+/// An error by its kind, comparable.
+fn kind_of(error: crate::Error) -> crate::ErrorKind {
+    error.kind()
+}
+
 /// A look stands for one moment of the vault: a session look after this Mac's identity was put
 /// in another's place judges as the asks' own calls do (its custody refused, and the access it
 /// opens no longer current), and finds a warm access no longer current.

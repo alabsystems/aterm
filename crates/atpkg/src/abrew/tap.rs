@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use super::fetch;
-use super::formula::Formula;
+use super::formula::{Artifact, Cask, Formula};
 use super::prefix::{Kind, Prefix};
 
 /// One tap on disk: `user/repo` (repo without the `homebrew-` prefix).
@@ -679,7 +679,10 @@ pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     std::fs::remove_dir_all(&path).map_err(|e| format!("abrew: {e}"))
 }
 
-/// Every tap on disk.
+/// Every tap on disk: brew's `Tap.installed` is any
+/// `Taps/*/*/` directory (hidden entries excluded by glob);
+/// a `.git` checkout is not required for a directory to be
+/// a tap brew resolves names from.
 #[must_use]
 pub fn list(prefix: &Prefix) -> Vec<Tap> {
     let mut out = Vec::new();
@@ -693,6 +696,9 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
         let Some(user) = u.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        if user.starts_with('.') {
+            continue;
+        }
         let Ok(repos) = std::fs::read_dir(u.path()) else {
             continue;
         };
@@ -702,8 +708,8 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
             }
             let fname = r.file_name();
             if let Some(repo) = fname.to_str().and_then(|s| s.strip_prefix("homebrew-"))
+                && !repo.starts_with('.')
                 && let Ok(path) = tap_path(prefix, &user, repo)
-                && std::fs::symlink_metadata(r.path().join(".git")).is_ok_and(|m| m.is_dir())
             {
                 out.push(Tap {
                     user: user.clone(),
@@ -1065,6 +1071,467 @@ fn version_from_url(url: &str) -> String {
     digits.trim_end_matches('.').to_string()
 }
 
+/// The first quoted string after `key` on a stanza line.
+fn cask_quoted(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &rest[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    Some(inner[..end].to_string())
+}
+
+/// Every quoted string in a stanza fragment (array members).
+fn cask_quoted_all(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(['"', '\'']) {
+        let quote = rest[start..].chars().next().unwrap_or('"');
+        let inner = &rest[start + quote.len_utf8()..];
+        let Some(end) = inner.find(quote) else { break };
+        out.push(inner[..end].to_string());
+        rest = &inner[end + quote.len_utf8()..];
+    }
+    out
+}
+
+/// Brew's `#{version...}` interpolation subset a cask URL or
+/// artifact name uses in practice; anything else marks the
+/// record unsupported for install (info still shows it raw).
+fn cask_interpolate(text: &str, version: &str, unsupported: &mut Option<&'static str>) -> String {
+    if !text.contains("#{") {
+        return text.to_string();
+    }
+    let csv: Vec<&str> = version.split(',').collect();
+    let first = csv.first().copied().unwrap_or(version);
+    let mut nums: Vec<&str> = first.split('.').collect();
+    while nums.len() < 3 {
+        nums.push("0");
+    }
+    let value = |expr: &str| -> Option<String> {
+        Some(match expr {
+            "version" => version.to_string(),
+            "version.major" => nums[0].to_string(),
+            "version.minor" => nums[1].to_string(),
+            "version.patch" => nums[2].to_string(),
+            "version.major_minor" => format!("{}.{}", nums[0], nums[1]),
+            "version.major_minor_patch" => format!("{}.{}.{}", nums[0], nums[1], nums[2]),
+            "version.no_dots" => first.replace('.', ""),
+            "version.before_comma" => first.to_string(),
+            "version.after_comma" => csv.get(1).copied().unwrap_or_default().to_string(),
+            "version.csv.first" => first.to_string(),
+            "version.csv.second" => csv.get(1).copied().unwrap_or_default().to_string(),
+            "version.csv.third" => csv.get(2).copied().unwrap_or_default().to_string(),
+            "version.dots_to_underscores" => first.replace('.', "_"),
+            "version.dots_to_hyphens" => first.replace('.', "-"),
+            _ => return None,
+        })
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("#{") {
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..];
+        let Some(end) = inner.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        match value(inner[..end].trim()) {
+            Some(v) => out.push_str(&v),
+            None => {
+                *unsupported = unsupported.or(Some("depends_on"));
+                out.push_str(&rest[start..start + 2 + end + 1]);
+            }
+        }
+        rest = &inner[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A macOS release symbol's numeric version (depends_on).
+fn macos_symbol_version(symbol: &str) -> Option<String> {
+    Some(
+        match symbol {
+            "golden_gate" => "27",
+            "tahoe" => "26",
+            "sequoia" => "15",
+            "sonoma" => "14",
+            "ventura" => "13",
+            "monterey" => "12",
+            "big_sur" => "11",
+            "catalina" => "10.15",
+            "mojave" => "10.14",
+            "high_sierra" => "10.13",
+            "sierra" => "10.12",
+            "el_capitan" => "10.11",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Parse a cask `.rb` as data without evaluating Ruby, the
+/// cask sibling of `parse_rb_as_data`: top-level stanzas
+/// line-wise, per-system blocks skipped (and marked
+/// unsupported for install), `#{version}` interpolation
+/// applied to url and artifact names.
+#[must_use]
+pub fn parse_cask_rb_as_data(text: &str, token: &str) -> Cask {
+    let mut c = Cask {
+        token: token.to_string(),
+        ..Cask::default()
+    };
+    let mut unsupported: Option<&'static str> = None;
+    let mut skip_depth = 0usize;
+    let mut heredoc: Option<String> = None;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let raw = lines[i];
+        i += 1;
+        if let Some(marker) = &heredoc {
+            if raw.trim() == marker.as_str() {
+                heredoc = None;
+                c.caveats = c.caveats.trim_start_matches('\u{1}').to_string();
+            } else {
+                if c.caveats.len() > 1 {
+                    c.caveats.push('\n');
+                }
+                c.caveats.push_str(raw.trim());
+            }
+            continue;
+        }
+        let line = raw.trim();
+        if skip_depth > 0 {
+            if line == "end" {
+                skip_depth -= 1;
+            } else if line.ends_with(" do") || line.contains(" do |") {
+                skip_depth += 1;
+            }
+            continue;
+        }
+        if (line.starts_with("on_") || line.starts_with("language "))
+            && (line.ends_with(" do") || line.contains(" do |"))
+        {
+            unsupported = unsupported.or(Some("variations"));
+            skip_depth = 1;
+            continue;
+        }
+        if line.starts_with("caveats <<~") || line.starts_with("caveats <<-") {
+            let marker = line
+                .rsplit(['~', '-'])
+                .next()
+                .unwrap_or("EOS")
+                .trim()
+                .to_string();
+            c.caveats = "\u{1}".to_string();
+            heredoc = Some(marker);
+            continue;
+        }
+        if c.version.is_empty() {
+            if line.starts_with("version :latest") {
+                c.version = "latest".to_string();
+            } else if let Some(v) = cask_quoted(line, "version") {
+                c.version = v;
+            }
+        }
+        if c.sha256.is_none() && line.starts_with("sha256") {
+            if line.contains(":no_check") {
+                c.sha256_no_check = true;
+            } else if let Some(hex) = cask_quoted(line, "sha256") {
+                c.sha256 = Some(hex);
+            } else if line.contains("arm:") {
+                // `sha256 arm: "…", intel: "…"` (may wrap)
+                let mut joined = line.to_string();
+                while !joined.contains("intel:") && i < lines.len() {
+                    joined.push_str(lines[i].trim());
+                    i += 1;
+                }
+                if let Some(arm) = joined.split("arm:").nth(1) {
+                    c.sha256 = cask_quoted_all(arm).into_iter().next();
+                }
+            }
+        }
+        if c.url.is_empty()
+            && let Some(u) = cask_quoted(line, "url")
+        {
+            c.url = u;
+        }
+        if c.name.is_empty()
+            && let Some(n) = cask_quoted(line, "name")
+        {
+            c.name = n;
+        }
+        if c.desc.is_empty()
+            && let Some(d) = cask_quoted(line, "desc")
+        {
+            c.desc = d;
+        }
+        if c.homepage.is_empty()
+            && let Some(h) = cask_quoted(line, "homepage")
+        {
+            c.homepage = h;
+        }
+        if line.starts_with("auto_updates true") {
+            c.auto_updates = true;
+        }
+        if line.starts_with("container type: :naked") {
+            c.naked = true;
+        }
+        if c.caveats.is_empty()
+            && let Some(text) = cask_quoted(line, "caveats")
+        {
+            c.caveats = text;
+        }
+        if line.starts_with("deprecate!") || line.starts_with("disable!") {
+            let disable = line.starts_with("disable!");
+            let date = cask_quoted(line.split("date:").nth(1).unwrap_or_default(), "");
+            let because = line.split("because:").nth(1).map(|s| {
+                s.trim()
+                    .trim_matches(|ch| ch == '"' || ch == ',')
+                    .to_string()
+            });
+            let because = because.map(|b| b.strip_prefix(':').map_or(b.clone(), str::to_string));
+            if disable {
+                c.disabled = true;
+                c.deprecate_disable.disable_date = date;
+                c.deprecate_disable.disable_reason = because;
+            } else {
+                c.deprecated = true;
+                c.deprecate_disable.deprecation_date = date;
+                c.deprecate_disable.deprecation_reason = because;
+            }
+        }
+        parse_cask_depends(line, &mut c, &mut unsupported);
+        parse_cask_artifact(line, &mut c);
+        if line.starts_with("zap ") || line == "zap" {
+            c.zap_present = true;
+            let (trash, delete, rmdir, other) = parse_cask_file_stanza(&lines, &mut i, line);
+            c.zap_trash.extend(trash);
+            c.zap_delete.extend(delete);
+            c.zap_rmdir.extend(rmdir);
+            c.zap_unsupported = c.zap_unsupported || other;
+        }
+        if line.starts_with("uninstall ") || line == "uninstall" {
+            let (trash, _, rmdir, other) = parse_cask_file_stanza(&lines, &mut i, line);
+            c.uninstall_trash.extend(trash);
+            c.uninstall_rmdir.extend(rmdir);
+            c.uninstall_unsupported = c.uninstall_unsupported || other;
+        }
+        if line.starts_with("conflicts_with ") {
+            c.conflicts.extend(cask_quoted_all(line));
+        }
+    }
+    if c.name.is_empty() {
+        c.name = token.to_string();
+    }
+    c.url = cask_interpolate(&c.url, &c.version, &mut unsupported);
+    for artifact in &mut c.artifacts {
+        interpolate_artifact(artifact, &c.version, &mut unsupported);
+    }
+    c.caveats = c.caveats.trim_start_matches('\u{1}').to_string();
+    c.unsupported_constraints = unsupported;
+    c
+}
+
+/// One `depends_on` stanza line of a cask file.
+fn parse_cask_depends(line: &str, c: &mut Cask, unsupported: &mut Option<&'static str>) {
+    let Some(rest) = line.strip_prefix("depends_on ") else {
+        return;
+    };
+    let values = |key: &str| -> Vec<String> {
+        rest.split(key)
+            .nth(1)
+            .map(cask_quoted_all)
+            .unwrap_or_default()
+    };
+    if rest.starts_with("cask:") {
+        c.depends_cask.extend(values("cask:"));
+    } else if rest.starts_with("formula:") {
+        c.depends_formula.extend(values("formula:"));
+    } else if rest.starts_with("macos:") {
+        let spec = rest.trim_start_matches("macos:").trim();
+        let raw = cask_quoted(spec, "").unwrap_or_default();
+        let (cmp, value) = if let Some(v) = raw.strip_prefix(">=") {
+            (">=", v.trim())
+        } else if let Some(v) = raw.strip_prefix("==") {
+            ("==", v.trim())
+        } else if raw.starts_with('<') {
+            ("<=", "")
+        } else {
+            ("==", raw.trim())
+        };
+        let numeric = value
+            .strip_prefix(':')
+            .and_then(macos_symbol_version)
+            .or_else(|| {
+                (!value.is_empty() && value.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+                    .then(|| value.to_string())
+            });
+        match (cmp, numeric) {
+            (">=", Some(v)) => c.macos_min = Some(v),
+            ("==", Some(v)) => c.macos_exact = Some(v),
+            _ => *unsupported = unsupported.or(Some("depends_on")),
+        }
+    } else if rest.starts_with("arch:") {
+        c.arch = rest
+            .split(':')
+            .nth(2)
+            .map(|s| {
+                s.trim()
+                    .trim_matches(|ch| ch == ',' || ch == ']' || ch == '[')
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty());
+    } else if !rest.starts_with("macos:") {
+        *unsupported = unsupported.or(Some("depends_on"));
+    }
+}
+
+/// One artifact stanza line of a cask file.
+fn parse_cask_artifact(line: &str, c: &mut Cask) {
+    const KINDS: &[&str] = &[
+        "app",
+        "pkg",
+        "binary",
+        "font",
+        "manpage",
+        "suite",
+        "keyboard_layout",
+        "screen_saver",
+        "prefpane",
+        "service",
+        "artifact",
+        "qlplugin",
+        "colorpicker",
+        "dictionary",
+        "input_method",
+        "internet_plugin",
+        "mdimporter",
+        "audio_unit_plugin",
+        "vst_plugin",
+        "vst3_plugin",
+        "bash_completion",
+        "zsh_completion",
+        "fish_completion",
+    ];
+    let Some(kind) = KINDS
+        .iter()
+        .find(|k| line.starts_with(&format!("{k} \"")) || line.starts_with(&format!("{k} '")))
+    else {
+        return;
+    };
+    let Some(first) = cask_quoted(line, kind) else {
+        return;
+    };
+    let dest = line
+        .split("target:")
+        .nth(1)
+        .and_then(|t| cask_quoted(t.trim_start(), ""));
+    let dest = dest.filter(|d| !d.is_empty() && !d.contains('/'));
+    c.artifacts.push(match *kind {
+        "app" => Artifact::App(first, dest),
+        "binary" => Artifact::Binary(first, dest),
+        "font" => Artifact::Font(first, dest),
+        "pkg" => Artifact::Pkg(first),
+        "manpage" => Artifact::Manpage(first, dest),
+        "suite" => Artifact::Suite(first, dest),
+        "keyboard_layout" => Artifact::KeyboardLayout(first, dest),
+        "screen_saver" => Artifact::ScreenSaver(first, dest),
+        "prefpane" => Artifact::PrefPane(first, dest),
+        "service" => Artifact::Service(first, dest),
+        "artifact" => Artifact::Generic(first, dest),
+        "qlplugin" => Artifact::Library(first, dest, "Library/QuickLook".into()),
+        "colorpicker" => Artifact::Library(first, dest, "Library/ColorPickers".into()),
+        "dictionary" => Artifact::Library(first, dest, "Library/Dictionaries".into()),
+        "input_method" => Artifact::Library(first, dest, "Library/Input Methods".into()),
+        "internet_plugin" => Artifact::Library(first, dest, "Library/Internet Plug-Ins".into()),
+        "mdimporter" => Artifact::Library(first, dest, "Library/Spotlight".into()),
+        "audio_unit_plugin" => {
+            Artifact::Library(first, dest, "Library/Audio/Plug-Ins/Components".into())
+        }
+        "vst_plugin" => Artifact::Library(first, dest, "Library/Audio/Plug-Ins/VST".into()),
+        "vst3_plugin" => Artifact::Library(first, dest, "Library/Audio/Plug-Ins/VST3".into()),
+        "bash_completion" => {
+            Artifact::Library(first, dest, "share/bash-completion/completions".into())
+        }
+        "zsh_completion" => Artifact::Library(first, dest, "share/zsh/site-functions".into()),
+        "fish_completion" => {
+            Artifact::Library(first, dest, "share/fish/vendor_completions.d".into())
+        }
+        other => Artifact::Other(format!("{other}:{first}")),
+    });
+}
+
+/// Interpolate `#{version}` in an artifact's names.
+fn interpolate_artifact(a: &mut Artifact, version: &str, unsupported: &mut Option<&'static str>) {
+    let mut go = |s: &mut String| *s = cask_interpolate(s, version, unsupported);
+    match a {
+        Artifact::App(s, _)
+        | Artifact::Binary(s, _)
+        | Artifact::Font(s, _)
+        | Artifact::Pkg(s)
+        | Artifact::Manpage(s, _)
+        | Artifact::Suite(s, _)
+        | Artifact::KeyboardLayout(s, _)
+        | Artifact::ScreenSaver(s, _)
+        | Artifact::PrefPane(s, _)
+        | Artifact::Service(s, _)
+        | Artifact::Generic(s, _)
+        | Artifact::Library(s, _, _) => go(s),
+        Artifact::Wrapper(_, _, _, _) | Artifact::Other(_) => {}
+    }
+}
+
+/// A `zap`/`uninstall` stanza (possibly multi-line): returns
+/// (trash, delete, rmdir, saw-other-directive). Consumes
+/// following lines while brackets are unbalanced.
+fn parse_cask_file_stanza(
+    lines: &[&str],
+    i: &mut usize,
+    first_line: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
+    let mut joined = first_line.to_string();
+    let depth = |s: &str| -> i64 {
+        s.chars().filter(|c| *c == '[').count() as i64
+            - s.chars().filter(|c| *c == ']').count() as i64
+    };
+    while depth(&joined) > 0 && *i < lines.len() {
+        joined.push('\n');
+        joined.push_str(lines[*i]);
+        *i += 1;
+    }
+    let grab = |key: &str| -> Vec<String> {
+        let Some(rest) = joined.split(key).nth(1) else {
+            return Vec::new();
+        };
+        let rest = rest.trim_start();
+        if rest.starts_with('[') {
+            let end = rest.find(']').map_or(rest.len(), |b| b + 1);
+            cask_quoted_all(&rest[..end])
+        } else {
+            let line = rest.lines().next().unwrap_or_default();
+            cask_quoted_all(line)
+        }
+    };
+    let other = [
+        "quit:",
+        "launchctl:",
+        "pkgutil:",
+        "script:",
+        "signal:",
+        "login_item:",
+        "kext:",
+        "delete:",
+    ]
+    .iter()
+    .any(|k| *k != "delete:" && joined.contains(k));
+    (grab("trash:"), grab("delete:"), grab("rmdir:"), other)
+}
+
 /// Look up `user/tap/name` (or a bare name in any tap) as data.
 pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
     if !super::valid_name(full) {
@@ -1102,6 +1569,78 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
                 &text,
                 &format!("{}/{canon_name}", tap.name()),
             ));
+        }
+    }
+    None
+}
+
+/// A cask file inside a tap, at brew's candidate locations.
+pub fn cask_file(tap: &Tap, token: &str) -> Option<PathBuf> {
+    if !super::valid_component(token) {
+        return None;
+    }
+    let root = tap.path.canonicalize().ok()?;
+    let shard = if let Some(rest) = token.strip_prefix("font-") {
+        format!("font/font-{}", rest.chars().next().unwrap_or('x'))
+    } else {
+        token.chars().next().unwrap_or('x').to_string()
+    };
+    for cand in [
+        tap.path.join("Casks").join(format!("{token}.rb")),
+        tap.path
+            .join("Casks")
+            .join(&shard)
+            .join(format!("{token}.rb")),
+    ] {
+        if let Ok(canon) = cand.canonicalize()
+            && canon.starts_with(&root)
+        {
+            return Some(canon);
+        }
+    }
+    None
+}
+
+/// Look up a cask token (qualified or bare) in tap directories
+/// as data. Returns the record and its qualified name.
+pub fn lookup_cask(prefix: &Prefix, full: &str) -> Option<(Cask, String)> {
+    if !super::valid_name(full) {
+        return None;
+    }
+    let finish = |tap: &Tap, file: &std::path::Path, token: &str| -> Option<(Cask, String)> {
+        let text = crate::metadata_io::read_bounded_regular_utf8(file, 1024 * 1024).ok()?;
+        let mut c = parse_cask_rb_as_data(&text, token);
+        c.full_name = format!("{}/{token}", tap.name());
+        if let Ok(root) = tap.path.canonicalize()
+            && let Ok(rel) = file.strip_prefix(&root)
+        {
+            c.source_url = Some(format!(
+                "https://github.com/{}/homebrew-{}/blob/HEAD/{}",
+                tap.user,
+                tap.repo,
+                rel.display()
+            ));
+        }
+        Some((c, format!("{}/{token}", tap.name())))
+    };
+    let parts: Vec<&str> = full.split('/').collect();
+    if parts.len() == 2 {
+        // Two-segment shorthand names the `user/homebrew-user` tap.
+        return lookup_cask(prefix, &format!("{}/{}/{}", parts[0], parts[0], parts[1]));
+    }
+    if parts.len() == 3 {
+        let (user, repo, token) = (parts.first()?, parts.get(1)?, parts.get(2)?);
+        let (user, repo) = parse_tap_name(&format!("{user}/{repo}"))?;
+        let path = tap_path(prefix, &user, &repo).ok()?;
+        let tap = Tap { user, repo, path };
+        let file = cask_file(&tap, token)?;
+        return finish(&tap, &file, token);
+    }
+    for tap in list(prefix) {
+        if let Some(file) = cask_file(&tap, full)
+            && let Some(found) = finish(&tap, &file, full)
+        {
+            return Some(found);
         }
     }
     None

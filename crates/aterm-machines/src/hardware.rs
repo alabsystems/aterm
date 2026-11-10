@@ -122,35 +122,10 @@ pub fn parse_product_name(text: &str) -> Option<String> {
     })
 }
 
-/// The model's marketing name.
-#[must_use]
-pub fn model_name(hw_model: &str, product_name: Option<&str>) -> Option<String> {
-    if hw_model.starts_with("VirtualMac") {
-        return Some("Virtual Machine".to_owned());
-    }
-    if let Some(base) = product_name
-        .and_then(|p| p.split(" (").next())
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    {
-        return Some(base.to_owned());
-    }
-    let family: String = hw_model
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect();
-    let name = match family.as_str() {
-        "MacBookPro" => "MacBook Pro",
-        "MacBookAir" => "MacBook Air",
-        "MacBook" => "MacBook",
-        "Macmini" => "Mac mini",
-        "iMacPro" => "iMac Pro",
-        "iMac" => "iMac",
-        "MacPro" => "Mac Pro",
-        _ => return None,
-    };
-    Some(name.to_owned())
-}
+/// The model's marketing name. It is the one definition every reader of a Mac's name uses, the
+/// in-process type reader's Mac rung (stats deck A4 §9), whose filter refuses a product name that
+/// is a code or a placeholder.
+pub use aterm_sysprobe::machine_type::model_name;
 
 /// One disk inside the Mac, as [`disk_cmd`] lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

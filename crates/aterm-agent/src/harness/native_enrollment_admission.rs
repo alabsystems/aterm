@@ -752,7 +752,7 @@ pub(super) mod tests {
         // An existing-source inspection does not reacquire shared S, even when
         // the existing holder is exclusive. It is metadata, not source authority.
         let other_source =
-            super::super::codex_source_gate::PublicationLock::released_for_home(&other_home);
+            super::super::codex_source_gate::PublicationLock::for_home(&other_home).unwrap();
         let isolated = RefreshExchangeLease::for_env(&other).unwrap();
         isolated.current().unwrap();
         assert!(RefreshExchangeLease::for_env(&a).is_err());

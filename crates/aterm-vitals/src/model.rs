@@ -114,11 +114,16 @@ pub struct ProcSample {
     pub reaps_unwaited: Option<bool>,
 }
 
-/// Process scheduler state (`Run` means neither stopped nor zombie).
+/// Process scheduler state (`Run` means neither stopped, nor a zombie, nor in an uninterruptible
+/// wait the sweep could see).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProcState {
     /// Running or sleeping.
     Run,
+    /// In an uninterruptible wait (Linux's `D`; a disk or a mount that does not answer). macOS
+    /// reports every live process as running, so its sweep never says this: its threads do
+    /// ([`crate::blockage`]).
+    Uninterruptible,
     /// Stopped.
     Stopped,
     /// Exited, not yet reaped.
@@ -134,6 +139,7 @@ impl ProcState {
     pub fn word(self) -> &'static str {
         match self {
             Self::Run => "run",
+            Self::Uninterruptible => "uninterruptible",
             Self::Stopped => "stopped",
             Self::Zombie => "zombie",
             Self::Unknown => "unknown",
@@ -882,6 +888,45 @@ pub struct PlaceView {
     pub line: String,
     /// The `place` JSON object's fields, in order.
     pub fields: Vec<(&'static str, PlaceValue)>,
+    /// The kind of network the place is, as netplace typed it: what the Machine row's place
+    /// glyph and the situation's place stripe draw (A4 §8). The same place as [`Self::fields`],
+    /// typed where the deck reads it.
+    pub kind: PlaceKind,
+}
+
+/// The kind of network this Mac's place is on (netplace's `Kind`, or none), as the Machine row
+/// draws it (A4 §8): one glyph per kind, the LAN's whatever its medium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceKind {
+    /// A LAN or Wi-Fi network (netplace's `Kind::Lan`), the ALab LAN or another.
+    Lan,
+    /// A phone's Personal Hotspot (by the path monitor's `expensive` flag on a non-cellular
+    /// link, or by its address range).
+    Hotspot,
+    /// A cellular link.
+    Cellular,
+    /// A tunnel holds the default route.
+    Vpn,
+    /// No network.
+    Offline,
+    /// Not known yet: netplace is still checking and has no kind.
+    Checking,
+}
+
+impl PlaceKind {
+    /// The word `sys` and `await sys` say: `lan`, `hotspot`, `cellular`, `vpn`, `offline`,
+    /// `checking`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Hotspot => "hotspot",
+            Self::Cellular => "cellular",
+            Self::Vpn => "vpn",
+            Self::Offline => "offline",
+            Self::Checking => "checking",
+        }
+    }
 }
 
 /// One value of a [`PlaceView`]'s JSON object.
@@ -1053,6 +1098,13 @@ pub struct Sample {
     pub machine_only: bool,
     /// The 1-minute load average.
     pub load1: Option<f64>,
+    /// The machine's runnable threads, every user's, as the host read them with the task tables
+    /// ([`crate::runq`]); the over rule reads their 10 s mean in place of [`Self::load1`].
+    pub run_queue: crate::runq::RunQueueRead,
+    /// What the host read of threads in an uninterruptible wait ([`crate::blockage`]).
+    pub dstate: crate::blockage::DStateRead,
+    /// Whether the host's process sweep reads process states, which the zombie count needs.
+    pub zombie_read: crate::blockage::ZombieRead,
     /// KiB swapped in plus out since boot.
     pub swapped_kib: Option<u64>,
     /// Every network link's counters.
@@ -1074,6 +1126,16 @@ pub struct Sample {
     pub plan: Option<PlanFact>,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
+    /// The documented thermal pressure level (A4 §4), as the host read it when its notification
+    /// fired: `None` on a system with no documented level, `Some(Err)` where its reader failed.
+    pub thermal_pressure: Option<Result<crate::heat::ThermalPressure, &'static str>>,
+    /// The chip's clock range, read once by the host from the power manager's tables: the heat
+    /// chain's clock bounds ([`crate::heat::judge`]). `None` on a system with no such table,
+    /// `Some(Err)` where the read gave none.
+    pub clock_range: Option<Result<crate::heat::ClockRange, &'static str>>,
+    /// The system's own watts readers' readings (Linux: RAPL, NVML), which stand where no
+    /// coalition chain reads ([`crate::heat::HostWatts`]).
+    pub host_watts: crate::heat::HostWatts,
     /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
     /// where no reader runs (every OS but macOS).
     pub ane: Option<Result<AneSample, AneCheck>>,
@@ -1107,6 +1169,9 @@ pub struct Sample {
     /// The physical devices home's volume and the front tab's are stored on, home's first, and
     /// their I/O counters ([`crate::units::BlockSample`]).
     pub block: Vec<crate::units::BlockSample>,
+    /// The machine's situation and type as the host's readers last heard them
+    /// ([`crate::situation`]); unread throughout where the host read none.
+    pub situation: crate::situation::Situation,
 }
 
 impl Sample {
@@ -1586,7 +1651,8 @@ pub const CORE_HISTORY_LEN: usize = 60;
 pub const GAP_CADENCES: u64 = 3;
 /// Maximum wall-vs-monotonic clock drift (ms) before an interval is treated as a sleep gap.
 pub const SLEEP_SKEW_MS: i64 = 1_000;
-/// Busy-core fraction threshold (`0.95`) for CPU overload when `load1 > cores`.
+/// Busy-core fraction threshold (`0.95`) for CPU overload while the run queue passes the cores
+/// ([`crate::strain::cpu_over_depth`]).
 pub const CPU_OVER_BUSY: f64 = 0.95;
 /// Swap traffic threshold (bytes/s) for memory overload.
 pub const SWAP_OVER_BPS: f64 = 4.0 * 1024.0 * 1024.0;
@@ -2191,6 +2257,11 @@ pub struct RowFacts {
     pub cpu_brand: Option<String>,
     /// CPU: the 1-minute load average.
     pub load1: Option<f64>,
+    /// CPU: P10, the machine's runnable threads over the last 10 s, or why unread.
+    pub runnable: crate::runq::Runnable,
+    /// CPU: the queue the over rule reads ([`crate::strain::cpu_over_depth`]): P10, or
+    /// [`Self::load1`] only where P10 is unread; `None` where neither was read.
+    pub queue: Option<crate::runq::RunQueue>,
     /// CPU: the busiest program this sweep, its processes grouped by name.
     pub busiest: Option<Busiest>,
     /// Memory: swap traffic, bytes per second.
@@ -2234,6 +2305,11 @@ pub struct RowFacts {
     pub flow: Option<crate::starts::TaskFlow>,
     /// Processes: seconds of readings toward learning its start peak ([`PROC_LEARN_S`]).
     pub proc_read_s: u32,
+    /// Processes: unreaped zombies by parent, machine-wide, from the sweep every whole reading
+    /// takes ([`crate::blockage`]).
+    pub zombies: crate::blockage::Zombies,
+    /// Processes: threads in an uninterruptible wait ([`crate::blockage`]).
+    pub dstate: crate::blockage::DState,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -2272,6 +2348,32 @@ pub enum SlotsUnread {
 }
 
 impl SlotsUnread {
+    /// Canonical unavailable reason string ([`crate::sys::UNAVAILABLE_WORDS`]).
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::NotSampled => "not_sampled",
+            Self::Refused => "refused",
+            Self::UnreadFormat => "unread_format",
+        }
+    }
+}
+
+/// Why a reading holds no value: one of the `sys` unavailable words, never a zero in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// No reader on this OS.
+    Unsupported,
+    /// Not read yet, or the read failed.
+    NotSampled,
+    /// The OS refused it to this user.
+    Refused,
+    /// The OS answered with values that fail their self-check.
+    UnreadFormat,
+}
+
+impl Unread {
     /// Canonical unavailable reason string ([`crate::sys::UNAVAILABLE_WORDS`]).
     #[must_use]
     pub fn word(self) -> &'static str {
@@ -2364,6 +2466,10 @@ pub struct Snapshot {
     pub procs_truncated: bool,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
+    /// The heat chain (A4 §4): the thermal pressure level, compute watts, the Super and
+    /// Efficiency clocks with their gates and the usual clock, work per joule, the cut; each
+    /// value with its absence ([`crate::heat::NoHeat`]).
+    pub heat: crate::heat::HeatView,
     /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
     /// where no reader runs (every OS but macOS).
     pub ane: Option<Result<AneSample, AneCheck>>,
@@ -2399,6 +2505,9 @@ pub struct Snapshot {
     pub strip_events: Vec<StripEvent>,
     /// What the deck's mechanism tiles draw ([`crate::units`]).
     pub units: crate::units::Units,
+    /// The machine's situation and type, as the reading's [`Sample::situation`] carried them
+    /// (A4 §8, §9): the Machine row's name and glyphs. Its place is [`Self::place`].
+    pub situation: crate::situation::Situation,
 }
 
 /// aterm's own process rows kept per snapshot, busiest first.
@@ -2954,6 +3063,9 @@ struct Rows {
     swap: Option<(Stamp, u64)>,
     /// The start counter at the last reading that read one, and when ([`RowFacts::flow`]).
     starts: Option<(Stamp, crate::starts::StartCount)>,
+    /// The heat counters' change the start counter's merge gave this reading, or why it gave none
+    /// ([`crate::starts::Moved::heat`]); `None` where the reading's start counter carries no heat.
+    heat_moved: Option<Result<crate::heat::HeatMove, &'static str>>,
     sessions: HashMap<String, Session>,
     /// Monotonic timestamp (ms) since which `rate60` disk filling has been positive.
     filling_since: Option<u64>,
@@ -2964,6 +3076,10 @@ struct Rows {
     gpu_clients: crate::gpu_clients::GpuShares,
     /// The units' 10 s readings and rates ([`crate::units`]).
     units: crate::units::UnitRings,
+    /// The run queue's readings, P10's window ([`crate::runq`]).
+    runq: crate::runq::RunQueueRing,
+    /// Zombies and uninterruptible waits between readings ([`crate::blockage`]).
+    blockage: crate::blockage::Book,
 }
 
 /// One scope's hour rings in [`Resource::ALL`] order; a row's ring exists once the scope read it.
@@ -3026,6 +3142,8 @@ pub struct Vitals {
     /// How many times the strip's held buckets changed other than by a bucket closing
     /// ([`Self::strip_rewrites`]).
     strip_rewrites: u64,
+    /// The heat chain's state across readings: the usual Super clock per decile.
+    heat: crate::heat::Engine,
 }
 
 /// The most gaps, and the most events, a strip keeps.
@@ -3743,7 +3861,11 @@ impl Vitals {
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let opens_before = self.strip_opens();
         let meaning_before = self.rows.proc_starts;
-        let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        let (resources, mut facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        (facts.zombies, facts.dstate) = self
+            .rows
+            .blockage
+            .absorb(s, pass.attribution.as_ref().map(|(m, _)| m.as_slice()));
         // Any strip ring re-keyed back, not only the rows': aterm's, which read nothing at a step
         // a rate cannot cross, re-key at the reading after it.
         let rekeyed = opens_before
@@ -3761,7 +3883,7 @@ impl Vitals {
                 cores: core_fracs.as_deref(),
                 n_cores: s.cores.as_ref().map(Vec::len).filter(|&n| n > 0),
                 clusters: cpu.as_ref().map_or(&[], |c| c.clusters.as_slice()),
-                load1: s.load1,
+                queue: facts.queue,
                 churn_bps: mem.as_ref().and_then(|m| m.rates).map(|r| r.churn_bps),
                 churn_read: mem.as_ref().is_some_and(|m| m.sample.counters.is_some()),
                 swap_bps: facts.swap_rate,
@@ -3811,6 +3933,16 @@ impl Vitals {
             _ => None,
         };
 
+        let heat = self.heat.absorb(&crate::heat::Input {
+            lane: s.coal_lane,
+            pressure: s.thermal_pressure,
+            moved: self.rows.heat_moved.take(),
+            range: s.clock_range,
+            gate: crate::heat::ClockGate::of_chip(self.rows.cpu_brand.as_deref()),
+            cores: core_fracs.as_deref().zip(cores_window_ns),
+            p_cores: cpu.as_ref().and_then(|c| super_cores(&c.clusters)),
+            host: s.host_watts,
+        });
         let mut snap = Snapshot {
             cpu_counter_sample: s.cores.clone(),
             hardware: s.hardware.clone(),
@@ -3847,6 +3979,7 @@ impl Vitals {
             programs: pass.programs,
             procs_truncated: s.procs_truncated,
             thermal: s.thermal,
+            heat,
             ane: s.ane,
             load: s.load,
             slots: None,
@@ -3861,6 +3994,7 @@ impl Vitals {
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
             units,
+            situation: s.situation.clone(),
         };
         let attribution = pass
             .attribution
@@ -4395,11 +4529,13 @@ impl Rows {
             ..RowFacts::default()
         };
 
+        facts.runnable = self.runq.absorb(t, s.run_queue);
+        facts.queue = crate::runq::RunQueue::of(facts.runnable, s.load1);
         let n_cores = s.cores.as_ref().map(Vec::len).filter(|&n| n > 0);
         if let Some(n) = n_cores {
             self.caps[Cpu.index()] = Some(n as f64);
         }
-        let cpu_over = crate::units::cpu_over(busy, n_cores, s.load1);
+        let cpu_over = crate::units::cpu_over(busy, n_cores, facts.queue);
         self.rings[Cpu.index()].push(t, busy, cpu_over);
 
         let gpu_pct = s
@@ -4476,15 +4612,31 @@ impl Rows {
 
         facts.flow = match s.starts.as_ref() {
             Some(count) => {
-                let flow = self.starts.as_ref().and_then(|(then, before)| {
-                    let dt = stamp.rate_dt(Some(*then))?;
-                    crate::starts::TaskFlow::of(crate::starts::moved(before, count)?, dt)
-                });
+                let moved = match self.starts.as_ref() {
+                    None => Err("warming"),
+                    Some((then, before)) => match stamp.rate_dt(Some(*then)) {
+                        None => Err("gap"),
+                        Some(dt) => crate::starts::moved(before, count)
+                            .map(|m| (m, dt))
+                            .ok_or("start_counter"),
+                    },
+                };
+                let carries_heat = matches!(
+                    count,
+                    crate::starts::StartCount::Coalitions { read, .. } if read.heat().is_some()
+                );
+                self.heat_moved = match moved {
+                    Ok((m, _)) => m.heat,
+                    Err(why) => carries_heat.then_some(Err(why)),
+                };
                 self.starts = Some((stamp, count.clone()));
-                flow
+                moved
+                    .ok()
+                    .and_then(|(m, dt)| crate::starts::TaskFlow::of(m, dt))
             }
             None => {
                 self.starts = None;
+                self.heat_moved = Some(Err("coalitions_unread"));
                 None
             }
         };
@@ -5158,6 +5310,13 @@ fn resolve(
         memo.insert(p, m);
     }
     memo.get(&pid).copied().unwrap_or_default()
+}
+
+/// The Super (performance) cores' indices: the fastest cluster's, where the machine names more than
+/// one kind of core; `None` with one kind, whose Super time no core count checks.
+fn super_cores(clusters: &[ClusterView]) -> Option<&[usize]> {
+    let kinds = clusters.iter().filter(|c| c.name != "CPU").count();
+    (kinds > 1).then(|| clusters[0].cores.as_slice())
 }
 
 fn cluster_views(specs: &[ClusterSpec], n: usize) -> Vec<ClusterView> {

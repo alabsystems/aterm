@@ -74,7 +74,7 @@ impl Preparation {
         self.prelude.extra()
     }
 
-    pub(super) fn configured(&mut self, command: &spawnfd::Command) -> io::Result<()> {
+    pub(super) fn configured(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         self.prelude.configured(command)
     }
 

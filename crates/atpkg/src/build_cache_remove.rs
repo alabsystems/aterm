@@ -422,6 +422,7 @@ mod sys {
     };
 
     use super::super::registered::retention::{self, WalkFence};
+    use super::super::registered::volume;
     use super::{Forecast, Identity, Left, Revoked, Why};
 
     /// A folder's owner bits: read, write, search.
@@ -647,11 +648,11 @@ mod sys {
             Err(_) => return Walked::top(Why::Unreachable),
         };
         let uid = crate::platform::our_uid();
-        match top_verdict(&held, read, holder.as_fd(), uid, expected) {
+        let top_read = match top_verdict(&held, read, holder.as_fd(), name, uid, expected) {
             Judged::Gone => return Walked::default(),
             Judged::Stays(why) => return Walked::top(why),
-            Judged::Ours(_) => {}
-        }
+            Judged::Ours(stat) => stat,
+        };
         let mut walk = Walk {
             device: held.st_dev,
             uid,
@@ -664,7 +665,9 @@ mod sys {
             met: HashMap::new(),
             again: false,
             permit,
-            expected_root: expected.map(|value| (value.root.device, value.root.inode)),
+            // The folder the removal was given, as this boot numbers its volume: `top` as it was
+            // judged that very folder ([`top_verdict`]), never adopted once swapped since.
+            expected_root: expected.map(|_| (top_read.st_dev, top_read.st_ino)),
             recursive,
             at: PathBuf::new(),
             first: Vec::new(),
@@ -696,12 +699,13 @@ mod sys {
         held: &Stat,
         read: Result<Stat, Errno>,
         holder: BorrowedFd<'_>,
+        name: &OsStr,
         uid: u32,
         expected: Option<&Expected<'_>>,
     ) -> Judged {
         let held_given = expected
             .and_then(|value| value.holder)
-            .is_none_or(|wanted| matches_holder(wanted, held));
+            .is_none_or(|wanted| names_holder(wanted, held, holder));
         match read {
             Err(e) if e.is_noent() && held_given => Judged::Gone,
             Err(e) if e.is_noent() => Judged::Stays(Why::NotIdentified),
@@ -710,7 +714,7 @@ mod sys {
                 Judged::Ours(stat)
                     if !held_given
                         || expected.is_some_and(|value| {
-                            !matches_identity(value.root, &stat) || !is_dir(&stat)
+                            !names_entry(value.root, &stat, holder, name) || !is_dir(&stat)
                         }) =>
                 {
                     Judged::Stays(Why::NotIdentified)
@@ -847,13 +851,37 @@ mod sys {
         false
     }
 
+    /// Whether `expected`, an identity this walk read in this boot, is the entry read as `stat`.
     fn matches_identity(expected: &Identity, stat: &Stat) -> bool {
         (expected.device, expected.inode) == (stat.st_dev, stat.st_ino)
     }
 
-    fn matches_holder(expected: &Identity, stat: &Stat) -> bool {
-        matches_identity(expected, stat)
-            && stat.st_uid == crate::platform::our_uid()
+    /// Whether `expected`, as its record keeps it (another boot's, perhaps), names the entry
+    /// `name` of the folder held as `folder`, read as `stat` ([`Identity::names`]): its volume is
+    /// read by that name only where the record keeps a volume's UUID.
+    fn names_entry(expected: &Identity, stat: &Stat, folder: BorrowedFd<'_>, name: &OsStr) -> bool {
+        let now = if expected.volume.is_some() {
+            Identity::at(folder, name, stat)
+        } else {
+            Some(Identity::unrecorded(stat.st_dev, stat.st_ino))
+        };
+        now.is_some_and(|now| expected.names(&now))
+    }
+
+    /// Whether `expected`, as its record keeps it, names the folder held as `holder`, read as
+    /// `stat` (its volume read through it only where the record keeps one), a private folder of
+    /// this user's.
+    fn names_holder(expected: &Identity, stat: &Stat, holder: BorrowedFd<'_>) -> bool {
+        let volume = if expected.volume.is_some() {
+            volume::held(holder).ok().flatten()
+        } else {
+            None
+        };
+        expected.names(&Identity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            volume,
+        }) && stat.st_uid == crate::platform::our_uid()
             && stat.st_mode & 0o022 == 0
     }
 
@@ -1518,13 +1546,9 @@ mod sys {
                         // Its custody descriptor is still among the folders held, so a keep
                         // published as the rename acted, in it or above it, is read here.
                         if moved.is_ok_and(|at| same(&at, held)) && self.permit.allows() {
-                            self.permit.escaped.insert(
-                                up.clone(),
-                                Identity {
-                                    device: held.st_dev,
-                                    inode: held.st_ino,
-                                },
-                            );
+                            self.permit
+                                .escaped
+                                .insert(up.clone(), Identity::unrecorded(held.st_dev, held.st_ino));
                             self.up.push(up);
                             return Tried::Gone;
                         }
@@ -1805,6 +1829,7 @@ mod sys {
             left,
             visits,
             expected,
+            root: None,
             alone,
             out: Forecast {
                 whole: true,
@@ -1831,6 +1856,9 @@ mod sys {
         visits: usize,
         /// An identified removal's rules ([`Expected`]), as [`walk`] takes them.
         expected: Option<&'a Expected<'a>>,
+        /// The folder an identified removal was given, as this boot numbers its volume (device
+        /// and inode): `top` as it was judged that very folder ([`top_verdict`]).
+        root: Option<(u64, u64)>,
         /// A removal that takes `top` only once empty, once these names of it went.
         alone: Option<&'a [&'a str]>,
         out: Forecast,
@@ -1878,10 +1906,13 @@ mod sys {
                 Err(_) => return self.judged(PathBuf::new(), Why::Unreachable),
             };
             self.device = held.st_dev;
-            match top_verdict(&held, read, holder.as_fd(), self.uid, self.expected) {
+            match top_verdict(&held, read, holder.as_fd(), name, self.uid, self.expected) {
                 Judged::Gone => {}
                 Judged::Stays(why) => self.judged(PathBuf::new(), why),
-                Judged::Ours(_) => self.entry(holder.as_fd(), name, PathBuf::new(), 0),
+                Judged::Ours(stat) => {
+                    self.root = self.expected.map(|_| (stat.st_dev, stat.st_ino));
+                    self.entry(holder.as_fd(), name, PathBuf::new(), 0);
+                }
             }
         }
 
@@ -1906,9 +1937,8 @@ mod sys {
             };
             // An identified removal never adopts a `top` swapped since it was first judged.
             if depth == 0
-                && self
-                    .expected
-                    .is_some_and(|value| !matches_identity(value.root, &stat) || !is_dir(&stat))
+                && self.expected.is_some()
+                && (self.root != Some((stat.st_dev, stat.st_ino)) || !is_dir(&stat))
             {
                 return self.stays(rel, Why::NotIdentified);
             }

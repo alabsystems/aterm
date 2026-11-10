@@ -291,7 +291,7 @@ mod tests {
         drop(reservation);
         registry.reap_gone();
         assert!(registry.state.lock().unwrap().launches.is_empty());
-        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
 
         let (registry, reservation, home) = pending();
         reservation.grant(&reservation.native.child).unwrap();
@@ -343,7 +343,7 @@ mod tests {
         assert!(status.success());
         registry.reap_gone();
         assert!(registry.state.lock().unwrap().launches.is_empty());
-        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
                 NoNativeReaderKind::ApiKey,
             )
             .unwrap();
-        drop(crate::harness::codex_source_gate::PublicationLock::released_for_home(home.path()));
+        assert!(crate::harness::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
         assert!(Process::observe(std::process::id()).is_some());
     }
 }

@@ -163,7 +163,7 @@ fn two_historical_trees() {
                     // Sequential to bound memory. Use the cut's exact warm target, source,
                     // release profile and sealed environment; only omit its executable wrapper.
                     let _memory = aterm_capacity::admit(
-                        crate::slice_units::slice_need(triple, target.is_none(), None),
+                        crate::slice_units::slice_need(triple, None),
                         aterm_capacity::Admit::Wait,
                     )
                     .unwrap();

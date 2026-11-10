@@ -28,7 +28,7 @@ impl Slot {
             let file = crate::util::append_regular_file(&path)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             match RecordLock::try_lock(file, 0) {
-                Ok(lock) => return Ok(Some(Self(lock.into_close_only()))),
+                Ok(lock) => return Ok(Some(Self(lock.into_sole_close_only()))),
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(e) => return Err(format!("{}: {e}", path.display()).into()),
             }

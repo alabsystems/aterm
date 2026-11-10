@@ -42,6 +42,9 @@ struct Fixture {
     retired: usize,
     before_arm_error: bool,
     launches: usize,
+    before_goes: usize,
+    starts: Vec<Started>,
+    lose_start_ack: bool,
     #[cfg(target_os = "macos")]
     producer_returns: usize,
 }
@@ -84,6 +87,9 @@ impl Fixture {
             retired: 0,
             before_arm_error: false,
             launches: 0,
+            before_goes: 0,
+            starts: Vec::new(),
+            lose_start_ack: false,
             #[cfg(target_os = "macos")]
             producer_returns: 0,
         }
@@ -149,7 +155,38 @@ impl MemberCustody for Fixture {
         }
     }
     fn before_go(&mut self) -> io::Result<()> {
+        self.before_goes += 1;
         Ok(())
+    }
+    fn commit_started(
+        &mut self,
+        actual: &Binding,
+        started: &Started,
+        requested: Option<RequestedStartLimits>,
+    ) -> io::Result<()> {
+        use std::io::Write as _;
+        if actual != &binding() || !self.starts.is_empty() {
+            return Err(io::Error::other(
+                "different or repeated original member Start",
+            ));
+        }
+        self.validate()?;
+        let bytes = aterm_json::to_vec(&aterm_json::json!({
+            "pid": started.pid, "birth": started.birth,
+            "monotonic_ns": started.monotonic_ns, "unix_ns": started.unix_ns,
+            "requested_units": requested.map(|limits| limits.units),
+            "requested_footprint_mib": requested.map(|limits| limits.footprint_mib),
+        }))
+        .map_err(io::Error::other)?;
+        let mut file = std::fs::File::create_new(self._scratch.path().join("started"))?;
+        file.write_all(&bytes)?;
+        aterm_durable::durable(&file)?;
+        aterm_durable::durable(&std::fs::File::open(self._scratch.path())?)?;
+        self.starts.push(started.clone());
+        if self.lose_start_ack {
+            return Err(io::Error::other("lost durable Started acknowledgment"));
+        }
+        self.validate()
     }
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError> {
         self.launches += 1;
@@ -243,7 +280,387 @@ fn binding() -> Binding {
     }
 }
 fn wake() {}
-fn done(member: &mut OwnedAttempt<Resources>, fixture: &mut Fixture) -> Progress {
+
+#[cfg(target_os = "macos")]
+struct DeferredStart {
+    resources: Resources,
+    start: Option<Started>,
+    since: Option<Instant>,
+    pending: bool,
+}
+
+/// Actual private bootstrap composed with the original cohort/claim fixture.
+/// Same-image authentication here is deliberately test-only, not an AY profile.
+/// The wire's requested units remain informational, not a shared CPU-bank grant.
+#[cfg(target_os = "macos")]
+struct SealedStart {
+    resources: Resources,
+    owner: crate::solver_bootstrap::Owner,
+    limit: spawnfd::FootprintLimit,
+    start: Option<(Started, Instant)>,
+}
+#[cfg(target_os = "macos")]
+impl MemberResources for SealedStart {
+    fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        self.resources.configure(command)?;
+        command.footprint_limit(self.limit);
+        command.append_guards_at(vec![self.owner.extra(9)?])?;
+        Ok(())
+    }
+    fn bind_child(&mut self, pid: u32) -> io::Result<()> {
+        self.resources.bind_child(pid)
+    }
+    fn prepare_target(&mut self, child: &mut spawnfd::Child) -> io::Result<bool> {
+        self.owner.poll_ready(child, same_bootstrap_image)
+    }
+    fn poll_start(
+        &mut self,
+        child: &mut spawnfd::Child,
+        cancelled: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut(&Started, Option<RequestedStartLimits>) -> io::Result<()>,
+    ) -> io::Result<TargetStart> {
+        let start = &mut self.start;
+        let sent = self
+            .owner
+            .poll_run(child, same_bootstrap_image, cancelled, |intent| {
+                let (_, unix_ns) = clocks()?;
+                let metadata = Started {
+                    pid: intent.pid,
+                    birth: intent.birth,
+                    monotonic_ns: intent.monotonic_ns,
+                    unix_ns,
+                };
+                let since = Instant::now();
+                commit(
+                    &metadata,
+                    Some(RequestedStartLimits {
+                        units: intent.units,
+                        footprint_mib: intent.footprint_mib,
+                    }),
+                )?;
+                *start = Some((metadata, since));
+                Ok(())
+            })?;
+        if !sent {
+            return Ok(TargetStart::Pending {
+                offered: self.owner.run_offered(),
+            });
+        }
+        let (metadata, since) = self
+            .start
+            .clone()
+            .ok_or_else(|| io::Error::other("Run without Start"))?;
+        Ok(TargetStart::Started { metadata, since })
+    }
+}
+#[cfg(target_os = "macos")]
+fn same_bootstrap_image(pid: u32) -> io::Result<()> {
+    let image = process::LoadedImage::read(pid as i32)
+        .ok_or_else(|| io::Error::other("original image unavailable"))?;
+    if image.matches_file(&std::env::current_exe()?) != Some(true) {
+        return Err(io::Error::other("original image changed"));
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn sealed_bootstrap_uses_actor_start_commit_before_original_target_work() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::sealed_bootstrap_uses_actor_start_commit_before_original_target_work",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let root = fixture._scratch.path();
+    let marker = root.join("work");
+    let limit = spawnfd::FootprintLimit::new(512).unwrap();
+    let owner = crate::solver_bootstrap::Owner::new(
+        binding().attempt,
+        3,
+        limit,
+        crate::fixture_deadline(Instant::now()),
+    )
+    .unwrap();
+    let mut command = spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .env_clear()
+        .env("ATERM_TEST_PRIVATE_SOLVER_BOOTSTRAP", "actor")
+        .env("ATERM_TEST_SOLVER_FD", "9")
+        .env("ATERM_TEST_SOLVER_WORK", &marker)
+        .env("ATERM_TEST_SOLVER_JOURNAL", root.join("started"))
+        .current_dir(root)
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::piped());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, client) = event_pair();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        SealedStart {
+            resources: Resources(dropped.clone(), None),
+            owner,
+            limit,
+            start: None,
+        },
+        events,
+        binding(),
+        Some(Duration::from_secs(60)),
+        wake,
+    );
+    let deadline = crate::fixture_deadline(Instant::now());
+    let started = loop {
+        assert!(Instant::now() < deadline);
+        assert!(member.poll(&mut fixture, None).ready_to_start);
+        assert!(!marker.exists());
+        match member.start(&mut fixture) {
+            Ok(started) => break started,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("actual sealed dispatch: {error}"),
+        }
+    };
+    assert_eq!(fixture.starts, [started]);
+    assert_eq!(fixture.before_goes, 1);
+    let progress = done(&mut member, &mut fixture);
+    assert!(matches!(
+        progress.completed.unwrap().outcome,
+        Outcome::Exit(0)
+    ));
+    assert!(
+        std::fs::read_to_string(marker)
+            .unwrap()
+            .starts_with("run 3 512 ")
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    drop(client);
+}
+
+#[cfg(target_os = "macos")]
+impl MemberResources for DeferredStart {
+    fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        self.resources.configure(command)
+    }
+    fn bind_child(&mut self, pid: u32) -> io::Result<()> {
+        self.resources.bind_child(pid)
+    }
+    fn poll_start(
+        &mut self,
+        child: &mut spawnfd::Child,
+        cancelled: &mut dyn FnMut() -> bool,
+        commit: &mut dyn FnMut(&Started, Option<RequestedStartLimits>) -> io::Result<()>,
+    ) -> io::Result<TargetStart> {
+        if self.start.is_none() {
+            let (monotonic_ns, unix_ns) = clocks()?;
+            let birth = process::read_birth(child.id() as i32)
+                .ok_or_else(|| io::Error::other("original child missing"))?
+                .0;
+            let start = Started {
+                pid: child.id(),
+                birth,
+                monotonic_ns,
+                unix_ns,
+            };
+            self.since = Some(Instant::now());
+            commit(&start, None)?;
+            self.start = Some(start);
+        }
+        if self.pending {
+            self.pending = false;
+            return Ok(TargetStart::Pending { offered: false });
+        }
+        if cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        child.resume()?;
+        Ok(TargetStart::Started {
+            metadata: self.start.clone().unwrap(),
+            since: self.since.unwrap(),
+        })
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn pending_start_keeps_actual_child_and_commits_its_one_clock_before_work() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::pending_start_keeps_actual_child_and_commits_its_one_clock_before_work",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let marker = fixture._scratch.path().join("work");
+    let mut command = spawnfd::command("/bin/sh");
+    command.args([
+        std::ffi::OsStr::new("-c"),
+        std::ffi::OsStr::new("printf owned > \"$1\""),
+        std::ffi::OsStr::new("sh"),
+        marker.as_os_str(),
+    ]);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, client) = event_pair();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        DeferredStart {
+            resources: Resources(dropped.clone(), None),
+            start: None,
+            since: None,
+            pending: true,
+        },
+        events,
+        binding(),
+        Some(Duration::from_secs(60)),
+        wake,
+    );
+    assert!(member.poll(&mut fixture, None).ready_to_start);
+    assert_eq!(
+        member.start(&mut fixture).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(!marker.exists());
+    assert_eq!(fixture.starts.len(), 1);
+    assert_eq!(fixture.before_goes, 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(member.poll(&mut fixture, None).ready_to_start);
+    let started = member.start(&mut fixture).unwrap();
+    assert_eq!(fixture.starts.as_slice(), std::slice::from_ref(&started));
+    assert_eq!(
+        fixture.before_goes, 1,
+        "pending does not lend or bind twice"
+    );
+    let record: aterm_json::Value =
+        aterm_json::from_slice(&std::fs::read(fixture._scratch.path().join("started")).unwrap())
+            .unwrap();
+    assert_eq!(record["pid"].as_u64(), Some(u64::from(started.pid)));
+    assert_eq!(record["birth"].as_u64(), Some(started.birth));
+    assert_eq!(record["monotonic_ns"].as_u64(), Some(started.monotonic_ns));
+    assert_eq!(record["unix_ns"].as_u64(), Some(started.unix_ns));
+    let progress = done(&mut member, &mut fixture);
+    assert!(matches!(
+        progress.completed.unwrap().outcome,
+        Outcome::Exit(0)
+    ));
+    assert_eq!(std::fs::read(marker).unwrap(), b"owned");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    drop(client);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn pending_start_cancellation_never_resumes_or_releases_before_retirement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::pending_start_cancellation_never_resumes_or_releases_before_retirement",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let marker = fixture._scratch.path().join("work");
+    let mut command = spawnfd::command("/bin/sh");
+    command.args([
+        std::ffi::OsStr::new("-c"),
+        std::ffi::OsStr::new("printf owned > \"$1\""),
+        std::ffi::OsStr::new("sh"),
+        marker.as_os_str(),
+    ]);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, client) = event_pair();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        DeferredStart {
+            resources: Resources(dropped.clone(), None),
+            start: None,
+            since: None,
+            pending: true,
+        },
+        events,
+        binding(),
+        Some(Duration::from_secs(60)),
+        wake,
+    );
+    assert!(member.poll(&mut fixture, None).ready_to_start);
+    assert_eq!(
+        member.start(&mut fixture).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    fixture.defer_retire = true;
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let progress = member.poll(&mut fixture, Some(CompletionCause::Cancelled));
+        // This target never received Run: its actual owning reap must not
+        // manufacture a solver completion or execution interval.
+        assert!(progress.completed.is_none());
+        assert!(!progress.go_attempted && !progress.launched);
+        if matches!(&member.state, State::Bound(bound) if bound.reaped) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!marker.exists());
+    assert_eq!(fixture.starts.len(), 1);
+    assert_eq!(fixture.before_goes, 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(member.start(&mut fixture).is_err());
+    fixture.defer_retire = false;
+    assert!(done(&mut member, &mut fixture).retired);
+    assert!(!marker.exists());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn lost_durable_native_start_ack_never_sends_go_or_releases_before_retirement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::lost_durable_native_start_ack_never_sends_go_or_releases_before_retirement",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.lose_start_ack = true;
+    let marker = fixture._scratch.path().join("work");
+    let mut command = spawnfd::command("/bin/sh");
+    command.args([
+        std::ffi::OsStr::new("-c"),
+        std::ffi::OsStr::new("printf owned > \"$1\""),
+        std::ffi::OsStr::new("sh"),
+        marker.as_os_str(),
+    ]);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, client) = event_pair();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        Resources(dropped.clone(), None),
+        events,
+        binding(),
+        Some(Duration::from_secs(60)),
+        wake,
+    );
+    assert!(member.poll(&mut fixture, None).ready_to_start);
+    let (pid, birth) = member.identity().unwrap();
+    assert!(member.start(&mut fixture).is_err());
+    assert_eq!(fixture.starts.len(), 1);
+    let record: aterm_json::Value =
+        aterm_json::from_slice(&std::fs::read(fixture._scratch.path().join("started")).unwrap())
+            .unwrap();
+    assert_eq!(record["pid"].as_u64(), Some(u64::from(pid)));
+    assert_eq!(record["birth"].as_u64(), Some(birth));
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(!marker.exists());
+    let progress = done(&mut member, &mut fixture);
+    assert!(progress.retired);
+    assert!(!progress.go_attempted && !progress.launched);
+    assert!(progress.completed.is_none());
+    assert!(!marker.exists());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    drop(client);
+}
+
+fn done<D: MemberResources>(member: &mut OwnedAttempt<D>, fixture: &mut Fixture) -> Progress {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let progress = member.poll(fixture, None);

@@ -108,6 +108,13 @@ fn a_listed_coalition_that_answers_nothing_is_dropped() {
             newest: Some(400),
             truncated: true,
             rows: vec![decode_usage(307, &mds_record(), (125, 3)).expect("decodes")],
+            // The filler words put Super cycles past all cycles: the read's heat is refused
+            // whole while its rows stand.
+            heat: crate::coalition_heat::CoalHeat {
+                timebase: (125, 3),
+                by_id: Vec::new(),
+                total: Err("super_over_whole"),
+            },
         }
     );
 }

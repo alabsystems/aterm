@@ -39,16 +39,13 @@ pub(crate) fn outlived_dir(prefix: &'static str) -> aterm_tempfile::TempDir {
 /// login's umask `002` (Ubuntu's default) leaves it `664`, which the rule every reader of
 /// `aterm.toml` holds (`aterm_types::dirs::aterm_config_refusal`) refuses, so the test would read
 /// no config at all.
+/// Publish the whole config atomically: live listeners must not mistake a truncated
+/// intermediate file for removal of their configured listen address.
 #[cfg(test)]
 #[track_caller]
 pub(crate) fn write_config(path: &Path, text: impl AsRef<[u8]>) {
-    std::fs::write(path, text).expect("write the config");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .expect("make the config owner-only");
-    }
+    aterm_uds::atomic_file::write(path, text.as_ref(), 0o600)
+        .expect("publish the config owner-only");
 }
 
 /// Per-test directory under `/tmp`, short enough for a Unix socket's `sun_path`.

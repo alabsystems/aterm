@@ -208,10 +208,31 @@ enum Observed<T> {
     Unseen,
 }
 
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// How many roster observations of their own this thread made ([`observe_roster`]).
+    static ROSTER_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many roster observations of their own this thread made ([`with_roster_observation`],
+/// [`with_roster_observation_or_busy`]): a roster access's currency or key check on its own call
+/// (`commons::roster::Access::is_current_observed`, `Access::with_key`, `Historical::with_key`),
+/// an access opened on its own call (`Bootstrap::access_in`, `Bootstrap::access_observed_in`), a
+/// swarm roster read on its own (`historical_swarm_roster`, a denial's roster), each one; a check
+/// judged through a look ([`super::VaultLook`]) adds none.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_roster_observations() -> usize {
+    ROSTER_OBSERVATIONS.with(std::cell::Cell::get)
+}
+
 fn observe_roster<T>(
     paths: &Paths,
     read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
 ) -> crate::Result<Observed<T>> {
+    #[cfg(any(test, debug_assertions))]
+    ROSTER_OBSERVATIONS.with(|observations| observations.set(observations.get() + 1));
     match StateLock::observe_narrowed(paths)? {
         StateObservation::Held(lock) => read(RosterObservation::Held(&lock)).map(Observed::Read),
         StateObservation::Busy => Ok(Observed::Busy),

@@ -5,6 +5,10 @@
 
 use crate::ledger::{Error, Result};
 
+#[path = "changelog_history.rs"]
+mod history;
+pub use history::gate as gate_history;
+
 /// The changelog's repo-root-relative path: the one hand-written source of release notes.
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
@@ -103,6 +107,51 @@ fn conflict_marker_head(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Refuse rather than reorder the verbatim notes during a cut. Historical sections
+/// are left alone; a recut judges the section it will actually publish.
+fn refuse_repeated_subsections(text: &str, section: &str) -> Result<()> {
+    let Some((start, end)) = section_span(text, section) else {
+        return Ok(());
+    };
+    let mut headings = std::collections::BTreeMap::new();
+    let mut in_comment = false;
+    for (idx, raw) in text.lines().enumerate().take(end).skip(start + 1) {
+        let mut visible = String::new();
+        let mut rest = raw;
+        loop {
+            if in_comment {
+                let Some((_, tail)) = rest.split_once("-->") else {
+                    break;
+                };
+                in_comment = false;
+                rest = tail;
+            } else if let Some((head, tail)) = rest.split_once("<!--") {
+                visible.push_str(head);
+                in_comment = true;
+                rest = tail;
+            } else {
+                visible.push_str(rest);
+                break;
+            }
+        }
+        if let Some(kind) = visible.trim().strip_prefix("### ") {
+            let kind = kind
+                .trim()
+                .trim_end_matches('#')
+                .trim()
+                .to_ascii_lowercase();
+            if let Some(first) = headings.insert(kind.clone(), idx + 1) {
+                return Err(Error::new(format!(
+                    "{CHANGELOG_FILE}: [{section}] repeats ### {kind} at lines {first} and {} — \
+                     combine the subsections before cutting; release notes ship verbatim",
+                    idx + 1
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The 1-based line of the first top-level entry (`- ` or `* `) above the first `## ` heading,
 /// outside HTML comments: an entry there belongs to no section, so no release's notes carry it.
 fn entry_above_every_section(text: &str) -> Option<usize> {
@@ -147,7 +196,10 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
     }
     refuse_repeated_notes(text, section)?;
     let body = real_body(text, section);
-    if body.iter().all(|l| l.starts_with(HARNESS_ENTRY_HEAD)) {
+    if note_entries(text, section)
+        .iter()
+        .all(|l| l.starts_with(HARNESS_ENTRY_HEAD))
+    {
         return Err(Error::new(format!(
             "the [{section}] section of {CHANGELOG_FILE} has no release notes — add a \
              hand-written \"### Added/Changed/Fixed\" entry before cutting (comments, \
@@ -155,6 +207,8 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
              count)"
         )));
     }
+    refuse_repeated_subsections(text, section)?;
+    crate::harness_versions::notes_gate(text, section)?;
     if let Some((start, end)) = section_span(text, section) {
         for (idx, raw) in text.lines().enumerate().take(end).skip(start + 1) {
             if raw.contains("'''") {
@@ -339,19 +393,30 @@ enum Unit<'a> {
 /// Full entries, with comments/scaffolds removed and whitespace folded. The whole
 /// entry matters: a follow-up may reuse a bold title while describing a new fix.
 /// Harness versions have their own release-window rule in `harness_versions`.
-fn note_keys(text: &str, section: &str) -> Vec<String> {
+pub(crate) fn note_keys(text: &str, section: &str) -> Vec<String> {
+    note_entries(text, section)
+        .into_iter()
+        .filter(|entry| !entry.starts_with(HARNESS_ENTRY_HEAD))
+        .map(|entry| {
+            entry
+                .strip_prefix("- ")
+                .or_else(|| entry.strip_prefix("* "))
+                .unwrap_or(&entry)
+                .to_string()
+        })
+        .collect()
+}
+
+/// Whole entries with whitespace folded, including harness announcements.
+pub(crate) fn note_entries(text: &str, section: &str) -> Vec<String> {
     let body = real_body(text, section);
     let lines: Vec<&str> = body.iter().map(String::as_str).collect();
     units(&lines)
         .into_iter()
         .filter_map(|unit| match unit {
-            Unit::Entry(lines) if !lines[0].starts_with(HARNESS_ENTRY_HEAD) => {
+            Unit::Entry(lines) => {
                 let joined = lines.join("\n");
-                let entry = joined
-                    .strip_prefix("- ")
-                    .or_else(|| joined.strip_prefix("* "))
-                    .unwrap_or(&joined);
-                Some(entry.split_whitespace().collect::<Vec<_>>().join(" "))
+                Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
             }
             _ => None,
         })
@@ -679,7 +744,7 @@ fn la_date(unix: i64, offset: i64) -> String {
 
 /// 0-based (start, end) line indices of a section: `start` is the `## [name]` header, `end`
 /// the next `## ` heading (or one past the last line).
-fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
+pub(crate) fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
     let mut start = None;
     let mut count = 0;
     for (idx, line) in text.lines().enumerate() {
@@ -698,6 +763,56 @@ fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_notes_repeated_subsections_refuse_before_cut() {
+        let doc = "## [Unreleased]\n\n### Fixed\n\n- first fix\n\n### Changed\n\n- a change\n\n### Fixed\n\n- another fix\n\n## [0.1.0] - date\n\n### Fixed\n\n- older fix\n";
+        let err = gate_unreleased(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("repeats ### fixed") && err.contains("lines"),
+            "{err}"
+        );
+        let coalesced = doc.replace("### Fixed\n\n- another fix\n\n", "").replacen(
+            "- first fix",
+            "- first fix\n\n- another fix",
+            1,
+        );
+        assert!(gate_unreleased(&coalesced).is_ok());
+        let comment = doc.replacen(
+            "### Fixed\n\n- another fix",
+            "<!-- ### Fixed -->\n\n- another fix",
+            1,
+        );
+        assert!(gate_unreleased(&comment).is_ok());
+        let recut = doc.replacen("## [Unreleased]", "## [0.2.0]", 1);
+        assert!(gate_section(&recut, "0.2.0").is_err());
+    }
+
+    #[test]
+    fn release_notes_harness_window_refuses_stale_announcements() {
+        let doc = "## [Unreleased]\n\n### Changed\n\n- a new fix\n\n- **Harness versions since v0.193.0: `alab claude harness 0.31`.**\n\n## [0.194.0] - date\n\n- `alab claude harness 0.31` records the upgrade changes.\n\n## [0.193.0] - date\n\n- older change\n";
+        let err = gate_unreleased(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("immediately preceding") && err.contains("0.194.0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn release_notes_harness_version_must_be_new() {
+        let doc = "## [Unreleased]\n\n- a new fix\n\n- **Harness versions since v0.193.0: `alab claude harness 0.31`.**\n\n## [0.194.0] - date\n\n- `alab claude harness 0.31` records the upgrade changes.\n";
+        let dated = doc.replacen("since v0.193.0", "since v0.194.0", 1);
+        let err = gate_unreleased(&dated).unwrap_err().to_string();
+        assert!(
+            err.contains("already announced") && err.contains("0.31"),
+            "{err}"
+        );
+        let fresh = dated.replacen("harness 0.31", "harness 0.32", 1);
+        assert!(gate_unreleased(&fresh).is_ok());
+        assert!(gate_unreleased(&fresh.replace("harness 0.32", "harness\n  0.32")).is_ok());
+        let recut = dated.replacen("## [Unreleased]", "## [0.195.0]", 1);
+        assert!(gate_section(&recut, "0.195.0").is_err());
+    }
 
     /// The original gate accepted this merge artifact. Each refusal assertion is
     /// a negative control against removing the duplicate check at that boundary.
@@ -732,9 +847,10 @@ mod tests {
 
     #[test]
     fn harness_entries_keep_their_own_rule_and_recuts_ignore_newer_notes() {
-        let harness = format!("{HARNESS_ENTRY_HEAD}0.1.0: tool 2**");
+        let harness = format!("{HARNESS_ENTRY_HEAD}0.2.0: `alab claude harness 0.32`.**");
+        let old_harness = format!("{HARNESS_ENTRY_HEAD}0.1.0: `alab claude harness 0.31`.**");
         let doc = format!(
-            "## [Unreleased]\n\n- fresh note\n\n{harness}\n\n## [0.2.0] - date\n\n- old note\n\n{harness}\n\n## [0.1.0] - date\n\n- oldest note\n"
+            "## [Unreleased]\n\n- fresh note\n\n{harness}\n\n## [0.2.0] - date\n\n- old note\n\n{old_harness}\n\n## [0.1.0] - date\n\n- oldest note\n"
         );
         assert!(gate_unreleased(&doc).is_ok());
         let duplicate = doc.replace("fresh note", "old note");

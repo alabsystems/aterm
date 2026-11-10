@@ -1367,10 +1367,9 @@ impl Checkpoint {
         layout: &Layout,
         length: u64,
     ) -> io::Result<std::fs::Metadata> {
-        let path = dir.join(&layout.astream);
         let (mut file, metadata) = judged.open(&layout.astream).map_err(|error| {
             context_error(
-                format!("open private {}", path.display()),
+                format!("open private {}", dir.join(&layout.astream).display()),
                 private_error(error),
             )
         })?;
@@ -1387,15 +1386,23 @@ impl Checkpoint {
                 "journal lost acknowledged bytes or exceeded its capacity",
             ));
         }
-        file.seek(SeekFrom::Start(self.length))
-            .map_err(|error| context_error(format!("seek {}", path.display()), error))?;
+        file.seek(SeekFrom::Start(self.length)).map_err(|error| {
+            context_error(
+                format!("seek {}", dir.join(&layout.astream).display()),
+                error,
+            )
+        })?;
         let mut remaining = length - self.length;
         let mut buffer = [0; 8192];
         while remaining != 0 {
             let count = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| io::Error::other("journal checkpoint length overflow"))?;
-            file.read_exact(&mut buffer[..count])
-                .map_err(|error| context_error(format!("read {}", path.display()), error))?;
+            file.read_exact(&mut buffer[..count]).map_err(|error| {
+                context_error(
+                    format!("read {}", dir.join(&layout.astream).display()),
+                    error,
+                )
+            })?;
             self.hash.update(&buffer[..count]);
             remaining -= count as u64;
         }

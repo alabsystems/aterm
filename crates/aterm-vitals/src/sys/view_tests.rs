@@ -1938,7 +1938,7 @@ fn jobs_capacity_keeps_machine_and_slot_ages_and_unknowns_separate() {
     assert_eq!(slots.get("age_ms"), Some(&Jv::Int(60_120)));
     let text = all_text(&render_text(&query(View::Jobs, false), &c));
     assert!(
-        text.contains("1/5 free, 1 pending, 0 unknown, age_ms=60120"),
+        text.contains("1/5 confirmed free, 1 awaiting confirmation, 0 unknown, age_ms=60120"),
         "{text}"
     );
 
@@ -1963,6 +1963,40 @@ fn jobs_capacity_keeps_machine_and_slot_ages_and_unknowns_separate() {
         all_text(&render_text(&query(View::Jobs, false), &c))
             .contains("build_slots=unavailable(refused)")
     );
+}
+
+#[test]
+fn jobs_capacity_unconfirmed_slots_are_not_an_admission_queue() {
+    use crate::model::SlotsView;
+    let mut s = snapshot_with_jobs();
+    s.slots_age_ms = Some(36_093);
+    s.slots = Some(SlotsView::Read {
+        n: 4,
+        held: 0,
+        free: 0,
+        pending: 4,
+        unknown: 0,
+        discounted: 0,
+    });
+    let w = world();
+    let c = ctx(&w, Some(&s), false, true);
+    let text = all_text(&render_text(&query(View::Jobs, false), &c));
+    assert!(
+        text.contains("0/4 confirmed free, 4 awaiting confirmation"),
+        "{text}"
+    );
+    assert!(text.contains("age_ms=36213"), "{text}");
+    assert!(
+        text.contains("paired slot observations; admission queue not measured"),
+        "{text}"
+    );
+
+    // The existing wire counts still describe slot observations, not ticket leases.
+    let j = render_json(&query(View::Jobs, true), &c);
+    let slots = j.get("machine").unwrap().get("slots").unwrap();
+    assert_eq!(slots.get("free"), Some(&Jv::Int(0)));
+    assert_eq!(slots.get("pending"), Some(&Jv::Int(4)));
+    assert_eq!(slots.get("age_ms"), Some(&Jv::Int(36_213)));
 }
 
 #[test]
@@ -2297,6 +2331,7 @@ fn sys_net_prints_the_hosts_network_place_as_it_came() {
                 PlaceValue::Object(vec![("state", PlaceValue::Text("path-up".to_owned()))]),
             ),
         ],
+        kind: crate::model::PlaceKind::Hotspot,
     });
     let c = ctx(&w, Some(&s), true, true);
     let text = all_text(&render_text(&query(View::Net, false), &c));

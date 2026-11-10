@@ -28,6 +28,38 @@ fn no_admission(ctx: &crate::SessionCtx, facts: &Facts) {
 }
 
 #[test]
+fn writer_discovery_is_read_only_and_reports_unavailable_before_admission() {
+    let (handle, facts, mut request, actor) = closed_restart::fixture(86920);
+    let ctx = &handle.ctx;
+    let info = run(ctx, &facts, Request::Info, actor.clone());
+    let now = crate::metrics::now_us();
+    let authority = ctx.meta.lock().unwrap().supervisor_authority(now);
+    let reply = run(ctx, &facts, Request::RecipientWriterSupport, actor.clone());
+    assert_eq!(
+        reply,
+        "OK native-act state=recipient-writer-support writer=none\n"
+    );
+    assert_eq!(
+        Reply::parse(&reply),
+        Some(Reply::RecipientWriterSupport(
+            RecipientWriterSupport::Unavailable
+        ))
+    );
+    assert_eq!(run(ctx, &facts, Request::Info, actor.clone()), info);
+    assert_eq!(
+        ctx.meta.lock().unwrap().supervisor_authority(now),
+        authority
+    );
+    no_admission(ctx, &facts);
+    marked(&mut request, &facts);
+    assert_eq!(
+        run(ctx, &facts, Request::prepare(request), actor),
+        RECIPIENT_WRITER_UNAVAILABLE
+    );
+    no_admission(ctx, &facts);
+}
+
+#[test]
 fn recognized_complete_mode_never_enters_a_legacy_admission_path() {
     for case in 0..3 {
         let (handle, facts, mut request, actor) = closed_restart::fixture(86900 + case);

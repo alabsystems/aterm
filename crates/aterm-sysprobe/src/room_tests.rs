@@ -23,7 +23,8 @@ fn put(root: &std::path::Path, rel: &str, text: &str) {
 
 /// Linux: every task against the smaller of `pid_max` and `threads-max` (as the Processes row
 /// has always weighed it) and against `threads-max`, the open files against `file-max`, and the
-/// caller's `RLIMIT_NPROC`; no per-user count. An unreadable file leaves its figure `None`.
+/// caller's `RLIMIT_NPROC`; no per-user count; the run queue from the same `loadavg` read, its
+/// reader taken off. An unreadable file leaves its figure `None`.
 #[test]
 fn linux_reads_its_task_room_from_proc() {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -47,12 +48,17 @@ fn linux_reads_its_task_room_from_proc() {
             threads_max: Some(126_507),
             files: Some(5216),
             files_max: Some(9_223_372_036_854_775_807),
+            run_queue: crate::runq::RunQueue::Milli(2000),
         }
     );
     let empty = aterm_tempfile::tempdir().expect("scratch root");
     assert_eq!(
         crate::linux::Root::new(empty.path()).task_room(None),
-        TaskRoom::default()
+        TaskRoom {
+            run_queue: crate::runq::RunQueue::Failed,
+            ..TaskRoom::default()
+        },
+        "an unread run queue is a failed read on Linux, not a count"
     );
 }
 
@@ -63,7 +69,7 @@ fn linux_reads_its_task_room_from_proc() {
 fn linux_reads_its_forks_from_proc_stat() {
     let stat = "cpu  10 0 5 100 0 0 0 0 0 0\ncpu0 10 0 5 100 0 0 0 0 0 0\n\
                 intr 42 0 0 1 2 3\nctxt 991\nbtime 1730000000\nprocesses 31337\n\
-                procs_running 2\nprocs_blocked 0\n";
+                procs_running 2\nprocs_blocked 4\n";
     assert_eq!(crate::linux::proc_stat_forks(stat), Some(31_337));
     let cut = &stat[..stat.find("31337").expect("the count") + 3];
     assert_eq!(crate::linux::proc_stat_forks(cut), None, "a torn line");
@@ -73,11 +79,15 @@ fn linux_reads_its_forks_from_proc_stat() {
     put(root.path(), "proc/stat", stat);
     let mut reader = crate::linux::StatReader::new(root.path(), 1);
     assert_eq!(reader.forks(), None, "nothing read yet");
+    assert_eq!(reader.blocked(), None, "nothing read yet");
     assert_eq!(reader.sample().map(|c| c.len()), Some(1), "the core ticks");
     assert_eq!(reader.forks(), Some(31_337), "the same read's forks");
+    assert_eq!(reader.blocked(), Some(4), "the same read's threads in D");
+    assert_eq!(crate::linux::proc_stat_count(cut, "procs_blocked"), None);
     std::fs::remove_file(root.path().join("proc/stat")).expect("the fixture goes");
     assert_eq!(reader.sample(), None);
     assert_eq!(reader.forks(), None, "a failed read keeps no stale count");
+    assert_eq!(reader.blocked(), None, "nor a stale blocked count");
 }
 
 /// Live, macOS: every pair reads, each count under its limit, this user's processes among the
@@ -102,6 +112,13 @@ fn this_macs_task_room_reads_every_pair_under_its_limit() {
     assert!(
         threads > procs + procs / 2,
         "{threads} threads for {procs} processes reads as the set's task count: {room:?}"
+    );
+    // The same read's run queue passes its self-check against its mach factor: a count, at
+    // most every thread the set holds.
+    let queue = room.run_queue.threads().expect("the run queue reads");
+    assert!(
+        (0.0..=threads as f64).contains(&queue),
+        "{queue} runnable of {threads}: {room:?}"
     );
     let sysctl =
         |name: &std::ffi::CStr| crate::macos::sysctl_int(name).and_then(|v| u64::try_from(v).ok());

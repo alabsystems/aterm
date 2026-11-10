@@ -23,8 +23,24 @@ const LEAD_IN_URL_CELLS: usize = 12;
 /// is a fragment of a hostname that names no site, not worth a row of output.
 const MIN_URL_CELLS: usize = 8;
 
-/// How many bytes of a URL are read: the engine's OSC 8 admission cap
-/// (`MAX_HYPERLINK_URL_BYTES`), so every URI is read whole.
+/// The painted caption's words for a client, without allocating its padding.
+pub(crate) fn row_words(row: &[RenderCell]) -> String {
+    let Some(start) = row.iter().position(|cell| !cell.ch.is_whitespace()) else {
+        return String::new();
+    };
+    let end = row
+        .iter()
+        .rposition(|cell| !cell.ch.is_whitespace())
+        .unwrap()
+        + 1;
+    let kept = &row[start..end];
+    let mut words = String::with_capacity(kept.iter().map(|cell| cell.ch.len_utf8()).sum());
+    words.extend(kept.iter().map(|cell| cell.ch));
+    words
+}
+
+/// How many bytes host discovery examines: the engine's OSC 8 admission cap
+/// (`MAX_HYPERLINK_URL_BYTES`), so every admitted URI's host is read whole.
 const SCAN_BYTES: usize = 8 * 1024;
 
 const HEX: [char; 16] = [
@@ -155,39 +171,93 @@ fn emphasis_span(text: &str, host: &Range<usize>) -> Range<usize> {
     host.start + start..host.end
 }
 
-/// Re-spell `text` so that nothing in it can reorder, hide inside, or
-/// impersonate the rest of the line: printable ASCII survives verbatim, every
-/// other character becomes the percent-encoding of its UTF-8 bytes.
-fn safe_form(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if safe_width(ch) == 1 {
-            out.push(ch);
+/// Characters in one encoded byte: printable ASCII survives; everything else is %XX.
+const fn encoded_byte_width(byte: u8) -> usize {
+    if byte.is_ascii_graphic() { 1 } else { 3 }
+}
+
+/// Encoded character count, without decoding and re-encoding UTF-8 characters.
+fn encoded_width(bytes: &[u8]) -> usize {
+    bytes.len()
+        + 2 * bytes
+            .iter()
+            .filter(|&&byte| !byte.is_ascii_graphic())
+            .count()
+}
+
+/// Append complete encoded bytes. The caller reserves the output's exact byte length.
+#[inline]
+fn append_safe(out: &mut String, bytes: &[u8]) {
+    for &byte in bytes {
+        if byte.is_ascii_graphic() {
+            out.push(char::from(byte));
         } else {
-            let mut buf = [0u8; 4];
-            for b in ch.encode_utf8(&mut buf).as_bytes() {
-                out.push('%');
-                out.push(HEX[usize::from(b >> 4)]);
-                out.push(HEX[usize::from(b & 0x0f)]);
-            }
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)]);
+            out.push(HEX[usize::from(byte & 0x0f)]);
         }
     }
-    out
 }
 
-/// How many characters `ch` takes in the [`safe_form`]: one for printable
-/// ASCII, three (`%XX`) for each UTF-8 byte of anything else.
-const fn safe_width(ch: char) -> usize {
-    if matches!(ch, '\u{21}'..='\u{7e}') {
-        1
-    } else {
-        3 * ch.len_utf8()
+/// Append a selected tail, omitting `skip` encoded characters at its beginning.
+/// A cut may fall inside a UTF-8 character or an escape; input is deliberately bytes.
+fn append_safe_tail(out: &mut String, mut bytes: &[u8], mut skip: usize) {
+    while skip != 0 {
+        let Some((&first, rest)) = bytes.split_first() else {
+            return;
+        };
+        let width = encoded_byte_width(first);
+        if skip >= width {
+            skip -= width;
+            bytes = rest;
+            continue;
+        }
+        // A positive remainder can only straddle a three-character escape.
+        let escape = [
+            '%',
+            HEX[usize::from(first >> 4)],
+            HEX[usize::from(first & 0x0f)],
+        ];
+        for &ch in escape.iter().skip(skip) {
+            out.push(ch);
+        }
+        bytes = rest;
+        break;
     }
+    append_safe(out, bytes);
 }
 
-/// The byte range of the host inside a URL: the run the band refuses to elide. Every delimiter
+/// Append at most `keep` encoded characters, without encoding the discarded suffix.
+fn append_safe_prefix(out: &mut String, bytes: &[u8], mut keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    for (at, &byte) in bytes.iter().enumerate() {
+        let width = encoded_byte_width(byte);
+        if width > keep {
+            append_safe(out, &bytes[..at]);
+            let escape = [
+                '%',
+                HEX[usize::from(byte >> 4)],
+                HEX[usize::from(byte & 0x0f)],
+            ];
+            for &ch in escape.iter().take(keep) {
+                out.push(ch);
+            }
+            return;
+        }
+        keep -= width;
+        if keep == 0 {
+            append_safe(out, &bytes[..at + 1]);
+            return;
+        }
+    }
+    append_safe(out, bytes);
+}
+
+/// The byte range of the host inside a URL. Every delimiter
 /// is ASCII, which never occurs inside a multi-byte UTF-8 sequence, so it reads the raw URL;
-/// [`caption`] converts the result to safe-form characters.
+/// [`caption`] maps the result to percent-encoded character positions.
 fn host_span(url: &str) -> Range<usize> {
     let Some(colon) = url.find(':') else {
         // no scheme: the whole thing is the identity
@@ -197,23 +267,29 @@ fn host_span(url: &str) -> Range<usize> {
     let special = ["http", "https", "ws", "wss", "ftp"]
         .iter()
         .any(|s| url[..colon].eq_ignore_ascii_case(s));
-    let (authority, ends): (Option<&str>, &[char]) = if special {
-        (
-            Some(after.trim_start_matches(['/', '\\'])),
-            &['/', '\\', '?', '#'],
-        )
+    let authority = if special {
+        Some(after.trim_start_matches(['/', '\\']))
     } else {
-        (after.strip_prefix("//"), &['/', '?', '#'])
+        after.strip_prefix("//")
     };
     if let Some(authority) = authority {
         let start = url.len() - authority.len();
-        let end = start + authority.find(ends).unwrap_or(authority.len());
+        let end = start
+            + authority
+                .bytes()
+                .position(|byte| matches!(byte, b'/' | b'?' | b'#') || (special && byte == b'\\'))
+                .unwrap_or(authority.len());
         let host_start = url[start..end]
             .rfind('@')
             .map_or(start, |at| start + at + 1);
         host_start..end
     } else {
-        let end = colon + 1 + after.find(['?', '#']).unwrap_or(after.len());
+        let end = colon
+            + 1
+            + after
+                .bytes()
+                .position(|byte| matches!(byte, b'?' | b'#'))
+                .unwrap_or(after.len());
         colon + 1..end
     }
 }
@@ -236,22 +312,30 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
     };
     let finish = |text, host| Caption { text, host, shape };
     let known = !span.is_empty() && (span.end < read || read == raw.len());
-    let width = |text: &str| text.chars().map(safe_width).sum::<usize>();
-    let host_start = width(&raw[..span.start]);
-    let host = host_start..host_start + width(&raw[span.clone()]);
-    let head_end = raw
-        .char_indices()
-        .nth(max_cells.saturating_add(1))
-        .map_or(raw.len(), |(at, _)| at);
-    let head = safe_form(&raw[..head_end]);
-    if head_end == raw.len() && head.len() <= max_cells {
-        return finish(head, host);
+    let host = || {
+        let start = encoded_width(&raw.as_bytes()[..span.start]);
+        start..start + encoded_width(&raw.as_bytes()[span.clone()])
+    };
+    // Escaping never shortens a byte string, so long inputs need no fit scan.
+    if raw.len() <= max_cells {
+        let width = encoded_width(raw.as_bytes());
+        if width <= max_cells {
+            let text = if width == raw.len() {
+                // Equal lengths prove every byte is printable ASCII.
+                raw.to_owned()
+            } else {
+                let mut text = String::with_capacity(width);
+                append_safe(&mut text, raw.as_bytes());
+                text
+            };
+            return finish(text, host());
+        }
     }
     match max_cells {
         0 => finish(String::new(), 0..0),
         1 => finish(ELLIPSIS.to_string(), 0..0),
         max if !known => {
-            let mut text = raw[..read]
+            let scheme = raw[..read]
                 .split_once(':')
                 .map(|(scheme, _)| scheme)
                 .filter(|scheme| {
@@ -260,32 +344,42 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
                         && scheme
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-'))
-                })
-                .map_or(String::new(), |scheme| format!("{scheme}:"));
+                });
+            let prefix = scheme.map_or(0, |scheme| scheme.len() + 1);
+            let mut text = String::with_capacity(prefix + ELLIPSIS.len_utf8());
+            if let Some(scheme) = scheme {
+                text.push_str(scheme);
+                text.push(':');
+            }
             text.push(ELLIPSIS);
             finish(text, 0..0)
         }
-        max if host.end < max => {
-            let mut text = head[..max - 1].to_string();
-            text.push(ELLIPSIS);
-            finish(text, host)
-        }
         max => {
+            let host = host();
+            if host.end < max {
+                let keep = max - 1;
+                let mut text = String::with_capacity(keep + ELLIPSIS.len_utf8());
+                append_safe_prefix(&mut text, raw.as_bytes(), keep);
+                text.push(ELLIPSIS);
+                return finish(text, host);
+            }
             let after_host = span.end < raw.len();
             let keep = if after_host { max - 2 } else { max - 1 };
-            let from = match keep.checked_sub(1) {
-                Some(back) => raw[..span.end]
-                    .char_indices()
-                    .rev()
-                    .nth(back)
-                    .map_or(0, |(at, _)| at),
-                None => span.end,
-            };
-            let tail = safe_form(&raw[from..span.end]);
+            let mut from = span.end;
+            let mut width = 0;
+            while from > 0 && width < keep {
+                from -= 1;
+                width += encoded_byte_width(raw.as_bytes()[from]);
+            }
             let start = host.end - keep;
-            let mut text = String::with_capacity(max);
+            let ellipses = 1 + usize::from(after_host);
+            let mut text = String::with_capacity(keep + ellipses * ELLIPSIS.len_utf8());
             text.push(ELLIPSIS);
-            text.push_str(&tail[tail.len() - keep..]);
+            append_safe_tail(
+                &mut text,
+                &raw.as_bytes()[from..span.end],
+                width.saturating_sub(keep),
+            );
             if after_host {
                 text.push(ELLIPSIS);
             }
@@ -358,7 +452,7 @@ const OPENS_IN_ATERM_TRACKED: &str = "ctrl+alt+click opens in aterm:";
 
 /// A file citation's name laid out for `max_cells`.
 pub(crate) fn path_caption(shown: &str, max_cells: usize) -> (String, Range<usize>) {
-    if max_cells == 0 {
+    if max_cells == 0 || shown.is_empty() {
         return (String::new(), 0..0);
     }
     // Each printable ASCII byte survives; every other UTF-8 byte becomes %XX.
@@ -369,40 +463,26 @@ pub(crate) fn path_caption(shown: &str, max_cells: usize) -> (String, Range<usiz
     let mut width = 0;
     for &byte in shown.as_bytes().iter().rev() {
         from -= 1;
-        width += if byte.is_ascii_graphic() { 1 } else { 3 };
+        width += encoded_byte_width(byte);
         if width > max_cells {
             break;
         }
     }
     let clipped = width > max_cells;
     let kept = if clipped { max_cells - 1 } else { width };
-    let mut skip = width - kept;
     let mut text = String::with_capacity(kept + if clipped { ELLIPSIS.len_utf8() } else { 0 });
     if clipped {
         text.push(ELLIPSIS);
     }
-    let mut emit = |ch| {
-        if skip > 0 {
-            skip -= 1;
-        } else {
-            text.push(ch);
-        }
-    };
-    for &byte in &shown.as_bytes()[from..] {
-        if byte.is_ascii_graphic() {
-            emit(char::from(byte));
-        } else {
-            emit('%');
-            emit(HEX[usize::from(byte >> 4)]);
-            emit(HEX[usize::from(byte & 0x0f)]);
-        }
+    if !clipped && width == shown.len() {
+        text.push_str(shown);
+    } else if kept != 0 {
+        append_safe_tail(&mut text, &shown.as_bytes()[from..], width - kept);
     }
-    let name_start = text
-        .chars()
-        .enumerate()
-        .filter_map(|(at, ch)| (ch == '/').then_some(at + 1))
-        .last()
-        .unwrap_or(usize::from(clipped));
+    let name_start = text.rfind('/').map_or(usize::from(clipped), |at| {
+        // All output after the optional leading ellipsis is ASCII.
+        at + 1 - usize::from(clipped) * (ELLIPSIS.len_utf8() - 1)
+    });
     (text, name_start..kept + usize::from(clipped))
 }
 
@@ -468,6 +548,12 @@ mod url_caption_tests;
 
 #[cfg(test)]
 mod literal_caption_tests;
+
+#[cfg(test)]
+mod encoding_tests;
+
+#[cfg(test)]
+mod row_words_tests;
 
 #[cfg(test)]
 mod tests {

@@ -757,6 +757,44 @@ fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
 }
 
+/// The process-bound name of one outgoing attempt.
+///
+/// Product handoffs always construct this from the live process. The fixture
+/// generator supplies a fixed producer identity so two isolated executions
+/// describe the same protocol input instead of committing their harness pids.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutgoingAttemptName {
+    producer_pid: u32,
+    nonce: String,
+}
+
+#[cfg(unix)]
+impl OutgoingAttemptName {
+    fn live(nonce: &str) -> Self {
+        Self {
+            producer_pid: std::process::id(),
+            nonce: nonce.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(producer_pid: u32, nonce: &str) -> Option<Self> {
+        (producer_pid != 0 && !nonce.is_empty()).then(|| Self {
+            producer_pid,
+            nonce: nonce.to_string(),
+        })
+    }
+
+    pub(crate) fn stem(&self) -> String {
+        format!("seamless-{}-{}", self.producer_pid, self.nonce)
+    }
+
+    pub(crate) fn manifest_name(&self) -> String {
+        format!("{}.toml", self.stem())
+    }
+}
+
 /// Mint the attempt nonce an outgoing handoff is named by, before anything is written: the successor is launched with the manifest's path in its environment before the manifest exists, so the writer (`write_outgoing`) and the launch environment derive the same name from the same nonce ([`outgoing_manifest_path`]).
 #[cfg(unix)]
 pub(crate) fn mint_outgoing_nonce() -> String {
@@ -765,7 +803,7 @@ pub(crate) fn mint_outgoing_nonce() -> String {
 
 #[cfg(unix)]
 fn outgoing_manifest_name(nonce: &str) -> String {
-    format!("seamless-{}-{nonce}.toml", std::process::id())
+    OutgoingAttemptName::live(nonce).manifest_name()
 }
 
 /// Where `write_outgoing` will put the manifest for `nonce` — `None` when there is no private control dir (then no seamless handoff is possible at all).
@@ -2957,11 +2995,11 @@ fn stamp_held_panes(
     controls: &[(u64, Vec<u8>)],
     aggregate_control: &mut u64,
     dir: &std::path::Path,
-    nonce: &str,
+    attempt: &OutgoingAttemptName,
     spent: (u64, u64),
     written_blobs: &mut Vec<std::path::PathBuf>,
 ) {
-    let stem = format!("seamless-{}-{nonce}", std::process::id());
+    let stem = attempt.stem();
     let (mut aggregate_cells, spent_bytes) = spent;
     let mut held_bytes = 0_u64;
     for pane in held {
@@ -3329,8 +3367,63 @@ pub(crate) fn write_outgoing_with_held(
     held_history: crate::handoff_history::HeldExports,
     nonce: &str,
 ) -> Result<OutgoingHandoff, WriteOutgoingFailure> {
+    write_outgoing_with_held_for_attempt(
+        manifest,
+        fds,
+        screens,
+        repaint,
+        window,
+        controls,
+        held,
+        held_history,
+        &OutgoingAttemptName::live(nonce),
+    )
+}
+
+/// Fixture-only entry to the exact product writer with an explicit producer identity.
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_fixture_outgoing_with_held(
+    manifest: &SessionHandoff,
+    fds: &HandoffFds,
+    screens: &[(u64, TerminalCheckpoint)],
+    repaint: &[u64],
+    window: Option<WindowCarry>,
+    controls: &[(u64, Vec<u8>)],
+    held: &[HeldScreen],
+    held_history: crate::handoff_history::HeldExports,
+    attempt: &OutgoingAttemptName,
+) -> Result<OutgoingHandoff, WriteOutgoingFailure> {
+    write_outgoing_with_held_for_attempt(
+        manifest,
+        fds,
+        screens,
+        repaint,
+        window,
+        controls,
+        held,
+        held_history,
+        attempt,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn write_outgoing_with_held_for_attempt(
+    manifest: &SessionHandoff,
+    fds: &HandoffFds,
+    screens: &[(u64, TerminalCheckpoint)],
+    repaint: &[u64],
+    window: Option<WindowCarry>,
+    controls: &[(u64, Vec<u8>)],
+    held: &[HeldScreen],
+    held_history: crate::handoff_history::HeldExports,
+    attempt: &OutgoingAttemptName,
+) -> Result<OutgoingHandoff, WriteOutgoingFailure> {
     let dir = crate::control_auth::socket_dir().ok_or(WriteOutgoingFailure::NoPrivateDir)?;
-    let path = dir.join(outgoing_manifest_name(nonce));
+    let path = dir.join(attempt.manifest_name());
+    let stem = attempt.stem();
+    let nonce = attempt.nonce.as_str();
 
     let _ = validated_identities(manifest, fds).ok_or(WriteOutgoingFailure::Inconsistent)?;
     let mut session_ids = manifest
@@ -3417,10 +3510,7 @@ pub(crate) fn write_outgoing_with_held(
             }
             return Err(WriteOutgoingFailure::Inconsistent);
         };
-        let grid_file = dir.join(format!(
-            "seamless-{}-{nonce}.s{local_id}.grid",
-            std::process::id()
-        ));
+        let grid_file = dir.join(format!("{stem}.s{local_id}.grid"));
         if let Err(error) = write_private(&grid_file, &cp.grid) {
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
@@ -3429,10 +3519,7 @@ pub(crate) fn write_outgoing_with_held(
         }
         written_blobs.push(grid_file.clone());
         let alt_grid_file = if let Some(alt) = cp.alt_grid.as_ref() {
-            let p = dir.join(format!(
-                "seamless-{}-{nonce}.s{local_id}.altgrid",
-                std::process::id()
-            ));
+            let p = dir.join(format!("{stem}.s{local_id}.altgrid"));
             if let Err(error) = write_private(&p, alt) {
                 for path in written_blobs {
                     let _ = std::fs::remove_file(path);
@@ -3494,10 +3581,7 @@ pub(crate) fn write_outgoing_with_held(
             );
             continue;
         }
-        let path = dir.join(format!(
-            "seamless-{}-{nonce}.s{local_id}.ctl",
-            std::process::id()
-        ));
+        let path = dir.join(format!("{stem}.s{local_id}.ctl"));
         if write_private_new(&path, bytes).is_some() {
             aggregate_control += len;
             written_blobs.push(path);
@@ -3517,7 +3601,7 @@ pub(crate) fn write_outgoing_with_held(
         controls,
         &mut aggregate_control,
         &dir,
-        nonce,
+        attempt,
         (aggregate_cells, aggregate_bytes),
         &mut written_blobs,
     );
@@ -3567,7 +3651,6 @@ pub(crate) fn write_outgoing_with_held(
             {
                 let _ = std::fs::remove_file(sidecar);
             }
-            let stem = format!("seamless-{}-{nonce}", std::process::id());
             if dropped.history.is_some() {
                 let _ = std::fs::remove_file(dir.join(held_history_name(&stem, dropped.local_id)));
             }
@@ -3891,6 +3974,18 @@ pub(crate) struct ProcessBirth {
 
 #[cfg(unix)]
 impl ProcessBirth {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) const fn fixture(seconds: u64, microseconds: u64) -> Option<Self> {
+        if microseconds < 1_000_000 {
+            Some(Self {
+                seconds,
+                microseconds,
+            })
+        } else {
+            None
+        }
+    }
+
     fn to_wire(self) -> String {
         format!("{}.{}", self.seconds, self.microseconds)
     }

@@ -3253,6 +3253,7 @@ impl Pool {
             sid: "s-law",
             supervisor,
             env: &env,
+            seen: &crate::harness::observe::Observation::Unread,
             sample: None,
             point: accounts::Point::Wall {
                 window: window.to_string(),

@@ -281,7 +281,15 @@ pub(super) fn settle(path: &Path) -> io::Result<Option<File>> {
         } else {
             None
         };
-        let replaced = complete(path, &m, &mut |_| Ok(()))?;
+        // A sealed log not handed back is let go by `LOCK_UN` before its close, on the error
+        // path too: a `fork` in another thread holds the description until its `execve`.
+        let replaced = complete(path, &m, &mut |_| Ok(()));
+        if !matches!(replaced, Ok(true)) {
+            if let Some(f) = &sealed {
+                let _ = f.unlock();
+            }
+        }
+        let replaced = replaced?;
         return Ok(sealed.filter(|_| replaced));
     }
     if present(&staged)? {

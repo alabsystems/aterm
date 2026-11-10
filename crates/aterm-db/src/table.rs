@@ -223,6 +223,11 @@ thread_local! {
     /// asked the session's currency afresh, on their own calls, as they do whatever look the
     /// session keeps.
     pub(crate) static FENCES_AFRESH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many store read batch fences (`Session::read_context`) this thread asked.
+    pub(crate) static FENCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many keys this thread's store read batches reused and checked again, afresh, before
+    /// returning (`ReadBatch::revalidate`).
+    pub(crate) static KEYS_REVALIDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One more of [`OWN_CHECKS`].
@@ -325,9 +330,13 @@ impl ReadBatch<'_, '_> {
             return Err(Error::snapshot_changed());
         }
         if let Some(keys) = &self.keys {
+            // Asked afresh, on their own calls, as the batch's fences are, whatever look its
+            // session keeps.
             let histories = self.session.history.borrow();
             for (roster, key) in &*keys.borrow() {
                 if key.reused {
+                    #[cfg(test)]
+                    KEYS_REVALIDATED.set(KEYS_REVALIDATED.get() + 1);
                     histories[roster]
                         .with_key(&self.session.journal, |_| ())
                         .map_err(failure)?;
@@ -808,10 +817,15 @@ impl<'a> Session<'a> {
         // derived from its `[everyone]` epochs (one-mesh M6): a member admitted after one holds
         // no `Wrap` of it and asks a peer for its table key.
         if self.access.is_log_backed()
-            && let Some((log, _)) = aterm_secrets::client::trusted_commons_log_now(
-                self.bootstrap.paths(),
-                self.bootstrap.trust(),
-            )
+            && let Some((log, _)) = match self.look.as_ref() {
+                Some(look) if look.paths() == self.bootstrap.paths() => {
+                    look.trusted_commons_log(self.bootstrap.trust())
+                }
+                _ => aterm_secrets::client::trusted_commons_log_now(
+                    self.bootstrap.paths(),
+                    self.bootstrap.trust(),
+                ),
+            }
             .map_err(failure)?
         {
             selected.extend(log.commons_epoch_ids());
@@ -831,14 +845,19 @@ impl<'a> Session<'a> {
             .collect();
         // One batch: a log-backed session leases the log's history once, for the ids the log
         // answers and the handoffs it opens; a fallback to the control journal still checks the
-        // membership for each id. It asks whether each opens, not for its key: an epoch this Mac
+        // membership for each id. A table-repair read batch's lease, its membership checks (the
+        // lease's and the control journal's) and its reads of the log judge through the look its
+        // session keeps; a handoff it opens checks on its own calls. It asks whether each opens, not for its key: an epoch this Mac
         // opened under the same log is answered without its key unwrapped again, and no asked
         // epoch's key is kept, so this round's asks leave the keys its table reads take where those
         // find them. An epoch this Mac holds only through a handoff opens the handoff at each ask,
         // which reads the handoff's issuance epoch through the kept keys as the historical reads do.
-        let held = self
-            .bootstrap
-            .holds_histories(&self.journal, &self.access, &unknown);
+        let held = self.bootstrap.holds_histories_in(
+            &self.journal,
+            &self.access,
+            &unknown,
+            self.look.as_ref(),
+        );
         let needed = unknown
             .into_iter()
             .zip(held)
@@ -1651,6 +1670,8 @@ impl<'a> Session<'a> {
     }
 
     fn read_context(&self, scope: Scope) -> Result<()> {
+        #[cfg(test)]
+        FENCES.set(FENCES.get() + 1);
         let current = Journal::read_existing(self.bootstrap.journal_dir(), self.bootstrap.trust())
             .map_err(failure)?;
         // The projection includes retained restrictive facts as well as the
@@ -1712,7 +1733,7 @@ impl<'a> Session<'a> {
             // grow; local contention stays busy.
             let history = self
                 .bootstrap
-                .historical(&self.journal, &self.access, roster)
+                .historical_in(&self.journal, &self.access, roster, self.look.as_ref())
                 .map_err(|error| {
                     let error = failure(error);
                     if error.is_busy() {
@@ -1762,7 +1783,7 @@ impl<'a> Session<'a> {
                 }
                 std::collections::btree_map::Entry::Vacant(entry) => entry.insert(ReadKey {
                     value: history
-                        .with_key(&self.journal, |network_key| {
+                        .with_key_in(&self.journal, self.look.as_ref(), |network_key| {
                             scope.key(&roster, epoch, network_key)
                         })
                         .map_err(failure)?,
@@ -1772,7 +1793,7 @@ impl<'a> Session<'a> {
             open(&key.value)?
         } else {
             history
-                .with_key(&self.journal, |network_key| {
+                .with_key_in(&self.journal, self.look.as_ref(), |network_key| {
                     open(&scope.key(&roster, epoch, network_key))
                 })
                 .map_err(failure)??

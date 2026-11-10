@@ -4495,6 +4495,21 @@ impl SessionTimeline {
         }
     }
 
+    /// A fixture timeline whose distinct epoch comes from one explicit
+    /// process allocator and whose subsequent rows read one explicit clock.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_fixture(
+        epochs: std::sync::Arc<crate::session_log::Epochs>,
+        at: aterm_slog::Stamp,
+    ) -> SessionTimeline {
+        let mut slog = crate::session_log::SessionLog::starting(epochs, at);
+        slog.set_clock(crate::session_log::Clock::reading(move || at));
+        SessionTimeline {
+            slog,
+            ..SessionTimeline::default()
+        }
+    }
+
     /// The session log, to write.
     pub(crate) const fn slog_mut(&mut self) -> &mut crate::session_log::SessionLog {
         &mut self.slog

@@ -57,6 +57,30 @@ pub const fn identity_clamp_ctx_len(len: u64, max_len: u64) -> u64 {
     }
 }
 
+/// `cert_validity_clamp` as `cert_island.rs` defines it in Clean:
+/// `if raw < cap then raw else cap`.
+#[cfg(feature = "identity")]
+#[must_use]
+pub const fn cert_validity_clamp(raw: u64, cap: u64) -> u64 {
+    if raw < cap {
+        raw
+    } else {
+        cap
+    }
+}
+
+/// `cert_epoch_advance` as `cert_island.rs` defines it in Clean:
+/// `if prev < cand then cand else prev`.
+#[cfg(feature = "identity")]
+#[must_use]
+pub const fn cert_epoch_advance(prev: u64, cand: u64) -> u64 {
+    if prev < cand {
+        cand
+    } else {
+        prev
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -102,6 +126,17 @@ mod tests {
                 want
             );
             assert_eq!(answers(|[a, b]| super::identity_clamp_ctx_len(a, b)), want);
+            assert_eq!(
+                answers(|[a, b]| crate::cert::cert_validity_clamp(a, b)),
+                want
+            );
+            assert_eq!(answers(|[a, b]| super::cert_validity_clamp(a, b)), want);
+            let want_mono = "012112222";
+            assert_eq!(
+                answers(|[a, b]| crate::cert::cert_epoch_advance(a, b)),
+                want_mono
+            );
+            assert_eq!(answers(|[a, b]| super::cert_epoch_advance(a, b)), want_mono);
         }
     }
 

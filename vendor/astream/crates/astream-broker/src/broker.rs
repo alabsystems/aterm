@@ -72,6 +72,7 @@ use crate::store::{
     WillRecord, COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER, RETIRE_SUBJECT,
 };
 use astream_wire::{Filter, Offset, Subject};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{
@@ -101,7 +102,7 @@ enum Sock {
     /// socket, it is ended as soon as that key is revoked ([`end_revoked_streams`]).
     #[cfg(feature = "stream")]
     Stream {
-        link: Arc<dyn crate::stream_link::StreamLink>,
+        link: crate::stream_link::LinkEnd,
         peer: [u8; 32],
     },
 }
@@ -398,11 +399,13 @@ struct StickyOpMeta {
 
 /// What the writer's queue carries: a durable mutation; a RUN of them, which one
 /// connection's client sent together and the writer takes into one batch
-/// ([`Pipeline::release`]); or the STOP [`stop_writer`] queues behind every one already
+/// ([`Pipeline::release`]); a connection-close fence removal ordered after every write
+/// that connection decoded; or the STOP [`stop_writer`] queues behind every one already
 /// queued, which is how the writer learns of shutdown at once ([`writer_loop`]).
 enum Queued {
     Op(WriteOp),
     Run(Vec<WriteOp>),
+    DropFences(u64),
     Stop,
 }
 
@@ -794,7 +797,9 @@ struct RevocationFileState {
 const REVOCATION_FILE_MAX: u64 = 1024 * 1024;
 
 #[allow(clippy::type_complexity)]
-fn parse_revocation_file(path: &Path) -> io::Result<(HashSet<[u8; 32]>, HashSet<String>, usize)> {
+fn parse_revocation_file(
+    path: &Path,
+) -> io::Result<(HashSet<[u8; 32]>, HashSet<String>, HashSet<u64>, usize)> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(REVOCATION_FILE_MAX + 1).read_to_end(&mut bytes))?;
@@ -813,10 +818,29 @@ fn parse_revocation_file(path: &Path) -> io::Result<(HashSet<[u8; 32]>, HashSet<
     };
     let mut identities = HashSet::new();
     let mut principals = HashSet::new();
+    let mut serials = HashSet::new();
     let mut count = 0usize;
     for (idx, raw_line) in text.lines().enumerate() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(serial_str) = line.strip_prefix("serial:") {
+            let serial = match serial_str.parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "revocation file {}:{} invalid serial entry {line:?}: expected serial:<u64> with serial > 0",
+                            path.display(),
+                            idx.saturating_add(1)
+                        ),
+                    ));
+                }
+            };
+            serials.insert(serial);
+            count = count.saturating_add(1);
             continue;
         }
         let mut is_hex64 = line.len() == 64;
@@ -852,36 +876,41 @@ fn parse_revocation_file(path: &Path) -> io::Result<(HashSet<[u8; 32]>, HashSet<
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "revocation file {}:{} invalid entry {line:?}: expected 64-hex Ed25519 pubkey or principal",
+                    "revocation file {}:{} invalid entry {line:?}: expected 64-hex Ed25519 pubkey, principal, or serial:<u64>",
                     path.display(),
                     idx.saturating_add(1)
                 ),
             ));
         }
     }
-    Ok((identities, principals, count))
+    Ok((identities, principals, serials, count))
 }
 
 fn apply_revocation_file(shared: &Shared, path: &Path) -> io::Result<usize> {
     #[cfg(target_vendor = "apple")]
     astream_sys::install_sighup_handler()?;
     let seen = astream_sys::sighup_generation();
-    let (new_identities, new_principals, count) = parse_revocation_file(path)?;
+    let (new_identities, new_principals, new_serials, count) = parse_revocation_file(path)?;
     {
         let mut file_state = shared
             .revocation_file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut ids = shared
+        shared
             .revoked_identities
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut princs = shared
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_file(new_identities);
+        shared
             .revoked_principals
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ids.replace_file(new_identities);
-        princs.replace_file(new_principals);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_file(new_principals);
+        shared
+            .revoked_cert_serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_file(new_serials);
         *file_state = Some(RevocationFileState {
             path: path.to_path_buf(),
         });
@@ -952,33 +981,104 @@ fn maybe_reload_revocation_file(shared: &Shared) {
     }
 }
 
-/// Whether `peer_id` stands revoked, by its key or by the `n-` principal that key derives, without
-/// triggering file I/O (safe to call while holding `shared.log`).
-fn is_peer_revoked_raw(shared: &Shared, peer_id: Option<[u8; 32]>) -> bool {
-    let Some(ref pk) = peer_id else {
-        return false;
-    };
-    if shared
-        .revoked_identities
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(pk)
-    {
-        return true;
-    }
-    let principals = shared
-        .revoked_principals
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    !principals.is_empty() && principals.contains(&identity_principal(pk))
+/// Authenticated transport-layer peer identity (Rung 8 raw Ed25519 key, `serve_stream`
+/// key, or Rung 9 CA-signed `ACRT` certificate), carried across the life of a served connection.
+#[cfg_attr(
+    not(any(feature = "identity", feature = "stream", feature = "relay")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Default)]
+struct PeerAuth {
+    pubkey: Option<[u8; 32]>,
+    cert_serial: Option<u64>,
+    cert_valid_before_ms: Option<u64>,
+    cert_principal: Option<String>,
+    cert_principal_lower: Option<String>,
 }
 
-/// Whether `peer_id` (an Ed25519 identity key from `serve_tcp_identity` or `serve_stream`) has
-/// been revoked via [`Broker::revoke_identity`], [`Broker::revoke_principal`] on the principal it
-/// derives, or a `SIGHUP` revocation-file reload.
-fn is_peer_revoked(shared: &Shared, peer_id: Option<[u8; 32]>) -> bool {
+impl PeerAuth {
+    const fn none() -> Self {
+        Self {
+            pubkey: None,
+            cert_serial: None,
+            cert_valid_before_ms: None,
+            cert_principal: None,
+            cert_principal_lower: None,
+        }
+    }
+
+    #[cfg(any(feature = "identity", feature = "stream", feature = "relay"))]
+    const fn from_identity(pubkey: [u8; 32]) -> Self {
+        Self {
+            pubkey: Some(pubkey),
+            cert_serial: None,
+            cert_valid_before_ms: None,
+            cert_principal: None,
+            cert_principal_lower: None,
+        }
+    }
+
+    #[cfg(feature = "identity")]
+    fn from_cert(v: astream_aead::VerifiedPeerCert) -> Self {
+        let lower = v.principal.to_ascii_lowercase();
+        Self {
+            pubkey: Some(v.subject_pub),
+            cert_serial: Some(v.serial),
+            cert_valid_before_ms: Some(v.valid_before_ms),
+            cert_principal: Some(v.principal),
+            cert_principal_lower: Some(lower),
+        }
+    }
+}
+
+/// Whether `peer` has been revoked (by Ed25519 identity key, derived `n-` principal, certificate
+/// serial, or certificate principal) without triggering file I/O — acquiring and dropping each
+/// leaf lock one at a time so it is safe to call while holding `shared.log`.
+fn peer_revocation_reason_raw(shared: &Shared, peer: &PeerAuth) -> Option<&'static str> {
+    if let Some(ref pk) = peer.pubkey {
+        if shared
+            .revoked_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(pk)
+        {
+            return Some("unauthorized: peer identity key has been revoked");
+        }
+        let principals = shared
+            .revoked_principals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !principals.is_empty() && principals.contains(&identity_principal(pk)) {
+            return Some("unauthorized: peer identity key has been revoked");
+        }
+    }
+    if let Some(ref serial) = peer.cert_serial {
+        if shared
+            .revoked_cert_serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(serial)
+        {
+            return Some("unauthorized: peer certificate serial has been revoked");
+        }
+    }
+    if let Some(ref lower) = peer.cert_principal_lower {
+        if shared
+            .revoked_principals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(lower)
+        {
+            return Some("unauthorized: peer certificate principal has been revoked");
+        }
+    }
+    None
+}
+
+/// Reload the revocation file if `SIGHUP` fired, then check [`peer_revocation_reason_raw`].
+fn peer_revocation_reason(shared: &Shared, peer: &PeerAuth) -> Option<&'static str> {
     maybe_reload_revocation_file(shared);
-    is_peer_revoked_raw(shared, peer_id)
+    peer_revocation_reason_raw(shared, peer)
 }
 
 /// Whether the capability principal bound to `producer_id` on a guarded broker has been
@@ -1089,15 +1189,13 @@ impl StreamCapCheck {
 
 fn stream_failure(
     shared: &Shared,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     cap_check: &mut StreamCapCheck,
     until: &mut u64,
 ) -> Option<StreamFailure> {
     maybe_reload_revocation_file(shared);
-    if is_peer_revoked_raw(shared, peer_id) {
-        return Some(StreamFailure::Revoked(
-            "unauthorized: peer identity key has been revoked",
-        ));
+    if let Some(reason) = peer_revocation_reason_raw(shared, peer) {
+        return Some(StreamFailure::Revoked(reason));
     }
     // Read before pruning. A concurrent later epoch remains different from this
     // accepted snapshot and is rechecked, rather than being silently consumed.
@@ -1300,7 +1398,7 @@ impl Conn {
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_read_timeout(d),
             #[cfg(feature = "stream")]
-            Conn::Stream(s, _) => s.0.set_read_timeout(d),
+            Conn::Stream(s, _) => s.set_read_timeout(d),
         }
     }
 
@@ -1312,7 +1410,7 @@ impl Conn {
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_write_timeout(d),
             #[cfg(feature = "stream")]
-            Conn::Stream(s, _) => s.0.set_write_timeout(d),
+            Conn::Stream(s, _) => s.set_write_timeout(d),
         }
     }
 
@@ -1327,7 +1425,7 @@ impl Conn {
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_nonblocking(on),
             #[cfg(feature = "stream")]
-            Conn::Stream(s, _) => s.0.set_nonblocking(on),
+            Conn::Stream(s, _) => s.set_nonblocking(on),
         }
     }
 
@@ -1384,7 +1482,7 @@ impl Conn {
             }
             #[cfg(feature = "stream")]
             Conn::Stream(s, peer) => Sock::Stream {
-                link: Arc::clone(&s.0),
+                link: s.clone(),
                 peer: *peer,
             },
         })
@@ -1399,7 +1497,7 @@ impl Conn {
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().shutdown(Shutdown::Write),
             #[cfg(feature = "stream")]
-            Conn::Stream(s, _) => s.0.shutdown(Shutdown::Write),
+            Conn::Stream(s, _) => s.shutdown(Shutdown::Write),
         };
     }
 }
@@ -2079,7 +2177,7 @@ struct AttachedConnInfo {
     producer_id: u64,
     attached_at_ms: u64,
     grants: Vec<(Filter, Option<u64>)>,
-    peer_id: Option<[u8; 32]>,
+    peer: PeerAuth,
 }
 
 struct Shared {
@@ -2185,6 +2283,8 @@ struct Shared {
     /// Revoked capability principals (`p=<principal>`, including `n-<16 hex>` node
     /// principals derived from revoked Ed25519 keys via [`identity_principal`]).
     revoked_principals: Mutex<RevocationSet<String>>,
+    /// Revoked `ACRT` certificate serial numbers (`serial:<u64>`, Rung 9).
+    revoked_cert_serials: Mutex<RevocationSet<u64>>,
     /// Whose relayed records this broker takes: `identity_principal(key) -> key`.
     #[cfg(feature = "relay")]
     origin_keys: Mutex<std::collections::BTreeMap<String, [u8; 32]>>,
@@ -2669,6 +2769,7 @@ struct Replicator {
 /// [`Broker::open_replicated_transport`] and `Broker::open_replicated_guarded_transport`
 /// (under `feature = "cap"`) wrap every follower socket — at initial open and on every
 /// reconnect — in one of `astream-aead`'s authenticated, encrypted transports.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum FollowerTransport {
     /// Plaintext TCP (`Broker::serve_tcp`).
@@ -2686,6 +2787,20 @@ pub enum FollowerTransport {
         identity: Arc<astream_aead::IdentityKeypair>,
         /// Expected Ed25519 public key for each follower in `follower_addrs` (`1:1` by index).
         expected_followers: Vec<[u8; astream_aead::ID_PUB_LEN]>,
+    },
+    /// Mutual CA-certified SIGMA (`Broker::serve_tcp_certified`) with a live-reloadable
+    /// CA trust store and an `IdentitySigner` (`Local` or `SshAgent`, Rung 9).
+    #[cfg(feature = "identity")]
+    Certified {
+        /// Leader's Ed25519 signer (`IdentityKeypair` or `SshAgentSigner`).
+        signer: astream_aead::IdentitySigner,
+        /// Leader's CA-signed `CertRole::Client` certificate.
+        cert: astream_aead::IdentityCertificate,
+        /// Shared CA trust store verifying each follower's `CertRole::Host` certificate.
+        trust: astream_aead::SharedCertTrust,
+        /// Expected host principal per follower (`1:1` with `follower_addrs`, or empty to
+        /// accept any CA-valid `CertRole::Host` principal).
+        expected_principals: Vec<Option<String>>,
     },
 }
 
@@ -2706,6 +2821,17 @@ impl std::fmt::Debug for FollowerTransport {
                 .debug_struct("FollowerTransport::Identity")
                 .field("followers", &expected_followers.len())
                 .finish(),
+            #[cfg(feature = "identity")]
+            FollowerTransport::Certified {
+                cert,
+                expected_principals,
+                ..
+            } => f
+                .debug_struct("FollowerTransport::Certified")
+                .field("principal", &cert.principal())
+                .field("serial", &cert.serial())
+                .field("followers", &expected_principals.len())
+                .finish(),
         }
     }
 }
@@ -2721,6 +2847,13 @@ enum LinkTransport {
     Identity {
         identity: Arc<astream_aead::IdentityKeypair>,
         expected_server: [u8; astream_aead::ID_PUB_LEN],
+    },
+    #[cfg(feature = "identity")]
+    Certified {
+        signer: Arc<astream_aead::IdentitySigner>,
+        cert: Arc<astream_aead::IdentityCertificate>,
+        trust: astream_aead::SharedCertTrust,
+        expected_principal: Option<String>,
     },
 }
 
@@ -2778,6 +2911,40 @@ impl FollowerTransport {
                     out.push(LinkTransport::Identity {
                         identity: identity.clone(),
                         expected_server: *pk,
+                    });
+                }
+                Ok(out)
+            }
+            #[cfg(feature = "identity")]
+            FollowerTransport::Certified {
+                signer,
+                cert,
+                trust,
+                expected_principals,
+            } => {
+                if !expected_principals.is_empty() && expected_principals.len() != count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "FollowerTransport::Certified expected_principals length ({}) must be empty or match follower_addrs length ({count})",
+                            expected_principals.len()
+                        ),
+                    ));
+                }
+                let signer_arc = Arc::new(signer.clone());
+                let cert_arc = Arc::new(cert.clone());
+                let mut out = if count <= 1024 {
+                    Vec::with_capacity(count)
+                } else {
+                    Vec::new()
+                };
+                for idx in 0..count {
+                    let expected_principal = expected_principals.get(idx).cloned().flatten();
+                    out.push(LinkTransport::Certified {
+                        signer: Arc::clone(&signer_arc),
+                        cert: Arc::clone(&cert_arc),
+                        trust: trust.clone(),
+                        expected_principal,
                     });
                 }
                 Ok(out)
@@ -3110,6 +3277,30 @@ fn upgrade_follower_stream(
             expected_server,
         } => {
             let sealed = astream_aead::client_identity_handshake(raw, identity, expected_server)?;
+            sealed.get_ref().set_read_timeout(Some(timeout))?;
+            sealed.get_ref().set_write_timeout(Some(timeout))?;
+            let mut fs = FollowerStream::Sealed(sealed);
+            if !has_cap {
+                confirm_follower_hello(&mut fs, timeout)?;
+            }
+            Ok(fs)
+        }
+        #[cfg(feature = "identity")]
+        LinkTransport::Certified {
+            signer,
+            cert,
+            trust,
+            expected_principal,
+        } => {
+            let store = trust.snapshot();
+            let (sealed, _) = astream_aead::client_cert_handshake(
+                raw,
+                signer,
+                cert,
+                &store,
+                expected_principal.as_deref(),
+                now_unix_ms(),
+            )?;
             sealed.get_ref().set_read_timeout(Some(timeout))?;
             sealed.get_ref().set_write_timeout(Some(timeout))?;
             let mut fs = FollowerStream::Sealed(sealed);
@@ -3641,6 +3832,7 @@ impl Replicator {
 struct ConnGuard<'a> {
     shared: &'a Arc<Shared>,
     id: u64,
+    fences_gaps: Cell<bool>,
 }
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
@@ -3654,12 +3846,12 @@ impl Drop for ConnGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
-        if self.shared.has_sticky_batch_refusal {
-            let mut fences = match self.shared.sticky_fences.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            fences.drop_conn(self.id);
+        if self.fences_gaps.get() {
+            // The pipeline is declared after this guard, so its held run reaches this same
+            // queue first on every return from `serve_conn`. Clear the connection's fences
+            // only once the writer has judged those writes: clearing here lets a clean close
+            // race an already-decoded successor and admit it after its predecessor failed.
+            let _ = self.shared.writes.send(Queued::DropFences(self.id));
         }
     }
 }
@@ -4965,6 +5157,61 @@ impl Broker {
             .contains(&principal.to_ascii_lowercase())
     }
 
+    /// Revoke an `ACRT` certificate `serial` (`serial > 0`, Rung 9).
+    ///
+    /// Any future connection presenting `serial` on `Self::serve_tcp_certified` is
+    /// refused during the handshake, and any already-open connection authenticated with
+    /// `serial` is terminated with `ERR_UNAUTHORIZED` on its next request or tail
+    /// delivery (suppressing any pending last will). Returns `true` if `serial` was
+    /// newly added.
+    pub fn revoke_cert_serial(&self, serial: u64) -> bool {
+        if serial == 0 {
+            return false;
+        }
+        let added = self
+            .shared
+            .revoked_cert_serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(serial);
+        if added {
+            self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
+            notify_all_tails(&self.shared);
+        }
+        added
+    }
+
+    /// Remove `serial` from the live certificate-serial revocation set. Returns `true`
+    /// if `serial` was present.
+    pub fn unrevoke_cert_serial(&self, serial: u64) -> bool {
+        let _file_state = self
+            .shared
+            .revocation_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = self
+            .shared
+            .revoked_cert_serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&serial);
+        if removed {
+            self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
+            notify_all_tails(&self.shared);
+        }
+        removed
+    }
+
+    /// Whether certificate `serial` is currently revoked on this broker.
+    pub fn is_cert_serial_revoked(&self, serial: u64) -> bool {
+        maybe_reload_revocation_file(&self.shared);
+        self.shared
+            .revoked_cert_serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&serial)
+    }
+
     /// Load a revocation file (`REQUIREMENTS` R6). On Apple targets, also register its
     /// path for automatic `SIGHUP` reload; elsewhere call this method again to reload:
     /// each non-empty, non-`#`-comment line is either a 64-hex-character
@@ -5054,6 +5301,7 @@ impl Broker {
             acceptors_abandoned: AtomicU64::new(0),
             revoked_identities: Mutex::new(RevocationSet::new()),
             revoked_principals: Mutex::new(RevocationSet::new()),
+            revoked_cert_serials: Mutex::new(RevocationSet::new()),
             #[cfg(feature = "relay")]
             origin_keys: Mutex::new(std::collections::BTreeMap::new()),
             origin_refused: AtomicU64::new(0),
@@ -6398,18 +6646,17 @@ impl Broker {
         link: Arc<dyn crate::stream_link::StreamLink>,
         peer_pubkey: [u8; 32],
     ) -> io::Result<JoinHandle<io::Result<()>>> {
-        if is_peer_revoked(&self.shared, Some(peer_pubkey)) {
-            let _ = link.shutdown(Shutdown::Both);
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "unauthorized: peer identity key has been revoked",
-            ));
+        let end = crate::stream_link::LinkEnd::new(link);
+        let stream_peer = PeerAuth::from_identity(peer_pubkey);
+        if let Some(reason) = peer_revocation_reason(&self.shared, &stream_peer) {
+            let _ = end.shutdown(Shutdown::Both);
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
         }
         let shared = self.shared.clone();
         thread::Builder::new().spawn(move || {
-            let conn = Conn::Stream(crate::stream_link::LinkEnd(Arc::clone(&link)), peer_pubkey);
-            let res = handle_conn_with_peer(&shared, conn, Wire::Tcp, "stream", Some(peer_pubkey));
-            let _ = link.shutdown(Shutdown::Both);
+            let conn = Conn::Stream(end.clone(), peer_pubkey);
+            let res = handle_conn_with_peer(&shared, conn, Wire::Tcp, "stream", stream_peer);
+            let _ = end.shutdown(Shutdown::Both);
             res
         })
     }
@@ -6483,6 +6730,33 @@ impl Broker {
             TcpWrap::Identity {
                 identity: Box::new(identity),
                 authorized_clients,
+            },
+        )
+    }
+
+    /// Like [`serve_tcp_identity`](Self::serve_tcp_identity) but bound to an **external
+    /// identity authority** (Rung 9): each connection runs a mutual certificate-authenticated
+    /// SIGMA handshake using `host_rotator` (supporting live overlapping host-key/certificate
+    /// rotation and out-of-process `SSH_AUTH_SOCK` signing via [`astream_aead::SshAgentSigner`])
+    /// and verifies client `ACRT` certificates against `client_trust` (multi-root CA rollover
+    /// plus monotonic KRL revocation). Session keys derive solely from ephemeral X25519.
+    ///
+    /// On a guarded broker, any capability naming a principal (`p=<principal>`) must match
+    /// the authenticated client certificate's principal, and open connections/subscriptions
+    /// automatically terminate when the peer certificate expires or its serial/principal/key
+    /// is revoked. Clients connect with [`crate::client::Client::connect_tcp_certified`].
+    #[cfg(feature = "identity")]
+    pub fn serve_tcp_certified(
+        &self,
+        addr: impl std::net::ToSocketAddrs,
+        host_rotator: astream_aead::HostCertRotator,
+        client_trust: astream_aead::SharedCertTrust,
+    ) -> io::Result<BrokerHandle> {
+        self.serve_tcp_with(
+            addr,
+            TcpWrap::Certified {
+                host_rotator,
+                client_trust,
             },
         )
     }
@@ -6577,10 +6851,9 @@ impl Broker {
                         preauth.fetch_sub(1, Ordering::AcqRel);
                         // Couldn't establish the (sealed) transport — the socket
                         // drops with the Err.
-                        if let Ok((stream, peer_id)) = wrapped {
+                        if let Ok((stream, peer)) = wrapped {
                             let _ = stream.set_read_timeout(None);
-                            let _ =
-                                handle_conn_with_peer(&sh, stream, Wire::Tcp, transport, peer_id);
+                            let _ = handle_conn_with_peer(&sh, stream, Wire::Tcp, transport, peer);
                         }
                     });
                 }
@@ -6634,6 +6907,13 @@ enum TcpWrap {
         identity: Box<astream_aead::IdentityKeypair>,
         authorized_clients: Vec<[u8; astream_aead::ID_PUB_LEN]>,
     },
+    /// [`Broker::serve_tcp_certified`]: mutual CA-certified SIGMA with overlapping
+    /// host-key rotation and external `ssh-agent` signing support.
+    #[cfg(feature = "identity")]
+    Certified {
+        host_rotator: astream_aead::HostCertRotator,
+        client_trust: astream_aead::SharedCertTrust,
+    },
 }
 
 impl TcpWrap {
@@ -6646,18 +6926,20 @@ impl TcpWrap {
             TcpWrap::Handshake(_) => "handshake",
             #[cfg(feature = "identity")]
             TcpWrap::Identity { .. } => "identity",
+            #[cfg(feature = "identity")]
+            TcpWrap::Certified { .. } => "certified",
         }
     }
-    /// The connection `s` becomes, and the client identity it proved (the identity
-    /// handshake's; `None` otherwise). `shared` is read for the revocation list.
+    /// The connection `s` becomes, and the [`PeerAuth`] identity/certificate it proved.
+    /// `shared` is read for the live revocation sets.
     #[cfg_attr(not(feature = "identity"), allow(unused_variables))]
-    fn wrap(&self, shared: &Shared, s: TcpStream) -> io::Result<(Conn, Option<[u8; 32]>)> {
+    fn wrap(&self, shared: &Shared, s: TcpStream) -> io::Result<(Conn, PeerAuth)> {
         match self {
-            TcpWrap::Plain => Ok((Conn::Tcp(s), None)),
+            TcpWrap::Plain => Ok((Conn::Tcp(s), PeerAuth::none())),
             #[cfg(feature = "aead")]
             TcpWrap::Sealed(key) => {
                 let sealed = astream_aead::SealedStream::handshake_server(s, *key)?;
-                Ok((Conn::Sealed(sealed), None))
+                Ok((Conn::Sealed(sealed), PeerAuth::none()))
             }
             #[cfg(feature = "handshake")]
             TcpWrap::Handshake(psk) => {
@@ -6672,7 +6954,7 @@ impl TcpWrap {
                 let sealed = astream_aead::server_handshake(s, psk)?;
                 sealed.get_ref().set_read_timeout(None)?;
                 sealed.get_ref().set_write_timeout(None)?;
-                Ok((Conn::Sealed(sealed), None))
+                Ok((Conn::Sealed(sealed), PeerAuth::none()))
             }
             #[cfg(feature = "identity")]
             TcpWrap::Identity {
@@ -6683,15 +6965,32 @@ impl TcpWrap {
                 s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
                 let (sealed, client_id) =
                     astream_aead::server_identity_handshake(s, identity, authorized_clients)?;
-                if is_peer_revoked(shared, Some(client_id)) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "unauthorized: peer identity key has been revoked",
-                    ));
+                let peer = PeerAuth::from_identity(client_id);
+                if let Some(reason) = peer_revocation_reason(shared, &peer) {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
                 }
                 sealed.get_ref().set_read_timeout(None)?;
                 sealed.get_ref().set_write_timeout(None)?;
-                Ok((Conn::Sealed(sealed), Some(client_id)))
+                Ok((Conn::Sealed(sealed), peer))
+            }
+            #[cfg(feature = "identity")]
+            TcpWrap::Certified {
+                host_rotator,
+                client_trust,
+            } => {
+                s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                let now_ms = now_unix_ms();
+                let trust_snap = client_trust.snapshot();
+                let (sealed, verified) =
+                    astream_aead::server_cert_handshake(s, host_rotator, &trust_snap, now_ms)?;
+                let peer = PeerAuth::from_cert(verified);
+                if let Some(reason) = peer_revocation_reason(shared, &peer) {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+                }
+                sealed.get_ref().set_read_timeout(None)?;
+                sealed.get_ref().set_write_timeout(None)?;
+                Ok((Conn::Sealed(sealed), peer))
             }
         }
     }
@@ -7294,7 +7593,7 @@ enum Wire {
 /// kind Windows has, goes straight to `handle_conn_with_peer`.
 #[cfg(unix)]
 fn handle_conn(shared: &Arc<Shared>, stream: Conn, wire: Wire) -> io::Result<()> {
-    handle_conn_with_peer(shared, stream, wire, "unix", None)
+    handle_conn_with_peer(shared, stream, wire, "unix", PeerAuth::none())
 }
 
 fn handle_conn_with_peer(
@@ -7302,7 +7601,7 @@ fn handle_conn_with_peer(
     stream: Conn,
     wire: Wire,
     transport: &'static str,
-    peer_id: Option<[u8; 32]>,
+    peer: PeerAuth,
 ) -> io::Result<()> {
     let conn_id = shared.conn_seq.fetch_add(1, Ordering::Relaxed);
     let mut will: Vec<(WillRecord, u64)> = Vec::new();
@@ -7315,11 +7614,14 @@ fn handle_conn_with_peer(
         conn_id,
         &mut will,
         &mut had_will,
-        peer_id,
+        &peer,
     );
     if let Some((will, until)) = will.pop() {
         if lapsed(until).is_none()
-            && !is_peer_revoked(shared, peer_id)
+            && peer_revocation_reason(shared, &peer).is_none()
+            && peer
+                .cert_valid_before_ms
+                .is_none_or(|exp| now_unix_ms() < exp)
             && !is_will_principal_revoked(shared, will.producer_id)
         {
             fire_will_for_conn(shared, Some(conn_id), will);
@@ -7581,7 +7883,7 @@ fn record_attached_conn(
     shared: &Shared,
     conn_id: u64,
     transport: &'static str,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     grant: &str,
 ) {
     let Ok(parsed) = astream_cap::Grant::parse(grant) else {
@@ -7613,7 +7915,7 @@ fn record_attached_conn(
         producer_id,
         attached_at_ms: now_ms,
         grants: vec![(grant_filter, expires_at_ms)],
-        peer_id,
+        peer: peer.clone(),
     });
 }
 
@@ -7626,7 +7928,7 @@ fn serve_conn(
     conn_id: u64,
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
 ) -> io::Result<()> {
     // Register a shutdown handle so BrokerHandle::shutdown can force-close this socket
     // (both directions) and unblock a thread parked in read_frame / a socket write —
@@ -7674,6 +7976,7 @@ fn serve_conn(
     let _conn_guard = ConnGuard {
         shared,
         id: conn_id,
+        fences_gaps: Cell::new(false),
     };
     // Registered; if the broker began stopping meanwhile (this socket may have been
     // accepted after shutdown's first registry drain), leave now rather than park.
@@ -7682,12 +7985,10 @@ fn serve_conn(
     }
     // A revocation that ran before this connection registered found nothing to end.
     #[cfg(feature = "stream")]
-    if let Conn::Stream(_, peer) = &stream {
-        if is_peer_revoked(shared, Some(*peer)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "unauthorized: peer identity key has been revoked",
-            ));
+    if let Conn::Stream(_, stream_pk) = &stream {
+        let stream_auth = PeerAuth::from_identity(*stream_pk);
+        if let Some(reason) = peer_revocation_reason(shared, &stream_auth) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
         }
     }
     // Nothing is known about the peer until its first frame — on a guarded broker,
@@ -7740,7 +8041,6 @@ fn serve_conn(
     // ([`Request::FenceGaps`]), on a broker that offers it: until it does, a refused write
     // latches no fence, and a write it pipelined behind one lands as on an unfenced broker,
     // so a client that predates the verb is served as it always was.
-    let mut fences_gaps = false;
     let replicate_diverged = Arc::new(AtomicBool::new(false));
     // The requests read off the socket and not yet served: one read takes every frame
     // that has arrived, and the loop asks it whether the next request is already here
@@ -7835,17 +8135,29 @@ fn serve_conn(
             }
             continue;
         }
-        if is_peer_revoked(shared, peer_id) {
+        if let Some(reason) = peer_revocation_reason(shared, peer) {
             will.clear();
             let _ = emit(
                 &mut stream,
                 &mut pipe,
-                Err(refusal(
-                    ERR_UNAUTHORIZED,
-                    "unauthorized: peer identity key has been revoked",
-                )),
+                Err(refusal(ERR_UNAUTHORIZED, reason)),
             );
             break;
+        }
+        if let Some(cert_exp) = peer.cert_valid_before_ms {
+            let now = now_unix_ms();
+            if now >= cert_exp {
+                will.clear();
+                let _ = emit(
+                    &mut stream,
+                    &mut pipe,
+                    Err(refusal(
+                        ERR_UNAUTHORIZED,
+                        format!("unauthorized: peer certificate expired at {cert_exp} (now {now}, unix ms)"),
+                    )),
+                );
+                break;
+            }
         }
         // `Hello` opens the capability handshake on EVERY build: it hands out this
         // connection's nonce and grants nothing, so an unguarded broker answers it too
@@ -7903,7 +8215,7 @@ fn serve_conn(
                         secret,
                         &mut keyring,
                         nonce.as_ref(),
-                        peer_id,
+                        peer,
                         grant,
                         proof,
                     ),
@@ -7915,7 +8227,7 @@ fn serve_conn(
                             preauth = false;
                             let _ = stream.set_read_timeout(None);
                         }
-                        record_attached_conn(shared, conn_id, transport, peer_id, grant);
+                        record_attached_conn(shared, conn_id, transport, peer, grant);
                         mark_at_head(shared)
                     }
                     Err((code, msg)) => {
@@ -7959,7 +8271,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    fences_gaps.then_some(conn_id),
+                                    _conn_guard.fences_gaps.get().then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7973,7 +8285,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    fences_gaps.then_some(conn_id),
+                                    _conn_guard.fences_gaps.get().then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7986,7 +8298,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    fences_gaps.then_some(conn_id),
+                                    _conn_guard.fences_gaps.get().then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -8012,6 +8324,10 @@ fn serve_conn(
                 continue;
             }
         }
+        let until = match peer.cert_valid_before_ms {
+            Some(cert_exp) => until.min(cert_exp),
+            None => until,
+        };
         if !dispatch_request(
             shared,
             &mut stream,
@@ -8021,10 +8337,10 @@ fn serve_conn(
             will,
             had_will,
             &mut asks,
-            &mut fences_gaps,
+            &_conn_guard.fences_gaps,
             &replicate_diverged,
             until,
-            peer_id,
+            peer,
             #[cfg(feature = "cap")]
             &mut keyring,
             req,
@@ -8079,16 +8395,16 @@ fn dispatch_request(
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
     asks: &mut TailAsks,
-    fences_gaps: &mut bool,
+    fences_gaps: &Cell<bool>,
     replicate_diverged: &Arc<AtomicBool>,
     until: u64,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     #[cfg(feature = "cap")] keyring: &mut Vec<astream_cap::Capability>,
     req: Request,
     req_bt_ms: Option<u64>,
 ) -> io::Result<bool> {
     // The connection a refused write fences, once it asked ([`Request::FenceGaps`]).
-    let fence = fences_gaps.then_some(conn_id);
+    let fence = fences_gaps.get().then_some(conn_id);
     match req {
         Request::Publish {
             producer_id,
@@ -8215,7 +8531,7 @@ fn dispatch_request(
                 filt,
                 until,
                 *asks,
-                peer_id,
+                peer,
                 cap_check,
             )?;
             Ok(false)
@@ -8248,7 +8564,7 @@ fn dispatch_request(
                 replacement_body,
                 filter,
                 until,
-                peer_id,
+                peer,
                 cap_check,
             )?;
             Ok(false)
@@ -8284,9 +8600,7 @@ fn dispatch_request(
                 StreamCapCheck::new(shared, keyring, Request::SubscribeGroup { group, filter });
             #[cfg(not(feature = "cap"))]
             let cap_check = StreamCapCheck::new(shared);
-            tail_loop(
-                shared, stream, start.0, filt, until, *asks, peer_id, cap_check,
-            )?;
+            tail_loop(shared, stream, start.0, filt, until, *asks, peer, cap_check)?;
             Ok(false)
         }
         Request::Last { filter, after, max } => {
@@ -8427,7 +8741,7 @@ fn dispatch_request(
                     )),
                 );
             }
-            *fences_gaps = true;
+            fences_gaps.set(true);
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
@@ -8728,7 +9042,7 @@ fn serve_fork_subscribe(
     replacement_body: Vec<u8>,
     filter: String,
     mut until: u64,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     mut cap_check: StreamCapCheck,
 ) -> io::Result<()> {
     if let Some((code, err)) = publish_subject_error(&replacement_subject) {
@@ -8766,7 +9080,7 @@ fn serve_fork_subscribe(
     let mut pinned: Option<u64> = None;
     let mut cursor = 0u64;
     let mut out = Vec::new();
-    if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+    if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
         return end_stream_failure(stream, &mut out, failure);
     }
     let visible = loop {
@@ -8809,13 +9123,13 @@ fn serve_fork_subscribe(
             if cursor >= visible || cursor <= before {
                 break visible;
             }
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+            if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
             continue;
         }
         for rec in chunk {
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+            if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
             // Below the pinned head, so never the last offset there is.
@@ -8835,7 +9149,7 @@ fn serve_fork_subscribe(
         cursor = cursor.max(scanned_to);
     };
     flush_egress(stream, &mut out)?;
-    if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+    if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
         return end_stream_failure(stream, &mut out, failure);
     }
     write_frame(
@@ -8958,7 +9272,13 @@ fn serve_stats(
         };
         let unrevoked: Vec<AttachedConnInfo> = in_scope
             .into_iter()
-            .filter(|info| !is_peer_revoked_raw(shared, info.peer_id))
+            .filter(|info| {
+                peer_revocation_reason_raw(shared, &info.peer).is_none()
+                    && info
+                        .peer
+                        .cert_valid_before_ms
+                        .is_none_or(|exp| now_ms < exp)
+            })
             .collect();
         let revoked = shared
             .revoked_principals
@@ -9240,7 +9560,7 @@ fn origin_refusal(
             format!("relay: {owner} is not a known origin"),
         ));
     };
-    if is_peer_revoked(shared, Some(key)) {
+    if peer_revocation_reason(shared, &PeerAuth::from_identity(key)).is_some() {
         return Some(refusal(
             ERR_ORIGIN_UNKNOWN,
             format!("relay: origin {owner} is revoked"),
@@ -9306,7 +9626,7 @@ fn attach_grant(
     secret: &[u8],
     keyring: &mut Vec<astream_cap::Capability>,
     nonce: Option<&[u8; 32]>,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     grant: &str,
     proof: &[u8],
 ) -> Result<(), Refusal> {
@@ -9366,7 +9686,17 @@ fn attach_grant(
     // (`REQUIREMENTS` R6). Non-identity role principals (e.g. `agent-7`, `pump`) remain
     // usable over any transport so multi-role capabilities on a single node continue
     // to work.
-    if let (Some(pk), Some(principal)) = (peer_id, &parsed.principal) {
+    if let (Some(cert_principal), Some(principal)) = (&peer.cert_principal, &parsed.principal) {
+        if !principal.eq_ignore_ascii_case(cert_principal) {
+            return Err(refusal(
+                ERR_UNAUTHORIZED,
+                format!(
+                    "unauthorized: grant principal {principal:?} does not match authenticated \
+                     certificate principal {cert_principal:?}"
+                ),
+            ));
+        }
+    } else if let (Some(pk), Some(principal)) = (peer.pubkey, &parsed.principal) {
         if is_identity_shaped_principal(principal) {
             let expected = identity_principal(&pk);
             if !principal.eq_ignore_ascii_case(&expected) {
@@ -10116,6 +10446,7 @@ mod held_tests {
                 let ops = match queued {
                     Queued::Op(op) => vec![op],
                     Queued::Run(ops) => ops,
+                    Queued::DropFences(_) => continue,
                     Queued::Stop => break,
                 };
                 runs.push(ops.len());
@@ -10244,6 +10575,24 @@ fn write_ack(stream: &mut Conn, ack: AckResult) -> io::Result<()> {
     write_frame(stream, &encode_response(&ack_response(ack)))
 }
 
+/// Commit the writer's accumulated batch and carry its full-flush horizon state forward.
+fn finish_writer_batch(
+    shared: &Arc<Shared>,
+    batch: &mut Vec<WriteOp>,
+    dirty_since: &mut Option<Instant>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let dirty = process_batch(shared, std::mem::take(batch));
+    let previous = dirty_since.take();
+    *dirty_since = if dirty {
+        Some(previous.unwrap_or_else(Instant::now))
+    } else {
+        None
+    };
+}
+
 /// The single writer thread: drain queued mutations into a batch and group-commit them
 /// with ONE fsync. The batch self-tunes to load — everything that queued while the
 /// previous fsync ran is drained at once — so throughput scales with offered
@@ -10320,6 +10669,16 @@ fn writer_loop(shared: &Arc<Shared>, rx: Receiver<Queued>) {
                     // Whole, even past BATCH_MAX: a run is at most a pipeline's depth of
                     // ops (each holds an ack slot; `Pipeline::reserve`).
                     Queued::Run(ops) => batch.extend(ops),
+                    // A connection's decoded writes were queued before this marker. Judge
+                    // them under its fences, then remove those fences before any later work.
+                    Queued::DropFences(conn_id) => {
+                        finish_writer_batch(shared, &mut batch, &mut dirty_since);
+                        shared
+                            .sticky_fences
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .drop_conn(conn_id);
+                    }
                     Queued::Stop => stopping = true,
                 }
                 // Nothing more queued right now → commit what we have.
@@ -10329,17 +10688,7 @@ fn writer_loop(shared: &Arc<Shared>, rx: Receiver<Queued>) {
                     None
                 };
             }
-            if !batch.is_empty() {
-                let dirty = process_batch(shared, batch);
-                dirty_since = if dirty {
-                    Some(match dirty_since {
-                        Some(t) => t,
-                        None => Instant::now(),
-                    })
-                } else {
-                    None
-                };
-            }
+            finish_writer_batch(shared, &mut batch, &mut dirty_since);
         }
         if stopping {
             continue;
@@ -12159,7 +12508,7 @@ fn tail_park_and_fetch_chunk(
     told: &mut Option<Told>,
     chunk: usize,
     asks: TailAsks,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     seen_epoch: Option<u64>,
     until: u64,
     marked_durable: u64,
@@ -12194,7 +12543,7 @@ fn tail_park_and_fetch_chunk(
             && !sighup_pending
             && !epoch_changed
             && !mode_changed
-            && !is_peer_revoked_raw(shared, peer_id)
+            && peer_revocation_reason_raw(shared, peer).is_none()
             && caught_up
             && !(asks.idle_marks
                 && shared.durable_marks
@@ -12238,7 +12587,7 @@ fn tail_park_and_fetch_chunk(
     if visible > *cursor
         && !sighup_pending
         && !epoch_changed
-        && !is_peer_revoked_raw(shared, peer_id)
+        && peer_revocation_reason_raw(shared, peer).is_none()
         && lapsed(until).is_none()
     {
         if shared.selective_tail_wake.load(Ordering::Relaxed) {
@@ -12279,12 +12628,12 @@ fn tail_deliver_batch(
     cursor: &mut u64,
     filter: &Filter,
     asks: TailAsks,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     cap_check: &mut StreamCapCheck,
     until: &mut u64,
 ) -> io::Result<Option<bool>> {
     if batch.is_empty() {
-        if let Some(failure) = stream_failure(shared, peer_id, cap_check, until) {
+        if let Some(failure) = stream_failure(shared, peer, cap_check, until) {
             end_stream_failure(stream, out, failure)?;
             return Ok(None);
         }
@@ -12293,7 +12642,7 @@ fn tail_deliver_batch(
     }
     let mut wrote = false;
     for (i, rec) in batch.into_iter().enumerate() {
-        if let Some(failure) = stream_failure(shared, peer_id, cap_check, until) {
+        if let Some(failure) = stream_failure(shared, peer, cap_check, until) {
             end_stream_failure(stream, out, failure)?;
             return Ok(None);
         }
@@ -12326,7 +12675,7 @@ fn tail_loop(
     filter: Filter,
     mut until: u64,
     asks: TailAsks,
-    peer_id: Option<[u8; 32]>,
+    peer: &PeerAuth,
     mut cap_check: StreamCapCheck,
 ) -> io::Result<()> {
     let idle_marks = asks.idle_marks;
@@ -12436,7 +12785,7 @@ fn tail_loop(
                 crate::store::TailStep::Unreadable(bad_off) => {
                     if let Some(g) = gap.take() {
                         if let Some(failure) =
-                            stream_failure(shared, peer_id, &mut cap_check, &mut until)
+                            stream_failure(shared, peer, &mut cap_check, &mut until)
                         {
                             return end_stream_failure(stream, &mut out, failure);
                         }
@@ -12447,14 +12796,14 @@ fn tail_loop(
             }
         };
         if let Some(g) = gap.take() {
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+            if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
             write_gap(stream, g)?;
             wrote_at = Instant::now();
         }
         if !did_scan {
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+            if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
             if owes_burst_mark
@@ -12487,7 +12836,7 @@ fn tail_loop(
                 &mut told,
                 chunk,
                 asks,
-                peer_id,
+                peer,
                 cap_check.seen_epoch,
                 until,
                 marked_durable,
@@ -12496,7 +12845,7 @@ fn tail_loop(
             );
             gap = g;
             if let Some(g) = gap.take() {
-                if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+                if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                     return end_stream_failure(stream, &mut out, failure);
                 }
                 write_gap(stream, g)?;
@@ -12516,7 +12865,7 @@ fn tail_loop(
                             return Ok(());
                         }
                         if let Some(failure) =
-                            stream_failure(shared, peer_id, &mut cap_check, &mut until)
+                            stream_failure(shared, peer, &mut cap_check, &mut until)
                         {
                             return end_stream_failure(stream, &mut out, failure);
                         }
@@ -12544,7 +12893,7 @@ fn tail_loop(
             &mut cursor,
             &filter,
             asks,
-            peer_id,
+            peer,
             &mut cap_check,
             &mut until,
         )?
@@ -12557,7 +12906,7 @@ fn tail_loop(
             wrote_at = Instant::now();
             owes_burst_mark = asks.burst_marks;
         } else if idle_marks && wrote_at.elapsed() >= idle_mark {
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+            if let Some(failure) = stream_failure(shared, peer, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
             let head = shared.head.load(Ordering::Relaxed);
@@ -15002,6 +15351,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CONNECTION CLOSE IS ORDERED AFTER ITS DECODED WRITES. A connection's first write is
+    /// refused and latches its producer fence. With the writer held on unrelated work, its
+    /// successor is queued, then the connection closes. The successor is still refused before
+    /// the close marker removes the fence; a sentinel queued after the close lands and proves
+    /// the marker ran. Clearing in [`ConnGuard::drop`] instead makes the successor land and is
+    /// this test's negative control.
+    #[test]
+    fn a_connection_close_drops_its_fences_after_its_queued_writes() {
+        const MINUTE: Duration = Duration::from_secs(60); // a hang detector, never a budget
+        const CONN: u64 = 77;
+        const PRODUCER: u64 = 9;
+
+        let root = crate::test_scratch::Scratch::new("close-fence-order");
+        let b = Broker::open_opts(
+            root.path().join("log"),
+            OpenOptions::new(Durability::Strict).with_sticky_batch_refusal(true),
+            || Ok(Prepared::Nothing),
+        )
+        .unwrap();
+        let submit = |conn_id, kind| {
+            let (tx, rx) = mpsc::channel();
+            b.shared
+                .writes
+                .send(Queued::Op(WriteOp {
+                    kind,
+                    ack: tx,
+                    conn_id,
+                }))
+                .unwrap();
+            rx
+        };
+        let publish = |producer_id, producer_seq, subject: &str| WriteKind::Publish {
+            producer_id,
+            producer_seq,
+            subject: subject.to_string(),
+            body: b"x".to_vec(),
+        };
+
+        let refused = submit(
+            Some(CONN),
+            WriteKind::PreRefused {
+                producer_id: PRODUCER,
+                producer_seq: 1,
+                err: refusal(ERR_REFUSED, "first refused"),
+            },
+        );
+        assert_eq!(
+            refused.recv_timeout(MINUTE).unwrap(),
+            Err(refusal(ERR_REFUSED, "first refused"))
+        );
+        assert_eq!(
+            b.shared
+                .sticky_fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the first refusal latched the connection's fence"
+        );
+
+        let gate = b.pause_next_batch();
+        let blocker = submit(None, publish(1, 1, "/other/blocker"));
+        assert!(
+            gate.wait_at_most(MINUTE),
+            "the writer held before the close"
+        );
+        let successor = submit(Some(CONN), publish(PRODUCER, 2, "/ordered/second"));
+        drop(ConnGuard {
+            shared: &b.shared,
+            id: CONN,
+            fences_gaps: Cell::new(true),
+        });
+        let sentinel = submit(None, publish(2, 1, "/other/sentinel"));
+        gate.resume();
+
+        assert_eq!(blocker.recv_timeout(MINUTE).unwrap(), Ok((0, false)));
+        let fenced = successor.recv_timeout(MINUTE).unwrap().unwrap_err();
+        assert_eq!(
+            crate::sticky_fence::parse_gap_fenced_seq(&fenced.1),
+            Some(1),
+            "the queued successor was judged before close removed its fence: {fenced:?}"
+        );
+        assert_eq!(sentinel.recv_timeout(MINUTE).unwrap(), Ok((1, false)));
+        assert!(
+            b.shared
+                .sticky_fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the close marker removed the fence before the sentinel"
+        );
+        assert_eq!(b.head(), 2, "the fenced successor never landed");
     }
 
     /// The writer's stop ([`stop_writer`]), driven straight through its queue so what is

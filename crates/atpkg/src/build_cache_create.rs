@@ -44,6 +44,9 @@ pub(super) fn pin(path: &Path) -> Option<aterm_dirfd::OwnedFd> {
     .then_some(fd)
 }
 
+/// Whether the entry `name` of the folder held as `parent` is the private folder `expected`
+/// names, as a record keeps it ([`Identity::names`]): its volume is read by that name only where
+/// `expected` keeps a volume's UUID (an interrupted creation resumed in a later boot).
 #[cfg(unix)]
 pub(super) fn named(
     parent: &aterm_dirfd::OwnedFd,
@@ -51,8 +54,12 @@ pub(super) fn named(
     expected: &Identity,
 ) -> bool {
     aterm_dirfd::fstatat(parent, name, aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|at| {
-        at.st_dev == expected.device
-            && at.st_ino == expected.inode
+        let now = if expected.volume.is_some() {
+            Identity::at(std::os::fd::AsFd::as_fd(parent), name, &at)
+        } else {
+            Some(Identity::unrecorded(at.st_dev, at.st_ino))
+        };
+        now.is_some_and(|now| expected.names(&now))
             && super::private(at.st_uid, at.st_mode, super::euid())
     })
 }

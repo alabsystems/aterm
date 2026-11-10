@@ -350,6 +350,9 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     s.resources[0] = row(now, n, &st, 0, fig(aterm), fig(tab));
     s.cpu = Some(cpu);
     f.load1 = Some(if worst { 999.9 } else { 25.7 });
+    // A hand-built reading has no run-queue reader: its queue is the load average, as the model
+    // reads one (P10's fallback), so the dial's over rule reads it.
+    f.queue = aterm_vitals::runq::RunQueue::of(aterm_vitals::runq::Runnable::default(), f.load1);
     f.busiest = Some(if worst {
         Busiest {
             name: "cc1plus-with-a-long-name".into(),

@@ -621,6 +621,9 @@ pub struct PublishPatch {
     pub make_latest: MakeLatest,
 }
 
+/// The prefix of the name GitHub gives a draft whose tag binding it dropped.
+pub const UNTAGGED: &str = "untagged-";
+
 /// What `release edit` changes. `None` leaves a field as it is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1082,6 +1085,13 @@ impl<'a> Releases<'a> {
         let writer = self.guard_view(Some(permit));
         writer.push_check()?;
         let mut fields = aterm_json::Map::new();
+        // GitHub unbinds a draft's tag when an edit names none: the draft then reads
+        // `untagged-…` (0.193.0's source draft, edited for its notes, 2026-11-10). An edit of a
+        // draft therefore names the tag it holds; an already unbound one is left as it is.
+        let current = writer.release_by_id(id)?;
+        if current.draft && !current.tag_name.starts_with(UNTAGGED) {
+            fields.insert("tag_name".into(), Value::from(current.tag_name.as_str()));
+        }
         if let Some(name) = &edit.name {
             fields.insert("name".into(), Value::from(name.as_str()));
         }

@@ -556,3 +556,35 @@ fn spawn_refusal_and_success_use_the_actual_process_result() {
     assert_eq!(passed["exit_code"].as_i64(), Some(0));
     assert!(run.output.contains("... FAILED"));
 }
+
+#[test]
+fn a_bare_panic_keeps_its_cause_without_inventing_a_case_or_owning_success() {
+    let binary = binary();
+    let mut run = Run {
+        ok: false,
+        code: Some(101),
+        output: "\nthread 'main' (42) panicked at owned.rs:87:9:\noriginal readiness failure\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n".into(),
+        ..Run::default()
+    };
+    let failed = event(&binary, &run);
+    assert_eq!(failed["outcome"].as_str(), Some("FAIL"));
+    let detail = failed["detail"].as_str().unwrap();
+    assert!(detail.contains("owned.rs:87:9"), "{detail}");
+    assert!(detail.contains("original readiness failure"), "{detail}");
+    assert!(!detail.contains("RUST_BACKTRACE"), "{detail}");
+    assert!(failed["failures"].as_array().unwrap().is_empty());
+    assert!(detail.chars().count() <= 200);
+
+    run.ok = true;
+    run.code = Some(0);
+    let passed = event(&binary, &run);
+    assert_eq!(passed["outcome"].as_str(), Some("ok"));
+    assert_eq!(passed["detail"].as_str(), Some(""));
+    assert!(passed["failures"].as_array().unwrap().is_empty());
+    assert!(
+        first_error(
+            "error: original compiler failure\nthread 'main' panicked at decoy.rs:1:1:\ndecoy\n"
+        )
+        .contains("original compiler failure")
+    );
+}

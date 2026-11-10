@@ -2523,14 +2523,33 @@ fn spawn_background_check_in(
         wake: &check_wake::SYSTEM_WOKE,
         wake_settle: cadence::WAKE_SETTLE,
     });
-    let generation = checker_watch::WATCH.register(
+    start_checker_once(
+        &CHECKER_ARGS,
+        &checker_watch::WATCH,
+        args,
+        spawn_checker_thread,
+    );
+}
+
+/// Publish one process-wide argument set before reserving its initial worker.
+/// A repeated startup cannot retire that worker or replace its restart arguments.
+#[cfg(target_os = "macos")]
+fn start_checker_once(
+    stored: &std::sync::OnceLock<std::sync::Arc<CheckerArgs>>,
+    watch: &checker_watch::CheckerWatch,
+    args: std::sync::Arc<CheckerArgs>,
+    spawn: impl FnOnce(u64, std::sync::Arc<CheckerArgs>) -> std::io::Result<()>,
+) {
+    if stored.set(std::sync::Arc::clone(&args)).is_err() {
+        return;
+    }
+    let generation = watch.register(
         cadence::Cadence::new(std::time::Duration::from_secs(cadence::INTERVAL_SECS))
             .max_wait()
             .as_secs(),
     );
-    let _ = CHECKER_ARGS.set(std::sync::Arc::clone(&args));
-    if let Err(error) = spawn_checker_thread(generation, args) {
-        checker_watch::WATCH.unstarted(generation);
+    if let Err(error) = spawn(generation, args) {
+        watch.unstarted(generation);
         warn(&format!("could not start the update checker: {error}"));
     }
 }
@@ -2751,6 +2770,9 @@ fn spawn_checker_thread(generation: u64, args: std::sync::Arc<CheckerArgs>) -> s
     std::thread::Builder::new()
         .name("aterm-update".into())
         .spawn(move || {
+            let Some(_worker) = checker_watch::WATCH.worker(generation) else {
+                return;
+            };
             let CheckerExit::Superseded { phase } =
                 run_checker(&checker_watch::WATCH, generation, &args);
             warn(&format!(

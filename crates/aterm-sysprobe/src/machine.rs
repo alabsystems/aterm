@@ -113,6 +113,22 @@ impl Probe {
         }
     }
 
+    /// Every user's threads in uninterruptible sleep now, as the last
+    /// [`core_ticks`](Self::core_ticks) read them: Linux `/proc/stat`'s `procs_blocked`, from that
+    /// same read ([`crate::linux::StatReader::blocked`]); `None` before one, and elsewhere (macOS
+    /// refuses other users' thread states, so its count is this user's, [`crate::dstate`]).
+    #[must_use]
+    pub const fn blocked(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            self.stat.blocked()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Current thermal throttle level, or [`Why`] it is unavailable.
     ///
     /// # Errors
@@ -701,6 +717,10 @@ pub struct GpuReading {
     /// it: an Apple GPU (macOS), or an NVIDIA card NVML reports no memory of its own for and that
     /// addresses system memory through ATS (Linux). `false` where the reader cannot tell.
     pub unified: bool,
+    /// The GPU's power draw, milliwatts, where its reader reads one (Linux: NVML's board power
+    /// for an NVIDIA card), or why it did not this time; `None` where no reader of it exists
+    /// (macOS reads the GPU's energy from the coalitions instead).
+    pub power_mw: Option<Result<u32, Why>>,
 }
 
 #[cfg(any(target_os = "macos", test))]

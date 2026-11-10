@@ -32,6 +32,7 @@ use super::accounts::Store;
 use super::accounts::{Auth, Cli, Event, Kind, Roster, State, WindowFig};
 use super::claims::LeaseKey;
 use super::provider_read::{ProbeEvent, Read};
+use crate::ai::connector::Region;
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::path::Path;
@@ -265,11 +266,22 @@ pub struct Note {
 
 impl Note {
     fn new(t: u64, kind: &'static str, account: Key, cli: Cli, src: &'static str) -> Note {
+        Note::worded(t, kind, account, cli.id(), src)
+    }
+
+    /// [`Note::new`] by the CLI's word ([`ObservedCli::id`]).
+    fn worded(
+        t: u64,
+        kind: &'static str,
+        account: Key,
+        cli: &'static str,
+        src: &'static str,
+    ) -> Note {
         Note {
             t,
             kind,
             account: Some(account),
-            cli: cli.id(),
+            cli,
             sub: None,
             window: None,
             pct_x10: None,
@@ -345,6 +357,42 @@ pub fn wrong_token_account(account: Key, t: u64) -> Note {
     Note::new(t, "wrong-account", account, Cli::Claude, "signin-flow")
 }
 
+/// The CLI an observed login is of: a pooled CLI, or Muse Code, which keeps no pool and no
+/// roster, so its login is known by observation alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedCli {
+    /// A pooled CLI.
+    Pool(Cli),
+    /// Muse Code.
+    Muse,
+}
+
+impl ObservedCli {
+    /// The CLI's word, as a note and an `account-obs` row carry it.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Pool(cli) => cli.id(),
+            Self::Muse => "muse",
+        }
+    }
+
+    /// The pooled CLI, where it is one: the one whose roster holds a belief to reconcile.
+    #[must_use]
+    pub const fn pool(self) -> Option<Cli> {
+        match self {
+            Self::Pool(cli) => Some(cli),
+            Self::Muse => None,
+        }
+    }
+}
+
+impl From<Cli> for ObservedCli {
+    fn from(cli: Cli) -> Self {
+        Self::Pool(cli)
+    }
+}
+
 /// Where a tab's observed login was read, as a `seen` note's source word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservedSrc {
@@ -397,7 +445,7 @@ impl SeenWhy {
 /// (`docs/DESIGN-account-discovery-2026-11-09.md`): read from `src`, in `tab`, run by `harness`.
 #[must_use]
 pub fn seen_note(
-    cli: Cli,
+    cli: impl Into<ObservedCli>,
     account: Key,
     tab: Tab,
     harness: &'static str,
@@ -405,9 +453,25 @@ pub fn seen_note(
     why: SeenWhy,
     t: u64,
 ) -> Note {
-    let mut note = Note::new(t, "seen", account, cli, src.word());
+    let mut note = Note::worded(t, "seen", account, cli.into().id(), src.word());
     note.tab = Some(tab);
     note.harness = Some(harness);
+    note.why = Some(why.word());
+    note
+}
+
+/// The note of the machine sweep's sighting of `cli`'s account `account` at `t`, read from `src`
+/// in a login place on this Mac: a `seen` that names no tab and no harness, since no tab's run
+/// is what it saw (`docs/DESIGN-account-discovery-2026-11-09.md`, step 4).
+#[must_use]
+pub fn idle_seen_note(
+    cli: impl Into<ObservedCli>,
+    account: Key,
+    src: ObservedSrc,
+    why: SeenWhy,
+    t: u64,
+) -> Note {
+    let mut note = Note::worded(t, "seen", account, cli.into().id(), src.word());
     note.why = Some(why.word());
     note
 }
@@ -416,14 +480,14 @@ pub fn seen_note(
 /// (`wrong-account` with `to` the believed account and `x` the tab).
 #[must_use]
 pub fn wrong_account_note(
-    cli: Cli,
+    cli: impl Into<ObservedCli>,
     observed: Key,
     believed: Option<Key>,
     tab: Tab,
     src: ObservedSrc,
     t: u64,
 ) -> Note {
-    let mut note = Note::new(t, "wrong-account", observed, cli, src.word());
+    let mut note = Note::worded(t, "wrong-account", observed, cli.into().id(), src.word());
     note.to = believed;
     note.tab = Some(tab);
     note
@@ -482,8 +546,8 @@ impl LoginState {
 /// [`Sink::observed`]): the account by its claims realm and login email, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedLogin {
-    pub cli: Cli,
-    /// The claims realm ([`LeaseKey::pool`]).
+    pub cli: ObservedCli,
+    /// The claims realm ([`observed_claims`]).
     pub realm: String,
     /// The login email the file names.
     pub email: String,
@@ -499,8 +563,10 @@ pub struct ObservedLogin {
 pub trait Sink: Send + Sync {
     /// The account key of the canonical claims `realm` and claims email (design §5), or none.
     fn account_pk(&self, realm: &str, email: &str) -> Option<String>;
-    /// Note one event: a bounded append, no lock, no allocation; a failure is dropped.
-    fn note(&self, note: &Note);
+    /// Note one event: a bounded append, no lock, no allocation; a failure is dropped. Returns
+    /// whether the journal took the note: false where it is off, has no spool, its spool is
+    /// full or the note is not one of its events.
+    fn note(&self, note: &Note) -> bool;
     /// Take up a login this Mac observed, for the registry: the executable hands it to a thread
     /// of its own and never makes the caller wait. Nothing by default.
     fn observed(&self, _login: &ObservedLogin) {}
@@ -547,9 +613,14 @@ pub fn install(sink: &'static dyn Sink) {
 
 /// Note `note` through the installed sink; nothing without one.
 pub fn note(note: &Note) {
-    if let Some(sink) = SINK.get() {
-        sink.note(note);
-    }
+    let _ = note_taken(note);
+}
+
+/// [`note`], saying whether the journal took it ([`Sink::note`]): false without a sink. For a
+/// caller that keeps what it noted, so a note the journal did not take is made again.
+#[must_use]
+pub fn note_taken(note: &Note) -> bool {
+    SINK.get().is_some_and(|sink| sink.note(note))
 }
 
 /// Hand `login` to the installed sink's registry path; nothing without one.
@@ -565,6 +636,32 @@ pub fn observed(login: &ObservedLogin) {
 pub fn claims_of(cli: Cli, email: &str) -> Option<(String, String)> {
     let lease = LeaseKey::for_cli(cli, None, email).ok()?;
     Some((lease.pool, lease.email))
+}
+
+/// The claims realm and claims email of an observed login `email` of `cli`, as the registry and
+/// the keyer take it: a pooled CLI's own claims ([`claims_of`]), but the provider's realm for
+/// agy (`google`) and Muse Code (`meta`), whose accounts the registry keys by provider
+/// ([`realm_key`]) since neither is in the claims ring's key. `region` is the account system
+/// the login was observed in, which for Kimi Code is the realm (`kimi:global` or
+/// `kimi:mainland-cn`).
+#[must_use]
+pub fn observed_claims(
+    cli: ObservedCli,
+    region: Option<Region>,
+    email: &str,
+) -> Option<(String, String)> {
+    let realm = match cli {
+        ObservedCli::Pool(Cli::Agy) => "google",
+        ObservedCli::Muse => "meta",
+        ObservedCli::Pool(cli @ (Cli::Claude | Cli::Codex | Cli::Grok | Cli::Kimi)) => {
+            let lease = LeaseKey::for_cli(cli, region, email).ok()?;
+            return Some((lease.pool, lease.email));
+        }
+    };
+    // The claims spelling of the address (validated, trimmed, lower case), under the
+    // provider's realm.
+    let (_, email) = claims_of(Cli::Agy, email)?;
+    Some((realm.to_owned(), email))
 }
 
 /// The account key of an unpooled CLI's login, by its realm (`google` for agy, `meta` for Muse)

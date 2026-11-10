@@ -870,6 +870,7 @@ fn native_exec_proposal_uses_fresh_shared_account_reads_and_typed_dispatch() {
         sid: request.sid,
         supervisor: request.supervisor,
         env: request.env,
+        seen: &crate::harness::observe::Observation::Unread,
         sample: request.sample,
         point: request.point,
         mode: request.mode,

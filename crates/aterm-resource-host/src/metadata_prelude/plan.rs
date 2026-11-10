@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private exec data, deliberately containing no admission binding or budget.
+//! Private launch data transports existing command state; it mints no admission grant.
 use super::*;
 use trust_resource_controller::CommandSpec;
-const MAGIC: &[u8; 8] = b"AMEX0002";
+const MAGIC: &[u8; 8] = b"AMEX0003";
 const MAX_ITEMS: usize = 4096;
 // Actual original GNU pair + SDK keeper + readonly source pair + close-only
 // output directory/lock. This bound supplies no description or resource grant.
@@ -13,9 +13,19 @@ pub(super) struct ExecPlan {
     pub parent: transport::Peer,
     pub command: CommandSpec,
     pub targets: Vec<i32>,
+    pub footprint_mib: Option<u32>,
 }
 impl ExecPlan {
     fn validate(&self) -> io::Result<()> {
+        if let Some(mib) = self.footprint_mib {
+            #[cfg(target_os = "macos")]
+            spawnfd::FootprintLimit::new(mib).map_err(|_| refused())?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = mib;
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+        }
         if self.parent.pid <= 1
             || self.parent.birth == 0
             || self.command.program.first() != Some(&b'/')
@@ -47,6 +57,13 @@ impl ExecPlan {
         let mut bytes = Vec::from(&MAGIC[..]);
         bytes.extend(self.parent.pid.to_be_bytes());
         bytes.extend(self.parent.birth.to_be_bytes());
+        match self.footprint_mib {
+            None => bytes.push(0),
+            Some(mib) => {
+                bytes.push(1);
+                bytes.extend(mib.to_be_bytes());
+            }
+        }
         fn field(out: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
             if value.len() > MAX_PLAN
                 || value.contains(&0)
@@ -126,6 +143,11 @@ impl ExecPlan {
             pid: read.number()?,
             birth: u64::from_be_bytes(read.take(8)?.try_into().map_err(|_| refused())?),
         };
+        let footprint_mib = match read.take(1)?[0] {
+            0 => None,
+            1 => Some(read.number()?),
+            _ => return Err(refused()),
+        };
         let program = read.field()?;
         let arg0 = match read.take(1)?[0] {
             0 => None,
@@ -150,6 +172,7 @@ impl ExecPlan {
         }
         let plan = Self {
             parent,
+            footprint_mib,
             command: CommandSpec {
                 program,
                 arg0,
@@ -169,6 +192,7 @@ mod tests {
     #[test]
     fn exec_data_is_lossless_bounded_and_contains_no_admission_fields() {
         let plan = ExecPlan {
+            footprint_mib: None,
             parent: transport::Peer {
                 pid: 123,
                 birth: 456,
@@ -187,6 +211,7 @@ mod tests {
         assert_eq!(decoded.parent, plan.parent);
         assert!(decoded.command == plan.command);
         assert_eq!(decoded.targets, plan.targets);
+        assert_eq!(decoded.footprint_mib, plan.footprint_mib);
         for end in 0..bytes.len() {
             assert!(ExecPlan::decode(&bytes[..end]).is_err());
         }
@@ -197,6 +222,35 @@ mod tests {
         let mut old = bytes.clone();
         old[..8].copy_from_slice(b"AMEX0001");
         assert!(ExecPlan::decode(&old).is_err());
+        old[..8].copy_from_slice(b"AMEX0002");
+        assert!(ExecPlan::decode(&old).is_err());
+        let mut unknown = bytes.clone();
+        unknown[20] = 2;
+        assert!(ExecPlan::decode(&unknown).is_err());
+        for mib in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let mut invalid = bytes.clone();
+            invalid[20] = 1;
+            invalid.splice(21..21, mib.to_be_bytes());
+            assert!(ExecPlan::decode(&invalid).is_err());
+        }
+        let mut limited = ExecPlan::decode(&bytes).unwrap();
+        limited.footprint_mib = Some(64);
+        #[cfg(target_os = "macos")]
+        {
+            let encoded = limited.encode().unwrap();
+            assert_eq!(ExecPlan::decode(&encoded).unwrap().footprint_mib, Some(64));
+            for end in 0..encoded.len() {
+                assert!(ExecPlan::decode(&encoded[..end]).is_err());
+            }
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(ExecPlan::decode(&trailing).is_err());
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            limited.encode().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         let mut changed = decoded;
         changed.targets.push(10);
         assert!(changed.encode().is_err());

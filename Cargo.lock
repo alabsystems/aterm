@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.195.0"
+version = "0.196.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1771,6 +1771,7 @@ dependencies = [
  "atpkg",
  "jobserver_utils",
  "libc",
+ "trust-exec-policy",
  "trust-resource-controller",
  "trust-resource-provenance",
 ]

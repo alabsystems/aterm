@@ -412,6 +412,9 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
         ("Performance", "P", core(r.cores.1)),
     ]));
     f.load1 = Some(load);
+    // The recordings predate P10: their queue is the load average, as the model reads one with
+    // no run-queue reader.
+    f.queue = aterm_vitals::runq::RunQueue::of(aterm_vitals::runq::Runnable::default(), f.load1);
     f.busiest = Some(top);
 
     let (share, gpu_gib, strip) = r.gpu;

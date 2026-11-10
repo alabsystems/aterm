@@ -70,7 +70,7 @@ impl Proven {
             && !receipt.owners_unknown
             && !receipt.owners.is_empty()
             && receipt.root == self.root
-            && receipt.identity == self.identity
+            && receipt.identity.names(&self.identity)
     }
 
     /// Whether `receipt`, ordinary disposable custody of this path (schema 1: no keep, no
@@ -79,7 +79,7 @@ impl Proven {
     /// settlement drops such a receipt anyway. A receipt of this very folder stays, one it
     /// cannot finish included.
     pub(super) fn supersedes(&self, receipt: &Receipt) -> bool {
-        receipt.schema == 1 && receipt.identity != self.identity
+        receipt.schema == 1 && !receipt.identity.names(&self.identity)
     }
 }
 
@@ -129,13 +129,15 @@ pub(super) fn proven(home: &Path, root: &Path, record: &Path) -> Option<Proven> 
     if !built(&held) && !leaf.as_ref().is_some_and(built) {
         return None;
     }
+    // Recorded by the adoption, so with its volume.
+    let identity = Identity::held(&held)?;
+    if (identity.device, identity.inode) != (stat.st_dev, stat.st_ino) {
+        return None;
+    }
     Some(Proven {
         root: root.to_path_buf(),
         held,
-        identity: Identity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        },
+        identity,
     })
 }
 

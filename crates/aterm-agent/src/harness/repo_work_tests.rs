@@ -3177,6 +3177,33 @@ fn a_sweep_keeps_another_read_s_temporary_dated_as_its_source() {
     assert!(!earlier.exists(), "its own index's earlier copy");
 }
 
+/// A sweep lets go of another index's copy a day after it was made, whatever its name: one an
+/// earlier build named, or one whose checkout is gone, which no read takes again. A copy made
+/// since stays.
+/// NEGATIVE CONTROL: without the day-old arm (`|| now.saturating_sub(changed.0) >= life`) both
+/// copies stay (`a copy a day old`), each until [`PRIVATE_INDEXES`] copies are kept.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_sweep_lets_go_of_another_index_s_copy_a_day_after_it_was_made() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let folder = tmp.path();
+    let [id, other, state] = ["a", "c", "d"].map(|digit| digit.repeat(64));
+    let earlier_build = folder.join(format!("{}-{}.index", "c".repeat(32), "d".repeat(16)));
+    let gone = folder.join(format!("{other}-{state}.index"));
+    for path in [&earlier_build, &gone] {
+        std::fs::write(path, b"DIRC").expect("a file");
+    }
+    let made = [&earlier_build, &gone].map(|path| std::fs::metadata(path).expect("a copy").ctime());
+    let life = i64::try_from(PRIVATE_INDEX_LIFE.as_secs()).expect("a day");
+    let kept = format!("{id}-{state}.index");
+    sweep_private_indexes_at(folder, &id, &kept, made[0].min(made[1]) + life - 1);
+    assert!(earlier_build.exists() && gone.exists(), "a copy made since");
+    sweep_private_indexes_at(folder, &id, &kept, made[0].max(made[1]) + life);
+    assert!(!earlier_build.exists(), "a copy a day old");
+    assert!(!gone.exists(), "a copy a day old");
+}
+
 /// Replacing an index with the same bytes and modification time reuses the same refreshed copy,
 /// regardless of its new inode or change time. Changed bytes in that replacement are read before
 /// choosing a copy: an actual assume-unchanged flag must change the status as the original index

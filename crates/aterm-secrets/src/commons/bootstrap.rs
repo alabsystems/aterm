@@ -2109,7 +2109,19 @@ impl Bootstrap {
         access: &super::roster::Access,
         basis: [u8; 32],
     ) -> Result<super::roster::Historical> {
-        self.historicals(journal, access, &[basis])
+        self.historical_in(journal, access, basis, None)
+    }
+
+    /// [`Bootstrap::historical`], judged through `look` where given
+    /// ([`Bootstrap::historicals_in`]): a table-repair read batch's record history.
+    pub fn historical_in(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        basis: [u8; 32],
+        look: Option<&crate::client::VaultLook<'_>>,
+    ) -> Result<super::roster::Historical> {
+        self.historicals_in(journal, access, &[basis], look)
             .pop()
             .expect("one answer for each basis")
     }
@@ -2125,10 +2137,27 @@ impl Bootstrap {
         access: &super::roster::Access,
         bases: &[[u8; 32]],
     ) -> Vec<Result<super::roster::Historical>> {
+        self.historicals_in(journal, access, bases, None)
+    }
+
+    /// [`Bootstrap::historicals`], its membership checks and its read of the log judged through
+    /// `look` where given ([`super::roster::Access::with_log_history_in`], and the control
+    /// journal's fallback through [`super::roster::Access::historical_in`]): a table-repair read
+    /// batch's record history, through the look its session keeps (`aterm-db`'s
+    /// `Session::decode_envelope`). A handoff a basis falls back to opens as it does for
+    /// [`Bootstrap::historicals`].
+    pub fn historicals_in(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        bases: &[[u8; 32]],
+        look: Option<&crate::client::VaultLook<'_>>,
+    ) -> Vec<Result<super::roster::Historical>> {
         self.each_historical(
             journal,
             access,
             bases,
+            look,
             |history, basis| history.historical(basis),
             |past| past,
         )
@@ -2146,10 +2175,24 @@ impl Bootstrap {
         access: &super::roster::Access,
         bases: &[[u8; 32]],
     ) -> Vec<bool> {
+        self.holds_histories_in(journal, access, bases, None)
+    }
+
+    /// [`Bootstrap::holds_histories`], judged through `look` where given, as
+    /// [`Bootstrap::historicals_in`] judges: a table-repair read batch's probe of the history it
+    /// needs (`aterm-db`'s `Session::history_needs`).
+    pub fn holds_histories_in(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        bases: &[[u8; 32]],
+        look: Option<&crate::client::VaultLook<'_>>,
+    ) -> Vec<bool> {
         self.each_historical(
             journal,
             access,
             bases,
+            look,
             |history, basis| Ok(history.opens(basis)?.then_some(())),
             |_| (),
         )
@@ -2158,7 +2201,7 @@ impl Bootstrap {
         .collect()
     }
 
-    /// [`Bootstrap::historicals`] answering each of `bases` as `from_log` reads it of the log's
+    /// [`Bootstrap::historicals_in`] answering each of `bases` as `from_log` reads it of the log's
     /// history, and as `held` reads a [`super::roster::Historical`] the control journal or a
     /// handoff opens where the log does not.
     fn each_historical<T>(
@@ -2166,6 +2209,7 @@ impl Bootstrap {
         journal: &Journal,
         access: &super::roster::Access,
         bases: &[[u8; 32]],
+        look: Option<&crate::client::VaultLook<'_>>,
         from_log: impl Fn(&super::roster::LogHistory<'_>, [u8; 32]) -> Result<Option<T>>,
         held: impl Fn(super::roster::Historical) -> T,
     ) -> Vec<Result<T>> {
@@ -2189,7 +2233,7 @@ impl Bootstrap {
             Err(error) => return each(error),
         }
         let identity = &self.device.identity;
-        access.with_log_history(journal, identity, |history| {
+        access.with_log_history_in(journal, identity, look, |history| {
             let history = history.as_ref().map(Option::as_ref);
             bases
                 .iter()
@@ -2201,7 +2245,9 @@ impl Bootstrap {
                     };
                     let native = match from_log {
                         Ok(Some(past)) => Ok(past),
-                        Ok(None) => access.historical(journal, identity, basis).map(&held),
+                        Ok(None) => access
+                            .historical_in(journal, identity, basis, look)
+                            .map(&held),
                         Err(error) => Err(error),
                     };
                     // A log-era Commons epoch this device holds no `Wrap` of (one from before it

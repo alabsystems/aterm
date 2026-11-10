@@ -209,7 +209,7 @@ impl Root {
             child,
         ))
     }
-    pub(super) fn configured(&mut self, command: &spawnfd::Command) -> io::Result<()> {
+    pub(super) fn configured(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         self.prelude.configured(command)
     }
     pub(super) fn bind_child(&self, pid: u32) -> io::Result<()> {

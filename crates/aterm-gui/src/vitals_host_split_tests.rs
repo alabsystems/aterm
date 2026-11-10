@@ -76,6 +76,7 @@ const STAND_IN: CoalProbe = CoalProbe {
             listed: 1,
             newest: Some(1),
             truncated: false,
+            heat: aterm_sysprobe::coalition_heat::CoalHeat::default(),
             rows: vec![CoalitionUsage {
                 id: 1,
                 tasks_started: 1,
@@ -331,6 +332,7 @@ const GROWING: CoalProbe = CoalProbe {
             listed: 1,
             newest: Some(1),
             truncated: false,
+            heat: aterm_sysprobe::coalition_heat::CoalHeat::default(),
             rows: vec![CoalitionUsage {
                 id: 1,
                 tasks_started: 10 * n,
@@ -752,6 +754,7 @@ fn a_misread_turns_the_hosts_lane_off_for_good() {
                 listed: 1,
                 newest: Some(1),
                 truncated: false,
+                heat: aterm_sysprobe::coalition_heat::CoalHeat::default(),
                 rows: vec![CoalitionUsage {
                     id: 1,
                     tasks_started: 1,
@@ -886,6 +889,7 @@ fn the_coalitions_reach_the_model_field_for_field() {
         listed: 9,
         newest: Some(12),
         truncated: true,
+        heat: aterm_sysprobe::coalition_heat::CoalHeat::default(),
         rows: vec![CoalitionUsage {
             id: 7,
             tasks_started: 11,

@@ -113,30 +113,53 @@ impl Device {
     fn put(&mut self, from: usize, bytes: &[u8]) {
         let old = self.logical.len();
         let to = from.saturating_add(bytes.len());
-        if to > old {
+        if to > old && to < (1 << 28) {
             self.logical.resize(to, 0);
         }
-        self.logical[from..to].copy_from_slice(bytes);
+        if let Some(dst) = self.logical.get_mut(from..to) {
+            dst.copy_from_slice(bytes);
+        }
         self.touch(from.min(old), to);
         self.appended((from == old).then_some(from));
     }
 
     /// The contents of block `b` as reads see it now (short at the file's end).
     fn block_now(&self, b: usize) -> Vec<u8> {
-        let from = (b * self.block).min(self.logical.len());
-        let to = ((b + 1) * self.block).min(self.logical.len());
-        self.logical[from..to].to_vec()
+        let from = b.saturating_mul(self.block).min(self.logical.len());
+        let to = b
+            .saturating_add(1)
+            .saturating_mul(self.block)
+            .min(self.logical.len());
+        self.logical.get(from..to).unwrap_or(&[]).to_vec()
+    }
+
+    fn resize_bounded(bytes: &mut Vec<u8>, size: usize, fill: u8) {
+        bytes.truncate(size);
+        let pad = [fill; 4096];
+        while bytes.len() < size && bytes.len() < 268_435_456 {
+            let step = size.saturating_sub(bytes.len()).min(pad.len());
+            match pad.get(..step) {
+                Some(s) if !s.is_empty() => bytes.extend_from_slice(s),
+                _ => break,
+            }
+        }
     }
 
     /// Persist `epoch` onto `bytes`: the file takes the epoch's size (new space reading
     /// `fill`), and every block it issued its contents then.
     fn apply(bytes: &mut Vec<u8>, block: usize, epoch: &Epoch, fill: u8) {
-        bytes.resize(epoch.size, fill);
+        Device::resize_bounded(bytes, epoch.size, fill);
         for (&b, data) in &epoch.blocks {
-            let from = b * block;
-            let to = (from + data.len()).min(epoch.size);
+            let from = b.saturating_mul(block);
+            let to = from
+                .saturating_add(data.len())
+                .min(epoch.size)
+                .min(bytes.len());
             if from < to {
-                bytes[from..to].copy_from_slice(&data[..to - from]);
+                let len = to.saturating_sub(from);
+                if let (Some(dst), Some(src)) = (bytes.get_mut(from..to), data.get(..len)) {
+                    dst.copy_from_slice(src);
+                }
             }
         }
     }
@@ -150,8 +173,9 @@ impl Device {
     }
 
     fn touch(&mut self, from: usize, to: usize) {
+        let blk = self.block.max(1);
         if to > from {
-            for b in from / self.block..to.div_ceil(self.block) {
+            for b in (from / blk)..to.div_ceil(blk) {
                 self.dirty.insert(b);
             }
         }
@@ -168,9 +192,9 @@ impl Device {
 
     /// The file's size once the first `full` issued epochs are persisted.
     fn size_after(&self, full: usize) -> usize {
-        match full {
-            0 => self.durable.len(),
-            n => self.epochs[n - 1].size,
+        match full.checked_sub(1) {
+            None => self.durable.len(),
+            Some(idx) => self.epochs.get(idx).map_or(self.durable.len(), |e| e.size),
         }
     }
 
@@ -185,18 +209,21 @@ impl Device {
         fill: u8,
     ) -> Device {
         let mut bytes = self.durable.clone();
-        for e in &self.epochs[..full] {
+        for e in self.epochs.get(..full).unwrap_or(&self.epochs) {
             Device::apply(&mut bytes, self.block, e, fill);
         }
         let next = self.epoch_after(full);
         let size = if new_size { next.size } else { bytes.len() };
-        bytes.resize(size, fill);
+        Device::resize_bounded(&mut bytes, size, fill);
         for b in keep {
             if let Some(data) = next.blocks.get(b) {
-                let from = b * self.block;
-                let to = (from + data.len()).min(size);
+                let from = b.saturating_mul(self.block);
+                let to = from.saturating_add(data.len()).min(size).min(bytes.len());
                 if from < to {
-                    bytes[from..to].copy_from_slice(&data[..to - from]);
+                    let len = to.saturating_sub(from);
+                    if let (Some(dst), Some(src)) = (bytes.get_mut(from..to), data.get(..len)) {
+                        dst.copy_from_slice(src);
+                    }
                 }
             }
         }
@@ -380,12 +407,15 @@ impl Sim {
         let mut s = self.lock();
         let len = usize::try_from(len).unwrap_or(usize::MAX);
         let old = s.dev.logical.len();
-        s.dev.logical.resize(len, 0);
+        if len < (1 << 28) {
+            s.dev.logical.resize(len, 0);
+        }
         // The block holding the new end changes (growth zero-fills it); a pure
         // truncation changes the size, which an image takes or leaves.
         s.dev.touch(len.min(old), len.max(old));
-        if len < old && len % s.dev.block != 0 {
-            let b = len / s.dev.block;
+        let blk = s.dev.block.max(1);
+        if len < old && len % blk != 0 {
+            let b = len / blk;
             s.dev.dirty.insert(b);
         }
         s.dev.appended(None);
@@ -504,17 +534,11 @@ impl SimDevice {
     /// crash simulation sweeps 16, 32 and 64: every 4 KiB outcome is one of theirs, and
     /// smaller blocks only add places a write can tear).
     ///
-    /// # Panics
-    ///
-    /// If `block` is 0.
+    /// Clamps `block` to at least 1 byte.
     #[must_use]
     pub fn new(block: usize) -> SimDevice {
-        assert!(
-            block > 0,
-            "a simulated device's blocks hold a byte at least"
-        );
         SimDevice {
-            sim: Sim::with(Device::new(block)),
+            sim: Sim::with(Device::new(block.max(1))),
         }
     }
 
@@ -599,19 +623,24 @@ pub(crate) fn images(dev: &Device, budget: usize, rng: &mut Rng) -> (Vec<Device>
             &[false, true]
         };
         let n = blocks.len();
-        let every = n < 63 && (1usize << n) * sizes.len() <= budget;
+        let every = n < 20 && (1usize << (n & 31)).saturating_mul(sizes.len()) <= budget;
         every_prefix &= every;
         let subsets: Vec<BTreeSet<usize>> = if every {
-            (0u64..(1u64 << n))
-                .map(|mask| {
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| mask & (1 << i) != 0)
-                        .map(|(_, &b)| b)
-                        .collect()
-                })
-                .collect()
+            let capped_n = n.min(19);
+            let subset_count = 1usize << (capped_n & 31);
+            let mut all_sets = Vec::with_capacity(subset_count.min(1_048_576));
+            let mut mask = 0usize;
+            while mask < subset_count {
+                let mut set = BTreeSet::new();
+                for (i, &b) in blocks.iter().enumerate() {
+                    if i < 20 && (mask & (1usize << (i & 31))) != 0 {
+                        set.insert(b);
+                    }
+                }
+                all_sets.push(set);
+                mask = mask.saturating_add(1);
+            }
+            all_sets
         } else {
             sample(&blocks, sizes.len(), budget, rng)
         };
@@ -621,7 +650,7 @@ pub(crate) fn images(dev: &Device, budget: usize, rng: &mut Rng) -> (Vec<Device>
                 let fill = if image_no % 2 == 1 { 0xEE } else { 0 };
                 out.push(dev.image(full, keep, new_size, fill));
             }
-            image_no += 1;
+            image_no = image_no.saturating_add(1);
         }
     }
     (out, every_prefix)
@@ -649,19 +678,27 @@ enum Pick {
 /// an epoch of more blocks than half the room are a sample too.
 fn sample(blocks: &[usize], per: usize, budget: usize, rng: &mut Rng) -> Vec<BTreeSet<usize>> {
     let n = blocks.len();
-    let mut picks: Vec<Pick> = Vec::with_capacity(3 * n + 1);
+    let cap = n.saturating_mul(3).saturating_add(1);
+    let mut picks: Vec<Pick> = if cap <= 65_536 {
+        Vec::with_capacity(cap)
+    } else {
+        Vec::new()
+    };
     // None and all lead: the trim below keeps the head of the list, and these two are the
     // ones no other pick stands for (nothing of the epoch persisted, or every block of it).
     picks.push(Pick::Prefix(0));
     if n > 0 {
         picks.push(Pick::Prefix(n));
     }
-    picks.extend((1..n).map(Pick::Prefix));
+    for k in 1..n {
+        picks.push(Pick::Prefix(k));
+    }
     for i in 0..n {
         picks.push(Pick::Alone(i));
         picks.push(Pick::AllBut(i));
     }
-    while picks.len() * per < budget {
+    let step = per.max(1);
+    while picks.len().saturating_mul(step) < budget {
         picks.push(Pick::Drawn(
             blocks
                 .iter()
@@ -670,18 +707,34 @@ fn sample(blocks: &[usize], per: usize, budget: usize, rng: &mut Rng) -> Vec<BTr
                 .collect(),
         ));
     }
-    let room = (budget / per).max(2);
+    let room = (budget / step).max(2);
     // At most `room`, as `room` is 2 at least: none and all are never trimmed.
     let keep = (room / 2).max(2);
     while picks.len() > room {
-        let at = keep + rng.below((picks.len() - keep) as u64) as usize;
-        picks.swap_remove(at);
+        let span = picks.len().saturating_sub(keep);
+        let off = usize::try_from(rng.below(span as u64)).unwrap_or(0);
+        let at = keep.saturating_add(off);
+        if at < picks.len() {
+            let last = picks.len().saturating_sub(1);
+            if at < last {
+                if let Some(sub) = picks.get_mut(at..=last) {
+                    if let Some((first, rest)) = sub.split_first_mut() {
+                        if let Some(end) = rest.last_mut() {
+                            std::mem::swap(first, end);
+                        }
+                    }
+                }
+            }
+            picks.pop();
+        } else {
+            picks.pop();
+        }
     }
     picks
         .into_iter()
         .map(|pick| match pick {
-            Pick::Prefix(k) => blocks[..k].iter().copied().collect(),
-            Pick::Alone(i) => [blocks[i]].into_iter().collect(),
+            Pick::Prefix(k) => blocks.get(..k).unwrap_or(blocks).iter().copied().collect(),
+            Pick::Alone(i) => blocks.get(i).copied().into_iter().collect(),
             Pick::AllBut(i) => blocks
                 .iter()
                 .enumerate()

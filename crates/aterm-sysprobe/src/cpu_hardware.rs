@@ -163,6 +163,32 @@ impl Probe {
     }
 }
 
+/// The chip's DVFS range, MHz: each core kind's lowest and highest power-manager state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DvfsRange {
+    /// The Super (performance) cores' lowest and highest state.
+    pub p_mhz: (f64, f64),
+    /// The Efficiency cores' lowest and highest state.
+    pub e_mhz: (f64, f64),
+}
+
+/// Reads the chip's DVFS range from the power manager's tables (`IODeviceTree:/arm-io/pmgr`'s
+/// `voltage-states1-sram` and `voltage-states5-sram`): one registry read, which the heat chain
+/// takes once. `None` on a system with no such table (every one but macOS).
+///
+/// `Some(Err)` names the table that did not read (an Intel Mac has neither).
+#[must_use]
+pub fn dvfs_range() -> Option<Result<DvfsRange, &'static str>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(native::dvfs_range())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The previous native snapshot of a cumulative-counter source, which the next one deltas
 /// against, under the gap rule (A2 §6.4): a snapshot pairs with the previous one only within
 /// its demand's gap. Past the gap, or with none held, it is kept only as the next one's

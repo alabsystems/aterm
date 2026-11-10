@@ -99,7 +99,7 @@ pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> String {
             unknown,
             ..
         }) => format!(
-            "{}/{n} free, {pending} pending, {unknown} unknown, age_ms={}",
+            "{}/{n} confirmed free, {pending} awaiting confirmation, {unknown} unknown, age_ms={} (paired slot observations; admission queue not measured)",
             free.saturating_sub(discounted),
             age_ms.saturating_add(s.slots_age_ms.unwrap_or(0))
         ),

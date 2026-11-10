@@ -432,6 +432,18 @@ impl Access {
         self.is_current_observed_in(journal, look).unwrap_or(false)
     }
 
+    /// [`Self::is_current_in`] where `look` is given, and otherwise [`Self::is_current`].
+    fn is_current_through(
+        &self,
+        journal: &Journal,
+        look: Option<&crate::client::VaultLook<'_>>,
+    ) -> bool {
+        look.map_or_else(
+            || self.is_current(journal),
+            |look| self.is_current_in(journal, look),
+        )
+    }
+
     /// [`Self::is_current_observed`] through `look`: judged under the look's shared observation of
     /// the state lock and its look at each file, rather than an observation and a look of its own,
     /// where it looks at this access's vault and observes that lock; otherwise
@@ -531,15 +543,40 @@ impl Access {
         identity: &Identity,
         read: impl FnOnce(Result<Option<LogHistory<'_>>>) -> R,
     ) -> R {
+        self.with_log_history_in(journal, identity, None, read)
+    }
+
+    /// [`Self::with_log_history`], its membership check and its read of the log judged through
+    /// `look` where given: under the look's shared observation of the state lock and its look at
+    /// each file ([`Self::is_current_in`], [`crate::client::trusted_commons_log_under`]) where it
+    /// looks at this access's vault and observes that lock, and otherwise each on its own call. A
+    /// table-repair read batch's record history and its probe of the history it needs
+    /// (`aterm-db`'s `Session::decode_envelope` and `Session::history_needs`) lease through the
+    /// look its session keeps.
+    pub(super) fn with_log_history_in<R>(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        look: Option<&crate::client::VaultLook<'_>>,
+        read: impl FnOnce(Result<Option<LogHistory<'_>>>) -> R,
+    ) -> R {
         let Some(paths) = &self.log_paths else {
             return read(Ok(None));
         };
-        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+        if !self.is_current_through(journal, look)
+            || self.local().binding.recipient() != identity.recipient()
+        {
             return read(Err(Error::new(
                 "historical access requires the current local membership",
             )));
         }
-        let log = match crate::client::trusted_commons_log_now(paths, self.trust) {
+        let trusted = match look.and_then(|look| look.held_at(paths)) {
+            Some((lock, glance)) => {
+                crate::client::trusted_commons_log_under(paths, self.trust, lock, glance)
+            }
+            None => crate::client::trusted_commons_log_now(paths, self.trust),
+        };
+        let log = match trusted {
             Ok(Some((log, _heads_digest))) => log,
             Ok(None) => return read(Err(Error::new("Commons membership log is unavailable"))),
             Err(error) => return read(Err(error)),
@@ -799,7 +836,22 @@ impl Access {
         identity: &Identity,
         basis: [u8; 32],
     ) -> Result<Historical> {
-        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+        self.historical_in(journal, identity, basis, None)
+    }
+
+    /// [`Self::historical`], its membership check judged through `look` where given
+    /// ([`Self::is_current_in`]): a table-repair read batch's fallback to the control journal for
+    /// a basis the log does not open (`Bootstrap::historicals_in`).
+    pub fn historical_in(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        basis: [u8; 32],
+        look: Option<&crate::client::VaultLook<'_>>,
+    ) -> Result<Historical> {
+        if !self.is_current_through(journal, look)
+            || self.local().binding.recipient() != identity.recipient()
+        {
             return Err(Error::new(
                 "historical access requires the current local membership",
             ));
@@ -1004,22 +1056,35 @@ impl Historical {
         journal: &Journal,
         use_key: impl FnOnce(&[u8; 32]) -> T,
     ) -> Result<T> {
+        self.with_key_in(journal, None, use_key)
+    }
+
+    /// [`Self::with_key`], its currency judged through `look` where given: under the look's
+    /// shared observation of the state lock and its look at each file where it looks at this
+    /// key's vault and observes that lock, and otherwise on its own call, as
+    /// [`Access::is_current_observed_in`] judges. A table-repair read batch takes each record's
+    /// key through the look its session keeps; a store read batch's closing check of the keys it
+    /// reused asks afresh (`aterm-db`'s `ReadBatch::revalidate`).
+    pub fn with_key_in<T>(
+        &self,
+        journal: &Journal,
+        look: Option<&crate::client::VaultLook<'_>>,
+        use_key: impl FnOnce(&[u8; 32]) -> T,
+    ) -> Result<T> {
         if let Some(paths) = &self.log_paths {
+            if let Some(under) = look.and_then(|look| look.held_at(paths)) {
+                if !self.log_key_is_current(journal, paths, under)? {
+                    return Err(Error::new(
+                        "historical key observation is no longer current",
+                    ));
+                }
+                return Ok(use_key(self.key.as_slice().try_into().unwrap()));
+            }
             return crate::client::with_roster_observation(paths, |observation| {
                 let lock = observation
                     .state_lock()
                     .ok_or_else(|| Error::new("historical key observation is unavailable"))?;
-                if journal.trust() != self.trust
-                    || !log_observation_is_current(
-                        paths,
-                        self.trust,
-                        self.local_recipient,
-                        self.head,
-                        self.basis,
-                        self.log_heads_digest,
-                        (lock, &crate::fsx::Glance::new()),
-                    )?
-                {
+                if !self.log_key_is_current(journal, paths, (lock, &crate::fsx::Glance::new()))? {
                     return Err(Error::new(
                         "historical key observation is no longer current",
                     ));
@@ -1040,6 +1105,26 @@ impl Historical {
             ));
         }
         Ok(use_key(self.key.as_slice().try_into().unwrap()))
+    }
+
+    /// Whether this log-backed key still stands for `journal` and the vault at `paths`, judged
+    /// under `under`: a shared observation of its state lock and a look at its files.
+    fn log_key_is_current(
+        &self,
+        journal: &Journal,
+        paths: &crate::client::Paths,
+        under: (&crate::client::StateLock, &crate::fsx::Glance),
+    ) -> Result<bool> {
+        Ok(journal.trust() == self.trust
+            && log_observation_is_current(
+                paths,
+                self.trust,
+                self.local_recipient,
+                self.head,
+                self.basis,
+                self.log_heads_digest,
+                under,
+            )?)
     }
 }
 

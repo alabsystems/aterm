@@ -414,7 +414,7 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
         "the update zip",
     )
     .expect_err("PRECONDITION: more than the volume holds is refused");
-    let extract = crate::install::unpack_failure(
+    let extract = crate::install::bundle_transfer_failure(
         &volume.root,
         "ditto zip extract failed",
         std::process::ExitStatus::from_raw(1 << 8),
@@ -482,7 +482,7 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
     .expect_err("a download that could not be stored fails the check");
     assert!(crate::is_passing_refusal(&denied), "{denied}");
     let _ = std::fs::remove_dir_all(&staging.root);
-    let quota = crate::install::unpack_failure(
+    let quota = crate::install::bundle_transfer_failure(
         &volume.root,
         "ditto zip extract failed",
         std::process::ExitStatus::from_raw(1 << 8),

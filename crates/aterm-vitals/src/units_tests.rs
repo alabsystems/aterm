@@ -107,17 +107,26 @@ fn the_mean_of_the_cpu_tiles_is_the_cpu_percent() {
     assert!(trend_apart, "the trend never left the 10 s mean");
 }
 
+/// A run queue of `threads`, P10.
+fn p10(threads: f64) -> Option<crate::runq::RunQueue> {
+    Some(crate::runq::RunQueue {
+        threads,
+        basis: crate::runq::QueueBasis::Runnable,
+    })
+}
+
 #[test]
 fn the_queue_tile_is_load_beyond_the_cores_and_turns_over_with_the_cpu() {
     assert_eq!(queue_level(6.0, 4), 0.5);
     assert_eq!(queue_level(12.0, 4), 1.0, "clamped at the cores again");
-    assert!(cpu_over(Some(3.9), Some(4), Some(6.0)));
+    assert!(cpu_over(Some(3.9), Some(4), p10(6.0)));
     assert!(
-        !cpu_over(Some(3.7), Some(4), Some(6.0)),
+        !cpu_over(Some(3.7), Some(4), p10(6.0)),
         "a queue under 95 % busy is not over"
     );
-    assert!(!cpu_over(Some(4.0), Some(4), Some(4.0)));
-    assert!(!cpu_over(None, Some(4), Some(6.0)));
+    assert!(!cpu_over(Some(4.0), Some(4), p10(4.0)));
+    assert!(!cpu_over(None, Some(4), p10(6.0)));
+    assert!(!cpu_over(Some(4.0), Some(0), p10(6.0)), "no cores, no rule");
 
     let mut v = Vitals::default();
     let load = |mut s: Sample, load1: f64| {
@@ -131,8 +140,10 @@ fn the_queue_tile_is_load_beyond_the_cores_and_turns_over_with_the_cpu() {
         snap.units.queue,
         Some(Queue {
             level: 0.5,
-            over: true
-        })
+            over: true,
+            basis: crate::runq::QueueBasis::Load1,
+        }),
+        "no run-queue reader: load1 is the queue"
     );
     assert!(snap.resources[Resource::Cpu.index()].over, "the row agrees");
     // Half busy under the same queue: the tile stands, not over.
@@ -157,6 +168,85 @@ fn no_queue_tile_draws_at_or_under_capacity() {
     // Negative control: no load read, no queue tile at all.
     s.load1 = None;
     assert_eq!(v.absorb(&s).units.queue, None);
+}
+
+#[test]
+fn the_queue_tile_reads_p10_where_it_is_read_and_load1_nowhere_else() {
+    let mut v = Vitals::default();
+    let full = |t: u64| [t * 100; 4];
+    // Every core busy, 2 threads runnable on 4 cores while load1 still holds 6 from a minute ago.
+    let at = |t: u64, p: crate::runq::RunQueueRead| {
+        let mut s = with_cores(reading(t), &full(t), &full(t));
+        s.load1 = Some(6.0);
+        s.run_queue = p;
+        s
+    };
+    let _ = v.absorb(&at(1, crate::runq::RunQueueRead::Milli(2_000)));
+    let snap = v.absorb(&at(2, crate::runq::RunQueueRead::Milli(2_000)));
+    assert_eq!(
+        snap.units.queue,
+        Some(Queue {
+            level: 0.0,
+            over: false,
+            basis: crate::runq::QueueBasis::Runnable,
+        })
+    );
+    assert!(
+        !snap.resources[Resource::Cpu.index()].over,
+        "the row agrees"
+    );
+    // P10 is the 10 s mean: 2 then 14 runnable read 8, past the 4 cores.
+    let snap = v.absorb(&at(3, crate::runq::RunQueueRead::Milli(20_000)));
+    let q = snap.units.queue.expect("a tile");
+    assert_eq!((q.level, q.over), (1.0, true), "{q:?}");
+    assert!(
+        (snap.facts.queue.expect("read").threads - 8.0).abs() < 1e-9,
+        "{:?}",
+        snap.facts.queue
+    );
+    // Negative control: the same readings with no run-queue reader read load1's 6.
+    let mut w = Vitals::default();
+    let _ = w.absorb(&at(1, crate::runq::RunQueueRead::Unsupported));
+    let snap = w.absorb(&at(2, crate::runq::RunQueueRead::Unsupported));
+    assert_eq!(snap.units.queue.map(|q| q.over), Some(true));
+}
+
+#[test]
+fn the_disk_queue_is_time_in_service_over_wall_time() {
+    let mut v = Vitals::default();
+    let mut units = None;
+    for t in 1..=5u64 {
+        let mut s = reading(t);
+        let mut b = block(10_000_000 * t, 2_000_000 * t);
+        // 120 ms of writes and 30 ms of reads served each second: 0.15 in flight (A4 §5.4's
+        // 10:56 reading).
+        b.write_ns = 120_000_000 * t;
+        b.read_ns = 30_000_000 * t;
+        s.block = vec![b];
+        units = Some(v.absorb(&s).units);
+    }
+    let disk = units.expect("units").disks.remove(0);
+    let l = disk.queue.expect("a queue");
+    assert!(
+        (l.mean - 0.15).abs() < 1e-9 && (l.max - 0.15).abs() < 1e-9,
+        "{l:?}"
+    );
+
+    // One reading makes no queue: unread, not zero.
+    let mut w = Vitals::default();
+    let mut s = reading(1);
+    s.block = vec![block(1, 1)];
+    assert_eq!(w.absorb(&s).units.disks[0].queue, None);
+    // A counter that went back (a device reset) makes no reading either.
+    let mut u = Vitals::default();
+    let mut first = block(10, 10);
+    first.write_ns = 5_000_000_000;
+    let mut s = reading(1);
+    s.block = vec![first];
+    let _ = u.absorb(&s);
+    let mut s = reading(2);
+    s.block = vec![block(20, 20)];
+    assert_eq!(u.absorb(&s).units.disks[0].queue, None);
 }
 
 /// Memory with the VM's counters: `compress` and `decompress` pages a second since `t` 0.

@@ -5,6 +5,115 @@
 
 use super::*;
 
+/// A prepared record beside a live supervisor and its exclusively held workspace.
+/// The controller releases both claims only after the child reports entering the wait.
+#[cfg(unix)]
+pub(crate) struct PrefreezeFixture {
+    pub fixture: Fixture,
+    owners: Option<(crate::release::RunClaim, crate::release::RunClaim)>,
+}
+
+#[cfg(unix)]
+impl PrefreezeFixture {
+    pub fn new() -> Self {
+        let fixture = Fixture::new();
+        let real = Self::real(fixture.root.path());
+        let cache = real.release.join("cutter-cache");
+        let source = fixture.root.path().join("prepared");
+        aterm_tempfile::stand_in(&source, &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; else printf '%s\\n' 'R policy passes'; fi\n",
+            crate::release_tools::CUTTER_VERSION
+        )).unwrap();
+        let source = std::fs::canonicalize(source).unwrap();
+        let inputs = cfg!(target_os = "macos").then(|| crate::cutter_inputs::Inputs {
+            digest: "1".repeat(64),
+            sources: "2".repeat(64),
+            seal: "3".repeat(64),
+        });
+        let prepared = crate::release_tools::stage_cutter(
+            &cache,
+            &fixture.candidate,
+            &source,
+            &real.step_log(real.step),
+            inputs,
+        )
+        .unwrap();
+        crate::release_tools::publish_cutter(&cache, &prepared).unwrap();
+        let pid = std::process::id();
+        let started = started_of(pid).unwrap();
+        let take = |name| {
+            crate::release::RunClaim::take(
+                &cache.join(name),
+                (pid, &started),
+                &real.logs,
+                &mut started_of,
+            )
+            .unwrap()
+        };
+        let owners = Some((take("prefreeze-running"), take("workspace-running")));
+        Self { fixture, owners }
+    }
+
+    pub fn release(&mut self) {
+        self.owners.take();
+    }
+
+    pub fn real(root: &Path) -> Real {
+        let repo = root.join("repo");
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.release = root.join("release");
+        real.state = root.join("state");
+        real.prefrozen_inputs = |state, _| Some(state.join("kept-seal"));
+        real.prefrozen_step1 = Some(PrefrozenStep1 {
+            commit: crate::ledger::git_ok(&GitCli::new(&repo), &["rev-parse", "--branches"])
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .into(),
+            seal: "3".repeat(64),
+        });
+        real.handed_inputs = || Some(PathBuf::from("/fixture/kept-seal"));
+        real.argv = vec!["release".into(), "--dry-run".into()];
+        real
+    }
+
+    pub fn judge(real: &Real, commit: &str) -> Result<(), Refusal> {
+        let unused = Prover {
+            bin: PathBuf::from("/no-compiler"),
+            commit: "f".repeat(40),
+            source: "unused".into(),
+        };
+        let cutter = real
+            .frozen_cutter(commit, &unused)
+            .map_err(|why| Refusal::new(why, "fixture"))?;
+        let output = aterm_uds::deadline::output_within(
+            &mut real.cutter_command(&cutter.tool.path),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("R policy passes"));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_prefreeze_uses_the_record_without_taking_the_held_workspace() {
+    let fixture = PrefreezeFixture::new();
+    let mut real = PrefreezeFixture::real(fixture.fixture.root.path());
+    let cache = real.release.join("cutter-cache");
+    let before = std::fs::read(cache.join("workspace-running")).unwrap();
+    let prepared = prepare_cached_cutter(&mut real, &fixture.fixture.candidate).unwrap();
+    assert_eq!(prepared.commit, fixture.fixture.candidate);
+    assert!(real.prefreeze_claim.is_none());
+    assert_eq!(
+        std::fs::read(cache.join("workspace-running")).unwrap(),
+        before
+    );
+}
+
 pub(crate) struct Fixture {
     pub root: aterm_tempfile::TempDir,
     pub repo: PathBuf,
@@ -166,9 +275,9 @@ impl BumpFixture {
         std::fs::write(
             repo.join("CHANGELOG.md"),
             if red {
-                "# Changelog\n\n## [Unreleased]\n"
+                "# Changelog\n\n## [Unreleased]\n\n## [0.5.0] - date\n\n- Previous release.\n"
             } else {
-                "# Changelog\n\n## [Unreleased]\n\n- A useful change.\n"
+                "# Changelog\n\n## [Unreleased]\n\n- A useful change.\n\n## [0.5.0] - date\n\n- Previous release.\n"
             },
         )
         .unwrap();

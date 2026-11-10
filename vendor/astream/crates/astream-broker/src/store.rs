@@ -7539,25 +7539,42 @@ impl BrokerLog {
     /// sequence. A relayed record keeps its origin's key on every broker and a will its own
     /// producer's, so neither asks this.
     fn produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
-        self.continued(producer_id, |id| {
-            self.staged_or_durable_dup((id, producer_seq))
-        })
+        self.continued(producer_id, producer_seq, true)
     }
 
     /// [`produced_dup`](Self::produced_dup) for the un-batched paths, which read the durable map
     /// alone.
     fn durable_produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
-        self.continued(producer_id, |id| self.dedup.get(id, producer_seq))
+        self.continued(producer_id, producer_seq, false)
     }
 
-    /// `dup` under `producer_id`, then under each producer it continues.
-    fn continued(&self, producer_id: u64, dup: impl Fn(u64) -> Option<Offset>) -> Option<Offset> {
-        dup(producer_id).or_else(|| {
-            self.lineage
-                .get(&producer_id)?
-                .iter()
-                .find_map(|&pred| dup(pred))
-        })
+    /// Lookup `(id, producer_seq)` under `producer_id`, then under each producer it continues.
+    fn continued(
+        &self,
+        producer_id: u64,
+        producer_seq: u64,
+        include_staged: bool,
+    ) -> Option<Offset> {
+        let first = if include_staged {
+            self.staged_or_durable_dup((producer_id, producer_seq))
+        } else {
+            self.dedup.get(producer_id, producer_seq)
+        };
+        if first.is_some() {
+            return first;
+        }
+        let preds = self.lineage.get(&producer_id)?;
+        for &pred in preds {
+            let hit = if include_staged {
+                self.staged_or_durable_dup((pred, producer_seq))
+            } else {
+                self.dedup.get(pred, producer_seq)
+            };
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        None
     }
 
     /// Say which producers continue others' sequences: for each `successor -> predecessors`, a
@@ -8215,7 +8232,12 @@ impl BrokerLog {
     /// record (including wills carried across compaction via `<log>.state`): read from the
     /// latest-will map ([`DurableWillEntry`]), so no record is read back, cold or hot.
     fn latest_wills(&self) -> Vec<(Offset, WillRecord)> {
-        let mut out = Vec::with_capacity(self.durable_latest_wills.len());
+        let cap = self.durable_latest_wills.len();
+        let mut out = if cap <= 65_536 {
+            Vec::with_capacity(cap)
+        } else {
+            Vec::new()
+        };
         for e in self.durable_latest_wills.values() {
             out.push((e.offset, e.will.clone()));
         }
@@ -9942,23 +9964,28 @@ impl BrokerLog {
         let mut met = self
             .tier
             .passing(from, to, |s| filter.matches_str(s))
-            .map(crate::tier::Met::index)
-            .peekable();
+            .map(crate::tier::Met::index);
+        let mut next_met = met.next();
         loop {
-            let i = match (also, met.peek().copied()) {
-                (Some(a), Some(m)) if a <= m => {
-                    also = None;
-                    if a == m {
-                        met.next();
+            let i = match (also, next_met) {
+                (Some(a), Some(m)) => {
+                    if a <= m {
+                        also = None;
+                        if a == m {
+                            next_met = met.next();
+                        }
+                        a
+                    } else {
+                        next_met = met.next();
+                        m
                     }
-                    a
                 }
                 (Some(a), None) => {
                     also = None;
                     a
                 }
-                (_, Some(m)) => {
-                    met.next();
+                (None, Some(m)) => {
+                    next_met = met.next();
                     m
                 }
                 (None, None) => break,
@@ -10385,19 +10412,18 @@ impl BrokerLog {
         if floors.is_empty() {
             return floors;
         }
-        self.dedup
-            .each_below(min, |producer_id, producer_seq, off| {
-                if producer_seq >= ACK_SEQ_BASE {
-                    return;
-                }
-                let summary = off
-                    .checked_sub(self.base.0)
-                    .and_then(|i| usize::try_from(i).ok())
-                    .and_then(|i| self.tier.summary(i));
-                if let Some(summary) = summary.filter(|s| !s.is_hidden()) {
-                    floors.raise(producer_id, summary.subject(), producer_seq);
-                }
-            });
+        for (producer_id, producer_seq, off) in self.dedup.keys_below(min) {
+            if producer_seq >= ACK_SEQ_BASE {
+                continue;
+            }
+            let summary = off
+                .checked_sub(self.base.0)
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| self.tier.summary(i));
+            if let Some(summary) = summary.filter(|s| !s.is_hidden()) {
+                floors.raise(producer_id, summary.subject(), producer_seq);
+            }
+        }
         floors.bound(
             crate::relay_floor::SUBJECTS_PER_ORIGIN,
             crate::relay_floor::MAX_ENCODED_BYTES,

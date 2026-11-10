@@ -79,6 +79,9 @@ mod runtime;
 #[path = "../src/runtime_input_transport.rs"]
 mod runtime_input_transport;
 #[cfg(target_os = "macos")]
+#[path = "../src/solver_bootstrap.rs"]
+mod solver_bootstrap;
+#[cfg(target_os = "macos")]
 #[path = "../src/subgroup_delegation.rs"]
 mod subgroup_delegation;
 #[cfg(all(unix, not(target_os = "macos")))]

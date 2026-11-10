@@ -118,6 +118,9 @@ mod cold_admission;
 #[path = "accounts_pool_claims_tests.rs"]
 mod claims;
 
+#[path = "accounts_pool_reconciled_tests.rs"]
+mod reconciled;
+
 struct World {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -269,6 +272,7 @@ fn session<'a>(cli: Cli, supervisor: Supervisor, mode: Mode, exe: &'a Path) -> S
         sid: "s-one",
         supervisor,
         env: &[],
+        seen: &crate::harness::observe::Observation::Unread,
         sample: Some(near_wall()),
         point: Point::TurnEnd,
         mode,

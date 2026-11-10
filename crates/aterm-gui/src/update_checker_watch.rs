@@ -12,8 +12,8 @@ use crate::App;
 /// What the watchdog remembers between looks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CheckerWatchState {
-    /// The generation whose stall was already acted on.
-    acted_on: Option<u64>,
+    /// The generation and returned-slot epoch whose stall was already acted on.
+    acted_on: Option<ActedOn>,
     /// A stale stamp seen by one look and not yet acted on.
     suspect: Option<Suspect>,
     /// The loop's completed-check count when this watchdog's warning was posted.
@@ -118,6 +118,26 @@ struct Suspect {
     confirm_at: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActedOn {
+    generation: u64,
+    phase: CheckerPhase,
+    at_secs: u64,
+    worker_epoch: u64,
+}
+
+impl ActedOn {
+    fn matches(self, beat: CheckerBeat) -> bool {
+        self.generation == beat.generation
+            && self.phase == beat.phase
+            && self.at_secs == beat.at_secs
+    }
+
+    fn suppresses(self, beat: CheckerBeat) -> bool {
+        self.matches(beat) && self.worker_epoch >= beat.worker_epoch
+    }
+}
+
 impl Suspect {
     /// Whether `beat` is still exactly the stamp this suspicion was raised over —
     /// a loop that stamped in between, however briefly, was not stuck.
@@ -144,7 +164,7 @@ pub(crate) struct CheckerStall {
 }
 
 /// Judge one look. Late heartbeats require confirmation; observed thread-start
-/// failures require only their retry backoff. The window and node share this.
+/// failures and observed worker exits require only their retry backoff. The window and node share this.
 pub(crate) fn judge(
     state: &mut CheckerWatchState,
     beat: Option<CheckerBeat>,
@@ -156,13 +176,14 @@ pub(crate) fn judge(
         state.suspect = None;
         return None;
     };
-    if state.acted_on == Some(beat.generation) {
+    if state.acted_on.is_some_and(|acted| acted.suppresses(beat)) {
         return None;
     }
-    // A failed thread creation is observed absence, not a heartbeat that may
-    // merely be late. Its retry backoff already elapsed in `classify`.
+    // A failed thread creation or observed exit is absence, not a heartbeat that
+    // may merely be late. Its retry backoff already elapsed in `classify`. Returned
+    // capacity rearms a previously confirmed stamp, never a different heartbeat.
     match state.suspect {
-        _ if phase == CheckerPhase::StartFailed => {}
+        _ if phase.worker_absent() || state.acted_on.is_some_and(|acted| acted.matches(beat)) => {}
         Some(suspect) if suspect.is(&beat) && now_secs >= suspect.confirm_at => {}
         Some(suspect) if suspect.is(&beat) => return None,
         _ => {
@@ -176,7 +197,12 @@ pub(crate) fn judge(
         }
     }
     state.suspect = None;
-    state.acted_on = Some(beat.generation);
+    state.acted_on = Some(ActedOn {
+        generation: beat.generation,
+        phase: beat.phase,
+        at_secs: beat.at_secs,
+        worker_epoch: beat.worker_epoch,
+    });
     Some(CheckerStall {
         generation: beat.generation,
         for_secs,
@@ -205,7 +231,11 @@ pub(crate) fn next_look_in(
 fn heartbeat_look_in(state: &CheckerWatchState, beat: CheckerBeat, now_secs: u64) -> Option<u64> {
     match checker_watch::classify(&beat, now_secs) {
         CheckerVerdict::Fresh { stale_in_secs } => Some(stale_in_secs),
-        CheckerVerdict::Stalled { .. } if state.acted_on == Some(beat.generation) => None,
+        CheckerVerdict::Stalled { .. }
+            if state.acted_on.is_some_and(|acted| acted.suppresses(beat)) =>
+        {
+            None
+        }
         CheckerVerdict::Stalled { .. } => Some(
             state
                 .suspect
@@ -282,12 +312,9 @@ impl App {
                 stall.phase.as_str()
             ),
             None => {
-                let respawns = checker_watch::checker_snapshot().map_or(0, |beat| beat.respawns);
-                let budget = if respawns >= checker_watch::MAX_RESPAWNS {
-                    format!(
-                        " (this process has started {respawns} of at most {})",
-                        checker_watch::MAX_RESPAWNS
-                    )
+                let workers = checker_watch::checker_snapshot().map_or(0, |beat| beat.workers);
+                let budget = if workers as u64 > checker_watch::MAX_RESPAWNS {
+                    format!(" (this process has {workers} outstanding checker workers, the limit)",)
                 } else {
                     String::new()
                 };
@@ -365,26 +392,28 @@ mod tests {
 
     #[test]
     fn a_failed_thread_start_retries_after_backoff_without_stall_confirmation() {
-        let mut state = CheckerWatchState::default();
-        let failed = beat(9, CheckerPhase::StartFailed, 100);
-        let due = 100 + checker_watch::START_RETRY.as_secs();
-        assert_eq!(next_look_in(&state, Some(failed), due - 1), Some(1));
-        assert!(judge(&mut state, Some(failed), due - 1).is_none());
-        assert_eq!(judge(&mut state, Some(failed), due).unwrap().generation, 9);
-        assert!(judge(&mut state, Some(failed), due + 1).is_none());
-        assert_eq!(next_look_in(&state, Some(failed), due + 1), None);
-        let again = beat(10, CheckerPhase::StartFailed, due);
-        assert!(judge(&mut state, Some(again), due + 1).is_none());
-        assert_eq!(
-            judge(
-                &mut state,
-                Some(again),
-                due + checker_watch::START_RETRY.as_secs()
-            )
-            .unwrap()
-            .generation,
-            10
-        );
+        for phase in [CheckerPhase::StartFailed, CheckerPhase::Stopped] {
+            let mut state = CheckerWatchState::default();
+            let failed = beat(9, phase, 100);
+            let due = 100 + checker_watch::START_RETRY.as_secs();
+            assert_eq!(next_look_in(&state, Some(failed), due - 1), Some(1));
+            assert!(judge(&mut state, Some(failed), due - 1).is_none());
+            assert_eq!(judge(&mut state, Some(failed), due).unwrap().generation, 9);
+            assert!(judge(&mut state, Some(failed), due + 1).is_none());
+            assert_eq!(next_look_in(&state, Some(failed), due + 1), None);
+            let again = beat(10, phase, due);
+            assert!(judge(&mut state, Some(again), due + 1).is_none());
+            assert_eq!(
+                judge(
+                    &mut state,
+                    Some(again),
+                    due + checker_watch::START_RETRY.as_secs()
+                )
+                .unwrap()
+                .generation,
+                10
+            );
+        }
     }
     use crate::update_words::LiveHealth as _;
     use aterm_update::checker_watch::{
@@ -399,6 +428,8 @@ mod tests {
             at_secs: at,
             max_interval_secs: 1_100,
             respawns: 0,
+            workers: 1,
+            worker_epoch: 0,
             deferrals: 0,
             settings_misses: 0,
             lane: None,
@@ -422,10 +453,10 @@ mod tests {
         judge(state, Some(beat), now + CONFIRM)
     }
 
-    /// A stall is acted on once per generation, and only a stall (here a checker parked in the
+    /// An unchanged stall is acted on once, and only a stall (here a checker parked in the
     /// lock wait for four days).
     #[test]
-    fn a_stall_is_acted_on_once_per_generation_and_a_fresh_beat_never() {
+    fn an_unchanged_stall_is_acted_on_once_and_a_fresh_beat_never() {
         let mut state = CheckerWatchState::default();
         assert_eq!(
             judge(&mut state, None, 1_000_000),
@@ -454,6 +485,41 @@ mod tests {
         let replacement = beat(2, CheckerPhase::Checking, days);
         let later = days + stall_threshold_secs(CheckerPhase::Checking, 1_100) + 1;
         assert!(confirmed(&mut state, replacement, later).is_some());
+    }
+
+    #[test]
+    fn a_returned_worker_slot_rearms_a_confirmed_stall_once_without_another_delay() {
+        let mut state = CheckerWatchState::default();
+        let mut parked = beat(4, CheckerPhase::Checking, 1_000);
+        parked.workers = 4;
+        let now = 1_000 + 4 * 86_400;
+        assert!(confirmed(&mut state, parked, now).is_some());
+        assert_eq!(next_look_in(&state, Some(parked), now + CONFIRM), None);
+        let old = parked;
+        parked.workers -= 1;
+        parked.worker_epoch += 1;
+        assert_eq!(next_look_in(&state, Some(parked), now + CONFIRM), Some(0));
+        assert!(judge(&mut state, Some(parked), now + CONFIRM).is_some());
+        assert!(judge(&mut state, Some(parked), now + CONFIRM).is_none());
+        assert!(
+            judge(&mut state, Some(old), now + CONFIRM).is_none(),
+            "an older snapshot cannot rearm it"
+        );
+        assert_eq!(next_look_in(&state, Some(old), now + CONFIRM), None);
+        parked.worker_epoch += 1;
+        parked.at_secs = now + CONFIRM;
+        assert!(
+            judge(&mut state, Some(parked), now + CONFIRM).is_none(),
+            "a fresh worker does not need replacing"
+        );
+        let stale =
+            parked.at_secs + stall_threshold_secs(parked.phase, parked.max_interval_secs) + 1;
+        assert!(
+            judge(&mut state, Some(parked), stale).is_none(),
+            "a different heartbeat needs its own confirmation"
+        );
+        assert_eq!(next_look_in(&state, Some(parked), stale), Some(CONFIRM));
+        assert!(judge(&mut state, Some(parked), stale + CONFIRM).is_some());
     }
 
     /// A process that was stopped is not a stalled checker: the first look after a continue

@@ -1501,13 +1501,16 @@ impl RestoredSplitTree {
         self.bounded_shape(MAX_SPLIT_DEPTH, &mut remaining_leaves)
     }
 
-    fn retire_unhanded_terminals(&mut self, unhanded: &[u64]) {
+    fn retire_unhanded_terminals(&mut self, unhanded_sorted: &[u64]) {
         match self {
             Self::Leaf { view } => {
                 let RestoredView::Terminal(terminal) = &*view else {
                     return;
                 };
-                if !terminal.local_id.is_some_and(|id| unhanded.contains(&id)) {
+                if !terminal
+                    .local_id
+                    .is_some_and(|id| unhanded_sorted.binary_search(&id).is_ok())
+                {
                     return;
                 }
                 let metadata = format!(
@@ -1527,24 +1530,15 @@ impl RestoredSplitTree {
                 });
             }
             Self::Split { first, second, .. } => {
-                first.retire_unhanded_terminals(unhanded);
-                second.retire_unhanded_terminals(unhanded);
+                first.retire_unhanded_terminals(unhanded_sorted);
+                second.retire_unhanded_terminals(unhanded_sorted);
             }
         }
     }
 
     /// Every terminal leaf of this tree names no pool id ([`TerminalLeafRestore::local_id`]).
     pub(crate) fn forget_pool_ids(&mut self) {
-        match self {
-            Self::Leaf {
-                view: RestoredView::Terminal(terminal),
-            } => terminal.local_id = None,
-            Self::Leaf { .. } => {}
-            Self::Split { first, second, .. } => {
-                first.forget_pool_ids();
-                second.forget_pool_ids();
-            }
-        }
+        self.visit_terminals_mut(&mut |terminal| terminal.local_id = None);
     }
 
     fn collect_settings_drafts(
@@ -1563,6 +1557,34 @@ impl RestoredSplitTree {
             Self::Split { first, second, .. } => {
                 first.collect_settings_drafts(drafts, unreadable);
                 second.collect_settings_drafts(drafts, unreadable);
+            }
+        }
+    }
+
+    /// Visit every terminal leaf in rebuild order without allocating a `Vec`.
+    pub(crate) fn visit_terminals<'a>(&'a self, f: &mut impl FnMut(&'a TerminalLeafRestore)) {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => f(terminal),
+            Self::Leaf { .. } => {}
+            Self::Split { first, second, .. } => {
+                first.visit_terminals(f);
+                second.visit_terminals(f);
+            }
+        }
+    }
+
+    /// Mutably visit every terminal leaf in rebuild order without allocating a `Vec`.
+    pub(crate) fn visit_terminals_mut(&mut self, f: &mut impl FnMut(&mut TerminalLeafRestore)) {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => f(terminal),
+            Self::Leaf { .. } => {}
+            Self::Split { first, second, .. } => {
+                first.visit_terminals_mut(f);
+                second.visit_terminals_mut(f);
             }
         }
     }
@@ -2491,23 +2513,14 @@ impl RestoreManifest {
 
     /// Every canonical terminal leaf that names a handed-off shell (`local_id`), cloned, in rebuild order.
     pub(crate) fn handed_off_leaves(&self) -> Vec<TerminalLeafRestore> {
-        fn collect(node: &RestoredSplitTree, leaves: &mut Vec<TerminalLeafRestore>) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(terminal),
-                } if terminal.local_id.is_some() => leaves.push(terminal.clone()),
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    collect(first, leaves);
-                    collect(second, leaves);
-                }
-            }
-        }
-
         let mut leaves = Vec::new();
         for window in &self.windows {
             for tab in &window.restored_tabs {
-                collect(&tab.root, &mut leaves);
+                tab.root.visit_terminals(&mut |terminal| {
+                    if terminal.local_id.is_some() {
+                        leaves.push(terminal.clone());
+                    }
+                });
             }
         }
         leaves
@@ -2568,48 +2581,20 @@ impl RestoreManifest {
         });
     }
 
-    fn fill_terminals(&mut self, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
-        fn walk(node: &mut RestoredSplitTree, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(terminal),
-                } => fill(terminal),
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    walk(first, fill);
-                    walk(second, fill);
-                }
-            }
-        }
+    fn fill_terminals(&mut self, fill: &mut impl FnMut(&mut TerminalLeafRestore)) {
         for window in &mut self.windows {
             for tab in &mut window.restored_tabs {
-                walk(&mut tab.root, fill);
+                tab.root.visit_terminals_mut(fill);
             }
         }
     }
 
     /// No terminal leaf carries an agent ([`TerminalLeafRestore::agent`]) or the tab's holds ([`TerminalLeafRestore::holds`]).
     pub(crate) fn forget_agents_and_holds(&mut self) {
-        fn forget(node: &mut RestoredSplitTree) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(terminal),
-                } => {
-                    terminal.agent = None;
-                    terminal.holds.clear();
-                }
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    forget(first);
-                    forget(second);
-                }
-            }
-        }
-        for window in &mut self.windows {
-            for tab in &mut window.restored_tabs {
-                forget(&mut tab.root);
-            }
-        }
+        self.fill_terminals(&mut |terminal| {
+            terminal.agent = None;
+            terminal.holds.clear();
+        });
     }
 
     /// The layout a seamless successor places.
@@ -2634,11 +2619,11 @@ impl RestoreManifest {
                     tab.root.retire_unhanded_terminals(&unhanded);
                 }
                 for tab in &mut window.tabs {
-                    tab.forget_local_ids(&|id| unhanded.contains(&id));
+                    tab.forget_local_ids(&|id| unhanded.binary_search(&id).is_ok());
                 }
             }
         }
-        if self.covers_exact_seamless_ids(expected) {
+        if self.seamless_terminal_ids().as_deref() == Some(handed.as_slice()) {
             Ok(self)
         } else {
             Err(self)
@@ -2659,6 +2644,7 @@ impl RestoreManifest {
     }
 
     /// True only when this layout names every authenticated inherited terminal exactly once and names no additional terminal.
+    #[cfg(test)]
     pub(crate) fn covers_exact_seamless_ids(&self, expected: &[u64]) -> bool {
         let mut expected = expected.to_vec();
         expected.sort_unstable();
@@ -2733,22 +2719,12 @@ impl RestoreManifest {
 
     /// The largest epoch a terminal leaf of the canonical tabs recorded for its shell's log, or `None`.
     pub(crate) fn max_log_ep(&self) -> Option<u32> {
-        fn walk(node: &RestoredSplitTree, max: &mut Option<u32>) {
-            match node {
-                RestoredSplitTree::Leaf {
-                    view: RestoredView::Terminal(terminal),
-                } => *max = (*max).max(terminal.log_ep),
-                RestoredSplitTree::Leaf { .. } => {}
-                RestoredSplitTree::Split { first, second, .. } => {
-                    walk(first, max);
-                    walk(second, max);
-                }
-            }
-        }
         let mut max = None;
         for window in &self.windows {
             for tab in &window.restored_tabs {
-                walk(&tab.root, &mut max);
+                tab.root.visit_terminals(&mut |terminal| {
+                    max = max.max(terminal.log_ep);
+                });
             }
         }
         max

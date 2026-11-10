@@ -477,9 +477,12 @@ LINES
             (mu_from=own), its kind's (class), or the 60 s the engine assumes before it has
             either (prior)
   machine   as_of_ms= age_ms= cpu=<busy>/<total> cores busy · available= · pressure= ·
-            build_slots=<free>/<n> free, <n> pending, <n> unknown, age_ms=: what the machine
-            can take now, at its own age. build_slots= reads the Trust toolchain's `build-slot`
-            records (~/.cache/build-slot); a free slot is an observation, not a reservation
+            build_slots=<free>/<n> confirmed free, <n> awaiting confirmation, <n> unknown,
+            age_ms=: paired observations of the Trust toolchain's `build-slot` records
+            (~/.cache/build-slot), not its admission queue. A first sighting or changed slot
+            awaits confirmation, not a queued build. Slot age is separate from CPU age;
+            reads are cached up to 60 s (5 s while a slot wait is armed). A confirmed free
+            slot is an observation, not a reservation; use `build-slot status` for its queue
   job       id= kind=shell|shell-bg|agent-call|nested|orphan consumer= [task=] [pgid=] exe=
             class= [wait=<what> [peer=<pid>]] [cpu_mc=] [quiet_ms= phi= mu_ms= mu_from=]
             verdict= [no_progress=1] [exit=] …

@@ -707,6 +707,7 @@ fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
 const fn nvml_busy(busy: Result<u8, Why>) -> linux::NvidiaCard {
     linux::NvidiaCard {
         busy,
+        power_mw: Err(Why::NotRead),
         name: None,
         unified: false,
     }
@@ -851,6 +852,7 @@ fn the_nvml_gpu_is_named_by_nvml() {
         assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
         linux::NvidiaCard {
             busy: Ok(7),
+            power_mw: Ok(31_500),
             name: Some("NVIDIA GB10".into()),
             unified: true,
         }
@@ -890,6 +892,44 @@ fn the_nvml_gpu_is_named_by_nvml() {
     );
     let laptop = nvidia_card("auto\n", "0\n");
     assert_eq!(gpu(&laptop, nvml_never), driver(None, Some(Why::NotRead)));
+}
+
+/// A4 §4 (N2, heat): an NVIDIA card's board power rides its reading as NVML gave it, or the
+/// reason it did not; a card NVML is not asked about carries its busy figure's reason. CONTROL: a
+/// card no power reader reads (amdgpu here) carries none, never a zero.
+#[test]
+fn an_nvidia_cards_power_is_nvmls() {
+    fn gb10(_: &str) -> linux::NvidiaCard {
+        linux::NvidiaCard {
+            busy: Ok(7),
+            power_mw: Ok(31_500),
+            name: Some("NVIDIA GB10".into()),
+            unified: true,
+        }
+    }
+    let power = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaRead| {
+        Root::new(root.path())
+            .with_nvidia(arm)
+            .gpu()
+            .expect("a GPU")
+            .power_mw
+    };
+    let spark = nvidia_card("auto\n", "1\n");
+    assert_eq!(power(&spark, gb10), Some(Ok(31_500)));
+    assert_eq!(power(&spark, linux::no_nvml), Some(Err(Why::NotRead)));
+    let laptop = nvidia_card("auto\n", "0\n");
+    assert_eq!(power(&laptop, nvml_never), Some(Err(Why::NotRead)));
+    let amd = tree(&[
+        ("sys/class/drm/card0/device/uevent", "DRIVER=amdgpu\n"),
+        (
+            "sys/class/drm/card0/device/power/runtime_status",
+            "active\n",
+        ),
+        ("sys/class/drm/card0/device/power/control", "on\n"),
+        ("sys/class/drm/card0/device/gpu_busy_percent", "37\n"),
+    ]);
+    let g = Root::new(amd.path()).gpu().expect("a GPU");
+    assert_eq!((g.device_pct, g.power_mw), (Some(37), None), "control");
 }
 
 #[test]

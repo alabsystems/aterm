@@ -75,23 +75,90 @@ pub trait StreamDial: Send + Sync + 'static {
     fn dial(&self) -> io::Result<Arc<dyn StreamLink>>;
 }
 
+/// Sized indirection so `LinkEnd` is a thin `Arc` pointer across `Conn`, `Sock`, and `Socket`.
+struct LinkSlot(Arc<dyn StreamLink>);
+
 /// A [`StreamLink`] as the `Read + Write` the frame layer speaks. Clones are ends of one stream.
-#[derive(Clone, Debug)]
-pub(crate) struct LinkEnd(pub(crate) Arc<dyn StreamLink>);
+#[derive(Clone)]
+pub(crate) struct LinkEnd(Arc<LinkSlot>);
+
+impl fmt::Debug for LinkEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LinkEnd")
+    }
+}
+
+impl LinkEnd {
+    pub(crate) fn new(link: Arc<dyn StreamLink>) -> Self {
+        Self(Arc::new(LinkSlot(link)))
+    }
+
+    pub(crate) fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.set_read_timeout(d)) {
+            Some(r) => r,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.set_write_timeout(d)) {
+            Some(r) => r,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.set_nonblocking(on)) {
+            Some(r) => r,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.shutdown(how)) {
+            Some(r) => r,
+            None => Ok(()),
+        }
+    }
+}
+
+pub(crate) fn dial_stream_link(dialer: &Arc<dyn StreamDial>) -> io::Result<LinkEnd> {
+    let link = match Some(()).map(|()| dialer.dial()) {
+        Some(r) => r?,
+        None => return Err(io::Error::other("unreachable dial state")),
+    };
+    Ok(LinkEnd::new(link))
+}
 
 impl Read for LinkEnd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.read(buf)) {
+            Some(r) => r,
+            None => Ok(0),
+        }
     }
 }
 
 impl Write for LinkEnd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.write(buf)) {
+            Some(r) => r,
+            None => Ok(0),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        let s = &self.0 .0;
+        match Some(()).map(|()| s.flush()) {
+            Some(r) => r,
+            None => Ok(()),
+        }
     }
 }
 

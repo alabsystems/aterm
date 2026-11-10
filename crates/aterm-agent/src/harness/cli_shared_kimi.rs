@@ -11,7 +11,8 @@ use aterm_json::Value;
 use aterm_uds::secret::Secret;
 
 const REPLY_MAX: usize = 256 * 1024;
-const PROVIDER: &str = "managed:kimi-code";
+/// Kimi Code's name for its managed provider in `config.toml`.
+pub(in crate::harness) const PROVIDER: &str = "managed:kimi-code";
 
 #[cfg(unix)]
 #[path = "cli_shared_kimi_refresh.rs"]
@@ -520,6 +521,42 @@ fn check_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a Kimi Code `config.toml` says of its managed provider's route, in its own words.
+pub(in crate::harness) struct ManagedRoute<'a> {
+    /// The provider's `type`.
+    pub kind: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    /// Whether it carries a key of its own: an `api_key` other than the empty one.
+    pub keyed: bool,
+    /// Where its login is kept (`oauth.storage`).
+    pub storage: Option<&'a str>,
+    /// The slot its login is kept in (`oauth.key`).
+    pub slot: Option<&'a str>,
+    pub oauth_host: Option<&'a str>,
+}
+
+impl ManagedRoute<'_> {
+    /// Whether this is `region`'s native route: Kimi's own provider at the region's endpoint,
+    /// with no key of its own, its login in a file in the region's slot, and the region's
+    /// issuer, which only the mainland route may leave unsaid.
+    fn is(&self, region: Region) -> bool {
+        self.kind == Some("kimi")
+            && self.base_url == Some(base(region))
+            && !self.keyed
+            && self.storage == Some("file")
+            && self.slot == Some(oauth_key(region).as_str())
+            && self.oauth_host.is_none_or(|host| host == issuer(region))
+            && (region != Region::Global || self.oauth_host.is_some())
+    }
+
+    /// The account system whose native route this is, where it is one's.
+    pub(in crate::harness) fn region(&self) -> Option<Region> {
+        [Region::Global, Region::MainlandCn]
+            .into_iter()
+            .find(|region| self.is(*region))
+    }
+}
+
 fn check_config(bytes: &[u8], region: Region) -> Result<(), String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "Kimi staged config is not UTF-8")?;
     let doc: aterm_toml::Value =
@@ -537,23 +574,26 @@ fn check_config(bytes: &[u8], region: Region) -> Result<(), String> {
         .and_then(aterm_toml::Value::as_table)
         .ok_or("Kimi staged config has no file credential binding")?;
     let auth_word = |key| oauth.get(key).and_then(aterm_toml::Value::as_str);
+    let route = ManagedRoute {
+        kind: word("type"),
+        base_url: word("base_url"),
+        keyed: provider
+            .get("api_key")
+            .is_some_and(|key| key.as_str() != Some("")),
+        storage: auth_word("storage"),
+        slot: auth_word("key"),
+        oauth_host: auth_word("oauth_host"),
+    };
     if fields
         .keys()
         .any(|key| !matches!(key.as_str(), "type" | "base_url" | "api_key" | "oauth"))
         || oauth
             .keys()
             .any(|key| !matches!(key.as_str(), "storage" | "key" | "oauth_host"))
-        || word("type") != Some("kimi")
-        || word("base_url") != Some(base(region))
-        || provider
-            .get("api_key")
-            .is_some_and(|key| key.as_str() != Some(""))
-        || auth_word("storage") != Some("file")
-        || auth_word("key") != Some(oauth_key(region).as_str())
         || oauth
             .get("oauth_host")
-            .is_some_and(|host| host.as_str() != Some(issuer(region)))
-        || (region == Region::Global && auth_word("oauth_host") != Some(issuer(region)))
+            .is_some_and(|host| host.as_str().is_none())
+        || !route.is(region)
     {
         return Err("Kimi staged provider differs from the approved native route".into());
     }

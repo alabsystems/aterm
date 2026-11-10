@@ -38,6 +38,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// A decoded reply, its broker timestamp and its optional delivery origin.
+type StampedResponse = (Response, Option<u64>, Option<(u64, u64)>);
+
 #[cfg(clean_islands)]
 #[path = "client_island.rs"]
 mod client_island;
@@ -679,6 +682,67 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         sealed.get_ref().set_read_timeout(None)?;
         sealed.get_ref().set_write_timeout(None)?;
         Ok(Client::from_stream(sealed).nowait_by(sealed_nonblocking))
+    }
+
+    /// Connect to a broker served by [`serve_tcp_certified`](crate::Broker::serve_tcp_certified)
+    /// using an external-authority `ACRT` certificate and an [`IdentitySigner`](astream_aead::IdentitySigner)
+    /// (in-memory [`IdentityKeypair`](astream_aead::IdentityKeypair) or out-of-process
+    /// [`SshAgentSigner`](astream_aead::SshAgentSigner) over `SSH_AUTH_SOCK`, Rung 9).
+    ///
+    /// Verifies the server's `CertRole::Host` certificate against `server_trust` (and
+    /// `expected_host_principal` when `Some`) before transmitting `client_cert`, and keys
+    /// the resulting [`SealedStream`](astream_aead::SealedStream) solely from ephemeral X25519.
+    pub fn connect_tcp_certified(
+        addr: impl ToSocketAddrs,
+        client_signer: astream_aead::IdentitySigner,
+        client_cert: astream_aead::IdentityCertificate,
+        server_trust: &astream_aead::CertTrustStore,
+        expected_host_principal: Option<&str>,
+    ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
+        let (client, _) = Self::connect_tcp_certified_verified(
+            addr,
+            client_signer,
+            client_cert,
+            server_trust,
+            expected_host_principal,
+        )?;
+        Ok(client)
+    }
+
+    /// Like [`Self::connect_tcp_certified`], returning both the connected [`Client`] and the
+    /// verified broker host certificate metadata ([`VerifiedPeerCert`](astream_aead::VerifiedPeerCert)).
+    pub fn connect_tcp_certified_verified(
+        addr: impl ToSocketAddrs,
+        client_signer: astream_aead::IdentitySigner,
+        client_cert: astream_aead::IdentityCertificate,
+        server_trust: &astream_aead::CertTrustStore,
+        expected_host_principal: Option<&str>,
+    ) -> io::Result<(
+        Client<astream_aead::SealedStream<TcpStream>>,
+        astream_aead::VerifiedPeerCert,
+    )> {
+        let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+            Err(_) => 0,
+        };
+        let stream = dial_tcp(addr, None)?;
+        let hs_timeout = KEY_AGREEMENT_TIMEOUT;
+        stream.set_read_timeout(Some(hs_timeout))?;
+        stream.set_write_timeout(Some(hs_timeout))?;
+        let (sealed, verified_host) = astream_aead::client_cert_handshake(
+            stream,
+            &client_signer,
+            &client_cert,
+            server_trust,
+            expected_host_principal,
+            now_ms,
+        )?;
+        sealed.get_ref().set_read_timeout(None)?;
+        sealed.get_ref().set_write_timeout(None)?;
+        Ok((
+            Client::from_stream(sealed).nowait_by(sealed_nonblocking),
+            verified_host,
+        ))
     }
 }
 
@@ -2762,7 +2826,7 @@ impl<S: Read + Write> Client<S> {
 
     /// [`read_response_with_bt`](Self::read_response_with_bt), and on a connection that asked
     /// for origins ([`origin_stamps`](Self::origin_stamps)) the one a `Delivery` carries.
-    fn read_response_stamped(&mut self) -> io::Result<(Response, Option<u64>, Option<(u64, u64)>)> {
+    fn read_response_stamped(&mut self) -> io::Result<StampedResponse> {
         self.in_step()?;
         let frame = if self.rx.is_empty() {
             read_frame(&mut self.stream)
@@ -4186,7 +4250,7 @@ enum Socket {
     Unix(UnixStream),
     Tcp(TcpStream),
     #[cfg(feature = "stream")]
-    Stream(Arc<dyn crate::stream_link::StreamLink>),
+    Stream(crate::stream_link::LinkEnd),
 }
 
 impl Socket {
@@ -4403,10 +4467,15 @@ pub fn connect(
 #[cfg(feature = "stream")]
 #[must_use]
 pub fn connect_stream(link: Arc<dyn crate::stream_link::StreamLink>) -> (AnyClient, Closer) {
+    connect_stream_end(crate::stream_link::LinkEnd::new(link))
+}
+
+#[cfg(feature = "stream")]
+pub(crate) fn connect_stream_end(end: crate::stream_link::LinkEnd) -> (AnyClient, Closer) {
     let closer = Closer {
-        socket: Arc::new(Socket::Stream(Arc::clone(&link))),
+        socket: Arc::new(Socket::Stream(end.clone())),
     };
-    erase(crate::stream_link::LinkEnd(link), closer)
+    erase(end, closer)
 }
 
 /// Box a connected stream behind [`AnyStream`], beside its closer. The box hides the

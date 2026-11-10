@@ -585,6 +585,14 @@ impl Row {
         self.identity_email.as_deref().or(self.email.as_deref())
     }
 
+    /// Whether this row says `email`: its expected identity address, its login `email` or its
+    /// `identity_email` answers to it.
+    fn says(&self, email: &str) -> bool {
+        self.expected_identity_email()
+            .is_some_and(|expected| email_matches(expected, email))
+            || self.matches_email(email)
+    }
+
     /// Whether `self` matches `email` by either its login `email` or its `identity_email`.
     #[must_use]
     pub fn matches_email(&self, email: &str) -> bool {
@@ -2101,24 +2109,9 @@ impl Roster {
     /// that answer to one address credit neither.
     #[must_use]
     pub fn row_answering(&self, email: &str) -> Option<&Row> {
-        let mut answering = self.rows.iter().filter(|row| {
-            row.expected_identity_email()
-                .is_some_and(|expected| email_matches(expected, email))
-                || row.matches_email(email)
-        });
+        let mut answering = self.rows.iter().filter(|row| row.says(email));
         let row = answering.next()?;
         answering.next().is_none().then_some(row)
-    }
-
-    fn rows_answering(&self, email: &str) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| {
-                row.expected_identity_email()
-                    .is_some_and(|expected| email_matches(expected, email))
-                    || row.matches_email(email)
-            })
-            .count()
     }
 }
 
@@ -2136,26 +2129,36 @@ pub fn reconcile<'a>(
     let Some(observed) = seen.seen() else {
         return Reconciled::Unread(believed);
     };
+    // An account system is a realm of its own (Kimi Code's regions): a row of another one
+    // does not answer to the address, whatever it says.
+    let in_realm = |row: &Row| match (observed.region, row.vendor.region) {
+        (Some(seen), Some(listed)) => seen == listed,
+        _ => true,
+    };
     if let Some(row) = believed
+        && in_realm(row)
         && row
             .expected_identity_email()
             .is_some_and(|expected| email_matches(expected, &observed.email))
     {
         return Reconciled::Agrees(row);
     }
-    match (
-        roster.rows_answering(&observed.email),
-        roster.row_answering(&observed.email),
-    ) {
+    let mut answering = roster
+        .rows
+        .iter()
+        .filter(|row| in_realm(row) && row.says(&observed.email));
+    match (answering.next(), answering.next()) {
         // A believed row that names no address cannot be contradicted by one: the belief
         // stands, unverified, until the row names its account.
-        (0, _) if believed.is_some_and(|row| row.expected_identity_email().is_none()) => {
+        (None, _) if believed.is_some_and(|row| row.expected_identity_email().is_none()) => {
             Reconciled::Unread(believed)
         }
-        (0, _) => Reconciled::Unlisted(observed.clone()),
-        (1, Some(row)) if believed.is_some_and(|b| b.label == row.label) => Reconciled::Agrees(row),
-        (1, Some(row)) => Reconciled::Other(row),
-        _ => Reconciled::Unread(believed),
+        (None, _) => Reconciled::Unlisted(observed.clone()),
+        (Some(row), None) if believed.is_some_and(|b| b.label == row.label) => {
+            Reconciled::Agrees(row)
+        }
+        (Some(row), None) => Reconciled::Other(row),
+        (Some(_), Some(_)) => Reconciled::Unread(believed),
     }
 }
 

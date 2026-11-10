@@ -189,7 +189,7 @@ impl Prepared {
         );
         command.env("ATERM_SDK_LEASE_V3", sdk::TARGET.to_string());
         command.env("CARGO_BUILD_JOBS", "1");
-        prelude.configured(&command)?;
+        prelude.configured(&mut command)?;
         held.validate(deadline)?;
         sdk.validate()?;
         check_gnu(&gnu, &request.gnu)?;

@@ -1881,6 +1881,36 @@ pub(crate) fn test_handle(local_id: u64) -> SessionHandle {
     handle_alive(local_id, None, -1)
 }
 
+/// Creates an `Alive` headless handle with explicit fixture identities.
+#[cfg(all(test, unix))]
+pub(crate) fn test_handle_identified(
+    local_id: u64,
+    sid: SessionId,
+    nonce: LaunchNonce,
+    epochs: Arc<crate::session_log::Epochs>,
+    at: aterm_slog::Stamp,
+) -> SessionHandle {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let handle = handle_ran_identified(
+        local_id,
+        None,
+        term,
+        aterm_session::sink::SinkWriter::new(-1),
+        Arc::default(),
+        sid,
+        nonce,
+    );
+    let mut slog = crate::session_log::SessionLog::starting(epochs, at);
+    slog.set_clock(crate::session_log::Clock::reading(move || at));
+    *handle
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .slog_mut() = slog;
+    handle
+}
+
 /// Creates a test [`SessionHandle`] wired to a caller-supplied raw PTY master fd.
 #[cfg(test)]
 pub(crate) fn test_handle_on(local_id: u64, master: i32) -> SessionHandle {
@@ -1955,10 +1985,23 @@ fn handle_ran(
     sink: aterm_session::sink::SinkWriter,
     ran: Arc<crate::command_ran::Ran>,
 ) -> SessionHandle {
-    use aterm_session::EdgeTable;
-    crate::prime_test_timing();
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
+    handle_ran_identified(local_id, parent, term, sink, ran, sid, nonce)
+}
+
+#[cfg(test)]
+fn handle_ran_identified(
+    local_id: u64,
+    parent: Option<SessionId>,
+    term: Arc<Mutex<Terminal>>,
+    sink: aterm_session::sink::SinkWriter,
+    ran: Arc<crate::command_ran::Ran>,
+    sid: SessionId,
+    nonce: LaunchNonce,
+) -> SessionHandle {
+    use aterm_session::EdgeTable;
+    crate::prime_test_timing();
     let master = sink.master();
     let observed = crate::session_watch::Observed::default();
     observed.watchers.bind_frame(&term);

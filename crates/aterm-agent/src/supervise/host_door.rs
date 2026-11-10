@@ -633,6 +633,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// THE SESSION'S ACCOUNT, AS ITS OWN LOGIN FILE NAMES IT, told at a turn-end point
+    /// (`docs/DESIGN-account-discovery-2026-11-09.md`): the host reads the file and makes the
+    /// sighting that is due. An observation alone: it advises nothing and changes nothing of
+    /// the session, so it is told whatever the account switches say, whichever programs move
+    /// between accounts ([`Self::account`] is asked only of those), and beside or behind another
+    /// supervisor, whose session runs on an account all the same.
+    fn account_seen(&self) {}
+
     /// The route move this host offers the session's Claude Code at the point just asked
     /// ([`Self::account`]): onto its account's vault token now in use on this Mac, or back onto
     /// its row's stored login from a token that cannot serve

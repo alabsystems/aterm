@@ -239,8 +239,8 @@ fn ditto_failure(what: &str, status: std::process::ExitStatus, stderr: &str) -> 
     }
 }
 
-/// A staging unpack's `ditto` failure ([`ditto_failure`]).
-pub(crate) fn unpack_failure(
+/// A bundle unpack or copy's `ditto` failure, distinguishing local space exhaustion.
+pub(crate) fn bundle_transfer_failure(
     dir: &Path,
     what: &str,
     status: std::process::ExitStatus,
@@ -260,7 +260,7 @@ pub(crate) fn unpack_failure(
     ));
     if line.contains("Disc quota exceeded") {
         return crate::verify::mark_passing(format!(
-            "this user's disk quota ran out while unpacking the update into {}; \
+            "this user's disk quota ran out while preparing the update at {}; \
              {FREE_SPACE_REMEDY}",
             dir.display()
         ));
@@ -269,7 +269,7 @@ pub(crate) fn unpack_failure(
         format!(" ({} MiB free there)", free.div_ceil(1024 * 1024))
     });
     crate::verify::mark_passing(format!(
-        "the disk holding {} filled while unpacking the update{room}; {FREE_SPACE_REMEDY}",
+        "the disk holding {} filled while preparing the update{room}; {FREE_SPACE_REMEDY}",
         dir.display()
     ))
 }
@@ -1595,6 +1595,15 @@ fn finish_swap_preparation(
     }
 }
 
+fn fixed_path_write_refusal(operation: &str, error: &std::io::Error) -> String {
+    let message = format!("{operation}: {error}");
+    if bundle::write_error_is_passing(error) {
+        verify::mark_passing(message)
+    } else {
+        message
+    }
+}
+
 fn prepare_fixed_swap_candidate(
     staging: &Staging,
     installed: &Path,
@@ -1607,12 +1616,13 @@ fn prepare_fixed_swap_candidate(
     UnprovenCandidate::check(staging, &fixed, ProbeClock::now())?;
     clear_kept_predecessor(staging);
     remove_path_no_follow(&fixed)
-        .map_err(|error| format!("remove stale fixed rollback: {error}"))?;
+        .map_err(|error| fixed_path_write_refusal("remove stale fixed rollback", &error))?;
 
     let moved_from_stage = same_volume(staged, installed);
     if moved_from_stage {
-        std::fs::rename(staged, &fixed)
-            .map_err(|error| format!("move verified stage to fixed swap path: {error}"))?;
+        std::fs::rename(staged, &fixed).map_err(|error| {
+            fixed_path_write_refusal("move verified stage to fixed swap path", &error)
+        })?;
     } else {
         let copy_started = std::time::Instant::now();
         let (status, stderr) = ditto_bounded(
@@ -1625,7 +1635,8 @@ fn prepare_fixed_swap_candidate(
         })?;
         if !status.success() {
             let _ = remove_path_no_follow(&fixed);
-            return Err(ditto_failure(
+            return Err(bundle_transfer_failure(
+                installed,
                 "ditto to fixed swap path failed",
                 status,
                 &stderr,
@@ -3200,7 +3211,7 @@ pub fn stage_from_dmg(
     })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(unpack_failure(
+        return Err(bundle_transfer_failure(
             &staging.staged_dir(),
             "ditto extract failed",
             status,
@@ -3560,7 +3571,7 @@ pub fn stage_from_zip(
     })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&extract);
-        return Err(unpack_failure(
+        return Err(bundle_transfer_failure(
             &staging.staged_dir(),
             "ditto zip extract failed",
             status,

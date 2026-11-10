@@ -1011,6 +1011,12 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
     wait_network(&bg_obs, "background runtime owns observation", |state| {
         state.via_local_process.is_none() && state.visibility == Visibility::Active
     });
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        crate::network_state::directory(&config_1),
+        aterm_uds::quiet_state::destination(&config_1.with_file_name("network-state")),
+        "window priority must follow the directory actually migrated by the background owner",
+    );
 
     // A window claims priority and takes the transport and observation.
     let win_progress = Attachment::new(port);

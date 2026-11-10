@@ -12596,6 +12596,9 @@ mod heartbeat_descriptor;
 #[path = "fleet_member_tests/book_fallback.rs"]
 mod book_fallback;
 
+#[path = "fleet_member_tests/heartbeat_reads.rs"]
+mod heartbeat_reads;
+
 /// Every failure names its kind as one token of [`REASONS`], and every token but the reader's
 /// own `gone` names some failure; two failures of one kind at two addresses share the token
 /// though their words differ, which is what lets a reader group by it.

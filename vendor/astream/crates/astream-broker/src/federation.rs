@@ -203,7 +203,9 @@ impl FederationEndpoint {
                 self.connect_timeout,
             )?,
             #[cfg(feature = "stream")]
-            FederationWire::Stream(dialer) => crate::client::connect_stream(dialer.dial()?),
+            FederationWire::Stream(dialer) => {
+                crate::client::connect_stream_end(crate::stream_link::dial_stream_link(dialer)?)
+            }
         };
         if let Some(io_to) = self.io_timeout {
             closer.set_read_timeout(Some(io_to))?;
@@ -877,11 +879,21 @@ impl FederationBridge {
 
     /// Pipeline `records` onto `dest` in bursts of at most `FEDERATION_BATCH_CAP`, gathering the
     /// answers.
-    fn mirror_all(&mut self, mut records: Vec<Staged>) -> Result<Answers, FederationError> {
+    fn mirror_all(&mut self, records: Vec<Staged>) -> Result<Answers, FederationError> {
         let mut all = Answers::default();
-        while !records.is_empty() {
-            let rest = records.split_off(records.len().min(FEDERATION_BATCH_CAP));
-            let answers = self.mirror(std::mem::replace(&mut records, rest))?;
+        let mut it = records.into_iter();
+        loop {
+            let mut batch = Vec::with_capacity(FEDERATION_BATCH_CAP);
+            for _ in 0..FEDERATION_BATCH_CAP {
+                match it.next() {
+                    Some(rec) => batch.push(rec),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let answers = self.mirror(batch)?;
             all.links.extend(answers.links);
             all.deduped = all.deduped.saturating_add(answers.deduped);
             all.refused = all.refused.saturating_add(answers.refused);
@@ -1056,13 +1068,14 @@ impl FederationBridge {
     ) -> Result<(), FederationError> {
         let mut taken = std::mem::take(burst);
         if !taken.gaps.is_empty() {
-            on_burst(&FederationReport {
+            let gap_report = FederationReport {
                 held: held.count.saturating_add(held.past_count),
                 committed_upto: held.committed(),
                 next_cursor: self.cursor,
                 gaps: std::mem::take(&mut taken.gaps),
                 ..FederationReport::default()
-            });
+            };
+            let _ = Some(()).map(|()| on_burst(&gap_report));
         }
         if taken.fetched == 0 && held.is_empty() {
             return Ok(());
@@ -1120,7 +1133,7 @@ impl FederationBridge {
                 held.resumes = Some(bound);
             }
         }
-        on_burst(&FederationReport {
+        let burst_report = FederationReport {
             fetched: taken.fetched,
             mirrored: answered.links.len(),
             deduped: answered.deduped,
@@ -1131,7 +1144,8 @@ impl FederationBridge {
             next_cursor: self.cursor,
             links: answered.links,
             gaps: Vec::new(),
-        });
+        };
+        let _ = Some(()).map(|()| on_burst(&burst_report));
         match held.past {
             Some(from) if held.queues.is_empty() => Err(FederationError::HeldBack { from }),
             _ => Ok(()),
@@ -1210,7 +1224,12 @@ impl Held {
 
     /// Take the first record of each origin's queue, to offer again.
     fn probes(&mut self) -> Vec<Staged> {
-        let mut probes = Vec::with_capacity(self.queues.len());
+        let cap = self.queues.len();
+        let mut probes = if cap <= 65_536 {
+            Vec::with_capacity(cap)
+        } else {
+            Vec::new()
+        };
         for queue in self.queues.values_mut() {
             if let Some(rec) = queue.pop_front() {
                 self.count = self.count.saturating_sub(1);
@@ -2160,7 +2179,7 @@ impl FederationRunner {
     /// `close` is for good. `on_burst` sees `(group, report)`, from those threads.
     pub fn run(
         &mut self,
-        on_burst: &(dyn Fn(&str, &FederationReport) + Sync),
+        on_burst: &(impl Fn(&str, &FederationReport) + Sync + ?Sized),
     ) -> Result<(), FederationError> {
         let closer = self.closer();
         for bridge in &closer.bridges {

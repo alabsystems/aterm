@@ -496,12 +496,16 @@ fn encode_carry(carry: Carry) -> Option<aterm_json::Value> {
     Some(value)
 }
 
-/// Encodes the release fixture's live producer root for seamless handoff tests.
+/// Encodes one explicit producer root for a release fixture. Product carry
+/// still obtains both identities from the running kernel in [`carry`].
 #[cfg(all(test, unix))]
-pub(crate) fn live_fixture_carry(session: &str) -> aterm_json::Value {
-    let root = key(std::process::id()).expect("fixture producer has a live kernel identity");
+pub(crate) fn fixture_carry(
+    session: &str,
+    fixture_boot: [u8; 16],
+    root: ProcessKey,
+) -> aterm_json::Value {
     encode_carry(Carry {
-        boot: boot().expect("fixture producer has a boot identity"),
+        boot: fixture_boot,
         jobs: vec![CarriedJob {
             pid: root.pid,
             start: root.start,
@@ -512,7 +516,7 @@ pub(crate) fn live_fixture_carry(session: &str) -> aterm_json::Value {
             members: vec![(root.pid, root.start)],
         }],
     })
-    .expect("live fixture identity fits the handoff format")
+    .expect("fixture identity fits the handoff format")
 }
 
 /// Restores carried delegated jobs matching the current boot and live process identities.

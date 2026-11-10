@@ -2537,7 +2537,8 @@ fn each_entry_that_stays_is_named_with_the_reason_the_removal_judged() {
     );
 }
 
-/// `path`'s identity as an identified removal is given it: its volume and inode.
+/// `path`'s identity as an identified removal is given it, as a receipt records it: its device
+/// number, its inode and its volume's UUID (where the volume has one).
 #[cfg(unix)]
 fn identity_of(path: &Path) -> super::super::registered::Identity {
     use std::os::unix::fs::MetadataExt as _;
@@ -2545,6 +2546,7 @@ fn identity_of(path: &Path) -> super::super::registered::Identity {
     super::super::registered::Identity {
         device: meta.dev(),
         inode: meta.ino(),
+        volume: super::super::registered::volume::at(aterm_dirfd::CWD, path).unwrap(),
     }
 }
 

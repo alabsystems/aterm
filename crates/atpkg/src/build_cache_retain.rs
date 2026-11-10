@@ -138,7 +138,7 @@ pub fn retain(home: &Path, root: &Path) -> Result<PathBuf, String> {
                     marker.receipt.removal_fence.as_ref().is_some_and(|fence| {
                         fence.original_schema.is_none()
                             && marker.receipt.root == root
-                            && marker.receipt.identity == captured
+                            && marker.receipt.identity.names(&captured)
                     })
                 })
             {
@@ -164,8 +164,12 @@ pub fn retain(home: &Path, root: &Path) -> Result<PathBuf, String> {
         }
         Err(_) => return Err("cache receipt cannot be inspected".into()),
     };
-    if receipt.identity != captured || super::identity(root).as_ref() != Some(&captured) {
+    if !receipt.identity.names(&captured) || super::identity(root).as_ref() != Some(&captured) {
         return Err("cache root was replaced during retention".into());
+    }
+    // A record that keeps no volume UUID gains this one's, as it is rewritten here anyway.
+    if let Some(witnessed) = receipt.identity.witnessed(&captured) {
+        receipt.identity = witnessed;
     }
     receipt.schema = 4;
     receipt.retained = true;
@@ -187,7 +191,7 @@ pub fn retain(home: &Path, root: &Path) -> Result<PathBuf, String> {
 
 #[cfg(unix)]
 fn bound(home: &Path, actual: &Path, captured: &super::Identity, receipt: &Receipt) -> bool {
-    if &receipt.identity != captured {
+    if !receipt.identity.names(captured) {
         return false;
     }
     if receipt.root == actual && super::same(home, receipt) {
@@ -287,7 +291,8 @@ pub(in crate::build_cache) fn kept_by(path: &Path) -> Option<&Path> {
         match std::fs::symlink_metadata(&marker) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Ok(_) => !super::read(&marker).is_some_and(|receipt| {
-                !receipt.retained && super::identity(at).as_ref() == Some(&receipt.identity)
+                !receipt.retained
+                    && super::identity(at).is_some_and(|now| receipt.identity.names(&now))
             }),
             Err(_) => true,
         }
@@ -325,9 +330,20 @@ pub(in crate::build_cache) fn allows_at(fd: impl std::os::fd::AsFd) -> bool {
         Ok(Some(marker)) => marker.receipt,
         Err(()) => return false,
     };
+    // The folder's volume is read through it only where the marker keeps a volume's UUID.
+    let now = if receipt.identity.volume.is_some() {
+        super::Identity::held(root)
+    } else {
+        Some(super::Identity::unrecorded(
+            identity.st_dev,
+            identity.st_ino,
+        ))
+    };
     !receipt.retained
-        && receipt.identity.device == identity.st_dev
-        && receipt.identity.inode == identity.st_ino
+        && now.is_some_and(|now| {
+            (now.device, now.inode) == (identity.st_dev, identity.st_ino)
+                && receipt.identity.names(&now)
+        })
         && super::private(identity.st_uid, identity.st_mode, super::euid())
 }
 
@@ -415,10 +431,7 @@ fn read_marker(root: impl std::os::fd::AsFd) -> Result<Option<HeldMarker>, ()> {
     }
     let receipt = super::decode(&bytes).ok_or(())?;
     Ok(Some(HeldMarker {
-        identity: super::Identity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        },
+        identity: super::Identity::unrecorded(metadata.dev(), metadata.ino()),
         bytes,
         receipt,
     }))
@@ -467,14 +480,15 @@ impl WalkFence {
         if held.st_uid != super::euid() {
             return None;
         }
-        let identity = super::Identity {
-            device: held.st_dev,
-            inode: held.st_ino,
-        };
+        // Recorded in the keep this publishes, so with its volume.
+        let identity = super::Identity::held(root)?;
+        if (identity.device, identity.inode) != (held.st_dev, held.st_ino) {
+            return None;
+        }
         let previous = read_marker(root).ok()?.map(|marker| marker.receipt);
         if previous
             .as_ref()
-            .is_some_and(|receipt| receipt.retained || receipt.identity != identity)
+            .is_some_and(|receipt| receipt.retained || !receipt.identity.names(&identity))
         {
             return None;
         }

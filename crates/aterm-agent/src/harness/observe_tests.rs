@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code observer's tests (`docs/DESIGN-account-discovery-2026-11-09.md`, step 1): one
-//! fixture home per selection the profile reader makes, an empty environment, the token route
-//! and a signed-out file; and the journal notes a tab's sightings make.
+//! The observers' tests (`docs/DESIGN-account-discovery-2026-11-09.md`, steps 1 to 3). Claude
+//! Code's: one fixture home per selection the profile reader makes, an empty environment, the
+//! token route and a signed-out file. Codex's, agy's, Muse Code's, Grok Build's and Kimi
+//! Code's: one fixture home each, by the file the process's own environment selects, and each
+//! case that names no account. And the journal notes a tab's sightings make. Every fixture is made up: no file here holds a
+//! credential.
 
 use super::*;
 use crate::harness::accounts::{ProcessLogin, Roster};
@@ -218,9 +221,10 @@ fn keyer(_realm: &str, email: &str) -> Option<String> {
 
 fn unicorn_seen() -> Observation {
     Observation::Seen(Observed {
-        cli: Cli::Claude,
+        cli: Cli::Claude.into(),
         email: UNICORN.to_owned(),
         key: None,
+        region: None,
         src: ObservedSrc::Profile,
         path: PathBuf::from("/home/someone/.claude.json"),
         mtime: Some(1),
@@ -396,4 +400,884 @@ fn an_unlisted_session_ends_when_the_tab_moves_or_ends() {
         assert_eq!(ended.login.unwrap().state, LoginState::Idle);
         assert_eq!(kept, Sightings::default(), "everything kept is forgotten");
     });
+}
+
+const ACCOUNT_ID: &str = "acct-fixture-0001";
+const USER_ID: &str = "user-fixture-0001";
+
+/// An unsigned stand-in for a ChatGPT token: a header, the claims and a signature word, which
+/// is all the reader decodes. It authenticates nothing.
+fn claims_token(email: &str) -> String {
+    let part = |bytes: &[u8]| {
+        aterm_codec::base64::encode(bytes)
+            .unwrap()
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    let claims = format!(
+        r#"{{"email":"{email}","https://api.openai.com/auth":{{"chatgpt_account_id":"{ACCOUNT_ID}","chatgpt_user_id":"{USER_ID}"}}}}"#
+    );
+    format!(
+        "{}.{}.fixture",
+        part(br#"{"alg":"none"}"#),
+        part(claims.as_bytes())
+    )
+}
+
+/// A Codex `auth.json` whose tokens' claims name `email`.
+fn codex_auth(email: &str) -> String {
+    let token = claims_token(email);
+    format!(
+        r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"{token}","access_token":"{token}"}}}}"#
+    )
+}
+
+fn process<'a>(env: &'a [String], cwd: Option<&'a Path>) -> Process<'a> {
+    Process {
+        argv: &[],
+        env,
+        cwd,
+    }
+}
+
+fn codex_who(env: &[String]) -> ProcessLogin {
+    ProcessLogin::of_env_for(Cli::Codex, env.iter().filter_map(|kv| kv.split_once('=')))
+}
+
+/// Codex's login is the one in the `CODEX_HOME` its own exec environment names: the default
+/// home's file is another account's. With no `CODEX_HOME` it is `~/.codex`'s.
+/// NEGATIVE CONTROL: with `codex` passing `None` for `CODEX_HOME`, the default home's bronto is
+/// read under the variable: `` left: "brontosaurus…" right: "unicorn…" ``.
+#[test]
+fn codex_home_comes_from_the_exec_env() {
+    let home = home("codex-home");
+    write(&home.path().join(".codex/auth.json"), &codex_auth(BRONTO));
+    let other = home.path().join("elsewhere");
+    write(&other.join("auth.json"), &codex_auth(UNICORN));
+    let moved = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("CODEX_HOME", other.to_str().unwrap()),
+    ]);
+    let got = codex(&process(&moved, None), home.path(), &codex_who(&moved));
+    let got = seen(&got);
+    assert_eq!(got.cli, ObservedCli::Pool(Cli::Codex));
+    assert_eq!(got.email, UNICORN);
+    assert_eq!(got.key, AccountKey::codex(ACCOUNT_ID, USER_ID));
+    assert!(got.key.is_some());
+    assert_eq!(got.src, ObservedSrc::AuthFile);
+    assert_eq!(got.path, other.join("auth.json"));
+    assert!(got.mtime.is_some());
+    let default = env(&[("HOME", home.path().to_str().unwrap())]);
+    let got = codex(&process(&default, None), home.path(), &codex_who(&default));
+    assert_eq!(seen(&got).email, BRONTO);
+    assert_eq!(seen(&got).path, home.path().join(".codex/auth.json"));
+    // A kernel environment with no `HOME` reads the user's own home.
+    let got = codex(&process(&[], None), home.path(), &codex_who(&[]));
+    assert_eq!(seen(&got).email, BRONTO);
+}
+
+/// A pooled Codex tab's login is the file its `CODEX_AUTH_PATH` names, whatever its home's
+/// own `auth.json` says; [`pooled`] reaches the same observer.
+/// NEGATIVE CONTROL: with `codex` ignoring `who.login`, the home's bronto is read: `` left:
+/// "brontosaurus…" right: "unicorn…" ``.
+#[test]
+fn codex_auth_path_names_the_login_file() {
+    let home = home("codex-path");
+    write(&home.path().join(".codex/auth.json"), &codex_auth(BRONTO));
+    let login = home.path().join("logins/work-2");
+    write(&login.join("auth.json"), &codex_auth(UNICORN));
+    let env = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("CODEX_AUTH_PATH", login.join("auth.json").to_str().unwrap()),
+    ]);
+    let who = codex_who(&env);
+    let got = pooled(Cli::Codex, &process(&env, None), home.path(), &who, None);
+    assert_eq!(seen(&got).email, UNICORN);
+    assert_eq!(seen(&got).path, login.join("auth.json"));
+}
+
+/// An `auth.json` that names no ChatGPT account (an API-key login) is signed out, a home with
+/// no file is unread, and so is a process off its stored login, whatever the file says.
+/// NEGATIVE CONTROL: with `codex` reading on an outside route, the file's unicorn is seen: ``
+/// left: Seen(…) right: Unread ``.
+#[test]
+fn codex_without_an_account_is_not_an_account() {
+    let home = home("codex-none");
+    let env = env(&[("HOME", home.path().to_str().unwrap())]);
+    let who = codex_who(&env);
+    assert_eq!(
+        codex(&process(&env, None), home.path(), &who),
+        Observation::Unread
+    );
+    let path = home.path().join(".codex/auth.json");
+    write(&path, r#"{"auth_mode":"apikey"}"#);
+    assert_eq!(
+        codex(&process(&env, None), home.path(), &who),
+        Observation::SignedOut { path: path.clone() }
+    );
+    write(&path, &codex_auth(UNICORN));
+    let outside = ProcessLogin {
+        route: AuthRoute::Outside,
+        ..who
+    };
+    assert_eq!(
+        codex(&process(&env, None), home.path(), &outside),
+        Observation::Unread
+    );
+}
+
+fn agy_log(email: &str, method: &str) -> String {
+    format!("I1109 12:00:00 auth.go:1] applyAuthResult: email={email}, authMethod={method}\n")
+}
+
+/// agy's login is the consumer account its CLI log's latest sign-in names, in the
+/// configuration directory its own environment selects.
+/// NEGATIVE CONTROL: with `agy` reading the first record of the log, the earlier bronto is
+/// read: `` left: "brontosaurus…" right: "unicorn…" ``.
+#[test]
+fn agy_log_names_the_consumer_account() {
+    let home = home("agy-log");
+    let config = home.path().join("agy-config");
+    let log = config.join("cli.log");
+    write(
+        &log,
+        &format!(
+            "{}{}",
+            agy_log(BRONTO, "consumer"),
+            agy_log(UNICORN, "consumer")
+        ),
+    );
+    let env = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("AGY_CLI_CONFIG_DIR", config.to_str().unwrap()),
+    ]);
+    let got = agy(&process(&env, None), home.path());
+    let got = seen(&got);
+    assert_eq!(got.cli, ObservedCli::Pool(Cli::Agy));
+    assert_eq!(got.email, UNICORN);
+    assert_eq!(got.key, None);
+    assert_eq!(got.src, ObservedSrc::CliLog);
+    assert_eq!(got.path, log);
+    // A latest sign-in by another method names no consumer account; no log names none.
+    write(&log, &agy_log(UNICORN, "gemini_api_key"));
+    assert_eq!(agy(&process(&env, None), home.path()), Observation::Unread);
+    std::fs::remove_file(&log).unwrap();
+    assert_eq!(agy(&process(&env, None), home.path()), Observation::Unread);
+}
+
+/// Behind a gateway agy runs on no account of its own: the observation says the route and
+/// names no account, whatever its log's last consumer sign-in said.
+/// NEGATIVE CONTROL: with `agy_read` not checking the gateway variable, the log's unicorn is
+/// seen: `` left: Seen(…) right: Routed { route: Gateway } ``.
+#[test]
+fn agy_behind_a_gateway_names_no_account() {
+    let home = home("agy-gateway");
+    let config = home.path().join("agy-config");
+    write(&config.join("cli.log"), &agy_log(UNICORN, "consumer"));
+    let env = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("AGY_CLI_CONFIG_DIR", config.to_str().unwrap()),
+        ("AGY_LLM_GATEWAY_URL", "http://127.0.0.1:1/v1"),
+    ]);
+    let got = agy(&process(&env, None), home.path());
+    assert_eq!(
+        got,
+        Observation::Routed {
+            route: ObservedRoute::Gateway
+        }
+    );
+    assert_eq!(got.email(), None);
+    assert_eq!(ObservedRoute::Gateway.word(), "gateway");
+}
+
+fn muse_auth(email: &str, mechanism: &str) -> String {
+    format!(r#"{{"providers":{{"meta":{{"mechanism":"{mechanism}","user_email":"{email}"}}}}}}"#)
+}
+
+/// Muse Code's login is Meta's OAuth account its `auth.json` names, under `XDG_CONFIG_HOME`
+/// where its environment sets one; with `META_API_KEY` set the process runs on no stored login
+/// and is unread.
+/// NEGATIVE CONTROL: with `muse_login_for` not checking `META_API_KEY`, the file's unicorn is
+/// seen under the key: `` left: Seen(…) right: Unread ``.
+#[test]
+fn muse_with_and_without_an_api_key() {
+    let home = home("muse");
+    let path = home.path().join(".config/muse/auth.json");
+    write(&path, &muse_auth(UNICORN, "oauth"));
+    let stored = env(&[("HOME", home.path().to_str().unwrap())]);
+    let got = muse(&process(&stored, None), home.path());
+    let got = seen(&got);
+    assert_eq!(got.cli, ObservedCli::Muse);
+    assert_eq!(got.email, UNICORN);
+    assert_eq!(got.src, ObservedSrc::AuthFile);
+    assert_eq!(got.path, path);
+    let keyed = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("META_API_KEY", "fixture"),
+    ]);
+    assert_eq!(
+        muse(&process(&keyed, None), home.path()),
+        Observation::Unread
+    );
+    let xdg = home.path().join("xdg");
+    write(&xdg.join("muse/auth.json"), &muse_auth(BRONTO, "oauth"));
+    let moved = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+    ]);
+    assert_eq!(
+        seen(&muse(&process(&moved, None), home.path())).email,
+        BRONTO
+    );
+}
+
+/// A Muse `auth.json` that names no OAuth account is signed out; no file is unread.
+/// NEGATIVE CONTROL: with `muse_login_for` answering `Unread` for a file with no account, the
+/// signed-out file is unread: `` left: Unread right: SignedOut { … } ``.
+#[test]
+fn muse_without_an_account_is_not_an_account() {
+    let home = home("muse-none");
+    let env = env(&[("HOME", home.path().to_str().unwrap())]);
+    assert_eq!(muse(&process(&env, None), home.path()), Observation::Unread);
+    let path = home.path().join(".config/muse/auth.json");
+    write(&path, &muse_auth(UNICORN, "api_key"));
+    assert_eq!(
+        muse(&process(&env, None), home.path()),
+        Observation::SignedOut { path }
+    );
+}
+
+fn realm_keyer(realm: &str, email: &str) -> Option<String> {
+    match (realm, email) {
+        ("codex", UNICORN) => Some("ac-00000000000000c1".to_owned()),
+        ("codex", BRONTO) => Some("ac-00000000000000c2".to_owned()),
+        ("google", UNICORN) => Some("ac-00000000000000d1".to_owned()),
+        ("google", BRONTO) => Some("ac-00000000000000d2".to_owned()),
+        ("meta", UNICORN) => Some("ac-00000000000000e1".to_owned()),
+        ("kimi:global", UNICORN) => Some("ac-00000000000000f1".to_owned()),
+        ("kimi:mainland-cn", UNICORN) => Some("ac-00000000000000f2".to_owned()),
+        _ => None,
+    }
+}
+
+fn observed_of(cli: ObservedCli, email: &str, src: ObservedSrc) -> Observation {
+    Observation::Seen(Observed {
+        cli,
+        email: email.to_owned(),
+        key: None,
+        region: None,
+        src,
+        path: PathBuf::from("/home/someone/login-file"),
+        mtime: Some(1),
+    })
+}
+
+fn pool_m22(cli: Cli) -> Roster {
+    Roster::parse_for(
+        cli,
+        &format!("[[account]]\nlabel = \"m22\"\nclass = \"dedicated\"\nemail = \"{BRONTO}\"\n"),
+    )
+    .unwrap()
+}
+
+/// The same marks for a pooled Codex tab as for Claude Code's: its sighting keyed by the
+/// observed account under Codex's realm, one `wrong-account` against the believed row, and the
+/// login handed to the registry under that realm.
+/// NEGATIVE CONTROL: with `sighting` keying by `claims_of(Cli::Claude, …)`, no `codex` key is
+/// found and no note is made: `` left: [] right: ["seen", "wrong-account", "session-start"] ``.
+#[test]
+fn a_codex_tab_makes_the_same_marks() {
+    crate::harness::journal::with_keyer(realm_keyer, || {
+        let roster = pool_m22(Cli::Codex);
+        let tab = Tab::of("machine", "s-c0de");
+        let mut kept = Sightings::default();
+        let seen = observed_of(Cli::Codex.into(), UNICORN, ObservedSrc::AuthFile);
+        let first = sighting(&roster, &stored(), &seen, &mut kept, tab, "codex", 1_000);
+        assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
+        assert_eq!(first.notes[0].cli, "codex");
+        assert_eq!(first.notes[0].src, "auth-file");
+        assert_eq!(
+            first.notes[1].account.unwrap().as_str(),
+            "ac-00000000000000c1"
+        );
+        assert_eq!(first.notes[1].to.unwrap().as_str(), "ac-00000000000000c2");
+        let login = first.login.unwrap();
+        assert_eq!(
+            (login.cli.id(), login.realm.as_str(), login.email.as_str()),
+            ("codex", "codex", UNICORN)
+        );
+        // The row's own account agrees: its sighting, and nothing against the row.
+        let mut kept = Sightings::default();
+        let agrees = observed_of(Cli::Codex.into(), BRONTO, ObservedSrc::AuthFile);
+        let first = sighting(&roster, &stored(), &agrees, &mut kept, tab, "codex", 1_000);
+        assert_eq!(kinds(&first), ["seen"]);
+    });
+}
+
+/// agy's account is keyed under its provider's realm, `google`, as its provider reads key it:
+/// the claims ring's `agy` is no realm the registry keys an account by. A disagreement names
+/// the believed row under that realm too.
+/// NEGATIVE CONTROL: with `observed_claims` answering `claims_of` for agy, the realm is `agy`
+/// and no key is found: `` left: [] right: ["seen", "wrong-account", "session-start"] ``.
+#[test]
+fn an_agy_tab_is_keyed_by_its_providers_realm() {
+    crate::harness::journal::with_keyer(realm_keyer, || {
+        let roster = pool_m22(Cli::Agy);
+        let tab = Tab::of("machine", "s-a61a");
+        let mut kept = Sightings::default();
+        let seen = observed_of(Cli::Agy.into(), UNICORN, ObservedSrc::CliLog);
+        let first = sighting(&roster, &stored(), &seen, &mut kept, tab, "agy", 1_000);
+        assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
+        assert_eq!(first.notes[0].cli, "agy");
+        assert_eq!(first.notes[0].src, "cli-log");
+        assert_eq!(
+            first.notes[0].account.unwrap().as_str(),
+            "ac-00000000000000d1"
+        );
+        assert_eq!(first.notes[1].to.unwrap().as_str(), "ac-00000000000000d2");
+        assert_eq!(first.login.unwrap().realm, "google");
+    });
+}
+
+/// A Muse Code tab has no roster and so no belief: its sighting and its session's start are
+/// keyed by the observed account under `meta`, nothing is called a wrong account, and its end
+/// closes the session and hands the login back.
+/// NEGATIVE CONTROL: with `sighting_unpooled` passing a roster that lists another account, a
+/// `wrong-account` is written: `` left: ["seen", "wrong-account", "session-start"] right:
+/// ["seen", "session-start"] ``.
+#[test]
+fn a_muse_tab_is_its_observed_account_alone() {
+    crate::harness::journal::with_keyer(realm_keyer, || {
+        let tab = Tab::of("machine", "s-0b5e");
+        let mut kept = Sightings::default();
+        let seen = observed_of(ObservedCli::Muse, UNICORN, ObservedSrc::AuthFile);
+        let first = sighting_unpooled(&seen, &mut kept, tab, "muse", 1_000);
+        assert_eq!(kinds(&first), ["seen", "session-start"]);
+        assert_eq!(first.notes[0].cli, "muse");
+        assert_eq!(
+            first.notes[0].account.unwrap().as_str(),
+            "ac-00000000000000e1"
+        );
+        let login = first.login.unwrap();
+        assert_eq!(
+            (login.cli.id(), login.realm.as_str(), login.email.as_str()),
+            ("muse", "meta", UNICORN)
+        );
+        assert_eq!(
+            kinds(&sighting_unpooled(&seen, &mut kept, tab, "muse", 1_060)),
+            Vec::<&str>::new()
+        );
+        let ended = kept.end(2_000);
+        assert_eq!(kinds(&ended), ["session-end"]);
+        assert_eq!(ended.login.unwrap().state, LoginState::Idle);
+    });
+}
+
+/// A process routed past any account changes no belief and makes no mark.
+/// NEGATIVE CONTROL: with `Observation::seen` answering a routed observation's account, the
+/// reconciliation is `Unlisted`: `` left: Unlisted(…) right: Unread(Some(…)) ``.
+#[test]
+fn a_routed_process_keeps_the_belief_unverified() {
+    let roster = pool_m22(Cli::Agy);
+    let routed = Observation::Routed {
+        route: ObservedRoute::Gateway,
+    };
+    assert_eq!(
+        crate::harness::accounts::reconcile(&roster, &stored(), &routed),
+        Reconciled::Unread(roster.row("m22"))
+    );
+    let mut kept = Sightings::default();
+    let tab = Tab::of("machine", "s-a61a");
+    assert_eq!(
+        sighting(&roster, &stored(), &routed, &mut kept, tab, "agy", 1_000),
+        Sighted::default()
+    );
+}
+
+const GROK_USER: &str = "grok-user-fixture-0001";
+const KIMI_USER: &str = "kimi-user-fixture-0001";
+
+/// A Grok Build `auth.json` with one login record under xAI's sign-in scope: its `key` is a
+/// made-up word that authenticates nothing.
+fn grok_auth(user: &str, email: Option<&str>) -> String {
+    let email = email.map_or_else(String::new, |email| format!(r#","email":"{email}""#));
+    format!(
+        r#"{{"https://accounts.x.ai/sign-in":{{"key":"fixture-not-a-token","user_id":"{user}"{email}}}}}"#
+    )
+}
+
+fn who_of(cli: Cli, env: &[String]) -> ProcessLogin {
+    ProcessLogin::of_env_for(cli, env.iter().filter_map(|kv| kv.split_once('=')))
+}
+
+fn grok_at(env: &[String], home: &Path) -> Observation {
+    grok(&process(env, None), home, &who_of(Cli::Grok, env))
+}
+
+/// Grok Build's login is the xAI account its `auth.json` names, keyed by its user id: the
+/// default home's, the one `GROK_HOME` names, or the login directory `GROK_AUTH_PATH` names,
+/// as the process's own environment selects.
+/// NEGATIVE CONTROL: with `grok` joining `auth.json` to the default home whatever `who.login`
+/// says, the pooled row's process reads the default's bronto: `` left: "brontosaurus…" right:
+/// "unicorn…" ``.
+#[test]
+fn grok_file_names_the_xai_account() {
+    let home = home("grok");
+    let path = home.path().join(".grok/auth.json");
+    write(&path, &grok_auth(GROK_USER, Some(BRONTO)));
+    let plain = env(&[("HOME", home.path().to_str().unwrap())]);
+    let got = grok_at(&plain, home.path());
+    let got = seen(&got);
+    assert_eq!(got.cli, ObservedCli::Pool(Cli::Grok));
+    assert_eq!(got.email, BRONTO);
+    assert_eq!(got.key, AccountKey::grok(GROK_USER));
+    assert!(got.key.is_some());
+    assert_eq!(got.region, None);
+    assert_eq!(got.src, ObservedSrc::AuthFile);
+    assert_eq!(got.path, path);
+    // The row's own login file, as a pooled launch names it.
+    let own = home.path().join("logins/work-2/auth.json");
+    write(&own, &grok_auth("grok-user-fixture-0002", Some(UNICORN)));
+    let pooled = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("GROK_AUTH_PATH", own.to_str().unwrap()),
+    ]);
+    let got = grok_at(&pooled, home.path());
+    assert_eq!(seen(&got).email, UNICORN);
+    assert_eq!(seen(&got).path, own);
+    assert_eq!(seen(&got).key, AccountKey::grok("grok-user-fixture-0002"));
+    // Another home.
+    let moved = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("GROK_HOME", own.parent().unwrap().to_str().unwrap()),
+    ]);
+    assert_eq!(seen(&grok_at(&moved, home.path())).email, UNICORN);
+}
+
+/// A credential variable signs Grok Build in ahead of its login file: the process runs on no
+/// account of its own, whatever the file names, and the route says so.
+/// NEGATIVE CONTROL: with `grok` reading the file before the variables, the file's account is
+/// seen under the key: `` left: Seen(…) right: Routed { route: Env } ``.
+#[test]
+fn grok_with_a_credential_variable_is_routed_by_env() {
+    let home = home("grok-env");
+    write(
+        &home.path().join(".grok/auth.json"),
+        &grok_auth(GROK_USER, Some(BRONTO)),
+    );
+    for name in ["XAI_API_KEY", "GROK_AUTH"] {
+        let keyed = env(&[("HOME", home.path().to_str().unwrap()), (name, "fixture")]);
+        let got = grok_at(&keyed, home.path());
+        assert_eq!(
+            got,
+            Observation::Routed {
+                route: ObservedRoute::Env
+            },
+            "{name}"
+        );
+        assert_eq!(ObservedRoute::Env.word(), "env");
+        assert_eq!(got.seen(), None);
+    }
+}
+
+/// What names no Grok account: no file is unread; a file with no login record, an empty file
+/// and one grok refused are signed out; records of two users leave the account unsaid; and a
+/// record with a user id and no address is a key-only sighting, which names no address.
+/// NEGATIVE CONTROL: with `grok_named` taking the first record's user, the two-user file names
+/// the first: `` left: KeyOnly { … } right: Unread ``.
+#[test]
+fn grok_without_an_addressed_account_is_not_one() {
+    let home = home("grok-none");
+    let plain = env(&[("HOME", home.path().to_str().unwrap())]);
+    assert_eq!(grok_at(&plain, home.path()), Observation::Unread);
+    let path = home.path().join(".grok/auth.json");
+    write(&path, "{}");
+    assert_eq!(
+        grok_at(&plain, home.path()),
+        Observation::SignedOut { path: path.clone() }
+    );
+    write(&path, "");
+    assert_eq!(
+        grok_at(&plain, home.path()),
+        Observation::SignedOut { path: path.clone() }
+    );
+    write(
+        &path,
+        r#"{"a":{"key":"fixture","user_id":"one"},"b":{"key":"fixture","user_id":"two"}}"#,
+    );
+    assert_eq!(grok_at(&plain, home.path()), Observation::Unread);
+    write(&path, &grok_auth(GROK_USER, None));
+    assert_eq!(
+        grok_at(&plain, home.path()),
+        Observation::KeyOnly {
+            key: AccountKey::grok(GROK_USER).unwrap(),
+            path: path.clone()
+        }
+    );
+    // A login grok refused is one it will not start on: no account runs there.
+    write(&path, &grok_auth(GROK_USER, Some(BRONTO)));
+    assert_eq!(seen(&grok_at(&plain, home.path())).email, BRONTO);
+    write(
+        &crate::harness::grok_signin::refused_marker(&path),
+        "refused",
+    );
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(crate::harness::grok_signin::refused_marker(&path))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    assert_eq!(
+        grok_at(&plain, home.path()),
+        Observation::SignedOut { path }
+    );
+}
+
+/// An unsigned stand-in for a token that is a set of claims: a header, `claims` and a signature
+/// word. It authenticates nothing.
+fn token_of(claims: &str) -> String {
+    let part = |bytes: &[u8]| {
+        aterm_codec::base64::encode(bytes)
+            .unwrap()
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    format!(
+        "{}.{}.fixture",
+        part(br#"{"alg":"none"}"#),
+        part(claims.as_bytes())
+    )
+}
+
+/// A Kimi Code credential file whose access token is `token`.
+fn kimi_credential(token: &str) -> String {
+    format!(
+        r#"{{"access_token":"{token}","refresh_token":"fixture-not-a-token","expires_at":1,"scope":"fixture","token_type":"Bearer","expires_in":1}}"#
+    )
+}
+
+/// A Kimi Code `config.toml` whose default model runs on the managed provider, which keeps its
+/// login in the slot `key` on that slot's region's endpoints (the mainland's for its fixed slot,
+/// the global ones for any other), beside a provider of someone's own and a model on it.
+fn kimi_config(key: &str) -> String {
+    let endpoints = if key == "oauth/kimi-code" {
+        "base_url = \"https://api.kimi.com/coding/v1\"\n"
+    } else {
+        "base_url = \"https://api.kimi.ai/coding/v1\"\n"
+    };
+    let host = if key == "oauth/kimi-code" {
+        ""
+    } else {
+        "oauth_host = \"https://auth.kimi.ai\"\n"
+    };
+    format!(
+        "default_model = \"model\"\n\
+         [providers.home]\ntype = \"openai\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+         api_key = \"fixture\"\n\
+         [providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n{endpoints}api_key = \"\"\n\
+         [providers.\"managed:kimi-code\".oauth]\nstorage = \"file\"\nkey = \"{key}\"\n{host}\
+         [models.model]\nprovider = \"managed:kimi-code\"\n\
+         [models.own]\nprovider = \"home\"\n"
+    )
+}
+
+/// The slot and credential file of the global account system's managed login
+/// (`cli_shared_kimi_tests.rs` holds the hash to Kimi's own).
+const KIMI_GLOBAL_SLOT: &str = "oauth/kimi-code-env-0e4f99c69cc27850";
+const KIMI_GLOBAL_FILE: &str = "credentials/kimi-code-env-0e4f99c69cc27850.json";
+
+fn kimi_at(env: &[String], home: &Path) -> Observation {
+    kimi(&process(env, None), home, &who_of(Cli::Kimi, env))
+}
+
+/// Kimi Code's login is the account its managed login's token names, in the account system its
+/// home is set up for: one user id in the two regions is two accounts, each with its own
+/// credential file and its own key. The home is the one `KIMI_CODE_HOME` names, else
+/// `~/.kimi-code`.
+/// NEGATIVE CONTROL: with `kimi_slot` answering the mainland file for every slot, the global
+/// home's login is the other region's file's: `` left: "brontosaurus…" right: "unicorn…" ``.
+#[test]
+fn kimi_in_both_regions() {
+    let home = home("kimi");
+    let claims = |email: &str| format!(r#"{{"user_id":"{KIMI_USER}","email":"{email}"}}"#);
+    let mainland = home.path().join(".kimi-code");
+    write(
+        &mainland.join("config.toml"),
+        &kimi_config("oauth/kimi-code"),
+    );
+    write(
+        &mainland.join("credentials/kimi-code.json"),
+        &kimi_credential(&token_of(&claims(BRONTO))),
+    );
+    let plain = env(&[("HOME", home.path().to_str().unwrap())]);
+    let got = kimi_at(&plain, home.path());
+    let got = seen(&got);
+    assert_eq!(got.cli, ObservedCli::Pool(Cli::Kimi));
+    assert_eq!(got.email, BRONTO);
+    assert_eq!(got.region, Some(Region::MainlandCn));
+    assert_eq!(got.key, AccountKey::kimi(Region::MainlandCn, KIMI_USER));
+    assert_eq!(got.src, ObservedSrc::AuthFile);
+    assert_eq!(got.path, mainland.join("credentials/kimi-code.json"));
+
+    let global = home.path().join("logins/work-2");
+    write(&global.join("config.toml"), &kimi_config(KIMI_GLOBAL_SLOT));
+    write(
+        &global.join(KIMI_GLOBAL_FILE),
+        &kimi_credential(&token_of(&claims(UNICORN))),
+    );
+    // The other region's file in the same home is not the one this home reads.
+    write(
+        &global.join("credentials/kimi-code.json"),
+        &kimi_credential(&token_of(&claims(BRONTO))),
+    );
+    let pooled = env(&[
+        ("HOME", home.path().to_str().unwrap()),
+        ("KIMI_CODE_HOME", global.to_str().unwrap()),
+    ]);
+    let got = kimi_at(&pooled, home.path());
+    let got = seen(&got);
+    assert_eq!(got.email, UNICORN);
+    assert_eq!(got.region, Some(Region::Global));
+    assert_eq!(got.key, AccountKey::kimi(Region::Global, KIMI_USER));
+    assert_ne!(got.key, AccountKey::kimi(Region::MainlandCn, KIMI_USER));
+    assert_eq!(got.path, global.join(KIMI_GLOBAL_FILE));
+}
+
+/// What names no addressed Kimi account. A token whose claims name a user and no address is a
+/// key-only sighting (by `sub` where there is no `user_id`); a token that is no set of claims
+/// says nothing of its account, which only Kimi's profile request would, and is unread; a
+/// credential file with no token is signed out; and a home with no managed login, a slot of
+/// someone's own endpoints, endpoints moved by the environment, or an environment model, is
+/// unread.
+/// NEGATIVE CONTROL: with `kimi_named` answering `Nobody` for a token that is no set of claims,
+/// a signed-in home reads as signed out: `` left: SignedOut { … } right: Unread ``.
+#[test]
+fn kimi_key_only_and_unread() {
+    let home = home("kimi-none");
+    let plain = env(&[("HOME", home.path().to_str().unwrap())]);
+    let dir = home.path().join(".kimi-code");
+    let path = dir.join("credentials/kimi-code.json");
+    // A credential and no config: the home's account system is unknown.
+    write(
+        &path,
+        &kimi_credential(&token_of(&format!(r#"{{"sub":"{KIMI_USER}"}}"#))),
+    );
+    assert_eq!(kimi_at(&plain, home.path()), Observation::Unread);
+    write(&dir.join("config.toml"), &kimi_config("oauth/kimi-code"));
+    assert_eq!(
+        kimi_at(&plain, home.path()),
+        Observation::KeyOnly {
+            key: AccountKey::kimi(Region::MainlandCn, KIMI_USER).unwrap(),
+            path: path.clone()
+        }
+    );
+    write(&path, &kimi_credential("fixture-opaque-word"));
+    assert_eq!(kimi_at(&plain, home.path()), Observation::Unread);
+    write(&path, "{}");
+    assert_eq!(
+        kimi_at(&plain, home.path()),
+        Observation::SignedOut { path: path.clone() }
+    );
+    // A readable account, then each environment that moves the process off it.
+    write(
+        &path,
+        &kimi_credential(&token_of(&format!(
+            r#"{{"user_id":"{KIMI_USER}","email":"{BRONTO}"}}"#
+        ))),
+    );
+    assert_eq!(seen(&kimi_at(&plain, home.path())).email, BRONTO);
+    for (name, value) in [
+        ("KIMI_CODE_BASE_URL", "http://127.0.0.1:1/v1"),
+        ("KIMI_CODE_OAUTH_HOST", "http://127.0.0.1:1"),
+        ("KIMI_MODEL_NAME", "fixture"),
+    ] {
+        let moved = env(&[("HOME", home.path().to_str().unwrap()), (name, value)]);
+        assert_eq!(kimi_at(&moved, home.path()), Observation::Unread, "{name}");
+    }
+    write(
+        &dir.join("config.toml"),
+        &kimi_config("oauth/kimi-code-env-0000000000000000"),
+    );
+    assert_eq!(kimi_at(&plain, home.path()), Observation::Unread);
+    std::fs::remove_file(&path).unwrap();
+    write(&dir.join("config.toml"), &kimi_config("oauth/kimi-code"));
+    assert_eq!(kimi_at(&plain, home.path()), Observation::Unread);
+}
+
+/// THE WRONG-ACCOUNT BUG: a home that keeps a managed provider's table and its credential file
+/// from an earlier login, while the model its turns run is on a provider of its own
+/// (`docs/measured/kimi-credentials-2026-10-24.md` §1), uses none of that account's quota and
+/// is unread: by its default model, and by the model its command line names. The same holds
+/// for a managed provider that is no region's native route: another type, another endpoint, a
+/// key of its own, or an issuer that is not the region's.
+/// NEGATIVE CONTROL: with `kimi_slot` not asking which provider the model runs on, the process
+/// is sighted on the earlier login's account:
+/// `` ["kimi", "-m", "own"] left: Seen(Observed { … }) right: Unread ``.
+#[test]
+fn kimi_off_its_managed_login_is_unread() {
+    let home = home("kimi-own");
+    let plain = env(&[("HOME", home.path().to_str().unwrap())]);
+    let dir = home.path().join(".kimi-code");
+    let config = dir.join("config.toml");
+    let managed = kimi_config("oauth/kimi-code");
+    write(
+        &dir.join("credentials/kimi-code.json"),
+        &kimi_credential(&token_of(&format!(
+            r#"{{"user_id":"{KIMI_USER}","email":"{BRONTO}"}}"#
+        ))),
+    );
+    let at = |argv: &[&str]| {
+        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+        kimi(
+            &Process {
+                argv: &argv,
+                env: &plain,
+                cwd: None,
+            },
+            home.path(),
+            &who_of(Cli::Kimi, &plain),
+        )
+    };
+    write(&config, &managed);
+    assert_eq!(
+        at(&[]).email(),
+        Some(BRONTO),
+        "CONTROL: on its managed login"
+    );
+    assert_eq!(at(&["kimi", "-m", "model"]).email(), Some(BRONTO));
+    assert_eq!(
+        at(&["kimi", "-p", "-m", "--", "-m", "own"]).email(),
+        Some(BRONTO),
+        "a prompt and what follows `--` name no model"
+    );
+    for argv in [
+        &["kimi", "-m", "own"][..],
+        &["kimi", "--model", "own"],
+        &["kimi", "--model=own"],
+        &["kimi", "-mown"],
+        &["kimi", "-m", "model", "-m", "own"],
+        &["kimi", "-m", "unlisted"],
+    ] {
+        assert_eq!(at(argv), Observation::Unread, "{argv:?}");
+    }
+    for (what, from, to) in [
+        (
+            "default model on another provider",
+            "default_model = \"model\"",
+            "default_model = \"own\"",
+        ),
+        (
+            "no default model",
+            "default_model = \"model\"",
+            "other = \"model\"",
+        ),
+        ("another type", "type = \"kimi\"", "type = \"openai\""),
+        (
+            "another endpoint",
+            "https://api.kimi.com/coding/v1",
+            "http://127.0.0.1:1/v1",
+        ),
+        (
+            "a key of its own",
+            "api_key = \"\"",
+            "api_key = \"fixture\"",
+        ),
+        (
+            "another issuer",
+            "storage = \"file\"",
+            "storage = \"file\"\noauth_host = \"http://127.0.0.1:1\"",
+        ),
+        (
+            "a login not in a file",
+            "storage = \"file\"",
+            "storage = \"keyring\"",
+        ),
+    ] {
+        assert!(managed.contains(from), "{what}");
+        write(&config, &managed.replace(from, to));
+        assert_eq!(at(&[]), Observation::Unread, "{what}");
+    }
+    // Its command line can put it back on the managed login.
+    write(
+        &config,
+        &managed.replace("default_model = \"model\"", "default_model = \"own\""),
+    );
+    assert_eq!(at(&["kimi", "--model", "model"]).email(), Some(BRONTO));
+}
+
+fn kimi_seen(region: Region, email: &str) -> Observation {
+    Observation::Seen(Observed {
+        cli: Cli::Kimi.into(),
+        email: email.to_owned(),
+        key: AccountKey::kimi(region, KIMI_USER),
+        region: Some(region),
+        src: ObservedSrc::AuthFile,
+        path: PathBuf::from("/home/someone/.kimi-code/credentials/kimi-code.json"),
+        mtime: Some(1),
+    })
+}
+
+/// A Kimi Code tab's account is keyed under its region's realm, and a row of the other region
+/// does not answer to its address: the mainland login of an address the roster lists under the
+/// global system is an account no row lists, noted against the believed row.
+/// NEGATIVE CONTROL: with `observed_claims` passing no region, the mainland login is keyed
+/// under `kimi:global`: `` left: "ac-…f1" right: "ac-…f2" ``; with `reconcile` matching by
+/// address alone, the mainland login agrees with the global row and is not `Unlisted`.
+#[test]
+fn a_kimi_tab_is_keyed_and_matched_by_its_region() {
+    crate::harness::journal::with_keyer(realm_keyer, || {
+        let roster = Roster::parse_for(
+            Cli::Kimi,
+            &format!(
+                "[[account]]\nlabel = \"k1\"\nclass = \"dedicated\"\nemail = \"{UNICORN}\"\n\
+                 region = \"global\"\n"
+            ),
+        )
+        .unwrap();
+        let global = kimi_seen(Region::Global, UNICORN);
+        assert_eq!(
+            crate::harness::accounts::reconcile(&roster, &stored(), &global),
+            Reconciled::Agrees(roster.row("k1").unwrap())
+        );
+        let mainland = kimi_seen(Region::MainlandCn, UNICORN);
+        assert!(matches!(
+            crate::harness::accounts::reconcile(&roster, &stored(), &mainland),
+            Reconciled::Unlisted(_)
+        ));
+        let tab = Tab::of("machine", "s-71a1");
+        let mut kept = Sightings::default();
+        let first = sighting(&roster, &stored(), &mainland, &mut kept, tab, "kimi", 1_000);
+        assert_eq!(kinds(&first), ["seen", "wrong-account", "session-start"]);
+        assert_eq!(first.notes[0].cli, "kimi");
+        assert_eq!(
+            first.notes[0].account.unwrap().as_str(),
+            "ac-00000000000000f2"
+        );
+        assert_eq!(first.notes[1].to.unwrap().as_str(), "ac-00000000000000f1");
+        assert_eq!(first.login.unwrap().realm, "kimi:mainland-cn");
+    });
+}
+
+/// A key-only sighting names no address: it answers to no row, changes no belief and makes no
+/// mark, so nothing is born of it.
+#[test]
+fn a_key_only_login_keeps_the_belief_unverified() {
+    let roster = pool_m22(Cli::Grok);
+    let keyed = Observation::KeyOnly {
+        key: AccountKey::grok(GROK_USER).unwrap(),
+        path: PathBuf::from("/home/someone/.grok/auth.json"),
+    };
+    assert_eq!(
+        crate::harness::accounts::reconcile(&roster, &stored(), &keyed),
+        Reconciled::Unread(roster.row("m22"))
+    );
+    let mut kept = Sightings::default();
+    let tab = Tab::of("machine", "s-960c");
+    assert_eq!(
+        sighting(&roster, &stored(), &keyed, &mut kept, tab, "grok", 1_000),
+        Sighted::default()
+    );
 }

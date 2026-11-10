@@ -23,6 +23,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::process::ProcessPresence;
+
 /// How long [`end_group`] keeps sending `SIGKILL` rounds to a group that has not emptied: a member
 /// a `SIGKILL` cannot end (one blocked in the kernel) is left to the kernel after this. XNU's fork
 /// lets a child born as a group signal lands join the group unsignalled, so one round is not
@@ -33,7 +35,7 @@ pub(super) const KILL_ROUNDS: Duration = Duration::from_secs(5);
 const PAUSE: Duration = Duration::from_millis(20);
 
 /// How long [`linger`] waits before it reads the group again when no exit can wake it: the
-/// listing or a member did not read, or a member's exit could not be watched.
+/// listing did not read, or a member's exit could not be watched.
 pub(super) const UNWATCHED_RECHECK: Duration = Duration::from_secs(1);
 
 /// What woke [`GroupControl::wait`].
@@ -45,21 +47,34 @@ pub(super) enum Woke {
     Other,
 }
 
-/// One listed process's state, keeping an unavailable read distinct from an ended process.
+/// Current execution evidence for the originally watched child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Member {
-    /// A live process whose current group was read.
-    Group(i32),
-    /// The process is absent or has exited.
-    Gone,
-    /// Its live group or ended state could not be established.
-    Unread,
+pub(super) enum Readiness {
+    /// Matching identity and unique id bracket a thread that has run.
+    Started,
+    /// Its original armed NOTE_EXIT was positively observed.
+    Exited,
+    /// Matching identity/unique id, but its thread has not run.
+    Held,
+    /// Required execution evidence could not be established.
+    Unavailable,
+}
+
+impl Readiness {
+    fn allows_signal(self) -> bool {
+        matches!(self, Self::Started | Self::Exited)
+    }
 }
 
 /// What [`end_group`] and [`linger`] read and do: the kernel, or a test's script.
 pub(super) trait GroupControl {
-    /// `pid`'s known live group, proven end, or unavailable reading.
-    fn member(&mut self, pid: i32) -> Member;
+    /// The caller's actual, exited child, held unreaped for this entire watch.
+    fn anchor(&self) -> i32;
+    /// `pid`'s process group as it reads now: `None` when gone, a zombie, another user's, or
+    /// unread.
+    fn group_of(&mut self, pid: i32) -> Option<i32>;
+    /// A positive ended/absent observation is distinct from an unread identity.
+    fn presence(&mut self, pid: i32) -> ProcessPresence;
     /// The pids of group `pgid`'s members, and whether the listing is whole; `None` when unread.
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)>;
     /// `sig` to every member of group `pgid` (`kill(-pgid, sig)`).
@@ -71,6 +86,59 @@ pub(super) trait GroupControl {
     fn now(&mut self) -> Instant;
     /// Sleeps `pause`.
     fn nap(&mut self, pause: Duration);
+}
+
+/// Ends this owned group only with positive execution evidence, renewed
+/// immediately before every TERM/KILL. Point rechecks never wait or extend the
+/// existing grace/round bounds. The original child's positive exit is monotone.
+pub(super) fn end_group_guarded(
+    pgid: i32,
+    grace: Duration,
+    control: &mut impl GroupControl,
+    mut readiness: impl FnMut() -> Readiness,
+) -> Option<GroupEnded> {
+    if !readiness().allows_signal() {
+        return None;
+    }
+    Some(end_group(pgid, grace, &mut Guarded { control, readiness }))
+}
+
+struct Guarded<'a, C, R> {
+    control: &'a mut C,
+    readiness: R,
+}
+
+impl<C: GroupControl, R: FnMut() -> Readiness> GroupControl for Guarded<'_, C, R> {
+    fn anchor(&self) -> i32 {
+        self.control.anchor()
+    }
+    fn group_of(&mut self, pid: i32) -> Option<i32> {
+        self.control.group_of(pid)
+    }
+    fn presence(&mut self, pid: i32) -> ProcessPresence {
+        self.control.presence(pid)
+    }
+    fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
+        self.control.listing(pgid)
+    }
+    fn signal_group(&mut self, pgid: i32, sig: i32) -> std::io::Result<()> {
+        if !(self.readiness)().allows_signal() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "owned group execution readiness is held or unavailable",
+            ));
+        }
+        self.control.signal_group(pgid, sig)
+    }
+    fn wait(&mut self, members: &[i32], patience: Option<Duration>) -> Woke {
+        self.control.wait(members, patience)
+    }
+    fn now(&mut self) -> Instant {
+        self.control.now()
+    }
+    fn nap(&mut self, pause: Duration) {
+        self.control.nap(pause);
+    }
 }
 
 /// What [`end_group`] did.
@@ -87,34 +155,48 @@ pub(super) struct GroupEnded {
 /// The live members of a group as one read finds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Live {
-    /// A whole listing proved no live member (the anchor is known exited).
+    /// A fresh whole listing contains only the caller's owned exited anchor.
     Empty,
     /// These read live in the group (a listing that was not whole may hold more).
     Members(Vec<i32>),
-    /// No live member read, but the listing or an individual member remained unknown.
+    /// The listing did not read, or was not whole and found none.
     Unknown,
 }
 
-/// Lists group `pgid` and reads each member's group: the members still live in it.
+/// Lists group `pgid` and reads each member's positive presence and group.
+/// Empty requires a fresh whole listing of the caller's pinned anchor alone.
+/// Earlier ended/absent pids cannot prove it: another member can fork after a
+/// listing, reusing an earlier absent pid, then exit before its own read.
 fn live(control: &mut impl GroupControl, pgid: i32) -> Live {
     let Some((pids, whole)) = control.listing(pgid) else {
         return Live::Unknown;
     };
     let mut members = Vec::new();
-    let mut unread = !whole;
+    let mut unknown = !whole;
     for pid in pids {
-        match control.member(pid) {
-            Member::Group(group) if group == pgid => members.push(pid),
-            Member::Group(_) | Member::Gone => {}
-            Member::Unread => unread = true,
+        match control.presence(pid) {
+            ProcessPresence::Exited | ProcessPresence::Absent => {}
+            ProcessPresence::Present if control.group_of(pid) == Some(pgid) => members.push(pid),
+            ProcessPresence::Present | ProcessPresence::Unknown => unknown = true,
         }
     }
     if !members.is_empty() {
-        Live::Members(members)
-    } else if unread {
-        Live::Unknown
-    } else {
-        Live::Empty
+        return Live::Members(members);
+    }
+    if unknown {
+        return Live::Unknown;
+    }
+    // Only the actually owned, never-reaped anchor has lifetime continuity.
+    // A recycled pid from the first list, even one previously observed ended,
+    // is not this anchor and must keep the watch/recheck path alive.
+    match control.listing(pgid) {
+        Some((again, true))
+            if again.as_slice() == [control.anchor()]
+                && control.presence(control.anchor()) == ProcessPresence::Exited =>
+        {
+            Live::Empty
+        }
+        _ => Live::Unknown,
     }
 }
 
@@ -164,11 +246,12 @@ pub(super) fn end_group(pgid: i32, grace: Duration, control: &mut impl GroupCont
 }
 
 /// The watch on group `pgid` once the child that led it exited first, with the parent still
-/// there: `false` once a whole listing finds no live member (the group has nothing left to end),
+/// there: `false` once a fresh whole listing contains only its pinned exited anchor,
 /// `true` once the parent exits or execs first, when the caller ends the group ([`end_group`]).
 /// Each read follows a wake: a listed member's exit, or [`UNWATCHED_RECHECK`] when the listing
-/// or a member did not read. A member forked after a listing is in the next one, since its
-/// parent, a listed member, has not exited while that one waits, or has and woke it.
+/// did not establish that result. Other exited members conservatively keep this watch until
+/// reaped or the parent ends. A listed member's exit wakes another read, including when it
+/// forked after enumeration; an unread or changed membership uses the bounded recheck.
 pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
     loop {
         let woke = match live(control, pgid) {
@@ -186,24 +269,25 @@ pub(super) fn linger(pgid: i32, control: &mut impl GroupControl) -> bool {
 /// [`group_members`](crate::process::group_members), `kill(2)` of the negated group id, the
 /// watcher's kqueue (`kq`, which watches `parent`'s exit and exec) and the thread's sleep.
 #[cfg(target_vendor = "apple")]
-pub(super) struct GroupLive {
+pub(super) struct GroupLive<'a> {
     /// The watcher's kqueue.
     pub kq: i32,
     /// The parent the watcher ties the child to.
     pub parent: i32,
+    /// Borrowed native wait custody, never reconstructed from a listed pid.
+    pub anchor: &'a super::Anchor,
 }
 
 #[cfg(target_vendor = "apple")]
-impl GroupControl for GroupLive {
-    fn member(&mut self, pid: i32) -> Member {
-        use crate::process::{ProcessPresence, process_presence, read_lineage};
-        if let Some(lineage) = read_lineage(pid) {
-            return i32::try_from(lineage.pgid).map_or(Member::Unread, Member::Group);
-        }
-        match process_presence(pid) {
-            ProcessPresence::Absent | ProcessPresence::Exited => Member::Gone,
-            ProcessPresence::Present | ProcessPresence::Unknown => Member::Unread,
-        }
+impl GroupControl for GroupLive<'_> {
+    fn anchor(&self) -> i32 {
+        self.anchor.pid
+    }
+    fn group_of(&mut self, pid: i32) -> Option<i32> {
+        crate::process::read_lineage(pid).and_then(|lineage| i32::try_from(lineage.pgid).ok())
+    }
+    fn presence(&mut self, pid: i32) -> ProcessPresence {
+        crate::process::process_presence(pid)
     }
     fn listing(&mut self, pgid: i32) -> Option<(Vec<i32>, bool)> {
         crate::process::group_members(u32::try_from(pgid).ok()?)

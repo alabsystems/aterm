@@ -13,6 +13,11 @@ fn row(id: u64, started: u64, exited: u64) -> CoalTasks {
     }
 }
 
+/// The merge's counts, the gone coalitions it hands back left unread.
+fn moves(then: &CoalTaskRead, now: &CoalTaskRead) -> Option<(u64, u64)> {
+    coalition_moves(then, now, |_| {})
+}
+
 fn read(newest: u64, rows: &[(u64, u64, u64)]) -> CoalTaskRead {
     CoalTaskRead::of(
         Some(newest),
@@ -36,11 +41,8 @@ fn starts_count_each_coalitions_growth_and_a_new_coalition_whole() {
             (912, 1, 0),
         ],
     );
-    assert_eq!(
-        coalition_moves(&then, &now),
-        Some((3 + 4 + 3 + 1, 2 + 1 + 1))
-    );
-    assert_eq!(coalition_moves(&now, &now), Some((0, 0)), "nothing moved");
+    assert_eq!(moves(&then, &now), Some((3 + 4 + 3 + 1, 2 + 1 + 1)));
+    assert_eq!(moves(&now, &now), Some((0, 0)), "nothing moved");
 }
 
 /// A coalition that no longer answers ended with its last members: each one it still held at
@@ -52,7 +54,7 @@ fn exits_close_a_gone_coalitions_live_members() {
         &[(1, 400, 380), (557, 9, 7), (700, 12, 9), (900, 2, 0)],
     );
     let now = read(900, &[(1, 400, 380), (900, 2, 0)]);
-    assert_eq!(coalition_moves(&then, &now), Some((0, (9 - 7) + (12 - 9))));
+    assert_eq!(moves(&then, &now), Some((0, (9 - 7) + (12 - 9))));
 }
 
 /// NEGATIVE CONTROLS for the count's refusals, each beside the same reads counted: a list cut at
@@ -63,37 +65,33 @@ fn exits_close_a_gone_coalitions_live_members() {
 fn a_truncated_list_or_an_unbased_coalition_gives_no_rate() {
     let then = read(900, &[(1, 400, 380), (900, 2, 0)]);
     let now = read(901, &[(1, 401, 380), (900, 2, 0), (901, 1, 0)]);
-    assert_eq!(coalition_moves(&then, &now), Some((2, 0)), "the control");
+    assert_eq!(moves(&then, &now), Some((2, 0)), "the control");
 
     let cut = |r: &CoalTaskRead| CoalTaskRead::of(r.newest, true, r.rows().iter().copied());
-    assert_eq!(coalition_moves(&cut(&then), &now), None, "then cut");
-    assert_eq!(coalition_moves(&then, &cut(&now)), None, "now cut");
+    assert_eq!(moves(&cut(&then), &now), None, "then cut");
+    assert_eq!(moves(&then, &cut(&now)), None, "now cut");
 
     let unbased = read(901, &[(1, 401, 380), (557, 9, 7), (900, 2, 0), (901, 1, 0)]);
-    assert_eq!(
-        coalition_moves(&then, &unbased),
-        None,
-        "557 ≤ 900 has no base"
-    );
+    assert_eq!(moves(&then, &unbased), None, "557 ≤ 900 has no base");
 
     let unanswered = read(900, &[(1, 400, 380)]);
     let answers = read(901, &[(1, 401, 380), (900, 2, 0), (901, 1, 0)]);
     assert_eq!(
-        coalition_moves(&unanswered, &answers),
+        moves(&unanswered, &answers),
         None,
         "900, the newest then, listed but unanswered, has no base"
     );
     let above = read(901, &[(1, 401, 380), (901, 1, 0)]);
     assert_eq!(
-        coalition_moves(&unanswered, &above),
+        moves(&unanswered, &above),
         Some((2, 0)),
         "the control: only 901 is above the newest"
     );
 
     let backwards = read(901, &[(1, 399, 380), (900, 2, 0), (901, 1, 0)]);
-    assert_eq!(coalition_moves(&then, &backwards), None, "starts backwards");
+    assert_eq!(moves(&then, &backwards), None, "starts backwards");
     let backwards = read(901, &[(1, 401, 379), (900, 2, 0), (901, 1, 0)]);
-    assert_eq!(coalition_moves(&then, &backwards), None, "exits backwards");
+    assert_eq!(moves(&then, &backwards), None, "exits backwards");
 }
 
 /// NEGATIVE CONTROL: a read in which no coalition answered, beside one in which some did, counts
@@ -105,27 +103,19 @@ fn a_read_in_which_no_coalition_answered_gives_no_count() {
     let full = read(900, &[(1, 400, 380), (557, 9, 7), (900, 2, 0)]);
     let silent = read(900, &[]);
     assert_eq!(
-        coalition_moves(&full, &full),
+        moves(&full, &full),
         Some((0, 0)),
         "the control: the same answers moved nothing"
     );
-    assert_eq!(
-        coalition_moves(&full, &silent),
-        None,
-        "every coalition gone"
-    );
-    assert_eq!(
-        coalition_moves(&silent, &full),
-        None,
-        "every coalition back"
-    );
+    assert_eq!(moves(&full, &silent), None, "every coalition gone");
+    assert_eq!(moves(&silent, &full), None, "every coalition back");
     let unlisted = CoalTaskRead::of(None, false, []);
     assert_eq!(
-        coalition_moves(&unlisted, &full),
+        moves(&unlisted, &full),
         None,
         "every coalition new above no newest id"
     );
-    assert_eq!(coalition_moves(&silent, &unlisted), Some((0, 0)));
+    assert_eq!(moves(&silent, &unlisted), Some((0, 0)));
 }
 
 /// Rows arrive in the kernel's list order; the read orders them by id and keeps one per id, so
@@ -166,6 +156,7 @@ fn moved_counts_aterms_own_coalition_and_linux_forks() {
             starts: 4,
             exits: Some(1),
             own_starts: Some(3),
+            heat: None,
         })
     );
     let unowned = StartCount::Coalitions {
@@ -179,6 +170,7 @@ fn moved_counts_aterms_own_coalition_and_linux_forks() {
             starts: 337,
             exits: None,
             own_starts: None,
+            heat: None,
         })
     );
     assert_eq!(
@@ -194,6 +186,7 @@ fn a_flow_is_its_counts_over_the_interval() {
         starts: 37,
         exits: Some(38),
         own_starts: Some(4),
+        heat: None,
     };
     assert_eq!(
         TaskFlow::of(m, 2.0),
@@ -243,11 +236,7 @@ fn the_starts_formula_matches_recorded_coalition_reads() {
             (1, 192, 190),
         ],
     );
-    assert_eq!(
-        coalition_moves(&then, &now),
-        Some((5, 8)),
-        "grown and ended"
-    );
+    assert_eq!(moves(&then, &now), Some((5, 8)), "grown and ended");
 
     let then = read(
         54_355,
@@ -276,7 +265,7 @@ fn the_starts_formula_matches_recorded_coalition_reads() {
             (1, 192, 190),
         ],
     );
-    assert_eq!(coalition_moves(&then, &now), Some((6, 3)), "begun");
+    assert_eq!(moves(&then, &now), Some((6, 3)), "begun");
     let moved = moved(
         &StartCount::Coalitions {
             read: then,
@@ -296,4 +285,68 @@ fn the_starts_formula_matches_recorded_coalition_reads() {
             aterm_starts_ps: Some(0.0),
         })
     );
+}
+
+/// The merge hands back each coalition of the earlier read that the later did not answer, in id
+/// order, and nothing else: the heat chain takes exactly those off the earlier total.
+#[test]
+fn the_merge_hands_back_the_gone_coalitions() {
+    let then = read(900, &[(1, 400, 380), (557, 9, 7), (600, 3, 3), (900, 2, 0)]);
+    let now = read(912, &[(1, 401, 380), (900, 2, 1), (912, 1, 0)]);
+    let mut gone = Vec::new();
+    assert!(coalition_moves(&then, &now, |id| gone.push(id)).is_some());
+    assert_eq!(gone, [557, 600]);
+}
+
+fn heat_book(at_ns: u64, rows: &[(u64, crate::heat::Words)]) -> crate::heat::HeatBook {
+    let mut total = [0u64; crate::heat::COUNTERS];
+    for (_, w) in rows {
+        for (t, v) in total.iter_mut().zip(w) {
+            *t += v;
+        }
+    }
+    crate::heat::HeatBook {
+        at_ns,
+        timebase: (125, 3),
+        by_id: rows.to_vec(),
+        total: Ok(total),
+    }
+}
+
+/// The heat change rides the start counter's one merge: a gone coalition's counters come off the
+/// earlier total and a born one counts whole. CONTROL: a read with no heat beside one with heat
+/// reads unread, and two without carry none.
+#[test]
+fn the_heat_change_rides_the_start_counters_merge() {
+    let w = |n: u64| [n; crate::heat::COUNTERS];
+    let then = read(900, &[(1, 4, 3), (557, 9, 7)])
+        .with_heat(heat_book(1_000_000_000, &[(557, w(50)), (1, w(10))]));
+    let now = read(912, &[(1, 5, 3), (912, 1, 0)])
+        .with_heat(heat_book(2_000_000_000, &[(912, w(2)), (1, w(13))]));
+    let count = |read: &CoalTaskRead| StartCount::Coalitions {
+        read: read.clone(),
+        own: None,
+    };
+    let m = moved(&count(&then), &count(&now)).expect("counts");
+    let heat = m.heat.expect("both read heat").expect("changes");
+    assert_eq!(heat.counters.words(), w(3 + 2));
+    assert_eq!(heat.window_ns, 1_000_000_000);
+    let bare = read(912, &[(1, 5, 3), (912, 1, 0)]);
+    let m = moved(&count(&then), &count(&bare)).expect("counts");
+    assert_eq!(m.heat, Some(Err("heat_unread")));
+    let m = moved(&count(&read(900, &[(1, 4, 3)])), &count(&bare)).expect("counts");
+    assert_eq!(m.heat, None);
+}
+
+/// A book whose rows do not match the read's (an id the list gave twice: one row, summed twice)
+/// is refused, never summed. CONTROL: one row an id, it stands.
+#[test]
+fn a_book_with_another_count_than_the_rows_is_refused() {
+    let w = [1u64; crate::heat::COUNTERS];
+    let twice = CoalTaskRead::of(Some(2), false, [row(1, 1, 0), row(1, 1, 0), row(2, 1, 0)])
+        .with_heat(heat_book(1, &[(1, w), (1, w), (2, w)]));
+    assert_eq!(twice.heat().map(|b| b.total), Some(Err("rows")));
+    let once = CoalTaskRead::of(Some(2), false, [row(1, 1, 0), row(2, 1, 0)])
+        .with_heat(heat_book(1, &[(1, w), (2, w)]));
+    assert!(once.heat().is_some_and(|b| b.total.is_ok()), "control");
 }

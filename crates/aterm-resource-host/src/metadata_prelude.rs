@@ -100,6 +100,7 @@ pub(super) struct Owner {
     arg0: Option<OsString>,
     arguments: Vec<OsString>,
     cwd: OsString,
+    footprint_mib: Option<u32>,
     payload: Vec<u8>,
     written: usize,
     acknowledgement: bool,
@@ -130,15 +131,11 @@ impl Owner {
         deadline: Instant,
     ) -> io::Result<(Self, spawnfd::Command)> {
         #[cfg(target_os = "macos")]
-        if command.get_footprint_limit().is_some() {
-            // This private plan does not serialize final-exec memory policy.
-            // Refuse rather than silently applying it to the prelude or losing
-            // it when the selected image replaces that trusted helper.
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "metadata prelude cannot transfer final footprint policy",
-            ));
-        }
+        let footprint_mib = command
+            .get_footprint_limit()
+            .map(spawnfd::FootprintLimit::mib);
+        #[cfg(not(target_os = "macos"))]
+        let footprint_mib = None;
         let target = (3..=130)
             .find(|fd| !targets.contains(fd))
             .ok_or_else(refused)? as i32;
@@ -170,6 +167,7 @@ impl Owner {
                     .ok_or_else(refused)?
                     .as_os_str()
                     .to_owned(),
+                footprint_mib,
                 payload: Vec::new(),
                 written: 0,
                 acknowledgement: false,
@@ -185,7 +183,21 @@ impl Owner {
     pub(super) fn extra(&mut self) -> io::Result<(OwnedFd, i32)> {
         Ok((self.child_channel.take().ok_or_else(refused)?, self.target))
     }
-    pub(super) fn configured(&mut self, command: &spawnfd::Command) -> io::Result<()> {
+    pub(super) fn configured(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        if !self.payload.is_empty() {
+            return Err(refused());
+        }
+        // Resource configuration is complete. A later requested policy replaces
+        // the selected command's initial one, but must never cap the prelude.
+        // Absence of a new request preserves the selected initial policy.
+        // Read it first; encoding failure leaves both command and owner intact.
+        #[cfg(target_os = "macos")]
+        let footprint_mib = command
+            .get_footprint_limit()
+            .map(spawnfd::FootprintLimit::mib)
+            .or(self.footprint_mib);
+        #[cfg(not(target_os = "macos"))]
+        let footprint_mib = self.footprint_mib;
         let peer = transport::Peer {
             pid: std::process::id(),
             birth: process::read_birth(std::process::id() as i32)
@@ -194,6 +206,7 @@ impl Owner {
         };
         let plan = ExecPlan {
             parent: peer,
+            footprint_mib,
             command: trust_resource_controller::CommandSpec {
                 program: self.program.as_bytes().to_vec(),
                 arg0: command
@@ -219,8 +232,15 @@ impl Owner {
                 .collect(),
         };
         let bytes = plan.encode()?;
-        self.payload.extend((bytes.len() as u32).to_be_bytes());
-        self.payload.extend(bytes);
+        let mut payload = Vec::with_capacity(bytes.len() + 4);
+        payload.extend((bytes.len() as u32).to_be_bytes());
+        payload.extend(bytes);
+        // Commit the fully encoded plan before the first ARM. No fallible work
+        // follows the extraction; the actual intermediate spawn remains uncapped.
+        #[cfg(target_os = "macos")]
+        let _ = command.take_footprint_limit();
+        self.footprint_mib = footprint_mib;
+        self.payload = payload;
         Ok(())
     }
     pub(super) fn poll(
@@ -391,6 +411,14 @@ fn entry_at(args: &[OsString], started: Instant) -> Option<std::process::ExitCod
             )
             .current_dir(OsStr::from_bytes(&plan.command.cwd))
             .start_suspended(true);
+        // The decoded policy is launch configuration only. Prepare it on the
+        // selected image's SETEXEC, never on the inspector/prelude spawn; the
+        // second native stop remains the identity/no-fork check, not a public
+        // receipt proving an installed memory policy or admission authority.
+        #[cfg(target_os = "macos")]
+        if let Some(mib) = plan.footprint_mib {
+            command.footprint_limit(spawnfd::FootprintLimit::new(mib)?);
+        }
         let targets = plan.targets;
         if let Some(arg0) = plan.command.arg0.as_ref() {
             command.arg0(OsStr::from_bytes(arg0));
@@ -713,7 +741,7 @@ mod tests {
                 (OwnedFd::from(write), 4),
             ])
             .unwrap();
-        owner.configured(&prelude).unwrap();
+        owner.configured(&mut prelude).unwrap();
         let mut guard = ChildGuard(prelude.spawn().unwrap());
         let child = &mut guard.0;
         let original = process::read_lineage(child.id() as i32).unwrap();

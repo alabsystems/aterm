@@ -1847,6 +1847,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.194.0", "stalled-sequence"),
     ("v0.194.0", "twelve-panes"),
     ("v0.194.0", "variants"),
+    ("v0.195.0", "carried-state"),
+    ("v0.195.0", "claude-code-1049"),
+    ("v0.195.0", "colour-and-shell"),
+    ("v0.195.0", "engine-state"),
+    ("v0.195.0", "fold"),
+    ("v0.195.0", "held-failed"),
+    ("v0.195.0", "held-pane"),
+    ("v0.195.0", "held-withheld"),
+    ("v0.195.0", "history"),
+    ("v0.195.0", "history-carry"),
+    ("v0.195.0", "incident-55x149"),
+    ("v0.195.0", "link-dense"),
+    ("v0.195.0", "link-dense-history"),
+    ("v0.195.0", "lone-workers-list"),
+    ("v0.195.0", "policy-repaint"),
+    ("v0.195.0", "policy-visible"),
+    ("v0.195.0", "shell-integration"),
+    ("v0.195.0", "stalled-sequence"),
+    ("v0.195.0", "twelve-panes"),
+    ("v0.195.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -4153,10 +4173,13 @@ struct RendezvousRecord {
     /// build and commit.
     target_value: String,
     env_parent_birth: String,
-    /// `ATERM_HANDOFF_PARENT_BIRTH` as that release's parent published its own.
+    /// The fixed, valid `ATERM_HANDOFF_PARENT_BIRTH` input that release used
+    /// for this compatibility record. Product launch still publishes the live
+    /// parent's kernel birth record.
     parent_birth_value: String,
-    /// The adoption proof over the PTY device terms (`st_rdev`) of that
-    /// release's capture, with the target read from `target_value`.
+    /// The adoption proof over that release's fixed representative PTY device
+    /// terms, with the target read from `target_value`. The generator separately
+    /// proves that live `st_rdev` conversion preserves every session id and pid.
     proof_layout_digest: String,
     proof_screen_digest: String,
     proof_terms: Vec<Vec<i64>>,

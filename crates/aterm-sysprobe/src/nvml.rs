@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NVIDIA's proprietary driver, through NVML: a card's device-wide busy figure, its name, and
-//! whether it works in the system's memory.
+//! NVIDIA's proprietary driver, through NVML: a card's device-wide busy figure, its board power
+//! draw, its name, and whether it works in the system's memory.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint};
 use std::sync::{Mutex, OnceLock};
@@ -72,6 +72,10 @@ aterm_dl::table! {
         /// A newer call than the rest, which an older driver's library lacks.
         addressing_mode = c"nvmlDeviceGetAddressingMode":
             unsafe extern "C" fn(*mut NvmlDevice, *mut AddressingMode) -> NvmlReturn;
+        /// The board's power draw, milliwatts (A4 §4's GPU watts on Linux); optional so a
+        /// library without it costs the busy figure nothing.
+        power_usage = c"nvmlDeviceGetPowerUsage":
+            unsafe extern "C" fn(*mut NvmlDevice, *mut c_uint) -> NvmlReturn;
     }
 }
 
@@ -113,8 +117,8 @@ fn nvml() -> Result<&'static Nvml, Why> {
 }
 
 /// The NVIDIA card in PCI slot `slot`, read through NVML: its device-wide busy percent (at most
-/// 100) every call, and its name and whether it works in the system's memory, which do not
-/// change while the driver runs, read once per process ([`facts`]).
+/// 100) and board power draw every call, and its name and whether it works in the system's
+/// memory, which do not change while the driver runs, read once per process ([`facts`]).
 pub(crate) fn card(slot: &str) -> NvidiaCard {
     let nvml = match nvml() {
         Ok(nvml) => nvml,
@@ -130,8 +134,14 @@ pub(crate) fn card(slot: &str) -> NvidiaCard {
     // `nvmlUtilization_t`.
     let busy = ok(unsafe { (nvml.utilization_rates)(device, &raw mut rates) })
         .map(|()| u8::try_from(rates.gpu.min(100)).unwrap_or(100));
+    let power_mw = nvml.power_usage.map_or(Err(Why::NotRead), |power_of| {
+        let mut mw: c_uint = 0;
+        // SAFETY: a handle NVML gave under a live init, and a place for an `unsigned int`.
+        ok(unsafe { power_of(device, &raw mut mw) }).map(|()| mw)
+    });
     NvidiaCard {
         busy,
+        power_mw,
         name,
         unified,
     }

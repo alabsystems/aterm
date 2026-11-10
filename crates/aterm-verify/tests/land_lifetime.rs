@@ -10,6 +10,18 @@ fn main() {
     use aterm_uds::spawnfd::command;
     use std::path::Path;
 
+    // Existence is the reader's readiness event. Publish only complete PID bytes:
+    // create-then-write exposes an empty marker between those two operations.
+    fn publish_pid(path: &Path) {
+        aterm_uds::atomic_file::write_flushed(
+            path,
+            std::process::id().to_string().as_bytes(),
+            0o600,
+            None,
+        )
+        .unwrap();
+    }
+
     if let Some(code) = aterm_uds::tether::entry() {
         std::process::exit(if code == std::process::ExitCode::SUCCESS {
             0
@@ -53,7 +65,7 @@ fn main() {
             &mut |_| {},
         )
         .unwrap();
-        std::fs::write(dir.join("verify"), std::process::id().to_string()).unwrap();
+        publish_pid(&dir.join("verify"));
         let mut cmd = aterm_verify::exec::Cmd::new(&exe);
         cmd.envs.push(("LAND_LIFETIME_ROLE".into(), "leaf".into()));
         let _ = aterm_verify::exec::run(
@@ -74,7 +86,7 @@ fn main() {
         unreachable!();
     }
     if role == "leaf" {
-        std::fs::write(dir.unwrap().join("leaf"), std::process::id().to_string()).unwrap();
+        publish_pid(&dir.unwrap().join("leaf"));
         loop {
             std::thread::park();
         }

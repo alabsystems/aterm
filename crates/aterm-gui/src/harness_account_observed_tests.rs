@@ -29,9 +29,10 @@ fn look(seen: Observation) -> AccountLook {
 
 fn seen(email: &str) -> Observation {
     Observation::Seen(Observed {
-        cli: accounts::Cli::Claude,
+        cli: accounts::Cli::Claude.into(),
         email: email.to_owned(),
         key: None,
+        region: None,
         src: ObservedSrc::Profile,
         path: "/home/someone/.claude.json".into(),
         mtime: Some(1),

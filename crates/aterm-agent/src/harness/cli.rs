@@ -19305,13 +19305,17 @@ pub struct PlaceSeen {
     pub tabs: Vec<String>,
     /// The file's modification age, seconds.
     pub written_s: Option<i64>,
-    /// Where it was read (`profile`).
+    /// Where it was read (`profile`, `vault-token`, `auth-file`, `cli-log`).
     pub src: &'static str,
+    /// Why the place names no login, where its observer said more than "signed out": `unread`
+    /// (no file, or a login no file names) or the route that answers for it (`gateway`).
+    pub gap: Option<&'static str>,
 }
 
 /// Every Claude Code login place `roster` names on this Mac, each as its file holds it now:
 /// the default home's profile for the row with no `dir` (and for no row), each row's own
-/// directory otherwise. The tabs are the store's sessions on that row.
+/// directory otherwise. The tabs are the store's sessions on that row. No row is taken to run
+/// on a vault token ([`places_seen_on`]).
 #[must_use]
 pub fn places_seen(
     roster: &Roster,
@@ -19319,32 +19323,36 @@ pub fn places_seen(
     user_home: &Path,
     now: i64,
 ) -> Vec<PlaceSeen> {
+    let on_token = super::observe::sweep::OnToken::none();
+    places_seen_on(roster, state, user_home, now, &on_token)
+}
+
+/// [`places_seen`], with the rows `on_token` names read as their vault token's account
+/// ([`super::observe::sweep::claude_places`]): the place is then the token entry's name.
+#[must_use]
+pub fn places_seen_on(
+    roster: &Roster,
+    state: &accounts::State,
+    user_home: &Path,
+    now: i64,
+    on_token: &super::observe::sweep::OnToken,
+) -> Vec<PlaceSeen> {
     let shown = |path: &Path| match path.strip_prefix(user_home) {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     };
-    let mut places: Vec<(Option<&accounts::Row>, Option<String>)> = Vec::new();
-    if roster.row_for_login(None).is_none() {
-        places.push((None, None));
-    }
-    for row in &roster.rows {
-        places.push((Some(row), row.dir.clone()));
-    }
-    places
+    super::observe::sweep::claude_places(roster, user_home, on_token)
         .into_iter()
-        .filter_map(|(row, dir)| {
-            let path = match dir.as_deref() {
-                None => super::profile::effective_of(&[], user_home)?,
-                Some(dir) => super::profile::profile_in_home(Path::new(dir)),
-            };
-            let record = super::profile::record_at(&path).ok().flatten();
-            let written_s = std::fs::metadata(&path)
+        .map(|place| {
+            let path = place.path();
+            let row = place.row;
+            let written_s = std::fs::metadata(path)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|at| i64::try_from(at.as_secs()).ok())
                 .map(|at| now.saturating_sub(at).max(0));
-            let observed = record.map(|record| record.email);
+            let observed = place.seen.email().map(str::to_owned);
             let agrees = match (
                 row.and_then(accounts::Row::expected_identity_email),
                 &observed,
@@ -19360,22 +19368,133 @@ pub fn places_seen(
                     .map(|(sid, _)| sid.clone())
                     .collect()
             });
-            Some(PlaceSeen {
+            PlaceSeen {
                 cli: Cli::Claude.id(),
-                place: shown(&path),
+                place: shown(path),
                 observed,
                 believed: row.map(|row| row.label.clone()),
                 agrees,
                 tabs,
                 written_s,
-                src: super::journal::ObservedSrc::Profile.word(),
-            })
+                src: place.src.word(),
+                gap: None,
+            }
         })
         .collect()
 }
 
-/// `aterm harness accounts observed [--json]`: one row per Claude Code login place on this Mac,
-/// what its file names beside what the roster believes is there, `✗` where they disagree.
+/// A login place as its CLI's observer read it ([`super::observe`]), beside the row `row` that
+/// names it. `fallback` is the place where the observer named no file.
+fn place_of(
+    cli: &'static str,
+    seen: &super::observe::Observation,
+    row: Option<&accounts::Row>,
+    state: &accounts::State,
+    fallback: &Path,
+    src: super::journal::ObservedSrc,
+    (user_home, now): (&Path, i64),
+) -> PlaceSeen {
+    use super::observe::Observation;
+    let (path, gap) = match seen {
+        Observation::Seen(seen) => (seen.path.as_path(), None),
+        Observation::SignedOut { path } => (path.as_path(), None),
+        Observation::KeyOnly { path, .. } => (path.as_path(), Some("key-only")),
+        Observation::Routed { route } => (fallback, Some(route.word())),
+        Observation::Unread => (fallback, Some("unread")),
+    };
+    let observed = seen.email().map(str::to_owned);
+    // A row of another account system (Kimi Code's regions) is another account's, whatever
+    // address it names.
+    let realm = match (
+        seen.seen().and_then(|seen| seen.region),
+        row.and_then(|row| row.vendor.region),
+    ) {
+        (Some(seen), Some(listed)) => seen == listed,
+        _ => true,
+    };
+    let agrees = match (
+        row.and_then(accounts::Row::expected_identity_email),
+        &observed,
+    ) {
+        (Some(expected), Some(seen)) => Some(realm && accounts::email_matches(expected, seen)),
+        _ => None,
+    };
+    PlaceSeen {
+        cli,
+        place: match path.strip_prefix(user_home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        observed,
+        believed: row.map(|row| row.label.clone()),
+        agrees,
+        tabs: row.map_or_else(Vec::new, |row| {
+            state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.account == row.label)
+                .map(|(sid, _)| sid.clone())
+                .collect()
+        }),
+        written_s: seen
+            .seen()
+            .and_then(|seen| seen.mtime)
+            .map(|at| now.saturating_sub(at).max(0)),
+        src: seen.seen().map_or(src, |seen| seen.src).word(),
+        gap,
+    }
+}
+
+/// Every login place of the pooled CLI `cli` other than Claude Code that `roster` names on this Mac,
+/// and its default home, each as its own observer reads it now ([`super::observe::pooled`]) for
+/// a process started on that place with nothing else set. The default home is a place whether
+/// or not a row names it, and is left out only where no row does and nothing is read there.
+/// Claude Code's places are [`places_seen`]'s.
+#[must_use]
+pub fn pool_places_seen(
+    cli: Cli,
+    roster: &Roster,
+    state: &accounts::State,
+    user_home: &Path,
+    now: i64,
+) -> Vec<PlaceSeen> {
+    super::observe::sweep::pool_places(cli, roster, user_home)
+        .iter()
+        .map(|place| {
+            place_of(
+                cli.id(),
+                &place.seen,
+                place.row,
+                state,
+                &place.fallback,
+                place.src,
+                (user_home, now),
+            )
+        })
+        .collect()
+}
+
+/// Muse Code's one login place on this Mac, as its observer reads it now
+/// ([`super::observe::muse`]): Muse keeps no roster, so no row believes anything of it. None
+/// where nothing is read there.
+#[must_use]
+pub fn muse_place_seen(user_home: &Path, now: i64) -> Option<PlaceSeen> {
+    super::observe::sweep::muse_place(user_home).map(|place| {
+        place_of(
+            place.cli.id(),
+            &place.seen,
+            None,
+            &accounts::State::default(),
+            &place.fallback,
+            place.src,
+            (user_home, now),
+        )
+    })
+}
+
+/// `aterm harness accounts observed [--json]`: one row per login place on this Mac (Claude
+/// Code's, Codex's, agy's, Grok Build's, Kimi Code's and Muse Code's), what its file names beside what the CLI's roster
+/// believes is there, `✗` where they disagree.
 fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     let Some(user_home) = env.home.as_deref() else {
         let _ = writeln!(out, "aterm harness accounts observed: no home is known");
@@ -19387,7 +19506,32 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
             Ok(records) => (records.roster, records.state),
             Err(_) => (Roster::default(), accounts::State::default()),
         };
-    let rows = places_seen(&roster, &state, user_home, env.now);
+    // A row on its vault token is read as its token's account. Where the vault cannot be read
+    // just now the report shows each directory's profile, as it does for a row on no token.
+    #[cfg(unix)]
+    let on_token = super::accounts_tokens::rows_on_token(
+        &aterm_secrets::client::Paths::for_home(user_home),
+        &store,
+        &roster,
+        env.now,
+    );
+    #[cfg(not(unix))]
+    let on_token = std::collections::BTreeMap::<String, u64>::new();
+    let on_token = super::observe::sweep::OnToken::Rows(on_token.into_keys().collect());
+    let mut rows = places_seen_on(&roster, &state, user_home, env.now, &on_token);
+    for cli in [Cli::Codex, Cli::Agy, Cli::Grok, Cli::Kimi] {
+        let records = env.accounts_store_for(cli).and_then(|store| {
+            store
+                .read_account_records(env.accounts_roster_for(cli).as_deref(), env.now)
+                .ok()
+        });
+        let (roster, state) = records.map_or_else(
+            || (Roster::default(), accounts::State::default()),
+            |records| (records.roster, records.state),
+        );
+        rows.extend(pool_places_seen(cli, &roster, &state, user_home, env.now));
+    }
+    rows.extend(muse_place_seen(user_home, env.now));
     if json {
         let value = Value::Array(
             rows.iter()
@@ -19401,6 +19545,7 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
                         "tabs": row.tabs,
                         "written_s": row.written_s,
                         "source": row.src,
+                        "gap": row.gap,
                     })
                 })
                 .collect(),
@@ -19435,7 +19580,9 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
             "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {}",
             row.cli,
             row.place,
-            row.observed.as_deref().unwrap_or("signed out"),
+            row.observed
+                .as_deref()
+                .unwrap_or_else(|| row.gap.unwrap_or("signed out")),
             believed,
             tabs,
             seen,

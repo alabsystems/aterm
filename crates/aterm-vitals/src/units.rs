@@ -8,17 +8,19 @@
 //! the row's % and live box, so a tile never disagrees with its row:
 //! - CPU: each logical core's busy fraction, pushed beside the CPU row's reading and only when it
 //!   is, from the same per-core fractions the row sums, so the mean of the tiles is the CPU %;
-//!   each cluster's mean of its cores with its busiest core's max; the queue tile's 1-minute
-//!   load beyond the cores.
+//!   each cluster's mean of its cores with its busiest core's max; the queue tile's run queue
+//!   beyond the cores (P10, the machine's runnable threads over 10 s, where read, else the
+//!   1-minute load: [`crate::runq`]).
 //! - Memory: compressor churn (bytes compressed and decompressed a second) against its own 7-day
 //!   sustained-30 s peak, and swap traffic against [`SWAP_OVER_BPS`].
 //! - Disk: each physical device's write and read rates against that device-direction's peak,
-//!   home's device first.
+//!   home's device first, and its queue: the operations in flight, `L = Δ(time serving reads and
+//!   writes) ÷ Δwall` (Little's law, A4 §5.4), from the same counters.
 //!
 //! A rate's peak learns for [`IO_LEARN_S`] (3 h) before its tile draws against it; until then its
 //! basis is [`CapBasis::Learning`] and the tile draws `hollow`.
 
-use crate::model::{CPU_OVER_BUSY, CapBasis, ClusterView, SWAP_OVER_BPS, day_of, note_peak};
+use crate::model::{CapBasis, ClusterView, SWAP_OVER_BPS, day_of, note_peak};
 use crate::peaks::{DailyMax, Peaks};
 use crate::ring::{BucketRing, NOW_WINDOW_MS, Taken};
 
@@ -67,35 +69,37 @@ impl Level {
     }
 }
 
-/// The CPU's queue tile (A1 §4.1).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The CPU's queue tile (A1 §4.1; A4 §2, §7).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Queue {
-    /// The 1-minute load beyond the cores as a share of them, `clamp((load1 − n)/n, 0, 1)`
+    /// The run queue beyond the cores as a share of them, `clamp((Q − n)/n, 0, 1)`
     /// ([`queue_level`]); the tile is absent at 0.
     pub level: f64,
     /// The CPU is over ([`cpu_over`]): the tile takes `over`.
     pub over: bool,
+    /// Which queue `Q` is: P10, or the 1-minute load where P10 is unread.
+    pub basis: crate::runq::QueueBasis,
 }
 
-/// `clamp((load1 − n)/n, 0, 1)`: the over rule's own arm (load1 > n), as a level. 0 for no cores
-/// or a load that is not a number.
+/// `clamp((Q − n)/n, 0, 1)`: the over rule's own arm (`Q > n`), as a level, `Q` the run queue's
+/// threads. 0 for no cores or a queue that is not a number.
 #[must_use]
-pub fn queue_level(load1: f64, n: usize) -> f64 {
-    if n == 0 || !load1.is_finite() {
+pub fn queue_level(queue: f64, n: usize) -> f64 {
+    if n == 0 || !queue.is_finite() {
         return 0.0;
     }
     let n = n as f64;
-    ((load1 - n) / n).clamp(0.0, 1.0)
+    ((queue - n) / n).clamp(0.0, 1.0)
 }
 
-/// The CPU over rule: the 1-minute load past the cores while at least [`CPU_OVER_BUSY`] of
-/// them are busy.
+/// The CPU over rule at one reading, `busy` the busy cores and `n` the cores: the one rule
+/// ([`crate::strain::cpu_over_depth`]) over the run queue `queue` (P10, or the 1-minute load
+/// where P10 is unread).
 #[must_use]
-pub fn cpu_over(busy: Option<f64>, n: Option<usize>, load1: Option<f64>) -> bool {
-    match (busy, n, load1) {
-        (Some(b), Some(n), Some(load)) => load > n as f64 && b >= CPU_OVER_BUSY * n as f64,
-        _ => false,
-    }
+pub fn cpu_over(busy: Option<f64>, n: Option<usize>, queue: Option<crate::runq::RunQueue>) -> bool {
+    let n = n.filter(|&n| n > 0).map(|n| n as f64);
+    crate::strain::cpu_over_depth(busy.zip(n).map(|(b, n)| b / n), n, queue.map(|q| q.threads))
+        .is_some()
 }
 
 /// A rate drawn against its own peak (compressor churn, a disk direction).
@@ -216,6 +220,9 @@ pub struct Disk {
     pub write: Rate,
     /// Bytes read a second, against its read peak.
     pub read: Rate,
+    /// Its queue: operations in flight, 10 s mean and max, `L = Δ(read + write time) ÷ Δwall`
+    /// (Little's law, A4 §5.4); `None` until two readings give one.
+    pub queue: Option<Level>,
 }
 
 /// What the units draw at one reading.
@@ -227,7 +234,7 @@ pub struct Units {
     /// Each cluster, in [`crate::CpuView::clusters`] order: its cores' mean, and its busiest
     /// core's max as the tick.
     pub clusters: Vec<Option<Level>>,
-    /// The queue tile, where the load and the cores were read.
+    /// The queue tile, where a run queue and the cores were read.
     pub queue: Option<Queue>,
     /// Compressor churn, bytes a second, where the VM reads its compressor's counters.
     pub churn: Option<Rate>,
@@ -253,8 +260,8 @@ pub(crate) struct UnitReading<'a> {
     pub n_cores: Option<usize>,
     /// The clusters, fastest first.
     pub clusters: &'a [ClusterView],
-    /// The 1-minute load.
-    pub load1: Option<f64>,
+    /// The run queue the over rule reads ([`crate::RowFacts::queue`]).
+    pub queue: Option<crate::runq::RunQueue>,
     /// Compressor churn this reading, bytes a second.
     pub churn_bps: Option<f64>,
     /// Whether the memory reading carried the VM's counters.
@@ -271,10 +278,31 @@ pub(crate) struct UnitReading<'a> {
 #[derive(Debug)]
 struct DiskRings {
     id: String,
-    /// When its counters were last read (monotonic ns), and its bytes written and read then.
-    last: Option<(u64, u64, u64)>,
+    /// When its counters were last read (monotonic ns), and its counters then.
+    last: Option<(u64, Counters)>,
     write: BucketRing,
     read: BucketRing,
+    /// Operations in flight.
+    queue: BucketRing,
+}
+
+/// A device's counters a rate is taken between.
+#[derive(Clone, Copy, Debug)]
+struct Counters {
+    write_bytes: u64,
+    read_bytes: u64,
+    /// Time serving reads and writes, ns.
+    busy_ns: u64,
+}
+
+impl Counters {
+    fn of(b: &BlockSample) -> Self {
+        Self {
+            write_bytes: b.write_bytes,
+            read_bytes: b.read_bytes,
+            busy_ns: b.read_ns.saturating_add(b.write_ns),
+        }
+    }
 }
 
 /// The units' running state, beside the rows' ([`crate::Vitals`]).
@@ -332,10 +360,11 @@ impl UnitRings {
         let queue = r
             .n_cores
             .filter(|&n| n > 0)
-            .zip(r.load1)
-            .map(|(n, load1)| Queue {
-                level: queue_level(load1, n),
-                over: cpu_over(busy, Some(n), Some(load1)),
+            .zip(r.queue)
+            .map(|(n, q)| Queue {
+                level: queue_level(q.threads, n),
+                over: cpu_over(busy, Some(n), Some(q)),
+                basis: q.basis,
             });
 
         let closed = self
@@ -394,24 +423,32 @@ impl UnitRings {
                         last: None,
                         write: unit_ring(),
                         read: unit_ring(),
+                        queue: unit_ring(),
                     });
                     self.disks.len() - 1
                 }
             };
             let mut rings = self.disks.remove(at);
-            let (write_bps, read_bps) = match rings.last {
-                Some((then, w, rd))
-                    if r.at_ns > then && b.write_bytes >= w && b.read_bytes >= rd =>
+            let now = Counters::of(b);
+            let (write_bps, read_bps, in_flight) = match rings.last {
+                Some((then, c))
+                    if r.at_ns > then
+                        && now.write_bytes >= c.write_bytes
+                        && now.read_bytes >= c.read_bytes =>
                 {
-                    let per_s = |d: u64| d as f64 * 1e9 / (r.at_ns - then) as f64;
+                    let dt = (r.at_ns - then) as f64;
+                    let per_s = |d: u64| d as f64 * 1e9 / dt;
                     (
-                        Some(per_s(b.write_bytes - w)),
-                        Some(per_s(b.read_bytes - rd)),
+                        Some(per_s(now.write_bytes - c.write_bytes)),
+                        Some(per_s(now.read_bytes - c.read_bytes)),
+                        // Little's law: time spent serving, summed over operations, per unit of
+                        // wall time is the mean number in flight.
+                        now.busy_ns.checked_sub(c.busy_ns).map(|d| d as f64 / dt),
                     )
                 }
-                _ => (None, None),
+                _ => (None, None, None),
             };
-            rings.last = Some((r.at_ns, b.write_bytes, b.read_bytes));
+            rings.last = Some((r.at_ns, now));
             let peak = peaks.disk(&b.id);
             let closed = rings
                 .write
@@ -421,12 +458,16 @@ impl UnitRings {
                 .read
                 .push(Taken::at(r.now, r.period_ms), read_bps, false);
             note_peak(&rings.read, closed, &mut peak.read);
+            let _ = rings
+                .queue
+                .push(Taken::at(r.now, r.period_ms), in_flight, false);
             out.push(Disk {
                 id: b.id.clone(),
                 name: b.name.clone(),
                 location: b.location,
                 write: Rate::of(&rings.write, r.now, &peak.write),
                 read: Rate::of(&rings.read, r.now, &peak.read),
+                queue: Level::of(&rings.queue, r.now),
             });
             self.disks.insert(0, rings);
         }

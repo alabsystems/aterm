@@ -748,15 +748,14 @@ fn build_slices(
         );
         let built = (|| {
             let units = units.iter().find(|u| u.triple() == triple);
-            let need = crate::slice_units::slice_need(triple, target.is_none(), units);
+            let need = crate::slice_units::slice_need(triple, units);
             println!(
                 "==> [{triple}] memory: claims {} for {}",
                 aterm_capacity::size(need.mem),
                 if units.is_some_and(crate::slice_units::Units::claims) {
-                    "its driver; each compiler claims its unit's recorded peak, leading"
+                    "its driver; each compiler claims its measured peak plus margin, leading"
                 } else {
-                    "its whole build (no record of every slice's last unit yet; its compilers \
-                     record theirs)"
+                    "its driver, alone while its compilers learn this toolchain's footprints"
                 }
             );
             let memory = aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
@@ -1265,7 +1264,7 @@ pub(crate) fn contention_slices(
             let units = units.iter().find(|u| u.triple() == triple);
             scope.spawn(move || {
                 let _memory = aterm_capacity::admit(
-                    crate::slice_units::slice_need(triple, target.is_none(), units),
+                    crate::slice_units::slice_need(triple, units),
                     aterm_capacity::Admit::Wait,
                 ).map_err(|e| e.to_string())?;
                 let run = SliceRun {
@@ -3171,23 +3170,29 @@ mod tests {
 
     #[test]
     fn release_slice_memory_waits_instead_of_overriding_available_memory() {
-        for (native, gib) in [(true, 42), (false, 23)] {
+        for triple in [super::ARM64, super::X86_64] {
             let dir = aterm_tempfile::tempdir().unwrap();
             let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
-            let machine =
-                aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, gib - 1, 16));
-            let need = crate::slice_units::slice_need("injected", native, None);
-            assert_eq!(need.mem, gib << 30);
+            let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 16));
+            let need = crate::slice_units::slice_need(triple, None);
+            assert!(need.alone, "unmeasured slices learn in isolation");
+            let other = aterm_capacity::admit::try_admit_with(
+                &ledger,
+                &machine,
+                aterm_capacity::Need::new("tree").mem_gib(1),
+            )
+            .unwrap()
+            .unwrap();
             assert!(
                 aterm_capacity::admit::try_admit_with(&ledger, &machine, need.clone())
                     .unwrap()
                     .is_none()
             );
-            machine.set(aterm_capacity::Reading::of_gib(128, gib + 1, 16));
+            drop(other);
             let claim = aterm_capacity::admit::try_admit_with(&ledger, &machine, need)
                 .unwrap()
                 .unwrap();
-            assert!(claim.alone().is_none());
+            assert!(claim.alone().is_some());
         }
     }
 

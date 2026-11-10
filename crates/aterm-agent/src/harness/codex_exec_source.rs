@@ -134,6 +134,7 @@ impl ExecSource {
             sid,
             supervisor: accounts::Supervisor::Own,
             env: env.as_slice(),
+            seen: &crate::harness::observe::Observation::Unread,
             sample: None,
             point: accounts::Point::Wall {
                 window: "seven_day".into(),

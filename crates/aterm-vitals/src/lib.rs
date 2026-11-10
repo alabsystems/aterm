@@ -5,11 +5,13 @@
 
 #![warn(missing_docs)]
 
+pub mod blockage;
 pub mod delegated;
 pub mod events;
 pub mod explain;
 pub mod gpu_clients;
 pub mod hardware;
+pub mod heat;
 pub mod history;
 pub mod ink;
 pub mod jobs;
@@ -18,8 +20,10 @@ pub mod model;
 pub mod peaks;
 pub mod program_check;
 pub mod ring;
+pub mod runq;
 pub mod scheduling;
 pub mod services;
+pub mod situation;
 pub mod starts;
 pub mod strain;
 pub mod sys;
@@ -34,10 +38,10 @@ pub use model::{
     AccountIx, AneCheck, AneSample, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView,
     CommitSample, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot,
     Hog, LinkKind, LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView,
-    NetState, NetView, NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample, ProcState,
-    ProcView, Resource, ResourceView, RowFacts, RowScope, STRIP_RINGS, Sample, SavedStrip,
-    ScopeFig, ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind, StripLine,
-    TabRoot, TabTokens, TabView, TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals,
+    NetState, NetView, NoFigure, PlaceKind, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample,
+    ProcState, ProcView, Resource, ResourceView, RowFacts, RowScope, STRIP_RINGS, Sample,
+    SavedStrip, ScopeFig, ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind,
+    StripLine, TabRoot, TabTokens, TabView, TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals,
     VolumeSample, Writer,
 };
 pub use peaks::{DailyMax, DiskPeaks, PeakRow, Peaks};

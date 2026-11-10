@@ -917,7 +917,7 @@ fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_dro
         );
     }
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    inherited_description_keeps_a_dropped_prerequisite_until_actual_child_reap();
+    a_dropped_prerequisite_is_reclaimable_while_a_forked_child_holds_its_copy();
 }
 
 #[test]
@@ -973,8 +973,10 @@ fn first_party_admission_refuses_forged_identity_environment_target_and_payload(
     }
 }
 
+/// A dropped prerequisite lease lets go by `LOCK_UN`, so a child another thread forked, holding a
+/// copy of its descriptor only until its `exec` closes it, does not keep the build held.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn inherited_description_keeps_a_dropped_prerequisite_until_actual_child_reap() {
+fn a_dropped_prerequisite_is_reclaimable_while_a_forked_child_holds_its_copy() {
     let fixture = Fixture::new(Prerequisite::Gitleaks);
     let tool = fixture
         .session(TRIPLE)
@@ -984,23 +986,15 @@ fn inherited_description_keeps_a_dropped_prerequisite_until_actual_child_reap() 
     let subject = Subject::build("gitleaks", 7).unwrap();
     let child = aterm_uds::fork_window::Parked::park();
     drop(tool);
-    let retained = crate::lease::reclaim(&fixture.layout.prefix, &subject);
-    assert!(
-        matches!(
-            retained,
-            crate::lease::Reclaim::Keep(crate::lease::Holders::Held(_))
-        ),
-        "fork inherited real custody despite CLOEXEC: {retained:?}"
-    );
-    drop(retained);
-    assert!(
-        child.release().success(),
-        "the owned child execs and is reaped"
-    );
     let reclaimed = crate::lease::reclaim(&fixture.layout.prefix, &subject);
     assert!(
         matches!(reclaimed, crate::lease::Reclaim::Clear(_)),
-        "after final actual child close and reap: {reclaimed:?}"
+        "a dropped lease is let go beside a forked child: {reclaimed:?}"
+    );
+    drop(reclaimed);
+    assert!(
+        child.release().success(),
+        "the owned child execs and is reaped"
     );
 }
 

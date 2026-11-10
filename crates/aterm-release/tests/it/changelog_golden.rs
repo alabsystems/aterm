@@ -145,11 +145,11 @@ fn the_generated_harness_line_alone_is_no_release_notes() {
          in which it changed.",
         changelog::HARNESS_ENTRY_HEAD
     );
-    let alone = format!("## [Unreleased]\n\n### Changed\n\n{generated}\n\n## [0.25] - x\n- y\n");
+    let alone = format!("## [Unreleased]\n\n### Changed\n\n{generated}\n\n## [0.149.0] - x\n- y\n");
     let err = changelog::gate_unreleased(&alone).unwrap_err().to_string();
     assert!(err.contains("no release notes"), "{err}");
     let beside = format!(
-        "## [Unreleased]\n\n### Changed\n\n{generated}\n\n### Fixed\n\n- **A fix.**\n\n## [0.25] - x\n"
+        "## [Unreleased]\n\n### Changed\n\n{generated}\n\n### Fixed\n\n- **A fix.**\n\n## [0.149.0] - x\n"
     );
     assert_eq!(changelog::gate_unreleased(&beside).unwrap().entries, 2);
     let hand = "## [Unreleased]\n\n### Fixed\n\n- **A fix.**\n\n## [0.25] - x\n";

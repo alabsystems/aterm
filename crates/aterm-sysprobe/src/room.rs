@@ -2,7 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The machine's task tables: what each holds now and the most it may hold, the four pairs the
-//! Processes row's Room weighs (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §8.1).
+//! Processes row's Room weighs (`docs/DESIGN-stats-deck-flow-2026-11-02.md` §8.1), and the run
+//! queue the read of the thread table answers beside them ([`crate::runq`]).
+
+use crate::runq::RunQueue;
 
 /// What the machine's task tables hold and the most each may hold. Each figure is `None` where
 /// this OS does not say it (and a limit where it is unlimited).
@@ -32,6 +35,10 @@ pub struct TaskRoom {
     /// The most [`Self::files`] may be: macOS `kern.maxfiles`, Linux `fs.file-max`; `None` on
     /// Windows.
     pub files_max: Option<u64>,
+    /// The machine's run queue from the read that counts its threads ([`crate::runq`]): macOS
+    /// the processor set's `load_average` (held to its `mach_factor`), Linux `/proc/loadavg`'s
+    /// running count; [`RunQueue::Unsupported`] on Windows.
+    pub run_queue: RunQueue,
 }
 
 /// The machine's [`TaskRoom`], its per-user pair for real user `uid`.
@@ -82,15 +89,15 @@ pub fn file_nr_open(text: &str) -> Option<u64> {
 const PROCESSOR_SET_LOAD_INFO: std::ffi::c_int = 4;
 
 /// `struct processor_set_load_info` (`mach/processor_info.h`): four `integer_t`s, of which the
-/// reader reads `thread_count` (the others keep their places).
+/// reader reads `thread_count`, `load_average` and `mach_factor` (`task_count` keeps its place).
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct PsetLoadInfo {
     _task_count: std::ffi::c_int,
     thread_count: std::ffi::c_int,
-    _load_average: std::ffi::c_int,
-    _mach_factor: std::ffi::c_int,
+    load_average: std::ffi::c_int,
+    mach_factor: std::ffi::c_int,
 }
 
 /// The processor-set layouts and flavor this reader declares, held to the SDK headers by
@@ -107,6 +114,14 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         std::mem::offset_of!(PsetLoadInfo, thread_count) as i64,
     ),
     (
+        "offsetof(struct processor_set_load_info, load_average)",
+        std::mem::offset_of!(PsetLoadInfo, load_average) as i64,
+    ),
+    (
+        "offsetof(struct processor_set_load_info, mach_factor)",
+        std::mem::offset_of!(PsetLoadInfo, mach_factor) as i64,
+    ),
+    (
         "PROCESSOR_SET_LOAD_INFO_COUNT",
         (std::mem::size_of::<PsetLoadInfo>() / std::mem::size_of::<std::ffi::c_int>()) as i64,
     ),
@@ -117,7 +132,7 @@ mod imp {
     use std::ffi::{CStr, c_int};
     use std::sync::OnceLock;
 
-    use super::{PROCESSOR_SET_LOAD_INFO, PsetLoadInfo, TaskRoom};
+    use super::{PROCESSOR_SET_LOAD_INFO, PsetLoadInfo, RunQueue, TaskRoom};
 
     unsafe extern "C" {
         fn processor_set_default(
@@ -144,9 +159,9 @@ mod imp {
         })
     }
 
-    /// Every thread on the machine: the default processor set's `thread_count` (macOS has one
-    /// set), unprivileged through its name port.
-    fn threads() -> Option<u64> {
+    /// The default processor set's load info (macOS has one set), unprivileged through its name
+    /// port; `None` where the call fails or answers short.
+    fn pset_load() -> Option<PsetLoadInfo> {
         let mut info = PsetLoadInfo::default();
         let words = std::mem::size_of::<PsetLoadInfo>() / std::mem::size_of::<c_int>();
         let mut count = libc::mach_msg_type_number_t::try_from(words).ok()?;
@@ -161,10 +176,35 @@ mod imp {
             )
         };
         let whole = usize::try_from(count).ok() == Some(words);
-        (kr == 0 && whole)
-            .then(|| u64::try_from(info.thread_count).ok())
-            .flatten()
-            .filter(|n| *n > 0)
+        (kr == 0 && whole).then_some(info)
+    }
+
+    /// The most processors the set's averages can count: the machine's logical cores, the one
+    /// count [`crate::cpu_layout`] gives (`aterm_capacity`'s and the vitals' too), read once.
+    fn cores() -> Option<u64> {
+        static CORES: OnceLock<Option<u64>> = OnceLock::new();
+        *CORES.get_or_init(|| {
+            u64::try_from(crate::cpu_layout().logical_cores())
+                .ok()
+                .filter(|n| *n > 0)
+        })
+    }
+
+    /// Every thread on the machine, the set's `thread_count`, and its run queue
+    /// ([`crate::runq::of_pset`]), from one read.
+    fn threads_and_queue() -> (Option<u64>, RunQueue) {
+        let Some(info) = pset_load() else {
+            return (None, RunQueue::Failed);
+        };
+        let threads = u64::try_from(info.thread_count).ok().filter(|n| *n > 0);
+        let queue = cores().map_or(RunQueue::Failed, |cores| {
+            crate::runq::of_pset(
+                i64::from(info.load_average),
+                i64::from(info.mach_factor),
+                cores,
+            )
+        });
+        (threads, queue)
     }
 
     pub(super) fn task_room(uid: u32) -> TaskRoom {
@@ -174,6 +214,7 @@ mod imp {
                 .filter(|v| *v > 0)
         };
         let (procs, user_procs) = crate::macos::pid_counts(uid);
+        let (threads, run_queue) = threads_and_queue();
         TaskRoom {
             procs,
             procs_max: positive(c"kern.maxproc"),
@@ -182,10 +223,11 @@ mod imp {
                 positive(c"kern.maxprocperuid"),
                 crate::machine::nproc_rlimit(),
             ),
-            threads: threads(),
+            threads,
             threads_max: positive(c"kern.num_threads"),
             files: crate::macos::sysctl_int(c"kern.num_files").and_then(|v| u64::try_from(v).ok()),
             files_max: positive(c"kern.maxfiles"),
+            run_queue,
         }
     }
 }

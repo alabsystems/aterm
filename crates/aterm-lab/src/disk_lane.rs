@@ -339,6 +339,17 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
 }
 
+/// The lane's stand-in build's `.cargo-lock`, let go by `LOCK_UN` before its close: an flock lives
+/// on the open file description, so a close alone leaves it held in every child forked meanwhile
+/// until its `exec` (clippy.toml: the flock release rule), on the error paths too.
+struct BuildLock(std::fs::File);
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Run the `disk-lane` disk awareness live lane.
 ///
 /// # Errors
@@ -422,6 +433,7 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     )]
     let held = lock.try_lock();
     held.map_err(|e| format!("cannot take the lock: {e:?}"))?;
+    let lock = BuildLock(lock);
     let free = free_on(&home).ok_or("the image's free space could not be read")?;
     let target = (9 << 30) / 2;
     if free > target {

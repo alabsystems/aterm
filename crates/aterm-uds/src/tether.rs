@@ -190,6 +190,82 @@ fn held_until_exit(
     false
 }
 
+/// A query's positive original-child exit is distinct from a failed watch read.
+#[cfg(any(target_vendor = "apple", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExitNotice {
+    Pending,
+    Exited,
+    Unavailable,
+}
+
+/// Positive point evidence, not permission retained across later signals.
+#[cfg(any(target_vendor = "apple", test))]
+fn group_readiness(
+    watched: Watched,
+    control: &mut impl EndControl,
+    proof: &mut impl FnMut(i32) -> Option<Proof>,
+    exited: &mut bool,
+    exit_notice: &mut impl FnMut(Duration) -> ChildExitNotice,
+) -> group::Readiness {
+    if *exited {
+        return group::Readiness::Exited;
+    }
+    let token = watched.token();
+    let before = Versionless(&mut *control).identity(watched.pid);
+    let observed = proof(watched.pid);
+    let after = Versionless(&mut *control).identity(watched.pid);
+    let current = if before == Some(token)
+        && after == Some(token)
+        && observed.is_some_and(|read| read.uniqueid == watched.uniqueid)
+    {
+        match observed {
+            Some(Proof { ran: true, .. }) => group::Readiness::Started,
+            _ => group::Readiness::Held,
+        }
+    } else {
+        group::Readiness::Unavailable
+    };
+    if current == group::Readiness::Started {
+        return current;
+    }
+    match exit_notice(Duration::ZERO) {
+        ChildExitNotice::Exited => {
+            *exited = true;
+            group::Readiness::Exited
+        }
+        ChildExitNotice::Pending => current,
+        ChildExitNotice::Unavailable => group::Readiness::Unavailable,
+    }
+}
+
+/// The production parent-exit path: retain the initial held wait, then renew
+/// positive point readiness immediately before each owned-group signal.
+#[cfg(any(target_vendor = "apple", test))]
+fn end_group_once_ready(
+    watched: Watched,
+    mut exited: bool,
+    control: &mut impl EndControl,
+    mut proof: impl FnMut(i32) -> Option<Proof>,
+    mut exit_notice: impl FnMut(Duration) -> ChildExitNotice,
+    group: &mut impl group::GroupControl,
+) -> Option<group::GroupEnded> {
+    loop {
+        match group_readiness(watched, control, &mut proof, &mut exited, &mut exit_notice) {
+            group::Readiness::Started | group::Readiness::Exited => break,
+            group::Readiness::Unavailable => return None,
+            group::Readiness::Held => match exit_notice(HELD_RECHECK) {
+                ChildExitNotice::Pending => {}
+                ChildExitNotice::Exited => exited = true,
+                ChildExitNotice::Unavailable => return None,
+            },
+        }
+    }
+    group::end_group_guarded(watched.pid, crate::process::END_GRACE, group, || {
+        group_readiness(watched, control, &mut proof, &mut exited, &mut exit_notice)
+    })
+}
+
 /// An [`EndControl`] whose identity reads drop their pid version, for a token that has none. Its
 /// signals get that token as it is, with no pid version: an inner arm whose signal re-reads the
 /// identity must judge it as these reads do.
@@ -648,17 +724,35 @@ fn noted(events: &[libc::kevent], pid: i32, notes: u32) -> bool {
 /// As [`watch`]'s, with `kq` the watcher's queue.
 #[cfg(target_vendor = "apple")]
 unsafe fn child_exited_within(kq: i32, child: i32) -> bool {
+    !matches!(
+        // SAFETY: this is the same owned watch and live kqueue as this function's contract.
+        unsafe { child_exit_notice(kq, child, HELD_RECHECK) },
+        ChildExitNotice::Pending
+    )
+}
+
+/// Typed read of the armed original child's exit. Errors refuse execution
+/// evidence; they must never grant a group's positive Exited state.
+///
+/// # Safety
+/// As [`watch`]'s, with `kq` the watcher's queue.
+#[cfg(target_vendor = "apple")]
+unsafe fn child_exit_notice(kq: i32, child: i32, patience: Duration) -> ChildExitNotice {
     const BLANK: libc::kevent = watch_of(0, 0);
     let pause = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: libc::c_long::try_from(HELD_RECHECK.as_nanos()).unwrap_or(0),
+        tv_sec: libc::time_t::try_from(patience.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::from(patience.subsec_nanos()),
     };
     let mut events = [BLANK; 2];
     // SAFETY: `events` is a live array of two kevents the call fills; nothing is changed.
     let got = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), 2, &pause) };
     match usize::try_from(got) {
-        Ok(got) => noted(&events[..got.min(2)], child, libc::NOTE_EXIT),
-        Err(_) => std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted,
+        Ok(got) if noted(&events[..got.min(2)], child, libc::NOTE_EXIT) => ChildExitNotice::Exited,
+        Ok(_) => ChildExitNotice::Pending,
+        Err(_) if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+            ChildExitNotice::Pending
+        }
+        Err(_) => ChildExitNotice::Unavailable,
     }
 }
 
@@ -696,9 +790,14 @@ unsafe fn watch(
         // exits at once and stays a zombie until the watcher exits, since `SIGCHLD` is reset to
         // its default (no automatic reap) and nothing here waits on it. `waitid`'s `WNOWAIT` sees
         // it exited and leaves it unreaped. One that does not arm so exits the watcher unarmed.
-        if leads && !anchored() {
-            libc::_exit(1);
-        }
+        let anchor = if leads {
+            match anchored() {
+                Some(anchor) => Some(anchor),
+                None => libc::_exit(1),
+            }
+        } else {
+            None
+        };
         // Then, before it arms: out of the child's group and session. The watcher is the
         // tether's second fork, never a group leader, so `setsid` has no cause to refuse; if it
         // does, the watcher exits unarmed and the tether starts nothing.
@@ -767,16 +866,16 @@ unsafe fn watch(
                     })
                 };
                 let mut control = crate::process::EndControlLive;
-                if leads {
+                if let Some(anchor) = &anchor {
                     // A child held before its first instruction gets no signal, by the group or
                     // alone; one that exited so started nothing the group could hold.
-                    let _held_exit = held_until_exit(watched, &mut control, proof, || {
-                        child_exited_within(kq, child)
-                    });
-                    let _ended = group::end_group(
-                        child,
-                        crate::process::END_GRACE,
-                        &mut group::GroupLive { kq, parent },
+                    let _ended = end_group_once_ready(
+                        watched,
+                        noted(events, child, libc::NOTE_EXIT),
+                        &mut control,
+                        proof,
+                        |patience| child_exit_notice(kq, child, patience),
+                        &mut group::GroupLive { kq, parent, anchor },
                     );
                 }
                 // The child alone, by its proof: any child of a watcher that did not lead its
@@ -792,11 +891,14 @@ unsafe fn watch(
                 libc::_exit(0);
             }
             if noted(events, child, libc::NOTE_EXIT) {
-                if leads && group::linger(child, &mut group::GroupLive { kq, parent }) {
-                    let _ended = group::end_group(
+                if let Some(anchor) = &anchor
+                    && group::linger(child, &mut group::GroupLive { kq, parent, anchor })
+                {
+                    let _ended = group::end_group_guarded(
                         child,
                         crate::process::END_GRACE,
-                        &mut group::GroupLive { kq, parent },
+                        &mut group::GroupLive { kq, parent, anchor },
+                        || group::Readiness::Exited,
                     );
                 }
                 libc::_exit(0);
@@ -807,39 +909,94 @@ unsafe fn watch(
 
 /// The watcher's anchor in the group its child leads: a fork that exits at once, seen exited by
 /// `waitid`'s `WNOWAIT` and left unreaped, with `SIGCHLD` reset to its default so the kernel does
-/// not reap it either. `false` when it could not be made so.
+/// not reap it either. `None` when it could not be made so.
 ///
 /// # Safety
 /// As [`watch`]'s, before the watcher leaves the child's group.
 #[cfg(target_vendor = "apple")]
-unsafe fn anchored() -> bool {
+unsafe fn anchored() -> Option<Anchor> {
     // SAFETY (whole body): the function's contract; every pointer is to a live local.
     unsafe {
         let mut default: libc::sigaction = std::mem::zeroed();
         default.sa_sigaction = libc::SIG_DFL;
         if libc::sigaction(libc::SIGCHLD, &default, std::ptr::null_mut()) != 0 {
-            return false;
+            return None;
         }
         let anchor = libc::fork();
         if anchor == 0 {
             libc::_exit(0);
         }
         if anchor < 0 {
-            return false;
+            return None;
         }
         let Ok(id) = libc::id_t::try_from(anchor) else {
-            return false;
+            return None;
         };
         loop {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             if libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) == 0 {
-                return info.si_pid == anchor;
+                if terminal_anchor_wait(anchor, info.si_signo, info.si_pid, info.si_code) {
+                    return Some(Anchor { pid: anchor });
+                }
+                // Darwin can report a stop despite WEXITED. This is still our
+                // actual, unreaped fork, but it is not an exited anchor. Refuse
+                // arming and clean up that owned child, never a listed pid.
+                if info.si_signo == libc::SIGCHLD && info.si_pid == anchor {
+                    retire_unarmed_anchor(anchor);
+                }
+                return None;
             }
             if *libc::__error() != libc::EINTR {
-                return false;
+                return None;
             }
         }
     }
+}
+
+/// A matching pid alone is insufficient: WEXITED may report a stopped Darwin child.
+#[cfg(any(target_vendor = "apple", all(test, unix)))]
+fn terminal_anchor_wait(expected: i32, signo: i32, pid: i32, code: i32) -> bool {
+    signo == libc::SIGCHLD
+        && pid == expected
+        && matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
+}
+
+/// End and reap only the actual fork whose nonterminal SIGCHLD was just observed,
+/// while that unreaped child still pins its number. A kernel-blocked child is left
+/// to the kernel after the existing group cleanup bound; the watcher stays unarmed.
+///
+/// # Safety
+/// The caller is the sole waiter of this actual, unreaped fork, as in `anchored()`.
+#[cfg(target_vendor = "apple")]
+unsafe fn retire_unarmed_anchor(anchor: i32) {
+    // SAFETY (whole body): that actual child remains unreaped until this sole
+    // wait returns its pid. No signal is sent after the wait, even on error.
+    unsafe {
+        libc::kill(anchor, libc::SIGKILL);
+        let until =
+            crate::deadline::saturating_after(std::time::Instant::now(), group::KILL_ROUNDS);
+        loop {
+            let mut status = 0;
+            let got = libc::waitpid(anchor, &mut status, libc::WNOHANG);
+            if got == anchor && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
+                || got < 0 && *libc::__error() != libc::EINTR
+            {
+                return;
+            }
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(20)));
+        }
+    }
+}
+
+/// The watcher's actual exited child, never reaped while this native watch runs.
+/// Only `anchored()` constructs it after its own fork and successful WNOWAIT.
+#[cfg(target_vendor = "apple")]
+pub(super) struct Anchor {
+    pid: i32,
 }
 
 #[cfg(any(target_vendor = "apple", test))]
@@ -850,6 +1007,24 @@ mod group;
 mod tests {
     use super::{Through, lost_of, parent_pid};
     use std::ffi::OsStr;
+
+    #[test]
+    #[cfg(unix)]
+    fn an_anchor_requires_a_terminal_sigchld_for_the_actual_child() {
+        for code in [libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED] {
+            assert!(super::terminal_anchor_wait(42, libc::SIGCHLD, 42, code));
+        }
+        for code in [libc::CLD_STOPPED, libc::CLD_TRAPPED, libc::CLD_CONTINUED] {
+            assert!(!super::terminal_anchor_wait(42, libc::SIGCHLD, 42, code));
+        }
+        assert!(!super::terminal_anchor_wait(
+            42,
+            libc::SIGCHLD,
+            43,
+            libc::CLD_EXITED
+        ));
+        assert!(!super::terminal_anchor_wait(42, 0, 42, libc::CLD_EXITED));
+    }
 
     #[test]
     fn parent_pid_accepts_only_unsigned_pids_above_init() {

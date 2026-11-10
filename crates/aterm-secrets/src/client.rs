@@ -194,6 +194,9 @@ pub use retirement::{
 #[cfg(any(test, debug_assertions))]
 pub use roster::admin_seed_swarm_roster;
 #[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use roster::test_roster_observations;
+#[cfg(any(test, debug_assertions))]
 pub use roster::test_unwaited_roster;
 pub use roster::{historical_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
 pub(crate) use roster::{vault_busy, with_roster_observation, with_roster_observation_or_busy};
@@ -214,9 +217,6 @@ pub use steward::{
     steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-pub use vault_memo::test_looks_observed;
 pub use vault_memo::{
     DeskInputs, VaultLook, acknowledged_commons_log_now, config_now, desk_inputs,
     desk_inputs_quiet, local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now,
@@ -227,6 +227,9 @@ pub(crate) use vault_memo::{
     local_recipient_denied_under, observe_commons_now, observe_commons_quiet, state_standing_in,
     trusted_commons_log_under,
 };
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use vault_memo::{test_logs_read, test_looks_observed};
 #[cfg(test)]
 mod approver_queue_tests;
 #[cfg(test)]

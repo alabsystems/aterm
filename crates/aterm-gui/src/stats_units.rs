@@ -293,9 +293,8 @@ impl UnitFacts {
                 work: true,
             })
         } else if cfg!(target_os = "linux") {
-            // No watt tile: sysprobe's NVML binding reads no power and nothing reads RAPL (A3
-            // rejects it: root-only, package scope), so A4 §4's Linux watts have no reader. The
-            // step that brings an NVML power reading into the Snapshot plans the GPU's tile here.
+            // No watt tile yet: N2 reads RAPL's package energy and NVML's board power into
+            // `snap.heat.watts`, and N5 plans their tiles here from those readings (A4 §4).
             Some(Heat {
                 ladder: true,
                 clocks: 0,

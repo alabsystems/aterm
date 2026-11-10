@@ -3393,6 +3393,8 @@ fn the_node_job_replaces_a_stalled_checker_once_and_a_fresh_one_never() {
         at_secs,
         max_interval_secs: 1_100,
         respawns: 0,
+        workers: 1,
+        worker_epoch: 0,
         deferrals: 0,
         settings_misses: 0,
         lane: None,

@@ -3750,6 +3750,158 @@ fn a_dry_run_without_rs_cutter_reports_no_r_verdict() {
     );
 }
 
+/// A real workspace holder cannot release until stderr proves the dry flow joined its
+/// handoff. No timed sleep decides when to release or signal the waiting controller.
+#[cfg(unix)]
+#[test]
+fn a_dry_run_waits_for_prefreeze_then_gives_rs_verdict() {
+    dry_prefreeze_wait(
+        false,
+        "release_flow::a_dry_run_waits_for_prefreeze_then_gives_rs_verdict",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_interrupted_during_prefreeze_ends_cleanly() {
+    dry_prefreeze_wait(
+        true,
+        "release_flow::a_dry_run_interrupted_during_prefreeze_ends_cleanly",
+    );
+}
+
+#[cfg(unix)]
+fn dry_prefreeze_wait(interrupted: bool, test: &str) {
+    use crate::release_steps::dry_tools_tests::PrefreezeFixture;
+    use aterm_uds::spawnfd::{Stdio, command};
+    use std::io::{BufRead as _, Read as _};
+    use std::time::Duration;
+    const ROOT: &str = "ATERM_DRY_PREFREEZE_ROOT";
+    const TARGET: &str = "ATERM_DRY_PREFREEZE_TARGET";
+    if let Some(root) = std::env::var_os(ROOT) {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        // SAFETY: reset SIGTERM before installing the production handler in this child.
+        unsafe {
+            signal(crate::interrupt::SIGTERM, 0);
+        }
+        crate::interrupt::install();
+        let root = PathBuf::from(root);
+        let target = std::env::var(TARGET).unwrap();
+        let real = PrefreezeFixture::real(&root);
+        let mut w = World::new();
+        w.history.push(target.clone());
+        w.versions.insert(target.clone(), "0.6.0".into());
+        w.own_cutter = false;
+        w.real = Some((PrefreezeFixture::real(&root), String::new(), root));
+        w.exec_judge = Some(Box::new(move |revision| {
+            PrefreezeFixture::judge(&real, revision)
+        }));
+        let (code, last) = w.run(ReleaseOptions {
+            commit: Some(target),
+            dry_run: true,
+            ..mac()
+        });
+        println!("{last}");
+        std::process::exit(code);
+    }
+    {
+        let mut fixture = PrefreezeFixture::new();
+        let mut child = command(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(ROOT, fixture.fixture.root.path())
+            .env(TARGET, &fixture.fixture.candidate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let output = std::thread::spawn(move || {
+            let mut s = String::new();
+            stdout.read_to_string(&mut s).unwrap();
+            s
+        });
+        let stderr = child.stderr.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            for line in std::io::BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                if line.contains("waiting for cutter preparation pid") {
+                    send.send(()).unwrap();
+                }
+                output.push_str(&line);
+                output.push('\n');
+            }
+            output
+        });
+        let waiting = receive.recv_timeout(Duration::from_secs(60));
+        if waiting.is_err() {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "dry run never joined prefreeze: {waiting:?} ({:?})\n{}\n{}",
+                out.status,
+                output.join().unwrap(),
+                reader.join().unwrap()
+            );
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the controller is still waiting"
+        );
+        if interrupted {
+            // SAFETY: the live child is ours and the checked conversion is its pid.
+            assert_eq!(
+                unsafe {
+                    libc::kill(
+                        i32::try_from(child.id()).unwrap(),
+                        crate::interrupt::SIGTERM,
+                    )
+                },
+                0
+            );
+        } else {
+            fixture.release();
+        }
+        let bound = std::time::Instant::now() + Duration::from_secs(60);
+        let ended = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= bound {
+                aterm_uds::deadline::settle_child(&mut child);
+                panic!("dry prefreeze controller did not end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let said = output.join().unwrap();
+        let errors = reader.join().unwrap();
+        assert_eq!(
+            ended.code(),
+            Some(if interrupted { 130 } else { 0 }),
+            "{said}\n{errors}"
+        );
+        if interrupted {
+            assert!(said.contains("INTERRUPTED at"), "{said}");
+            assert!(
+                fixture
+                    .fixture
+                    .root
+                    .path()
+                    .join("release/cutter-cache/workspace-running")
+                    .exists(),
+                "interruption leaves the other holder alone"
+            );
+        } else {
+            assert!(errors.contains("cutter preparation yielded"), "{errors}");
+            assert!(said.contains("R policy passes"), "{said}");
+        }
+    }
+}
+
 /// Both entry paths judge the input before qualify; the negative control reaches its dry
 /// success summary only after that same check passes.
 #[test]

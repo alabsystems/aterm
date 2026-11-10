@@ -277,8 +277,8 @@ same-build test and fails every update, so each release directory holds
 | `env_rendezvous`, `rendezvous_file_shape`, `env_claim`, `claim_hex_len` | The launch variables' names, the socket's file name (pid and nonce elided) and the claim secret's length. |
 | `env_proof_term`, `proof_term_launched`, `proof_term_fork` | The proof-term variable and the two values the parent writes. |
 | `env_target`, `target_value` | `ATERM_SEAMLESS_TARGET` and that release's `encode_target_identity` of its own build and commit. |
-| `env_parent_birth`, `parent_birth_value` | `ATERM_HANDOFF_PARENT_BIRTH` and the value that release's `outgoing_parent_env` published. Only its shape is read. |
-| `proof_terms`, `proof_count`, `proof_digest` | The masters' PTY device terms (`proof_identities_in_device_terms`) and that release's `adoption_proof` over them. |
+| `env_parent_birth`, `parent_birth_value` | `ATERM_HANDOFF_PARENT_BIRTH` and a fixed valid birth-record input chosen by that release's generator. Product launch still publishes `outgoing_parent_env`'s live kernel value; only the record's shape is read here. |
+| `proof_terms`, `proof_count`, `proof_digest` | Fixed representative PTY device terms and that release's `adoption_proof` over them. The generator separately converts fresh PTYs with `proof_identities_in_device_terms` and checks that every session id and pid survives. |
 
 The claim secret's key is `claim_input`, not `claim_secret`: the public
 export's gitleaks scan (built-in rules only; the publication engine refuses

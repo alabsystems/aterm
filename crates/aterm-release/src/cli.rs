@@ -25,6 +25,9 @@ USAGE
       series requires --before-verify PATH and runs alone/shared/chain/chain/shared/tree
       with one fixed grant; shared and tree use the before verifier.
   targo --unverified ship qualify-summary RETAINED-TAKE-DIRECTORY
+  targo --unverified ship slice-memory [--takes 1|2]
+      Measure native release links alone (default two), learning footprint peaks and
+      printing the next claim. Builds only; never executes or publishes aterm.
   targo --unverified ship qualify-replay RETAINED-CSV-DIRECTORY PILOT-RUNS.json
       Summarize unit chains and sampled CPU/runnable/QoS/core residency.
       Builds only: no product execution or publication. Retains all evidence.
@@ -532,6 +535,7 @@ pub enum Cmd {
     DevApp(crate::dev_app::Cmd),
     ProfilePilot(crate::profile_pilot::Options),
     QualifyPilot(crate::qualify_pilot::Options),
+    SliceMemory(u8),
     QualifySummary(std::path::PathBuf),
     QualifyReplay(std::path::PathBuf, std::path::PathBuf),
     /// `harness-bump`: the harness versions the release gate asks for ([`crate::harness_versions`]).
@@ -986,6 +990,12 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )),
         },
         "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
+        "slice-memory" => match (it.next(), it.next(), it.next()) {
+            (None, None, None) => Ok(Cmd::SliceMemory(2)),
+            (Some("--takes"), Some("1"), None) => Ok(Cmd::SliceMemory(1)),
+            (Some("--takes"), Some("2"), None) => Ok(Cmd::SliceMemory(2)),
+            _ => Err("slice-memory takes only --takes 1|2".into()),
+        },
         "qualify-pilot" => {
             crate::qualify_pilot::parse(it.map(str::to_owned)).map(Cmd::QualifyPilot)
         }
@@ -1328,6 +1338,9 @@ fn normalize_version(v: &str) -> std::result::Result<String, String> {
 fn dispatch(cmd: Cmd) -> ledger::Result<()> {
     match cmd {
         Cmd::QualifySummary(path) => crate::qualify_pilot::summarize(&path).map_err(Error::new),
+        Cmd::SliceMemory(takes) => {
+            crate::slice_units::measure(&repo_root()?, takes).map_err(Error::new)
+        }
         Cmd::QualifyReplay(path, takes) => {
             crate::qualify_replay::run(&path, &takes).map_err(Error::new)
         }

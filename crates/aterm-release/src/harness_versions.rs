@@ -22,6 +22,146 @@ pub use aterm_phase::harness_version::{
 
 use crate::ledger::{Error, GitRunner, Origin, Result, git_ok};
 
+/// Harness announcements use one canonical release-window line. The immediately
+/// older public section includes legacy prose announcements; the independent
+/// source/version gate still compares the actual released Git objects.
+pub fn notes_gate(text: &str, section: &str) -> Result<()> {
+    let Some((_, end)) = crate::changelog::section_span(text, section) else {
+        return Ok(());
+    };
+    let previous = text.lines().skip(end).find_map(|line| {
+        let (name, suffix) = line.strip_prefix("## [")?.split_once(']')?;
+        if !suffix.trim().is_empty() && !suffix.starts_with([' ', '\t', '-']) {
+            return None;
+        }
+        crate::ledger::check_version_shape(name)
+            .is_ok()
+            .then_some(name)
+    });
+    let body = crate::changelog::note_entries(text, section);
+    let earlier = previous.map_or_else(Vec::new, |name| crate::changelog::note_entries(text, name));
+    notes_against(&body, section, previous, &earlier)
+}
+
+/// The same note rule bound to the public predecessor the existing harness gate
+/// selected. Candidate copies of older notes cannot change what that release
+/// actually announced. Both reads are local, bounded and strict UTF-8.
+pub fn notes_gate_at(
+    git: &dyn GitRunner,
+    released: (&str, &str),
+    commit: &str,
+    version: &str,
+) -> Result<()> {
+    let read = |at: &str| -> Result<String> {
+        let spec = format!("{at}:{}", crate::changelog::CHANGELOG_FILE);
+        let out = crate::ledger::git_read_ok(
+            git,
+            &[
+                "--no-lazy-fetch",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                &spec,
+            ],
+        )?;
+        String::from_utf8(out.stdout)
+            .map_err(|_| Error::new(format!("harness notes: non-UTF-8 {spec}")))
+    };
+    let (release, released_commit) = released;
+    let current = read(commit)?;
+    let old = read(released_commit)?;
+    let section = if crate::changelog::has_section(&current, version) {
+        version
+    } else {
+        "Unreleased"
+    };
+    // Older public tags can name the source before its notes were rolled.
+    let old_section = if crate::changelog::has_section(&old, release) {
+        release
+    } else {
+        "Unreleased"
+    };
+    notes_against(
+        &crate::changelog::note_entries(&current, section),
+        section,
+        Some(release),
+        &crate::changelog::note_entries(&old, old_section),
+    )
+}
+
+fn notes_against(
+    body: &[String],
+    section: &str,
+    previous: Option<&str>,
+    earlier: &[String],
+) -> Result<()> {
+    let mut announcements = 0;
+    for line in body {
+        let versions = note_versions(line)?;
+        if versions.is_empty() && !line.starts_with(crate::changelog::HARNESS_ENTRY_HEAD) {
+            continue;
+        }
+        announcements += 1;
+        let previous = previous.ok_or_else(|| {
+            Error::new("harness notes: an announcement has no preceding public release section")
+        })?;
+        let prefix = format!("{}{previous}: ", crate::changelog::HARNESS_ENTRY_HEAD);
+        if announcements > 1 || !line.starts_with(&prefix) || versions.is_empty() {
+            return Err(Error::new(format!(
+                "harness notes: [{section}] must have one announcement naming the immediately \
+                 preceding public release: `{prefix}…`"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (cli, version) in versions {
+            if !seen.insert(cli) {
+                return Err(Error::new(format!("harness notes: {cli} appears twice")));
+            }
+            for old in earlier {
+                if note_versions(old)?
+                    .iter()
+                    .any(|(h, v)| *h == cli && *v >= version)
+                {
+                    return Err(Error::new(format!(
+                        "harness notes: [{section}] announces {cli} {}.{} already announced \
+                         (or superseded) by v{previous} — remove the stale announcement",
+                        version.0, version.1
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read generated and historical prose spellings. Punctuation/backticks end the
+/// major.minor token. A malformed named version is an error, never a bypass.
+fn note_versions(line: &str) -> Result<Vec<(&'static str, (u16, u16))>> {
+    let mut versions = Vec::new();
+    for harness in CliHarness::ALL {
+        let prefix = format!("alab {} harness ", harness.cli());
+        for tail in line.split(&prefix).skip(1) {
+            if !tail.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            let token = tail
+                .split(|c: char| !c.is_ascii_digit() && c != '.')
+                .next()
+                .unwrap_or("");
+            let token = token.trim_end_matches('.');
+            let version =
+                aterm_phase::HarnessVersion::parse_major_minor(token).ok_or_else(|| {
+                    Error::new(format!(
+                        "harness notes: invalid {} version {token:?}",
+                        harness.cli()
+                    ))
+                })?;
+            versions.push((harness.cli(), version));
+        }
+    }
+    Ok(versions)
+}
+
 /// One harness whose sources moved in a release window under an unchanged version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owed {
@@ -448,18 +588,10 @@ fn apply_with(
     let version = crate::publish::release_version_from_workspace(
         &crate::publish::workspace_version(&manifest)?,
     )?;
-    let ceiling = crate::gates::version_triple(&version)
-        .ok_or_else(|| Error::new(format!("cannot order product release {version}")))?;
-    let mut names = Vec::new();
-    for record in crate::ledger::parse(&ledger_text)?.iter().rev() {
-        let name = format!("v{}", record.version);
-        // Match release_through: retired ledger versions are not candidate baselines.
-        if crate::gates::version_triple(&record.version).is_some_and(|key| key <= ceiling)
-            && !names.contains(&name)
-        {
-            names.push(name);
-        }
-    }
+    let names = crate::gates::release_candidates_through(&ledger_text, &version)?
+        .into_iter()
+        .map(|version| format!("v{version}"))
+        .collect::<Vec<_>>();
     let Some((tag, commit)) = origin.first_tag_commit(&names).map_err(Error::new)? else {
         // Retain the ledger's distinction between no earlier window and an
         // earlier window none of whose versions has actually shipped.
@@ -916,13 +1048,10 @@ fn read() {}
             "https://github.com/fixture/app.git",
         ]);
         std::fs::write(source.join("Cargo.toml"), "[workspace.package]\nversion = \"0.2.0\"\nrepository = \"https://github.com/fixture/app\"\n").unwrap();
-        // Match release_through's eligibility: old two-component ledger rows
-        // are retained history, and a future canonical release is above the ceiling.
-        std::fs::write(
-            source.join(crate::ledger::LEDGER_FILE),
-            "1 0.0\n2 0.1.0\n3 0.3.0\n",
-        )
-        .unwrap();
+        // The real append-only ledger retains pre-three-component labels,
+        // repeated claims and future windows. They are not comparison floors.
+        let ledger = "1 0.61\n2 0.1.0\n3 0.1.0\n4 0.2.0\n5 0.3.0\n6 1.20261109.1\n";
+        std::fs::write(source.join(crate::ledger::LEDGER_FILE), ledger).unwrap();
         let origin = crate::github_remote::claim_fixture(&source, &bare);
         assert_eq!(
             origin.get("refs/heads/main").unwrap(),
@@ -934,6 +1063,11 @@ fn read() {}
             .unwrap()
             .unwrap();
         assert_eq!(release, "0.1.0");
+        assert_eq!(
+            std::fs::read_to_string(source.join(crate::ledger::LEDGER_FILE)).unwrap(),
+            ledger,
+            "selecting a public baseline never rewrites historical release identity"
+        );
         assert_eq!(
             owed.iter().map(|row| row.harness).collect::<Vec<_>>(),
             [CliHarness::ClaudeCode, CliHarness::Muse]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Content evidence for carrying one release test binary across candidate hops.
+//! Content evidence for carrying one test binary across candidate hops.
 //!
 //! A package opts into bounded reuse with `[package.metadata.aterm.test-inputs]` and
 //! `bounded = true`. `paths` declares package-relative runtime roots and `workspace-paths`
@@ -9,7 +9,7 @@
 //! target observes those roots only through path names, entry types and regular-file bytes, and
 //! opens no other file or external tool; metadata identity, timestamps, ownership, ACLs, xattrs,
 //! interpreters and dynamic tool inputs are therefore out of this schema and fail closed.
-//! `read-only = true` additionally asserts that the target, every peer in the release dispatch
+//! `read-only = true` additionally asserts that the target, every peer in the dispatch
 //! and external writers leave its roots, executable, helpers and toolchain inputs immutable,
 //! including transient mutate-and-restore writes which snapshots cannot observe. The
 //! finalized environment is exact. `volatile-environment` is the closed set of per-invocation
@@ -39,7 +39,7 @@ pub const SCHEMA: u32 = 1;
 
 /// One prior successful execution. A `--passed-binaries` file is JSONL, one proof per line.
 ///
-/// `outcome` deliberately remains in the proof even though only `ok` is accepted: a release
+/// `outcome` deliberately remains in the proof even though only `ok` is accepted: a run
 /// cannot accidentally feed a prior FAIL into the carry set by changing only its selector.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,7 +191,7 @@ struct PackageInputs {
     volatile_environment: Vec<String>,
 }
 
-/// Shared caches for a release's parallel evidence workers. Package trees are read once per
+/// Shared caches for a run's parallel evidence workers. Package trees are read once per
 /// package and helper bytes once per physical executable.
 #[derive(Debug)]
 pub struct EvidenceBuilder {
@@ -220,6 +220,8 @@ impl EvidenceBuilder {
 
     /// Evidence for `binary`. The executable is always hashed first, even when the package's
     /// runtime inputs are unbounded, so every release binary has byte identity on its first run.
+    /// Development dispatch checks [`Self::inputs_declared`] first and leaves unknown targets
+    /// to ordinary execution without reading their executable bytes for carry.
     #[must_use]
     pub fn evidence(&self, binary: &Binary, command: &Cmd) -> Evidence {
         let exe_sha256 = self.file_digest(&command.program).ok();
@@ -236,6 +238,19 @@ impl EvidenceBuilder {
                 reason: Some(reason),
             },
         }
+    }
+
+    /// Development runs judge only existing bounded declarations, before reading executable
+    /// bytes. An undeclared application suite still runs without a costly identity walk.
+    pub(crate) fn inputs_declared(&self, binary: &Binary, command: &Cmd) -> bool {
+        let env = effective_env(command);
+        let Some(manifest) = env
+            .get(b"CARGO_MANIFEST_DIR".as_slice())
+            .map(|value| PathBuf::from(os_from_bytes(value)))
+        else {
+            return false;
+        };
+        manifest.is_absolute() && self.package_inputs(&manifest, &binary.spec).is_ok()
     }
 
     fn content_key(
@@ -290,7 +305,7 @@ impl EvidenceBuilder {
             .carry_context
             .as_deref()
             .filter(|value| aterm_codec::hex::is_lower(value, 64))
-            .ok_or_else(|| "the release supplied no valid carry context".to_owned())?;
+            .ok_or_else(|| "the run supplied no valid carry context".to_owned())?;
         let verifier = self
             .verifier_sha256
             .as_deref()

@@ -1615,8 +1615,7 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line(
         "threads",
         format!(
-            "threads runnable={} waiting_mc={} unread={} tab_waiting_mc={} tab_starved_pm={}",
-            unavailable("not_sampled"),
+            "threads waiting_mc={} unread={} tab_waiting_mc={} tab_starved_pm={}",
             s.global
                 .wait
                 .map_or_else(|| unavailable("not_sampled"), |w| format!("≥{}", mc(w))),
@@ -2616,7 +2615,6 @@ fn global_json(s: &Snapshot) -> Jv {
             ),
         );
     }
-    o.set("runnable_threads", Jv::why("not_sampled"));
     o.set(
         "wait_mc",
         s.global.wait.map_or_else(

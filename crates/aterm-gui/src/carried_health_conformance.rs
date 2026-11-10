@@ -57,6 +57,8 @@ impl Rig {
             at_secs: 100,
             max_interval_secs: 1_100,
             respawns: 0,
+            workers: 1,
+            worker_epoch: 0,
             deferrals: 0,
             settings_misses: 0,
             lane: None,

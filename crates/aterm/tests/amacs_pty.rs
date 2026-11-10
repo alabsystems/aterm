@@ -36,6 +36,11 @@ fn session_driver() {
         return;
     };
     let file = std::env::var_os(DRIVER_FILE).expect("the editor file");
+    // The editor's pid goes out whole, never split by the editor's own output: on Darwin the
+    // editor starts stopped at its exec until the pid is out; Linux has no such start, so the
+    // editor runs at once and the pid goes out in one write, which a Linux tty keeps whole
+    // against every other writer (`tty_write` holds the terminal's `atomic_write_lock`).
+    let suspended = cfg!(target_vendor = "apple");
     let child = aterm_uds::spawnfd::command(program)
         .arg(file)
         .env_remove(DRIVER)
@@ -43,7 +48,7 @@ fn session_driver() {
         .stdin(aterm_uds::spawnfd::Stdio::inherit())
         .stdout(aterm_uds::spawnfd::Stdio::inherit())
         .stderr(aterm_uds::spawnfd::Stdio::inherit())
-        .start_suspended(true)
+        .start_suspended(suspended)
         .spawn()
         .expect("start the editor inside its controlling session");
     let mut child = DriverChild(child);
@@ -52,10 +57,12 @@ fn session_driver() {
         .write_all(format!("<amacs-pid:{}>", child.0.id()).as_bytes())
         .unwrap();
     output.flush().unwrap();
-    child
-        .0
-        .resume()
-        .expect("the editor may run after its identity is published");
+    if suspended {
+        child
+            .0
+            .resume()
+            .expect("the editor may run after its identity is published");
+    }
     let status = child.0.wait().expect("the editor exits");
     output
         .write_all(format!("<amacs-status:{}>", status.into_raw()).as_bytes())

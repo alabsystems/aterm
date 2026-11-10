@@ -74,7 +74,7 @@ fn previous_row(
     } else {
         (MARGIN, body)
     };
-    // Caption formatting and host admission are unchanged by this patch.
+    // Share the caller's formatter to isolate the pre-borrow emphasis/slice pipeline.
     let cap = caption(url, url_cells);
     if !cap.text.chars().any(|ch| ch != ELLIPSIS) {
         return None;

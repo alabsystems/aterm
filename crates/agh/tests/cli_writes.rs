@@ -507,6 +507,37 @@ fn edit_without_a_change_is_usage() {
     assert_eq!(again.exits(0).report()["outcome"], Value::from("unchanged"));
 }
 
+/// GitHub drops a draft's tag when an edit names none (the fake does too); agh's edit of a
+/// draft names the tag the draft holds, so notes and a title leave it bound.
+#[test]
+fn editing_a_draft_keeps_its_tag() {
+    let w = World::new("cw-edit-tag");
+    let id = w.draft("v1");
+    let notes = w.file("notes", "n.md", b"the notes");
+    w.run(&["release", "edit", APP, "v1", "--notes-file", &notes])
+        .exits(0);
+    w.run(&[
+        "release",
+        "edit",
+        APP,
+        "--id",
+        &id.to_string(),
+        "--title",
+        "T",
+    ])
+    .exits(0);
+    let release = w.release("v1");
+    assert_eq!(release.id, id);
+    assert!(release.draft);
+    let edits: Vec<_> = w
+        .fake
+        .seen()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 2, "{edits:?}");
+}
+
 #[test]
 fn ensure_reports_each_step() {
     let w = World::new("cw-ensure");

@@ -8,6 +8,7 @@
 //! keeps its own argv.
 
 extern "C" fn enter() {
+    crate::solver_bootstrap::tests::entry();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if let Some(result) = crate::metadata_prelude::entry(&args) {
         std::process::exit(if result == std::process::ExitCode::SUCCESS {

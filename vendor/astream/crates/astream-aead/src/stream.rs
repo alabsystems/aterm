@@ -976,7 +976,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::net::{TcpListener, TcpStream};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const KEY: [u8; KEY_LEN] = [7u8; KEY_LEN];
 
@@ -1533,15 +1533,21 @@ mod tests {
         }
     }
 
-    fn tcp_pair() -> (TcpStream, TcpStream) {
+    const REQUIRED_IO_HANG: Duration = Duration::from_secs(60);
+
+    fn tcp_pair(started: Instant) -> io::Result<(TcpStream, TcpStream)> {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let c = TcpStream::connect(addr).unwrap();
         let (s, _) = l.accept().unwrap();
+        let remaining = REQUIRED_IO_HANG
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
         for x in [&c, &s] {
-            x.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            x.set_read_timeout(Some(remaining))?;
         }
-        (c, s)
+        Ok((c, s))
     }
 
     struct Conn {
@@ -1558,7 +1564,11 @@ mod tests {
     }
 
     fn connect(key_client: [u8; KEY_LEN], key_server: [u8; KEY_LEN]) -> Conn {
-        let (c, s) = tcp_pair();
+        connect_at(key_client, key_server, Instant::now())
+    }
+
+    fn connect_at(key_client: [u8; KEY_LEN], key_server: [u8; KEY_LEN], started: Instant) -> Conn {
+        let (c, s) = tcp_pair(started).unwrap();
         let raw_client = c.try_clone().unwrap();
         let raw_server = s.try_clone().unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1579,6 +1589,22 @@ mod tests {
             sent,
             received,
         }
+    }
+
+    #[test]
+    fn required_native_handshake_keeps_its_original_start_without_a_latency_budget() {
+        let connection = connect_at(KEY, KEY, Instant::now() - Duration::from_secs(6));
+        let (mut client, mut server) = (connection.client.unwrap(), connection.server.unwrap());
+        client.write_all(b"confirmed").unwrap();
+        let mut observed = [0; 9];
+        server.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"confirmed");
+        assert_eq!(
+            tcp_pair(Instant::now() - Duration::from_secs(61))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     /// The client's next record on the wire after `mark` bytes were sent.

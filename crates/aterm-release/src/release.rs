@@ -5352,8 +5352,14 @@ impl Run<'_> {
                     // A real backend cannot reach this edge: exec replaced it. The model uses
                     // it to represent the old image producing no final line of its own.
                     Ok(()) => Err(Halt::Said(0)),
-                    Err(refusal) if self.dry => self.refuse_hard(refusal.could_not_run()),
-                    Err(refusal) => self.refuse(refusal),
+                    Err(refusal) => {
+                        self.halt_if_interrupted()?;
+                        if self.dry {
+                            self.refuse_hard(refusal.could_not_run())
+                        } else {
+                            self.refuse(refusal)
+                        }
+                    }
                 }
             }
         }

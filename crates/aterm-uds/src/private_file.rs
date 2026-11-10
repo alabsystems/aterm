@@ -123,7 +123,7 @@ pub fn read_private_with_metadata(
     max: usize,
 ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
     let (file, metadata) = open_private(dir, name)?;
-    read_capped_with_len(&file, metadata.len(), max).map(|bytes| (bytes, metadata))
+    read_capped_with_len(&file, metadata.len(), max, name).map(|bytes| (bytes, metadata))
 }
 
 /// Parsed private files, kept only for the exact bytes read under [`read_private`]'s rules
@@ -185,13 +185,15 @@ impl<T: Clone> KeptParse<T> {
 #[cfg(test)]
 fn read_capped(file: std::fs::File, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let len = file.metadata().map_err(PrivateFileError::Io)?.len();
-    read_capped_with_len(&file, len, max)
+    read_capped_with_len(&file, len, max, "")
 }
 
+/// `file`'s bytes, at most `max`, read as the file `name`, which [`tally`] counts them under.
 fn read_capped_with_len(
     file: &std::fs::File,
     file_len: u64,
     max: usize,
+    name: &str,
 ) -> Result<Vec<u8>, PrivateFileError> {
     if file_len > max as u64 {
         return Err(PrivateFileError::Malformed(
@@ -211,6 +213,10 @@ fn read_capped_with_len(
         crate::secret::scrub(&mut bytes);
         return Err(PrivateFileError::Io(e));
     }
+    #[cfg(any(test, debug_assertions))]
+    tally::add(name, bytes.len());
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = name;
     if bytes.len() > max {
         crate::secret::scrub(&mut bytes);
         return Err(PrivateFileError::Malformed(
@@ -353,7 +359,21 @@ impl<'a> JudgedDir<'a> {
         max: usize,
     ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
         let (file, meta) = self.open(name)?;
-        read_capped_with_len(&file, meta.len(), max).map(|bytes| (bytes, meta))
+        read_capped_with_len(&file, meta.len(), max, name).map(|bytes| (bytes, meta))
+    }
+
+    /// The first `len` bytes of `name` under this verdict, opened as [`Self::open`] opens it,
+    /// or all of it when it holds fewer: a reader that needs only a record's head reads no more.
+    /// # Errors
+    /// As [`Self::open`], and [`PrivateFileError::Io`] when the file cannot be read.
+    pub fn read_head(&self, name: &str, len: usize) -> Result<Vec<u8>, PrivateFileError> {
+        let (mut file, _meta) = self.open(name)?;
+        let mut head = vec![0; len];
+        let read = read_full(&mut file, &mut head).map_err(PrivateFileError::Io)?;
+        head.truncate(read);
+        #[cfg(any(test, debug_assertions))]
+        tally::add(name, read);
+        Ok(head)
     }
 }
 
@@ -532,7 +552,7 @@ pub fn read_private_into(
 ) -> Result<PrivateRead, PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta) = open_private(dir, name)?;
-    let len = read_capped_into(&mut file, meta.len(), max, buf)?;
+    let len = read_capped_into(&mut file, meta.len(), max, buf, name)?;
     Ok(PrivateRead {
         len,
         dev: meta.dev(),
@@ -545,7 +565,7 @@ pub fn read_private_into(
 /// As [`read_owned_into`].
 pub fn read_owned(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let (file, meta, _loose) = open_judged(dir, name, Opening::Owned)?;
-    read_capped_with_len(&file, meta.len(), max)
+    read_capped_with_len(&file, meta.len(), max, name)
 }
 
 /// What [`read_owned_into`] read: the length, the file's identity, and whether the file or
@@ -585,7 +605,7 @@ pub fn read_owned_into(
 ) -> Result<OwnedRead, PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta, loose) = open_judged(dir, name, Opening::Owned)?;
-    let len = read_capped_into(&mut file, meta.len(), max, buf)?;
+    let len = read_capped_into(&mut file, meta.len(), max, buf, name)?;
     Ok(OwnedRead {
         len,
         dev: meta.dev(),
@@ -602,6 +622,7 @@ fn read_capped_into(
     file_len: u64,
     max: usize,
     buf: &mut [u8],
+    name: &str,
 ) -> Result<usize, PrivateFileError> {
     let cap = max.min(buf.len());
     if file_len > cap as u64 {
@@ -633,6 +654,10 @@ fn read_capped_into(
             return Err(refused);
         }
     }
+    #[cfg(any(test, debug_assertions))]
+    tally::add(name, len);
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = name;
     Ok(len)
 }
 
@@ -1084,6 +1109,57 @@ impl PrivateLock {
 impl Drop for PrivateLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
+    }
+}
+
+/// What this thread read through this module's reads, by file name, while [`tally::counted`]
+/// runs: the instrument a test uses to hold a path to the bytes it reads.
+#[cfg(any(test, debug_assertions))]
+pub mod tally {
+    use std::cell::RefCell;
+
+    /// What [`counted`] saw of one file name: how many reads, and their bytes in all.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Read {
+        /// The file's name in its directory.
+        pub name: String,
+        /// How many reads of it.
+        pub reads: usize,
+        /// The bytes those reads returned.
+        pub bytes: usize,
+    }
+
+    thread_local! {
+        static READ: RefCell<Option<Vec<Read>>> = const { RefCell::new(None) };
+    }
+
+    /// `run`'s result, and each file name this thread read through this module while it ran,
+    /// in the order first read. A count running around this one counts none of what this one
+    /// does.
+    pub fn counted<R>(run: impl FnOnce() -> R) -> (R, Vec<Read>) {
+        let outer = READ.with(|read| read.replace(Some(Vec::new())));
+        let ran = run();
+        let read = READ.with(|read| read.replace(outer)).unwrap_or_default();
+        (ran, read)
+    }
+
+    pub(super) fn add(name: &str, bytes: usize) {
+        READ.with(|read| {
+            if let Some(read) = read.borrow_mut().as_mut() {
+                let at = match read.iter().position(|seen| seen.name == name) {
+                    Some(at) => at,
+                    None => {
+                        read.push(Read {
+                            name: name.to_owned(),
+                            ..Read::default()
+                        });
+                        read.len() - 1
+                    }
+                };
+                read[at].reads += 1;
+                read[at].bytes += bytes;
+            }
+        });
     }
 }
 

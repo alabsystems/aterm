@@ -4,7 +4,7 @@
 //! The lint admission edge and qualify memory, in MiB. The lint peak is m112's
 //! fresh 26,452,845,576 bytes, rounded up; its claim adds the shared 20% margin.
 //! The fresh native peak is 46,219,853,824 bytes and compat's is
-//! 25,890,799,616 bytes. The existing unit chooser rounds those to 44 and 25 GiB.
+//! 25,890,799,616 bytes. The unit chooser adds 20% and rounds to 52 and 29 GiB.
 //! Neither link is made smaller. Two unit-admission drivers hold 2 GiB each. Memory is the
 //! 75.8 GiB m3 case already used by the capacity conformance model.
 //!
@@ -24,9 +24,9 @@ pub fn release_lint_memory_model() -> Model {
             const LintPeak = 25228;
             const LintClaim = 30273;
             const NativePeak = 44079;
-            const NativeClaim = 45056;
+            const NativeClaim = 53248;
             const CompatPeak = 24691;
-            const CompatClaim = 25600;
+            const CompatClaim = 29696;
             const Driver = 2048;
             var held = 0;
             var lint = 0;

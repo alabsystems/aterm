@@ -16,12 +16,22 @@
 //! again with the next pass. A test, a debug
 //! build or a checkout's `targo run` never installs it, so nothing reaches a live registry from
 //! there.
+//!
+//! The machine sweep (step 4) starts here too ([`start_sweep`]): in a process that lives on and
+//! holds a lab, one thread reads every login place on this Mac every [`SWEEP_EVERY`]
+//! (`aterm_agent::harness::observe::sweep`), so a login no tab runs is noted as a `seen` with no
+//! tab, once a day and when its file names another account, and marked `idle` through the same
+//! queue. The sweep hands each login at every look and the queue keeps what a pass took
+//! ([`Queue::passed`]): a swept login goes to the registry once a day, and again at each look
+//! until a pass of it succeeds, in whichever process looks.
 
 use aterm_agent::harness::journal::LoginState;
 use aterm_agent::harness::journal::ObservedLogin;
+use aterm_agent::harness::observe::sweep::{IDLE_REFRESH_S, OnToken};
 use aterm_db::alab::{Observed, observe::Sighting};
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -47,25 +57,37 @@ struct Gathered {
 }
 
 /// What waits for the next pass, each tab's login and last sighting, the count of tabs each
-/// login's last pass took, and whether a pass's thread runs and when the last one ended.
+/// login's last pass took, when a pass that read the registry last took each login (Unix
+/// seconds), and whether a pass's thread runs and when the last one ended.
 #[derive(Default)]
 struct Queue {
     by: BTreeMap<Login, Gathered>,
     tabs: BTreeMap<String, (Login, u64)>,
     counted: BTreeMap<Login, (u64, &'static str)>,
+    passed: BTreeMap<(String, String, String), u64>,
     running: bool,
     last: Option<Instant>,
 }
 
 impl Queue {
     /// Gather `login`: the newest sighting's state and source; a running tab now on it (and on
-    /// no other), or a tab that ended off it.
+    /// no other), or a tab that ended off it. A login with no tab is the machine sweep's, handed
+    /// at every look: it is gathered unless a pass took the login within the day
+    /// ([`Queue::took`]), so it is passed once a day and again until a pass succeeds.
     fn gather(&mut self, login: &ObservedLogin) {
         let key: Login = (
             login.cli.id(),
             login.realm.clone(),
             login.email.trim().to_ascii_lowercase(),
         );
+        if login.tab.is_none()
+            && self
+                .passed
+                .get(&(key.0.to_owned(), key.1.clone(), key.2.clone()))
+                .is_some_and(|at| *at <= login.at && login.at - *at < IDLE_REFRESH_S.unsigned_abs())
+        {
+            return;
+        }
         if let Some(tab) = login.tab {
             let tab = tab.as_str().to_owned();
             match login.state {
@@ -165,6 +187,18 @@ impl Queue {
             .collect()
     }
 
+    /// Keep that a pass at `now` (Unix seconds) read the registry with `sightings`: each login
+    /// is passed, so the sweep's next sighting of it within the day is not gathered. Logins
+    /// passed more than a day ago are dropped.
+    fn took(&mut self, sightings: &[Sighting], now: u64) {
+        self.passed
+            .retain(|_, at| now.saturating_sub(*at) < IDLE_REFRESH_S.unsigned_abs());
+        for seen in sightings {
+            let login = (seen.cli.clone(), seen.realm.clone(), seen.email.clone());
+            self.passed.insert(login, now);
+        }
+    }
+
     /// Whether a pass's thread should start now: something waits and none runs. How long it
     /// first sleeps is [`Queue::wait`].
     fn start(&mut self) -> bool {
@@ -245,6 +279,11 @@ fn run(queue: &Mutex<Queue>, pass: fn(&[Sighting]) -> Result<Observed, String>) 
         let Ok(mut queue) = queue.lock() else {
             return;
         };
+        // Only a pass whose plan ran took its sightings: one that failed, or read no registry
+        // (`quiet`), leaves each swept login to be handed again at the sweep's next look.
+        if done.is_ok_and(|done| done.quiet.is_none()) {
+            queue.took(&sightings, now);
+        }
         queue.last = Some(Instant::now());
         if queue.by.is_empty() {
             queue.running = false;
@@ -287,6 +326,88 @@ fn pass(sightings: &[Sighting]) -> Result<Observed, String> {
         .map_err(|why| why.to_string())
 }
 
+/// How often a process looks at this Mac's login places. What it notes is bounded by the sweep's
+/// own file (once a day for an unchanged place, whichever process looks) and what it passes to
+/// the registry by the queue ([`Queue::took`]), so this is how soon a login file that came to
+/// name another account is heard of, and how soon a note or a pass that failed is made again.
+const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
+
+/// Start this process's machine sweep on a thread of its own, once. Called where a Commons
+/// runtime started, a process that lives on: a short command would read every CLI's login file
+/// at each start. Inert where [`install`] did not open the queue (a test, a debug build), so
+/// nothing there reads a login place on a timer or notes one.
+pub(crate) fn start_sweep() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if QUEUE.get().is_none() {
+        return;
+    }
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("aterm-lab-sweep".into())
+            .spawn(|| {
+                loop {
+                    sweep_now();
+                    std::thread::sleep(SWEEP_EVERY);
+                }
+            });
+        if spawned.is_err() {
+            aterm_log::debug!("lab account sweep: no thread");
+        }
+    });
+}
+
+/// One sweep of this Mac's login places, by the rosters beside its `aterm.toml`.
+fn sweep_now() {
+    let Ok(state) = aterm_agent::harness::cli::harness_state_dir() else {
+        return;
+    };
+    let Some(home) = crate::alab_journal::user_home() else {
+        return;
+    };
+    let config = aterm_types::dirs::aterm_config_path();
+    let now = aterm_agent::supervise::limit::unix_now();
+    let noted = sweep_at(&state, &home, config.as_deref(), now);
+    aterm_log::debug!("lab account sweep: {noted} login(s) noted");
+}
+
+/// [`sweep_now`] at `now` for the harness state `state`, the user home `home` and the rosters
+/// beside `config`; nothing before the epoch. Returns how many logins it noted.
+fn sweep_at(state: &Path, home: &Path, config: Option<&Path>, now: i64) -> usize {
+    if now <= 0 {
+        return 0;
+    }
+    use aterm_agent::ai::connector::Cli;
+    let rosters: Vec<_> = Cli::ALL
+        .into_iter()
+        .filter_map(|cli| Some((cli, crate::alab_journal::roster_of(config, cli)?)))
+        .collect();
+    let claude = rosters
+        .iter()
+        .find_map(|(cli, roster)| (*cli == Cli::Claude).then_some(roster));
+    let on_token = claude.map_or_else(OnToken::none, |roster| on_token(state, home, roster, now));
+    aterm_agent::harness::observe::sweep::run(state, home, &rosters, &on_token, now)
+}
+
+/// Which rows of Claude Code's `roster` run on their vault token on this Mac, read value-free
+/// from this Mac's vault (`accounts_tokens::rows_on_token_read`): such a row's directory may
+/// hold a stale profile, so the sweep reads it as its token's account. Unread where this Mac
+/// has no vault state or it could not be read just now; the sweep then reads no row's place.
+fn on_token(
+    state: &Path,
+    home: &Path,
+    roster: &aterm_agent::harness::accounts::Roster,
+    now: i64,
+) -> OnToken {
+    use aterm_agent::harness::{accounts, accounts_tokens};
+    let store = accounts::Store::at_for(state, accounts::Cli::Claude, home);
+    aterm_secrets::client::Paths::live()
+        .ok()
+        .and_then(|paths| accounts_tokens::rows_on_token_read(&paths, &store, roster, now))
+        .map_or(OnToken::Unread, |rows| {
+            OnToken::Rows(rows.into_keys().collect())
+        })
+}
+
 /// Open the queue where this process holds a lab ([`crate::alab_view::holds`]).
 pub(crate) fn install() {
     if crate::alab_view::holds() {
@@ -304,7 +425,7 @@ mod tests {
 
     fn login(email: &str, tab: Option<&str>, state: LoginState, at: u64) -> ObservedLogin {
         ObservedLogin {
-            cli: Cli::Claude,
+            cli: Cli::Claude.into(),
             realm: "claude".into(),
             email: email.into(),
             state,
@@ -456,5 +577,99 @@ mod tests {
         assert!(!held.running);
         held.gather(&seen);
         assert!(held.start());
+    }
+
+    /// A swept login reaches the planner as idle with no tab, and as running where a tab of
+    /// this process runs it: the sweep says a login is here, never that no tab runs it.
+    #[test]
+    fn a_swept_login_is_idle_unless_a_tab_runs_it() {
+        const A: &str = "a@proton.example";
+        let mut queue = Queue::default();
+        queue.gather(&login(A, None, LoginState::Idle, 100));
+        let taken = queue.take(100);
+        assert_eq!((taken[0].tabs, taken[0].state.as_str()), (0, "idle"));
+        queue.gather(&login(A, Some("s1"), LoginState::Running, 160));
+        queue.gather(&login(A, None, LoginState::Idle, 170));
+        let taken = queue.take(170);
+        assert_eq!(taken.len(), 1);
+        assert_eq!((taken[0].tabs, taken[0].state.as_str()), (1, "running"));
+    }
+
+    /// The sweep hands a login at every look, and the queue passes it once a day: a swept
+    /// login is gathered again until a pass whose plan ran took it, then not within the day, in
+    /// whatever spelling; a pass that failed or read no registry took nothing, so the next look
+    /// is gathered and passed again. A tab's sighting is gathered whatever was passed.
+    /// NEGATIVE CONTROL: with `run` keeping every pass as taken, the look after the quiet pass
+    /// is not gathered: `` not taken yet: gathered again ``.
+    #[test]
+    fn a_swept_login_is_passed_again_until_a_pass_takes_it() {
+        const A: &str = "a@proton.example";
+        fn incomplete(_: &[Sighting]) -> Result<Observed, String> {
+            Ok(Observed {
+                quiet: Some("incomplete"),
+                born: 0,
+                marked: 0,
+                findings: Vec::new(),
+                records: 0,
+            })
+        }
+        fn failed(_: &[Sighting]) -> Result<Observed, String> {
+            Err("no vault state on this Mac".to_owned())
+        }
+        fn planned(sightings: &[Sighting]) -> Result<Observed, String> {
+            Ok(Observed {
+                quiet: None,
+                born: 0,
+                marked: sightings.len(),
+                findings: Vec::new(),
+                records: 1,
+            })
+        }
+        let day = IDLE_REFRESH_S.unsigned_abs();
+        let now = aterm_time::unix_millis().unwrap() / 1_000;
+        let queue = Mutex::new(Queue::default());
+        for pass in [incomplete, failed, planned] {
+            let mut held = queue.lock().unwrap();
+            held.last = None;
+            held.gather(&login(A, None, LoginState::Idle, now));
+            assert!(held.start(), "not taken yet: gathered again");
+            drop(held);
+            run(&queue, pass);
+        }
+        let mut held = queue.lock().unwrap();
+        held.gather(&login(
+            " A@Proton.example",
+            None,
+            LoginState::Idle,
+            now + 900,
+        ));
+        assert!(!held.start(), "taken: not within the day");
+        held.gather(&login(A, Some("s1"), LoginState::Running, now + 900));
+        assert_eq!(held.take(now + 900).len(), 1, "a tab's sighting always");
+        held.gather(&login(A, None, LoginState::Idle, now + day + 60));
+        assert_eq!(held.take(now + day + 60).len(), 1, "the day is over");
+    }
+
+    /// The sweep reads the login places of the home and the rosters it is given and keeps its
+    /// day under the state it is given; with no journal sink in a test nothing is keyed, so it
+    /// notes nothing and writes no file, and a clock before the epoch sweeps nothing.
+    /// `start_sweep` is inert where the queue is not installed.
+    #[test]
+    fn a_sweep_reads_its_own_home_and_start_is_inert_uninstalled() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-lab-sweep-")
+            .tempdir()
+            .unwrap();
+        let state = scratch.path().join("state");
+        std::fs::write(
+            scratch.path().join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"a@proton.example"}}"#,
+        )
+        .unwrap();
+        assert_eq!(sweep_at(&state, scratch.path(), None, 0), 0);
+        assert_eq!(sweep_at(&state, scratch.path(), None, 1_790_000_000), 0);
+        assert!(!state.exists());
+        start_sweep();
+        assert!(QUEUE.get().is_none());
     }
 }

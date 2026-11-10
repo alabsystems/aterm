@@ -10,6 +10,8 @@ pub(super) fn run(
     nonce: u8,
 ) {
     let end = Instant::now() + HANG;
+    let began = Instant::now();
+    trace(&format!("probe-request-begin query={query}"));
     let cpu = aterm_uds::kept_out(|| lease.as_fd().try_clone_to_owned()).unwrap();
     let mut request = original.clone();
     request.member_attempt = [nonce; 16];
@@ -30,17 +32,35 @@ pub(super) fn run(
             end,
         )
         .unwrap();
+    trace(&format!(
+        "probe-request-returned query={query} elapsed_ns={} started={:?}",
+        began.elapsed().as_nanos(),
+        child.started()
+    ));
     let mut output = child.take_stdout().unwrap();
+    let mut recorded_start = false;
     let status = loop {
         assert!(
             Instant::now() < end,
             "actual metadata probe did not complete"
         );
-        if let Some(status) = child.try_wait(end) {
+        let status = child.try_wait(end);
+        if !recorded_start && let Some(started) = child.started() {
+            trace(&format!(
+                "probe-start-observed query={query} elapsed_ns={} started={started:?}",
+                began.elapsed().as_nanos()
+            ));
+            recorded_start = true;
+        }
+        if let Some(status) = status {
             break status;
         }
         std::thread::sleep(POLL);
     };
+    trace(&format!(
+        "probe-terminal query={query} elapsed_ns={} status={status:?}",
+        began.elapsed().as_nanos()
+    ));
     assert!(
         matches!(
             status,

@@ -1010,13 +1010,13 @@ pub const FAILURE_OUTPUT_BYTES: usize = 2048;
 /// release reader's 64 KiB line cap beside ten full failure blocks and the hang detail.
 const HUNG_CASES_SHOWN: usize = 8;
 
-/// What a release's resume does with its binaries ([`carry`]).
+/// What a run carries from prior successful binaries ([`carry`]).
 pub struct Carried {
     /// The binaries that run, in their order.
     pub run: Vec<Binary>,
     /// The binaries carried, with current evidence and the prior execution wall.
     pub carried: Vec<CarriedBinary>,
-    /// The current evidence of every release binary, by spec.
+    /// The current evidence of every candidate binary, by spec.
     pub known: BTreeMap<String, Evidence>,
 }
 
@@ -1029,7 +1029,7 @@ pub struct CarriedBinary {
     pub prior_execution_s: f64,
 }
 
-/// Which of `bins` a release carries. `evidence` runs for every binary, including a first run
+/// Which of `bins` a run carries. `evidence` runs for every binary, including a first run
 /// with an empty `passed` set. A binary is carried only when its prior outcome was `ok` (enforced
 /// by [`read_passed`]), both input sets are bounded, executable and complete content key match,
 /// and its package is not [`crate::checks::GOLDEN`]'s. The rest run, in their original order.
@@ -1049,7 +1049,7 @@ pub fn carry(
     let mut known = BTreeMap::new();
     let (mut run, mut carried) = (Vec::new(), Vec::new());
     for (binary, evidence) in bins.into_iter().zip(evidence) {
-        let evidence = evidence.expect("every release binary was assigned to the evidence pool");
+        let evidence = evidence.expect("every candidate binary was assigned to the evidence pool");
         known.insert(binary.spec.clone(), evidence.clone());
         let prior = passed.get(&binary.spec);
         let matches = !golden(&binary)
@@ -1720,15 +1720,44 @@ pub fn not_started(b: &Binary, limit: Duration) -> Run {
     }
 }
 
-/// A line of a failed recording pass worth quoting: its first diagnostic, or
-/// its last line.
+/// A failed recording pass diagnostic. Preserve a bare binary panic location
+/// and cause rather than its trailing backtrace hint. This quotes output only:
+/// the owned binary exit still supplies the verdict and no case is invented.
 fn first_error(log: &str) -> String {
-    let line = log
+    if let Some(line) = log.lines().find(|l| l.trim_start().starts_with("error")) {
+        return line.trim().chars().take(200).collect();
+    }
+    // A libtest summary already accompanies its separately captured cases. The
+    // panic fallback is for bare binaries that supplied no such final summary.
+    if let Some(line) = log.lines().rev().find(|line| !line.trim().is_empty())
+        && line.trim_start().starts_with("test result:")
+    {
+        return line.trim().chars().take(200).collect();
+    }
+    if let Some(at) = log
         .lines()
-        .find(|l| l.trim_start().starts_with("error"))
-        .or_else(|| log.lines().rev().find(|l| !l.trim().is_empty()))
-        .unwrap_or("no output");
-    line.trim().chars().take(200).collect()
+        .position(|line| line.trim_start().starts_with("thread ") && line.contains(" panicked at "))
+    {
+        return log
+            .lines()
+            .skip(at)
+            .take(6)
+            .map(str::trim)
+            .take_while(|line| !line.starts_with("note:") && !line.starts_with("stack backtrace:"))
+            .flat_map(|line| line.chars().chain(std::iter::once('\n')))
+            .take(200)
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+    }
+    log.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("no output")
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Decide the test run's row exactly as the serial child's was decided. A test
@@ -2562,6 +2591,7 @@ fn run_planned_observed(
     // held claim, and carry only an equal complete key. The probe below sees misses alone, so a
     // binary reported as carried has not even run startup code in this hop.
     let evidenced = AtomicU64::new(0);
+    let content_evidence = ctx.release || ctx.carry_context.is_some();
     let verifier = crate::report::running_driver().map(str::to_owned);
     let new_evidence_builder = || {
         crate::test_content::EvidenceBuilder::new(
@@ -2580,7 +2610,7 @@ fn run_planned_observed(
         let width = widths
             .get(&binary.spec)
             .copied()
-            .expect("every release binary is in the fixed test plan");
+            .expect("every candidate binary is in the fixed test plan");
         let command = final_binary_cmd(
             ctx,
             binary,
@@ -2602,7 +2632,13 @@ fn run_planned_observed(
                         command: &Cmd,
                         exact_error: Option<&str>| {
         let began = Instant::now();
-        let mut evidence = if exact_error.is_some() {
+        let mut evidence = if !ctx.release && !builder.inputs_declared(binary, command) {
+            Evidence {
+                exe_sha256: None,
+                content_key: None,
+                reason: Some("runtime inputs have no complete bounded declaration".into()),
+            }
+        } else if exact_error.is_some() {
             let mut incomplete = command.clone();
             incomplete.exact_env = false;
             builder.evidence(binary, &incomplete)
@@ -2629,7 +2665,7 @@ fn run_planned_observed(
         )
     };
     let empty_passed = Passed::new();
-    let (carried, known) = if ctx.release {
+    let (carried, known) = if content_evidence {
         let all = bins;
         let Carried {
             run,
@@ -2805,7 +2841,7 @@ fn run_planned_observed(
     // Misses now have the probe's actual mode. Finalize and retain their exact commands, but do
     // not hash runtime inputs yet: an earlier admitted binary may legitimately precede this one.
     // Each miss is hashed immediately before its own spawn below.
-    let commands = if ctx.release {
+    let commands = if content_evidence {
         let asked: Vec<usize> = (0..bins.len()).collect();
         let completed = pool(
             bins.len(),
@@ -2841,10 +2877,10 @@ fn run_planned_observed(
     // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
     // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
     let ended = |binary: &Binary, ran: &Ran, started: bool, halt: Option<&dyn Fn()>| {
-        if ctx.release && started && ran.run.ok {
+        if content_evidence && started && ran.run.ok {
             let (command, exact_error) = commands
                 .get(&binary.spec)
-                .expect("every successful release miss keeps its exact command");
+                .expect("every successful miss keeps its exact command");
             let after = evidence_for(
                 &new_evidence_builder(),
                 binary,
@@ -2921,11 +2957,11 @@ fn run_planned_observed(
                 }
                 env.child_ceiling = Some(left);
             }
-            let (cmd, exact_error) = if ctx.release {
+            let (cmd, exact_error) = if content_evidence {
                 let (command, exact_error) = commands
                     .get(&b.spec)
                     .cloned()
-                    .expect("every release miss keeps its finalized exact command");
+                    .expect("every miss keeps its finalized exact command");
                 (command, exact_error)
             } else {
                 (
@@ -2933,7 +2969,7 @@ fn run_planned_observed(
                     None,
                 )
             };
-            if ctx.release {
+            if content_evidence {
                 let before = evidence_for(&new_evidence_builder(), b, &cmd, exact_error.as_deref());
                 evidence
                     .lock()
@@ -3047,13 +3083,13 @@ fn run_planned_observed(
             })
         ),
     );
-    // What the binaries' memory claim was, what a release's resume carried and what hashing the
+    // What the binaries' memory claim was, what the run carried and what hashing the
     // executables cost, how the binaries used their charges and whether their history was kept,
     // in a halted run's report as in a whole one's.
     let accounted = |r: &mut Report| {
         r.raw(summary(&plan, &ran));
         claimed_said(r, claim);
-        if ctx.release {
+        if content_evidence {
             r.raw(format!(
                 "  test binaries: {} of {listed} carried (prior ok, executable and complete \
                  runtime inputs equal through dispatch); {} run; {} invalidated",
@@ -3062,7 +3098,7 @@ fn run_planned_observed(
                 carried_drift.len()
             ));
         }
-        if ctx.release {
+        if content_evidence {
             let evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
             let bounded = evidence.values().filter(|item| item.bounded()).count();
             let mut unbounded: BTreeMap<&str, usize> = BTreeMap::new();

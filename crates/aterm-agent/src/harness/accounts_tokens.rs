@@ -1954,9 +1954,24 @@ pub fn rows_on_token(
     roster: &Roster,
     now: i64,
 ) -> BTreeMap<String, u64> {
+    rows_on_token_read(paths, store, roster, now).unwrap_or_default()
+}
+
+/// [`rows_on_token`], or `None` where the vault could not be read just now: for a reader that
+/// must not take a row for one on its stored login while it does not know (the machine sweep,
+/// `docs/DESIGN-account-discovery-2026-11-09.md` step 4).
+#[must_use]
+pub fn rows_on_token_read(
+    paths: &Paths,
+    store: &Store,
+    roster: &Roster,
+    now: i64,
+) -> Option<BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
-    let Ok(Lookup::Found(standings)) = claude_token::listed(paths) else {
-        return out;
+    let standings = match claude_token::listed(paths) {
+        Ok(Lookup::Found(standings)) => standings,
+        Ok(Lookup::Absent) => return Some(out),
+        Ok(Lookup::Unknown) | Err(_) => return None,
     };
     let now = u64::try_from(now).unwrap_or(0);
     for row in &roster.rows {
@@ -1984,7 +1999,7 @@ pub fn rows_on_token(
             out.insert(row.label.clone(), meta.expires_at);
         }
     }
-    out
+    Some(out)
 }
 
 /// The accounts the sessions on this Mac are logged into (§5.2), each as its own login record

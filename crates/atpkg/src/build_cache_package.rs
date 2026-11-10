@@ -65,7 +65,7 @@ impl PreserveIfPresent {
         let parent = path.parent()?;
         let guard = Self {
             path: path.to_path_buf(),
-            parent_identity: super::identity(parent)?,
+            parent_identity: super::boot_local(parent)?,
         };
         (guard.valid() && guard.absent()).then_some(guard)
     }
@@ -77,7 +77,7 @@ impl PreserveIfPresent {
         };
         let current = || {
             parent.canonicalize().ok().as_deref() == Some(parent)
-                && super::identity(parent).as_ref() == Some(&self.parent_identity)
+                && super::boot_local(parent).as_ref() == Some(&self.parent_identity)
         };
         self.valid()
             && current()
@@ -249,7 +249,9 @@ pub(super) fn payload_safe(receipt: &Receipt, pending: &Pending) -> bool {
     }
     match std::fs::symlink_metadata(&payload) {
         Err(error) => return pending.authorized && error.kind() == std::io::ErrorKind::NotFound,
-        Ok(_) if super::identity(&payload).as_ref() != Some(&receipt.identity) => return false,
+        Ok(_) if !super::identity(&payload).is_some_and(|now| receipt.identity.names(&now)) => {
+            return false;
+        }
         Ok(_) => {}
     }
     if [".git", "Cargo.toml", "Targo.toml"].iter().any(|name| {
@@ -262,7 +264,7 @@ pub(super) fn payload_safe(receipt: &Receipt, pending: &Pending) -> bool {
     match std::fs::symlink_metadata(&marker) {
         Err(error) => pending.authorized && error.kind() == std::io::ErrorKind::NotFound,
         Ok(_) => super::read(&marker).is_some_and(|marker| {
-            marker.identity == receipt.identity
+            marker.identity.same_record(&receipt.identity)
                 && marker.nonce == receipt.nonce
                 && marker.schema == receipt.schema
                 && same_declaration(marker.package.as_ref(), receipt.package.as_ref())
@@ -388,10 +390,7 @@ fn file_identity(file: &std::fs::File) -> Option<Identity> {
     // SAFETY: geteuid has no preconditions and does not mutate process state.
     let uid = unsafe { libc::geteuid() };
     (info.is_file() && info.uid() == uid && info.mode() & 0o022 == 0 && info.nlink() == 1)
-        .then_some(Identity {
-            device: info.dev(),
-            inode: info.ino(),
-        })
+        .then_some(Identity::unrecorded(info.dev(), info.ino()))
 }
 
 #[cfg(unix)]
@@ -399,7 +398,7 @@ fn coordinator(home: &Path, cache: &Path) -> Option<(Declaration, std::fs::File)
     if !super::scope(home, cache) || cache.canonicalize().ok().as_deref() != Some(cache) {
         return None;
     }
-    let cache_identity = super::identity(cache)?;
+    let cache_identity = super::boot_local(cache)?;
     let path = cache.join(COORDINATOR);
     let file = crate::metadata_io::open_regular(&path).ok()?;
     let lock_identity = file_identity(&file)?;

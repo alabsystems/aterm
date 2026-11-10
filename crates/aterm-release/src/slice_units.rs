@@ -1,21 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! EACH RELEASE SLICE COMPILER CLAIMS ITS OWN MEMORY (`docs/measured/qualify-cores-2026-11-08.md`).
+//! Release compilers claim their measured unit peaks plus the capacity margin,
+//! rounded up to GiB. Records distinguish target, unit, compiler build and metric;
+//! Darwin combines sampled simultaneous descendant footprints with kernel
+//! lifetime maxima, including the compiler's final counter read before reaping.
+//! RSS remains in the timeline for comparison, never as footprint history.
 //!
-//! A slice's build claimed the peak of its last unit, the fat-LTO link of `aterm` (42 GiB native,
-//! 23 GiB compat), for its whole life. On m3 the two left 10.8 GiB for the qualify's tree, whose
-//! heavy test compiles waited for the compat slice to end, and the tree took 46m59s of the
-//! qualify's 47m52s. Here the slice's Cargo starts every compiler under this executable, its
-//! `RUSTC_WRAPPER` ([`Units::env`]). The wrapper ([`entry`]) names the compiler's unit
-//! ([`aterm_verify::memory::unit_of`]) and claims that unit's recorded peak, rounded up to a GiB
-//! ([`unit_need`]). The claim LEADS ([`aterm_capacity::Need::leads`]): while it waits, the
-//! release's other work leaves its room. The wrapper then runs the compiler as Cargo asked, its
-//! own variables and `RUSTC_WRAPPER` removed, so the compiler sees the release's environment
-//! ([`compiler`]). It keeps a finished compiler's `wait4` peak in the record ([`RECORD`]) where
-//! that reaches [`FLOOR`]. A build whose record holds every slice's last unit then has each slice
-//! claim only its driver ([`DRIVER`]); one without claims each slice's whole peak as before, and
-//! its wrappers only record ([`slice_need`], [`Units::of`]).
+//! A build with every slice's final link recorded claims only its drivers and
+//! admits units separately, leading. Otherwise each slice learns alone; no fixed
+//! link estimate or incompatible history supplies an unmeasured envelope.
+//! See `docs/measured/slice-memory-claim-2026-11-10.md`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -45,6 +40,85 @@ const CLAIMS: &str = "ATERM_RELEASE_UNIT_CLAIMS";
 /// The line a refused wrapper prints, which Cargo keeps in the slice's log.
 const REFUSED: &str = "aterm-release: slice unit admission: ";
 
+/// Native release links in isolation, without executing the product or
+/// constructing a release. Distinct leaf metadata forces each link while
+/// reusing dependencies. Each take prints the learned production claim.
+pub(crate) fn measure(root: &Path, takes: u8) -> Result<(), String> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(
+            "slice-memory currently measures the native Apple Silicon release slice".into(),
+        );
+    }
+    let triple = "aarch64-apple-darwin";
+    let wrapper = std::env::current_exe().map_err(|e| e.to_string())?;
+    let driver = crate::gates::trust_stage2_bin()
+        .map_err(|e| e.to_string())?
+        .join("targo");
+    let nonce = std::process::id();
+    for take in 1..=takes {
+        let units = Units::live(&[triple], 1);
+        let units = units
+            .first()
+            .ok_or("no account state directory for slice memory")?;
+        let records = aterm_capacity::book::Records::load(&units.record);
+        let before = unit_need(triple, &records, &last_unit(), DRIVER);
+        eprintln!(
+            "{}",
+            aterm_json::json!({"event":"slice-memory-take", "take":take,
+            "record":units.record.display().to_string(), "measured":units.claims(),
+            "claim_bytes":units.claims().then_some(before.mem),
+            "memory_identity":toolchain_key(triple)})
+        );
+        let _claim = aterm_capacity::admit(slice_need(triple, None), aterm_capacity::Admit::Wait)
+            .map_err(|e| e.to_string())?;
+        // The experiment leaves every other memory claimant out, including
+        // while measuring a known unit whose ordinary claim cannot fit beside
+        // unclaimed machine load. The production claim is still printed above.
+        let mut units = units.clone();
+        units.spare = None;
+        let mut command = aterm_uds::spawnfd::command(&driver);
+        command
+            .current_dir(root)
+            .args([
+                "--unverified",
+                "rustc",
+                "--locked",
+                "--release",
+                "-p",
+                "aterm",
+                "--bin",
+                "aterm",
+                "--",
+            ])
+            .arg(format!("-Cmetadata=slice-memory-{nonce}-{take}"))
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
+            .env(
+                "CARGO_TARGET_DIR",
+                root.join("target/.ubd/slice-memory.noindex"),
+            )
+            .env("CARGO_PROFILE_RELEASE_STRIP", "false")
+            .env("ATERM_STAMP", "postlink")
+            .env("SOURCE_DATE_EPOCH", "0");
+        for (name, value) in units.env(&wrapper) {
+            command.env(name, value);
+        }
+        let status = command.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!("slice memory take {take}: {status}"));
+        }
+        let records = aterm_capacity::book::Records::load(&units.record);
+        let peak = peak(&records, triple, &last_unit())
+            .ok_or("link completed without a physical-footprint record")?;
+        let after = unit_need(triple, &records, &last_unit(), DRIVER);
+        eprintln!(
+            "{}",
+            aterm_json::json!({"event":"slice-memory-result", "take":take,
+            "peak_bytes":peak, "next_claim_bytes":after.mem})
+        );
+    }
+    Ok(())
+}
+
 /// One slice's units: the record they keep, the slice's triple, and, where they claim, the
 /// drivers each leaves spare.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,9 +131,10 @@ pub(crate) struct Units {
 impl Units {
     /// The units of the slices one build runs, `triples`, `at_once` of them at a time, kept at
     /// `record`. They claim only where it holds every one's last unit, `aterm`'s link
-    /// ([`last_unit`]): the slices' claims are one process's, which each slice's compilers leave
-    /// out of their own admission, so a slice that claimed its whole peak would go uncounted by
-    /// the other's. Each unit then leaves spare the drivers its build holds at once.
+    /// ([`last_unit`]): the slices' claims share a process, whose claims a child
+    /// compiler excludes from its admission. Mixing isolated training and unit
+    /// admission would therefore leave the training slice unprotected from the
+    /// other's compilers. Each unit leaves every concurrent driver spare.
     pub(crate) fn of(record: &Path, triples: &[&str], at_once: u64) -> Vec<Units> {
         let records = aterm_capacity::book::Records::load(record);
         let claims = triples
@@ -108,13 +183,9 @@ impl Units {
     }
 }
 
-/// What `triple`'s slice claims: its driver where its units claim ([`Units::claims`]), else its
-/// whole build's peak, rounded up from the 0.174.0 m3 peaks (41.7 and 22.8 GiB).
-pub(crate) fn slice_need(
-    triple: &str,
-    native: bool,
-    units: Option<&Units>,
-) -> aterm_capacity::Need {
+/// A measured slice claims its driver. An unmeasured slice learns in isolation:
+/// an RSS record or another compiler build cannot establish its memory envelope.
+pub(crate) fn slice_need(triple: &str, units: Option<&Units>) -> aterm_capacity::Need {
     let need = aterm_capacity::Need::new(format!("release slice {triple}"))
         .rank(aterm_capacity::Rank::Release)
         // An unclaimed load cannot turn a memory shortage into admission ALONE.
@@ -122,7 +193,7 @@ pub(crate) fn slice_need(
     if units.is_some_and(Units::claims) {
         need.mem(DRIVER)
     } else {
-        need.mem_gib(if native { 42 } else { 23 })
+        need.mem(DRIVER).alone()
     }
 }
 
@@ -134,13 +205,38 @@ fn last_unit() -> aterm_verify::unitgraph::UnitName {
     }
 }
 
-fn key(triple: &str, unit: &aterm_verify::unitgraph::UnitName) -> aterm_capacity::book::Key {
+pub(crate) fn key(
+    triple: &str,
+    unit: &aterm_verify::unitgraph::UnitName,
+) -> aterm_capacity::book::Key {
     aterm_capacity::book::Key {
         stage: STAGE.to_owned(),
         // A release builds from a fresh clone, so no checkout names a slice's units.
         checkout: String::new(),
         crates: Some(vec![unit.package.clone()]),
-        variant: Some(format!("{triple} {}", unit.kind)),
+        variant: Some(format!("{triple} {} {}", unit.kind, toolchain_key(triple))),
+    }
+}
+
+/// The build is part of the measurement, as is the accounting metric. Old RSS
+/// records deliberately do not match physical-footprint records. The compat
+/// slice uses the stock compiler pinned by the same lock.
+fn toolchain_key(triple: &str) -> String {
+    let lock = std::env::current_dir()
+        .ok()
+        .and_then(|dir| aterm_toolchain::trust_lock::find(&dir))
+        .and_then(|found| found.lock.ok());
+    let metric = if cfg!(target_os = "macos") {
+        "phys-footprint-tree-v1"
+    } else {
+        "maxrss-v1"
+    };
+    match lock {
+        Some(lock) if triple == "x86_64-apple-darwin" => {
+            format!("{metric} stock-{}", lock.stock_toolchain)
+        }
+        Some(lock) => format!("{metric} trust-{}-{}", lock.build, lock.tree_root),
+        None => format!("{metric} unknown"),
     }
 }
 
@@ -151,6 +247,13 @@ fn peak(
     unit: &aterm_verify::unitgraph::UnitName,
 ) -> Option<u64> {
     let key = key(triple, unit);
+    if key
+        .variant
+        .as_ref()
+        .is_some_and(|v| v.ends_with(" unknown"))
+    {
+        return None;
+    }
     records
         .rows()
         .iter()
@@ -159,7 +262,7 @@ fn peak(
 }
 
 /// What `unit`'s compiler in `triple`'s slice claims: its recorded peak, at least [`FLOOR`],
-/// rounded up to a GiB (a slice's whole claim was rounded up from its measured peak alike),
+/// plus 20% (at least 1 GiB), rounded up to a GiB,
 /// leading, with `spare` (its build's drivers, [`Units::of`]) left spare.
 pub(crate) fn unit_need(
     triple: &str,
@@ -167,9 +270,7 @@ pub(crate) fn unit_need(
     unit: &aterm_verify::unitgraph::UnitName,
     spare: u64,
 ) -> aterm_capacity::Need {
-    let bytes = peak(records, triple, unit)
-        .unwrap_or(FLOOR)
-        .max(FLOOR)
+    let bytes = aterm_capacity::peak_claim(peak(records, triple, unit).unwrap_or(FLOOR).max(FLOOR))
         .div_ceil(FLOOR)
         .saturating_mul(FLOOR);
     aterm_capacity::Need::new(format!(
@@ -258,6 +359,12 @@ fn wrap(
     let claim = match (&unit, units.spare) {
         (Some(unit), Some(spare)) => {
             let records = aterm_capacity::book::Records::load(&units.record);
+            // Recheck in the compiler's own working directory. A snapshot can
+            // carry a different lock from its orchestration checkout, or the
+            // book can have been replaced since the driver chose unit claims.
+            if peak(&records, &units.triple, &last_unit()).is_none() {
+                return Err("no matching toolchain footprint for the final link; rerun the slice alone to learn it".into());
+            }
             let need = unit_need(&units.triple, &records, unit, spare);
             let bytes = need.mem;
             let admit = |need| {
@@ -295,6 +402,7 @@ fn wrap(
     let child = command
         .spawn()
         .map_err(|e| format!("start {}: {e}", words.first().map_or("", String::as_str)))?;
+    let meter = aterm_capacity::tree_meter::TreeMeter::start(child.id());
     if let Some(unit) = &unit {
         let mut event = unit_event(units, unit, "started", queued, started, None, None);
         if let aterm_json::Value::Object(fields) = &mut event {
@@ -306,20 +414,36 @@ fn wrap(
         }
         eprintln!("{event}");
     }
-    let (status, peak, cpu) = wait(child).map_err(|e| format!("wait for the compiler: {e}"))?;
+    let CompilerUsage {
+        status,
+        peak: compiler_peak,
+        rss,
+        cpu,
+    } = wait(child).map_err(|e| format!("wait for the compiler: {e}"))?;
+    let peak = Some(meter.stop(compiler_peak.unwrap_or(0))).filter(|p| *p > 0);
     if let Some(unit) = &unit {
-        eprintln!(
-            "{}",
-            unit_event(
-                units,
-                unit,
-                "ended",
-                queued,
-                timestamp(),
-                cpu,
-                Some(status.success())
-            )
+        let mut event = unit_event(
+            units,
+            unit,
+            "ended",
+            queued,
+            timestamp(),
+            cpu,
+            Some(status.success()),
         );
+        if let aterm_json::Value::Object(fields) = &mut event {
+            fields.insert("peak_bytes".into(), aterm_json::json!(peak));
+            fields.insert(
+                "compiler_peak_bytes".into(),
+                aterm_json::json!(compiler_peak),
+            );
+            fields.insert("maxrss_bytes".into(), aterm_json::json!(rss));
+            fields.insert(
+                "memory_identity".into(),
+                toolchain_key(&units.triple).into(),
+            );
+        }
+        eprintln!("{event}");
     }
     drop(claim);
     // A compiler that failed or was killed stopped short of its peak.
@@ -381,25 +505,63 @@ fn keep(units: &Units, unit: &aterm_verify::unitgraph::UnitName, peak: u64) -> s
     .map(|_| ())
 }
 
-/// The compiler's exit and its peak resident bytes (`wait4`'s `ru_maxrss`, its own children's
-/// included), `None` where the host does not report it.
+/// The owning wait's counters. `peak` is physical footprint on Darwin and
+/// resident peak off it; `rss` remains distinct for comparison on Darwin.
+struct CompilerUsage {
+    status: std::process::ExitStatus,
+    peak: Option<u64>,
+    rss: Option<u64>,
+    cpu: Option<f64>,
+}
+
+/// Wait without reaping first: Darwin retains the lifetime maximum physical
+/// footprint on the zombie. Read it while the child handle still pins its pid,
+/// then reap for RSS and CPU accounting. No sampling interval can miss a peak.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn wait(
-    mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>, Option<f64>)> {
+fn wait(mut child: aterm_uds::spawnfd::Child) -> std::io::Result<CompilerUsage> {
+    child.wait_exited()?;
+    #[cfg(target_os = "macos")]
+    let peak = footprint(child.id());
     let usage = child.wait_with_rusage()?;
-    Ok((
-        usage.status,
-        Some(usage.maxrss).filter(|b| *b > 0),
-        Some(usage.cpu.as_secs_f64()),
-    ))
+    let rss = Some(usage.maxrss).filter(|b| *b > 0);
+    #[cfg(not(target_os = "macos"))]
+    let peak = rss;
+    Ok(CompilerUsage {
+        status: usage.status,
+        peak,
+        rss,
+        cpu: Some(usage.cpu.as_secs_f64()),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn footprint(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: info has the layout and writable size requested by RUSAGE_INFO_V4;
+    // the caller holds the owned, unreaped child, so the pid cannot be reused.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid.try_into().ok()?,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: the successful kernel call initialized the integer-only record.
+    let peak = unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint;
+    (peak > 0).then_some(peak)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn wait(
-    mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>, Option<f64>)> {
-    Ok((child.wait()?, None, None))
+fn wait(mut child: aterm_uds::spawnfd::Child) -> std::io::Result<CompilerUsage> {
+    Ok(CompilerUsage {
+        status: child.wait()?,
+        peak: None,
+        rss: None,
+        cpu: None,
+    })
 }
 
 #[cfg(test)]

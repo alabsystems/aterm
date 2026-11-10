@@ -236,6 +236,122 @@ fn a_store_read_batchs_fences_ask_afresh_under_a_kept_look() {
     assert_eq!(asked, 0, "a read batch's own checks");
 }
 
+/// A table-repair read batch's record history and keys are judged through the look its session
+/// keeps: over a log-backed pair (`compatibility::log_pair`), its probe of the history it needs
+/// (`Session::history_needs`) makes no roster observation of its own
+/// (`aterm_secrets::client::test_roster_observations`) and reads the log on no call of its own
+/// (`aterm_secrets::client::test_logs_read`), and its store open, whose records' history and keys
+/// it takes, makes none beyond its fences' own currency checks (`Session::read_context`,
+/// [`crate::table::FENCES`]) and its closing check of each key it reused
+/// ([`crate::table::KEYS_REVALIDATED`]), which ask afresh by design: a lone record, replayed with
+/// no read batch and no fence, and two, replayed in one read batch whose keys it takes as it goes,
+/// the second reusing the first's. A write batch's probe asks each on its own call.
+/// NEGATIVE CONTROLS (2026-11-10): with `Session::history_needs` reading the log on its own call,
+/// or asking `Bootstrap::holds_histories_in` with no look, its probe asks on its own (`a read
+/// batch's history probe`); with `Session::decode_envelope` asking `Bootstrap::historical_in` with
+/// no look, the store open asks more than its fences do (`a read batch's record history and keys`,
+/// of one record and of two); with its key taken by `Historical::with_key_in` with no look, the
+/// lone record's open (`... of one record`) or, for a read batch's keys, the two records' open
+/// (`... of two records`) asks more.
+#[test]
+fn a_read_batchs_record_history_and_keys_are_judged_through_its_look() {
+    let p = super::compatibility::log_pair();
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let asked = || {
+        (
+            aterm_secrets::client::test_roster_observations(),
+            aterm_secrets::client::test_logs_read(),
+        )
+    };
+    let since = |before: (usize, usize)| {
+        let now = asked();
+        (now.0 - before.0, now.1 - before.1)
+    };
+    let afresh = || {
+        (
+            crate::table::FENCES.get(),
+            crate::table::KEYS_REVALIDATED.get(),
+        )
+    };
+    // The probe's asks, and the store open's asks, fences and keys checked again, as one read
+    // batch judges them.
+    let read = |records: usize| {
+        let replica = p.replica(0);
+        let round = replica.round(peer).unwrap();
+        round
+            .local(peer, |session| {
+                assert!(session.is_log_backed(), "CONTROL: its access");
+                let before = asked();
+                session.history_needs(None, 16)?;
+                let probe = since(before);
+                let (before, afresh_before) = (asked(), afresh());
+                let store = Store::observe(session, &p.paths[0], p.scope)?;
+                assert_eq!(
+                    store.inventory(session)?.count(),
+                    records,
+                    "CONTROL: its records"
+                );
+                let opened = since(before);
+                let now = afresh();
+                Ok((
+                    probe,
+                    opened,
+                    (now.0 - afresh_before.0, now.1 - afresh_before.1),
+                ))
+            })
+            .unwrap()
+    };
+    let (probe, opened, fenced) = read(1);
+    assert_eq!(probe, (0, 0), "a read batch's history probe");
+    assert_eq!(
+        fenced,
+        (0, 0),
+        "CONTROL: a lone record's replay has no fence"
+    );
+    assert_eq!(
+        opened,
+        (0, 0),
+        "a read batch's record history and keys, of one record"
+    );
+    {
+        let bootstrap = p.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &p.paths[0], p.scope)
+            .unwrap()
+            .commit_catalog(&session, b"a second record")
+            .unwrap();
+    }
+    let (probe, opened, fenced) = read(2);
+    assert_eq!(
+        probe,
+        (0, 0),
+        "a read batch's history probe, over two records"
+    );
+    assert!(
+        fenced.0 > 0 && fenced.1 > 0,
+        "CONTROL: two records' replay is fenced and reuses a key: {fenced:?}"
+    );
+    assert_eq!(
+        opened,
+        (fenced.0 + fenced.1, 0),
+        "a read batch's record history and keys, of two records"
+    );
+    let replica = p.replica(0);
+    let probe = replica
+        .round(peer)
+        .unwrap()
+        .local_write(peer, |session| {
+            let before = asked();
+            session.history_needs(None, 16)?;
+            Ok(since(before))
+        })
+        .unwrap();
+    assert!(
+        probe.0 > 0 && probe.1 > 0,
+        "CONTROL: a write batch's probe asks on its own calls: {probe:?}"
+    );
+}
+
 /// Another of this Mac's rounds ingesting into `p`'s first table: a writer's commit, which overtakes
 /// an observer of that table it lands inside.
 fn overtaking_ingest(p: &Pair) -> impl Fn() + 'static {

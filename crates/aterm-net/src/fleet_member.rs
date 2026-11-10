@@ -9053,13 +9053,8 @@ fn pushed_facts_key_at(
     judged: &aterm_uds::private_file::JudgedDir<'_>,
     node: &str,
 ) -> Option<Option<NodeKey>> {
-    match judged.open(&format!("{node}.facts")) {
-        Ok((file, _metadata)) => {
-            let mut head = Vec::with_capacity(PUSHED_FACTS_HEAD);
-            (&file)
-                .take(PUSHED_FACTS_HEAD as u64)
-                .read_to_end(&mut head)
-                .ok()?;
+    match judged.read_head(&format!("{node}.facts"), PUSHED_FACTS_HEAD) {
+        Ok(head) => {
             let rest = head.strip_prefix(PUSHED_FACTS_MAGIC.as_bytes())?;
             let key = &rest[..rest.iter().position(|b| *b == b'\n')?];
             if key == b"-" {

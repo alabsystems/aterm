@@ -101,7 +101,7 @@ fn mapped_guards_preserve_parent_table_and_shared_description() {
     ] {
         let before: Vec<_> = targets.iter().map(|&fd| id(fd)).collect();
         let mut child = command(std::env::current_exe().unwrap());
-        let guards = targets
+        let mut guards: Vec<_> = targets
             .iter()
             .enumerate()
             .map(|(index, &at)| {
@@ -113,8 +113,31 @@ fn mapped_guards_preserve_parent_table_and_shared_description() {
                 (source.as_fd().try_clone_to_owned().unwrap(), at)
             })
             .collect();
+        let rest = guards.split_off(targets.len() / 2);
         child.inherit_guards_at(guards).unwrap();
+        let original_targets = child.guard_targets().collect::<Vec<_>>();
+        assert_eq!(
+            child
+                .append_guards_at(vec![(a.as_fd().try_clone_to_owned().unwrap(), targets[0])])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(child.guard_targets().collect::<Vec<_>>(), original_targets);
+        child.append_guards_at(rest).unwrap();
         assert_eq!(child.guard_targets().collect::<Vec<_>>(), targets);
+        if targets.len() == MAX_GUARD_FDS {
+            assert_eq!(
+                child
+                    .append_guards_at(vec![(a.as_fd().try_clone_to_owned().unwrap(), 2000)])
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(child.guard_targets().collect::<Vec<_>>(), targets);
+        }
         assert_eq!(targets.iter().map(|&fd| id(fd)).collect::<Vec<_>>(), before);
         let mut exec = command("/definitely-absent/mapped-guard-fixture");
         exec.inherit_guards_at(vec![(a.as_fd().try_clone_to_owned().unwrap(), 900)])

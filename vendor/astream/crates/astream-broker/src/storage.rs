@@ -346,6 +346,11 @@ impl Backing {
     }
 }
 
+/// The length in bytes of `file` via `fstat` / `metadata`.
+pub(crate) fn file_len(file: &File) -> io::Result<u64> {
+    Ok(file.metadata()?.len())
+}
+
 /// Up to `buf.len()` bytes of `file` from byte `start`, by positional reads, fewer only
 /// where the file ends: how many were read.
 pub(crate) fn read_some_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<usize> {

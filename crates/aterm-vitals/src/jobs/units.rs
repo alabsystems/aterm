@@ -7,6 +7,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::blockage::{ZombieBook, per_min_deci};
+
 use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
 use super::{
@@ -800,8 +802,9 @@ pub struct Jobs {
     /// A pass identity independent of its clock, so acceptance requires another actual probe.
     read_revision: u64,
     classes: ClassTable,
-    zombies: HashMap<u32, (u64, u32)>,
-    zombie_parents: HashMap<u32, u64>,
+    /// Every zombie this engine's passes saw, by parent ([`crate::blockage::ZombieBook`]): its
+    /// own book, not the model's the Processes row reads, which every whole reading notes.
+    zombies: ZombieBook,
     d_since: HashMap<u32, u64>,
     /// The first reading that saw each `(pid, exec)` not started, by what keeps it
     /// ([`StartWait`]), kept for the keys the last reading held. An unavailable exec version's
@@ -2483,8 +2486,7 @@ impl Jobs {
                 pid,
                 name,
             });
-            let zombies =
-                zombie_facts(&now, &live, &sweep, &self.zombies, &self.zombie_parents, at);
+            let zombies = zombie_facts(&now, &live, &sweep, &self.zombies, at);
             let leaves = leaves_of(&live, &now, &sweep);
             let gate = tab.map_or(InputGate::default(), |t| t.input);
             let shell_pid = tab.map_or(0, |t| t.shell_pid);
@@ -2965,18 +2967,13 @@ impl Jobs {
     }
 
     fn note_zombies(&mut self, at: u64, sweep: &[SweepProc]) {
-        let mut live: HashMap<u32, u32> = HashMap::new();
-        for p in sweep.iter().filter(|p| p.state == ProcState::Zombie) {
-            live.insert(p.pid, p.ppid);
-        }
-        self.zombies
-            .retain(|pid, (_, ppid)| live.get(pid).is_some_and(|pp| pp == ppid));
-        for (pid, ppid) in &live {
-            self.zombies.entry(*pid).or_insert((at, *ppid));
-            self.zombie_parents.entry(*ppid).or_insert(at);
-        }
-        let parents: BTreeSet<u32> = live.values().copied().collect();
-        self.zombie_parents.retain(|p, _| parents.contains(p));
+        self.zombies.note(
+            at,
+            sweep
+                .iter()
+                .filter(|p| p.state == ProcState::Zombie)
+                .map(|p| (p.pid, p.ppid)),
+        );
     }
 
     fn note_d_state(&mut self, at: u64, sweep: &[SweepProc], facts: &HashMap<u32, &JobProc>) {
@@ -3128,14 +3125,8 @@ impl Jobs {
                 f.own_procs += 1;
             }
         }
-        let mut by_parent: BTreeMap<u32, u32> = BTreeMap::new();
-        for (first, ppid) in self.zombies.values() {
-            if at.saturating_sub(*first) >= ZOMBIE_AGE_MS {
-                *by_parent.entry(*ppid).or_default() += 1;
-            }
-        }
-        for (ppid, count) in by_parent {
-            let since = self.zombie_parents.get(&ppid).copied().unwrap_or(at);
+        for (ppid, count) in self.zombies.piles(at) {
+            let since = self.zombies.pile_since(ppid).unwrap_or(at);
             f.zombies.push(ZombieParent {
                 ppid,
                 name: name(ppid),
@@ -3440,10 +3431,6 @@ fn delta(now: Option<u64>, then: Option<u64>) -> u64 {
         (Some(a), Some(b)) => a.saturating_sub(b),
         _ => 0,
     }
-}
-
-fn per_min_deci(count: u32, elapsed_ms: u64) -> u64 {
-    u64::from(count) * 600_000 / elapsed_ms.max(60_000)
 }
 
 fn is_detached(p: &SweepProc) -> bool {
@@ -4402,28 +4389,27 @@ fn zombie_facts(
     now: &MemberMap,
     live: &[u32],
     sweep: &HashMap<u32, &SweepProc>,
-    seen: &HashMap<u32, (u64, u32)>,
-    parents: &HashMap<u32, u64>,
+    book: &ZombieBook,
     at: u64,
 ) -> Option<Zombies> {
     let live: BTreeSet<u32> = live.iter().copied().collect();
     let mut by_parent: BTreeMap<u32, u32> = BTreeMap::new();
     for pid in now.keys() {
-        let Some((first, ppid)) = seen.get(pid) else {
+        let Some((first, ppid)) = book.seen(*pid) else {
             continue;
         };
         if sweep.get(pid).is_some_and(|s| s.state == ProcState::Zombie)
-            && at.saturating_sub(*first) >= ZOMBIE_AGE_MS
-            && live.contains(ppid)
+            && at.saturating_sub(first) >= ZOMBIE_AGE_MS
+            && live.contains(&ppid)
         {
-            *by_parent.entry(*ppid).or_default() += 1;
+            *by_parent.entry(ppid).or_default() += 1;
         }
     }
     let count: u32 = by_parent.values().sum();
     let (parent, _) = by_parent
         .iter()
         .max_by_key(|(p, c)| (**c, std::cmp::Reverse(**p)))?;
-    let since = parents.get(parent).copied().unwrap_or(at);
+    let since = book.pile_since(*parent).unwrap_or(at);
     Some(Zombies {
         count,
         parent: *parent,

@@ -20,17 +20,19 @@ pub use kimi::KimiOauth;
 pub use kimi::RefreshAuthority as KimiRefreshAuthority;
 #[cfg(unix)]
 pub use kimi::RefreshRecoveryContext as KimiRecoveryContext;
+pub(in crate::harness) use kimi::credential_path as kimi_credential_path;
 #[cfg(all(unix, not(test)))]
 pub(in crate::harness) use kimi::verify_or_refresh as verify_or_refresh_kimi;
 #[cfg(unix)]
 pub(in crate::harness) use kimi::{
     KimiProof, NativeError as KimiNativeError, RejectedSnapshot as KimiRejectedSnapshot,
-    credential_path as kimi_credential_path, expire_pending as expire_kimi_pending,
-    observation_error as kimi_observation_error, pending_expiry as kimi_pending_expiry,
-    pending_files as kimi_pending_files, rejected_snapshot as kimi_rejected_snapshot,
+    expire_pending as expire_kimi_pending, observation_error as kimi_observation_error,
+    pending_expiry as kimi_pending_expiry, pending_files as kimi_pending_files,
+    rejected_snapshot as kimi_rejected_snapshot,
     verify_native_classified as verify_native_kimi_classified,
     verify_or_refresh_with_rejection as verify_or_refresh_kimi_with_rejection,
 };
+pub(in crate::harness) use kimi::{ManagedRoute as KimiManagedRoute, PROVIDER as KIMI_MANAGED};
 #[cfg(all(test, unix))]
 pub(in crate::harness) use kimi::{
     pending_proof_fixture as kimi_pending_proof_fixture, proof_fixture as kimi_proof_fixture,

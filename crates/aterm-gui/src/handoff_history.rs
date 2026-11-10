@@ -1488,9 +1488,41 @@ pub(crate) fn stamp_manifest(
     manifest: &mut crate::session_store::SessionHandoff,
     screens: &[(u64, TerminalCheckpoint)],
     heads: &[HistoryHead],
-    mut results: ExportResults,
+    results: ExportResults,
     dir: &Path,
     nonce: &str,
+) -> Vec<(u64, Joined)> {
+    stamp_manifest_with_stem(
+        manifest,
+        screens,
+        heads,
+        results,
+        dir,
+        &format!("seamless-{}-{nonce}", std::process::id()),
+    )
+}
+
+/// Fixture-only form of [`stamp_manifest`] whose producer identity is a
+/// deterministic input shared with the product writer.
+#[cfg(all(test, unix))]
+pub(crate) fn stamp_fixture_manifest(
+    manifest: &mut crate::session_store::SessionHandoff,
+    screens: &[(u64, TerminalCheckpoint)],
+    heads: &[HistoryHead],
+    results: ExportResults,
+    dir: &Path,
+    attempt: &crate::seamless::OutgoingAttemptName,
+) -> Vec<(u64, Joined)> {
+    stamp_manifest_with_stem(manifest, screens, heads, results, dir, &attempt.stem())
+}
+
+fn stamp_manifest_with_stem(
+    manifest: &mut crate::session_store::SessionHandoff,
+    screens: &[(u64, TerminalCheckpoint)],
+    heads: &[HistoryHead],
+    mut results: ExportResults,
+    dir: &Path,
+    stem: &str,
 ) -> Vec<(u64, Joined)> {
     let mut verdicts = Vec::with_capacity(manifest.sessions.len());
     for record in &mut manifest.sessions {
@@ -1516,11 +1548,7 @@ pub(crate) fn stamp_manifest(
         if joined.take > 0
             && let Some(export) = export
         {
-            let named = dir.join(format!(
-                "seamless-{}-{nonce}.s{}.hist",
-                std::process::id(),
-                record.local_id
-            ));
+            let named = dir.join(format!("{stem}.s{}.hist", record.local_id));
             let links_dropped = export.links_dropped;
             let source = export.file.keep();
             match std::fs::hard_link(&source, &named) {

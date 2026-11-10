@@ -999,6 +999,7 @@ pub fn runner_text(r: &Run, tb: (u32, u32)) -> String {
             name,
             unread,
             unified,
+            power_mw,
         }) = g
         else {
             put(which, "-".to_owned());
@@ -1018,6 +1019,14 @@ pub fn runner_text(r: &Run, tb: (u32, u32)) -> String {
             escape(unread.as_ref().map(ToString::to_string).as_deref()),
         );
         put(&format!("{which}.unified"), u8::from(*unified).to_string());
+        put(
+            &format!("{which}.power_mw"),
+            match power_mw {
+                None => "-".to_owned(),
+                Some(Ok(mw)) => mw.to_string(),
+                Some(Err(why)) => why.to_string(),
+            },
+        );
     }
     for n in notes {
         put("note", escape(Some(n)));
@@ -1064,21 +1073,27 @@ impl Fields<'_> {
             return Ok(None);
         }
         let k = |f: &str| format!("{which}.{f}");
+        let why = |key: &str, w: &str| {
+            [
+                aterm_sysprobe::Why::Unsupported,
+                aterm_sysprobe::Why::NotRead,
+                aterm_sysprobe::Why::Asleep,
+                aterm_sysprobe::Why::Absent,
+            ]
+            .into_iter()
+            .find(|y| y.to_string() == w)
+            .ok_or_else(|| format!("{key}={w} names no reason a reading here gives"))
+        };
         let unread = match self.text(&k("unread"))? {
             None => None,
-            Some(w) => Some(
-                [
-                    aterm_sysprobe::Why::Unsupported,
-                    aterm_sysprobe::Why::NotRead,
-                    aterm_sysprobe::Why::Asleep,
-                    aterm_sysprobe::Why::Absent,
-                ]
-                .into_iter()
-                .find(|y| y.to_string() == w)
-                .ok_or_else(|| {
-                    format!("{which}.unread={w} names no reason a reading here gives")
-                })?,
-            ),
+            Some(w) => Some(why(&k("unread"), &w)?),
+        };
+        let power_mw = match self.raw(&k("power_mw"))? {
+            "-" => None,
+            v => Some(match v.parse::<u32>() {
+                Ok(mw) => Ok(mw),
+                Err(_) => Err(why(&k("power_mw"), v)?),
+            }),
         };
         Ok(Some(GpuReading {
             device_pct: self.num(&k("device_pct"))?,
@@ -1095,6 +1110,7 @@ impl Fields<'_> {
                 "1" => true,
                 v => return Err(format!("{which}.unified={v} is neither 0 nor 1")),
             },
+            power_mw,
         }))
     }
 }

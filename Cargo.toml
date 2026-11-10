@@ -84,7 +84,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.195.0"
+version = "0.196.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -452,6 +452,14 @@ opt-level = 2
 # aterm-secrets --lib 142 -> 72 CPU-s). ring builds in 5.4 s instead of 4.8. Only opt-level
 # moves; debug assertions and overflow checks stay on.
 [profile.dev.package.ring]
+opt-level = 2
+
+# Native provenance verifies the whole original image inside bounded member
+# queries. In the measured 32 MB fixture, ancestor connection spent 856-860 ms
+# CPU with SHA-256 at level 0 and 74-86 ms at 2. Keep all validation checks;
+# debug assertions and overflow checks remain on. The trust lane clears this
+# override with the other named dev rows above.
+[profile.dev.package.trust-sha2]
 opt-level = 2
 
 [profile.dev.package.aterm-spec]

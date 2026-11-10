@@ -1403,6 +1403,12 @@ fn work_status_in(
 #[cfg(unix)]
 const PRIVATE_INDEXES: usize = 256;
 
+/// How long [`private_index`] keeps a copy, by its change time: a day after it was made a sweep
+/// lets it go, so a copy no read takes again (its checkout gone, or named by an earlier build)
+/// leaves with the next sweep past it, and one still read is made again at its next read.
+#[cfg(unix)]
+const PRIVATE_INDEX_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// What [`private_index`] hands [`work_status`]: the copy, and which file it was then.
 #[cfg(unix)]
 struct PrivateIndex {
@@ -1599,23 +1605,32 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
 }
 
 /// Let go of what [`private_index`] keeps in `folder` that the copy `kept`, of the index `id`
-/// names, leaves behind: that index's copies of earlier states, temporaries unchanged for an hour
-/// (a read that ended before it renamed its copy into place), and past [`PRIVATE_INDEXES`] the
-/// copies refreshed longest ago. Each is aged by its change time, which no writer sets: a
-/// temporary carries its source's modification time, often hours old, so a sweep that went by it
-/// would let go of another read's temporary mid-refresh, and git refresh the missing file into an
-/// empty index, every tracked file deleted.
+/// names, leaves behind: that index's copies of earlier states, every other copy made
+/// [`PRIVATE_INDEX_LIFE`] or longer ago, temporaries unchanged for an hour (a read that ended
+/// before it renamed its copy into place), and past [`PRIVATE_INDEXES`] the copies refreshed
+/// longest ago. Each is aged by its change time, which no writer sets: a temporary carries its
+/// source's modification time, often hours old, so a sweep that went by it would let go of
+/// another read's temporary mid-refresh, and git refresh the missing file into an empty index,
+/// every tracked file deleted. A copy let go while a read holds it is read no more
+/// ([`PrivateIndex::stands`]).
 #[cfg(unix)]
 fn sweep_private_indexes(folder: &Path, id: &str, kept: &str) {
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return;
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| {
             i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
         });
+    sweep_private_indexes_at(folder, id, kept, now);
+}
+
+/// [`sweep_private_indexes`] at `now`, in seconds since the epoch.
+#[cfg(unix)]
+fn sweep_private_indexes_at(folder: &Path, id: &str, kept: &str, now: i64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let life = i64::try_from(PRIVATE_INDEX_LIFE.as_secs()).unwrap_or(i64::MAX);
     let earlier = format!("{id}-");
     let mut copies = Vec::new();
     for entry in entries.flatten() {
@@ -1629,7 +1644,9 @@ fn sweep_private_indexes(folder: &Path, id: &str, kept: &str) {
         else {
             continue;
         };
-        if name.ends_with(".index") && name.starts_with(&earlier) {
+        if name.ends_with(".index")
+            && (name.starts_with(&earlier) || now.saturating_sub(changed.0) >= life)
+        {
             let _ = std::fs::remove_file(entry.path());
         } else if name.ends_with(".index") {
             copies.push((changed, entry.path()));

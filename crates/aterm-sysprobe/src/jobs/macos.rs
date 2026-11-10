@@ -246,6 +246,38 @@ fn threads(pid: c_int, listed: &[u64]) -> (Vec<ThreadReading>, bool) {
     (out, truncated)
 }
 
+/// [`super::census_read`] on macOS: the thread list and each thread's state by the readers a
+/// member's facts use ([`thread_handles`], [`threads`]). An empty or refused list is a zombie
+/// (which has no threads), a process the kernel refuses, or one gone, told apart by `kill(0)`.
+pub(super) fn census_read(pid: u32) -> crate::dstate::Read {
+    use crate::dstate::Read;
+    let Some(p) = c_int::try_from(pid).ok().filter(|p| *p > 0) else {
+        return Read::Gone;
+    };
+    match thread_handles(p, MAX_THREADS + 1) {
+        Some(list) if !list.is_empty() => {
+            let (ts, _cut) = threads(p, &list);
+            let count = |f: fn(&ThreadReading) -> bool| {
+                u32::try_from(ts.iter().filter(|t| f(t)).count()).unwrap_or(u32::MAX)
+            };
+            Read::Threads {
+                threads: count(|_| true),
+                uninterruptible: count(|t| t.state == RunState::Uninterruptible),
+            }
+        }
+        _ => {
+            // SAFETY: signal 0 sends nothing; it asks whether `p` exists. `errno` is this
+            // thread's, read straight after.
+            let (rc, errno) = unsafe { (libc::kill(p, 0), *libc::__error()) };
+            if rc == 0 || errno == libc::EPERM {
+                Read::Refused
+            } else {
+                Read::Gone
+            }
+        }
+    }
+}
+
 /// Whether this Mac is arm64 (`hw.optional.arm64`, which reads 1 under Rosetta too), read once.
 fn host_arm64() -> bool {
     static ARM64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

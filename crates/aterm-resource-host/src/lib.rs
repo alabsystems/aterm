@@ -93,3 +93,7 @@ pub use native_fixture::entry as native_member_fixture;
 
 #[cfg(all(test, target_os = "macos"))]
 mod metadata_native_test_entry;
+
+// The actual private protocol is exercised before any Solver recipe can select it.
+#[cfg(all(test, target_os = "macos"))]
+mod solver_bootstrap;

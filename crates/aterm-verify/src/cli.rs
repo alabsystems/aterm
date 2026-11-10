@@ -64,14 +64,14 @@ pub struct Args {
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
-    /// `--passed-binaries <path>`: with `release` running `test`, the versioned content proofs of
+    /// `--passed-binaries <path>`: with `test`, the versioned content proofs of
     /// prior successful test binaries; only a complete matching proof is carried
     /// ([`crate::testrun::carry`]).
     pub passed_binaries: Option<PathBuf>,
     /// `--passed-lint-packages <path>`: prior successful per-package lint content proofs.
     pub passed_lint_packages: Option<PathBuf>,
-    /// `--carry-context <sha256>`: with release test or lint, the cutter's frozen verifier, seal
-    /// and toolchain context. It is part of every item content key.
+    /// `--carry-context <sha256>`: a test run's frozen caller context, or a release lint's
+    /// verifier, seal and toolchain context. It is part of every item content key.
     pub carry_context: Option<String>,
     /// `--events <path>`: the file each `check-finished`, `test-binary-finished` and
     /// `lint-package-finished` line is appended to whole, apart from the output its children share
@@ -336,11 +336,9 @@ where
             );
         }
     }
-    if a.passed_binaries.is_some() && !(a.release && a.checks.contains(&Check::Test)) {
+    if a.passed_binaries.is_some() && !a.checks.contains(&Check::Test) {
         return usage(
-            "--passed-binaries carries test binaries into a release's test run; run it with \
-             `release` and its test check"
-                .into(),
+            "--passed-binaries carries complete test proofs; run it with the test check".into(),
         );
     }
     if a.passed_lint_packages.is_some() && !(a.release && a.checks.contains(&Check::Lint)) {
@@ -351,14 +349,9 @@ where
         );
     }
     if let Some(context) = &a.carry_context {
-        if !(a.release
-            && a.checks
-                .iter()
-                .any(|check| matches!(check, Check::Test | Check::Lint)))
-        {
+        if !(a.checks.contains(&Check::Test) || (a.release && a.checks.contains(&Check::Lint))) {
             return usage(
-                "--carry-context salts a release's test or lint evidence; run it with `release` \
-                 and one of those checks"
+                "--carry-context salts test or release lint evidence; run it with one of those checks"
                     .into(),
             );
         }
@@ -574,7 +567,7 @@ Options:
                           <target>/verify/.ubd/logs.noindex/runs.noindex; retention
                           targets 20 while preserving all running logs)
       --passed-binaries <path>
-                          with release and its test check: binaries that passed
+                          with the test check: binaries that passed
                           before, as schema-1 content proofs; only a prior ok
                           whose executable and complete runtime-input key match
                           is carried, not run again
@@ -583,8 +576,8 @@ Options:
                           proofs; only a prior ok with the same complete compiler
                           input key is carried
       --carry-context <sha256>
-                          with release test or lint: frozen verifier, seal and
-                          toolchain context; required with prior content proofs
+                          frozen caller context for test or release lint;
+                          required with prior content proofs
       --events <path>     append each check-finished and test-binary-finished
                           line there too, whole
   -h, --help
@@ -684,9 +677,8 @@ mod tests {
         );
     }
 
-    /// `--passed-binaries` goes only with a release whose run holds `test`, the whole release's
-    /// or a resume's; `--events` with any run (a release's cutter and `verify land` keep them).
-    /// Negative control: dropping the first rule lets a dev `test --all` take the binaries.
+    /// Binary proofs go only with a test check and a frozen context, including development
+    /// rejudges. Release-only lint proofs remain separate; another check cannot take binaries.
     #[test]
     fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
         assert_eq!(
@@ -721,6 +713,15 @@ mod tests {
             .checks
             .contains(&Check::Test)
         );
+        for selection in [vec!["test", "--all"], vec!["--base", "previous-main"]] {
+            let context = "ab".repeat(32);
+            let mut args = selection;
+            args.extend(["--passed-binaries", "/p", "--carry-context", &context]);
+            let parsed = ok(&args);
+            assert!(!parsed.release && !parsed.as_release);
+            assert!(parsed.checks.contains(&Check::Test));
+            assert_eq!(parsed.carry_context.as_deref(), Some(context.as_str()));
+        }
         for args in [
             &[
                 "release",
@@ -742,8 +743,7 @@ mod tests {
                 "/a",
             ],
             &[
-                "test",
-                "--all",
+                "fmt",
                 "--passed-binaries",
                 "/p",
                 "--carry-context",

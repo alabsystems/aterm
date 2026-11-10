@@ -447,6 +447,7 @@ fn start_node_commons_runtime(
                 let observation = runtime.network_observation();
                 aterm_gui::hear_commons(move || Some(observation.snapshot().peers));
                 alab_journal::start_backfill();
+                alab_observed::start_sweep();
             }
             true
         }
@@ -1983,6 +1984,7 @@ fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path
                     relay_by_node(runtime, state_dir);
                 }
                 alab_journal::start_backfill();
+                alab_observed::start_sweep();
             }
             true
         }

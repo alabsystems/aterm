@@ -268,6 +268,124 @@ fn resource_admission_cannot_replace_the_landing_check_scope() {
             "now"
         ]
     );
+
+    let driver = "ab".repeat(32);
+    let context = development_context(Some(&driver)).unwrap();
+    assert_ne!(context, driver, "development has its own proof domain");
+    assert_ne!(
+        context,
+        development_context(Some(&"cd".repeat(32))).unwrap()
+    );
+    assert!(development_context(None).is_none());
+    let id = "12".repeat(16);
+    let invocation = aterm_json::json!({
+        "id": id, "identity_error": null,
+        "source_observation": {
+            "observed_head": "ab".repeat(20), "selection": "-p fixture",
+            "selection_truncated": false, "checks": ["test"], "checks_omitted": 0,
+            "release": false, "fix": false, "no_windows": false, "compile_only": false,
+        },
+    });
+    let line = |mut event: aterm_json::Value| {
+        let object = event.as_object_mut().unwrap();
+        object.insert("schema".into(), aterm_json::json!(1));
+        object.insert("invocation".into(), invocation.clone());
+        format!("verify-event: {event}\n")
+    };
+    let exe = "34".repeat(32);
+    let key = "56".repeat(32);
+    let lines = vec![
+        line(aterm_json::json!({"event":"invocation-started"})),
+        line(aterm_json::json!({
+            "event":"test-binary-finished", "test":"-p fixture --lib",
+            "outcome":"ok", "exit_code":0, "carried":false, "json":false,
+            "exe_sha256":exe, "content_key":key, "inputs_bounded":true,
+            "input_reason":null, "recorded_execution_s":1.0,
+            "evidence": {"schema":1, "exe_sha256":exe, "content_key":key,
+                "inputs_bounded":true, "input_reason":null},
+        })),
+        line(aterm_json::json!({"event":"check-finished", "check":"test",
+            "outcome":"ok", "findings":[], "findings_total":0})),
+        line(aterm_json::json!({"event":"run-finished", "code":0,
+            "checks":[{"check":"test", "outcome":"ok"}]})),
+    ];
+    let text = lines.concat();
+    let read = |text: &str, code| development_proofs(text, &Judged::from_events(text, code, 1));
+    let proof = read(&text, exit::PASS);
+    assert_eq!(proof.len(), 1);
+    assert_eq!(
+        proof["-p fixture --lib"].exe_sha256.as_deref(),
+        Some(exe.as_str())
+    );
+    assert!(
+        !proof["-p fixture --lib"].json,
+        "non-harness evidence invents no counts"
+    );
+    assert!(read(&text, exit::FAILED).is_empty());
+    #[cfg(unix)]
+    let disk = line(
+        aterm_json::from_str(
+            crate::disk::event("unclaimed", 0)
+                .strip_prefix("verify-event: ")
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    #[cfg(not(unix))]
+    let disk = line(aterm_json::json!({"event":"disk", "mode":"unclaimed", "walks":0}));
+    for mode in ["claimed", "covered", "unclaimed"] {
+        let footer = disk.replace("unclaimed", mode);
+        assert_eq!(read(&format!("{text}{footer}"), exit::PASS), proof);
+    }
+    for tail in [
+        line(aterm_json::json!({"event":"stage-admitted"})),
+        lines[1].clone(),
+        lines[2].clone(),
+        lines[3].clone(),
+        format!("{disk}{disk}"),
+        disk.replace("\"mode\":\"unclaimed\"", "\"mode\":\"unknown\""),
+        disk.replace("\"walks\":0", "\"walks\":-1"),
+        disk.replace("\"walks\":0", "\"walks\":0,\"walks\":0"),
+        disk.replace(&id, &"78".repeat(16)),
+        disk.trim_end().to_owned(),
+    ] {
+        assert!(
+            read(&format!("{text}{tail}"), exit::PASS).is_empty(),
+            "{tail}"
+        );
+    }
+    let mut early_disk = lines.clone();
+    early_disk.insert(1, disk);
+    assert!(read(&early_disk.concat(), exit::PASS).is_empty());
+    let mut no_test = lines.clone();
+    no_test.remove(2);
+    no_test[2] = line(aterm_json::json!({"event":"run-finished", "code":0, "checks":[]}));
+    assert!(read(&no_test.concat(), exit::PASS).is_empty());
+    for changed in [
+        text.trim_end().to_owned(),
+        text.replace("\"exe_sha256\":", "broken-json:"),
+        text.replace("\"inputs_bounded\":true", "\"inputs_bounded\":false"),
+        text.replace(&format!("\"exe_sha256\":\"{exe}\""), "\"exe_sha256\":null"),
+        text.replace("\"exit_code\":0", "\"exit_code\":101"),
+        text.replace("\"carried\":false", "\"carried\":true"),
+        text.replace("\"release\":false", "\"release\":true"),
+        text.replace(
+            "\"event\":\"test-binary-finished\"",
+            "\"event\":\"observation-unavailable\"",
+        ),
+        text.replace(
+            "\"inputs_bounded\":true",
+            "\"inputs_bounded\":false,\"inputs_bounded\":true",
+        ),
+    ] {
+        assert!(read(&changed, exit::PASS).is_empty(), "{changed}");
+    }
+    let mut foreign = lines.clone();
+    foreign[1] = foreign[1].replace(&id, &"78".repeat(16));
+    assert!(read(&foreign.concat(), exit::PASS).is_empty());
+    let mut repeated = lines;
+    repeated.insert(2, repeated[1].clone());
+    assert!(read(&repeated.concat(), exit::PASS).is_empty());
 }
 
 fn git_cmd(dir: &Path) -> Command {
@@ -2205,6 +2323,66 @@ fn a_landing_moves_only_what_a_release_cut_stranded() {
             .expect("changelog")
             .trim_end()
     );
+}
+
+/// A BRANCH THAT REORDERS `[Unreleased]` WHILE MAIN WRITES INTO IT LANDS EACH KIND ONCE, over real
+/// git and its union driver (the shape of 7d1464cf8bb, 2026-11-10): the branch puts `### Fixed`
+/// first and rewords the entry under `### Changed`, main writes a new entry above that one, and
+/// git keeps main's side whole and adds the branch's `### Changed` below it, so the merge says
+/// the kind twice. The landing joins the branch's added subsection into main's, leaving main's
+/// lines as they are (the entry's old words with them: ATERM-KI-1110-3). CONTROL:
+/// [`a_landing_moves_only_what_a_release_cut_stranded`], where main's own words stay.
+/// NEGATIVE CONTROL (2026-11-10): without the join, `### Changed` lands twice.
+#[test]
+fn a_branch_that_reorders_unreleased_while_main_writes_into_it_lands_each_kind_once() {
+    let changelog = |unreleased: &str| {
+        format!(
+            "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [0.1.0] - 2026-11-01\n\n### \
+             Fixed\n\n- **The first fix.** Shipped.\n"
+        )
+    };
+    let old = "- **Old words.** Said once.\n\n";
+    let fixed = "### Fixed\n\n- **First fix.** One.\n\n";
+    let new = "- **New words.** Said better.\n\n";
+    let mains = "- **Main's change.** Written meanwhile.\n\n";
+    let world = world();
+    rival_moves(&world, ".gitattributes", "CHANGELOG.md merge=union\n");
+    rival_moves(
+        &world,
+        "CHANGELOG.md",
+        &changelog(&format!("### Changed\n\n{old}{fixed}")),
+    );
+    git(&world.work, &["fetch", "-q", "origin"]);
+    git(&world.work, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit(
+        &world.work,
+        "CHANGELOG.md",
+        &changelog(&format!("{fixed}### Changed\n\n{new}")),
+    );
+    rival_moves(
+        &world,
+        "CHANGELOG.md",
+        &changelog(&format!("### Changed\n\n{mains}{old}{fixed}")),
+    );
+    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let landed = git(
+        &world.work,
+        &["show", &format!("{}:CHANGELOG.md", origin_main(&world))],
+    );
+    assert_eq!(
+        landed,
+        changelog(&format!("### Changed\n\n{mains}{old}{new}{fixed}")).trim_end(),
+        "{said:#?}"
+    );
+    assert!(
+        said.iter().any(|l| l.starts_with(
+            "verify land: joined a `### Changed` subsection this branch adds under [Unreleased] \
+             beside another of its kind into that one (merging"
+        )),
+        "{said:#?}"
+    );
+    assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
 }
 
 /// WHERE AN ENTRY CAME FROM IS THE BRANCH'S OWN COMMITS, NOT ONE MERGE BASE, over real git and a

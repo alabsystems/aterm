@@ -38,6 +38,16 @@ fn scope_covers_at(peer: Peer, pid: u32, birth: u64, started: Instant) -> bool {
 pub(super) trait MemberCustody {
     fn before_arm(&mut self) -> io::Result<()>;
     fn before_go(&mut self) -> io::Result<()>;
+    /// A protocol-gated target must durably bind its actual Started metadata
+    /// before offering Run. Ordinary native-resume targets keep their existing path.
+    fn commit_started(
+        &mut self,
+        _: &Binding,
+        _: &Started,
+        _: Option<RequestedStartLimits>,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError>;
     fn bind(&mut self, child: spawnfd::Spawned) -> Result<CohortChild, LaunchError>;
     fn cancel_no_child(&mut self, proof: spawnfd::NotSpawned) -> Result<(), CancelError>;
@@ -99,17 +109,46 @@ pub(super) trait MemberResources {
     fn prepare_target(&mut self, _: &mut spawnfd::Child) -> io::Result<bool> {
         Ok(true)
     }
+    /// Poll the original target's execution gate. A Pending result retains
+    /// exactly this child/resources; it is not a request to repeat preparation,
+    /// journal commitment, native loan binding or launch under another attempt.
+    fn poll_start(
+        &mut self,
+        _: &mut spawnfd::Child,
+        _: &mut dyn FnMut() -> bool,
+        _: &mut dyn FnMut(&Started, Option<RequestedStartLimits>) -> io::Result<()>,
+    ) -> io::Result<TargetStart> {
+        Ok(TargetStart::Resume)
+    }
     fn take_producer_inputs(&mut self) -> io::Result<Option<ProducerInputs>> {
         Ok(None)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Started {
     pub pid: u32,
     pub birth: u64,
     pub monotonic_ns: u64,
     pub unix_ns: u64,
+}
+/// The original private offer's requested policy, not an installed-limit receipt
+/// or CPU/memory ownership. A production profile must bind retained resources first.
+#[derive(Clone, Copy)]
+pub(super) struct RequestedStartLimits {
+    pub units: u32,
+    pub footprint_mib: u32,
+}
+pub(super) enum TargetStart {
+    /// The original native child remains held before its first execution.
+    Resume,
+    /// A private execution gate has not completed. `offered` is a fact about
+    /// delivery of this SAME Run, never permission to replay it elsewhere.
+    #[cfg(all(test, target_os = "macos"))]
+    Pending { offered: bool },
+    /// The protocol dispatched exactly the metadata previously durably committed.
+    #[cfg(all(test, target_os = "macos"))]
+    Started { metadata: Started, since: Instant },
 }
 #[derive(Clone, Debug)]
 pub(super) struct Completed {
@@ -142,6 +181,8 @@ struct Bound {
     ended: Option<Instant>,
     started: Option<Instant>,
     go_attempted: bool,
+    dispatching: bool,
+    committed_start: Option<Started>,
     launched: bool,
     reaped: bool,
     cleanup_at: Option<Instant>,
@@ -164,6 +205,8 @@ impl Bound {
             ended: None,
             started: None,
             go_attempted: false,
+            dispatching: false,
+            committed_start: None,
             launched: false,
             reaped: false,
             cleanup_at: None,
@@ -317,7 +360,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
         let State::Bound(bound) = &mut self.state else {
             return Err(refused("member is not durably bound"));
         };
-        if bound.go_attempted || bound.cleanup_at.is_some() {
+        if (bound.go_attempted && !bound.dispatching) || bound.cleanup_at.is_some() {
             return Err(refused("member cannot start or replay"));
         }
         if bound.birth == 0 || bound.exit.is_none() {
@@ -325,11 +368,15 @@ impl<D: MemberResources> OwnedAttempt<D> {
             bound.stop(CompletionCause::Cancelled);
             return Err(refused("member identity or exit witness unavailable"));
         }
-        let prepared = self
-            .resources
-            .as_mut()
-            .ok_or_else(|| refused("member descriptors missing"))?
-            .prepare_target(bound.child.child_mut());
+        let first_dispatch = !bound.dispatching;
+        let prepared = if first_dispatch {
+            self.resources
+                .as_mut()
+                .ok_or_else(|| refused("member descriptors missing"))?
+                .prepare_target(bound.child.child_mut())
+        } else {
+            Ok(true)
+        };
         match prepared {
             Ok(false) => return Err(io::ErrorKind::WouldBlock.into()),
             Ok(true) => {}
@@ -340,51 +387,117 @@ impl<D: MemberResources> OwnedAttempt<D> {
             }
         }
         let prepare = (|| {
-            bound.producer = self
-                .resources
-                .as_mut()
-                .ok_or_else(|| refused("member descriptors missing"))?
-                .take_producer_inputs()?;
-            if let Some(inputs) = &bound.producer {
-                inputs.check_child(&bound.child, bound.pid, bound.birth)?;
-            } else if require_containment {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "producer descendant retirement requires enforced native containment",
-                ));
+            if first_dispatch {
+                bound.producer = self
+                    .resources
+                    .as_mut()
+                    .ok_or_else(|| refused("member descriptors missing"))?
+                    .take_producer_inputs()?;
+                if let Some(inputs) = &bound.producer {
+                    inputs.check_child(&bound.child, bound.pid, bound.birth)?;
+                } else if require_containment {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "producer descendant retirement requires enforced native containment",
+                    ));
+                }
+                self.resources
+                    .as_mut()
+                    .ok_or_else(|| refused("member descriptors missing"))?
+                    .bind_child(bound.pid)?;
+                self.resources
+                    .as_mut()
+                    .ok_or_else(|| refused("member descriptors missing"))?
+                    .publish_prepared((bound.pid, bound.birth), &mut self.events)?;
+                custody.validate()?;
+                if let Some(inputs) = &mut bound.producer {
+                    custody.bind_producer(inputs)?;
+                }
+                custody.before_go()?;
+                bound.dispatching = true;
             }
-            self.resources
-                .as_mut()
-                .ok_or_else(|| refused("member descriptors missing"))?
-                .bind_child(bound.pid)?;
-            self.resources
-                .as_mut()
-                .ok_or_else(|| refused("member descriptors missing"))?
-                .publish_prepared((bound.pid, bound.birth), &mut self.events)?;
             custody.validate()?;
-            if let Some(inputs) = &mut bound.producer {
-                custody.bind_producer(inputs)?;
-            }
-            custody.before_go()?;
-            let (monotonic_ns, unix_ns) = clocks()?;
             if self.events.cancelled() || bound.child.child_mut().exited()? {
                 return Err(refused("member cancelled or exited before GO"));
             }
-            // Capture before resume: a very fast child can publish its exit
-            // before resume returns. Queue/durable journal time is excluded.
-            bound.started = Some(Instant::now());
-            bound.go_attempted = true;
-            bound.child.child_mut().resume()?;
+            let pid = bound.pid;
+            let birth = bound.birth;
+            let committed = &mut bound.committed_start;
+            let dispatch = self
+                .resources
+                .as_mut()
+                .ok_or_else(|| refused("member descriptors missing"))?
+                .poll_start(
+                    bound.child.child_mut(),
+                    &mut || self.events.cancelled(),
+                    &mut |started, requested| {
+                        if committed.is_some()
+                            || started.pid != pid
+                            || started.birth != birth
+                            || started.monotonic_ns == 0
+                            || started.unix_ns == 0
+                            || requested.is_some_and(|limits| {
+                                limits.units == 0 || limits.footprint_mib == 0
+                            })
+                        {
+                            return Err(refused("member Start commitment changed or replayed"));
+                        }
+                        custody.commit_started(&self.binding, started, requested)?;
+                        custody.validate()?;
+                        *committed = Some(started.clone());
+                        Ok(())
+                    },
+                )?;
+            let (started, since) = match dispatch {
+                TargetStart::Resume => {
+                    if !first_dispatch || bound.committed_start.is_some() {
+                        return Err(refused(
+                            "pending execution gate cannot become native resume",
+                        ));
+                    }
+                    let (monotonic_ns, unix_ns) = clocks()?;
+                    let since = Instant::now();
+                    let metadata = Started {
+                        pid,
+                        birth,
+                        monotonic_ns,
+                        unix_ns,
+                    };
+                    custody.commit_started(&self.binding, &metadata, None)?;
+                    custody.validate()?;
+                    bound.committed_start = Some(metadata.clone());
+                    if self.events.cancelled() || bound.child.child_mut().exited()? {
+                        return Err(refused("member cancelled or exited before native resume"));
+                    }
+                    bound.go_attempted = true;
+                    bound.child.child_mut().resume()?;
+                    (metadata, since)
+                }
+                #[cfg(all(test, target_os = "macos"))]
+                TargetStart::Pending { offered } => {
+                    if offered && bound.committed_start.is_none() {
+                        return Err(refused("member Run offered without durable Start"));
+                    }
+                    bound.go_attempted |= offered;
+                    return Ok(None);
+                }
+                #[cfg(all(test, target_os = "macos"))]
+                TargetStart::Started { metadata, since } => {
+                    if bound.committed_start.as_ref() != Some(&metadata) {
+                        return Err(refused("member Run differs from durable Start"));
+                    }
+                    bound.go_attempted = true;
+                    (metadata, since)
+                }
+            };
+            bound.started = Some(since);
             bound.launched = true;
-            Ok(Started {
-                pid: bound.pid,
-                birth: bound.birth,
-                monotonic_ns,
-                unix_ns,
-            })
+            bound.dispatching = false;
+            Ok(Some(started))
         })();
         match prepare {
-            Ok(started) => {
+            Ok(None) => Err(io::ErrorKind::WouldBlock.into()),
+            Ok(Some(started)) => {
                 if self
                     .events
                     .emit(Event::Started {
@@ -503,7 +616,9 @@ impl<D: MemberResources> OwnedAttempt<D> {
         self.finish_return(custody);
         let (ready, completed) = match &self.state {
             State::Bound(bound) => (
-                !bound.go_attempted && bound.cleanup_at.is_none(),
+                (!bound.go_attempted || bound.dispatching)
+                    && !bound.launched
+                    && bound.cleanup_at.is_none(),
                 bound.completed.clone(),
             ),
             _ => (false, None),

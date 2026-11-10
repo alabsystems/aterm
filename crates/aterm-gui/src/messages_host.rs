@@ -475,7 +475,7 @@ impl App {
     }
 
     fn post_config_set(&mut self, resolved: usize, msgs: Vec<Message>) {
-        let stamp = wall_stamp_now();
+        let stamp = self.messages_wall.now();
         let mut posted = 0usize;
         for msg in msgs {
             if let Some(key) = msg.key.as_deref()
@@ -696,7 +696,7 @@ impl App {
     /// gate's paced paint asks for none: nothing the GUI paints reads the glass.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
         let strip = self.settle_strip_fall(now);
-        if self.messages.settle_digest(wall_stamp_now(), now) {
+        if self.messages.settle_digest(self.messages_wall.now(), now) {
             self.digest_moved();
         }
         self.ripen_exceptions(now);
@@ -843,7 +843,7 @@ impl App {
             }
             dirs.for_each(|dir| named.add(dir));
             let row = crate::message_reporters::folder_row(fault, named);
-            self.post_unsynced(row, wall_stamp_now());
+            self.post_unsynced(row, self.messages_wall.now());
         }
     }
 
@@ -1144,9 +1144,12 @@ impl App {
             self.sync_messages();
             intent
         } else if self.messages.digest_entry(id).is_some() {
-            let intent =
-                self.messages
-                    .act_digest(id, ActionIndex(action), wall_stamp_now(), Instant::now());
+            let intent = self.messages.act_digest(
+                id,
+                ActionIndex(action),
+                self.messages_wall.now(),
+                Instant::now(),
+            );
             self.digest_moved();
             intent
         } else {
@@ -1184,7 +1187,7 @@ impl App {
         wire::message_rows(
             &self.messages,
             q,
-            wall_stamp_now().unix_ms,
+            self.messages_wall.now().unix_ms,
             &crate::control::pct_encode,
         )
     }
@@ -1233,7 +1236,7 @@ impl App {
             &mut self.messages,
             &mut self.wire_gate,
             req,
-            wall_stamp_now(),
+            self.messages_wall.now(),
             Instant::now(),
         );
         let digest_changed = self.messages.digest_revision() != digest_before;
@@ -1947,7 +1950,7 @@ impl App {
                         "message: left unseen, posted again for a window on screen: {}",
                         logged_as(&owed.msg)
                     );
-                    let id = self.post_unsynced_at(owed.msg.clone(), wall_stamp_now(), now);
+                    let id = self.post_unsynced_at(owed.msg.clone(), self.messages_wall.now(), now);
                     owed.seen = self.messages.live(id).is_some_and(|live| !live.is_queued());
                 }
                 return true;
@@ -1980,7 +1983,7 @@ impl App {
     }
 
     fn claim_update_health_entry(&mut self, kind: update_words::HealthKind, body: &str) {
-        let now_unix = i64::try_from(wall_stamp_now().unix_ms / 1000).unwrap_or(i64::MAX);
+        let now_unix = i64::try_from(self.messages_wall.now().unix_ms / 1000).unwrap_or(i64::MAX);
         self.except_after(
             &update_words::update_health_entry(kind, body),
             update_words::health_entry_delay(body, now_unix),
@@ -2288,7 +2291,7 @@ impl App {
     pub(crate) fn carried_messages(&self) -> crate::session_store::MessagesCarry {
         let mut carry = crate::session_store::MessagesCarry::from(&self.messages.carried());
         carry.update_health_said = self.carried_health_said();
-        carry.captured_unix_ms = Some(wall_stamp_now().unix_ms);
+        carry.captured_unix_ms = Some(self.messages_wall.now().unix_ms);
         carry
     }
 
@@ -2430,7 +2433,8 @@ impl App {
         if nothing_carried {
             return;
         }
-        self.messages.seed_carried(&carried, wall_stamp_now(), now);
+        self.messages
+            .seed_carried(&carried, self.messages_wall.now(), now);
         self.retire_obsolete_join_alerts(now);
         let old_process: Vec<MessageId> = self
             .messages

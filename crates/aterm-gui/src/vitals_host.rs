@@ -1942,6 +1942,103 @@ fn hardware_sample(s: aterm_sysprobe::cpu_hardware::Sample) -> aterm_vitals::har
     }
 }
 
+/// The heat chain's host readers (A4 §4): the documented thermal pressure level's notify watch,
+/// checked every reading and read again only when it fires; the chip's clock range, read once;
+/// and, where no coalitions read, the system's own watts readers (Linux's RAPL package energy;
+/// NVML's GPU power rides the GPU reading). A system without one reads `None` for it, which the
+/// model carries as not supported.
+pub(crate) struct HeatReaders {
+    pressure: Option<aterm_sysprobe::notify::Watch>,
+    range: Option<Result<aterm_vitals::heat::ClockRange, &'static str>>,
+    rapl: Option<aterm_sysprobe::rapl::Rapl>,
+}
+
+impl HeatReaders {
+    /// A unit test's: no notify token, no registry read, no powercap read.
+    pub(crate) const INERT: Self = Self {
+        pressure: None,
+        range: None,
+        rapl: None,
+    };
+
+    /// This system's: on macOS the pressure watch and the power manager's tables, on Linux the
+    /// package energy counters.
+    pub(crate) fn native() -> Self {
+        Self {
+            pressure: cfg!(target_os = "macos").then(aterm_sysprobe::notify::thermal_pressure),
+            range: aterm_sysprobe::cpu_hardware::dvfs_range().map(|r| {
+                r.map(|r| aterm_vitals::heat::ClockRange {
+                    p_mhz: r.p_mhz,
+                    e_mhz: r.e_mhz,
+                })
+            }),
+            rapl: cfg!(target_os = "linux")
+                .then(|| aterm_sysprobe::rapl::Rapl::open(std::path::Path::new("/"))),
+        }
+    }
+
+    /// The system's own watts at this reading: the packages' since the last reading (RAPL), and
+    /// the GPU's board power from this reading's `gpu` (NVML).
+    fn host_watts(
+        &mut self,
+        gpu: Option<&aterm_sysprobe::GpuReading>,
+    ) -> aterm_vitals::heat::HostWatts {
+        host_watts_of(
+            self.rapl.as_mut().map(|r| r.watts(Instant::now())),
+            gpu.and_then(|g| g.power_mw),
+        )
+    }
+
+    /// The pressure level at this reading ([`pressure_of`]).
+    fn pressure(&mut self) -> Option<Result<aterm_vitals::heat::ThermalPressure, &'static str>> {
+        self.pressure
+            .as_mut()
+            .map(|watch| pressure_of(watch.state()))
+    }
+}
+
+/// The system's own watts from what its readers answered: `rapl`, the packages' watts since the
+/// last reading (`None` with no RAPL reader), and `gpu_power`, the GPU reading's board power
+/// (`None` with no reader of it). A reader refused for good, or a runtime-suspended card, is not
+/// supported, so it adds nothing to compute watts and never reads 0 W; a reader that ran and gave
+/// nothing this reading reads unread.
+fn host_watts_of(
+    rapl: Option<Result<Option<f64>, aterm_sysprobe::Why>>,
+    gpu_power: Option<Result<u32, aterm_sysprobe::Why>>,
+) -> aterm_vitals::heat::HostWatts {
+    use aterm_sysprobe::Why;
+    use aterm_vitals::heat::NoHeat;
+    let none = NoHeat::NotSupported("no_power_reader");
+    let cpu = match rapl {
+        None => Err(none),
+        Some(Ok(Some(w))) => Ok(w),
+        Some(Ok(None)) => Err(NoHeat::Unread("warming")),
+        Some(Err(Why::Absent)) => Err(NoHeat::NotSupported("no_rapl")),
+        Some(Err(Why::NeedsPrivilege(_))) => Err(NoHeat::NotSupported("rapl_needs_root")),
+        Some(Err(_)) => Err(NoHeat::Unread("rapl_read")),
+    };
+    let gpu = match gpu_power {
+        None => Err(none),
+        Some(Ok(mw)) => Ok(f64::from(mw) / 1e3),
+        // Runtime-suspended: not read, so as not to wake it; it adds nothing measured.
+        Some(Err(Why::Asleep)) => Err(NoHeat::NotSupported("gpu_asleep")),
+        Some(Err(Why::Unsupported)) => Err(NoHeat::NotSupported("nvml_power_unsupported")),
+        Some(Err(Why::NeedsPrivilege(_))) => Err(NoHeat::NotSupported("nvml_needs_privilege")),
+        Some(Err(_)) => Err(NoHeat::Unread("nvml_power")),
+    };
+    aterm_vitals::heat::HostWatts { cpu, gpu }
+}
+
+/// The pressure level from what its watch answered: a posted state outside the documented levels
+/// reads unread (`pressure_level`), never a guessed level; a failed read keeps its reason.
+fn pressure_of(
+    read: Result<u64, &'static str>,
+) -> Result<aterm_vitals::heat::ThermalPressure, &'static str> {
+    read.and_then(|state| {
+        aterm_vitals::heat::ThermalPressure::of_state(state).ok_or("pressure_level")
+    })
+}
+
 fn platform_thermal() -> Option<Thermal> {
     #[cfg(target_os = "macos")]
     {
@@ -2246,7 +2343,7 @@ impl SplitReader {
     /// reading.
     fn start_count(
         &self,
-        read: Option<&aterm_sysprobe::coalitions::CoalitionRead>,
+        read: Option<&mut CoalRead>,
         machine: &aterm_sysprobe::Probe,
     ) -> Option<aterm_vitals::StartCount> {
         if self.lane.on() {
@@ -2467,19 +2564,36 @@ fn lead_identity(
     }
 }
 
-/// The task counters of `read`'s answering coalitions ([`aterm_vitals::starts`]).
-fn coal_tasks(
-    read: &aterm_sysprobe::coalitions::CoalitionRead,
-) -> aterm_vitals::starts::CoalTaskRead {
+/// A coalition read and the middle of its span on the reader's epoch clock, ns: the heat
+/// change's window runs from one read's middle to the next's.
+pub(crate) struct CoalRead {
+    read: aterm_sysprobe::coalitions::CoalitionRead,
+    at_ns: u64,
+}
+
+/// The task counters of `read`'s answering coalitions ([`aterm_vitals::starts`]), carrying the
+/// heat counters its copy loop decoded (moved out of `read`, which the split's fill reads only
+/// for its rows): the start counter's merge takes their change (A4 §4, one engine).
+fn coal_tasks(read: &mut CoalRead) -> aterm_vitals::starts::CoalTaskRead {
+    let heat = std::mem::take(&mut read.read.heat);
     aterm_vitals::starts::CoalTaskRead::of(
-        read.newest,
-        read.truncated,
-        read.rows.iter().map(|u| aterm_vitals::starts::CoalTasks {
-            id: u.id,
-            started: u.tasks_started,
-            exited: u.tasks_exited,
-        }),
+        read.read.newest,
+        read.read.truncated,
+        read.read
+            .rows
+            .iter()
+            .map(|u| aterm_vitals::starts::CoalTasks {
+                id: u.id,
+                started: u.tasks_started,
+                exited: u.tasks_exited,
+            }),
     )
+    .with_heat(aterm_vitals::heat::HeatBook {
+        at_ns: read.at_ns,
+        timebase: heat.timebase,
+        by_id: heat.by_id,
+        total: heat.total,
+    })
 }
 
 fn coal_sample(read: aterm_sysprobe::coalitions::CoalitionRead) -> CoalSample {
@@ -2623,6 +2737,9 @@ impl WhyFixture {
             procs: live.procs.as_ref().and(scene.procs),
             mem: scene.mem.or(live.mem),
             thermal: scene.thermal.or(live.thermal),
+            thermal_pressure: live.thermal_pressure,
+            clock_range: live.clock_range,
+            host_watts: live.host_watts,
             gpu: live.gpu.clone(),
             gpu_clients: live.gpu_clients.clone(),
             ane: live.ane,
@@ -2630,6 +2747,9 @@ impl WhyFixture {
             cadence_ms: live.cadence_ms,
             machine_only: live.machine_only,
             load1: live.load1,
+            run_queue: live.run_queue,
+            dstate: live.dstate.clone(),
+            zombie_read: live.zombie_read,
             load: live.load,
             cpu_brand: live.cpu_brand.clone(),
             swapped_kib: live.swapped_kib,
@@ -2644,6 +2764,7 @@ impl WhyFixture {
             plan: live.plan.clone(),
             note_events: live.note_events.clone(),
             note_gaps: live.note_gaps.clone(),
+            situation: live.situation.clone(),
             ..scene
         }
     }
@@ -2701,6 +2822,9 @@ pub(crate) struct Reader {
     job_watch: aterm_vitals::events::JobWatch,
     watched: Option<Arc<aterm_vitals::jobs::JobsView>>,
     thermal: ThermalProbe,
+    /// The heat chain's own readers: the thermal pressure level, the chip's clock range and,
+    /// on Linux, the packages' energy.
+    heat: HeatReaders,
     counter_throttle: Option<(Instant, Option<Thermal>)>,
     /// The Neural Engine reader (A2 §3.1), which every reading reads beside the GPU; `None`
     /// where the OS has none, and in a unit test's reader, which reads no registry.
@@ -2719,6 +2843,10 @@ pub(crate) struct Reader {
     pub(crate) machine: Machine,
     /// The block-storage reader, which keeps each volume's walk to its device.
     block: aterm_sysprobe::blockio::BlockReader,
+    /// The machine's situation and type (A4 §8, §9), kept current on notifications.
+    situation: crate::vitals_situation::SituationReader,
+    /// The own-thread D-state census's worker (macOS; inert in a unit test's reader).
+    census: crate::vitals_census::CensusLane,
 }
 
 /// What a reading takes of its tabs before its sweep ([`Request::tab_reads`]): the pass's clock,
@@ -2847,6 +2975,10 @@ impl Reader {
         let mut reader = Self {
             probe: aterm_sysprobe::Probe::new(),
             block: aterm_sysprobe::blockio::BlockReader::new(),
+            census: crate::vitals_census::CensusLane::new(cfg!(all(
+                target_os = "macos",
+                not(test)
+            ))),
             hardware: aterm_sysprobe::cpu_hardware::Probe::default(),
             hardware_read: if cfg!(test) {
                 HardwareProbe::INERT
@@ -2879,6 +3011,11 @@ impl Reader {
             } else {
                 platform_thermal
             },
+            heat: if cfg!(test) {
+                HeatReaders::INERT
+            } else {
+                HeatReaders::native()
+            },
             counter_throttle: None,
             ane: if cfg!(test) {
                 None
@@ -2902,18 +3039,30 @@ impl Reader {
                 os: words.os,
                 family: os_family(),
             },
+            situation: if cfg!(test) {
+                crate::vitals_situation::SituationReader::inert()
+            } else {
+                crate::vitals_situation::SituationReader::host()
+            },
         };
         reader.read_scene(fixture);
         reader
     }
 
-    /// The machine's coalitions at this reading ([`SplitReader::coalitions`]); none while a
-    /// recorded scene stands for the machine's lane, whose coalitions are the scene's.
-    fn coalitions(&self) -> Option<aterm_sysprobe::coalitions::CoalitionRead> {
+    /// The machine's coalitions at this reading ([`SplitReader::coalitions`]), stamped with the
+    /// middle of the read; none while a recorded scene stands for the machine's lane, whose
+    /// coalitions are the scene's.
+    fn coalitions(&self) -> Option<CoalRead> {
         if self.fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
             return None;
         }
-        self.split.coalitions()
+        let before = self.epoch.elapsed();
+        let read = self.split.coalitions()?;
+        let middle = (before + self.epoch.elapsed()) / 2;
+        Some(CoalRead {
+            read,
+            at_ns: u64::try_from(middle.as_nanos()).unwrap_or(u64::MAX),
+        })
     }
 
     fn read_scene(&mut self, fixture: Option<WhyFixture>) {
@@ -2983,10 +3132,13 @@ impl Reader {
             },
             &mut self.split.coalition_ids,
         );
-        let coalitions = self.coalitions();
+        let mut coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, at_unix_ms);
-        sample.starts = self.split.start_count(coalitions.as_ref(), &self.probe);
+        sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.machine_only = false;
+        if let aterm_vitals::blockage::DStateRead::Census(pass) = &mut sample.dstate {
+            *pass = self.census.step(now, self.epoch);
+        }
         sample.procs_truncated = sweep.as_ref().is_some_and(|s| s.truncated);
         let observed = sweep
             .as_ref()
@@ -3008,7 +3160,7 @@ impl Reader {
                 complete,
             }
         });
-        if let Some(read) = coalitions.filter(|_| live_split && sweep.is_some()) {
+        if let Some(CoalRead { read, .. }) = coalitions.filter(|_| live_split && sweep.is_some()) {
             self.split.fill(&mut sample, read, now);
         } else {
             // Every whole reading, a jobs-only edge's too: `sys` answers a
@@ -3091,10 +3243,10 @@ impl Reader {
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
-        let coalitions = self.coalitions();
+        let mut coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, unix_ms_now());
         sample.machine_only = true;
-        sample.starts = self.split.start_count(coalitions.as_ref(), &self.probe);
+        sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
         let scene = self
             .fixture
@@ -3179,7 +3331,9 @@ impl Reader {
         let links = (self.net.links)(&mut self.scratch)
             .map(|links| links.iter().map(link_sample).collect());
         let tcp_sum = (self.net.tcp)(&mut self.scratch);
-        Sample {
+        let gpu = aterm_sysprobe::gpu();
+        let room = aterm_sysprobe::task_room(self.uid.unwrap_or(0));
+        let mut sample = Sample {
             hardware: None,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
@@ -3193,7 +3347,8 @@ impl Reader {
             }),
             clusters: self.clusters.clone(),
             mem: aterm_sysprobe::memory_detail().map(mem_sample),
-            gpu: aterm_sysprobe::gpu().map(gpu_sample),
+            host_watts: self.heat.host_watts(gpu.as_ref()),
+            gpu: gpu.map(gpu_sample),
             gpu_clients: None,
             ane: self.ane.as_mut().map(|engine| ane_sample(engine.read())),
             volume: volume.map(|v| VolumeSample {
@@ -3215,13 +3370,23 @@ impl Reader {
             load,
             cpu_brand: self.machine.cpu.clone(),
             thermal: (self.thermal)().or_else(|| self.counter_throttle()),
+            thermal_pressure: self.heat.pressure(),
+            clock_range: self.heat.range,
             swapped_kib: aterm_sysprobe::swapped_kib(),
             links,
             tcp: tcp_sum.map(|s| tcp_counts(s.counts, s.counters_only)),
             tcp_srtt_ms: tcp_sum.and_then(|s| s.srtt_ms),
             aterm_sockets: None,
             tab_sockets: Vec::new(),
-            room: task_room(aterm_sysprobe::task_room(self.uid.unwrap_or(0))),
+            room: task_room(room),
+            run_queue: run_queue_read(room.run_queue),
+            dstate: aterm_vitals::blockage::DStateRead::Unsupported,
+            // Windows' sweep reads no process state (`RunState::Unknown`), so no zombie.
+            zombie_read: if cfg!(any(target_os = "macos", target_os = "linux")) {
+                aterm_vitals::blockage::ZombieRead::Sweep
+            } else {
+                aterm_vitals::blockage::ZombieRead::Unsupported
+            },
             starts: None,
             self_uid: self.uid,
             disk: Some(disk_facts(
@@ -3248,7 +3413,38 @@ impl Reader {
             note_events: req.note_events.clone(),
             note_gaps: req.note_gaps.clone(),
             block,
+            situation: self.situation.read(at_unix_ms),
+        };
+        // After the core ticks: Linux's `procs_blocked` comes from their read of `/proc/stat`.
+        sample.dstate = dstate_read(&self.probe);
+        sample
+    }
+}
+
+/// What a reading reads of uninterruptible waits: Linux's sweep states with `procs_blocked`,
+/// macOS's census (a whole reading adds its pass, [`crate::vitals_census`]), none elsewhere.
+fn dstate_read(probe: &aterm_sysprobe::Probe) -> aterm_vitals::blockage::DStateRead {
+    use aterm_vitals::blockage::DStateRead;
+    if cfg!(target_os = "linux") {
+        DStateRead::Sweep {
+            blocked: probe.blocked(),
         }
+    } else if cfg!(target_os = "macos") {
+        DStateRead::Census(None)
+    } else {
+        DStateRead::Unsupported
+    }
+}
+
+/// The model's copy of the run queue read with the task tables.
+const fn run_queue_read(q: aterm_sysprobe::runq::RunQueue) -> aterm_vitals::runq::RunQueueRead {
+    use aterm_sysprobe::runq::RunQueue as Q;
+    use aterm_vitals::runq::RunQueueRead as R;
+    match q {
+        Q::Milli(m) => R::Milli(m),
+        Q::Failed => R::Failed,
+        Q::UnreadFormat => R::UnreadFormat,
+        Q::Unsupported => R::Unsupported,
     }
 }
 
@@ -3319,9 +3515,8 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         pgid: p.pgid,
         sid: p.sid,
         state: match p.state {
-            RunState::Running | RunState::Sleeping | RunState::Uninterruptible | RunState::Idle => {
-                ProcState::Run
-            }
+            RunState::Running | RunState::Sleeping | RunState::Idle => ProcState::Run,
+            RunState::Uninterruptible => ProcState::Uninterruptible,
             RunState::Stopped => ProcState::Stopped,
             RunState::Zombie => ProcState::Zombie,
             RunState::Unknown => ProcState::Unknown,

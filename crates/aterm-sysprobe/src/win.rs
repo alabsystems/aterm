@@ -427,3 +427,67 @@ pub(crate) fn caps() -> Caps {
         capacity: CapSource::Host,
     }
 }
+
+#[link(name = "advapi32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+unsafe extern "system" {
+    fn RegGetValueW(
+        hkey: HANDLE,
+        lpSubKey: *const u16,
+        lpValue: *const u16,
+        dwFlags: u32,
+        pdwType: *mut u32,
+        pvData: *mut c_void,
+        pcbData: *mut u32,
+    ) -> i32;
+}
+
+/// `HKEY_LOCAL_MACHINE`: `(LONG)0x80000002`, sign-extended to a handle.
+const HKEY_LOCAL_MACHINE: HANDLE = -2_147_483_646;
+/// `RRF_RT_REG_SZ`: a string value, refused when the value is of another type.
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+/// Where Windows keeps its copy of the firmware's product fields (SMBIOS type 1).
+const BIOS_KEY: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
+
+/// One string value of [`BIOS_KEY`], at most 255 UTF-16 units; `None` where it is missing,
+/// longer, or not a string.
+fn bios_value(name: &str) -> Option<String> {
+    let key: Vec<u16> = BIOS_KEY.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut buf = [0u16; 256];
+    let mut bytes = u32::try_from(size_of_val(&buf)).ok()?;
+    // SAFETY: `key` and `value` are NUL-terminated UTF-16 strings that outlive the call; the
+    // predefined key needs no open or close; `buf` is writable for `bytes` bytes, which the call
+    // writes at most (the terminator included) and then sets to the bytes written.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &raw mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let units = &buf[..(bytes as usize / 2).min(buf.len())];
+    let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16(&units[..len]).ok()
+}
+
+/// [`crate::machine_type::read`] on Windows: the firmware's product fields as the registry keeps
+/// them, through the same ladder as Linux's DMI table (never a WMI query or a child process).
+pub(crate) fn machine_type() -> crate::machine_type::MachineType {
+    let vendor = bios_value("SystemManufacturer");
+    let name = bios_value("SystemProductName");
+    let version = bios_value("SystemVersion");
+    let family = bios_value("SystemFamily");
+    crate::machine_type::dmi_type(&crate::machine_type::Dmi {
+        vendor: vendor.as_deref(),
+        name: name.as_deref(),
+        version: version.as_deref(),
+        family: family.as_deref(),
+    })
+}

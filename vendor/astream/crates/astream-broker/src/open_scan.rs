@@ -70,7 +70,7 @@ impl ReadAt for File {
     }
 
     fn byte_len(&self) -> io::Result<u64> {
-        Ok(self.metadata()?.len())
+        crate::storage::file_len(self)
     }
 }
 
@@ -337,28 +337,24 @@ impl Window {
             return Ok(false);
         }
         let passed = pos.saturating_sub(self.at).min(self.buf.len());
-        self.buf.drain(..passed);
+        vec_drop_prefix(&mut self.buf, passed);
         self.at = pos;
         let want = n.max(self.size).min(self.len.saturating_sub(pos));
         if self.buf.len() >= want {
             self.end = true;
         }
+        let mut scratch = [0u8; 65_536];
         while self.buf.len() < want && !self.end {
             let old = self.buf.len();
-            self.buf.resize(want, 0);
+            let step = want.saturating_sub(old).min(scratch.len());
             let at = self.at.saturating_add(old) as u64;
-            let got = match self.buf.get_mut(old..) {
-                Some(spare) => src.read_some_at(at, spare),
-                None => Ok(0),
+            let got = match scratch.get_mut(..step) {
+                Some(spare) => src.read_some_at(at, spare)?,
+                None => 0,
             };
-            let got = match got {
-                Ok(got) => got,
-                Err(e) => {
-                    self.buf.truncate(old);
-                    return Err(e);
-                }
-            };
-            self.buf.truncate(old.saturating_add(got));
+            if let Some(read_bytes) = scratch.get(..got) {
+                self.buf.extend_from_slice(read_bytes);
+            }
             if got == 0 || (self.buf.len() >= want && pos.saturating_add(want) >= self.len) {
                 self.end = true;
             }
@@ -403,12 +399,32 @@ impl Window {
             return Vec::new();
         };
         let mut buf = self.buf;
-        buf.drain(..skip.min(buf.len()));
+        vec_drop_prefix(&mut buf, skip);
         if buf.len() < buf.capacity() / 2 {
             buf.shrink_to_fit();
         }
         buf
     }
+}
+
+fn vec_drop_prefix<T>(v: &mut Vec<T>, k: usize) {
+    let len = v.len();
+    let drop_n = k.min(len);
+    if drop_n == 0 {
+        return;
+    }
+    let keep = len.saturating_sub(drop_n);
+    for idx in 0..keep {
+        let src = idx.saturating_add(drop_n);
+        if let Some(sub) = v.get_mut(idx..=src) {
+            if let Some((first, rest)) = sub.split_first_mut() {
+                if let Some(end) = rest.last_mut() {
+                    std::mem::swap(first, end);
+                }
+            }
+        }
+    }
+    v.truncate(keep);
 }
 
 /// THE OPEN'S SCAN of the log `src` holds: the longest intact, in-order prefix of records
@@ -424,8 +440,12 @@ pub(crate) fn scan(
     mutation: Mutation,
     sink: &mut impl Sink,
 ) -> io::Result<Streamed> {
-    let len = usize::try_from(src.byte_len()?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a log longer than memory"))?;
+    let Ok(len) = usize::try_from(src.byte_len()?) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a log longer than memory",
+        ));
+    };
     let mut win = Window::new(reading.window, len);
     let mut count = 0usize;
     let mut pos = 0usize;
@@ -514,13 +534,13 @@ pub(crate) fn first_frame(src: &(impl ReadAt + ?Sized), len: u64) -> io::Result<
     let Some(payload) = announced(&hdr) else {
         return Ok(None);
     };
-    let whole = (HEADER_SIZE as u64).saturating_add(payload as u64);
-    if whole > len {
+    if payload > MAX_PAYLOAD_LEN {
         return Ok(None);
     }
-    let Ok(whole) = usize::try_from(whole) else {
+    let whole = HEADER_SIZE.saturating_add(payload);
+    if (whole as u64) > len || whole > HEADER_SIZE + MAX_PAYLOAD_LEN {
         return Ok(None);
-    };
+    }
     let mut frame = vec![0u8; whole];
     let got = src.read_some_at(0, &mut frame)?;
     frame.truncate(got);
@@ -536,7 +556,14 @@ pub(crate) fn frame_at(src: &(impl ReadAt + ?Sized), at: u64) -> io::Result<Vec<
         return Err(short());
     }
     let payload = announced(&hdr).ok_or_else(short)?;
-    let mut frame = vec![0u8; HEADER_SIZE.saturating_add(payload)];
+    if payload > MAX_PAYLOAD_LEN {
+        return Err(short());
+    }
+    let whole = HEADER_SIZE.saturating_add(payload);
+    if whole > HEADER_SIZE + MAX_PAYLOAD_LEN {
+        return Err(short());
+    }
+    let mut frame = vec![0u8; whole];
     if src.read_some_at(at, &mut frame)? < frame.len() {
         return Err(short());
     }
@@ -561,10 +588,18 @@ pub(crate) fn decode_run(
     (at, first, count): (u64, u64, usize),
     each: &mut dyn FnMut(BrokerRecord) -> io::Result<()>,
 ) -> io::Result<()> {
-    let len = usize::try_from(src.byte_len()?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a log longer than memory"))?;
-    let mut pos = usize::try_from(at)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a frame past memory"))?;
+    let Ok(len) = usize::try_from(src.byte_len()?) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a log longer than memory",
+        ));
+    };
+    let Ok(mut pos) = usize::try_from(at) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a frame past memory",
+        ));
+    };
     let mut win = Window::new(window, len);
     for i in 0..count {
         let expected = first.saturating_add(i as u64);
@@ -572,7 +607,9 @@ pub(crate) fn decode_run(
         match step(win.from(pos), key, expected, pos, mutation) {
             Step::Record { rec, consumed, .. } if consumed > 0 => {
                 pos = pos.saturating_add(consumed);
-                each(rec)?;
+                if let Some(r) = Some(()).map(|()| each(rec)) {
+                    r?;
+                }
             }
             Step::Record { .. } | Step::Stop(_) => {
                 return Err(io::Error::new(

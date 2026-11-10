@@ -11,6 +11,35 @@ const PHISH: &[u8] =
 const LINK_COL: u16 = 6;
 const TARGET: &str = "https://evil.example/steal";
 
+#[test]
+fn composed_disclosure_matches_the_complete_painted_caption() {
+    let long_host = format!("https://{}.evil.example/x", "猫".repeat(40));
+    for target in [
+        TARGET,
+        long_host.as_str(),
+        "https://[2001:db8::ffff:192.0.2.1]:8443/x",
+        "https://evil.example/a b",
+    ] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let input = format!("Visit \x1b]8;;{target}\x1b\\bank.example\x1b]8;;\x1b\\");
+        feed(&app, wid, input.as_bytes());
+        extract_only(&mut app, wid);
+        hover(&mut app, wid, 0, LINK_COL);
+        let shown = app.compose_link_caption(wid, None).expect("a caption");
+        let rows = frame_rows(&app, wid);
+        assert_eq!(
+            shown.words,
+            rows.last().unwrap().trim(),
+            "target={target:?}"
+        );
+        assert_eq!(
+            shown.names,
+            crate::app_mouse::CaptionNames::Url(target.into())
+        );
+    }
+}
+
 fn frame_rows(app: &App, wid: WindowId) -> Vec<String> {
     app.windows[&wid]
         .input_scratch

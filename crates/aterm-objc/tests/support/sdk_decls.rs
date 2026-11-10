@@ -365,8 +365,10 @@ fn probe(d: &Decls, invert: Option<&str>) -> String {
          #include <CoreGraphics/CoreGraphics.h>\n\
          #include <IOKit/IOKitLib.h>\n\
          #include <IOKit/pwr_mgt/IOPMLib.h>\n\
+         #include <IOKit/ps/IOPowerSources.h>\n\
          #include <dlfcn.h>\n\
          #include <dns_sd.h>\n\
+         #include <notify.h>\n\
          #include <mach/processor_info.h>\n\
          #include <stddef.h>\n\
          #include <stdint.h>\n\

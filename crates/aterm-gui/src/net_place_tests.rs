@@ -277,6 +277,30 @@ fn sys_carries_the_places_line_and_object_with_unknowns_not_sampled() {
     );
 }
 
+/// The place's kind is netplace's own `Kind`, typed for the Machine row's glyph (A4 §8): the
+/// hotspot sample a hotspot, the home LAN a LAN, an offline place offline whatever kind it held,
+/// and a place with no kind still checking.
+/// NEGATIVE CONTROL: reading the kind before the offline arm (`(_, Some(Kind::Lan))` first)
+/// draws the offline home as a LAN, and this test fails at "offline wins".
+#[test]
+fn the_places_kind_is_netplaces_own() {
+    use aterm_vitals::PlaceKind;
+    let hotspot = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    assert_eq!(place_kind(&hotspot), PlaceKind::Hotspot);
+    assert_eq!(
+        sys_view_of(&hotspot, &words_at(SINCE_MS)).kind,
+        PlaceKind::Hotspot
+    );
+    let home = aterm_netplace::sample::home(SINCE_MS, 4);
+    assert_eq!(place_kind(&home), PlaceKind::Lan);
+    let mut offline = home.clone();
+    offline.at = aterm_netplace::Where::Offline;
+    assert_eq!(place_kind(&offline), PlaceKind::Offline, "offline wins");
+    let mut checking = home;
+    checking.kind = None;
+    assert_eq!(place_kind(&checking), PlaceKind::Checking);
+}
+
 /// With a current, history-ready observer, the network band leads with the place away from the
 /// ALab LAN (`Away from ALab LAN · phone
 /// hotspot · 41 known`, short `Away · hotspot`), and on the ALab LAN, before any place was read,

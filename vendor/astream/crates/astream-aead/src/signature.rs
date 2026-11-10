@@ -59,28 +59,24 @@ fn is_small_order(point: &[u8; 32]) -> bool {
     SMALL_ORDER.contains(&y)
 }
 
-fn key_pair(seed: &[u8; 32]) -> Ed25519KeyPair {
-    match Ed25519KeyPair::from_seed_unchecked(seed) {
-        Ok(pair) => pair,
-        Err(_) => unreachable!("ring takes every 32-byte Ed25519 seed"),
-    }
-}
-
 /// The public key of `seed`.
 #[must_use]
 pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
-    let pair = key_pair(seed);
     let mut public = [0u8; 32];
-    public.copy_from_slice(pair.public_key().as_ref());
+    if let Ok(pair) = Ed25519KeyPair::from_seed_unchecked(seed) {
+        public.copy_from_slice(pair.public_key().as_ref());
+    }
     public
 }
 
 /// `seed`'s signature over `message`.
 #[must_use]
 pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
-    let signature = key_pair(seed).sign(message);
     let mut out = [0u8; 64];
-    out.copy_from_slice(signature.as_ref());
+    if let Ok(pair) = Ed25519KeyPair::from_seed_unchecked(seed) {
+        let signature = pair.sign(message);
+        out.copy_from_slice(signature.as_ref());
+    }
     out
 }
 

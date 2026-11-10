@@ -1529,32 +1529,37 @@ fn abs_home_dir(env: &[String], user_home: &Path) -> PathBuf {
         .unwrap_or_else(|| user_home.to_path_buf())
 }
 
-/// The account a Muse Code process is signed in as, with its weekly quota
-/// ([`SubscriptionDisplay`]): the login `~/.config/muse/auth.json` names, and the week a
-/// bounded `muse serve` usage refresh reads ([`super::muse_usage`]), cached per config
-/// and account under the one age rule ([`WeeklyFigure::words`]). The refresh runs only
-/// where the process's own binary resolves; a screen card's words in `prev` stand while
-/// no figure is current, as agy's do ([`agy_subscription_for`]).
-/// A provider read additionally requires `host` to own this process's arguments and environment.
-#[must_use]
-pub fn muse_subscription_for(
-    argv: &[String],
-    env: &[String],
-    user_home: &Path,
-    prev: &SubscriptionDisplay,
-    now: i64,
-    host: &dyn super::provider_read::FooterHost,
-) -> Option<SubscriptionDisplay> {
-    let var = |key: &str| non_empty_env_var(env, key);
-    if var("META_API_KEY").is_some() {
-        return None;
-    }
-    let home_dir = abs_home_dir(env, user_home);
-    let config = match var("XDG_CONFIG_HOME").map(PathBuf::from) {
+/// What a Muse Code process's own files say of its login ([`muse_login_for`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MuseLogin {
+    /// `auth.json` names Meta's OAuth account `email`.
+    Seen { email: String, path: PathBuf },
+    /// `auth.json` is there and names no OAuth account.
+    SignedOut { path: PathBuf },
+    /// Nothing to read: `META_API_KEY` is set, another provider is selected, the settings
+    /// could not be read, or there is no readable `auth.json`.
+    Unread,
+}
+
+/// The `muse` configuration directory of a process with environment `env` whose home is
+/// `home_dir`: `$XDG_CONFIG_HOME/muse` where that is absolute, else `<home>/.config/muse`.
+fn muse_config_dir(env: &[String], home_dir: &Path) -> PathBuf {
+    match non_empty_env_var(env, "XDG_CONFIG_HOME").map(PathBuf::from) {
         Some(xdg) if xdg.is_absolute() => xdg,
         _ => home_dir.join(".config"),
     }
-    .join("muse");
+    .join("muse")
+}
+
+/// The login a Muse Code process with `argv` and `env` runs on, read from its own
+/// `auth.json` and `settings.json` alone: the email of Meta's OAuth account, never a credential
+/// (the bytes read are zeroed, [`read_with`]). No network and no child process.
+#[must_use]
+pub fn muse_login_for(argv: &[String], env: &[String], user_home: &Path) -> MuseLogin {
+    if non_empty_env_var(env, "META_API_KEY").is_some() {
+        return MuseLogin::Unread;
+    }
+    let config = muse_config_dir(env, &abs_home_dir(env, user_home));
     let provider = match muse_provider_arg(argv) {
         Some(provider) => Some(provider),
         None => match read_with(&config.join("settings.json"), |bytes| {
@@ -1568,16 +1573,17 @@ pub fn muse_subscription_for(
         }) {
             Ok(provider) => provider,
             Err(NoProfile::Missing) => None,
-            Err(_) => return None,
+            Err(_) => return MuseLogin::Unread,
         },
     };
     if provider
         .as_deref()
         .is_some_and(|provider| provider != "meta")
     {
-        return None;
+        return MuseLogin::Unread;
     }
-    let email = read_with(&config.join("auth.json"), |bytes| {
+    let path = config.join("auth.json");
+    let email = read_with(&path, |bytes| {
         let Obj(raw) =
             aterm_json::from_slice::<Obj<RawMuseAuth>>(bytes).map_err(|_| NoProfile::Unreadable)?;
         let meta = raw.and_then(|auth| auth.providers.0).and_then(|p| p.meta.0);
@@ -1588,8 +1594,35 @@ pub fn muse_subscription_for(
                 .flatten()
                 .filter(|email| email.contains('@') && !email.chars().any(char::is_whitespace))
         }))
-    })
-    .ok()??;
+    });
+    match email {
+        Ok(Some(email)) => MuseLogin::Seen { email, path },
+        Ok(None) => MuseLogin::SignedOut { path },
+        Err(_) => MuseLogin::Unread,
+    }
+}
+
+/// The account a Muse Code process is signed in as, with its weekly quota
+/// ([`SubscriptionDisplay`]): the login `~/.config/muse/auth.json` names ([`muse_login_for`]),
+/// and the week a bounded `muse serve` usage refresh reads ([`super::muse_usage`]), cached per
+/// config and account under the one age rule ([`WeeklyFigure::words`]). The refresh runs only
+/// where the process's own binary resolves; a screen card's words in `prev` stand while
+/// no figure is current, as agy's do ([`agy_subscription_for`]).
+/// A provider read additionally requires `host` to own this process's arguments and environment.
+#[must_use]
+pub fn muse_subscription_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    now: i64,
+    host: &dyn super::provider_read::FooterHost,
+) -> Option<SubscriptionDisplay> {
+    let MuseLogin::Seen { email, .. } = muse_login_for(argv, env, user_home) else {
+        return None;
+    };
+    let home_dir = abs_home_dir(env, user_home);
+    let config = muse_config_dir(env, &home_dir);
     let same_email = prev.email.as_deref() == Some(email.as_str());
     let key = (config.clone(), email.clone());
     let cached = {
@@ -2017,7 +2050,8 @@ pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option
     })
 }
 
-fn agy_log_scan<T, F>(argv: &[String], config: &Path, parse: F) -> Option<T>
+/// [`agy_log_scan`] with the log the answer was read from.
+fn agy_log_scan_at<T, F>(argv: &[String], config: &Path, parse: F) -> Option<(T, PathBuf)>
 where
     F: Fn(&[u8]) -> Option<T>,
 {
@@ -2074,10 +2108,11 @@ where
     if let Some(path) = log_arg.as_deref().map(Path::new)
         && let Some(found) = read_log(path)
     {
-        return Some(found);
+        return Some((found, path.to_path_buf()));
     }
-    if let Some(found) = read_log(&config.join("cli.log")) {
-        return Some(found);
+    let cli_log = config.join("cli.log");
+    if let Some(found) = read_log(&cli_log) {
+        return Some((found, cli_log));
     }
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(config.join("log"))
         .ok()?
@@ -2101,11 +2136,20 @@ where
         })
         .collect();
     logs.sort_by_key(|a| std::cmp::Reverse(a.0));
-    logs.into_iter().take(3).find_map(|(_, p)| read_log(&p))
+    logs.into_iter()
+        .take(3)
+        .find_map(|(_, p)| read_log(&p).map(|found| (found, p)))
 }
 
-fn agy_log_auth_record(argv: &[String], config: &Path) -> Option<Option<String>> {
-    agy_log_scan(argv, config, parse_agy_auth_record)
+fn agy_log_scan<T, F>(argv: &[String], config: &Path, parse: F) -> Option<T>
+where
+    F: Fn(&[u8]) -> Option<T>,
+{
+    agy_log_scan_at(argv, config, parse).map(|(found, _)| found)
+}
+
+fn agy_log_auth_record(argv: &[String], config: &Path) -> Option<(Option<String>, PathBuf)> {
+    agy_log_scan_at(argv, config, parse_agy_auth_record)
 }
 
 /// Parses an `agy` or `muse` model label such as `"Gemini 4 Argon (High)"` into
@@ -2726,6 +2770,123 @@ fn agy_override_object(argv: &[String], cwd: Option<&Path>, user_home: &Path) ->
     }
 }
 
+/// What [`agy_read`] read of an `agy` process's native Google login.
+struct AgyRead {
+    /// Its CLI configuration directory.
+    config: PathBuf,
+    /// Its `--settings` override, where it has one.
+    ovr: Option<aterm_json::Map>,
+    /// Its `settings.json`, where one was read.
+    settings: Option<aterm_json::Map>,
+    /// The latest `applyAuthResult:` record of its CLI log and the log it was read from
+    /// ([`parse_agy_auth_record`]); `None` where no log holds a complete one.
+    record: Option<(Option<String>, PathBuf)>,
+}
+
+/// Why [`agy_read`] gave up.
+enum AgyUnread {
+    /// The process runs through a gateway or Vertex: no Google account of its own.
+    Gateway,
+    /// Its settings could not be read, or select another provider or sign-in method.
+    Other,
+}
+
+/// What an `agy` process with `argv` and `env`, started in `cwd`, reads its native Google login
+/// from: its settings and its CLI log, never a credential.
+fn agy_read(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    user_home: &Path,
+) -> Result<AgyRead, AgyUnread> {
+    let var = |key: &str| non_empty_env_var(env, key);
+    if var(super::witness::AGY_GATEWAY_URL).is_some()
+        || super::witness::agy_vertex_reason(env).is_some()
+    {
+        return Err(AgyUnread::Gateway);
+    }
+    let ovr = match agy_override_object(argv, cwd, user_home) {
+        AgyOverrideObject::None => None,
+        AgyOverrideObject::Object(obj) => Some(obj),
+        AgyOverrideObject::Blocked => return Err(AgyUnread::Other),
+    };
+    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => {
+            super::upgrade_agy::config_dir(argv, var("HOME"), user_home).ok_or(AgyUnread::Other)?
+        }
+    };
+    if super::footer::under_file_provider_domain(Some(user_home), &config) {
+        return Err(AgyUnread::Other);
+    }
+    let settings = match crate::supervise::policy::claude_settings::read_settings_in(
+        Some(user_home),
+        &config.join("settings.json"),
+    ) {
+        Ok(Some(text)) => super::witness::parse_settings_object(&text),
+        Ok(None) => None,
+        Err(why) if why.contains("file-provider domain") => return Err(AgyUnread::Other),
+        Err(_) => None,
+    };
+    let provider = ovr
+        .as_ref()
+        .and_then(|o| o.get("modelProvider"))
+        .or_else(|| settings.as_ref().and_then(|s| s.get("modelProvider")));
+    match provider {
+        None | Some(aterm_json::Value::Null) => {}
+        Some(aterm_json::Value::String(p)) if p.is_empty() => {}
+        Some(_) => return Err(AgyUnread::Other),
+    }
+    if ovr
+        .as_ref()
+        .and_then(|o| o.get("auth_method"))
+        .or_else(|| settings.as_ref().and_then(|s| s.get("auth_method")))
+        .and_then(aterm_json::Value::as_str)
+        .is_some_and(|m| m != "oauth" && m != "google" && m != "consumer")
+    {
+        return Err(AgyUnread::Other);
+    }
+    let record = agy_log_auth_record(argv, &config);
+    Ok(AgyRead {
+        config,
+        ovr,
+        settings,
+        record,
+    })
+}
+
+/// What an `agy` process's own files say of its login ([`agy_login_in_dir`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgyLogin {
+    /// Its CLI log's latest sign-in names the consumer Google account `email`.
+    Seen { email: String, path: PathBuf },
+    /// It runs through a gateway or Vertex: no account of its own.
+    Gateway,
+    /// Nothing to read: another provider or sign-in method, unreadable settings, or no log
+    /// with a complete consumer sign-in.
+    Unread,
+}
+
+/// The login an `agy` process with `argv` and `env`, started in `cwd`, runs on, read from its
+/// settings and its CLI log alone ([`agy_subscription_in_dir`]'s own read): no network, no
+/// child process and no credential.
+#[must_use]
+pub fn agy_login_in_dir(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    user_home: &Path,
+) -> AgyLogin {
+    match agy_read(argv, env, cwd, user_home) {
+        Ok(AgyRead {
+            record: Some((Some(email), path)),
+            ..
+        }) => AgyLogin::Seen { email, path },
+        Ok(_) | Err(AgyUnread::Other) => AgyLogin::Unread,
+        Err(AgyUnread::Gateway) => AgyLogin::Gateway,
+    }
+}
+
 /// The account and weekly quota an `agy` process is signed in as ([`SubscriptionDisplay`]).
 /// A provider read additionally requires `host` to own its arguments and environment.
 #[must_use]
@@ -2789,54 +2950,19 @@ fn agy_subscription_with_store_in_dir(
     host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
-    if var(super::witness::AGY_GATEWAY_URL).is_some()
-        || super::witness::agy_vertex_reason(env).is_some()
-    {
+    let Ok(AgyRead {
+        config,
+        ovr,
+        settings,
+        record,
+    }) = agy_read(argv, env, cwd, user_home)
+    else {
         return None;
-    }
-    let ovr = match agy_override_object(argv, cwd, user_home) {
-        AgyOverrideObject::None => None,
-        AgyOverrideObject::Object(obj) => Some(obj),
-        AgyOverrideObject::Blocked => return None,
     };
     let home_dir = abs_home_dir(env, user_home);
-    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => dir,
-        _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
-    };
-    if super::footer::under_file_provider_domain(Some(user_home), &config) {
-        return None;
-    }
-    let settings = match crate::supervise::policy::claude_settings::read_settings_in(
-        Some(user_home),
-        &config.join("settings.json"),
-    ) {
-        Ok(Some(text)) => super::witness::parse_settings_object(&text),
-        Ok(None) => None,
-        Err(why) if why.contains("file-provider domain") => return None,
-        Err(_) => None,
-    };
-    let provider = ovr
-        .as_ref()
-        .and_then(|o| o.get("modelProvider"))
-        .or_else(|| settings.as_ref().and_then(|s| s.get("modelProvider")));
-    match provider {
-        None | Some(aterm_json::Value::Null) => {}
-        Some(aterm_json::Value::String(p)) if p.is_empty() => {}
-        Some(_) => return None,
-    }
-    if ovr
-        .as_ref()
-        .and_then(|o| o.get("auth_method"))
-        .or_else(|| settings.as_ref().and_then(|s| s.get("auth_method")))
-        .and_then(aterm_json::Value::as_str)
-        .is_some_and(|m| m != "oauth" && m != "google" && m != "consumer")
-    {
-        return None;
-    }
-    let email = match agy_log_auth_record(argv, &config) {
-        Some(Some(email)) => email,
-        Some(None) => return None,
+    let email = match record {
+        Some((Some(email), _)) => email,
+        Some((None, _)) => return None,
         None => prev.email.clone()?,
     };
     let active_model = model.map(str::to_owned).or_else(|| {

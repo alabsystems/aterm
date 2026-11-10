@@ -682,7 +682,7 @@ pub struct Ctx {
     /// by ([`test_plan`]): planning data, never a verdict. `None` keeps nothing and plans every
     /// binary as unseen, as every run a test makes does.
     pub test_history: Option<PathBuf>,
-    /// The test binaries a release's resume carries ([`testrun::carry`], `--passed-binaries`).
+    /// The complete test proofs a run may carry ([`testrun::carry`], `--passed-binaries`).
     pub passed_binaries: Option<testrun::Passed>,
     /// Per-package lint successes a release resume may carry by complete content key.
     pub passed_lint_packages: Option<lint_content::Passed>,
@@ -1126,8 +1126,8 @@ impl Ctx {
         self
     }
 
-    /// Carry the test binaries `passed` names into this release's test run, each whose
-    /// executable still hashes so ([`Ctx::passed_binaries`]).
+    /// Carry the complete test proofs `passed` names when their current executable and runtime
+    /// inputs still match ([`Ctx::passed_binaries`]).
     #[must_use]
     pub fn with_passed_binaries(mut self, passed: Option<testrun::Passed>) -> Self {
         self.passed_binaries = passed;
@@ -1141,8 +1141,8 @@ impl Ctx {
         self
     }
 
-    /// Salt test-binary and lint-package evidence with the release's frozen verifier, seal and
-    /// toolchain context.
+    /// Salt test evidence with its frozen caller context, or release lint with its frozen
+    /// verifier, seal and toolchain context.
     #[must_use]
     pub fn with_carry_context(mut self, context: Option<String>) -> Self {
         self.carry_context = context;
@@ -3691,28 +3691,14 @@ mod tests {
         ));
         let said = said.expect("said in the log");
         assert!(said.contains("trust build 9192"), "{said}");
+        // A lease this run never offered to a child lets go by LOCK_UN at its drop, so a
+        // sibling spawn's copy, held until its exec, does not keep it held.
         #[cfg(unix)]
         let fork = aterm_uds::fork_window::Parked::park();
         drop(held);
+        assert_eq!(lease::holders(&prefix, &subject), Holders::Free);
         #[cfg(unix)]
-        {
-            // SDK leases deliberately retain genuine descriptor duplicates. A sibling
-            // spawn also holds one until exec, even though this run dropped its lease.
-            assert!(matches!(
-                lease::holders(&prefix, &subject),
-                Holders::Held(_)
-            ));
-            assert!(fork.release().success());
-        }
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the final borrowed-tool lease descriptor closing",
-            || match lease::holders(&prefix, &subject) {
-                Holders::Free => Some(()),
-                Holders::Held(_) => None,
-                Holders::Unknown(error) => panic!("lease probe failed: {error}"),
-            },
-        );
+        assert!(fork.release().success());
 
         let own_only = Toolchain {
             borrowed: Vec::new(),

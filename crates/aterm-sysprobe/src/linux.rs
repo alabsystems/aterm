@@ -157,6 +157,7 @@ pub struct StatReader {
     buf: Vec<u8>,
     present: usize,
     forks: Option<u64>,
+    blocked: Option<u64>,
 }
 
 impl StatReader {
@@ -168,16 +169,19 @@ impl StatReader {
             buf: vec![0; STAT_CAP],
             present: present.min(MAX_CPUS),
             forks: None,
+            blocked: None,
         }
     }
 
     /// One reading; `None` when the file cannot be read or parsed. The same read's `processes`
-    /// line is kept for [`Self::forks`].
+    /// and `procs_blocked` lines are kept for [`Self::forks`] and [`Self::blocked`].
     pub fn sample(&mut self) -> Option<Vec<CoreTicks>> {
         self.forks = None;
+        self.blocked = None;
         let (n, cut) = crate::read_into(&self.path, &mut self.buf).ok()?;
         let text = crate::utf8_prefix(&self.buf[..n]);
         self.forks = proc_stat_forks(text);
+        self.blocked = proc_stat_count(text, "procs_blocked");
         let mut cores = proc_stat_cores(text, cut)?;
         if cores.len() < self.present {
             cores.resize(self.present, CoreTicks::default());
@@ -192,15 +196,29 @@ impl StatReader {
     pub const fn forks(&self) -> Option<u64> {
         self.forks
     }
+
+    /// The threads in uninterruptible sleep now, every user's (`procs_blocked`: state `D`), as the
+    /// last [`Self::sample`] read them; `None` before one, or where that read held no whole line.
+    #[must_use]
+    pub const fn blocked(&self) -> Option<u64> {
+        self.blocked
+    }
 }
 
 /// `/proc/stat`'s `processes` line: every `fork` and `clone` since boot. Only a whole line
 /// counts, so a read cut inside it gives `None`.
 #[must_use]
 pub fn proc_stat_forks(text: &str) -> Option<u64> {
+    proc_stat_count(text, "processes")
+}
+
+/// `/proc/stat`'s one-number line `key` (`processes`, `procs_blocked`). Only a whole line counts,
+/// so a read cut inside it gives `None`.
+#[must_use]
+pub fn proc_stat_count(text: &str, key: &str) -> Option<u64> {
     whole_lines(text).find_map(|line| {
         let mut fields = line.split_whitespace();
-        (fields.next()? == "processes")
+        (fields.next()? == key)
             .then(|| {
                 let n = crate::parse_uint(fields.next()?)?;
                 fields.next().is_none().then_some(n)
@@ -820,10 +838,19 @@ pub fn tcp_sockets_in_fd_dir(
 /// The kernel's count of every thread on the machine, kernel threads included.
 #[must_use]
 pub fn loadavg_tasks(text: &str) -> Option<u64> {
+    loadavg_counts(text).map(|(_, total)| total)
+}
+
+/// `/proc/loadavg`'s fourth field, `running/total`: the threads runnable now (the reader among
+/// them) and every thread, kernel threads included; `None` unless both read and the total is
+/// positive.
+#[must_use]
+pub fn loadavg_counts(text: &str) -> Option<(u64, u64)> {
     let line = whole_lines(text).next()?;
     let (running, total) = line.split_whitespace().nth(3)?.split_once('/')?;
     let total: u64 = crate::parse_uint(total)?;
-    (crate::parse_uint::<u64>(running).is_some() && total > 0).then_some(total)
+    let running: u64 = crate::parse_uint(running)?;
+    (total > 0).then_some((running, total))
 }
 
 /// One PSI file's ten-second averages (`/proc/pressure/memory`): the share of wall time some task, and every task, stalled on memory.
@@ -1175,6 +1202,8 @@ fn gpu_unread(driver: &str) -> Why {
 pub struct NvidiaCard {
     /// Its device-wide busy percent (at most 100), or why it is unread.
     pub busy: Result<u8, Why>,
+    /// Its board power draw, milliwatts (`nvmlDeviceGetPowerUsage`), or why it is unread.
+    pub power_mw: Result<u32, Why>,
     /// NVML's own name for it (`NVIDIA GB10`), where NVML gave one.
     pub name: Option<String>,
     /// Whether it works in the system's memory ([`GpuReading::unified`]).
@@ -1187,6 +1216,7 @@ impl NvidiaCard {
     pub const fn unread(why: Why) -> Self {
         Self {
             busy: Err(why),
+            power_mw: Err(why),
             name: None,
             unified: false,
         }
@@ -1313,6 +1343,13 @@ impl Root {
         self.base.join(rel)
     }
 
+    /// The text of at most 4 KiB of `rel`, as written (a device-tree string keeps its NUL);
+    /// `None` when unreadable.
+    #[must_use]
+    pub fn text(&self, rel: &str) -> Option<String> {
+        self.read(rel, str::to_owned)
+    }
+
     /// `f` over the text of at most 4 KiB of `rel`; `None` when unreadable.
     fn read<T>(&self, rel: &str, f: impl FnOnce(&str) -> T) -> Option<T> {
         crate::with_bounded(&self.at(rel), f)
@@ -1386,6 +1423,12 @@ impl Root {
         self.read("proc/loadavg", loadavg_tasks).flatten()
     }
 
+    /// `/proc/loadavg`'s runnable and total threads ([`loadavg_counts`]), one read.
+    #[must_use]
+    pub fn loadavg_counts(&self) -> Option<(u64, u64)> {
+        self.read("proc/loadavg", loadavg_counts).flatten()
+    }
+
     /// The machine's task tables ([`crate::room::TaskRoom`]): every task against the smaller of
     /// `kernel/pid_max` and `threads-max` (each thread takes a pid) and against `threads-max`,
     /// `fs/file-nr`'s open files against `fs/file-max`, and one user's limit `nproc` (its
@@ -1396,9 +1439,11 @@ impl Root {
             self.read(rel, |t| crate::parse_uint::<u64>(t.trim()))
                 .flatten()
         };
-        let tasks = self.tasks();
+        let counts = self.loadavg_counts();
+        let tasks = counts.map(|(_, total)| total);
         let threads_max = count("proc/sys/kernel/threads-max");
         crate::room::TaskRoom {
+            run_queue: crate::runq::of_running(counts.map(|(running, _)| running)),
             procs: tasks,
             procs_max: crate::machine::smaller(count("proc/sys/kernel/pid_max"), threads_max),
             user_procs: None,
@@ -1685,12 +1730,19 @@ impl Root {
                 card = Some(read);
                 busy
             };
+            // An NVIDIA card's power is NVML's; one not read (asleep, its runtime PM unsettled)
+            // carries the busy figure's reason.
+            let power_mw = (driver == "nvidia").then(|| match &card {
+                Some(c) => c.power_mw,
+                None => Err(busy.err().unwrap_or(Why::NotRead)),
+            });
             let (named, unified) = card.map_or((None, false), |c| (c.name, c.unified));
             readings.push(GpuReading {
                 device_pct: busy.ok(),
                 unread: busy.err(),
                 name: named.or(Some(driver)),
                 unified,
+                power_mw,
                 ..GpuReading::default()
             });
         }

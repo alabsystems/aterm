@@ -99,8 +99,9 @@ impl Script {
 
 impl Step {
     /// `snap` with this step's strain: the CPU row busy at `min(level, 1)` of its capacity and
-    /// the GPU row idle, the load average `2^(3·over)` times the cores past capacity (so
-    /// [`aterm_vitals::strain::over`] reads `level − 1`), no swap, and the CPU row's hour over
+    /// the GPU row idle, the run queue `2^(3·over)` times the cores past capacity (so
+    /// [`aterm_vitals::strain::over`] reads `level − 1`), read as a snapshot with no run-queue
+    /// reader reads it (the load average, P10 unread), no swap, and the CPU row's hour over
     /// capacity for its newest buckets, as many as make [`aterm_vitals::strain::soak`] read this
     /// step's soak from calm. A row with no capacity read yet keeps its reading.
     #[must_use]
@@ -124,6 +125,8 @@ impl Step {
             Some(n) => Some(n * 0.5),
             None => out.facts.load1,
         };
+        out.facts.runnable = aterm_vitals::runq::Runnable::default();
+        out.facts.queue = aterm_vitals::runq::RunQueue::of(out.facts.runnable, out.facts.load1);
         out.facts.swap_rate = Some(0.0);
         out
     }

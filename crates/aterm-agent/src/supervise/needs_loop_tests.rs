@@ -614,6 +614,9 @@ struct Hears {
     /// from 0 in `checks`) from which the host holds the account for an hour; `None`, never.
     held_from: Option<usize>,
     checks: std::sync::atomic::AtomicUsize,
+    /// How many points told it the session's account is to be sighted
+    /// ([`IdleHost::account_seen`]).
+    sighted: std::sync::atomic::AtomicUsize,
 }
 
 impl Hears {
@@ -651,6 +654,10 @@ impl IdleHost for Hears {
         self.held_from
             .filter(|&from| check >= from)
             .map(|_| Instant::now() + Duration::from_secs(3600))
+    }
+    fn account_seen(&self) {
+        self.sighted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -736,6 +743,29 @@ fn long_need_then_none() -> Vec<Vec<String>> {
         busy_screen(),
         said(&["Shipped the docs.", "NEEDS YOU: nothing"]),
     ]
+}
+
+/// THE DEAD HOOK (`docs/DESIGN-account-discovery-2026-11-09.md`, step 2): the host is told to
+/// sight the session's account at each of its points, with the account switches at their
+/// defaults and whichever program runs, and beside a proven self-claim too, where the loop
+/// decides nothing: a watched session runs on an account all the same. The recorded run replays
+/// ([`heard_with`]), so the door is on the tape.
+/// NEGATIVE CONTROL: with the tell below `turn_end_at_point`'s watching gate, the loop beside
+/// a self-claim never tells it: `` left: (0, 3) right: (1, 3) ``.
+#[test]
+fn the_account_is_sighted_at_each_point_carried_or_beside() {
+    let sighted = |beside: bool| {
+        let host = Arc::new(Hears::default());
+        let _ = heard(long_need_then_none(), vec![1, 3], &host, beside);
+        host.sighted.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    // Beside, nothing is typed, so the script rests at its first point; carried, the loop's own
+    // acts bring it to three.
+    assert_eq!(
+        (sighted(true), sighted(false)),
+        (1, 3),
+        "beside a proven self-claim, then carried"
+    );
 }
 
 #[test]

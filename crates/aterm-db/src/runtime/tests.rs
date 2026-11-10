@@ -1121,7 +1121,13 @@ fn a_configuration_refusal_stands_across_a_windows_claim_until_commons_is_switch
         }
     };
     assert_eq!(next(), configuration(false));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        crate::network_state::directory(&config),
+        aterm_uds::quiet_state::destination(&config.with_file_name("network-state"))
+    );
     let claim = owner::WindowClaim::acquire(&config).unwrap();
+    assert!(owner::window_claimed(&config));
     until(Status::Waiting);
     drop(claim);
     assert_eq!(

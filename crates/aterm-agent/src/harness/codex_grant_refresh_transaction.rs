@@ -1280,10 +1280,10 @@ mod tests {
             !entered,
             "legacy sign-in must exclude refresh before owner work"
         );
-        // Failed refresh admission must release its source lease.
-        let publication = crate::harness::codex_source_gate::PublicationLock::released_for_home(
+        let publication = crate::harness::codex_source_gate::PublicationLock::for_home(
             fixture.env.home.as_deref().unwrap(),
-        );
+        )
+        .expect("failed refresh admission must release its source lease");
         drop(publication);
         drop(signin);
         with_refresh_work(&fixture.env, |work| {
@@ -1505,10 +1505,10 @@ mod tests {
         }
         assert!(source_status.retired());
         assert!(exchange_is_exclusive(&exchange_file(env)));
-        // A settled or durably deferred response must release source exclusion.
-        let publication = crate::harness::codex_source_gate::PublicationLock::released_for_home(
+        let publication = crate::harness::codex_source_gate::PublicationLock::for_home(
             env.home.as_deref().unwrap(),
-        );
+        )
+        .expect("settled or durably deferred response must release source exclusion");
         drop(publication);
         if let Some(proof) = &resource_probe {
             let namespace = crate::harness::codex_source_gate::existing_namespace_for_home(

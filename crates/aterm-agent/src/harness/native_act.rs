@@ -935,6 +935,29 @@ pub enum ReceiptMode {
     Recipients5,
 }
 
+/// A host's separate writer-protocol advertisement, never reader evidence or
+/// permission to admit, signal or execute a particular operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecipientWriterSupport {
+    /// Complete-recipient admission is unavailable on this host.
+    Unavailable,
+    /// The native admission/Execute path durably records each possible recipient
+    /// in the independently bound journal. A particular admission still requires
+    /// current authority, identity and image checks.
+    BoundRecipientsV1,
+}
+
+impl RecipientWriterSupport {
+    /// Exact discovery token. This is deliberately distinct from a Prepare mode.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Unavailable => "none",
+            Self::BoundRecipientsV1 => "bound-recipients-v1",
+        }
+    }
+}
+
 /// A preparation's complete data-only expectation; the host independently derives authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepare {
@@ -1186,6 +1209,9 @@ pub enum Request {
     /// Discover atomic initial-prepare cancellation before creating a scoped claim.
     /// This probe leaves the frozen native protocol's Info reply unchanged.
     CancelSupport,
+    /// Discover the host's complete-recipient writer protocol separately from
+    /// frozen Info fields and signed bundle reader capabilities.
+    RecipientWriterSupport,
     /// Admit a complete plan, atomically with its actor and revision.
     Prepare(Box<Prepare>),
     /// Seal this exact original OwnImage preparation against future admission. A fresh
@@ -1322,6 +1348,7 @@ impl Request {
             "constructors" => Self::Constructors,
             "rejection-domain" => Self::RejectionDomain,
             "cancel-support" => Self::CancelSupport,
+            "recipient-writer-support" => Self::RecipientWriterSupport,
             "prepare" | "cancel-prepare" => {
                 let id = take(&mut words, "id")?.to_string();
                 if !aterm_codec::hex::is_lower(&id, 32) {
@@ -1581,6 +1608,7 @@ impl Request {
             Self::Constructors => out.push_str("constructors"),
             Self::RejectionDomain => out.push_str("rejection-domain"),
             Self::CancelSupport => out.push_str("cancel-support"),
+            Self::RecipientWriterSupport => out.push_str("recipient-writer-support"),
             Self::Prepare(_) | Self::CancelPrepare(_) => {
                 let p = match self {
                     Self::Prepare(prepare) => &**prepare,
@@ -1803,6 +1831,8 @@ pub enum Reply {
     /// This host can atomically seal an exact initial OwnImage preparation. Check this
     /// separate discovery reply before claiming; native-act=1 alone is insufficient.
     CancelSupport,
+    /// Writer protocol support only; this grants no operation or capability.
+    RecipientWriterSupport(RecipientWriterSupport),
     /// No mutation committed and no future original Prepare can admit this exact plan.
     /// The echoed original request binds all fields, including its unchanged deadline.
     Cancelled(Box<CancelPrepare>),
@@ -1927,6 +1957,14 @@ impl Reply {
                     return None;
                 }
                 Self::CancelSupport
+            }
+            "recipient-writer-support" => {
+                let support = match words.next()? {
+                    "writer=none" => RecipientWriterSupport::Unavailable,
+                    "writer=bound-recipients-v1" => RecipientWriterSupport::BoundRecipientsV1,
+                    _ => return None,
+                };
+                Self::RecipientWriterSupport(support)
             }
             "rejection-domain" => {
                 let domain = words.next()?.strip_prefix("domain=")?;
@@ -2394,6 +2432,51 @@ mod tests {
         );
         assert_eq!(Request::parse(&(wire.clone() + " deadline-us=92")), None);
         assert_eq!(Request::parse(&(wire + " unrecognized=1")), None);
+    }
+
+    #[test]
+    fn recipient_writer_discovery_is_explicit_and_strict() {
+        assert_eq!(
+            Request::parse("recipient-writer-support"),
+            Some(Request::RecipientWriterSupport)
+        );
+        assert_eq!(
+            Request::RecipientWriterSupport.encode().as_deref(),
+            Some("recipient-writer-support")
+        );
+        for support in [
+            RecipientWriterSupport::Unavailable,
+            RecipientWriterSupport::BoundRecipientsV1,
+        ] {
+            let line = format!(
+                "OK native-act state=recipient-writer-support writer={}\n",
+                support.word()
+            );
+            assert_eq!(
+                Reply::parse(&line),
+                Some(Reply::RecipientWriterSupport(support))
+            );
+        }
+        for malformed in [
+            "recipient-writer-support writer=none",
+            "recipient-writer-support writer=bound-recipients-v1",
+            "recipient-writer-support extra=1",
+        ] {
+            assert_eq!(Request::parse(malformed), None);
+        }
+        for malformed in [
+            "OK native-act state=recipient-writer-support",
+            "OK native-act state=recipient-writer-support writer=recipients5",
+            "OK native-act state=recipient-writer-support writer=bound-recipients5",
+            "OK native-act state=recipient-writer-support writer=true",
+            "OK native-act state=recipient-writer-support writer=unknown",
+            "OK native-act state=recipient-writer-support writer=none writer=bound-recipients-v1",
+            "OK native-act state=recipient-writer-support writer=bound-recipients-v1 native-act=1",
+            "OK native-act state=recipient-writer-support ATermNativeRecipientRecovery=bound-recipients5",
+            "OK native-act state=info writer=bound-recipients5",
+        ] {
+            assert_eq!(Reply::parse(malformed), None, "{malformed}");
+        }
     }
 
     #[test]

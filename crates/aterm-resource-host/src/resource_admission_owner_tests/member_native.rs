@@ -15,6 +15,7 @@ use std::{
         fd::{AsFd as _, AsRawFd as _},
         unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     },
+    path::Path,
 };
 use trust_resource_controller::{
     self as control,
@@ -33,6 +34,10 @@ const PROGRESS: &str = "ATERM_MEMBER_FIXTURE_PROGRESS";
 const ROOT_BUDGET: Duration = Duration::from_secs(600);
 
 pub(super) fn run(args: &[OsString], gnu: Option<[OwnedFd; 2]>) -> std::process::ExitCode {
+    // The maintained native entry has already captured the original SDK/GNU
+    // descriptions before dispatch reaches this fixture. Diagnostics must not
+    // allocate descriptors before that capture.
+    trace(&format!("fixture-entry args={args:?}"));
     if matches!(args, [arg] if arg == "-vV")
         || matches!(args, [worker, subgroup, name, value]
             if worker == "--resource-worker-v3" && subgroup == "--resource-subgroups-v3"
@@ -80,6 +85,9 @@ fn outer() {
                 );
             }
         };
+        // Keep the host's bounded phase timeline in the actual test output,
+        // including successful runs whose private scratch is removed normally.
+        std::io::stderr().write_all(&output.stderr).unwrap();
         assert!(
             output
                 .stdout
@@ -100,6 +108,46 @@ fn progressed(phase: &str) {
         .open(std::env::var_os(PROGRESS).unwrap())
         .unwrap();
     writeln!(log, "{phase}").unwrap();
+}
+fn trace(phase: &str) {
+    if let Some(marker) = std::env::var_os(MARKER) {
+        trace_at(Path::new(&marker), phase);
+    }
+}
+fn trace_at(marker: &Path, phase: &str) {
+    assert!(phase.len() <= 1024, "native fixture trace row is bounded");
+    let now = aterm_uds::process::continuous_ns().expect("native fixture clock");
+    // Use the same kernel CPU record and timebase as sysprobe and the native
+    // stopped-child accounting controls, without sweeping other processes.
+    // SAFETY: this record consists only of integers and bytes; zero is valid.
+    let mut usage: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: the kernel writes the selected record into a live, correctly
+    // sized buffer. This read observes only this process and changes no policy.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id().try_into().unwrap(),
+            libc::RUSAGE_INFO_V4,
+            (&raw mut usage).cast::<libc::rusage_info_t>(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let ticks = usage
+        .ri_user_time
+        .checked_add(usage.ri_system_time)
+        .unwrap();
+    let (numer, denom) = aterm_sysprobe::procs::kernel_timebase().unwrap();
+    let cpu_ns = aterm_sysprobe::procs::ticks_to_ns(ticks, numer, denom);
+    let row = format!("{now} pid={} cpu_ns={cpu_ns} {phase}\n", std::process::id());
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(marker.with_extension("timeline"))
+        .unwrap();
+    assert!(log.metadata().unwrap().len() < 64 * 1024);
+    // One append request per row: formatting directly into the shared file
+    // issued several writes that could interleave with another fixture process.
+    assert_eq!(log.write(row.as_bytes()).unwrap(), row.len());
 }
 fn host(unknown: bool) {
     progressed("host-started");
@@ -228,6 +276,7 @@ fn host(unknown: bool) {
                     Err(error) => panic!("actual member HELLO: {error}"),
                 };
                 let role = hello["role"].as_str().unwrap();
+                trace_at(&marker, &format!("host-dispatch-begin role={role}"));
                 match role {
                     "native-context" => {
                         crate::resource_context::serve(&stream, peer, &hello, end, |peer, query| {
@@ -297,6 +346,7 @@ fn host(unknown: bool) {
                     }
                     _ => panic!("unexpected native member role"),
                 }
+                trace_at(&marker, &format!("host-dispatch-done role={role}"));
                 progressed(role);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
@@ -317,6 +367,10 @@ fn host(unknown: bool) {
     let accounted =
         aterm_types::resource_admission::AccountedEventFrame::decode(&raw_terminal, &binding)
             .unwrap();
+    eprintln!(
+        "actual member phase timeline (continuous ns):\n{}",
+        fs::read_to_string(marker.with_extension("timeline")).unwrap()
+    );
     assert!(
         matches!(accounted.finished.event, Event::Finished { outcome: Outcome::Exit(code), cause: CompletionCause::Exited, .. } if code == if unknown { 101 } else { 0 }),
         "actual root terminal {:?}; submissions={submissions}; root stderr {}",
@@ -703,18 +757,18 @@ fn root() {
 }
 fn metadata(gnu: Option<[OwnedFd; 2]>, value: &str) {
     let end = Instant::now() + HANG;
+    trace("metadata-open-store-begin");
     let store = ReadStore::open_at(&PathBuf::from(std::env::var_os(STORE).unwrap())).unwrap();
-    let client = Client::from_helper(
-        store
-            .connect_ancestor(end)
-            .unwrap()
-            .into_helper(end)
-            .unwrap()
-            .into(),
-    );
+    trace("metadata-open-store-done");
+    let host = store.connect_ancestor(end).unwrap();
+    trace("metadata-connected-ancestor");
+    let helper = host.into_helper(end).unwrap();
+    trace("metadata-entered-helper");
+    let client = Client::from_helper(helper.into());
     let binding =
         control::JobBinding::from_locator(&std::env::var("ATERM_RESOURCE_JOB_V3").unwrap())
             .unwrap();
+    trace("metadata-context-query");
     let reply = client
         .context(
             &control::ContextQuery {
@@ -724,11 +778,13 @@ fn metadata(gnu: Option<[OwnedFd; 2]>, value: &str) {
             end,
         )
         .unwrap();
+    trace("metadata-context-reply");
     assert!(matches!(
         reply.context.subject,
         control::Subject::RegisteredMember { .. }
     ));
     trust_resource_controller::client::sdk::validate_sdk_keeper(&reply.context).unwrap();
+    trace("metadata-keeper-validated");
     assert!(reply.context.sdk.is_some());
     if let Some([read, write]) = gnu {
         let mut input = File::from(read);
@@ -768,7 +824,9 @@ fn metadata(gnu: Option<[OwnedFd; 2]>, value: &str) {
             .unwrap();
         writeln!(marker, "{value}").unwrap();
     }
+    trace("metadata-marker-written");
     println!("{value}");
+    trace("metadata-output-enqueued");
 }
 
 #[path = "member_native_probe.rs"]

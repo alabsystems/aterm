@@ -39,9 +39,10 @@ fn stored() -> ProcessLogin {
 
 fn seen(email: &str) -> Observation {
     Observation::Seen(Observed {
-        cli: Cli::Claude,
+        cli: Cli::Claude.into(),
         email: email.to_owned(),
         key: None,
+        region: None,
         src: ObservedSrc::Profile,
         path: PathBuf::from("/home/someone/.claude.json"),
         mtime: Some(1),

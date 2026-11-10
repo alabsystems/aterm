@@ -243,10 +243,116 @@ const MAX_RECORD: usize = 64 << 10;
 const MAX_ROOTS: usize = 4096;
 const MAX_OWNERS: usize = 64;
 
+#[path = "build_cache_volume.rs"]
+pub(super) mod volume;
+
+/// A folder (or file) as custody binds it: its inode on its volume.
+///
+/// THE DEVICE NUMBER IS THE MOUNT'S (VOLUME-IDENTITY, 2026-11-10): macOS numbers a volume as it
+/// mounts it, so after a restart the same volume, folder and inode read with another device
+/// number, and another volume can read with the number a record kept ([`volume`]). A record that
+/// keeps its volume's UUID binds the volume by that UUID ([`Identity::names`]); one written before
+/// records kept it (no `volume`), or of a volume with none, binds by the device number alone, as
+/// every record did, and so binds nothing once its volume is renumbered ([`renumbered`]).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Identity {
+    /// The device number of the volume where this was read, as that mount numbered it.
     pub(super) device: u64,
     pub(super) inode: u64,
+    /// The persistent UUID of the volume where this was read (`ATTR_VOL_UUID`, [`volume`]), where
+    /// it was read and the volume has one. Absent off macOS, and in every record written before
+    /// records kept it; an older reader ignores it and binds by the device number, as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) volume: Option<volume::Uuid>,
+}
+
+impl Identity {
+    /// What a read gives with its volume unread: an identity compared only with another of this
+    /// boot, by its device number, and never recorded (a record keeps the volume: [`identity`],
+    /// [`Identity::held`]).
+    #[cfg(unix)]
+    pub(super) const fn unrecorded(device: u64, inode: u64) -> Self {
+        Self {
+            device,
+            inode,
+            volume: None,
+        }
+    }
+
+    /// The folder or file held open as `fd`, read now, its volume included. `None` where either
+    /// read fails.
+    #[cfg(unix)]
+    pub(super) fn held(fd: impl std::os::fd::AsFd) -> Option<Self> {
+        let stat = aterm_dirfd::fstat(fd.as_fd()).ok()?;
+        Some(Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            volume: volume::held(fd.as_fd()).ok()?,
+        })
+    }
+
+    /// The entry `name` of the folder held as `folder`, read now as `stat` (`fstatat`, a link as
+    /// itself), its volume read by that name; `None` where that read fails or the name no longer
+    /// reads as `stat` once it is done.
+    #[cfg(unix)]
+    pub(super) fn at(
+        folder: aterm_dirfd::BorrowedFd<'_>,
+        name: &std::ffi::OsStr,
+        stat: &aterm_dirfd::Stat,
+    ) -> Option<Self> {
+        let volume = volume::at(folder, name).ok()?;
+        let again =
+            aterm_dirfd::fstatat(folder, name, aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+        ((again.st_dev, again.st_ino) == (stat.st_dev, stat.st_ino)).then_some(Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            volume,
+        })
+    }
+
+    /// WHETHER THIS IDENTITY, AS RECORDED (in another boot, perhaps), NAMES THE FOLDER READ NOW AS
+    /// `now`: the same inode on the same volume. Where it keeps the volume's UUID, `now` must be
+    /// on the volume of that UUID, whatever its device number now (another boot numbers a volume
+    /// anew), so another volume is refused though it reads with the device number recorded, and so
+    /// is a folder whose volume reads with no UUID now. Where it keeps none, only the device number
+    /// recorded can say, as before records kept the UUID: `now` must read with it.
+    pub(super) fn names(&self, now: &Self) -> bool {
+        self.inode == now.inode
+            && match &self.volume {
+                Some(volume) => now.volume.as_ref() == Some(volume),
+                None => self.device == now.device,
+            }
+    }
+
+    /// Whether two records name one folder (a marker and its receipt, a receipt and the copy a
+    /// pending stage keeps): the same inode, and one volume, by its UUID where both keep it, by
+    /// the device number where either does not (one written before the other was witnessed:
+    /// [`Identity::witnessed`] never changes the device number recorded).
+    pub(super) fn same_record(&self, other: &Self) -> bool {
+        self.inode == other.inode && self.same_volume(other)
+    }
+
+    /// Whether two records name folders on one volume: by its UUID where both keep it, by the
+    /// device number where either does not.
+    pub(super) fn same_volume(&self, other: &Self) -> bool {
+        match (&self.volume, &other.volume) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.device == other.device,
+        }
+    }
+
+    /// THIS RECORD WITH ITS VOLUME WITNESSED (VOLUME-WITNESS): a record that keeps no UUID but
+    /// still names `now` by its device number (this boot has not renumbered its volume) gains
+    /// `now`'s volume UUID, its device number and inode kept as recorded, so it goes on naming
+    /// the folder once a restart renumbers the volume. `None` where it keeps one already, where
+    /// `now` has none, or where it does not name `now`.
+    #[cfg(unix)]
+    pub(super) fn witnessed(&self, now: &Self) -> Option<Self> {
+        (self.volume.is_none() && now.volume.is_some() && self.names(now)).then(|| Self {
+            volume: now.volume,
+            ..self.clone()
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -334,14 +440,35 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// The private folder at `path` (a link at it read as itself), its volume included: the volume
+/// is read by the path as the folder is (`FSOPT_NOFOLLOW`, which asks no more of the path than
+/// `lstat` does), and the folder read again after it, so a folder swapped at the path between the
+/// two reads is no identity.
 #[cfg(unix)]
 fn identity_for(path: &Path, uid: u32) -> Option<Identity> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = std::fs::symlink_metadata(path).ok()?;
-    (metadata.is_dir() && private(metadata.uid(), metadata.mode(), uid)).then(|| Identity {
+    if !metadata.is_dir() || !private(metadata.uid(), metadata.mode(), uid) {
+        return None;
+    }
+    let volume = volume::at(aterm_dirfd::CWD, path).ok()?;
+    let again = std::fs::symlink_metadata(path).ok()?;
+    ((again.dev(), again.ino()) == (metadata.dev(), metadata.ino())).then(|| Identity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        volume,
     })
+}
+
+/// The private folder at `path` as [`identity`] judges it, its volume left unread: the identities
+/// a package declaration records (its coordinator folder and its preserved path's folder), which
+/// keep binding by the device number alone, as they did (VOLUME-IDENTITY's open item).
+#[cfg(unix)]
+fn boot_local(path: &Path) -> Option<Identity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (metadata.is_dir() && private(metadata.uid(), metadata.mode(), euid()))
+        .then(|| Identity::unrecorded(metadata.dev(), metadata.ino()))
 }
 
 /// Whether a folder owned by `owner`, its mode `mode`, is one custody binds for the user `uid`:
@@ -407,10 +534,7 @@ fn directory_child(
     if !creation::named(
         parent,
         name,
-        &Identity {
-            device: captured.st_dev,
-            inode: captured.st_ino,
-        },
+        &Identity::unrecorded(captured.st_dev, captured.st_ino),
     ) {
         return None;
     }
@@ -581,7 +705,7 @@ fn same(home: &Path, receipt: &Receipt) -> bool {
     receipt.creating.is_none()
         && scope(home, &receipt.root)
         && std::fs::canonicalize(&receipt.root).ok().as_ref() == Some(&receipt.root)
-        && identity(&receipt.root).as_ref() == Some(&receipt.identity)
+        && identity(&receipt.root).is_some_and(|now| receipt.identity.names(&now))
         && [".git", "Cargo.toml", "Targo.toml"].iter().all(|name| {
             std::fs::symlink_metadata(receipt.root.join(name))
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -593,10 +717,146 @@ fn same(home: &Path, receipt: &Receipt) -> bool {
 /// package state belong to the index and need not equal the creation-time marker.
 fn marker_binds(marker: &Receipt, receipt: &Receipt) -> bool {
     marker.root == receipt.root
-        && marker.identity == receipt.identity
+        && marker.identity.same_record(&receipt.identity)
         && marker.nonce == receipt.nonce
         && marker.schema == receipt.schema
         && package::same_declaration(marker.package.as_ref(), receipt.package.as_ref())
+}
+
+/// RECORD THE VOLUME OF THE FOLDER A RECEIPT WITHOUT ONE BINDS (VOLUME-WITNESS), while this boot
+/// still numbers its volume as the receipt recorded it: the folder's marker first, read and
+/// rewritten through the folder held, under its publication lock (which a removal's walk takes
+/// to arm its fence), then the receipt at `path`, each keeping the device number and inode it
+/// recorded and gaining the volume's UUID ([`Identity::witnessed`]), so both go on naming the
+/// folder once a restart renumbers its volume. A receipt that keeps a UUID already is left as it
+/// is; so is any but an ordinary settled one (pending, being created, a keep or a package's) or
+/// one whose marker does not bind it or is a keep or a removal's fence. Called holding the
+/// receipt's gate exclusively. Whether `*receipt`, what is on record at `path`, keeps its
+/// volume's UUID once done; a marker rewritten before the receipt failed still binds it
+/// ([`marker_binds`]: the device numbers they keep are the same).
+#[cfg(unix)]
+fn witness(home: &Path, path: &Path, receipt: &mut Receipt) -> bool {
+    if receipt.identity.volume.is_some() {
+        return true;
+    }
+    if receipt.retained
+        || receipt.removal_fence.is_some()
+        || receipt.creating.is_some()
+        || receipt.pending.is_some()
+        || receipt.package.is_some()
+        || !same(home, receipt)
+        || read(path).as_ref() != Some(receipt)
+    {
+        return false;
+    }
+    let Some(held) = creation::pin(&receipt.root) else {
+        return false;
+    };
+    let Some(identity) = Identity::held(&held).and_then(|now| receipt.identity.witnessed(&now))
+    else {
+        return false;
+    };
+    let Some(_publication) = retention::publication_lock(&held) else {
+        return false;
+    };
+    let Some(mut marker) = retention::receipt_at(&held) else {
+        return false;
+    };
+    if marker.retained || marker.removal_fence.is_some() || !marker_binds(&marker, receipt) {
+        return false;
+    }
+    if marker.identity.volume.is_none() {
+        marker.identity = Identity {
+            volume: identity.volume,
+            ..marker.identity
+        };
+        if retention::write_marker(&held, &marker).is_err() {
+            return false;
+        }
+    }
+    let witnessed = Receipt {
+        identity,
+        ..receipt.clone()
+    };
+    if write(path, &witnessed).is_none() || read(path).as_ref() != Some(&witnessed) {
+        return false;
+    }
+    *receipt = witnessed;
+    same(home, receipt)
+}
+
+/// [`witness`] the receipt of `root` where it keeps no volume UUID yet, for a producer that found
+/// its owner on record already ([`recorded_while`]) and so writes nothing else: only where the
+/// admission lock and the root's gate are both free at once, held as [`create_with_policy`] holds
+/// them to write, so no producer waits for this or is refused by it (one that finds the gate held
+/// waits on the admission lock, then finds it free); skipped otherwise, for a later producer or
+/// the reclaim pass ([`reclaim_selected_on`]) to do.
+#[cfg(unix)]
+fn witness_soon(home: &Path, root: &Path) {
+    let directory = home.join(INDEX);
+    let Some(key) = key(root) else {
+        return;
+    };
+    let path = directory.join(format!("{key}.json"));
+    if read(&path).is_none_or(|receipt| receipt.identity.volume.is_some()) {
+        return;
+    }
+    let (Ok(admission), Some(gate)) = (
+        crate::metadata_io::open_regular(&directory.join("locks.noindex/admission.lock")),
+        gate_path(&path),
+    ) else {
+        return;
+    };
+    let Ok(_admission) = crate::lock::Flock::try_lock(admission) else {
+        return;
+    };
+    let Ok(gate) = crate::metadata_io::open_regular(&gate) else {
+        return;
+    };
+    let Ok(_held) = crate::lock::Flock::try_lock(gate) else {
+        return;
+    };
+    if let Some(mut receipt) = read(&path)
+        && receipt.root == root
+    {
+        witness(home, &path, &mut receipt);
+    }
+}
+
+/// WHETHER `receipt` NAMES ITS FOLDER IN ALL BUT THE DEVICE NUMBER (VOLUME-IDENTITY): a receipt
+/// that keeps no volume UUID (written before records kept one, and not witnessed since), whose
+/// folder stands at its canonical path, private, with the inode it recorded and the marker that
+/// binds it, but on a volume this boot numbers otherwise, as a restart renumbers one. Nothing it
+/// recorded can prove that volume the one it was written on, so it binds nothing ([`same`]) and
+/// stays refused; the device number its folder reads with now, for [`renumbered_words`].
+#[cfg(unix)]
+fn renumbered(home: &Path, receipt: &Receipt) -> Option<u64> {
+    if receipt.identity.volume.is_some()
+        || receipt.creating.is_some()
+        || !scope(home, &receipt.root)
+        || std::fs::canonicalize(&receipt.root).ok().as_ref() != Some(&receipt.root)
+    {
+        return None;
+    }
+    let now = identity(&receipt.root)?;
+    (now.inode == receipt.identity.inode
+        && now.device != receipt.identity.device
+        && read(&receipt.root.join(MARKER)).is_some_and(|marker| marker_binds(&marker, receipt)))
+    .then_some(now.device)
+}
+
+/// What a producer is told of a [`renumbered`] receipt: why it is refused, and what to do.
+#[cfg(unix)]
+fn renumbered_words(receipt: &Receipt, now: u64) -> String {
+    let root = receipt.root.display();
+    format!(
+        "the managed build cache {root} was recorded on device {}, and its volume reads as device \
+         {now} now (a restart renumbers a volume); its record predates atpkg's record of a \
+         volume's own identity, so nothing proves it the same folder and it stays refused: \
+         remove {root} (a build cache atpkg made; the next build makes it again) or build into \
+         another target directory",
+        receipt.identity.device
+    )
 }
 
 #[cfg(unix)]
@@ -629,9 +889,10 @@ fn pending_copy(index: &Path, root_key: &str, receipt: &Receipt) -> Option<()> {
     ));
     if let Some(before) = read(&path) {
         return (before.nonce == receipt.nonce
-            && before.identity == receipt.identity
+            && before.identity.same_record(&receipt.identity)
             && before.pending.as_ref().is_some_and(|before| {
-                before.directory == pending.directory && before.identity == pending.identity
+                before.directory == pending.directory
+                    && before.identity.same_record(&pending.identity)
             }))
         .then_some(());
     }
@@ -740,6 +1001,7 @@ fn create_with_policy(
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut must_record = false;
     let mut created = false;
+    let mut refusal = None;
     let mut attempt = || -> Option<()> {
         if !scope(home, root) || !scope(home, workspace) {
             return None;
@@ -766,6 +1028,7 @@ fn create_with_policy(
             {
                 return None;
             }
+            witness_soon(home, root);
             return Some(());
         }
         let index = index(home)?;
@@ -847,7 +1110,16 @@ fn create_with_policy(
             Ok(_) => {
                 let mut receipt = match before.or_else(|| read(&path)) {
                     Some(receipt) if receipt.root != root => return None,
-                    Some(receipt) if same(home, &receipt) => receipt,
+                    Some(mut receipt) if same(home, &receipt) => {
+                        witness(home, &path, &mut receipt);
+                        receipt
+                    }
+                    Some(receipt) if renumbered(home, &receipt).is_some() => {
+                        must_record = true;
+                        refusal =
+                            renumbered(home, &receipt).map(|now| renumbered_words(&receipt, now));
+                        return None;
+                    }
                     // Only an adoption puts its receipt on record before its marker binds it, and
                     // an ordinary receipt of a folder no longer here binds nothing here.
                     Some(receipt) if adopt && !declared => {
@@ -905,9 +1177,9 @@ fn create_with_policy(
     if attempt().is_some() {
         Ok((true, created))
     } else if must_record {
-        Err(std::io::Error::other(
-            "the managed build cache's owner could not be recorded",
-        ))
+        Err(std::io::Error::other(refusal.unwrap_or_else(|| {
+            "the managed build cache's owner could not be recorded".to_owned()
+        })))
     } else {
         Ok((false, false))
     }
@@ -939,6 +1211,9 @@ enum LinkRefusal {
     CargoMade,
     /// Its folder declares custody, or the index records it, but no receipt binds it here.
     Foreign,
+    /// Its folder's receipt names it in all but the device number, recorded before atpkg recorded
+    /// a volume's own identity, on a volume a restart has renumbered since ([`renumbered`]).
+    Renumbered,
     /// The link, or the folder it names, changed between its observation and the re-check
     /// under the folder's gate.
     Changed,
@@ -961,6 +1236,9 @@ impl LinkRefusal {
             }
             Self::Foreign => {
                 "the explicit target is a link to a folder whose custody atpkg cannot confirm"
+            }
+            Self::Renumbered => {
+                "the explicit target is a link to a build cache recorded before atpkg recorded a volume's own identity, on a volume a restart has renumbered since, so nothing proves it the same folder: remove the folder it names (the next build makes it again) or build into another target directory"
             }
             Self::Changed => "the explicit target's link changed while atpkg observed it",
         }
@@ -1132,6 +1410,7 @@ fn admit_linked(
         return Err(stop());
     }
     if recorded_while(home, root, workspace, &|| linked.still()) {
+        witness_soon(home, root);
         return Ok(Ok(()));
     }
     let index = index(home).ok_or_else(stop)?;
@@ -1155,11 +1434,15 @@ fn admit_linked(
         return Ok(Err(LinkRefusal::Changed));
     }
     let Some(mut receipt) = read(&path).filter(|receipt| {
-        receipt.root == root && receipt.identity == linked.identity && same(home, receipt)
+        receipt.root == root && receipt.identity.names(&linked.identity) && same(home, receipt)
     }) else {
         return Ok(Err(
             if scope(home, root) && adoption::proven(home, root, &path).is_some() {
                 LinkRefusal::CargoMade
+            } else if read(&path)
+                .is_some_and(|receipt| receipt.root == root && renumbered(home, &receipt).is_some())
+            {
+                LinkRefusal::Renumbered
             } else if custody_present(root) || std::fs::symlink_metadata(&path).is_ok() {
                 LinkRefusal::Foreign
             } else {
@@ -1172,6 +1455,7 @@ fn admit_linked(
     }) {
         return Err(stop());
     }
+    witness(home, &path, &mut receipt);
     let mut changed = false;
     if receipt.pending.is_some() {
         if receipt.package.is_some() {
@@ -1231,7 +1515,7 @@ pub fn roots(home: &Path) -> Vec<Registered> {
 
 #[cfg(unix)]
 fn settle(path: &Path, receipt: &mut Receipt) {
-    let still_root = identity(&receipt.root).as_ref() == Some(&receipt.identity);
+    let still_root = identity(&receipt.root).is_some_and(|now| receipt.identity.names(&now));
     if receipt.package.is_none()
         && (!still_root
             || path
@@ -1250,11 +1534,11 @@ fn pending_owned(home: &Path, receipt: &Receipt, pending: &Pending) -> bool {
     package::payload_safe(receipt, pending)
         && scope(home, &pending.directory)
         && std::fs::canonicalize(&pending.directory).ok().as_ref() == Some(&pending.directory)
-        && identity(&pending.directory).as_ref() == Some(&pending.identity)
+        && identity(&pending.directory).is_some_and(|now| pending.identity.names(&now))
         && (pending.authorized
-            || (identity(&payload).as_ref() == Some(&receipt.identity)
+            || (identity(&payload).is_some_and(|now| receipt.identity.names(&now))
                 && read(&payload.join(MARKER)).is_some_and(|marker| {
-                    marker.identity == receipt.identity && marker.nonce == receipt.nonce
+                    marker.identity.same_record(&receipt.identity) && marker.nonce == receipt.nonce
                 })))
 }
 
@@ -2355,8 +2639,8 @@ fn recover_unstarted(
     }
     match std::fs::symlink_metadata(&pending.directory) {
         Ok(_) => {
-            if identity(&pending.directory).as_ref() != Some(&pending.identity)
-                || pending.identity.device != receipt.identity.device
+            if !identity(&pending.directory).is_some_and(|now| pending.identity.names(&now))
+                || !pending.identity.same_volume(&receipt.identity)
                 || std::fs::canonicalize(&pending.directory).ok().as_ref()
                     != Some(&pending.directory)
             {
@@ -2371,7 +2655,7 @@ fn recover_unstarted(
             drop(entries);
             if !fence.clear(&pending.directory, &pending.directory)
                 || !current(receipt)
-                || identity(&pending.directory).as_ref() != Some(&pending.identity)
+                || !identity(&pending.directory).is_some_and(|now| pending.identity.names(&now))
                 || std::fs::remove_dir(&pending.directory).is_err()
             {
                 return false;
@@ -2775,6 +3059,10 @@ fn reclaim_selected_on<'policy>(
             fence.note(&cache.root, super::KeepReason::PackageChanged);
             continue;
         }
+        // Under the gate held, a settled receipt with no volume UUID gains its folder's while this
+        // boot still numbers the volume as it was recorded (VOLUME-WITNESS), so a cache no build
+        // touched before a restart still binds after it ([`witness`]).
+        witness(home, &cache.receipt_path, &mut receipt);
         if let Some(mut pending) = receipt.pending.clone() {
             if !takes {
                 continue;
@@ -6051,6 +6339,7 @@ mod tests {
             LinkRefusal::Chain,
             LinkRefusal::OtherVolume,
             LinkRefusal::Foreign,
+            LinkRefusal::Renumbered,
             LinkRefusal::NotFolder,
             LinkRefusal::Unreachable,
             LinkRefusal::Changed,
@@ -6888,6 +7177,405 @@ mod tests {
         assert!(create_checked(&world.home, &world.target, &other).is_err());
         for path in [&directory, &gates] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// THE RECORD OF `world`'s TARGET, ITS RECEIPT AND ITS MARKER, AS KEEPING `identity`: as an
+    /// earlier boot, an older atpkg or another volume recorded it (VOLUME-IDENTITY). The marker is
+    /// written through the folder held, as atpkg writes one.
+    fn recorded_as(world: &World, identity: &Identity) {
+        let path = world.path();
+        let mut receipt = read(&path).unwrap();
+        receipt.identity = identity.clone();
+        write(&path, &receipt).unwrap();
+        let held = creation::pin(&world.target).unwrap();
+        let mut marker = retention::receipt_at(&held).unwrap();
+        marker.identity = identity.clone();
+        retention::write_marker(&held, &marker).unwrap();
+    }
+
+    /// The identity an earlier boot recorded of the folder read now as `now`: the same volume and
+    /// inode, the volume numbered otherwise, as a restart renumbers one. Only the tests that read
+    /// a volume's UUID (macOS) ask for one.
+    #[cfg(target_os = "macos")]
+    fn an_earlier_boots(now: &Identity) -> Identity {
+        Identity {
+            device: now.device.wrapping_add(1),
+            ..now.clone()
+        }
+    }
+
+    /// WHETHER A RECORD NAMES A FOLDER, AS [`Identity::names`] DECIDES IT (VOLUME-IDENTITY): a
+    /// record that keeps the volume's UUID names the same inode on the volume of that UUID
+    /// whatever its device number now (a), and nothing on another volume, its device number and
+    /// inode those recorded (b), nor on a volume that reads with no UUID now; nothing of another
+    /// inode (c); a record that keeps none names by its device number alone (d), and is witnessed
+    /// (gains the UUID, its device number and inode kept) only while that number still names it.
+    /// Two records name one folder by their UUIDs where both keep one, else by device number.
+    #[test]
+    fn a_record_names_a_folder_by_its_volumes_uuid_else_by_its_device_number() {
+        let (one, another) = ([7; 16], [8; 16]);
+        let at = |device, inode, volume| Identity {
+            device,
+            inode,
+            volume,
+        };
+        let recorded = at(16_777_233, 42, Some(one));
+        assert!(
+            recorded.names(&at(16_777_232, 42, Some(one))),
+            "(a) renumbered"
+        );
+        assert!(recorded.names(&at(16_777_233, 42, Some(one))));
+        assert!(!recorded.names(&at(16_777_233, 42, Some(another))), "(b)");
+        assert!(!recorded.names(&at(16_777_233, 42, None)), "no UUID now");
+        assert!(!recorded.names(&at(16_777_233, 43, Some(one))), "(c)");
+        let legacy = at(16_777_233, 42, None);
+        assert!(
+            legacy.names(&at(16_777_233, 42, Some(one))),
+            "(d) as before"
+        );
+        assert!(
+            !legacy.names(&at(16_777_232, 42, Some(one))),
+            "(d) renumbered"
+        );
+        assert!(!legacy.names(&at(16_777_233, 43, Some(one))));
+        assert_eq!(
+            legacy.witnessed(&at(16_777_233, 42, Some(one))),
+            Some(at(16_777_233, 42, Some(one)))
+        );
+        assert_eq!(legacy.witnessed(&at(16_777_232, 42, Some(one))), None);
+        assert_eq!(legacy.witnessed(&at(16_777_233, 42, None)), None);
+        assert_eq!(recorded.witnessed(&at(16_777_233, 42, Some(one))), None);
+        assert!(
+            legacy.same_record(&recorded),
+            "witnessed beside unwitnessed"
+        );
+        assert!(recorded.same_record(&at(16_777_232, 42, Some(one))));
+        assert!(!recorded.same_record(&at(16_777_233, 42, Some(another))));
+        assert!(!legacy.same_record(&at(16_777_232, 42, None)));
+        assert!(!legacy.same_record(&at(16_777_233, 43, None)));
+        // A record that keeps no UUID is written as an older atpkg wrote one, and reads back.
+        let bytes = aterm_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("volume"));
+        assert_eq!(aterm_json::from_slice::<Identity>(&bytes).unwrap(), legacy);
+        let bytes = aterm_json::to_vec(&recorded).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<Identity>(&bytes).unwrap(),
+            recorded
+        );
+    }
+
+    /// (a) A RECEIPT AN EARLIER BOOT RECORDED BINDS ITS FOLDER BY ITS VOLUME'S UUID: a build
+    /// records the volume's UUID beside the device number; recorded with the volume numbered
+    /// otherwise (as before a restart: the same UUID and inode, another device number), the cache
+    /// is still the registered root it was, its owner admitted with nothing written, another
+    /// owner recorded, the device number kept as recorded, and its marker binds it, read by its
+    /// path and through the folder held. Before receipts kept the UUID, this was the restart's
+    /// `the managed build cache's owner could not be recorded`, exit 75.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_receipt_an_earlier_boot_recorded_binds_its_folder_by_its_volumes_uuid() {
+        let world = World::new();
+        world.build();
+        let now = identity(&world.target).unwrap();
+        assert!(now.volume.is_some(), "the scratch volume has a UUID");
+        assert_eq!(read(&world.path()).unwrap().identity, now);
+        let earlier = an_earlier_boots(&now);
+        recorded_as(&world, &earlier);
+        assert!(same(&world.home, &read(&world.path()).unwrap()));
+        let index = receipts(&world.home);
+        assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+        assert_eq!(
+            receipts(&world.home),
+            index,
+            "an owner on record writes nothing"
+        );
+        let other = world.another_owner();
+        assert!(create_checked(&world.home, &world.target, &other).unwrap());
+        let receipt = read(&world.path()).unwrap();
+        assert_eq!(
+            receipt.identity, earlier,
+            "the device number stays as recorded"
+        );
+        assert_eq!(receipt.owners, [world.owner.clone(), other]);
+        assert!(
+            roots(&world.home)
+                .iter()
+                .any(|cache| cache.root == world.target)
+        );
+        assert_eq!(retention::kept_by(&world.target), None);
+        assert!(retention::allows_at(creation::pin(&world.target).unwrap()));
+    }
+
+    /// (b) A RECEIPT OF ANOTHER VOLUME BINDS NOTHING, THOUGH ITS DEVICE NUMBER AND INODE MATCH: a
+    /// record whose UUID is another volume's, with the device number and inode the folder reads
+    /// with now (another volume reusing that number, as a restart can leave it), names nothing
+    /// here: the producer is refused and nothing is written, it is no registered root, and its
+    /// marker binds nothing, so the ordinary cleaners keep the folder. MUTANT: with the UUID
+    /// dropped from [`Identity::names`] (the device number alone deciding), the producer is
+    /// admitted and this fails.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_receipt_of_another_volume_binds_nothing_though_its_device_number_and_inode_match() {
+        let world = World::new();
+        world.build();
+        let now = identity(&world.target).unwrap();
+        let mut volume = now.volume.unwrap();
+        volume[0] ^= 0xff;
+        let elsewhere = Identity {
+            volume: Some(volume),
+            ..now.clone()
+        };
+        assert_eq!((elsewhere.device, elsewhere.inode), (now.device, now.inode));
+        recorded_as(&world, &elsewhere);
+        assert!(!same(&world.home, &read(&world.path()).unwrap()));
+        let index = receipts(&world.home);
+        let refused = create_checked(&world.home, &world.target, &world.another_owner())
+            .expect_err("another volume's receipt admits no producer");
+        assert_eq!(
+            refused.to_string(),
+            "the managed build cache's owner could not be recorded"
+        );
+        assert_eq!(receipts(&world.home), index, "nothing is written");
+        assert!(
+            !roots(&world.home)
+                .iter()
+                .any(|cache| cache.root == world.target)
+        );
+        assert_eq!(
+            retention::kept_by(&world.target),
+            Some(world.target.as_path())
+        );
+        assert!(!retention::allows_at(creation::pin(&world.target).unwrap()));
+    }
+
+    /// (c) A FOLDER SWAPPED IN AT A RECEIPT'S PATH BINDS NOTHING: the cache moved aside and
+    /// another private folder made at its path, holding a copy of its marker: the same volume and
+    /// device number, another inode. The producer is refused, nothing is written, and the copied
+    /// marker binds nothing there, so the ordinary cleaners keep it; the cache moved aside binds
+    /// nothing either (its receipt names its path).
+    #[test]
+    fn a_folder_swapped_in_at_a_receipts_path_binds_nothing() {
+        let world = World::new();
+        world.build();
+        let receipt = read(&world.path()).unwrap();
+        let aside = world.home.join("aside.noindex");
+        std::fs::rename(&world.target, &aside).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&world.target)
+            .unwrap();
+        for name in [MARKER, "CACHEDIR.TAG"] {
+            std::fs::copy(aside.join(name), world.target.join(name)).unwrap();
+        }
+        let now = identity(&world.target).unwrap();
+        assert_eq!(
+            (now.device, &now.volume),
+            (receipt.identity.device, &receipt.identity.volume)
+        );
+        assert_ne!(now.inode, receipt.identity.inode);
+        assert!(!same(&world.home, &receipt));
+        let index = receipts(&world.home);
+        assert!(
+            create_checked(&world.home, &world.target, &world.another_owner()).is_err(),
+            "a swapped folder admits no producer"
+        );
+        assert_eq!(receipts(&world.home), index, "nothing is written");
+        assert_eq!(
+            retention::kept_by(&world.target),
+            Some(world.target.as_path())
+        );
+        assert!(
+            !roots(&world.home)
+                .iter()
+                .any(|cache| cache.root == world.target)
+        );
+    }
+
+    /// (d) A RECEIPT AN OLDER ATPKG WROTE (NO VOLUME UUID) IS WITNESSED WHILE THIS BOOT NUMBERS ITS
+    /// VOLUME AS IT WAS RECORDED: it reads back as written; its owner's next build is admitted,
+    /// and the receipt and its marker gain the volume's UUID, the device number and inode they
+    /// recorded kept; so once a restart renumbers the volume the cache still binds, and the next
+    /// build is admitted. NEGATIVE CONTROL: without the witness, the renumbered receipt is refused
+    /// as [`renumbered`].
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_receipt_an_older_atpkg_wrote_is_witnessed_while_its_volume_is_numbered_alike() {
+        let world = World::new();
+        world.build();
+        let now = identity(&world.target).unwrap();
+        let legacy = Identity::unrecorded(now.device, now.inode);
+        recorded_as(&world, &legacy);
+        assert!(!String::from_utf8_lossy(&std::fs::read(world.path()).unwrap()).contains("volume"));
+        assert!(same(&world.home, &read(&world.path()).unwrap()));
+        assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+        assert_eq!(read(&world.path()).unwrap().identity, now, "the receipt");
+        let marker = retention::receipt_at(creation::pin(&world.target).unwrap()).unwrap();
+        assert_eq!(marker.identity, now, "the marker");
+        recorded_as(&world, &an_earlier_boots(&now));
+        assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+        assert!(create_checked(&world.home, &world.target, &world.another_owner()).unwrap());
+    }
+
+    /// (d) A RECEIPT AN OLDER ATPKG WROTE ON A VOLUME A RESTART HAS RENUMBERED SINCE STAYS REFUSED,
+    /// AND SAYS WHAT TO DO: its folder stands at its path with the inode it recorded and the
+    /// marker that binds it, but nothing it recorded proves the volume the one it was written on,
+    /// so it is never witnessed: the producer is refused naming the cache, both device numbers
+    /// and the remedy; nothing is written, and the ordinary cleaners keep the folder. Once the
+    /// person removes it, as the words say, the next build makes it again.
+    #[test]
+    fn a_receipt_an_older_atpkg_wrote_on_a_renumbered_volume_stays_refused_and_says_what_to_do() {
+        let world = World::new();
+        world.build();
+        let now = identity(&world.target).unwrap();
+        let legacy = Identity::unrecorded(now.device.wrapping_add(1), now.inode);
+        recorded_as(&world, &legacy);
+        let receipt = read(&world.path()).unwrap();
+        assert_eq!(renumbered(&world.home, &receipt), Some(now.device));
+        let index = receipts(&world.home);
+        for owner in [world.owner.clone(), world.another_owner()] {
+            let refused = create_checked(&world.home, &world.target, &owner)
+                .expect_err("a renumbered receipt that keeps no UUID admits no producer");
+            let words = refused.to_string();
+            assert_eq!(words, renumbered_words(&receipt, now.device));
+            for part in [
+                format!(
+                    "{} was recorded on device {}",
+                    world.target.display(),
+                    legacy.device
+                ),
+                format!("reads as device {} now", now.device),
+                format!("remove {}", world.target.display()),
+                "or build into another target directory".to_owned(),
+            ] {
+                assert!(words.contains(&part), "{words}: {part}");
+            }
+        }
+        assert_eq!(
+            receipts(&world.home),
+            index,
+            "nothing is written or witnessed"
+        );
+        assert_eq!(
+            retention::kept_by(&world.target),
+            Some(world.target.as_path())
+        );
+        std::fs::remove_dir_all(&world.target).unwrap();
+        assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+        assert!(same(&world.home, &read(&world.path()).unwrap()));
+    }
+
+    /// THE RECLAIM PASS WITNESSES A RECEIPT NO BUILD TOUCHED: a receipt an older atpkg wrote, its
+    /// volume numbered as recorded, gains its UUID in a pass that removes nothing (its owner
+    /// stands and it is fresh), so the cache binds after a restart though no build ran before it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_reclaim_pass_witnesses_a_receipt_no_build_touched() {
+        let world = World::new();
+        world.build();
+        let now = identity(&world.target).unwrap();
+        recorded_as(&world, &Identity::unrecorded(now.device, now.inode));
+        let removed = reclaim(
+            &world.home,
+            SystemTime::now(),
+            super::super::ReclaimAfter::CALM,
+            None,
+            &mut |_, _| true,
+        );
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(read(&world.path()).unwrap().identity, now);
+        recorded_as(&world, &an_earlier_boots(&now));
+        assert!(create_checked(&world.home, &world.target, &world.another_owner()).unwrap());
+    }
+
+    /// A RETIREMENT STAGED IN AN EARLIER BOOT IS FINISHED, AND ONE WHOSE STAGE IS ANOTHER VOLUME'S
+    /// STAYS: the receipt, its marker and its pending stage recorded with the volume numbered
+    /// otherwise (the same UUIDs and inodes), the next pass removes the staged cache and its
+    /// stage by their recorded identities, read through the folders held. NEGATIVE CONTROL: the
+    /// stage recorded with another volume's UUID is no stage of this receipt's, and stays whole.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_retirement_staged_in_an_earlier_boot_finishes_and_another_volumes_stays() {
+        for elsewhere in [false, true] {
+            let world = World::new();
+            world.build();
+            let root = an_earlier_boots(&identity(&world.target).unwrap());
+            recorded_as(&world, &root);
+            let stage = world.home.join("interrupted-retirement.noindex");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&stage)
+                .unwrap();
+            let mut staged = an_earlier_boots(&identity(&stage).unwrap());
+            if elsewhere {
+                staged.volume.as_mut().unwrap()[0] ^= 0xff;
+            }
+            let mut receipt = read(&world.path()).unwrap();
+            receipt.pending = Some(Pending {
+                directory: stage.clone(),
+                identity: staged,
+                authorized: false,
+            });
+            write(&world.path(), &receipt).unwrap();
+            std::fs::rename(&world.target, stage.join(PAYLOAD)).unwrap();
+            assert_eq!(
+                pending_owned(&world.home, &receipt, receipt.pending.as_ref().unwrap()),
+                !elsewhere
+            );
+            let removed = reclaim(
+                &world.home,
+                world.later(),
+                super::super::ReclaimAfter::CALM,
+                None,
+                &mut |_, _| true,
+            );
+            if elsewhere {
+                assert!(removed.is_empty(), "{removed:?}");
+                assert!(stage.join(PAYLOAD).join("debug/deps/keep").is_file());
+                assert!(read(&world.path()).unwrap().pending.is_some());
+            } else {
+                assert_eq!(removed.len(), 1, "{removed:?}");
+                assert!(!stage.exists());
+            }
+        }
+    }
+
+    /// A LINK TO A CACHE AN OLDER ATPKG RECORDED ON A VOLUME RENUMBERED SINCE IS REFUSED IN ITS
+    /// OWN WORDS ([`LinkRefusal::Renumbered`]), with nothing written; NEGATIVE CONTROL: with the
+    /// device number its volume has now, the same link is owned.
+    #[test]
+    fn a_link_to_a_cache_recorded_on_a_renumbered_volume_says_so() {
+        for renumbered in [true, false] {
+            let world = World::new();
+            world.build();
+            let now = identity(&world.target).unwrap();
+            let device = now.device.wrapping_add(u64::from(renumbered));
+            recorded_as(&world, &Identity::unrecorded(device, now.inode));
+            let link = world.home.join("target");
+            std::os::unix::fs::symlink("outputs.noindex", &link).unwrap();
+            let other = world.another_owner();
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&other),
+                env: &|_| None,
+                read: &|_| Ok(None),
+                writable: &|_| Some(true),
+            };
+            let index = receipts(&world.home);
+            let observed = observe(
+                &build_into(&other, &link),
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+            )
+            .unwrap();
+            if renumbered {
+                assert_eq!(observed, Observation::Refused(LinkRefusal::Renumbered));
+                assert_eq!(receipts(&world.home), index);
+            } else {
+                assert_eq!(observed, Observation::Owned);
+            }
         }
     }
 }

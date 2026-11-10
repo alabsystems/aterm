@@ -5179,6 +5179,9 @@ impl WorkerIdle {
             },
         };
         let mode = self.switches.pool_controls(accounts::Cli::Kimi).mode;
+        // The plan is the observed account's, as the look, the hold and the sighting are
+        // (`docs/DESIGN-account-discovery-2026-11-09.md`).
+        let seen = scoped_kimi_seen(&args, &seat.home);
         let plan = accounts_pool::session_login_plan(
             &pool_seat,
             &accounts_pool::Session {
@@ -5186,6 +5189,7 @@ impl WorkerIdle {
                 sid: &self.sid,
                 supervisor: accounts::Supervisor::Aterm,
                 env: &pairs,
+                seen: &seen,
                 sample: None,
                 point: at,
                 mode,
@@ -5289,7 +5293,7 @@ impl WorkerIdle {
             now: seat.now,
         };
         let roster = pool_seat.bound_roster(cli).ok()?;
-        let (look, env) = self.pool_account_look(cli, &roster)?;
+        let (look, env) = self.pool_account_look(cli, &roster, &seat.home)?;
         let seen = self.lost_seen(&look, point, seat.now)?;
         let at = pool_point(&seat, cli, &look, point, seen);
         let snap = &look.snap;
@@ -5319,6 +5323,7 @@ impl WorkerIdle {
                 sid: &self.sid,
                 supervisor,
                 env: &pairs,
+                seen: &look.seen,
                 sample,
                 point: at,
                 mode: self.switches.pool_controls(cli).mode,
@@ -5338,6 +5343,11 @@ impl WorkerIdle {
                 look.note_pool_session(&self.kept, note);
             },
         );
+        let state = pool_seat
+            .store(cli)
+            .load(seat.now)
+            .ok()
+            .map(|(state, _)| state);
         if let accounts::Advice::Move { to, yields, .. } = planned.advice() {
             aterm_log::info!("harness @{}: account advice: move to {to}", self.sid);
             let clock = Instant::now();
@@ -5356,7 +5366,7 @@ impl WorkerIdle {
             self.agent.name(),
             planned.advice().as_str()
         );
-        let (state, _) = pool_seat.store(cli).load(seat.now).ok()?;
+        let state = state?;
         let enrolled = accounts::enrolled_for(cli, &roster);
         let opening = accounts::next_opening(&roster, &state, &enrolled, seat.now);
         account_advice_of(
@@ -5397,6 +5407,24 @@ impl WorkerIdle {
         self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
             .then_some(key)
     }
+}
+
+/// What the login file of a scoped Kimi Code process says it runs on ([`observe::kimi`]), read
+/// by the argv and exec environment `args` its plan is made from, in the user home `home`.
+fn scoped_kimi_seen(args: &atpkg::caller_shell::ProcArgs, home: &Path) -> Observation {
+    let who = accounts::ProcessLogin::of_env_for(
+        accounts::Cli::Kimi,
+        args.env.iter().filter_map(|entry| entry.split_once('=')),
+    );
+    observe::kimi(
+        &observe::Process {
+            argv: &args.argv,
+            env: &args.env,
+            cwd: None,
+        },
+        home,
+        &who,
+    )
 }
 
 /// A tab as the login latch names it to the other tabs (`@<sid>`, the name `aterm ctl` addresses it by).
@@ -6711,6 +6739,21 @@ impl IdleHost for WorkerIdle {
         Some(to)
     }
 
+    /// What the session's own login file says it runs on, sighted at a turn-end point
+    /// ([`IdleHost::account_seen`]): a Codex, agy, Grok Build or Kimi Code session's against its
+    /// pool's roster ([`Self::note_pool_sighting`]), a Muse Code session's alone
+    /// ([`Self::note_muse_sighting`]). Claude Code's is made where its account is noted
+    /// ([`Self::account_note`]).
+    fn account_seen(&self) {
+        match self.agent {
+            Program::Codex | Program::Agy | Program::Grok | Program::Kimi => {
+                self.note_pool_sighting();
+            }
+            Program::Muse => self.note_muse_sighting(),
+            Program::Claude | Program::Generic => {}
+        }
+    }
+
     fn account_execution_hold(&self) -> Option<Instant> {
         use aterm_agent::harness::account_progress::{
             EXECUTION_CONTEXT_UNREAD_FINDING, EXECUTION_PREPARED_FINDING,
@@ -6766,7 +6809,7 @@ impl IdleHost for WorkerIdle {
                         return wait();
                     }
                 };
-                let Some((look, _)) = self.pool_account_look(cli, &roster) else {
+                let Some((look, _)) = self.pool_account_look(cli, &roster, &seat.home) else {
                     return wait();
                 };
                 (roster, look, pool.store(cli))
@@ -9000,11 +9043,13 @@ impl WorkerIdle {
     }
 
     /// What a non-Claude pooled CLI's own process environment says of its login, without reading
-    /// Claude Code's settings chain.
+    /// Claude Code's settings chain, and what its own login file in the user home `home` says
+    /// it runs on ([`observe::pooled`]), read afresh on every look.
     fn pool_account_look(
         &self,
         cli: accounts::Cli,
         roster: &accounts::Roster,
+        home: &Path,
     ) -> Option<(AccountLook, Vec<String>)> {
         let (snap, generation) = with_kept_of(&self.kept, |k| {
             Some((k.snapshot.clone()?, Arc::clone(&k.account.landing)))
@@ -9015,7 +9060,21 @@ impl WorkerIdle {
         }
         let who =
             accounts::ProcessLogin::of_env_for(cli, env.iter().filter_map(|kv| kv.split_once('=')));
-        let label = who.me(roster).label().map(str::to_owned);
+        let seen = observe::pooled(
+            cli,
+            &observe::Process {
+                argv: &snap.argv,
+                env: &env,
+                cwd: Some(Path::new(&snap.cwd)),
+            },
+            home,
+            &who,
+            Some(roster),
+        );
+        // The account it runs on is the observed one (`docs/DESIGN-account-discovery-2026-11-09.md`).
+        let label = accounts::observed_me(roster, &who, &seen)
+            .label()
+            .map(str::to_owned);
         Some((
             AccountLook {
                 who,
@@ -9024,7 +9083,7 @@ impl WorkerIdle {
                 snap,
                 generation,
                 profile_env: Vec::new(),
-                seen: Observation::Unread,
+                seen,
             },
             env,
         ))
@@ -9300,7 +9359,7 @@ impl WorkerIdle {
         look: &AccountLook,
         state: &accounts::State,
     ) {
-        self.note_sighting(seat, roster, look, state);
+        self.note_sighting(seat, roster, look, &state.machine);
         let Some(label) = look.judged(roster) else {
             return;
         };
@@ -9352,12 +9411,12 @@ impl WorkerIdle {
         seat: &AccountSeat,
         roster: &accounts::Roster,
         look: &AccountLook,
-        state: &accounts::State,
+        machine: &str,
     ) {
         if look.seen.seen().is_none() {
             return;
         }
-        let tab = journal::Tab::of(&state.machine, &self.sid);
+        let tab = journal::Tab::of(machine, &self.sid);
         let harness = accounts::Cli::of(self.agent).map_or("claude", accounts::Cli::id);
         let sighted = with_kept_of(&self.kept, |k| {
             observe::sighting(
@@ -9384,6 +9443,82 @@ impl WorkerIdle {
                 accounts::judged_label(roster, &look.who).unwrap_or("default row")
             );
         }
+        journal::publish(&sighted.notes);
+        if let Some(login) = &sighted.login {
+            journal::observed(login);
+        }
+    }
+
+    /// A pooled session's sighting other than Claude Code's ([`Self::note_sighting`]), read
+    /// against its own pool's roster and named with that pool's machine id. No switch gates it
+    /// and no supervisor: a session that answers its own walls, as a codex-alab does, runs on an
+    /// account all the same. An unreadable roster or store leaves it for the next point, since
+    /// the belief it is reconciled with is then unknown.
+    fn note_pool_sighting(&self) {
+        let Some(cli) = accounts::Cli::of(self.agent) else {
+            return;
+        };
+        let Some(seat) = (self.hooks.acts.account_seat)() else {
+            return;
+        };
+        let Some(config_dir) = seat.roster.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let pool_seat = accounts_pool::Seat {
+            config_dir,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
+        };
+        let Ok(roster) = pool_seat.bound_roster(cli) else {
+            return;
+        };
+        let Some((look, _)) = self.pool_account_look(cli, &roster, &seat.home) else {
+            return;
+        };
+        if look.seen.seen().is_none() {
+            return;
+        }
+        let Ok((state, _)) = pool_seat.store(cli).load(seat.now) else {
+            return;
+        };
+        self.note_sighting(&seat, &roster, &look, &state.machine);
+    }
+
+    /// A Muse Code session's sighting ([`observe::sighting_unpooled`]): Muse keeps no pool and
+    /// no roster, so the login its own `auth.json` names is its account, told to the journal
+    /// and the registry when due. The tab is named with the machine id Claude Code's store
+    /// holds, read without writing one.
+    fn note_muse_sighting(&self) {
+        let Some(seat) = (self.hooks.acts.account_seat)() else {
+            return;
+        };
+        let Some(snap) = with_kept_of(&self.kept, |k| k.snapshot.clone()) else {
+            return;
+        };
+        let Some(env) = (self.hooks.acts.account_env)(&snap) else {
+            return;
+        };
+        let seen = observe::muse(
+            &observe::Process {
+                argv: &snap.argv,
+                env: &env,
+                cwd: Some(Path::new(&snap.cwd)),
+            },
+            &seat.home,
+        );
+        if seen.seen().is_none() {
+            return;
+        }
+        let machine = seat
+            .claude_store()
+            .read_account_records(None, seat.now)
+            .map(|records| records.state.machine)
+            .unwrap_or_default();
+        let tab = journal::Tab::of(&machine, &self.sid);
+        let sighted = with_kept_of(&self.kept, |k| {
+            observe::sighting_unpooled(&seen, &mut k.account.sighted, tab, "muse", seat.now)
+        });
         journal::publish(&sighted.notes);
         if let Some(login) = &sighted.login {
             journal::observed(login);
@@ -11380,21 +11515,38 @@ fn forget_snapshot(job: &WorkerJob, hooks: &Hooks) {
     tell_published(&job.sid, moved, hooks);
 }
 
-/// The session's agent left and nothing brings it back, so the accounts recorder forgets the session ([`Acts::account_gone`]).
+/// The session's agent left and nothing brings it back, so its sightings end
+/// ([`observe::Sightings::end`]) and, where the host records its accounts ([`accounts_for`]),
+/// the accounts recorder forgets the session ([`Acts::account_gone`]).
 fn account_gone(job: &WorkerJob, hooks: &Hooks) {
-    if accounts_for(job.agent) {
-        let mut sighted = with_kept(job, |k| std::mem::take(&mut k.account).sighted);
-        // The journal hears the end of what the tab was seen running: a session it opened on
-        // an account no row lists, and the registry's count of this Mac's tabs on its login.
-        if let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) {
-            let ended = sighted.end(now);
-            journal::publish(&ended.notes);
-            if let Some(login) = &ended.login {
-                journal::observed(login);
-            }
+    let mut sighted = account_left(&job.kept, job.agent);
+    // The journal hears the end of what the tab was seen running: a session it opened on
+    // an account no row lists, and the registry's count of this Mac's tabs on its login.
+    if let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) {
+        let ended = sighted.end(now);
+        journal::publish(&ended.notes);
+        if let Some(login) = &ended.login {
+            journal::observed(login);
         }
+    }
+    if accounts_for(job.agent) {
         (hooks.acts.account_gone)(&job.sid);
     }
+}
+
+/// What `kept` held of the sightings of an `agent` that left for good, taken from it: every
+/// program's end with its agent, whichever flow records its accounts, so the next agent in the
+/// tab starts with none of them (no session open on the last one's account, no disagreement
+/// already noted). Where the host records the program's accounts ([`accounts_for`]) the rest
+/// of what it kept of them goes too.
+fn account_left(kept: &Mutex<Kept>, agent: Program) -> observe::Sightings {
+    with_kept_of(kept, |k| {
+        if accounts_for(agent) {
+            std::mem::take(&mut k.account).sighted
+        } else {
+            std::mem::take(&mut k.account.sighted)
+        }
+    })
 }
 
 /// The agent is gone for good, as its task record hears it.
@@ -23798,7 +23950,7 @@ struct AccountLook {
     /// Only the profile selectors from the same process environment as `who`.
     profile_env: Vec<String>,
     /// What the process's login file says it runs on, read when `who` was
-    /// ([`observe::claude`]); unread for another CLI until its observer lands.
+    /// ([`observe::claude`], [`observe::pooled`]).
     seen: Observation,
 }
 

@@ -91,12 +91,13 @@ impl Offs {
                 v: Vec::new(),
             };
         }
-        if hi - lo > u64::from(u32::MAX) {
-            let mut v = Vec::with_capacity(n);
+        let cap = if n <= 65_536 { n } else { 0 };
+        if hi.saturating_sub(lo) > u64::from(u32::MAX) {
+            let mut v = Vec::with_capacity(cap);
             v.extend(all);
             return Offs::Wide(v);
         }
-        let mut v = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(cap);
         for o in all {
             v.push(Offs::narrow(lo, o));
         }
@@ -122,7 +123,12 @@ impl Offs {
 
     /// Every offset, in seq order.
     fn to_vec(&self) -> Vec<u64> {
-        let mut out = Vec::with_capacity(self.len());
+        let len = self.len();
+        let mut out = if len <= 65_536 {
+            Vec::with_capacity(len)
+        } else {
+            Vec::new()
+        };
         for j in 0..self.len() {
             if let Some(o) = self.get(j) {
                 out.push(o);
@@ -147,13 +153,18 @@ impl Offs {
             lo = lo.min(o);
             hi = hi.max(o);
         }
-        if hi - lo <= u64::from(u32::MAX) {
+        if hi.saturating_sub(lo) <= u64::from(u32::MAX) {
             let old = *base;
-            let mut moved = Vec::with_capacity(v.capacity());
+            let cap = v.capacity();
+            let mut moved = if cap <= 65_536 {
+                Vec::with_capacity(cap)
+            } else {
+                Vec::new()
+            };
             for &d in v.iter() {
                 // In range: `old + d` lies in `lo..=hi`, a span that fits a `u32`.
                 let o = old.saturating_add(u64::from(d));
-                moved.push(u32::try_from(o - lo).unwrap_or(u32::MAX));
+                moved.push(u32::try_from(o.saturating_sub(lo)).unwrap_or(u32::MAX));
             }
             *self = Offs::Narrow { base: lo, v: moved };
         } else {
@@ -171,8 +182,8 @@ impl Offs {
         #[cfg(test)]
         tally::moved(self.len().saturating_sub(j));
         match self {
-            Offs::Narrow { base, v } => v.insert(j, Offs::narrow(*base, off)),
-            Offs::Wide(v) => v.insert(j, off),
+            Offs::Narrow { base, v } => vec_insert_at(v, j, Offs::narrow(*base, off)),
+            Offs::Wide(v) => vec_insert_at(v, j, off),
         }
     }
 
@@ -196,8 +207,8 @@ impl Offs {
     #[cfg(any(test, feature = "retention"))]
     fn drain_front(&mut self, k: usize) {
         match self {
-            Offs::Narrow { v, .. } => drop(v.drain(..k.min(v.len()))),
-            Offs::Wide(v) => drop(v.drain(..k.min(v.len()))),
+            Offs::Narrow { v, .. } => vec_drop_prefix(v, k),
+            Offs::Wide(v) => vec_drop_prefix(v, k),
         }
     }
 
@@ -260,6 +271,64 @@ struct Chunk {
     first: u64,
 }
 
+fn vec_insert_at<T>(v: &mut Vec<T>, idx: usize, val: T) {
+    let at = idx.min(v.len());
+    v.push(val);
+    let mut cur = v.len().saturating_sub(1);
+    while cur > at {
+        let prev = cur.saturating_sub(1);
+        if let Some(pair) = v.get_mut(prev..=cur) {
+            if let Some((first, rest)) = pair.split_first_mut() {
+                if let Some(second) = rest.last_mut() {
+                    std::mem::swap(first, second);
+                }
+            }
+        }
+        cur = prev;
+    }
+}
+
+fn vec_remove_at<T>(v: &mut Vec<T>, idx: usize) -> Option<T> {
+    if idx >= v.len() {
+        return None;
+    }
+    let last_idx = v.len().saturating_sub(1);
+    let mut cur = idx;
+    while cur < last_idx {
+        let next = cur.saturating_add(1);
+        if let Some(pair) = v.get_mut(cur..=next) {
+            if let Some((first, rest)) = pair.split_first_mut() {
+                if let Some(second) = rest.last_mut() {
+                    std::mem::swap(first, second);
+                }
+            }
+        }
+        cur = next;
+    }
+    v.pop()
+}
+
+#[cfg(any(test, feature = "retention"))]
+fn vec_drop_prefix<T>(v: &mut Vec<T>, k: usize) {
+    let len = v.len();
+    let drop_n = k.min(len);
+    if drop_n == 0 {
+        return;
+    }
+    let keep = len.saturating_sub(drop_n);
+    for idx in 0..keep {
+        let src = idx.saturating_add(drop_n);
+        if let Some(sub) = v.get_mut(idx..=src) {
+            if let Some((first, rest)) = sub.split_first_mut() {
+                if let Some(end) = rest.last_mut() {
+                    std::mem::swap(first, end);
+                }
+            }
+        }
+    }
+    v.truncate(keep);
+}
+
 impl Chunk {
     /// The chunk holding `pairs`, `(seq, offset)` sorted by seq and distinct, at capacity.
     fn of(pairs: &[(u64, u64)]) -> Chunk {
@@ -271,7 +340,12 @@ impl Chunk {
             }
             prev = Some(seq);
         }
-        let mut runs = Vec::with_capacity(n_runs);
+        let cap = n_runs;
+        let mut runs = if cap <= 65_536 {
+            Vec::with_capacity(cap)
+        } else {
+            Vec::new()
+        };
         prev = None;
         for (at, &(seq0, _)) in pairs.iter().enumerate() {
             if !follows(prev, seq0) {
@@ -335,7 +409,7 @@ impl Chunk {
             .partition_point(|r| r.seq0 <= seq)
             .checked_sub(1)?;
         let run = self.runs.get(i)?;
-        let k = usize::try_from(seq - run.seq0).ok()?;
+        let k = usize::try_from(seq.checked_sub(run.seq0)?).ok()?;
         let j = run.at.checked_add(k)?;
         if j < self.run_end(i) {
             Some(j)
@@ -410,7 +484,7 @@ impl Chunk {
         match (extends, starts_next) {
             (true, true) => {
                 // The run before now runs into the one after: they are one run.
-                self.runs.remove(i);
+                let _ = vec_remove_at(&mut self.runs, i);
                 self.shift_from(i);
             }
             (true, false) => self.shift_from(i),
@@ -421,7 +495,7 @@ impl Chunk {
                 self.shift_from(i.saturating_add(1));
             }
             (false, false) => {
-                self.runs.insert(i, Run { seq0: seq, at: j });
+                vec_insert_at(&mut self.runs, i, Run { seq0: seq, at: j });
                 self.shift_from(i.saturating_add(1));
             }
         }
@@ -438,7 +512,7 @@ impl Chunk {
                 let Some(o) = self.offs.get(j) else {
                     return false;
                 };
-                if !f(run.seq0.saturating_add((j - run.at) as u64), o) {
+                if !f(run.seq0.saturating_add(j.saturating_sub(run.at) as u64), o) {
                     return false;
                 }
             }
@@ -448,7 +522,12 @@ impl Chunk {
 
     /// Every `(seq, offset)` held, in seq order.
     fn pairs(&self) -> Vec<(u64, u64)> {
-        let mut out = Vec::with_capacity(self.len());
+        let len = self.len();
+        let mut out = if len <= 65_536 {
+            Vec::with_capacity(len)
+        } else {
+            Vec::new()
+        };
         self.each(|seq, o| {
             out.push((seq, o));
             true
@@ -459,7 +538,12 @@ impl Chunk {
     /// Take in `from`'s keys, every one of which lies above this chunk's.
     #[cfg(any(test, feature = "retention"))]
     fn absorb(&mut self, from: &Chunk) {
-        let mut pairs = Vec::with_capacity(self.len().saturating_add(from.len()));
+        let cap = self.len().saturating_add(from.len());
+        let mut pairs = if cap <= 65_536 {
+            Vec::with_capacity(cap)
+        } else {
+            Vec::new()
+        };
         for c in [&*self, from] {
             c.each(|seq, o| {
                 pairs.push((seq, o));
@@ -493,15 +577,15 @@ impl Chunk {
             }
             // The run holding entry `k` becomes the first; the ones wholly below go.
             let first = self.runs.partition_point(|r| r.at <= k).saturating_sub(1);
-            self.runs.drain(..first.min(self.runs.len()));
+            vec_drop_prefix(&mut self.runs, first);
             if k == n {
                 self.runs.clear();
             } else if let Some(run) = self.runs.first_mut() {
-                run.seq0 = run.seq0.saturating_add((k - run.at) as u64);
+                run.seq0 = run.seq0.saturating_add(k.saturating_sub(run.at) as u64);
                 run.at = k;
             }
             for r in &mut self.runs {
-                r.at -= k;
+                r.at = r.at.saturating_sub(k);
             }
             self.offs.drain_front(k);
             self.refirst();
@@ -519,7 +603,12 @@ impl Chunk {
         if gone == 0 {
             return 0;
         }
-        let mut kept = Vec::with_capacity(n - gone);
+        let rem = n.saturating_sub(gone);
+        let mut kept = if rem <= 65_536 {
+            Vec::with_capacity(rem)
+        } else {
+            Vec::new()
+        };
         self.each(|seq, o| {
             if !cut(o) {
                 kept.push((seq, o));
@@ -618,7 +707,7 @@ impl Packed {
         *c = Chunk::of(lo);
         #[cfg(test)]
         tally::moved(pairs.len() + self.chunks.len().saturating_sub(i));
-        self.chunks.insert(i.saturating_add(1), Chunk::of(hi));
+        vec_insert_at(&mut self.chunks, i.saturating_add(1), Chunk::of(hi));
         let into = if upper_first.is_some_and(|f| seq > f) {
             i.saturating_add(1)
         } else {
@@ -634,7 +723,12 @@ impl Packed {
     fn open(&mut self, i: usize, seq: u64, off: u64) {
         #[cfg(test)]
         tally::moved(self.chunks.len().saturating_sub(i));
-        self.chunks.insert(i, Chunk::of(&[(seq, off)]));
+        let chunk = Chunk::of(&[(seq, off)]);
+        if i <= self.chunks.len() {
+            vec_insert_at(&mut self.chunks, i, chunk);
+        } else {
+            self.chunks.push(chunk);
+        }
     }
 
     /// Drop every key whose offset lies below `min`; how many were dropped. Emptied chunks
@@ -652,7 +746,8 @@ impl Packed {
         let half = chunk_cap() / 2;
         // In place: `..w` are the chunks kept so far, `w..r` the emptied or absorbed.
         let mut w = 0usize;
-        for r in 0..self.chunks.len() {
+        let total = self.chunks.len();
+        for r in 0..total {
             let len = match self.chunks.get(r) {
                 Some(c) if c.len() > 0 => c.len(),
                 _ => continue,
@@ -662,13 +757,28 @@ impl Packed {
                 None => false,
             };
             if joins {
-                let (kept, rest) = self.chunks.split_at_mut(r);
-                if let (Some(into), Some(from)) = (kept.get_mut(w - 1), rest.first()) {
-                    into.absorb(from);
+                if let Some(prev_idx) = w.checked_sub(1) {
+                    if prev_idx < r {
+                        if let Some(sub) = self.chunks.get_mut(prev_idx..=r) {
+                            if let Some((into, rest)) = sub.split_first_mut() {
+                                if let Some(from) = rest.last() {
+                                    into.absorb(from);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
-                self.chunks.swap(w, r);
-                w += 1;
+                if w < r {
+                    if let Some(sub) = self.chunks.get_mut(w..=r) {
+                        if let Some((first, rest)) = sub.split_first_mut() {
+                            if let Some(end) = rest.last_mut() {
+                                std::mem::swap(first, end);
+                            }
+                        }
+                    }
+                }
+                w = w.saturating_add(1);
             }
         }
         self.chunks.truncate(w);
@@ -799,7 +909,7 @@ impl DedupIndex {
         let before = self.loose.len();
         self.loose
             .retain(|_, o| crate::store::dedup_retains_from_cut(*o, min));
-        dropped = dropped.saturating_add(before - self.loose.len());
+        dropped = dropped.saturating_add(before.saturating_sub(self.loose.len()));
         self.len = self.len.saturating_sub(dropped);
         if self.packed.capacity() > 64 && self.packed.len() <= self.packed.capacity() / 4 {
             self.packed
@@ -825,6 +935,7 @@ impl DedupIndex {
 
     /// Call `f` with every held `(producer_id, producer_seq, offset)` while it answers
     /// true; whether it always did.
+    #[cfg(test)]
     fn each(&self, mut f: impl FnMut(u64, u64, u64) -> bool) -> bool {
         for (&pid, p) in &self.packed {
             for c in &p.chunks {
@@ -841,15 +952,30 @@ impl DedupIndex {
         true
     }
 
-    /// Call `f` with every held `(producer_id, producer_seq, offset)` below offset `min`.
+    /// Collect every held `(producer_id, producer_seq, offset)` below offset `min`.
     #[cfg(all(feature = "retention", feature = "relay"))]
-    pub(crate) fn each_below(&self, min: u64, mut f: impl FnMut(u64, u64, u64)) {
-        self.each(|producer_id, producer_seq, off| {
-            if !crate::store::dedup_retains_from_cut(off, min) {
-                f(producer_id, producer_seq, off);
+    pub(crate) fn keys_below(&self, min: u64) -> Vec<(u64, u64, u64)> {
+        let mut out = Vec::new();
+        for (&pid, p) in &self.packed {
+            for c in &p.chunks {
+                for (i, run) in c.runs.iter().enumerate() {
+                    for j in run.at..c.run_end(i) {
+                        if let Some(off) = c.offs.get(j) {
+                            if !crate::store::dedup_retains_from_cut(off, min) {
+                                let seq = run.seq0.saturating_add(j.saturating_sub(run.at) as u64);
+                                out.push((pid, seq, off));
+                            }
+                        }
+                    }
+                }
             }
-            true
-        });
+        }
+        for (&(pid, seq), &off) in &self.loose {
+            if !crate::store::dedup_retains_from_cut(off, min) {
+                out.push((pid, seq, off));
+            }
+        }
+        out
     }
 
     /// Every held key and its offset, sorted.
@@ -898,7 +1024,30 @@ impl PartialEq for DedupIndex {
     fn eq(&self, other: &DedupIndex) -> bool {
         // Keys are distinct in each, so equal counts and every key of one held in the other
         // at its offset make the sets equal.
-        self.len == other.len && self.each(|pid, seq, o| other.lookup(pid, seq) == Some(o))
+        if self.len != other.len {
+            return false;
+        }
+        for (&pid, p) in &self.packed {
+            for c in &p.chunks {
+                for (i, run) in c.runs.iter().enumerate() {
+                    for j in run.at..c.run_end(i) {
+                        let Some(o) = c.offs.get(j) else {
+                            return false;
+                        };
+                        let seq = run.seq0.saturating_add(j.saturating_sub(run.at) as u64);
+                        if other.lookup(pid, seq) != Some(o) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        for (&(pid, seq), &o) in &self.loose {
+            if other.lookup(pid, seq) != Some(o) {
+                return false;
+            }
+        }
+        true
     }
 }
 

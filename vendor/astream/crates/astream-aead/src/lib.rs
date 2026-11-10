@@ -94,6 +94,21 @@ pub use identity::{
     server_identity_handshake, IdentityKeypair, ID_PUB_LEN,
 };
 
+#[cfg(feature = "identity")]
+mod cert;
+#[cfg(all(feature = "identity", unix))]
+pub use cert::SshAgentServer;
+#[cfg(feature = "identity")]
+pub use cert::{
+    cert_epoch_advance, cert_horizon_reached, cert_validity_clamp, cert_wire_version_valid,
+    client_cert_handshake, decode_ssh_ed25519_key_blob, encode_ssh_ed25519_key_blob,
+    server_cert_handshake, ssh_agent_list_over, ssh_agent_sign_over, CertRole, CertTrustStore,
+    CertificateAuthority, HostCertRotator, IdentityCertificate, IdentitySigner, SharedCertTrust,
+    SshAgentSigner, VerifiedPeerCert, CERT_WIRE_MAGIC, CERT_WIRE_VERSION, MAX_CERT_ISSUER_LEN,
+    MAX_CERT_PRINCIPAL_LEN, MAX_CERT_REVOKED_SERIALS, MAX_CERT_VALIDITY_CAP_MS, MAX_CERT_WIRE_LEN,
+    MAX_TRUSTED_CAS, MIN_CERT_WIRE_LEN,
+};
+
 mod hchacha;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};

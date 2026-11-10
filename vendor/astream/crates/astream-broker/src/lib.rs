@@ -207,6 +207,17 @@ pub use tier::TierTally;
 #[cfg(feature = "cap")]
 pub use astream_cap::{mint, producer_id_of, Capability};
 
+#[cfg(all(feature = "identity", unix))]
+pub use astream_aead::SshAgentServer;
+/// External identity authority, CA certificate, rotation, trust-store, and `ssh-agent`
+/// types (Rung 9), re-exported so callers of [`Broker::serve_tcp_certified`] /
+/// [`Client::connect_tcp_certified`] can issue, rotate, and present certificates without
+/// depending on `astream-aead` directly.
+#[cfg(feature = "identity")]
+pub use astream_aead::{
+    CertRole, CertTrustStore, CertificateAuthority, HostCertRotator, IdentityCertificate,
+    IdentitySigner, SharedCertTrust, SshAgentSigner, VerifiedPeerCert,
+};
 /// Static public-key identity types (Rung 8), re-exported so callers of
 /// [`Broker::serve_tcp_identity`] / [`Client::connect_tcp_identity`] can build an
 /// identity without depending on `astream-aead` directly.

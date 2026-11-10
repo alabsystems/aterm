@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IOKit and CoreFoundation declarations for reading macOS GPU, Neural Engine, CPU and block-storage IORegistry entries, and the GPU's user clients.
+//! IOKit and CoreFoundation declarations for reading macOS GPU, Neural Engine, CPU and block-storage IORegistry entries, and the GPU's user clients; and for the machine's situation (`crate::situation`): the power sources (`IOKit/ps/IOPowerSources.h`), the notify tokens that say when they changed and the states `crate::notify` reads (`notify.h`), and the run loop on which the root domain's interest and the display matching notifications arrive.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 /// Zero-sized `#[repr(C)]` types that only sit behind a pointer
 /// CoreFoundation owns: never constructed, `!Send`, `!Sync`, `!Unpin`.
@@ -19,7 +19,10 @@ macro_rules! opaque {
         }
     )*};
 }
-opaque! { __CFAllocator, __CFArray, __CFBoolean, __CFData, __CFDictionary, __CFNumber, __CFString }
+opaque! {
+    __CFAllocator, __CFArray, __CFBoolean, __CFData, __CFDictionary, __CFNumber, __CFString,
+    __CFRunLoop, __CFRunLoopSource, IONotificationPort,
+}
 
 pub type CFIndex = isize;
 pub type CFTypeID = usize;
@@ -50,6 +53,36 @@ pub type io_iterator_t = io_object_t;
 pub type io_registry_entry_t = io_object_t;
 pub type io_service_t = io_object_t;
 pub type IOOptionBits = u32;
+pub type IONotificationPortRef = *mut IONotificationPort;
+/// Called on the thread whose run loop holds the notification port's source, with the
+/// message's type and argument.
+pub type IOServiceInterestCallback =
+    Option<unsafe extern "C" fn(*mut c_void, io_service_t, u32, *mut c_void)>;
+/// Called on the same thread with the iterator a matching notification armed: draining it
+/// arms it again. Apple silicon's display pipes alone are watched this way.
+#[cfg(target_arch = "aarch64")]
+pub type IOServiceMatchingCallback = Option<unsafe extern "C" fn(*mut c_void, io_iterator_t)>;
+
+pub type CFHashCode = usize;
+pub type CFTimeInterval = f64;
+pub type CFRunLoopRef = *mut __CFRunLoop;
+pub type CFRunLoopSourceRef = *mut __CFRunLoopSource;
+pub type CFRunLoopMode = CFStringRef;
+
+/// A version-0 run-loop source's context; CoreFoundation copies it at creation.
+#[repr(C)]
+pub struct CFRunLoopSourceContext {
+    pub version: CFIndex,
+    pub info: *mut c_void,
+    pub retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    pub release: Option<extern "C" fn(*const c_void)>,
+    pub copyDescription: Option<extern "C" fn(*const c_void) -> CFStringRef>,
+    pub equal: Option<extern "C" fn(*const c_void, *const c_void) -> Boolean>,
+    pub hash: Option<extern "C" fn(*const c_void) -> CFHashCode>,
+    pub schedule: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFRunLoopMode)>,
+    pub cancel: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFRunLoopMode)>,
+    pub perform: extern "C" fn(*mut c_void),
+}
 
 /// `mach/processor_info.h`: selectors and layout for online processor slots.
 pub const PROCESSOR_BASIC_INFO: i32 = 1;
@@ -134,6 +167,58 @@ unsafe extern "C" {
         allocator: CFAllocatorRef,
         options: IOOptionBits,
     ) -> CFTypeRef;
+    /// A notification port of the caller's (NULL when refused), destroyed by
+    /// `IONotificationPortDestroy`.
+    pub fn IONotificationPortCreate(mainPort: mach_port_t) -> IONotificationPortRef;
+    /// Borrowed (the Get rule): the port owns it.
+    pub fn IONotificationPortGetRunLoopSource(notify: IONotificationPortRef) -> CFRunLoopSourceRef;
+    pub fn IONotificationPortDestroy(notify: IONotificationPortRef);
+    /// `interestType` names the interest (`IOGeneralInterest`); on success `notification` is
+    /// the caller's (+1), released to end it.
+    pub fn IOServiceAddInterestNotification(
+        notifyPort: IONotificationPortRef,
+        service: io_service_t,
+        interestType: *const c_char,
+        callback: IOServiceInterestCallback,
+        refCon: *mut c_void,
+        notification: *mut io_object_t,
+    ) -> kern_return_t;
+    /// Consumes `matching`; on success `notification` is a +1 iterator over the services that
+    /// match now, which must be drained to arm it.
+    #[cfg(target_arch = "aarch64")]
+    pub fn IOServiceAddMatchingNotification(
+        notifyPort: IONotificationPortRef,
+        notificationType: *const c_char,
+        matching: CFDictionaryRef,
+        callback: IOServiceMatchingCallback,
+        refCon: *mut c_void,
+        notification: *mut io_iterator_t,
+    ) -> kern_return_t;
+    /// Public IOPowerSources.h: the power sources now, +1 (released by the caller), or NULL.
+    pub fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
+    /// The sources in `blob`, +1, or NULL.
+    pub fn IOPSCopyPowerSourcesList(blob: CFTypeRef) -> CFArrayRef;
+    /// Borrowed (the Get rule) while `blob` lives.
+    pub fn IOPSGetPowerSourceDescription(blob: CFTypeRef, ps: CFTypeRef) -> CFDictionaryRef;
+    /// What provides power now (`AC Power`, `Battery Power`, `UPS Power`), borrowed while
+    /// `snapshot` lives.
+    pub fn IOPSGetProvidingPowerSourceType(snapshot: CFTypeRef) -> CFStringRef;
+    /// The wall adapter's details (`Watts`), +1, or NULL where none is attached.
+    pub fn IOPSCopyExternalPowerAdapterDetails() -> CFDictionaryRef;
+}
+
+// notify(3), in libSystem: a check token reads whether a name was posted since the last check,
+// and wakes nothing.
+unsafe extern "C" {
+    /// Registers a check token for `name`; 0 on success.
+    pub fn notify_register_check(name: *const c_char, out_token: *mut c_int) -> u32;
+    /// Sets `check` non-zero when the name was posted since the last check (and on the first
+    /// check after registration); 0 on success.
+    pub fn notify_check(token: c_int, check: *mut c_int) -> u32;
+    /// The state last set for the token's name (`crate::notify`'s thermal pressure level); 0 on
+    /// success.
+    pub fn notify_get_state(token: c_int, state: *mut u64) -> u32;
+    pub fn notify_cancel(token: c_int) -> u32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -177,6 +262,31 @@ unsafe extern "C" {
     ) -> Boolean;
     pub fn CFDataGetLength(theData: CFDataRef) -> CFIndex;
     pub fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+    pub static kCFRunLoopDefaultMode: CFRunLoopMode;
+    /// The calling thread's run loop, made on first use; borrowed (the Get rule).
+    pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    pub fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+    pub fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+    /// Thread-safe: a source signalled before its run loop runs is handled at the next run.
+    pub fn CFRunLoopSourceCreate(
+        allocator: CFAllocatorRef,
+        order: CFIndex,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    pub fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
+    pub fn CFRunLoopSourceInvalidate(source: CFRunLoopSourceRef);
+    /// Wakes `rl` from its wait, from any thread.
+    pub fn CFRunLoopWakeUp(rl: CFRunLoopRef);
+    /// Ends the current run of `rl`; a stop while it is not running is lost.
+    pub fn CFRunLoopStop(rl: CFRunLoopRef);
+    pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    /// Runs the calling thread's run loop in `mode` for at most `seconds`; returns a
+    /// `CFRunLoopRunResult`.
+    pub fn CFRunLoopRunInMode(
+        mode: CFRunLoopMode,
+        seconds: CFTimeInterval,
+        returnAfterSourceHandled: Boolean,
+    ) -> i32;
 }
 
 // The calls a test makes to read a recorded registry entry (`ioreg -a`'s XML) back as the

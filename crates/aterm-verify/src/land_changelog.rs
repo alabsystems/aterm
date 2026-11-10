@@ -35,6 +35,23 @@
 //! of main's line next to it, an entry whose next non-blank line starts at the margin but opens
 //! nothing (a code fence), which leaves its end unclear, and two rewrites of one entry, main's
 //! and the branch's, which no rule here can choose between.
+//!
+//! A `### <kind>` subsection under `## [Unreleased]` that the landing adds whole beside main's file
+//! (its heading and every non-blank line of it), where the section holds another of that kind and
+//! more `### <kind>` headings than main's does, joins it ([`joinable`]): the first of the kind the
+//! landing does not add whole (main's), else the first. The lines it adds go to the top of that one
+//! where it sat above it, after its last line where it sat below, and its heading goes; a blank
+//! line main holds stays. Git's diff may give an added run any of the equal places where the lines
+//! around it repeat (one directly above a subsection of its kind takes the lower of two identical
+//! headings), so the run is read at the earliest ([`slid_up`]). `CHANGELOG.md` merges with git's
+//! union driver, which keeps both sides of a conflicting hunk, so a branch that reordered
+//! `[Unreleased]` while main wrote into it had its merge open a kind main's side already held,
+//! above or below main's (measured 2026-11-10 on 7d1464cf8bb, which landed `### Changed` twice),
+//! and a release ships the section as it stands. Only lines the landing adds move, so no line main
+//! holds is rewritten, and a release cut that lands mid-run strands the moved lines as any other
+//! added ones, for the rules above. A kind said twice by main's own lines, or by a second
+//! subsection the landing adds only in part, stays, as does a section holding an HTML comment or a
+//! code fence at the margin, where a `### ` line is not a heading.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -118,6 +135,9 @@ pub(super) struct Rehomed {
     /// Each entry dropped as words no commit of the branch wrote and main no longer holds, which
     /// a merge brought back, by its title.
     pub(super) revived: Vec<String>,
+    /// Each `### <kind>` the landing added under `## [Unreleased]` beside another of its kind,
+    /// with how many of its subsections joined that one ([`joinable`]), in file order.
+    pub(super) joined: Vec<(String, usize)>,
 }
 
 /// One entry of a changelog: a top-level `- ` line and its indented lines.
@@ -307,10 +327,11 @@ fn settled<'e, 'a>(
 /// commits): a surplus copy (one `text` holds more often than `main` does, another copy staying)
 /// and words neither `main` nor the branch wrote are dropped, and one the branch wrote under
 /// `## [Unreleased]` that sits under a release heading `main` holds and the changelog did not when
-/// the branch wrote it ([`Wrote::Unreleased`]) moves to the top of its `### <kind>` there. `None`
-/// where none is, or where `text` has no `## [Unreleased]` or holds a carriage return. A
-/// `### <kind>` heading under a released version that the same lines added, left with no entry,
-/// goes with them.
+/// the branch wrote it ([`Wrote::Unreleased`]) moves to the top of its `### <kind>` there; and a
+/// `### <kind>` subsection the landing adds whole under `## [Unreleased]` beside another of its
+/// kind joins that one ([`joinable`]). `None` where none is, or where `text` has no
+/// `## [Unreleased]` or holds a carriage return. A `### <kind>` heading under a released version
+/// that the same lines added, left with no entry, goes with them.
 pub(super) fn rehome(
     text: &str,
     added: &BTreeSet<usize>,
@@ -333,6 +354,7 @@ pub(super) fn rehome(
             .entry(words(&lines[entry.lines.clone()]))
             .or_insert(0_usize) += 1;
     }
+    let joins = joinable(&lines, added, main);
     let mut moved: Vec<(Option<&str>, std::ops::Range<usize>)> = Vec::new();
     let (mut dropped, mut revived) = (Vec::new(), Vec::new());
     for entry in settled(&entries, added) {
@@ -361,7 +383,7 @@ pub(super) fn rehome(
             }
         }
     }
-    if moved.is_empty() && dropped.is_empty() && revived.is_empty() {
+    if moved.is_empty() && dropped.is_empty() && revived.is_empty() && joins.is_empty() {
         return None;
     }
     let mut gone: BTreeSet<usize> = moved
@@ -375,6 +397,30 @@ pub(super) fn rehome(
         if added.contains(&heading) && emptied(&lines, heading, &gone) {
             gone.insert(heading);
         }
+    }
+    // A joined subsection gives up its heading and the lines the landing adds; the ones no other
+    // rule took join the subsection of their kind, a removal inside them leaving one blank line
+    // as below.
+    let mut join_blocks: Vec<(&str, bool, Vec<String>)> = Vec::new();
+    for join in &joins {
+        let mut block: Vec<String> = Vec::new();
+        let mut after_gone = false;
+        for n in join.body.clone() {
+            if gone.contains(&n) {
+                after_gone = true;
+                continue;
+            }
+            if after_gone
+                && lines[n].trim().is_empty()
+                && block.last().is_none_or(|l| l.trim().is_empty())
+            {
+                continue;
+            }
+            after_gone = false;
+            block.push(lines[n].to_owned());
+        }
+        gone.extend(join.remove.iter().copied());
+        join_blocks.push((join.kind, join.above, block));
     }
     let mut kept: Vec<String> = Vec::with_capacity(lines.len());
     let mut after_gone = false;
@@ -404,13 +450,239 @@ pub(super) fn rehome(
         }
         place(&mut kept, kind, block);
     }
+    let mut joined: Vec<(String, usize)> = Vec::new();
+    for (kind, _, _) in &join_blocks {
+        match joined.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, count)) => *count += 1,
+            None => joined.push(((*kind).to_owned(), 1)),
+        }
+    }
+    for (kind, _) in &joined {
+        let run = |above: bool| {
+            let mut run: Vec<String> = Vec::new();
+            for (_, _, block) in join_blocks
+                .iter()
+                .filter(|(k, a, _)| k == kind && *a == above)
+            {
+                let block = trimmed(block);
+                if !block.is_empty() {
+                    if !run.is_empty() {
+                        run.push(String::new());
+                    }
+                    run.extend_from_slice(block);
+                }
+            }
+            run
+        };
+        join_into(&mut kept, kind, run(true), run(false));
+    }
     let titled = |entry: &std::ops::Range<usize>| title(&lines[entry.clone()]);
     Some(Rehomed {
         text: kept.join("\n"),
         moved: moved.iter().map(|(_, entry)| titled(entry)).collect(),
         dropped: dropped.iter().map(titled).collect(),
         revived: revived.iter().map(titled).collect(),
+        joined,
     })
+}
+
+/// A `### <kind>` subsection the landing adds whole, which joins another of its kind.
+struct Join<'a> {
+    /// Its kind, trimmed.
+    kind: &'a str,
+    /// The lines it gives up, 0-based: its heading and the lines the landing adds after it.
+    remove: BTreeSet<usize>,
+    /// The lines after its heading, 0-based.
+    body: std::ops::Range<usize>,
+    /// Whether it sits above the subsection it joins.
+    above: bool,
+}
+
+/// The `### <kind>` subsections under `## [Unreleased]` the landing adds whole (the heading and
+/// every non-blank line up to the next heading in `added`, read as [`slid_up`] places it) where
+/// the section holds another of the kind and more `### <kind>` headings than `main`'s
+/// `## [Unreleased]` holds, at least one for each that joins, in file order: each joins the first
+/// subsection of its kind the landing does not add whole (main's), else the first. A kind main's
+/// own lines repeat stays as main holds it. None where the section holds an HTML comment or a
+/// code fence at the margin: a `### ` line in one is not a heading.
+fn joinable<'a>(lines: &[&'a str], added: &BTreeSet<usize>, main: &str) -> Vec<Join<'a>> {
+    let Some((unreleased, end)) = unreleased_span(lines) else {
+        return Vec::new();
+    };
+    if lines[unreleased + 1..end].iter().any(|line| {
+        line.trim_start().starts_with("<!--") || line.starts_with("```") || line.starts_with("~~~")
+    }) {
+        return Vec::new();
+    }
+    let main_lines: Vec<&str> = main.split('\n').collect();
+    let main_kinds: Vec<&str> = unreleased_span(&main_lines).map_or_else(Vec::new, |(u, e)| {
+        main_lines[u + 1..e]
+            .iter()
+            .filter_map(|line| line.strip_prefix("### ").map(str::trim))
+            .collect()
+    });
+    let added = slid_up(lines, added, unreleased + 1, end);
+    let headings: Vec<usize> = (unreleased + 1..end)
+        .filter(|&n| lines[n].starts_with("### "))
+        .collect();
+    // Each subsection: its kind, its lines, and whether the landing adds it whole.
+    let subsections: Vec<(&str, std::ops::Range<usize>, bool)> = headings
+        .iter()
+        .enumerate()
+        .map(|(i, &heading)| {
+            let body_end = headings.get(i + 1).copied().unwrap_or(end);
+            let whole = (heading..body_end)
+                .all(|n| added.contains(&n) || lines[n].trim().is_empty())
+                && added.contains(&heading);
+            (
+                lines[heading]["### ".len()..].trim(),
+                heading..body_end,
+                whole,
+            )
+        })
+        .collect();
+    let mut joins = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (kind, _, _) in &subsections {
+        if seen.contains(kind) {
+            continue;
+        }
+        seen.push(kind);
+        let of_kind: Vec<usize> = (0..subsections.len())
+            .filter(|&j| subsections[j].0 == *kind)
+            .collect();
+        let Some(target) = of_kind
+            .iter()
+            .copied()
+            .find(|&j| !subsections[j].2)
+            .or_else(|| of_kind.first().copied())
+        else {
+            continue;
+        };
+        let joining: Vec<usize> = of_kind
+            .iter()
+            .copied()
+            .filter(|&j| j != target && subsections[j].2)
+            .collect();
+        let theirs = main_kinds.iter().filter(|k| *k == kind).count();
+        if joining.is_empty() || of_kind.len() < theirs + joining.len() {
+            continue;
+        }
+        for j in joining {
+            let range = subsections[j].1.clone();
+            joins.push(Join {
+                kind,
+                remove: range.clone().filter(|n| added.contains(n)).collect(),
+                body: range.start + 1..range.end,
+                above: j < target,
+            });
+        }
+    }
+    joins.sort_by_key(|join| join.body.start);
+    joins
+}
+
+/// The span of `lines`' `## [Unreleased]` section: its heading's line and the line after its
+/// last (the next `## ` heading, or the end).
+fn unreleased_span(lines: &[&str]) -> Option<(usize, usize)> {
+    let unreleased = lines.iter().position(|line| is_unreleased(line))?;
+    let end = (unreleased + 1..lines.len())
+        .find(|&n| lines[n].starts_with("## "))
+        .unwrap_or(lines.len());
+    Some((unreleased, end))
+}
+
+/// `added` with each run of its consecutive lines inside `from..to` moved up while the line above
+/// the run is the same as its last line. Git's diff places an added run at one of the equal
+/// places where the lines around it repeat, which leave the same text; this takes the earliest,
+/// so a subsection added directly above one of its kind reads as added whole whichever of the
+/// two identical headings the diff gave it.
+fn slid_up(lines: &[&str], added: &BTreeSet<usize>, from: usize, to: usize) -> BTreeSet<usize> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for &n in added {
+        match runs.last_mut() {
+            Some(run) if run.end == n => run.end += 1,
+            _ => runs.push(n..n + 1),
+        }
+    }
+    let mut slid = BTreeSet::new();
+    for run in runs {
+        let (mut start, mut end) = (run.start, run.end);
+        if start >= from && end <= to {
+            while start > from && !slid.contains(&(start - 1)) && lines[start - 1] == lines[end - 1]
+            {
+                start -= 1;
+                end -= 1;
+            }
+        }
+        slid.extend(start..end);
+    }
+    slid
+}
+
+/// `lines` without its leading and trailing blank lines.
+fn trimmed(lines: &[String]) -> &[String] {
+    let mut lines = lines;
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines = &lines[1..];
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines = &lines[..lines.len() - 1];
+    }
+    lines
+}
+
+/// Join `top` (the lines of subsections that sat above it) and `bottom` (of ones below) into the
+/// first `### <kind>` subsection under `kept`'s `## [Unreleased]`: `top` at the top of its lines,
+/// `bottom` after its last, each with one blank line around it. Its own lines stay as they are.
+fn join_into(kept: &mut Vec<String>, kind: &str, top: Vec<String>, bottom: Vec<String>) {
+    // The subsection's heading and the line after its last (the next heading, or the end).
+    let bounds = |kept: &[String]| {
+        let unreleased = kept.iter().position(|line| is_unreleased(line))?;
+        let end = (unreleased + 1..kept.len())
+            .find(|&n| kept[n].starts_with("## "))
+            .unwrap_or(kept.len());
+        let heading = (unreleased + 1..end).find(|&n| {
+            kept[n]
+                .strip_prefix("### ")
+                .is_some_and(|h| h.trim() == kind)
+        })?;
+        let next = (heading + 1..end)
+            .find(|&n| kept[n].starts_with("### "))
+            .unwrap_or(end);
+        Some((heading, next))
+    };
+    if !top.is_empty() {
+        let Some((heading, next)) = bounds(kept) else {
+            return;
+        };
+        let mut at = heading + 1;
+        while at < next && kept[at].trim().is_empty() {
+            at += 1;
+        }
+        let mut insert = Vec::new();
+        if at == heading + 1 {
+            insert.push(String::new());
+        }
+        insert.extend(top);
+        insert.push(String::new());
+        kept.splice(at..at, insert);
+    }
+    if !bottom.is_empty() {
+        let Some((heading, next)) = bounds(kept) else {
+            return;
+        };
+        let mut last = next;
+        while last > heading + 1 && kept[last - 1].trim().is_empty() {
+            last -= 1;
+        }
+        let mut insert = vec![String::new()];
+        insert.extend(bottom);
+        if !(last < kept.len() && kept[last].trim().is_empty()) {
+            insert.push(String::new());
+        }
+        kept.splice(last..last, insert);
+    }
 }
 
 fn is_unreleased(line: &str) -> bool {
@@ -443,14 +715,23 @@ fn entry_end(lines: &[&str], start: usize) -> usize {
     end
 }
 
-/// Whether the subsection headed at `heading` holds nothing but blank lines once `gone` goes.
+/// Whether the subsection headed at `heading` loses its last entry to `gone`: it holds a line in
+/// `gone`, and nothing but blank lines once `gone` goes.
 fn emptied(lines: &[&str], heading: usize, gone: &BTreeSet<usize>) -> bool {
-    lines
+    let (mut lost, mut left) = (false, false);
+    for (n, line) in lines
         .iter()
         .enumerate()
         .skip(heading + 1)
         .take_while(|(_, line)| !is_heading(line))
-        .all(|(n, line)| gone.contains(&n) || line.trim().is_empty())
+    {
+        if gone.contains(&n) {
+            lost = true;
+        } else if !line.trim().is_empty() {
+            left = true;
+        }
+    }
+    lost && !left
 }
 
 /// Put `block` (entries, each followed by a blank line) at the top of `kind` under
@@ -527,8 +808,8 @@ fn title(entry: &[&str]) -> String {
     words.chars().take(72).collect()
 }
 
-/// What the landing did, in a clause: the entries it moved and the copies it dropped, each
-/// by its title.
+/// What the landing did, in a clause: the entries it moved and the ones it dropped, each by its
+/// title, and the subsections it joined, by their kind.
 pub(super) fn said(rehomed: &Rehomed) -> String {
     let quoted = |titles: &[String]| {
         titles
@@ -578,6 +859,21 @@ pub(super) fn said(rehomed: &Rehomed) -> String {
                 format!("{} entries' words", revived.len())
             },
             quoted(revived)
+        ));
+    }
+    if !rehomed.joined.is_empty() {
+        let joined = rehomed
+            .joined
+            .iter()
+            .map(|(kind, count)| match count {
+                1 => format!("a `### {kind}` subsection"),
+                _ => format!("{count} `### {kind}` subsections"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "joined {joined} this branch adds under [Unreleased] beside another of its kind into \
+             that one"
         ));
     }
     parts.join("; ")
@@ -899,6 +1195,262 @@ Write each change under `## [Unreleased]`.
     fn a_changelog_with_no_unreleased_section_is_left_alone() {
         let text = "# Changelog\n\n## [0.1.0]\n\n- **Fix.** One.\n";
         assert_eq!(rehome(text, &(0..6).collect(), "", &Written::new()), None);
+    }
+
+    /// A changelog whose `## [Unreleased]` body is `unreleased`, above one release.
+    fn changelog(unreleased: &str) -> String {
+        format!(
+            "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [0.1.0] - 2026-11-01\n\n### \
+             Fixed\n\n- **The first fix.** Shipped.\n"
+        )
+    }
+
+    /// `text`'s 0-based lines that `main` lacks, as a diff of the two would add them: here,
+    /// one run of lines inserted after `main`'s own.
+    fn appended(text: &str, main: &str) -> BTreeSet<usize> {
+        let (ours, theirs): (Vec<&str>, Vec<&str>) =
+            (text.split('\n').collect(), main.split('\n').collect());
+        let lead = ours.iter().zip(&theirs).take_while(|(a, b)| a == b).count();
+        let tail = ours[lead..]
+            .iter()
+            .rev()
+            .zip(theirs[lead..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        (lead..ours.len() - tail).collect()
+    }
+
+    /// A `### <kind>` SUBSECTION THE LANDING ADDS BESIDE MAIN'S OF ITS KIND JOINS IT, over
+    /// 7d1464cf8bb's shape as a real `git merge --no-ff` under the union driver writes it
+    /// (2026-11-10): the branch put `### Fixed` first and reworded the entry under
+    /// `### Changed`; main wrote a new entry above that one; the merge kept main's side whole
+    /// and added the branch's `### Changed` below it. The added subsection's entry follows main's
+    /// last, its heading goes, and main's lines stay as they are; running it again changes
+    /// nothing. The mirror (the added one above main's) puts its entries at the top of main's,
+    /// and a surplus copy inside an added subsection goes with one blank line left. CONTROLS: a
+    /// kind main's own lines say twice stays; a subsection the landing adds only in part (main's
+    /// entry inside it) stays; a section holding an HTML comment is left alone; an added bare
+    /// `### <kind>` under a release, with nothing to join or settle, is `None`.
+    /// NEGATIVE CONTROL (2026-11-10): without the join, `rehome` returns `None` here; joining
+    /// into the first of the kind fails the mirror, a join block kept without the blank-line
+    /// collapse doubles the blank where the copy sat, and no early `None` fails the bare heading.
+    #[test]
+    fn a_kind_the_landing_adds_a_second_time_joins_mains() {
+        let old = "- **Old words.** Said once.\n\n";
+        let mains = "- **Main's change.** Written meanwhile.\n\n";
+        let fixed = "### Fixed\n\n- **First fix.** One.\n\n";
+        let new = "- **New words.** Said better.\n\n";
+        let main = changelog(&format!("### Changed\n\n{mains}{old}{fixed}"));
+        let union = changelog(&format!(
+            "### Changed\n\n{mains}{old}{fixed}### Changed\n\n{new}"
+        ));
+        let added = appended(&union, &main);
+        let branch = wrote_unreleased(&[new]);
+        let rehomed = rehome(&union, &added, &main, &branch).expect("the kinds join");
+        assert_eq!(rehomed.joined, [("Changed".to_owned(), 1)]);
+        assert_eq!(
+            rehomed.text,
+            changelog(&format!("### Changed\n\n{mains}{old}{new}{fixed}"))
+        );
+        assert_eq!(
+            said(&rehomed),
+            "joined a `### Changed` subsection this branch adds under [Unreleased] beside another \
+             of its kind into that one"
+        );
+        let mirror_main = changelog(&format!("{fixed}### Changed\n\n{mains}{old}"));
+        let mirror = changelog(&format!(
+            "### Changed\n\n{new}{fixed}### Changed\n\n{mains}{old}"
+        ));
+        let mirrored = rehome(
+            &mirror,
+            &appended(&mirror, &mirror_main),
+            &mirror_main,
+            &branch,
+        )
+        .expect("the mirror joins");
+        assert_eq!(mirrored.joined, [("Changed".to_owned(), 1)]);
+        assert_eq!(
+            mirrored.text,
+            changelog(&format!("{fixed}### Changed\n\n{new}{mains}{old}"))
+        );
+        let next = "- **Next words.** Said last.\n\n";
+        let copied = changelog(&format!(
+            "### Changed\n\n{mains}{old}{fixed}### Changed\n\n{new}{mains}{next}"
+        ));
+        let both = wrote_unreleased(&[new, next]);
+        let rehomed_copy = rehome(&copied, &appended(&copied, &main), &main, &both)
+            .expect("the copy goes and the kinds join");
+        assert_eq!(rehomed_copy.dropped, ["Main's change."]);
+        assert_eq!(
+            rehomed_copy.text,
+            changelog(&format!("### Changed\n\n{mains}{old}{new}{next}{fixed}"))
+        );
+        let (bare, bare_added) = insert(
+            &main,
+            "### Fixed\n\n- **The first fix.**",
+            "### Security\n\n",
+        );
+        assert_eq!(
+            rehome(&bare, &bare_added, &main, &branch),
+            None,
+            "an added bare heading under a release"
+        );
+        let settled = appended(&rehomed.text, &main);
+        assert_eq!(
+            rehome(&rehomed.text, &settled, &main, &branch),
+            None,
+            "settled"
+        );
+        assert_eq!(
+            rehome(&union, &BTreeSet::new(), &union, &branch),
+            None,
+            "main's own lines say `### Changed` twice"
+        );
+        // The branch adds a `### Changed` heading above main's entry and its own entry below it.
+        let partly_main = changelog(&format!("### Changed\n\n{old}{fixed}{mains}"));
+        let (step, mut partly_added) =
+            insert(&partly_main, "- **Main's change.**", "### Changed\n\n");
+        let (partly, more) = insert(&step, "## [0.1.0]", new);
+        partly_added.extend(more);
+        assert_eq!(
+            rehome(&partly, &partly_added, &partly_main, &branch),
+            None,
+            "the second `### Changed` holds main's entry"
+        );
+        let commented = union.replace(
+            "## [Unreleased]\n\n",
+            "## [Unreleased]\n\n<!-- note -->\n\n",
+        );
+        let commented_main = main.replace(
+            "## [Unreleased]\n\n",
+            "## [Unreleased]\n\n<!-- note -->\n\n",
+        );
+        assert_eq!(
+            rehome(
+                &commented,
+                &appended(&commented, &commented_main),
+                &commented_main,
+                &branch
+            ),
+            None,
+            "an HTML comment in the section"
+        );
+    }
+
+    /// WHICH LINES A JOIN TAKES: only its heading and the lines the landing adds, so a blank line
+    /// main holds after it (a compact section's, or the file's last line) stays; a subsection
+    /// added directly above one of its kind joins whichever identical heading git's diff gave it;
+    /// two of one kind join and are counted; a bare heading the branch added under a release stays
+    /// beside a join. CONTROL: a branch that reorders a kind main's own lines repeat adds no
+    /// heading main lacks, and the kind stays as it holds it.
+    /// NEGATIVE CONTROL (2026-11-10): removing the joined subsection's whole range loses the
+    /// blank lines and final newline; without the slide the adjacent subsection never joins;
+    /// without the heading count main's repeat is joined; an `emptied` that needs no lost line
+    /// removes the bare heading.
+    #[test]
+    fn a_join_takes_only_the_lines_the_landing_adds() {
+        let new = "- **New words.** N.";
+        let branch = wrote_unreleased(&[new, "- **B2.** Two.", "- **E5.** e5."]);
+        // A compact section: no blank line before the added heading, main's blank line after it.
+        let main = "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **M.** m.\n\n### Fixed\n\n- \
+                    **F1.** one.\n- **F2.** two.\n\n## [0.1.0] - 2026-11-01\n";
+        let (compact, added) = insert(main, "\n## [0.1.0]", &format!("### Changed\n\n{new}\n"));
+        let rehomed = rehome(&compact, &added, main, &branch).expect("the kinds join");
+        assert_eq!(
+            rehomed.text,
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **M.** m.\n\n- **New words.** \
+             N.\n\n### Fixed\n\n- **F1.** one.\n- **F2.** two.\n\n## [0.1.0] - 2026-11-01\n"
+        );
+        // `## [Unreleased]` the file's last section: its final newline stays.
+        let last = "# Changelog\n\n## [Unreleased]\n### Changed\n- **M.** m.\n### Fixed\n- **F.** \
+                    f.\n";
+        let at_end = format!("{last}### Changed\n{new}\n");
+        let added: BTreeSet<usize> = [7, 8].into();
+        let rehomed = rehome(&at_end, &added, last, &branch).expect("the kinds join");
+        assert_eq!(
+            rehomed.text,
+            "# Changelog\n\n## [Unreleased]\n### Changed\n- **M.** m.\n\n- **New words.** \
+             N.\n\n### Fixed\n- **F.** f.\n"
+        );
+        // Directly above main's `### Changed`, as git's diff gives it: the added run starts at
+        // the entry and takes the lower heading.
+        let e1 = "- **E1.** e1.\n\n";
+        let e2 = "- **E2.** e2.\n\n";
+        let e5 = "- **E5.** e5.\n\n";
+        let main = changelog(&format!("### Fixed\n\n{e1}### Changed\n\n{e2}"));
+        let (adjacent, added) = insert(&main, "- **E2.**", &format!("{e5}### Changed\n\n"));
+        let rehomed = rehome(&adjacent, &added, &main, &branch).expect("the adjacent one joins");
+        assert_eq!(
+            rehomed.text,
+            changelog(&format!("### Fixed\n\n{e1}### Changed\n\n{e5}{e2}"))
+        );
+        assert_eq!(
+            rehome(
+                &rehomed.text,
+                &appended(&rehomed.text, &main),
+                &main,
+                &branch
+            ),
+            None,
+            "settled"
+        );
+        // Two `### Changed` the landing adds, and a bare `### Security` under the release.
+        let m1 = "- **M1.** Main.\n\n";
+        let f1 = "- **F1.** Fix.\n\n";
+        let main = changelog(&format!("### Changed\n\n{m1}### Fixed\n\n{f1}"));
+        let (step, mut added) = insert(&main, "### Fixed", "### Changed\n\n- **B1.** One.\n\n");
+        let (step, more) = insert(&step, "## [0.1.0]", "### Changed\n\n- **B2.** Two.\n\n");
+        added.extend(more);
+        let at = step.matches('\n').count() - 3;
+        let (twice, more) = insert(
+            &step,
+            "### Fixed\n\n- **The first fix.**",
+            "### Security\n\n",
+        );
+        let more: Vec<usize> = more.into_iter().collect();
+        assert_eq!(more[0], at, "the heading sits under the release");
+        added.extend(more);
+        let branch = wrote_unreleased(&["- **B1.** One.", "- **B2.** Two."]);
+        let rehomed = rehome(&twice, &added, &main, &branch).expect("both join");
+        assert_eq!(rehomed.joined, [("Changed".to_owned(), 2)]);
+        assert_eq!(
+            said(&rehomed),
+            "joined 2 `### Changed` subsections this branch adds under [Unreleased] beside \
+             another of its kind into that one"
+        );
+        assert_eq!(
+            rehomed.text,
+            changelog(&format!(
+                "### Changed\n\n{m1}- **B1.** One.\n\n- **B2.** Two.\n\n### Fixed\n\n{f1}"
+            ))
+            .replace(
+                "### Fixed\n\n- **The first fix.**",
+                "### Security\n\n### Fixed\n\n- **The first fix.**"
+            )
+        );
+        // A branch that reorders main's own repeat: `### Fixed` twice before and after.
+        let a1 = "- **A1.** a1.\n\n";
+        let b1 = "- **B1.** b1.\n\n";
+        let c1 = "- **C1.** c1.\n\n";
+        let main = changelog(&format!(
+            "### Fixed\n\n{a1}### Changed\n\n{c1}### Fixed\n\n{b1}"
+        ));
+        let reordered = changelog(&format!(
+            "### Changed\n\n{c1}### Fixed\n\n{b1}### Fixed\n\n{a1}"
+        ));
+        // The diff deletes main's first `### Fixed` (a removal of non-blank lines adds nothing)
+        // and adds the last one.
+        let start = reordered
+            .split('\n')
+            .position(|l| l == "- **A1.** a1.")
+            .expect("A1")
+            - 2;
+        let added: BTreeSet<usize> = (start..start + 4).collect();
+        assert_eq!(
+            rehome(&reordered, &added, &main, &branch),
+            None,
+            "main's own repeat"
+        );
     }
 
     /// WHAT A COMMIT WROTE is each entry it holds that none of its parents does, a merge's own

@@ -3,8 +3,11 @@
 
 //! The heat self-check on records this kernel wrote (xnu-13432, macOS 27.0.1, Apple M5): a busy
 //! coalition read twice 1.0045 s apart, and one whose lifetime Super time passed its `cpu_time`.
+//! The record half is this crate's ([`decode`], [`CoalHeat`]); the judgement is the model's
+//! (`aterm_vitals::heat::judge`), so these hold the two together.
 
 use super::*;
+use aterm_vitals::heat::{Busy, ClockRange, Counters, Judged, judge};
 
 /// Coalition 1513 at the first read (`coal_clocks record`, 2026-11-06).
 #[rustfmt::skip]
@@ -58,7 +61,7 @@ const M5: ClockRange = ClockRange {
 /// The busy core time that matches the pair: its own `cpu_time` and Super time.
 const BUSY: Busy = Busy {
     all_ns: 3_062_516_708,
-    p_ns: 2_247_436_750,
+    p_ns: Some(2_247_436_750),
 };
 
 fn read(records: &[(u64, [u64; USAGE_WORDS])], newest: u64) -> HeatRead {
@@ -70,9 +73,13 @@ fn read(records: &[(u64, [u64; USAGE_WORDS])], newest: u64) -> HeatRead {
     })
 }
 
+fn counters(heat: Heat) -> Counters {
+    Counters::from_words(heat.words())
+}
+
 fn judged(then: &[u64; USAGE_WORDS], now: &[u64; USAGE_WORDS]) -> Result<Judged, &'static str> {
     let m = moved(&read(&[(1513, *then)], 1513), &read(&[(1513, *now)], 1513))?;
-    judge(&m.sum, WINDOW_NS, TIMEBASE, &M5, Some(BUSY))
+    judge(&counters(m.sum), WINDOW_NS, TIMEBASE, Some(&M5), Some(BUSY))
 }
 
 fn near(v: Option<f64>, want: f64) -> bool {
@@ -82,11 +89,10 @@ fn near(v: Option<f64>, want: f64) -> bool {
 #[test]
 fn a_recorded_pair_decodes_its_words_and_judges_within_the_chip() {
     let j = judged(&THEN, &NOW).expect("the recorded layout");
-    assert!(near(j.mhz, 2327.99), "{j:?}");
+    assert!(near(j.mhz, 2327.99 * j.cpu_s / j.qos_s), "{j:?}");
     assert!(near(j.p_mhz, 2184.38), "{j:?}");
-    assert!(near(j.e_mhz, 2723.97), "{j:?}");
-    assert!(near(j.e_qos_mhz, 2691.76), "{j:?}");
-    assert!(!j.e_refused && !j.e_qos_refused);
+    assert!(near(j.e_mhz, 2691.76), "{j:?}");
+    assert!(!j.e_refused);
     assert!(near(j.ipc, 3.53), "{j:?}");
     assert!((j.cpu_w - 3.4549).abs() < 1e-3, "{j:?}");
     assert_eq!((j.gpu_w, j.ane_w, j.ane_busy), (0.0, 0.0, 0.0));
@@ -114,9 +120,11 @@ fn a_shifted_layout_reads_unread_never_a_shifted_value() {
     }
 }
 
-/// The busy cross-check is what refuses a time word moved onto a counter that barely moves (the
-/// clocks under [`MIN_CLOCK_NS`] judge nothing). CONTROL: without the busy time, moved by one it
-/// would judge as an idle coalition.
+/// The busy cross-check refuses a time word moved onto a counter that barely moves: the shifted
+/// `cpu_time` reads 14 µs of a window the cores were busy 3.06 s. Without the busy time the
+/// whole clock over the QoS time refuses it as well (0.02 MHz, `clock_range`), where N1's judge,
+/// whose clocks read `cpu_time`, judged it an idle coalition. CONTROL: unshifted, the same busy
+/// time judges.
 #[test]
 fn a_time_word_moved_onto_a_still_counter_is_refused_by_the_busy_time() {
     let shift = |raw: &[u64; USAGE_WORDS]| {
@@ -129,13 +137,14 @@ fn a_time_word_moved_onto_a_still_counter_is_refused_by_the_busy_time() {
     let (then, now) = (shift(&THEN), shift(&NOW));
     let m = moved(&read(&[(1513, then)], 1513), &read(&[(1513, now)], 1513)).expect("moves");
     assert_eq!(
-        judge(&m.sum, WINDOW_NS, TIMEBASE, &M5, Some(BUSY)),
+        judge(&counters(m.sum), WINDOW_NS, TIMEBASE, Some(&M5), Some(BUSY)),
         Err("busy_time")
     );
-    assert!(
-        judge(&m.sum, WINDOW_NS, TIMEBASE, &M5, None).is_ok(),
-        "control"
+    assert_eq!(
+        judge(&counters(m.sum), WINDOW_NS, TIMEBASE, Some(&M5), None),
+        Err("clock_range")
     );
+    assert!(judged(&THEN, &NOW).is_ok(), "control");
 }
 
 /// The record's times are separate accounts: a lifetime Super time above `cpu_time` still decodes,
@@ -178,32 +187,6 @@ fn the_change_matches_by_id_and_refuses_a_counter_that_ran_backwards() {
     assert_eq!(moved(&then, &refused), Err("refused_record"));
 }
 
-/// The recorded 6.03 GHz Efficiency clock (`rec/heat-clocks.jsonl` i=6) is refused alone, past the
-/// table's top: the Super clock and the reading stand.
-#[test]
-fn an_efficiency_clock_past_its_table_top_is_refused_alone() {
-    let ns_to_ticks = |ns: u64| ns * 3 / 125;
-    let m = Heat {
-        cpu_ticks: ns_to_ticks(4_610_000_000),
-        qos_ticks: ns_to_ticks(4_610_000_000),
-        p_ticks: ns_to_ticks(3_660_000_000),
-        energy_nj: 12_770_000_000,
-        instructions: 40_000_000_000,
-        cycles: 13_436_000_000 + 5_728_500_000,
-        p_instructions: 30_000_000_000,
-        p_cycles: 13_436_000_000,
-        ..Heat::default()
-    };
-    let busy = Busy {
-        all_ns: 4_610_000_000,
-        p_ns: 3_660_000_000,
-    };
-    let j = judge(&m, 1_000_000_000, TIMEBASE, &M5, Some(busy)).expect("the reading stands");
-    assert!(near(j.p_mhz, 3671.04), "{j:?}");
-    assert!(j.e_refused && j.e_mhz.is_none(), "{j:?}");
-    assert!(j.e_qos_refused && j.e_qos_mhz.is_none(), "{j:?}");
-}
-
 /// A refill keeps its rows ascending by id, one per id, and counts the records it refused.
 #[test]
 fn a_refill_sorts_its_rows_and_counts_its_refusals() {
@@ -218,4 +201,175 @@ fn a_refill_sorts_its_rows_and_counts_its_refusals() {
     });
     assert_eq!(r.rows.iter().map(|x| x.0).collect::<Vec<_>>(), [10, 30]);
     assert_eq!(r.refused, Some(("layout", 1)));
+}
+
+/// The word order the copy loop sums in is the order the model names: every counter of a recorded
+/// record lands on the model's field of the same name. CONTROL: two words swapped land on each
+/// other's fields.
+#[test]
+fn the_words_land_on_the_models_names() {
+    let heat = decode(&THEN).expect("decodes");
+    let named = |c: Counters| {
+        [
+            c.cpu_ticks,
+            c.qos_ticks,
+            c.p_ticks,
+            c.energy_nj,
+            c.instructions,
+            c.cycles,
+            c.p_instructions,
+            c.p_cycles,
+            c.ane_ticks,
+            c.ane_energy_nj,
+            c.gpu_energy_nj,
+        ]
+    };
+    let ours = [
+        heat.cpu_ticks,
+        heat.qos_ticks,
+        heat.p_ticks,
+        heat.energy_nj,
+        heat.instructions,
+        heat.cycles,
+        heat.p_instructions,
+        heat.p_cycles,
+        heat.ane_ticks,
+        heat.ane_energy_nj,
+        heat.gpu_energy_nj,
+    ];
+    assert_eq!(named(counters(heat)), ours);
+    assert_eq!(COUNTERS, aterm_vitals::heat::COUNTERS);
+    let mut swapped = heat.words();
+    swapped.swap(3, 4);
+    assert_ne!(named(Counters::from_words(swapped)), ours, "control");
+}
+
+/// The copy loop keeps each record's words by id in the kernel's order and sums them; one record
+/// that does not decode refuses the read's heat and keeps nothing. CONTROL: without it, the same
+/// records sum.
+#[test]
+fn the_copy_loop_sums_what_decoded_and_refuses_a_read_with_one_that_did_not() {
+    let usage = |id| match id {
+        30 => Some(NOW),
+        10 => Some(THEN),
+        20 => Some(P_PAST_CPU_TIME),
+        _ => None,
+    };
+    let read =
+        crate::coalitions::read_of(&[(30, 1), (10, 1), (20, 1)], false, usage, TIMEBASE).heat;
+    let words = |raw: &[u64; USAGE_WORDS]| decode(raw).expect("decodes").words();
+    assert_eq!(
+        read.by_id,
+        [
+            (30, words(&NOW)),
+            (10, words(&THEN)),
+            (20, words(&P_PAST_CPU_TIME))
+        ]
+    );
+    let mut total = [0u64; COUNTERS];
+    for (_, w) in &read.by_id {
+        for (t, v) in total.iter_mut().zip(w) {
+            *t += v;
+        }
+    }
+    assert_eq!(read.total, Ok(total));
+    let mut other = THEN;
+    other[EQOS_LEN] = 6;
+    let refused = crate::coalitions::read_of(
+        &[(30, 1), (10, 1)],
+        false,
+        |id| (id == 30).then_some(NOW).or(Some(other)),
+        TIMEBASE,
+    )
+    .heat;
+    assert_eq!((refused.total, refused.by_id.len()), (Err("layout"), 0));
+}
+
+/// A total that would pass `u64` refuses the read's heat (`overflow`) and keeps nothing, never a
+/// wrapped sum that the change would read as a shifted value. CONTROL: the same records less one
+/// instruction each sum.
+#[test]
+fn a_total_past_u64_refuses_the_read_never_a_wrapped_sum() {
+    let big = |instructions| {
+        let mut raw = NOW;
+        raw[INSTRUCTIONS] = instructions;
+        raw
+    };
+    let half = u64::MAX / 2 + 1;
+    let past =
+        crate::coalitions::read_of(&[(10, 1), (20, 1)], false, |_| Some(big(half)), TIMEBASE).heat;
+    assert_eq!((past.total, past.by_id.len()), (Err("overflow"), 0));
+    let within = crate::coalitions::read_of(
+        &[(10, 1), (20, 1)],
+        false,
+        |_| Some(big(half - 1)),
+        TIMEBASE,
+    )
+    .heat;
+    let instructions = decode(&big(half - 1)).expect("decodes").words();
+    let at = instructions
+        .iter()
+        .position(|&w| w == half - 1)
+        .expect("the instructions word");
+    assert_eq!(within.total.map(|t| t[at]), Ok(u64::MAX - 1), "control");
+}
+
+/// The folded form (the copy loop's totals, the start counter's merge handing back the gone
+/// coalitions, their last words off the earlier total) equals the change by coalition id that a
+/// pass after the read gives ([`moved`]), over a matched, a gone and a born coalition. CONTROL:
+/// leaving the gone coalition on the earlier total runs the counters backwards.
+#[test]
+fn the_folded_change_equals_the_change_by_id() {
+    use aterm_vitals::heat::HeatBook;
+    use aterm_vitals::starts::{CoalTaskRead, CoalTasks, StartCount};
+    let then_records = [(10, THEN), (20, NOW)];
+    let now_records = [(30, P_PAST_CPU_TIME), (10, NOW)];
+    let fold = |records: &[(u64, [u64; USAGE_WORDS])], at_ns: u64| {
+        let listed: Vec<(u64, u32)> = records.iter().map(|&(id, _)| (id, 1)).collect();
+        let read = crate::coalitions::read_of(
+            &listed,
+            false,
+            |id| records.iter().find(|r| r.0 == id).map(|r| r.1),
+            TIMEBASE,
+        );
+        let tasks = CoalTaskRead::of(
+            read.newest,
+            read.truncated,
+            read.rows.iter().map(|u| CoalTasks {
+                id: u.id,
+                started: u.tasks_started,
+                exited: u.tasks_exited,
+            }),
+        );
+        StartCount::Coalitions {
+            read: tasks.with_heat(HeatBook {
+                at_ns,
+                timebase: read.heat.timebase,
+                by_id: read.heat.by_id,
+                total: read.heat.total,
+            }),
+            own: None,
+        }
+    };
+    let (then, now) = (fold(&then_records, 0), fold(&now_records, WINDOW_NS));
+    let folded = aterm_vitals::starts::moved(&then, &now)
+        .expect("counts")
+        .heat
+        .expect("carries heat")
+        .expect("changes");
+    let by_id = moved(&read(&then_records, 20), &read(&now_records, 30)).expect("moves");
+    assert_eq!((by_id.matched, by_id.born), (1, 1));
+    assert_eq!(folded.counters, counters(by_id.sum));
+    assert_eq!(folded.window_ns, WINDOW_NS);
+    let (StartCount::Coalitions { read: a, .. }, StartCount::Coalitions { read: b, .. }) =
+        (&then, &now)
+    else {
+        unreachable!("coalition reads")
+    };
+    let (a, b) = (a.heat().expect("heat"), b.heat().expect("heat"));
+    assert_eq!(
+        aterm_vitals::heat::change(a, b, &[]),
+        Err("backwards"),
+        "control"
+    );
 }

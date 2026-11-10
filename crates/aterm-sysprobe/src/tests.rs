@@ -2265,6 +2265,13 @@ fn the_load_average_file_gives_every_thread_on_the_machine() {
     assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 1/-80 5\n"), None);
     assert_eq!(linux::loadavg_tasks("0.20 0.18\n"), None);
     assert_eq!(linux::loadavg_tasks(""), None);
+    assert_eq!(
+        linux::loadavg_counts("30.12 31.40 29.98 12/3412 98765\n"),
+        Some((12, 3412)),
+        "the runnable count beside the total, one field"
+    );
+    assert_eq!(linux::loadavg_counts("0.20 0.18 0.12 x/80 5\n"), None);
+    assert_eq!(linux::loadavg_counts("0.20 0.18 0.12 1/8"), None, "torn");
 
     let root = aterm_tempfile::tempdir().expect("scratch root");
     std::fs::create_dir_all(root.path().join("proc")).unwrap();

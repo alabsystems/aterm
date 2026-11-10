@@ -198,10 +198,17 @@ fn cask_token_dictionary(api: &Api, core_tokens: &[String]) -> Vec<String> {
         }
         let official = tap.user.eq_ignore_ascii_case("homebrew");
         for token in tap_cask_tokens(&tap) {
+            // Brew's cask token lists are trust-filtered
+            // (unlike formula names): an untrusted tap's casks
+            // never appear in search at all.
+            let qualified = format!("{}/{}/{token}", tap.user, tap.repo);
+            if !super::trust::trusted(api.prefix(), super::trust::TrustType::Cask, &qualified) {
+                continue;
+            }
             if official {
                 out.push(token);
             } else {
-                out.push(format!("{}/{}/{token}", tap.user, tap.repo));
+                out.push(qualified);
             }
         }
     }
@@ -1168,6 +1175,116 @@ fn search_field_hits(mode: &SearchMode, fields: &[&str]) -> Result<bool, ExitCod
     }
 }
 
+/// Brew's factory trust refusal for a tap formula/cask, when
+/// the qualified name is not trusted (the error search's
+/// fuzzy/qualified loads die with).
+fn untrusted_load_error(
+    prefix: &Prefix,
+    kind: super::trust::TrustType,
+    qualified: &str,
+) -> Option<ExitCode> {
+    if super::trust::trusted(prefix, kind, qualified) {
+        return None;
+    }
+    let (word, flag) = match kind {
+        super::trust::TrustType::Formula => ("formula", "--formula"),
+        super::trust::TrustType::Cask => ("cask", "--cask"),
+        _ => return None,
+    };
+    let tap = qualified.rsplit_once('/').map_or(qualified, |(tap, _)| tap);
+    Some(failed(&format!(
+        "Error: Refusing to load {word} {qualified} from untrusted tap {tap}.\nRun `brew trust {flag} {qualified}` or `brew trust {tap}` to trust it."
+    )))
+}
+
+/// Brew's `Formulary.factory` order for one name: the named
+/// tap for qualified references, else the core API record,
+/// else any tap's record — with the load trust gate brew
+/// applies (Err is the already-printed refusal).
+fn factory_formula(prefix: &Prefix, api: &Api, name: &str) -> Result<Option<Formula>, ExitCode> {
+    let found = if foreign_qualified(name) {
+        foreign_formula(prefix, name)
+    } else {
+        match api.formula(name) {
+            Ok(f) => Some(f),
+            Err(_) => tap::lookup(prefix, name),
+        }
+    };
+    match found {
+        Some(f) => match formula_load_refusal(prefix, &f) {
+            Some(code) => Err(code),
+            None => Ok(Some(f)),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Brew's `Cask::CaskLoader` order for one token: the core
+/// cask API record, else a tap directory's record — with the
+/// load trust gate.
+fn factory_cask(
+    prefix: &Prefix,
+    api: &Api,
+    name: &str,
+) -> Result<Option<super::formula::Cask>, ExitCode> {
+    let short = super::api::canonical_cask_token(Formula::short_name(name));
+    if !foreign_qualified(name)
+        && let Ok(c) = api.cask(short)
+    {
+        return Ok(Some(c));
+    }
+    let lookup_name = if foreign_qualified(name) {
+        name.to_string()
+    } else {
+        short.to_string()
+    };
+    match tap::lookup_cask(prefix, &lookup_name) {
+        Some((c, qualified)) => {
+            match untrusted_load_error(prefix, super::trust::TrustType::Cask, &qualified) {
+                Some(code) => Err(code),
+                None => Ok(Some(c)),
+            }
+        }
+        None => Ok(if foreign_qualified(name) {
+            None
+        } else {
+            api.cask(short).ok()
+        }),
+    }
+}
+
+/// Brew's factory trust gate on an already-resolved tap
+/// formula record (API records carry no qualified tap name
+/// and never gate).
+fn formula_load_refusal(prefix: &Prefix, f: &Formula) -> Option<ExitCode> {
+    if f.full_name.matches('/').count() == 2 {
+        untrusted_load_error(prefix, super::trust::TrustType::Formula, &f.full_name)
+    } else {
+        None
+    }
+}
+
+/// Whether the tap named by a qualified cask reference holds
+/// that token on disk (trust-independent existence).
+fn tap_cask_tokens_exist(prefix: &Prefix, qualified: &str) -> bool {
+    let parts: Vec<&str> = qualified.split('/').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    tap_dirs(prefix)
+        .iter()
+        .find(|t| t.user == parts[0] && t.repo == parts[1])
+        .is_some_and(|tap| tap_cask_tokens(tap).iter().any(|token| token == parts[2]))
+}
+
+/// One tap formula/cask search candidate, display-qualified.
+struct TapSearchEntry {
+    qualified: String,
+    stem: String,
+    deprecated: bool,
+    disabled: bool,
+}
+
 /// (formula hits, cask hits, cask canonical names), pretty-printed.
 type NameHits = (Vec<String>, Vec<String>, Vec<String>);
 
@@ -1208,49 +1325,73 @@ fn collect_name_hits(
             Err(e) => return Err(failed(&e)),
         }
     }
-    // Brew's search also covers tapped formulae and casks (the
-    // official taps are the API indexes already loaded).
-    for tap in tap::list(prefix) {
-        let official = tap.user.eq_ignore_ascii_case("homebrew")
-            && matches!(tap.repo.as_str(), "core" | "cask");
-        if official {
+    // Brew's search also covers tap-directory formulae and
+    // casks under their qualified names (the core taps are the
+    // API indexes already loaded). Formula file data is read
+    // only for trusted entries — brew's factory rescue prints
+    // an untrusted substring hit bare.
+    let mut tap_formulae: Vec<TapSearchEntry> = Vec::new();
+    let mut tap_aliases: Vec<(String, String)> = Vec::new();
+    let mut tap_casks: Vec<TapSearchEntry> = Vec::new();
+    for tap in tap_dirs(prefix) {
+        if (tap.user == "homebrew" && tap.repo == "core")
+            || (tap.user == "homebrew" && tap.repo == "cask")
+        {
             continue;
         }
         if formula_wanted {
             for stem in tap_formula_names(&tap) {
-                if formula_rows.iter().any(|r| r.name == stem) {
-                    continue;
-                }
-                let (desc, deprecated, disabled) = tap::formula_file(&tap, &stem)
-                    .and_then(|file| file.canonicalize().ok())
-                    .and_then(|canon| {
-                        crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024).ok()
-                    })
-                    .map(|text| {
-                        let f = tap::parse_rb_as_data(&text, &stem);
-                        (f.desc, f.deprecate, f.disable)
-                    })
-                    .unwrap_or_default();
-                formula_rows.push(super::api::SearchRow {
-                    name: stem,
-                    aliases: Vec::new(),
-                    display_names: Vec::new(),
-                    desc,
+                let qualified = format!("{}/{}/{stem}", tap.user, tap.repo);
+                let trusted =
+                    super::trust::trusted(prefix, super::trust::TrustType::Formula, &qualified);
+                let (deprecated, disabled) = if trusted {
+                    tap::formula_file(&tap, &stem)
+                        .and_then(|file| file.canonicalize().ok())
+                        .and_then(|canon| {
+                            crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024).ok()
+                        })
+                        .map(|text| {
+                            let f = tap::parse_rb_as_data(&text, &stem);
+                            (f.deprecate, f.disable)
+                        })
+                        .unwrap_or_default()
+                } else {
+                    (false, false)
+                };
+                tap_formulae.push(TapSearchEntry {
+                    qualified,
+                    stem,
                     deprecated,
                     disabled,
                 });
             }
+            // Tap Aliases/ entries are search candidates under
+            // their qualified alias names.
+            if let Ok(entries) = std::fs::read_dir(tap.path.join("Aliases")) {
+                for entry in entries.flatten() {
+                    let Some(alias) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if let Ok(canon) = entry.path().canonicalize()
+                        && let Some(target) = canon.file_stem().and_then(|s| s.to_str())
+                    {
+                        tap_aliases.push((
+                            format!("{}/{}/{alias}", tap.user, tap.repo),
+                            format!("{}/{}/{target}", tap.user, tap.repo),
+                        ));
+                    }
+                }
+            }
         }
         if cask_wanted {
             for stem in tap_cask_tokens(&tap) {
-                if cask_rows.iter().any(|r| r.name == stem) {
+                let qualified = format!("{}/{}/{stem}", tap.user, tap.repo);
+                if !super::trust::trusted(prefix, super::trust::TrustType::Cask, &qualified) {
                     continue;
                 }
-                cask_rows.push(super::api::SearchRow {
-                    name: stem,
-                    aliases: Vec::new(),
-                    display_names: Vec::new(),
-                    desc: String::new(),
+                tap_casks.push(TapSearchEntry {
+                    qualified,
+                    stem,
                     deprecated: false,
                     disabled: false,
                 });
@@ -1260,26 +1401,97 @@ fn collect_name_hits(
     let by_name_f: std::collections::BTreeMap<&str, &super::api::SearchRow> =
         formula_rows.iter().map(|r| (r.name.as_str(), r)).collect();
     if tap_parts.len() == 3 {
+        // A qualified query resolves exactly in its named tap
+        // (formula and cask independently), prints the short
+        // name, and dies on an untrusted load like brew's
+        // factory.
         let short = tap_parts[2];
-        let is_cask_tap = tap_parts[1] == "cask" || tap_parts[0] != "homebrew";
-        if !is_cask_tap && formula_wanted && by_name_f.contains_key(short) {
-            formula_hits.push(short.to_string());
-        } else if cask_wanted && cask_rows.iter().any(|r| r.name == short) {
-            cask_hits.push(short.to_string());
+        let qualified = joined.to_lowercase();
+        if formula_wanted {
+            if tap_parts[0] == "homebrew" && tap_parts[1] == "core" {
+                if by_name_f.contains_key(short) {
+                    formula_hits.push(short.to_string());
+                }
+            } else if let Some(entry) = tap_formulae.iter().find(|e| e.qualified == qualified) {
+                if let Some(code) =
+                    untrusted_load_error(prefix, super::trust::TrustType::Formula, &entry.qualified)
+                {
+                    return Err(code);
+                }
+                formula_hits.push(short.to_string());
+            } else if let Some((_, canonical)) =
+                tap_aliases.iter().find(|(alias, _)| *alias == qualified)
+            {
+                // A qualified alias prints the canonical name.
+                if let Some(code) =
+                    untrusted_load_error(prefix, super::trust::TrustType::Formula, canonical)
+                {
+                    return Err(code);
+                }
+                formula_hits.push(
+                    canonical
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(canonical)
+                        .to_string(),
+                );
+            }
+        }
+        if cask_wanted {
+            if tap_parts[0] == "homebrew" && tap_parts[1] == "cask" {
+                if cask_rows.iter().any(|r| r.name == short) {
+                    cask_hits.push(short.to_string());
+                }
+            } else if tap_cask_tokens_exist(prefix, &qualified) {
+                if let Some(code) =
+                    untrusted_load_error(prefix, super::trust::TrustType::Cask, &qualified)
+                {
+                    return Err(code);
+                }
+                cask_hits.push(short.to_string());
+                cask_hit_names.push(short.to_string());
+            }
         }
     } else {
         if formula_wanted {
-            // Candidates: canonical names then aliases, displayed as found.
-            let mut candidates: Vec<(String, &super::api::SearchRow, bool)> = Vec::new();
+            // Candidates: full names (core + qualified taps)
+            // then aliases, displayed as found. The row carries
+            // status flags; the canonical display keys alias
+            // suppression.
+            let tap_rows: Vec<super::api::SearchRow> = tap_formulae
+                .iter()
+                .map(|e| super::api::SearchRow {
+                    name: e.stem.clone(),
+                    aliases: Vec::new(),
+                    display_names: Vec::new(),
+                    desc: String::new(),
+                    deprecated: e.deprecated,
+                    disabled: e.disabled,
+                })
+                .collect();
+            type FCand<'a> = (String, &'a super::api::SearchRow, String, bool);
+            let mut candidates: Vec<FCand> = Vec::new();
             for row in &formula_rows {
-                candidates.push((row.name.clone(), row, false));
+                candidates.push((row.name.clone(), row, row.name.clone(), false));
+            }
+            for (entry, row) in tap_formulae.iter().zip(&tap_rows) {
+                candidates.push((entry.qualified.clone(), row, entry.qualified.clone(), false));
             }
             for row in &formula_rows {
                 for alias in &row.aliases {
-                    candidates.push((alias.clone(), row, true));
+                    candidates.push((alias.clone(), row, row.name.clone(), true));
                 }
             }
-            let mut results: Vec<(String, &super::api::SearchRow, bool)> = Vec::new();
+            for (alias, canonical) in &tap_aliases {
+                if let Some((_, row)) = tap_formulae
+                    .iter()
+                    .zip(&tap_rows)
+                    .find(|(e, _)| &e.qualified == canonical)
+                {
+                    candidates.push((alias.clone(), row, canonical.clone(), true));
+                }
+            }
+            let mut results: Vec<FCand> = Vec::new();
             for cand in &candidates {
                 match search_field_hits(mode, &[cand.0.as_str()]) {
                     Ok(true) => results.push(cand.clone()),
@@ -1296,21 +1508,47 @@ fn collect_name_hits(
             });
             if let SearchMode::Text(q) = &mode {
                 // Brew's fuzzy dictionary is names + full names —
-                // canonical names only, never aliases.
+                // canonical names only, never aliases. Every
+                // correction is factory-loaded, so one landing
+                // in an untrusted tap kills the search.
                 let core: Vec<String> = formula_rows.iter().map(|r| r.name.clone()).collect();
                 let dictionary = fuzzy_dictionary(api, &core);
                 for correction in spell_correct(&dictionary, q) {
-                    if let Some(row) = by_name_f.get(correction.as_str())
-                        && !results.iter().any(|r| r.0 == row.name)
-                    {
-                        results.push((row.name.clone(), row, false));
+                    let resolved: Option<FCand> = if correction.contains('/') {
+                        tap_formulae
+                            .iter()
+                            .zip(&tap_rows)
+                            .find(|(e, _)| e.qualified == correction)
+                            .map(|(e, row)| (e.qualified.clone(), row, e.qualified.clone(), false))
+                    } else if let Some(row) = by_name_f.get(correction.as_str()) {
+                        Some((row.name.clone(), row, row.name.clone(), false))
+                    } else {
+                        tap_formulae
+                            .iter()
+                            .zip(&tap_rows)
+                            .find(|(e, _)| e.stem == correction)
+                            .map(|(e, row)| (e.qualified.clone(), row, e.qualified.clone(), false))
+                    };
+                    if let Some(cand) = resolved {
+                        if cand.0.contains('/')
+                            && let Some(code) = untrusted_load_error(
+                                prefix,
+                                super::trust::TrustType::Formula,
+                                &cand.0,
+                            )
+                        {
+                            return Err(code);
+                        }
+                        if !results.iter().any(|r| r.0 == cand.0) {
+                            results.push(cand);
+                        }
                     }
                 }
             }
             let found: std::collections::BTreeSet<String> =
                 results.iter().map(|r| r.0.clone()).collect();
-            for (name, row, is_alias) in results {
-                if is_alias && found.contains(row.name.as_str()) {
+            for (name, row, canonical, is_alias) in results {
+                if is_alias && found.contains(canonical.as_str()) {
                     continue;
                 }
                 // Brew's valid_platform? filter never fires for
@@ -1322,30 +1560,55 @@ fn collect_name_hits(
             }
         }
         if cask_wanted {
-            let mut results: Vec<&super::api::SearchRow> = Vec::new();
-            for row in &cask_rows {
-                match search_field_hits(mode, &[row.name.as_str()]) {
-                    Ok(true) => results.push(row),
+            // Brew searches the Tap.each-ordered token list
+            // (core tokens + trusted tap tokens), substring
+            // then fuzzy, sorts, and prints full names.
+            let core_tokens: Vec<String> = cask_rows.iter().map(|r| r.name.clone()).collect();
+            let tokens = cask_token_dictionary(api, &core_tokens);
+            let tap_cask_rows: Vec<super::api::SearchRow> = tap_casks
+                .iter()
+                .map(|e| super::api::SearchRow {
+                    name: e.stem.clone(),
+                    aliases: Vec::new(),
+                    display_names: Vec::new(),
+                    desc: String::new(),
+                    deprecated: e.deprecated,
+                    disabled: e.disabled,
+                })
+                .collect();
+            let resolve = |display: &str| -> Option<&super::api::SearchRow> {
+                if let Some(row) = cask_rows.iter().find(|r| r.name == display) {
+                    return Some(row);
+                }
+                tap_casks
+                    .iter()
+                    .zip(&tap_cask_rows)
+                    .find(|(e, _)| e.qualified == display || e.stem == display)
+                    .map(|(_, row)| row)
+            };
+            let mut results: Vec<String> = Vec::new();
+            for token in &tokens {
+                match search_field_hits(mode, &[token.as_str()]) {
+                    Ok(true) => results.push(token.clone()),
                     Ok(false) => {}
                     Err(code) => return Err(code),
                 }
             }
             if let SearchMode::Text(q) = &mode {
-                let core_tokens: Vec<String> = cask_rows.iter().map(|r| r.name.clone()).collect();
-                let dictionary = cask_token_dictionary(api, &core_tokens);
-                for correction in spell_correct(&dictionary, q) {
-                    if let Some(row) = cask_rows.iter().find(|r| r.name == correction)
-                        && !results.iter().any(|r| r.name == row.name)
-                    {
-                        results.push(row);
+                for correction in spell_correct(&tokens, q) {
+                    if !results.contains(&correction) {
+                        results.push(correction);
                     }
                 }
             }
-            results.sort_by(|a, b| a.name.cmp(&b.name));
-            for row in results {
+            results.sort();
+            for display in results {
+                let Some(row) = resolve(&display) else {
+                    continue;
+                };
                 cask_hit_names.push(row.name.clone());
                 cask_hits.push(pretty_search_name(
-                    &row.name,
+                    &display,
                     Some(row),
                     installed_c.contains(&row.name),
                     false,
@@ -4919,6 +5182,9 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
             let cask_only = has_flag(rest, "--cask", "");
             match foreign_formula(prefix, name) {
                 Some(f) if !cask_only => {
+                    if let Some(code) = formula_load_refusal(prefix, &f) {
+                        return code;
+                    }
                     if quiet {
                         for line in formula_quiet_lines(prefix, &f) {
                             println!("{line}");
@@ -4929,25 +5195,47 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                     printed = true;
                 }
                 _ => {
-                    super::tty::onoe!(
-                        "Error: {}",
-                        foreign_unavailable(
-                            prefix,
-                            api,
-                            name,
-                            cask_only,
-                            has_flag(rest, "--formula", "")
-                        )
-                    );
-                    info_missing_reason(prefix, api, name);
-                    failures += 1;
+                    // A foreign cask reference resolves as that
+                    // cask when --formula is not in force.
+                    let mut shown = false;
+                    if !has_flag(rest, "--formula", "") {
+                        match factory_cask(prefix, api, name) {
+                            Ok(Some(c)) => {
+                                if quiet {
+                                    for line in cask_quiet_lines(prefix, &c) {
+                                        println!("{line}");
+                                    }
+                                } else {
+                                    print_cask_info(prefix, api, &c, verbose);
+                                }
+                                printed = true;
+                                shown = true;
+                            }
+                            Ok(None) => {}
+                            Err(code) => return code,
+                        }
+                    }
+                    if !shown {
+                        super::tty::onoe!(
+                            "Error: {}",
+                            foreign_unavailable(
+                                prefix,
+                                api,
+                                name,
+                                cask_only,
+                                has_flag(rest, "--formula", "")
+                            )
+                        );
+                        info_missing_reason(prefix, api, name);
+                        failures += 1;
+                    }
                 }
             }
             continue;
         }
         if has_flag(rest, "--cask", "") {
-            match api.cask(name) {
-                Ok(c) => {
+            match factory_cask(prefix, api, name) {
+                Ok(Some(c)) => {
                     if quiet {
                         for line in cask_quiet_lines(prefix, &c) {
                             println!("{line}");
@@ -4957,10 +5245,11 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                     }
                     printed = true;
                 }
-                Err(_) => {
+                Ok(None) => {
                     super::tty::onoe!("Error: {}", cask_unavailable(Formula::short_name(name)));
                     failures += 1;
                 }
+                Err(code) => return code,
             }
             continue;
         }
@@ -4977,6 +5266,9 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
             }
             Err(_) => match tap::lookup(prefix, name) {
                 Some(f) => {
+                    if let Some(code) = formula_load_refusal(prefix, &f) {
+                        return code;
+                    }
                     if quiet {
                         for line in formula_quiet_lines(prefix, &f) {
                             println!("{line}");
@@ -5022,8 +5314,8 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                         failures += 1;
                         continue;
                     }
-                    match api.cask(Formula::short_name(name)) {
-                        Ok(c) => {
+                    match factory_cask(prefix, api, name) {
+                        Ok(Some(c)) => {
                             if quiet {
                                 for line in cask_quiet_lines(prefix, &c) {
                                     println!("{line}");
@@ -5033,7 +5325,8 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                             }
                             printed = true;
                         }
-                        Err(_) => {
+                        Err(code) => return code,
+                        Ok(None) => {
                             if name.starts_with("homebrew/cask/") && name.split('/').count() == 3 {
                                 super::tty::onoe!(
                                     "Error: {}",
@@ -5194,10 +5487,13 @@ fn print_cask_info(prefix: &Prefix, api: &Api, c: &super::formula::Cask, verbose
     print_metadata_lines(prefix, &c.token, true, inst.is_some(), false);
     println!(
         "From: {}",
-        super::tty::url(&format!(
-            "https://github.com/Homebrew/homebrew-cask/blob/HEAD/Casks/{}/{}.rb",
-            cask_shard(&c.token),
-            c.token
+        super::tty::url(&c.source_url.as_deref().map_or_else(
+            || format!(
+                "https://github.com/Homebrew/homebrew-cask/blob/HEAD/Casks/{}/{}.rb",
+                cask_shard(&c.token),
+                c.token
+            ),
+            str::to_string,
         ))
     );
     if !c.depends_formula.is_empty() || !c.depends_cask.is_empty() {
@@ -5469,9 +5765,15 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             let hit = if foreign {
                 super::tap::lookup(prefix, &name)
             } else {
-                api.formula(&name).ok()
+                match factory_formula(prefix, api, &name) {
+                    Ok(f) => f,
+                    Err(code) => return code,
+                }
             };
             if let Some(f) = hit {
+                if foreign && let Some(code) = formula_load_refusal(prefix, &f) {
+                    return code;
+                }
                 let shown = super::tty::pretty_install_status(
                     &f.name,
                     prefix.installed_one(Kind::Formula, &f.name).is_some(),
@@ -5498,7 +5800,10 @@ pub(super) fn cmd_desc(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             }
         }
         if !want_formula {
-            let cask_hit = if foreign { None } else { api.cask(short).ok() };
+            let cask_hit = match factory_cask(prefix, api, &name) {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
             if let Some(c) = cask_hit {
                 let shown = super::tty::pretty_install_status(
                     &c.token,
@@ -5728,6 +6033,9 @@ pub(super) fn cmd_home(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         if foreign_qualified(name) {
             match foreign_formula(prefix, name) {
                 Some(f) if !want_cask => {
+                    if let Some(code) = formula_load_refusal(prefix, &f) {
+                        return code;
+                    }
                     println!("Opening homepage for Formula {}", f.name);
                     urls.push(f.homepage);
                     continue;
@@ -5741,16 +6049,26 @@ pub(super) fn cmd_home(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             }
         }
         let resolved = if want_cask {
-            api.cask(short)
-                .map(|c| (format!("Cask {}", c.token), c.homepage))
-                .map_err(|_| format!("Error: {}", cask_unavailable(short)))
+            match factory_cask(prefix, api, name) {
+                Ok(Some(c)) => Ok((format!("Cask {}", c.token), c.homepage)),
+                Ok(None) => Err(format!("Error: {}", cask_unavailable(short))),
+                Err(code) => return code,
+            }
         } else if want_formula {
-            api.formula(name)
-                .map(|f| (format!("Formula {}", f.name), f.homepage))
-                .map_err(|_| format!("Error: {}", formula_unavailable(api, name)))
-        } else if let Ok(f) = api.formula(name) {
+            match factory_formula(prefix, api, name) {
+                Ok(Some(f)) => Ok((format!("Formula {}", f.name), f.homepage)),
+                Ok(None) => Err(format!("Error: {}", formula_unavailable(api, name))),
+                Err(code) => return code,
+            }
+        } else if let Some(f) = match factory_formula(prefix, api, name) {
+            Ok(f) => f,
+            Err(code) => return code,
+        } {
             Ok((format!("Formula {}", f.name), f.homepage))
-        } else if let Ok(c) = api.cask(short) {
+        } else if let Some(c) = match factory_cask(prefix, api, name) {
+            Ok(c) => c,
+            Err(code) => return code,
+        } {
             Ok((format!("Cask {}", c.token), c.homepage))
         } else {
             Err(format!("Error: {}", formula_unavailable(api, name)))
@@ -8161,6 +8479,9 @@ pub(super) fn cmd_gist_logs(
             }
         }
     };
+    if let Some(code) = formula_load_refusal(prefix, &formula) {
+        return code;
+    }
     let logs_root = std::env::var_os("HOMEBREW_LOGS").map_or_else(
         || {
             std::env::home_dir()
@@ -8862,6 +9183,9 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
     for name in &foreign {
         match foreign_formula(prefix, name) {
             Some(f) => {
+                if let Some(code) = formula_load_refusal(prefix, &f) {
+                    return code;
+                }
                 let parts: Vec<&str> = name.split('/').collect();
                 let (user, repo, leaf) = if parts.len() == 3 {
                     (parts[0], parts[1], parts[2])
@@ -8893,6 +9217,9 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
         }
     }
     for name in &names {
+        if let Err(code) = factory_formula(prefix, api, name) {
+            return code;
+        }
         let defined = match api.formula_value(name) {
             Ok(v) => v.get("post_install_defined").and_then(|b| b.as_bool()),
             Err(_) => {
@@ -8920,7 +9247,7 @@ pub(super) fn cmd_postinstall(prefix: &Prefix, api: &Api, rest: &[String]) -> Ex
     }
     for (name, _) in &plan {
         super::tty::opoo!("Warning: {name}: no `post_install` method was defined in the formula!");
-        eprintln!("{}", super::tty::oh1(&format!("Postinstalling {name}")));
+        println!("{}", super::tty::oh1(&format!("Postinstalling {name}")));
     }
     ExitCode::SUCCESS
 }
@@ -11436,6 +11763,20 @@ pub(super) fn cmd_install(
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
     for name in &names {
+        // Brew factory-loads each name first: an untrusted
+        // tap record refuses before any other shaping.
+        if !want_cask && let Err(code) = factory_formula(prefix, api, name) {
+            return code;
+        }
+        // A name only a tap answers delegates like a qualified
+        // tap name (the install catalog is the core API).
+        if !want_cask
+            && !foreign_qualified(name)
+            && api.formula(name).is_err()
+            && tap::lookup(prefix, name).is_some()
+        {
+            return not_native(prefix, args, "install (tap formula)");
+        }
         if foreign_qualified(name) {
             // Resolvable foreign names still delegate; brew's
             // rescue searches by leaf name for the two-segment
@@ -11458,24 +11799,25 @@ pub(super) fn cmd_install(
             ));
         }
         if want_cask {
-            if let Err(e) = api.cask(name) {
-                if e.contains("no such") {
+            match factory_cask(prefix, api, name) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
                     return install_unknown_name(prefix, api, name, true, false);
                 }
-                return failed(&e);
+                Err(code) => return code,
             }
         } else if want_formula {
             if api.formula(name).is_err() && tap::lookup(prefix, name).is_none() {
                 return install_unknown_name(prefix, api, name, false, true);
             }
-        } else if api.formula(name).is_err()
-            && tap::lookup(prefix, name).is_none()
-            && let Err(error) = api.cask(name)
-        {
-            if error.contains("no such") {
-                return install_unknown_name(prefix, api, name, false, false);
+        } else if api.formula(name).is_err() && tap::lookup(prefix, name).is_none() {
+            match factory_cask(prefix, api, name) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return install_unknown_name(prefix, api, name, false, false);
+                }
+                Err(code) => return code,
             }
-            return failed(&error);
         }
     }
     // Brew routes an outdated, linked formula through its upgrade
@@ -11542,12 +11884,18 @@ pub(super) fn cmd_install(
             } else if want_formula {
                 false
             } else {
-                api.formula(name).is_err()
+                api.formula(name).is_err() && tap::lookup(prefix, name).is_none()
             };
             if as_cask {
-                let c = match api.cask(name) {
-                    Ok(c) => c,
-                    Err(error) => return failed(&error),
+                let c = match factory_cask(prefix, api, name) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        return failed(&format!(
+                            "abrew: no such cask: {}",
+                            Formula::short_name(name)
+                        ));
+                    }
+                    Err(code) => return code,
                 };
                 // An up-to-date cask is not part of the dry plan.
                 if !opts.force
@@ -11561,7 +11909,14 @@ pub(super) fn cmd_install(
                     continue;
                 }
                 match cask::install_with_deps(api, prefix, &c, true, opts.force, false, false) {
-                    Ok(_) => casks.push((c.token.clone(), cask::dry_dep_names(api, prefix, &c))),
+                    Ok(_) => casks.push((
+                        if c.full_name.is_empty() {
+                            c.token.clone()
+                        } else {
+                            c.full_name.clone()
+                        },
+                        cask::dry_dep_names(api, prefix, &c),
+                    )),
                     Err(install::InstallError::Failed(msg)) => {
                         eprintln!("{msg}");
                         failures += 1;
@@ -11778,8 +12133,8 @@ pub(super) fn cmd_install(
             if api.formula(name).is_ok() {
                 install::install(api, prefix, name, &plain_opts).map(|_| ())
             } else {
-                match api.cask(name) {
-                    Ok(c) => cask::install_with_deps(
+                match factory_cask(prefix, api, name) {
+                    Ok(Some(c)) => cask::install_with_deps(
                         api,
                         prefix,
                         &c,
@@ -11789,19 +12144,19 @@ pub(super) fn cmd_install(
                         false,
                     )
                     .map(|_| ()),
-                    Err(error) if error.contains("no such") => {
+                    Ok(None) => {
                         return failed(&no_such(api, name, None));
                     }
-                    Err(error) => return failed(&error),
+                    Err(code) => return code,
                 }
             }
         } else if want_cask {
-            match api.cask(name) {
-                Ok(c) => {
+            match factory_cask(prefix, api, name) {
+                Ok(Some(c)) => {
                     cask::install_with_deps(api, prefix, &c, opts.dry_run, opts.force, false, false)
                         .map(|_| ())
                 }
-                Err(e) if e.contains("no such") => {
+                Ok(None) => {
                     if api.formula(name).is_ok() {
                         return failed(&format!(
                             "abrew: {name} is a formula, not a cask (drop --cask)"
@@ -11809,7 +12164,7 @@ pub(super) fn cmd_install(
                     }
                     return failed(&no_such(api, name, Some("cask")));
                 }
-                Err(e) => return failed(&e),
+                Err(code) => return code,
             }
         } else {
             match install::install(api, prefix, name, &plain_opts).map(|_| ()) {
@@ -13400,6 +13755,13 @@ pub(super) fn cmd_reinstall(
     };
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
+    if !want_cask {
+        for name in &names {
+            if let Err(code) = factory_formula(prefix, api, name) {
+                return code;
+            }
+        }
+    }
     if opts.dry_run {
         // Brew's reinstall has no dry run; abrew's extension reports
         // through the same grouped summary as install.
@@ -13977,6 +14339,15 @@ const fn outdated_failed(any: bool, named: bool) -> bool {
 }
 
 pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    // Named operands factory-load: an untrusted tap record
+    // refuses outright.
+    if !has_flag(rest, "--cask", "") || has_flag(rest, "--formula", "") {
+        for op in operands_without_flag_values(rest, &["--minimum-version", "--min-version"]) {
+            if let Err(code) = factory_formula(prefix, api, &op) {
+                return code;
+            }
+        }
+    }
     for op in operands_without_flag_values(rest, &["--minimum-version", "--min-version"]) {
         if foreign_qualified(&op) {
             let cask_only = has_flag(rest, "--cask", "") && !has_flag(rest, "--formula", "");
@@ -14378,6 +14749,11 @@ pub(super) fn cmd_upgrade(
     let names = operands_without_flag_values(rest, &["--minimum-version", "--min-version"]);
     if has_flag(rest, "--cask", "") {
         return cmd_upgrade_casks(prefix, api, args, rest, &opts, names, false, minimum);
+    }
+    for name in &names {
+        if let Err(code) = factory_formula(prefix, api, name) {
+            return code;
+        }
     }
     if !names.is_empty() && !has_flag(rest, "--formula", "") {
         // Brew partitions untagged names by resolution
@@ -18449,6 +18825,9 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
             let cask_only = has_flag(rest, "--cask", "");
             match foreign_formula(prefix, name) {
                 Some(f) if !cask_only => {
+                    if let Some(code) = formula_load_refusal(prefix, &f) {
+                        return code;
+                    }
                     if has_flag(rest, "--deps", "") {
                         return not_native(prefix, args, "fetch --deps (tap-qualified name)");
                     }
@@ -18486,6 +18865,16 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                     continue;
                 }
                 Err(e) => {
+                    if let Some(f) = tap::lookup(prefix, name) {
+                        if let Some(code) = formula_load_refusal(prefix, &f) {
+                            return code;
+                        }
+                        if has_flag(rest, "--deps", "") {
+                            return not_native(prefix, args, "fetch --deps (tap name)");
+                        }
+                        jobs.push(FetchJob::Formula(f, Vec::new()));
+                        continue;
+                    }
                     if has_flag(rest, "--formula", "") {
                         return failed(&lookup_error(api, name, "formula", e));
                     }
@@ -18493,8 +18882,9 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                 }
             }
         }
-        match api.cask(name) {
-            Ok(raw) => {
+        match factory_cask(prefix, api, name) {
+            Err(code) => return code,
+            Ok(Some(raw)) => {
                 let c = match cask::resolve(&raw, super::machine::Machine::this()) {
                     Ok(c) => c.into_owned(),
                     Err(e) => return from_install(prefix, args, Err(e)),
@@ -18504,6 +18894,17 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                 }
                 if c.disabled {
                     return failed(&format!("abrew: cask {} is disabled upstream", c.token));
+                }
+                // Brew skips combinations with no url/sha256
+                // (a sha256-less tap cask without :no_check).
+                if c.url.is_empty() || (c.sha256.is_none() && !c.sha256_no_check) {
+                    super::tty::opoo!(
+                        "Warning: Cask {} is not supported on os {} and arch {}",
+                        c.token,
+                        super::machine::current_os_symbol(),
+                        super::machine::current_arch_symbol()
+                    );
+                    continue;
                 }
                 let sim_os = super::valued_flag_last(rest, "--os");
                 let sim_arch = super::valued_flag_last(rest, "--arch");
@@ -18542,7 +18943,7 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                     jobs.push(FetchJob::Cask(c));
                 }
             }
-            Err(e) => {
+            Ok(None) => {
                 return failed(&lookup_error(
                     api,
                     name,
@@ -18551,7 +18952,7 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                     } else {
                         "cask"
                     },
-                    formula_error.unwrap_or(e),
+                    formula_error.unwrap_or_else(|| format!("abrew: no such cask: {name}")),
                 ));
             }
         }
@@ -18854,6 +19255,15 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     // each tagged with the kind it resolved as.
     let mut inputs: Vec<(bool, super::api::DepRow)> = Vec::new();
     if !names.is_empty() || brewfile.is_some() {
+        // Named targets factory-load first: an untrusted tap
+        // record refuses before any row is built.
+        if !only_cask {
+            for name in &names {
+                if let Err(code) = factory_formula(prefix, api, name) {
+                    return code;
+                }
+            }
+        }
         for name in &names {
             let resolved = if only_cask {
                 cask_row(api, name).map(|row| (true, row))
@@ -19690,19 +20100,23 @@ pub(super) fn cmd_uses(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
     // formula answers to; dependents of such a name are then an error.
     let mut unknown = false;
     for (name, t) in names.iter().zip(&targets) {
-        if foreign_qualified(name) {
-            if foreign_formula(prefix, name).is_none() {
-                super::tty::opoo!(
-                    "Warning: {}",
-                    foreign_unavailable(prefix, api, name, false, true)
-                );
-                unknown = true;
+        // Brew factory-loads each target: an untrusted tap
+        // record is a hard error, not the unknown warning.
+        match factory_formula(prefix, api, name) {
+            Err(code) => return code,
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if foreign_qualified(name) {
+                    super::tty::opoo!(
+                        "Warning: {}",
+                        foreign_unavailable(prefix, api, name, false, true)
+                    );
+                    unknown = true;
+                } else if !installed_f.contains(t) {
+                    super::tty::opoo!("Warning: {}", formula_unavailable(api, t));
+                    unknown = true;
+                }
             }
-            continue;
-        }
-        if !installed_f.contains(t) && api.formula(t).is_err() {
-            super::tty::opoo!("Warning: {}", formula_unavailable(api, t));
-            unknown = true;
         }
     }
     // Rows are the candidate dependents. With --installed (and
@@ -20205,7 +20619,10 @@ pub(super) fn cmd_options(
         let mut rows = Vec::new();
         for name in &names {
             if foreign_qualified(name) {
-                if foreign_formula(prefix, name).is_some() {
+                if let Some(f) = foreign_formula(prefix, name) {
+                    if let Some(code) = formula_load_refusal(prefix, &f) {
+                        return code;
+                    }
                     return tapped();
                 }
                 return failed(&format!(
@@ -20227,8 +20644,15 @@ pub(super) fn cmd_options(
                         head,
                     });
                 }
-                Err(_) if tap::lookup(prefix, name).is_some() => return tapped(),
-                Err(_) => return failed(&format!("Error: {}", formula_unavailable(api, name))),
+                Err(_) => match tap::lookup(prefix, name) {
+                    Some(f) => match formula_load_refusal(prefix, &f) {
+                        Some(code) => return code,
+                        None => return tapped(),
+                    },
+                    None => {
+                        return failed(&format!("Error: {}", formula_unavailable(api, name)));
+                    }
+                },
             }
         }
         rows
@@ -24476,6 +24900,133 @@ mod tests {
     }
 
     #[test]
+    fn tap_cask_records_parse_and_resolve() {
+        let text = r#"cask "custapp" do
+  version "1.2.3"
+  sha256 arm:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         intel: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+  url "https://example.com/custapp-#{version.major_minor}.dmg"
+  name "CustApp"
+  desc "Probe app"
+  homepage "https://example.com/"
+
+  auto_updates true
+  depends_on macos: ">= :sonoma"
+  depends_on cask: "helper"
+
+  app "CustApp.app"
+  binary "custapp-cli", target: "custapp"
+
+  zap trash: [
+    "~/Library/CustApp",
+    "~/Library/Preferences/com.example.custapp.plist",
+  ]
+end
+"#;
+        let c = tap::parse_cask_rb_as_data(text, "custapp");
+        assert_eq!(c.version, "1.2.3");
+        assert_eq!(
+            c.sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(c.url, "https://example.com/custapp-1.2.dmg");
+        assert_eq!(c.name, "CustApp");
+        assert!(c.auto_updates);
+        assert_eq!(c.macos_min.as_deref(), Some("14"));
+        assert_eq!(c.depends_cask, ["helper"]);
+        assert_eq!(c.artifacts.len(), 2);
+        assert_eq!(c.zap_trash.len(), 2);
+        assert!(c.zap_present);
+        assert!(c.unsupported_constraints.is_none());
+        let nocheck = tap::parse_cask_rb_as_data(
+            "cask \"x\" do\n  version :latest\n  sha256 :no_check\n  url \"https://e.com/x.dmg\"\n  app \"X.app\"\nend\n",
+            "x",
+        );
+        assert_eq!(nocheck.version, "latest");
+        assert!(nocheck.sha256.is_none() && nocheck.sha256_no_check);
+    }
+
+    #[test]
+    fn tap_lookup_and_factory_gate_cover_plain_tap_directories() {
+        // Brew resolves names from any tap directory (no .git
+        // checkout required) and factory-refuses untrusted
+        // ones. The fixture tap is untrusted in any default
+        // trust store.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let tap = p.taps_dir().join("searchtest").join("homebrew-probe");
+        std::fs::create_dir_all(tap.join("Formula")).expect("mkdir");
+        std::fs::write(
+            tap.join("Formula/custool.rb"),
+            "class Custool < Formula\n  url \"https://example.com/x.tgz\"\n  version \"1.0\"\nend\n",
+        )
+        .expect("write");
+        let api = Api::read_only(p.clone());
+        let found = tap::lookup(&p, "custool").expect("plain tap dir resolves by leaf");
+        assert_eq!(found.full_name, "searchtest/probe/custool");
+        assert!(factory_formula(&p, &api, "custool").is_err());
+        assert!(factory_formula(&p, &api, "searchtest/probe/custool").is_err());
+    }
+
+    #[test]
+    fn search_covers_tap_names_with_brew_trust_semantics() {
+        // A tap directory with one formula + one cask, against
+        // a two-entry core index. The tap is untrusted in any
+        // default trust store: brew prints an exact substring
+        // formula hit, dies on the fuzzy load, and never shows
+        // the cask.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let api_dir = p.cache().join("api");
+        std::fs::create_dir_all(&api_dir).expect("mkdir");
+        std::fs::write(
+            api_dir.join("formula-index.json"),
+            r#"[{"name":"cuetools","desc":"cue tools"}]"#,
+        )
+        .expect("write");
+        std::fs::write(
+            api_dir.join("cask-index.json"),
+            r#"[{"token":"caffeine","desc":"keep awake"}]"#,
+        )
+        .expect("write");
+        let tap = p.taps_dir().join("searchtest").join("homebrew-probe");
+        std::fs::create_dir_all(tap.join("Formula")).expect("mkdir");
+        std::fs::create_dir_all(tap.join("Casks")).expect("mkdir");
+        std::fs::write(
+            tap.join("Formula/custool.rb"),
+            "class Custool < Formula\n  url \"https://example.com/x.tgz\"\n  version \"1.0\"\nend\n",
+        )
+        .expect("write");
+        std::fs::write(tap.join("Casks/custapp.rb"), "cask \"custapp\" do\nend\n").expect("write");
+        let api = Api::read_only(p.clone());
+        let empty = std::collections::BTreeSet::new();
+        let hits = |q: &str| {
+            collect_name_hits(
+                &p,
+                &api,
+                &SearchMode::Text(q.to_string()),
+                q,
+                true,
+                true,
+                &empty,
+                &empty,
+            )
+        };
+        let (formula_hits, cask_hits, _) = hits("custool").expect("exact substring prints");
+        assert_eq!(formula_hits, ["searchtest/probe/custool", "cuetools"]);
+        assert!(cask_hits.is_empty(), "{cask_hits:?}");
+        assert!(hits("custol").is_err(), "fuzzy load of untrusted tap dies");
+        let (_, cask_hits, _) = hits("custapp").expect("cask search runs");
+        assert!(
+            cask_hits.is_empty(),
+            "untrusted tap cask hidden: {cask_hits:?}"
+        );
+    }
+
+    #[test]
     fn regex_search_matches_brew_case_and_anchoring() {
         assert_eq!(search_regex_pattern("/wget.+/"), Some("wget.+"));
         assert_eq!(search_regex_pattern("/http client/"), Some("http client"));
@@ -25868,8 +26419,9 @@ mod tests {
             ]
         );
         assert_eq!(spell_correct(&dict, "custol"), ["custool"]);
-        // Cask token dictionary: tap tokens qualified, core
-        // tokens appended when no core cask dir exists.
+        // Cask token dictionary: core tokens are present; a
+        // tap's tokens join only when that tap is trusted,
+        // which is machine state this test does not assume.
         let casks = p
             .taps_dir()
             .join("ProbeUser")
@@ -25878,7 +26430,7 @@ mod tests {
         std::fs::create_dir_all(&casks).expect("mkdir");
         std::fs::write(casks.join("custapp.rb"), "# c\n").expect("write");
         let dict = cask_token_dictionary(&api, &["caffeine".to_string()]);
-        assert_eq!(dict, ["probeuser/probe/custapp", "caffeine"]);
+        assert!(dict.contains(&"caffeine".to_string()), "{dict:?}");
     }
 
     #[test]

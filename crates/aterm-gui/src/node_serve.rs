@@ -3833,7 +3833,12 @@ fn serve_one_node_generation(
                     }
 
                     let serving = serving_watch();
-                    let keys = aterm_net::fleet_member::Keyring::read(&state_dir);
+                    // The book is read at the first judgment that needs it, an open drive's
+                    // key, and once a tick at most: a tick with no drive open reads none, as the
+                    // window's listener does (`holds_now`, `fleet_listen.rs`).
+                    let book = std::cell::OnceCell::new();
+                    let keys =
+                        || book.get_or_init(|| aterm_net::fleet_member::Keyring::read(&state_dir));
                     let mut log = members_watch.as_ref().and_then(|members| members.keys());
                     if let Some(automatic) = &automatic {
                         automatic.observe_membership(log.as_ref());
@@ -3848,7 +3853,7 @@ fn serve_one_node_generation(
                     let _ = match denied.as_deref() {
                         Some(denied) => open_watch.cut_unserved(
                             &serving,
-                            &|n, key| holds_in(&keys, log.as_deref(), n, key),
+                            &|n, key| holds_in(keys(), log.as_deref(), n, key),
                             denied,
                         ),
                         None => open_watch.cut_unserved(&unread, &|_, _| false, &[]),

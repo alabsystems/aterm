@@ -2413,6 +2413,11 @@ fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> An
     let spec = &mut state.releases[at].spec;
     if let Some(tag) = tag {
         spec.tag = tag;
+    } else if final_draft {
+        // GitHub drops a draft's tag binding when an edit that leaves it a draft names no
+        // `tag_name` (0.193.0's source draft read `untagged-88239b0cc2be8b1abf48` after a
+        // notes-only edit, 2026-11-10); the PATCH that publishes it keeps the tag.
+        spec.tag = format!("untagged-{id:020x}");
     }
     if name.is_some() {
         spec.name = name;

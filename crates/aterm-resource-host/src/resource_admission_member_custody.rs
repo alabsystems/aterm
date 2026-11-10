@@ -439,6 +439,41 @@ impl member::MemberCustody for Borrowed<'_> {
         }
         Ok(())
     }
+    fn commit_started(
+        &mut self,
+        binding: &Binding,
+        started: &member::Started,
+        requested: Option<member::RequestedStartLimits>,
+    ) -> io::Result<()> {
+        self.validate()?;
+        if binding.session != self.job.binding.session
+            || binding.attempt != self.member
+            || started.pid <= 1
+            || started.birth == 0
+            || started.monotonic_ns == 0
+            || started.unix_ns == 0
+            || requested.is_some_and(|limits| limits.units == 0 || limits.footprint_mib == 0)
+        {
+            return Err(refused("member Started journal binding changed"));
+        }
+        // The owner bound this original child before dispatch. Select the known
+        // running phase with its exact clock before the first GO/Run byte;
+        // this intent cannot reconstruct execution or cold resume authority.
+        self.journal.update(
+            binding,
+            "member_running",
+            aterm_json::json!({
+                "pid": started.pid,
+                "birth": started.birth,
+                "monotonic_ns": started.monotonic_ns,
+                "unix_ns": started.unix_ns,
+                "requested_units": requested.map(|limits| limits.units),
+                "requested_footprint_mib": requested.map(|limits| limits.footprint_mib),
+            }),
+        )?;
+        // No Run byte may be offered on a root/fence lost during durable I/O.
+        self.validate()
+    }
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError> {
         self.validate().map_err(LaunchError::Refused)?;
         match &mut self.job.custody {

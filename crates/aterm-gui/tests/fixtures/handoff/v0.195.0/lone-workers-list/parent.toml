@@ -1,0 +1,20 @@
+# What the v0.195.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.195.0"
+producer_commit = "ec5324f66e00"
+outgoing_build = 1794319617
+park_carry_ceiling = "full"
+manifest = "seamless-41347-0000000000000000000000000100001a.toml"
+nonce = "0000000000000000000000000100001a"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "d2ee8fbe5c4f707e743d38c5a05934bedbc84c81f0cfb63d11c3f9a53eab7cf9"
+layout_digest = "a92a2308afea9034bb0753c00c5d338ff05f792f9a51a2e70cd6c435fba90885"
+proof_target_build = 1794406017
+proof_target_commit = "fedcba987654"
+proof_identities = []
+proof_count = 0
+proof_digest = "1b76427c01070ba14ec2b98002119e4ad89b6521589ad6e71cfff0fafac55360"
+ready_wire = "41535231000000001b76427c01070ba14ec2b98002119e4ad89b6521589ad6e71cfff0fafac55360"
+commit_wire = "41534331000000001b76427c01070ba14ec2b98002119e4ad89b6521589ad6e71cfff0fafac55360"
+files = ["seamless-41347-0000000000000000000000000100001a.layout.toml", "seamless-41347-0000000000000000000000000100001a.toml"]
+

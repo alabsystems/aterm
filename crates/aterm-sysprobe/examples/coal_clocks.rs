@@ -75,9 +75,10 @@ mod mac {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use aterm_sysprobe::coalition_heat::{self, ClockRange, Heat, HeatRead};
+    use aterm_sysprobe::coalition_heat::{self, Heat, HeatRead};
     use aterm_sysprobe::coalitions;
     use aterm_sysprobe::cpu_hardware::{self, State};
+    use aterm_vitals::heat::{self as model, ClockRange};
 
     unsafe extern "C" {
         fn notify_register_check(name: *const c_char, token: *mut c_int) -> u32;
@@ -274,7 +275,7 @@ mod mac {
     /// What one reading's parse gave: the change and its judgement, or the first refusal (with
     /// the change, where it was taken), each with the window.
     enum Verdict {
-        Judged(coalition_heat::Moved, coalition_heat::Judged, u64),
+        Judged(coalition_heat::Moved, model::Judged, u64),
         Refused(&'static str, Option<coalition_heat::Moved>, u64),
     }
 
@@ -408,6 +409,11 @@ mod mac {
             }
         }
         s
+    }
+
+    /// A change's counters as the model names them.
+    fn counters(h: Heat) -> model::Counters {
+        model::Counters::from_words(h.words())
     }
 
     fn opt(v: Option<f64>, digits: usize) -> String {
@@ -553,9 +559,9 @@ mod mac {
                 let busy_of = |window_ns: u64| {
                     let (sb, eb) = (sb?, eb?);
                     let w = window_ns as f64;
-                    Some(coalition_heat::Busy {
+                    Some(model::Busy {
                         all_ns: ((sb * cores[0] + eb * cores[1]) * w) as u64,
-                        p_ns: (sb * cores[0] * w) as u64,
+                        p_ns: Some((sb * cores[0] * w) as u64),
                     })
                 };
                 // The added parse as N2 would run it after the read: decode into kept rows, the
@@ -568,11 +574,11 @@ mod mac {
                         u64::try_from(read_at.duration_since(then_at).as_nanos()).unwrap_or(0);
                     match coalition_heat::moved(&heat_then, &heat_now) {
                         Err(why) => Verdict::Refused(why, None, window_ns),
-                        Ok(m) => match coalition_heat::judge(
-                            &m.sum,
+                        Ok(m) => match model::judge(
+                            &counters(m.sum),
                             window_ns,
                             timebase,
-                            &range,
+                            Some(&range),
                             busy_of(window_ns),
                         ) {
                             Ok(j) => Verdict::Judged(m, j, window_ns),
@@ -587,11 +593,11 @@ mod mac {
                 let warm_t0 = Instant::now();
                 scratch.refill(&records);
                 let again = coalition_heat::moved(&heat_then, &scratch).and_then(|m| {
-                    coalition_heat::judge(
-                        &m.sum,
+                    model::judge(
+                        &counters(m.sum),
                         1_000_000_000,
                         timebase,
-                        &range,
+                        Some(&range),
                         busy_of(1_000_000_000),
                     )
                 });
@@ -673,16 +679,25 @@ mod mac {
                 };
                 match &judged {
                     Some(Verdict::Judged(m, j, window_ns)) => {
+                        // N1's comparison: the Efficiency clock over `cpu_time` beside the
+                        // engine's, over the QoS time, by the model's one rule.
+                        let s = m.sum;
+                        let e_cpu = model::e_clock(
+                            s.cycles - s.p_cycles,
+                            ns(s.cpu_ticks),
+                            ns(s.p_ticks),
+                            Some(range.e_mhz),
+                        );
                         let _ = write!(
                             row,
                             "{}ok,{},{},{},{},{},{},",
                             sums(m, *window_ns),
                             opt(j.ipc, 2),
                             opt(j.p_mhz, 1),
+                            opt(e_cpu.ok().flatten(), 1),
+                            u8::from(e_cpu.is_err()),
                             opt(j.e_mhz, 1),
                             u8::from(j.e_refused),
-                            opt(j.e_qos_mhz, 1),
-                            u8::from(j.e_qos_refused),
                         );
                     }
                     Some(Verdict::Refused(why, m, window_ns)) => {
@@ -882,15 +897,21 @@ mod mac {
                         u64::try_from(read_at.duration_since(*then_at).as_nanos()).unwrap_or(0);
                     let busy = sb.zip(eb).map(|(sb, eb)| {
                         let w = window_ns as f64;
-                        coalition_heat::Busy {
+                        model::Busy {
                             all_ns: ((sb * cores[0] + eb * cores[1]) * w) as u64,
-                            p_ns: (sb * cores[0] * w) as u64,
+                            p_ns: Some((sb * cores[0] * w) as u64),
                         }
                     });
                     match coalition_heat::moved(&heat_then, &heat_now) {
                         Err(why) => why,
                         Ok(m) => {
-                            match coalition_heat::judge(&m.sum, window_ns, timebase, &range, busy) {
+                            match model::judge(
+                                &counters(m.sum),
+                                window_ns,
+                                timebase,
+                                Some(&range),
+                                busy,
+                            ) {
                                 Ok(_) => "ok",
                                 Err(why) => why,
                             }
@@ -993,11 +1014,11 @@ mod mac {
             let _ = std::hint::black_box(coalition_heat::moved(&then, &now));
         });
         let judge = time(&mut || {
-            let _ = std::hint::black_box(coalition_heat::judge(
-                &m.sum,
+            let _ = std::hint::black_box(model::judge(
+                &counters(m.sum),
                 1_000_000_000,
                 timebase,
-                &range,
+                Some(&range),
                 None,
             ));
         });
@@ -1194,7 +1215,7 @@ mod mac {
             if let Some(h) = heat.as_deref_mut() {
                 match coalition_heat::decode(std::hint::black_box(&buf)) {
                     Ok(one) => {
-                        for (t, v) in total.iter_mut().zip(heat_words(&one)) {
+                        for (t, v) in total.iter_mut().zip(one.words()) {
                             *t = t.wrapping_add(v);
                         }
                         h.push((*id, one));
@@ -1210,40 +1231,7 @@ mod mac {
         }
         out.sort_by_key(|r| r.id);
         out.dedup_by_key(|r| r.id);
-        (heat.is_some() && whole).then(|| heat_of_words(total))
-    }
-
-    /// A [`Heat`]'s counters in field order, and back.
-    fn heat_words(h: &Heat) -> [u64; 11] {
-        [
-            h.cpu_ticks,
-            h.qos_ticks,
-            h.p_ticks,
-            h.energy_nj,
-            h.instructions,
-            h.cycles,
-            h.p_instructions,
-            h.p_cycles,
-            h.ane_ticks,
-            h.ane_energy_nj,
-            h.gpu_energy_nj,
-        ]
-    }
-
-    fn heat_of_words(w: [u64; 11]) -> Heat {
-        Heat {
-            cpu_ticks: w[0],
-            qos_ticks: w[1],
-            p_ticks: w[2],
-            energy_nj: w[3],
-            instructions: w[4],
-            cycles: w[5],
-            p_instructions: w[6],
-            p_cycles: w[7],
-            ane_ticks: w[8],
-            ane_energy_nj: w[9],
-            gpu_energy_nj: w[10],
-        }
+        (heat.is_some() && whole).then(|| Heat::of_words(total))
     }
 
     /// The same loop decoding each copied record's heat into `heat` in the kernel's order, each

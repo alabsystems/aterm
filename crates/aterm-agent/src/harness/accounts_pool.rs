@@ -3614,6 +3614,11 @@ pub struct Session<'a, R = PoolRelaunch<'a>> {
     pub supervisor: Supervisor,
     /// Its process's environment, as `NAME`/value pairs.
     pub env: &'a [(&'a str, &'a str)],
+    /// What its own login file says it runs on ([`super::observe`]), which beats the row its
+    /// environment names ([`accounts::reconcile`]): the session, its usage and its move are
+    /// the observed row's, and no row's where no row lists the observed account.
+    /// [`super::observe::Observation::Unread`] where the caller read none: the belief stands.
+    pub seen: &'a super::observe::Observation,
     /// The usage its CLI's own records said last (codex's rollout `rate_limits`), where read.
     pub sample: Option<Sample>,
     /// Where it is.
@@ -3737,6 +3742,8 @@ struct PreparedMove<T> {
     source: MoveContext,
     before: PoolSnapshot,
     who: accounts::ProcessLogin,
+    /// What the session's login file said as the move was prepared ([`Session::seen`]).
+    seen: super::observe::Observation,
     excluded: std::collections::BTreeSet<String>,
     configured_mode: Mode,
     line: T,
@@ -3765,7 +3772,7 @@ impl<T> SessionPlan<T> {
             return None;
         };
         let roster = &prepared.before.roster;
-        let source = prepared.who.me(roster).label()?;
+        let source = accounts::observed_me(roster, &prepared.who, &prepared.seen).label()?;
         Some((roster.row(source)?, roster.row(to)?))
     }
 
@@ -4205,7 +4212,15 @@ fn session_plan_with<T, R>(
         return SessionPlan::stay(StayWhy::NoRoster);
     };
     let who = accounts::ProcessLogin::of_env_for(s.cli, s.env.iter().copied());
-    let me = who.me(&roster);
+    // The row its login file names, not the one its environment does, is the session's
+    // (`docs/DESIGN-account-discovery-2026-11-09.md`): none where no row lists that account.
+    let me = accounts::observed_me(&roster, &who, s.seen);
+    // The row its environment names while its login file names another account: that row's
+    // directory holds the other account's login, so no line of this session's reaches the row.
+    let displaced = accounts::reconcile(&roster, &who, s.seen)
+        .disagrees()
+        .then(|| accounts::judged_label(&roster, &who).map(str::to_owned))
+        .flatten();
     if me
         .label()
         .is_some_and(|label| roster.row(label).is_some_and(held_source))
@@ -4236,7 +4251,7 @@ fn session_plan_with<T, R>(
     }
     let roster = &snapshot.roster;
     let state = &snapshot.state;
-    let me = who.me(roster);
+    let me = accounts::observed_me(roster, &who, s.seen);
     let configured_mode = seat.mode_for(s.cli);
     if s.mode != configured_mode {
         return SessionPlan::stay(StayWhy::NothingDue);
@@ -4327,6 +4342,7 @@ fn session_plan_with<T, R>(
             });
         };
         if (!native || native_target_admitted(row, state, seat.now))
+            && displaced.as_deref() != Some(to.as_str())
             && let Some(line) = prepare(row)
         {
             break (advice, line);
@@ -4353,6 +4369,7 @@ fn session_plan_with<T, R>(
             },
             before: snapshot,
             who,
+            seen: s.seen.clone(),
             excluded,
             configured_mode,
             line,
@@ -4463,8 +4480,7 @@ fn finish_move<T>(
     else {
         return Err("no prepared account move".into());
     };
-    let from = who
-        .me(&before.roster)
+    let from = accounts::observed_me(&before.roster, who, &prepared.seen)
         .label()
         .ok_or("source account disappeared")?;
     let store = seat.store(session.cli);
@@ -4528,7 +4544,7 @@ fn finish_move<T>(
     }
     let candidates = without_failed_preparations(&current.state, excluded);
     let enrolled = accounts::enrolled_in(session.cli, &current.roster, seat.home);
-    let me = who.me(&current.roster);
+    let me = accounts::observed_me(&current.roster, who, &prepared.seen);
     let fresh = if matches!(session.authority, MoveAuthority::NativeCodexQuota) {
         accounts::advise_for(
             session.cli,
@@ -4744,7 +4760,9 @@ pub fn account_pool_identity_environment() {}
 /// current login into a historical one. Check the process's own login directory against
 /// current identity policy before recording anything. Keep a historical login's usage,
 /// but only an unchanged current login can prove the canary. An unrecognised login or
-/// known identity contradiction supplies neither kind of evidence.
+/// known identity contradiction supplies neither kind of evidence. `row` is the row the
+/// session's login file names ([`Session::seen`], [`accounts::observed_me`]): where that is
+/// another row than its environment names, the usage is that row's and proves no canary.
 /// Return the effective roster read under the lock for the following advice step.
 #[cfg_attr(
     any(test, debug_assertions),
@@ -4774,8 +4792,7 @@ fn record_session<R>(
         roster_path: &path,
         row,
         who,
-        // The pool's login writer proves identity under its own lock: the believed row.
-        seen: &super::observe::Observation::Unread,
+        seen: session.seen,
     };
     let mut recorded = None;
     seat.store(session.cli).transact_pool_logins_within(
@@ -4785,7 +4802,7 @@ fn record_session<R>(
         &mut None,
         |raw, state, logins| {
             let current = accounts::bound(raw, logins);
-            let me = who.me(&current);
+            let me = accounts::observed_me(&current, who, session.seen);
             if !me.default_home || !me.route.on_account() || me.label() != Some(row.label.as_str())
             {
                 return Err("session login changed; usage attribution is unknown".into());

@@ -74,6 +74,7 @@ cargo)
 		*":$ch:"*) ;;
 		*) PATH="$ch:$PATH" ;;
 		esac
+		[ -z "${ATERM_STAMP:-}" ] || echo "proxy[$tc] stamp=$ATERM_STAMP release=${ATERM_RELEASE_BUILD:-} pin=${ATERM_BUILD_GIT_COMMIT:-}" >>"${SHIM_LOG:?}"
 		echo "proxy[$tc] $* (rustc: $(command -v rustc || echo none))" >>"${SHIM_LOG:?}"
 		exit 97
 		;;
@@ -106,6 +107,7 @@ case "${1:-}" in
 --unverified)
 	shift
 	[ -z "${RUSTC:-}${CARGO_BUILD_RUSTC:-}" ] || echo "targo[9192] STEERED: RUSTC=${RUSTC:-} CARGO_BUILD_RUSTC=${CARGO_BUILD_RUSTC:-}" >>"${SHIM_LOG:?}"
+	[ -z "${ATERM_STAMP:-}" ] || echo "targo[9192] stamp=$ATERM_STAMP release=${ATERM_RELEASE_BUILD:-} pin=${ATERM_BUILD_GIT_COMMIT:-}" >>"${SHIM_LOG:?}"
 	echo "targo[9192] --unverified $* (PATH first: ${PATH%%:*})" >>"${SHIM_LOG:?}"
 	exit 97
 	;;
@@ -879,10 +881,10 @@ fn a_build_runs_under_exactly_what_the_proof_chose() {
         assert_eq!(
             recs[build_log].out,
             format!(
-                "proxy[{PIN}] build --release -p aterm --bin aterm --target-dir {root}/target --config {UNVERIFIED_LANE} (rustc: {})",
+                "proxy[{PIN}] stamp=commit release= pin=\nproxy[{PIN}] build --release -p aterm --bin aterm --target-dir {root}/target --config {UNVERIFIED_LANE} (rustc: {})",
                 lab.p(rustc)
             ),
-            "{label}"
+            "{label}: stamped with the checkout's commit"
         );
         assert_eq!(
             recs[build].var("PATH"),
@@ -943,6 +945,7 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
         &[],
     );
     let steered_log = lib.call("cat \"$SHIM_LOG\"; : >\"$SHIM_LOG\"", &[]);
+    lib.step("export ATERM_RELEASE_BUILD=1 ATERM_BUILD_GIT_COMMIT=0123456789ab");
     let build = lib.call(format!("cargo_build_pinned {}", q(&root)), &["PATH"]);
     let build_log = lib.call("cat \"$SHIM_LOG\"; : >\"$SHIM_LOG\"", &[]);
     let recs = lib.run(&scratch);
@@ -993,8 +996,9 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
     assert_eq!(
         recs[build_log].out,
         format!(
-            "targo[9192] --unverified build --release -p aterm --bin aterm --target-dir {root}/target (PATH first: {store_bin})"
-        )
+            "targo[9192] stamp=commit release= pin=\ntargo[9192] --unverified build --release -p aterm --bin aterm --target-dir {root}/target (PATH first: {store_bin})"
+        ),
+        "stamped with the checkout's commit, the caller's release mark and pin unset"
     );
     assert_eq!(
         recs[build].var("PATH"),

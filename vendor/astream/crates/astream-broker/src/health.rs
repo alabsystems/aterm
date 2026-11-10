@@ -831,7 +831,7 @@ impl HealthFile {
                 Ok(())
             }
             Err(e) => {
-                drop(file);
+                release(file);
                 let _ = crate::store::remove_file_path(&self.tmp);
                 Err(e)
             }

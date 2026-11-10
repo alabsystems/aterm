@@ -18857,7 +18857,7 @@ impl App {
             // Distinct branch.
             return None; // too narrow to name a site; the row stays the person's
         };
-        let words: String = built.iter().map(|cell| cell.ch).collect();
+        let words = crate::link_target::row_words(&built);
         let cell_h = self.win_cell_size(wid).1;
         self.splice_band_rows_at(wid, frame_row, vec![built], cols, cell_h);
         self.windows
@@ -18867,7 +18867,7 @@ impl App {
                 session: hover.session,
                 cell: hover.cell,
                 names,
-                words: words.trim().to_owned(),
+                words,
             })
     }
 

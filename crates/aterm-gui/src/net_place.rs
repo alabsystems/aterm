@@ -476,8 +476,8 @@ fn value_of(field: words::Field) -> aterm_vitals::PlaceValue {
     }
 }
 
-/// `sys`'s place for `place` at `words`: its line ([`words::line`]) and JSON object
-/// ([`words::json_fields`]).
+/// `sys`'s place for `place` at `words`: its line ([`words::line`]), JSON object
+/// ([`words::json_fields`]) and kind ([`place_kind`]).
 pub(crate) fn sys_view_of(place: &Place, words: &Words<'_>) -> aterm_vitals::PlaceView {
     aterm_vitals::PlaceView {
         line: words::line(place, words),
@@ -485,6 +485,23 @@ pub(crate) fn sys_view_of(place: &Place, words: &Words<'_>) -> aterm_vitals::Pla
             .into_iter()
             .map(|(key, value)| (key, value_of(value)))
             .collect(),
+        kind: place_kind(place),
+    }
+}
+
+/// The kind of network `place` is on, as the Machine row draws it (A4 §8): netplace's own
+/// [`aterm_netplace::Kind`] wherever it has one, offline where it is offline, and still checking
+/// where it has neither.
+pub(crate) fn place_kind(place: &Place) -> aterm_vitals::PlaceKind {
+    use aterm_netplace::Kind;
+    use aterm_vitals::PlaceKind;
+    match (place.at, place.kind) {
+        (aterm_netplace::Where::Offline, _) => PlaceKind::Offline,
+        (_, Some(Kind::Lan)) => PlaceKind::Lan,
+        (_, Some(Kind::Hotspot { .. })) => PlaceKind::Hotspot,
+        (_, Some(Kind::Cellular)) => PlaceKind::Cellular,
+        (_, Some(Kind::Vpn)) => PlaceKind::Vpn,
+        (_, None) => PlaceKind::Checking,
     }
 }
 

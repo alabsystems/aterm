@@ -2738,7 +2738,7 @@ impl Real {
         let cache = self.release.join("cutter-cache");
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
         #[cfg(unix)]
-        if self.line_priority.is_some() {
+        {
             // The new line makes the clone's old supervisor settle its compiler.
             // Join that handoff before competing for its workspace; a live
             // background owner is cancellation in progress, not a cut refusal.
@@ -3051,17 +3051,10 @@ impl Real {
                 .env(TOOLCHAIN_LEASE_LEAF_ENV, &lease.leaf);
             guards.push(lease.descriptor);
         }
-        let Some(claim) = self.line_priority.as_ref() else {
-            if !self.scratch_logs {
-                return Err("the release-line claim is absent at the cutter handover".into());
-            }
-            // A dry run has no release-line claim to hand on. Keep the actual toolchain
-            // lease across exec, while the resumed options continue to prohibit writes.
-            command
-                .inherit_exec_guards(guards)
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        };
+        let claim = self
+            .line_priority
+            .as_ref()
+            .ok_or("the release-line claim is absent at the cutter handover")?;
         let descriptor = claim
             .descriptor()
             .map_err(|e| format!("duplicate release-line claim: {e}"))?;
@@ -9771,7 +9764,6 @@ fn prepare_cached_cutter(
     real: &mut Real,
     tip: &str,
 ) -> Result<crate::release_tools::Cutter, String> {
-    real.prefreeze_claim = Some(prefreeze_admission()?);
     let tip = if let Some(target) = std::env::var_os(PREFREEZE_WORKER) {
         // The supervisor observed and imported this exact main through the typed native
         // boundary before it created a worker. Do not race that attribution with another
@@ -9787,6 +9779,15 @@ fn prepare_cached_cutter(
         tip.to_owned()
     };
     let cache = real.release.join("cutter-cache");
+    // The atomically published record binds an immutable, content-addressed executable.
+    // Rechecking that binding and kept input seal needs no compiler checkout or lease.
+    if let Some(cutter) = crate::release_tools::recorded_cutter(&cache, &tip)
+        .ok()
+        .filter(|cutter| real.cached_input_record(&cache.join("state"), cutter))
+    {
+        return Ok(cutter);
+    }
+    real.prefreeze_claim = Some(prefreeze_admission()?);
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let pid = std::process::id();
     let started = started_of(pid).ok_or("cannot identify pre-freeze holder")?;
@@ -9797,6 +9798,12 @@ fn prepare_cached_cutter(
         &mut started_of,
     )
     .map_err(|why| format!("cutter workspace unavailable: {why:?}"))?;
+    if let Some(cutter) = crate::release_tools::recorded_cutter(&cache, &tip)
+        .ok()
+        .filter(|cutter| real.cached_input_record(&cache.join("state"), cutter))
+    {
+        return Ok(cutter);
+    }
     let mut compiler = real.cutter_workspace_at(&cache, &tip)?;
     compiler.prefreeze_claim = real.prefreeze_claim.take();
     // This standalone worker has not selected a prover yet. Resolve from the new
@@ -10483,7 +10490,9 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     )
     .then(|| crate::release_target::retire(repo));
     interrupt::install();
-    let line = if !opts.dry_run && inherited_line.is_none() {
+    // Dry judgments need the same clone-local compiler handoff as a cut. This
+    // capacity claim settles the old supervisor; it reserves no publication state.
+    let line = if inherited_line.is_none() {
         match aterm_capacity::admit(
             aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
             aterm_capacity::Admit::Wait,
@@ -10853,16 +10862,7 @@ mod tests {
             ("x86_64-apple-darwin", 25_890_799_616, "CompatClaim"),
         ] {
             let mut records = aterm_capacity::book::Records::default();
-            records.push(
-                aterm_capacity::book::Key {
-                    checkout: String::new(),
-                    stage: "release slice unit".into(),
-                    crates: Some(vec!["aterm".into()]),
-                    variant: Some(format!("{triple} aterm bin")),
-                },
-                peak,
-                1,
-            );
+            records.push(crate::slice_units::key(triple, &unit), peak, 1);
             let need = crate::slice_units::unit_need(triple, &records, &unit, 4 << 30);
             assert!(need.mem >= peak);
             let modeled = model
@@ -10951,9 +10951,9 @@ mod tests {
             "SlicesStart",
             "CompatRuns",
             "LintEnds",
+            "CompatEnds",
             "NativeRuns",
             "NativeEnds",
-            "CompatEnds",
         ] {
             let next = model.successors(action, &state).pop().unwrap();
             let (ok, why) = aterm_spec::verify::validate_transition_tiered(
@@ -10968,11 +10968,11 @@ mod tests {
             state = next;
         }
         assert_eq!(state["held"], 0);
-        // The undersized mutant admits both links beside lint, fitting its declared
-        // claims while exceeding memory at the recorded lint peak.
+        // The undersized mutant admits the native link beside lint, fitting its
+        // declared claims while exceeding the budget at the recorded lint peak.
         let mutant = with_buggy(&model, 1);
         let mut state = mutant.init_state();
-        for action in ["UndersizedLint", "SlicesStart", "NativeRuns", "CompatRuns"] {
+        for action in ["UndersizedLint", "SlicesStart", "NativeRuns"] {
             state = mutant.successors(action, &state).pop().unwrap();
         }
         assert!(mutant.check_invariant("FitsMemory", &state));
@@ -16497,16 +16497,23 @@ mod tests {
         );
     }
 
+    /// On macOS a dry run's logs go in its temp root's quiet folder, which fseventsd drops, even
+    /// where that root is heard; elsewhere nothing drops a file event by its path, so they go in
+    /// the root itself ([`aterm_tempfile::quiet_in`]).
     #[test]
-    fn dry_run_logs_are_quiet_even_when_the_callers_temp_root_is_heard() {
+    fn dry_run_logs_go_quiet_on_macos_even_when_the_callers_temp_root_is_heard() {
         let root = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
         assert!(!aterm_tempfile::is_quiet(root.path()));
         let logs = dry_log_dir(root.path(), 42, 7);
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(logs.join("operational-status.json"), b"{}").unwrap();
-        assert!(aterm_tempfile::is_quiet(&logs));
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(aterm_tempfile::is_quiet(&logs), macos);
         assert!(logs.ends_with("aterm-release-dry-42-7.noindex"));
-        assert!(!root.path().join("aterm-release-dry-42-7.noindex").exists());
+        assert_eq!(
+            root.path().join("aterm-release-dry-42-7.noindex").exists(),
+            !macos
+        );
     }
 
     /// A handed cutter carries the moment it was judged from, with this process as the one that

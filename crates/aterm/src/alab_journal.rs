@@ -42,13 +42,17 @@ impl Sink for Glue {
         keyer(realm, email)
     }
 
-    fn note(&self, note: &Note) {
+    fn note(&self, note: &Note) -> bool {
         if !self.publishing.now() {
-            return;
+            return false;
         }
-        if let (Some(spool), Some(event)) = (&self.spool, event(note)) {
-            // The spool drops what it cannot take; a note never waits or fails its caller.
-            let _ = spool.append(&event);
+        let (Some(spool), Some(event)) = (&self.spool, event(note)) else {
+            return false;
+        };
+        // The spool drops what it cannot take; a note never waits or fails its caller.
+        match spool.append(&event) {
+            Ok(Appended::Written) => true,
+            Ok(Appended::Full | Appended::Refused) | Err(_) => false,
         }
     }
 
@@ -150,14 +154,14 @@ fn probe(event: &ProbeEvent) {
 }
 
 /// The user's home, when it is absolute.
-fn user_home() -> Option<PathBuf> {
+pub(crate) fn user_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
 }
 
 /// `cli`'s roster beside the aterm config at `config`.
-fn roster_of(config: Option<&Path>, cli: Cli) -> Option<Roster> {
+pub(crate) fn roster_of(config: Option<&Path>, cli: Cli) -> Option<Roster> {
     let path = accounts::roster_beside_for(config?, cli)?;
     Roster::load_for(cli, &path).ok()
 }
@@ -334,6 +338,14 @@ mod tests {
                 journal::Key::new("ac-fedcba9876543210"),
                 journal::Tab::of("machine", "s-41a2"),
                 journal::ObservedSrc::Profile,
+                9_999_999_999,
+            ),
+            // The machine sweep's sighting of an idle login, which names no tab.
+            journal::idle_seen_note(
+                Cli::Kimi,
+                account,
+                journal::ObservedSrc::AuthFile,
+                journal::SeenWhy::First,
                 9_999_999_999,
             ),
         ];
@@ -547,10 +559,10 @@ mod tests {
             .path()
             .join("alab")
             .join(aterm_db::alab::journal::spool::SPOOL);
-        glue.note(&note);
+        assert!(!glue.note(&note), "a note made while off is not taken");
         assert!(!spooled.exists(), "nothing is spooled while off");
         std::fs::write(&config, "[alab]\njournal = true\n").unwrap();
-        glue.note(&note);
+        assert!(glue.note(&note), "a spooled note is taken");
         assert!(spooled.exists(), "on again, the note is spooled");
     }
 

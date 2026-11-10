@@ -10,6 +10,99 @@ const NATIVE: &str = "aarch64-apple-darwin";
 const COMPAT: &str = "x86_64-apple-darwin";
 
 #[test]
+fn stale_compiler_and_rss_records_cannot_admit_an_unmeasured_link() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let record = dir.path().join("units.json");
+    let mut records = Records::default();
+    let current = key(NATIVE, &last_unit());
+    let prefix = current
+        .variant
+        .as_ref()
+        .unwrap()
+        .rsplit_once(' ')
+        .unwrap()
+        .0;
+    let variants = vec![
+        format!("{NATIVE} aterm bin"),
+        format!("{prefix} trust-stale"),
+    ];
+    #[cfg(target_os = "macos")]
+    let variants = {
+        let mut variants = variants;
+        variants.push(
+            current
+                .variant
+                .as_ref()
+                .unwrap()
+                .replace("phys-footprint-tree-v1", "phys-footprint-v1"),
+        );
+        variants
+    };
+    for variant in variants {
+        let mut stale = current.clone();
+        stale.variant = Some(variant);
+        records.push(stale, GIB, 1);
+    }
+    records.save(&record).unwrap();
+    assert_eq!(peak(&records, NATIVE, &last_unit()), None);
+    let units = Units::of(&record, &[NATIVE], 1);
+    assert!(!units[0].claims());
+    assert!(slice_need(NATIVE, Some(&units[0])).alone);
+    // Even if the driver's earlier decision enabled unit claims, the wrapper
+    // refuses before spawning a compiler against this stale book.
+    #[cfg(unix)]
+    {
+        let mut claiming = units[0].clone();
+        claiming.spare = Some(DRIVER);
+        let args = [
+            "/usr/bin/true",
+            "--crate-name",
+            "aterm",
+            "--crate-type",
+            "bin",
+        ]
+        .map(OsString::from);
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, 76, 18));
+        assert!(
+            wrap(&args, Some("aterm"), &claiming, &ledger, &machine)
+                .unwrap_err()
+                .contains("no matching toolchain footprint")
+        );
+        assert!(ledger.list().unwrap().is_empty());
+    }
+    // A matching measurement receives the margin, retaining the larger run
+    // when a later successful link is lighter.
+    records.push(current.clone(), 20 * GIB, 2);
+    records.push(current, 10 * GIB, 3);
+    records.save(&record).unwrap();
+    assert!(Units::of(&record, &[NATIVE], 1)[0].claims());
+    assert_eq!(
+        unit_need(NATIVE, &records, &last_unit(), DRIVER).mem,
+        24 * GIB
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unreaped_child_retains_its_kernel_footprint_peak() {
+    let child = aterm_uds::spawnfd::command("/usr/bin/true")
+        .spawn()
+        .unwrap();
+    let CompilerUsage {
+        status, peak, rss, ..
+    } = wait(child).unwrap();
+    assert!(status.success());
+    assert!(
+        peak.is_some_and(|p| p > 0),
+        "the final zombie read must supply physical footprint"
+    );
+    assert!(rss.is_some_and(|p| p > 0));
+    // A missing process is not a zero-byte measurement.
+    assert_eq!(footprint(u32::MAX), None);
+}
+
+#[test]
 fn unit_timeline_keeps_identity_timestamps_failure_and_unknown_cpu() {
     let units = Units {
         record: PathBuf::from("unused"),
@@ -48,6 +141,9 @@ fn wrapper_timeline_probe() {
         triple: NATIVE.to_owned(),
         spare: (mode == "claim").then_some(2 * DRIVER),
     };
+    let mut records = Records::default();
+    records.push(key(NATIVE, &last_unit()), GIB, 1);
+    records.save(&units.record).unwrap();
     let mut args = vec![OsString::from("/usr/bin/false")];
     args.extend(["--crate-name", "fixture", "--crate-type", "lib"].map(OsString::from));
     if mode == "query" {
@@ -105,16 +201,8 @@ fn unit(package: &str, kind: &str) -> UnitName {
     }
 }
 
-/// A BUILD WHOSE RECORD HOLDS EVERY SLICE'S LAST UNIT HAS EACH SLICE CLAIM ITS DRIVER, AND EACH
-/// UNIT ITS OWN PEAK, ROUNDED UP AND LEADING, WITH EVERY DRIVER THE BUILD HOLDS AT ONCE SPARE:
-/// `aterm`'s 41.7 GiB link claims 42 GiB and a 19.2 GiB lib 20, each at Release rank with both
-/// slices' 2 GiB drivers spare, a unit the record does not hold claims the 1 GiB floor, and a
-/// build of one slice at a time leaves one driver spare. Cargo's environment names this
-/// executable its wrapper, the record, the triple and that spare. NEGATIVE CONTROLS: with no
-/// record of the last units the slices claim their whole peaks as before (42 and 23 GiB) and
-/// their wrappers only record; nor does either slice's units claim while only the native
-/// slice's last unit is on record, since each slice's compilers leave the other slice's claim,
-/// their own process's, out of their admission.
+/// Matching records enable unit claims with margins and driver spare. Without
+/// both final links, the slices learn alone and wrappers only record.
 #[test]
 fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit_its_own() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -128,9 +216,9 @@ fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit
     };
     let empty = Units::of(&record, &slices, 2);
     assert_eq!(spares(2), [None, None]);
-    assert_eq!(slice_need(NATIVE, true, Some(&empty[0])).mem, 42 * GIB);
-    assert_eq!(slice_need(COMPAT, false, Some(&empty[1])).mem, 23 * GIB);
-    assert_eq!(slice_need(COMPAT, false, None).mem, 23 * GIB);
+    assert!(slice_need(NATIVE, Some(&empty[0])).alone);
+    assert!(slice_need(COMPAT, Some(&empty[1])).alone);
+    assert!(slice_need(COMPAT, None).alone);
     let wrapper = Path::new("/r/aterm-release");
     assert!(!empty[0].env(wrapper).iter().any(|(k, _)| *k == CLAIMS));
 
@@ -154,18 +242,18 @@ fn a_build_with_every_slices_last_unit_recorded_claims_its_drivers_and_each_unit
     assert_eq!(spares(1), [Some(DRIVER), Some(DRIVER)]);
     let both = Units::of(&record, &slices, 2);
     assert!(both.iter().all(Units::claims));
-    assert_eq!(slice_need(NATIVE, true, Some(&both[0])).mem, DRIVER);
-    assert_eq!(slice_need(COMPAT, false, Some(&both[1])).mem, DRIVER);
+    assert_eq!(slice_need(NATIVE, Some(&both[0])).mem, DRIVER);
+    assert_eq!(slice_need(COMPAT, Some(&both[1])).mem, DRIVER);
     assert_eq!(DRIVER, 2 * GIB);
     let records = Records::load(&record);
     let link = unit_need(NATIVE, &records, &last_unit(), 2 * DRIVER);
     assert_eq!(
         (link.mem, link.margin, link.leads, link.rank),
-        (42 * GIB, 4 * GIB, true, aterm_capacity::Rank::Release)
+        (51 * GIB, 4 * GIB, true, aterm_capacity::Rank::Release)
     );
     let need = |u: &UnitName| unit_need(NATIVE, &records, u, 2 * DRIVER).mem;
-    assert_eq!(need(&unit("aterm-gui", "aterm_gui lib")), 20 * GIB);
-    assert_eq!(need(&unit("aterm-cell", "aterm_cell lib")), FLOOR);
+    assert_eq!(need(&unit("aterm-gui", "aterm_gui lib")), 24 * GIB);
+    assert_eq!(need(&unit("aterm-cell", "aterm_cell lib")), 2 * FLOOR);
     let env = both[0].env(wrapper);
     let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
     assert_eq!(
@@ -254,6 +342,7 @@ fn the_wrapper_runs_each_compiler_under_its_claim_and_keeps_a_finished_ones_peak
     let kept = unit("fixture", "kept lib");
     let heavy = unit("fixture", "heavy lib");
     let mut records = Records::default();
+    records.push(key(NATIVE, &last_unit()), GIB, 1);
     records.push(key(NATIVE, &kept), 2 * GIB, 1);
     records.push(key(NATIVE, &heavy), 41 * GIB, 1);
     records.save(&record).unwrap();

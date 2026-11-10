@@ -20,8 +20,8 @@ use std::time::Duration;
 use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::native_act::{
     AskedIntent, Binding, BootStamp, CancelPrepare, ClaimOutcome, Closure, ColdEnvironmentFacts,
-    ColdIntent, Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process, Recorded,
-    Request, RestartCommand, Retirement,
+    ColdIntent, Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process,
+    RecipientWriterSupport, Recorded, Request, RestartCommand, Retirement,
 };
 
 use crate::session_timeline::{
@@ -238,6 +238,9 @@ pub(crate) fn serve_codex_exec_handoff(_: &Arc<crate::SessionCtx>, _: i32, _: &s
 
 const DENIED: &str = "ERR denied native operation authority\n";
 const RECIPIENT_WRITER_UNAVAILABLE: &str = "ERR native complete-recipient writer unavailable\n";
+// Storage support and bundle reader declarations do not establish the live
+// admission/Execute protocol. Keep discovery negative until that path exists.
+const RECIPIENT_WRITER_SUPPORT: RecipientWriterSupport = RecipientWriterSupport::Unavailable;
 const UNKNOWN: &str = "OK native-act state=unknown\n";
 const NOEXEC: &str = "OK native-act state=retired reason=no-exec-grant\n";
 #[cfg(test)]
@@ -4802,6 +4805,7 @@ fn serve_request(
         },
         Request::Prepare(request) => return prepare(ctx, master, *request, caller, kernel),
         Request::CancelSupport => return "OK native-act state=cancel-support cancel-prepare=1\n".into(),
+        Request::RecipientWriterSupport => return format!("OK native-act state=recipient-writer-support writer={}\n", RECIPIENT_WRITER_SUPPORT.word()),
         Request::CancelPrepare(request) => return cancel_prepare(ctx, master, *request, caller, kernel),
         request => request,
     };
@@ -4811,6 +4815,7 @@ fn serve_request(
         | Request::RejectionDomain
         | Request::Prepare(_)
         | Request::CancelSupport
+        | Request::RecipientWriterSupport
         | Request::CancelPrepare(_) => unreachable!(),
         Request::Precommit(b, _)
         | Request::Commit(b, _, _)
@@ -5472,6 +5477,7 @@ fn serve_request(
         | Request::RejectionDomain
         | Request::Prepare(_)
         | Request::CancelSupport
+        | Request::RecipientWriterSupport
         | Request::CancelPrepare(_)
         | Request::Attach(..)
         | Request::Resolve(..)

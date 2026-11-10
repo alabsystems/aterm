@@ -31,6 +31,9 @@ aterm-toolchain = { workspace = true }
 # (`aterm_capacity::telemetry::capture`). aterm-capacity already links it.
 aterm-telemetry = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+trust-exec-policy = { workspace = true }
+
 [lints]
 workspace = true
 

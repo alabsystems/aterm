@@ -1106,6 +1106,10 @@ fn cancelled_paid_metadata_preparation_joins_before_native_release_and_settlemen
 #[cfg(target_os = "macos")]
 mod metadata_native;
 
+#[cfg(target_os = "macos")]
+#[path = "resource_admission_owner_tests/member_started.rs"]
+mod member_started;
+
 #[test]
 fn workload_ancestry_slice_waits_without_renewing_or_granting_original_resources() {
     if !aterm_uds::test_binary::isolated_lifecycle(

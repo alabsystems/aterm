@@ -327,11 +327,13 @@ impl Columns {
         self.subject.push(subject);
     }
 
-    fn reserve_exact(&mut self, n: usize) {
-        self.at.reserve_exact(n);
-        self.bt.reserve_exact(n);
-        self.meta.reserve_exact(n);
-        self.subject.reserve_exact(n);
+    fn preallocate(&mut self, n: usize) {
+        if n <= 16_777_216 {
+            self.at.reserve_exact(n);
+            self.bt.reserve_exact(n);
+            self.meta.reserve_exact(n);
+            self.subject.reserve_exact(n);
+        }
     }
 
     /// The entries each column holds.
@@ -367,7 +369,7 @@ impl Columns {
     #[cfg(any(test, feature = "retention"))]
     fn drain_front(&mut self, n: usize) {
         fn drain<T>(v: &mut Vec<T>, n: usize) {
-            v.drain(..n.min(v.len()));
+            vec_drop_prefix(v, n);
             if v.capacity() > 64 && v.len() <= v.capacity() / 4 {
                 v.shrink_to(v.len().saturating_mul(2));
             }
@@ -384,6 +386,27 @@ impl Columns {
         self.meta.clear();
         self.subject.clear();
     }
+}
+
+#[cfg(any(test, feature = "retention"))]
+fn vec_drop_prefix<T>(v: &mut Vec<T>, k: usize) {
+    let len = v.len();
+    let drop_n = k.min(len);
+    if drop_n == 0 {
+        return;
+    }
+    let keep = len.saturating_sub(drop_n);
+    for idx in 0..keep {
+        let src = idx.saturating_add(drop_n);
+        if let Some(sub) = v.get_mut(idx..=src) {
+            if let Some((first, rest)) = sub.split_first_mut() {
+                if let Some(end) = rest.last_mut() {
+                    std::mem::swap(first, end);
+                }
+            }
+        }
+    }
+    v.truncate(keep);
 }
 
 /// Up to [`PAGE`] consecutive retained records: where their frame starts and broker times
@@ -587,9 +610,10 @@ impl Walk<'_> {
         let tier = self.tier;
         while self.i < self.hi.min(tier.len) {
             let j = tier.head.saturating_add(self.i);
-            let p = j >> tier.shift;
-            let end = (p.saturating_add(1) << tier.shift)
-                .min(tier.head.saturating_add(self.hi.min(tier.len)));
+            let s = tier.shift & 31;
+            let p = j >> s;
+            let end =
+                (p.saturating_add(1) << s).min(tier.head.saturating_add(self.hi.min(tier.len)));
             let page = tier.pages.get(p);
             let metas = tier.cols.meta.get(j..end);
             let locals = tier.cols.subject.get(j..end);
@@ -844,8 +868,9 @@ impl<W: FnMut(&str) -> bool> Passing<'_, W> {
         let tier = self.tier;
         while self.i < self.hi {
             let j = tier.head.saturating_add(self.i);
-            let p = j >> tier.shift;
-            let end = (p.saturating_add(1) << tier.shift).min(tier.head.saturating_add(self.hi));
+            let s = tier.shift & 31;
+            let p = j >> s;
+            let end = (p.saturating_add(1) << s).min(tier.head.saturating_add(self.hi));
             let n = end.saturating_sub(j).max(1);
             let page = tier.pages.get(p);
             let metas = tier.cols.meta.get(j..end);
@@ -955,7 +980,7 @@ impl Tier {
 
     /// The places a page holds minus one: the mask of a place within its page.
     fn mask(&self) -> usize {
-        (1usize << self.shift).saturating_sub(1)
+        (1usize << (self.shift & 31)).saturating_sub(1)
     }
 
     /// Whether a [`Walk`] keeps its last subject name across a page boundary: under a test's
@@ -977,7 +1002,7 @@ impl Tier {
             return None;
         }
         let j = self.head.checked_add(i)?;
-        let page = self.pages.get(j >> self.shift)?;
+        let page = self.pages.get(j >> (self.shift & 31))?;
         Some((page, j))
     }
 
@@ -1008,7 +1033,7 @@ impl Tier {
             self.cols.meta.len(),
             "a record's place is its column entry"
         );
-        if j >> self.shift >= self.pages.len() {
+        if (j >> (self.shift & 31)) >= self.pages.len() {
             self.pages.push(Page::new(at));
         }
         let mask = self.mask();
@@ -1303,8 +1328,8 @@ impl Tier {
             self.pages.truncate((end + self.mask()) >> self.shift);
             self.cols.truncate(end);
             let from = self.base + keep as u64;
-            drop(self.wide_at.split_off(&from));
-            drop(self.wide_bt.split_off(&from));
+            self.wide_at.retain(|&k, _| k < from);
+            self.wide_bt.retain(|&k, _| k < from);
             self.renumber_last_page();
         }
         self.shadow.truncate(keep);
@@ -1662,9 +1687,11 @@ impl Tier {
         if let Some(first) = records.first() {
             self.base = first.seq.0;
         }
-        self.pages
-            .reserve_exact((n >> self.shift).saturating_add(1));
-        self.cols.reserve_exact(n);
+        let pages = (n >> (self.shift & 31)).saturating_add(1);
+        if pages <= 16_777_216 {
+            self.pages.reserve_exact(pages);
+        }
+        self.cols.preallocate(n);
         let hot_start = hot_window_start(&records, self.budget);
         for (i, rec) in records.into_iter().enumerate() {
             let bt = bts.get(i).copied().flatten();
@@ -1720,11 +1747,13 @@ impl Tier {
 
     /// Room in the pages and columns for `records` records in all.
     fn reserve_for(&mut self, records: usize) {
-        let pages = (records >> self.shift).saturating_add(1);
-        self.pages
-            .reserve_exact(pages.saturating_sub(self.pages.len()));
+        let pages = (records >> (self.shift & 31)).saturating_add(1);
+        let add_pages = pages.saturating_sub(self.pages.len());
+        if add_pages <= 16_777_216 {
+            self.pages.reserve_exact(add_pages);
+        }
         self.cols
-            .reserve_exact(records.saturating_sub(self.cols.len()));
+            .preallocate(records.saturating_sub(self.cols.len()));
     }
 
     /// Drop the oldest `n` records (a retention cut) and move every kept frame start
@@ -1741,17 +1770,19 @@ impl Tier {
         self.maybe_shrink_hot();
         self.give_subjects(0..n);
         let gone = self.head.saturating_add(n);
-        let whole = (gone >> self.shift).min(self.pages.len());
-        self.pages.drain(..whole);
-        self.cols.drain_front(whole << self.shift);
+        let s = self.shift & 31;
+        let whole = (gone >> s).min(self.pages.len());
+        vec_drop_prefix(&mut self.pages, whole);
+        self.cols.drain_front(whole << s);
         self.head = gone & self.mask();
         self.len = self.len.saturating_sub(n);
         self.base = self.base.saturating_add(n as u64);
         if self.len == 0 {
             self.clear_pages();
         } else {
-            self.wide_at = self.wide_at.split_off(&self.base);
-            self.wide_bt = self.wide_bt.split_off(&self.base);
+            let min_key = self.base;
+            self.wide_at.retain(|&k, _| k >= min_key);
+            self.wide_bt.retain(|&k, _| k >= min_key);
             self.shift_frames(shift);
         }
         if self.pages.capacity() > 64 && self.pages.len() <= self.pages.capacity() / 4 {
@@ -1771,7 +1802,7 @@ impl Tier {
     /// first page, whose cut entries start below the cut) has each live entry rewritten.
     #[cfg(any(test, feature = "retention"))]
     fn shift_frames(&mut self, by: u64) {
-        let page = 1usize << self.shift;
+        let page = 1usize << (self.shift & 31);
         let end = self.head.saturating_add(self.len);
         let mut rewritten: BTreeMap<u64, u64> = BTreeMap::new();
         for p in 0..self.pages.len() {
@@ -1789,7 +1820,7 @@ impl Tier {
             // Each live entry's frame start, read before the page moves, then written moved.
             let mut moved: Vec<(usize, u64, u64)> = Vec::new();
             for k in lo..hi {
-                let j = p.saturating_mul(page) + k;
+                let j = p.saturating_mul(page).saturating_add(k);
                 let i = j.saturating_sub(self.head);
                 let off = self.base.saturating_add(i as u64);
                 if let Some(a) = self.at(i) {
@@ -2044,11 +2075,17 @@ impl Opening {
     pub(crate) fn finish(self, reread: Reread<'_>) -> std::io::Result<Tier> {
         let mut t = self.tier;
         let count = self.ring.len();
-        let mut hot = VecDeque::with_capacity(count);
+        let mut hot = if count <= 16_777_216 {
+            VecDeque::with_capacity(count)
+        } else {
+            VecDeque::new()
+        };
         if let Some(held) = self.held {
             #[cfg(test)]
             WINDOWS.with(|n| n.set((n.get().0.saturating_add(1), n.get().1)));
-            hot.extend(held.into_iter().map(Arc::new));
+            for rec in held {
+                hot.push_back(Arc::new(rec));
+            }
         } else if let Some(&(at, _)) = self.ring.front() {
             #[cfg(test)]
             WINDOWS.with(|n| n.set((n.get().0, n.get().1.saturating_add(1))));
@@ -2058,7 +2095,7 @@ impl Opening {
             let first = t.base.saturating_add(skipped as u64);
             let mut costs = self.ring.iter();
             let mut next = first;
-            reread(at, first, count, &mut |rec: BrokerRecord| {
+            let mut on_rec = |rec: BrokerRecord| -> std::io::Result<()> {
                 let due = costs.next().map(|&(_, cost)| cost);
                 if rec.seq.0 != next || due != Some(resident_cost(&rec)) {
                     return Err(not_the_window(next, rec.seq.0));
@@ -2066,7 +2103,11 @@ impl Opening {
                 next = next.saturating_add(1);
                 hot.push_back(Arc::new(rec));
                 Ok(())
-            })?;
+            };
+            let on_rec_ref: &mut dyn FnMut(BrokerRecord) -> std::io::Result<()> = &mut on_rec;
+            if let Some(r) = Some(()).map(|()| reread(at, first, count, on_rec_ref)) {
+                r?;
+            }
         }
         if hot.len() != count {
             return Err(std::io::Error::new(
@@ -2128,6 +2169,13 @@ impl<'a> Iterator for Entries<'a> {
 /// The retention planning reads the tier's pages as its records: each one's summary and
 /// broker time, walked a page at a time, and no whole record (the planning loads a carried
 /// one through `BrokerLog::record_arc`).
+impl Tier {
+    #[cfg(feature = "retention")]
+    fn retention_entries(&self, from: usize, to: usize) -> Entries<'_> {
+        Entries(self.summaries(from, to).walk())
+    }
+}
+
 #[cfg(feature = "retention")]
 impl crate::retention::Records for Tier {
     type Entries<'a> = Entries<'a>;
@@ -2143,7 +2191,7 @@ impl crate::retention::Records for Tier {
     }
 
     fn entries(&self, from: usize, to: usize) -> Entries<'_> {
-        Entries(self.summaries(from, to).walk())
+        self.retention_entries(from, to)
     }
 
     fn whole(&self, _i: usize) -> Option<Arc<BrokerRecord>> {

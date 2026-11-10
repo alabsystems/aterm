@@ -3409,6 +3409,13 @@ impl<C: Ctl> Session<'_, C> {
         {
             self.left_went = None;
         }
+        // The account the session runs on is sighted at every point, watched or carried: a
+        // tape recorded before the door replays as recorded.
+        if !self.fx.replay_lacks_host_door("host.account_seen")
+            && let Some(host) = opts.idle_host.as_ref()
+        {
+            host.account_seen();
+        }
         if self.claim.watching_behind().is_some() {
             return Ok(TurnEndAction::Nothing);
         }

@@ -181,6 +181,8 @@ fn path_into(pid: i32, buf: &mut [u8; PATH_CAP]) -> Option<usize> {
 
 /// `PROC_PGRP_ONLY` (`sys/proc_info.h`).
 const PROC_PGRP_ONLY: u32 = 2;
+/// `PROC_UID_ONLY` (`sys/proc_info.h`): by effective user.
+const PROC_UID_ONLY: u32 = 4;
 /// `PROC_RUID_ONLY` (`sys/proc_info.h`).
 const PROC_RUID_ONLY: u32 = 5;
 
@@ -561,6 +563,21 @@ pub(crate) fn machine_words() -> crate::MachineWords {
     }
 }
 
+/// [`crate::machine_type::read`] on macOS: `hw.model` and the device tree's `product` node's
+/// `product-name` (a NUL-terminated CFData), read in process through the registry.
+pub(crate) fn machine_type() -> crate::machine_type::MachineType {
+    // SAFETY: A NUL-terminated registry path; the entry is +1 or 0.
+    let product = unsafe {
+        iokit::IORegistryEntryFromPath(MAIN_PORT_DEFAULT, c"IODeviceTree:/product".as_ptr())
+    };
+    let product_name = (product != 0).then(|| Io(product)).and_then(|entry| {
+        let key = Cf::string(c"product-name")?;
+        let value = Cf::property(entry.0, key.0)?;
+        cf_text(value.0)
+    });
+    crate::machine_type::mac_type(sysctl_text(c"hw.model").as_deref(), product_name.as_deref())
+}
+
 /// A string sysctl (at most 63 bytes), NUL-trimmed; `None` where unreadable or empty.
 fn sysctl_text(name: &CStr) -> Option<String> {
     sysctl_text_in::<64>(name)
@@ -921,11 +938,12 @@ unsafe impl Send for Accel {}
 unsafe impl Sync for Accel {}
 
 /// The power manager's root domain and the keys read off it (`System Capabilities`,
-/// `AppleClamshellState`), kept for the process.
+/// `AppleClamshellState`, `Last Sleep Reason`), kept for the process.
 struct RootDomain {
     service: Io,
     capabilities: Cf,
     clamshell: Cf,
+    sleep_reason: Cf,
 }
 
 // SAFETY: `service` is a Mach port name and the keys immutable CFStrings the process keeps; IOKit
@@ -956,6 +974,7 @@ fn root_domain() -> Option<&'static RootDomain> {
             service,
             capabilities: Cf::string(c"System Capabilities")?,
             clamshell: Cf::string(c"AppleClamshellState")?,
+            sleep_reason: Cf::string(c"Last Sleep Reason")?,
         })
     })
     .as_ref()
@@ -974,14 +993,40 @@ pub(crate) fn system_capabilities() -> Option<u32> {
 /// (a CFBoolean, `true` while the lid is closed). `None` where the key is missing, as on a Mac
 /// with no lid, or is not a boolean.
 pub(crate) fn clamshell_closed() -> Option<bool> {
+    clamshell_state().flatten()
+}
+
+/// The lid as the root domain publishes it, telling a Mac with no lid from a root domain that
+/// could not be read: `None` where the root domain could not be found or publishes an
+/// `AppleClamshellState` that is not a boolean (unread, never "no lid"); `Some(None)` where it
+/// publishes none ("not present == no clamshell on this hardware", `IOKit/pwr_mgt/IOPM.h`); else
+/// `Some(Some(closed))`.
+pub(crate) fn clamshell_state() -> Option<Option<bool>> {
     let root = root_domain()?;
-    let value = Cf::property(root.service.0, root.clamshell.0)?;
+    let Some(value) = Cf::property(root.service.0, root.clamshell.0) else {
+        return Some(None);
+    };
     // SAFETY: `value` is a live +1 CF object this function holds; its type is checked before
     // `CFBooleanGetValue` reads it as a boolean.
     unsafe {
         (iokit::CFGetTypeID(value.0) == iokit::CFBooleanGetTypeID())
-            .then(|| iokit::CFBooleanGetValue(value.0.cast()) != 0)
+            .then(|| Some(iokit::CFBooleanGetValue(value.0.cast()) != 0))
     }
+}
+
+/// The root domain's `Last Sleep Reason` (`Clamshell Sleep`, `Idle Sleep`, `Software Sleep`):
+/// why the machine last slept, which the power manager keeps for the last sleep only. `None`
+/// where the root domain or the key is missing.
+pub(crate) fn sleep_reason() -> Option<String> {
+    let root = root_domain()?;
+    let value = Cf::property(root.service.0, root.sleep_reason.0)?;
+    cf_text(value.0)
+}
+
+/// The root domain's service, kept for the process (the watch registers its interest on it);
+/// `None` where it could not be found.
+pub(crate) fn root_service() -> Option<io_registry_entry_t> {
+    root_domain().map(|root| root.service.0)
 }
 
 /// [`crate::power::hold`] on macOS: a power assertion of type `kind` named `name`, created at
@@ -1683,6 +1728,45 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
         crate::machine::listed_count(i64::from(all), room),
         crate::machine::owned_count(i64::from(own / width), errno, room),
     )
+}
+
+/// The pids effective user `uid` runs, ascending, into `pids` (cleared first): the D-state
+/// census's list ([`crate::dstate::Kernel`]), whose thread reads the kernel permits for the
+/// effective user. `false` when the list fails; an empty list is an answer.
+pub(crate) fn uid_pids(uid: u32, pids: &mut Vec<u32>) -> bool {
+    pids.clear();
+    // SAFETY: A null buffer asks for the room only.
+    let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Some(room) = crate::machine::pid_room(i64::from(estimate)) else {
+        return false;
+    };
+    let mut buf = vec![0 as c_int; room];
+    let Ok(bytes) = c_int::try_from(std::mem::size_of_val(buf.as_slice())) else {
+        return false;
+    };
+    // SAFETY: `buf` is writable for `bytes` bytes, the size passed; the call returns how many
+    // bytes it wrote. `errno` is this thread's, cleared first: libproc answers zero both for a
+    // user that runs nothing and for a failure, and only a failure sets it.
+    let (n, errno) = unsafe {
+        *libc::__error() = 0;
+        let n = proc_listpids(PROC_UID_ONLY, uid, buf.as_mut_ptr().cast(), bytes);
+        (n, *libc::__error())
+    };
+    let width = std::mem::size_of::<c_int>() as c_int;
+    let Some(n) = crate::machine::owned_count(i64::from(n / width), errno, room)
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return false;
+    };
+    pids.extend(
+        buf[..n]
+            .iter()
+            .filter_map(|&p| u32::try_from(p).ok())
+            .filter(|&p| p > 0),
+    );
+    pids.sort_unstable();
+    pids.dedup();
+    true
 }
 
 /// [`fn@crate::caps`] on macOS.

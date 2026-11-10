@@ -235,15 +235,19 @@ pub fn probe_parent_write(app_root: &Path) -> ParentWrite {
 /// The verdict of a failed probe `create_dir` in `parent`.
 pub(crate) fn classify_probe_error(parent: &Path, error: &std::io::Error) -> ParentWrite {
     let message = format!("create a probe in {}: {error}", parent.display());
-    let passing = matches!(
-        error.raw_os_error(),
-        Some(libc::ENOSPC | libc::EDQUOT | libc::EIO | libc::EINTR)
-    ) || crate::verify::io_error_is_passing(error);
-    if passing {
+    if write_error_is_passing(error) {
         ParentWrite::Passing(message)
     } else {
         ParentWrite::NotWritable(message)
     }
+}
+
+/// Whether a native write failed because of temporary volume or process resources.
+pub(crate) fn write_error_is_passing(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSPC | libc::EDQUOT | libc::EIO | libc::EINTR)
+    ) || crate::verify::io_error_is_passing(error)
 }
 
 #[cfg(test)]

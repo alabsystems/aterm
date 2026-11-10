@@ -1,6 +1,41 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+#[test]
+fn a_fixed_path_write_keeps_resource_pressure_out_of_the_failure_budget() {
+    for errno in [
+        libc::ENOSPC,
+        libc::EDQUOT,
+        libc::EIO,
+        libc::EINTR,
+        libc::EMFILE,
+    ] {
+        let error = std::io::Error::from_raw_os_error(errno);
+        let refusal = fixed_path_write_refusal("move verified stage to fixed swap path", &error);
+        assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+    }
+    for errno in [libc::EACCES, libc::EPERM, libc::EROFS, libc::ENOENT] {
+        let error = std::io::Error::from_raw_os_error(errno);
+        let refusal = fixed_path_write_refusal("remove stale fixed rollback", &error);
+        assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+    }
+}
+
+#[test]
+fn a_fixed_swap_copy_that_runs_out_of_space_is_not_a_verdict_on_the_update() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let status = std::process::ExitStatus::from_raw(1 << 8);
+    for cause in ["No space left on device", "Disc quota exceeded"] {
+        let refusal = super::bundle_transfer_failure(
+            std::path::Path::new("/Applications"),
+            "ditto to fixed swap path failed",
+            status,
+            &format!("ditto: /Applications/aterm.app.old/Contents/MacOS/aterm: {cause}\n"),
+        );
+        assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+    }
+}
+
 /// `ditto` names files the bundle chose, so a line naming one after the passing key
 /// leaves an unpack failure the refusal it is, still reading the name.
 #[test]
@@ -8,7 +43,7 @@ fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
     use std::os::unix::process::ExitStatusExt as _;
     let status = std::process::ExitStatus::from_raw(1 << 8);
     let unpack = |stderr: &str| {
-        super::unpack_failure(
+        super::bundle_transfer_failure(
             std::path::Path::new("/tmp"),
             "ditto extract failed",
             status,

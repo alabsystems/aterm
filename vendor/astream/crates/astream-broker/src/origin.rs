@@ -21,7 +21,12 @@ pub const SIGNATURE_LEN: usize = 64;
 const DOMAIN: &[u8] = b"astream relay origin v1\0";
 
 fn signed_message(subject: &str, sequence: u64, payload: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(DOMAIN.len() + 4 + subject.len() + 8 + 32);
+    let cap = subject.len().saturating_add(68);
+    let mut message = if cap <= 65_536 {
+        Vec::with_capacity(cap)
+    } else {
+        Vec::new()
+    };
     message.extend_from_slice(DOMAIN);
     // A subject is bounded far below this by the wire's own limits; saturating cannot make two
     // subjects of an accepted length sign alike.
@@ -45,7 +50,12 @@ pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
 pub fn seal(seed: &[u8; 32], subject: &str, sequence: u64, payload: &[u8]) -> Vec<u8> {
     let signature =
         astream_aead::signature::sign(seed, &signed_message(subject, sequence, payload));
-    let mut body = Vec::with_capacity(SIGNATURE_LEN + payload.len());
+    let cap = payload.len().saturating_add(SIGNATURE_LEN);
+    let mut body = if cap <= 16_777_280 {
+        Vec::with_capacity(cap)
+    } else {
+        Vec::new()
+    };
     body.extend_from_slice(&signature);
     body.extend_from_slice(payload);
     body

@@ -204,7 +204,7 @@ fn window_lane_in(
     })?;
     let held = WindowLane {
         path: path.clone(),
-        held: held.into_close_only(),
+        held: held.into_sole_close_only(),
     };
     check(&held).map_err(|why| fail(&why, None))?;
     if stopped() {

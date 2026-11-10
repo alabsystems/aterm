@@ -155,6 +155,7 @@ fn observe(
         sid: &job.sid,
         supervisor: accounts::Supervisor::Own,
         env: &variables,
+        seen: &aterm_agent::harness::observe::Observation::Unread,
         sample: None,
         point: accounts::Point::Wall {
             window: "seven_day".into(),

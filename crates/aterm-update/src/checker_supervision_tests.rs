@@ -58,6 +58,71 @@ fn run_to_exit(
 static UNPOSTED: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
 
 #[test]
+fn concurrent_checker_startup_keeps_one_worker_and_its_exact_restart_arguments() {
+    let (finished, completion) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stored = std::sync::OnceLock::new();
+        let watch = CheckerWatch::new();
+        let spawned = Mutex::new(Vec::new());
+        let ready = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for build in 1..=8 {
+                let mut input = args(Arc::new(|| Some(source())));
+                input.current_build = build;
+                let input = Arc::new(input);
+                let (stored, watch, spawned, ready) = (&stored, &watch, &spawned, &ready);
+                scope.spawn(move || {
+                    ready.wait();
+                    crate::start_checker_once(stored, watch, input, |generation, input| {
+                        spawned.lock().unwrap().push((generation, input));
+                        Ok(())
+                    });
+                });
+            }
+        });
+        let spawned = spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].0, 1);
+        assert!(Arc::ptr_eq(stored.get().unwrap(), &spawned[0].1));
+        let beat = watch.snapshot().unwrap();
+        assert_eq!((beat.generation, beat.workers, beat.respawns), (1, 1, 0));
+        finished.send(()).unwrap();
+    });
+    completion
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("competing startup calls must finish");
+}
+
+#[test]
+fn repeated_startup_does_not_replace_a_failed_starts_retained_arguments() {
+    let stored = std::sync::OnceLock::new();
+    let watch = CheckerWatch::new();
+    let original = Arc::new(args(Arc::new(|| Some(source()))));
+    crate::start_checker_once(&stored, &watch, Arc::clone(&original), |_, _| {
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+    });
+    let failed = watch.snapshot().unwrap();
+    assert_eq!(failed.phase, CheckerPhase::StartFailed);
+    assert_eq!(failed.workers, 0);
+    crate::start_checker_once(
+        &stored,
+        &watch,
+        Arc::new(args(Arc::new(|| None))),
+        |_, _| panic!("a duplicate startup bypassed the watchdog"),
+    );
+    let after = watch.snapshot().unwrap();
+    assert_eq!(
+        (after.generation, after.phase, after.at_secs),
+        (failed.generation, failed.phase, failed.at_secs)
+    );
+    assert!(Arc::ptr_eq(stored.get().unwrap(), &original));
+    assert!(
+        watch.supersede(after.generation).is_some(),
+        "the normal watchdog retry remains available"
+    );
+}
+
+#[test]
 fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
     static WATCH: CheckerWatch = CheckerWatch::new();
     static WAKE: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();

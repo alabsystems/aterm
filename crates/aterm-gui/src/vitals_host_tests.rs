@@ -1077,6 +1077,66 @@ fn readings_of_every_os_map_to_the_models_classes() {
     assert_eq!(gpu_sample(gpu(Some(37), None)).device_pct, Some(37));
 }
 
+/// The system's own watts enter the model as their readers answered (A4 §4's Linux sources): a
+/// runtime-suspended NVIDIA card (`gpu_asleep`) and RAPL refused to all but root
+/// (`rapl_needs_root`) are not supported, so they add nothing to compute watts and never read
+/// 0 W; RAPL's first read, which has no base, is unread (`warming`); a posted pressure state is
+/// its level, and one past the documented levels is unread. CONTROL: NVML failing a read
+/// (`not_read`) leaves compute watts unread, where `gpu_asleep` left the CPU's alone.
+#[test]
+fn the_host_watts_and_pressure_enter_the_model_as_their_readers_answered() {
+    use aterm_sysprobe::Why;
+    use aterm_vitals::heat::{ClockGate, Engine, Input, NoHeat, ThermalPressure};
+    let compute = |host| {
+        Engine::default()
+            .absorb(&Input {
+                lane: CoalLane::Unsupported,
+                pressure: None,
+                moved: None,
+                range: None,
+                gate: ClockGate::default(),
+                cores: None,
+                p_cores: None,
+                host,
+            })
+            .watts
+            .compute()
+    };
+    let read = host_watts_of(Some(Ok(Some(12.5))), Some(Ok(31_500)));
+    assert_eq!((read.cpu, read.gpu), (Ok(12.5), Ok(31.5)));
+    assert_eq!(compute(read), Ok(44.0));
+
+    let asleep = host_watts_of(Some(Ok(Some(12.5))), Some(Err(Why::Asleep)));
+    assert_eq!(asleep.gpu, Err(NoHeat::NotSupported("gpu_asleep")));
+    assert_eq!(compute(asleep), Ok(12.5), "an asleep card adds nothing");
+
+    let root = host_watts_of(Some(Err(Why::NeedsPrivilege("root"))), Some(Ok(31_500)));
+    assert_eq!(root.cpu, Err(NoHeat::NotSupported("rapl_needs_root")));
+    assert_eq!(
+        compute(root),
+        Err(NoHeat::NotSupported("rapl_needs_root")),
+        "no CPU reader, no figure: never 31.5 W as if the CPU drew 0"
+    );
+
+    let warming = host_watts_of(Some(Ok(None)), Some(Ok(31_500)));
+    assert_eq!(warming.cpu, Err(NoHeat::Unread("warming")));
+    assert_eq!(compute(warming), Err(NoHeat::Unread("warming")));
+
+    let none = host_watts_of(None, None);
+    assert_eq!(none, aterm_vitals::heat::HostWatts::default());
+
+    let not_read = host_watts_of(Some(Ok(Some(12.5))), Some(Err(Why::NotRead)));
+    assert_eq!(
+        compute(not_read),
+        Err(NoHeat::Unread("nvml_power")),
+        "control"
+    );
+
+    assert_eq!(pressure_of(Ok(2)), Ok(ThermalPressure::Heavy));
+    assert_eq!(pressure_of(Ok(5)), Err("pressure_level"));
+    assert_eq!(pressure_of(Err("notify_check")), Err("notify_check"));
+}
+
 /// This Mac's `vm_stat` (MacBook Air, macOS 27.0.1, 32 GiB, 16 KiB pages, 2026-11-05), mapped as
 /// `memory_detail_of` maps it (sysprobe's `this_macs_vm_classes_partition_what_its_queues_hold`).
 const PAGE: u64 = 16_384;
@@ -1460,7 +1520,17 @@ fn the_new_readings_reach_the_model() {
         threads_max: Some(40_960),
         files: Some(6_131),
         files_max: Some(245_760),
+        run_queue: aterm_sysprobe::runq::RunQueue::Milli(26_800),
     };
+    // The run queue reaches the model as read, each unread kind as its own (A4 §2, N2).
+    {
+        use aterm_sysprobe::runq::RunQueue as Q;
+        use aterm_vitals::runq::RunQueueRead as R;
+        assert_eq!(
+            [Q::Milli(26_800), Q::Failed, Q::UnreadFormat, Q::Unsupported].map(run_queue_read),
+            [R::Milli(26_800), R::Failed, R::UnreadFormat, R::Unsupported]
+        );
+    }
     assert_eq!(
         task_room(read),
         TaskRoom {

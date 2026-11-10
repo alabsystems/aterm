@@ -513,8 +513,9 @@ fn judge(
 }
 
 /// Move the `CHANGELOG.md` entries the checkout adds beside main commit `main` that sit under a
-/// released version back under `## [Unreleased]`, or drop one that copies an entry the file
-/// holds elsewhere ([`changelog::rehome`]), and commit the change:
+/// released version back under `## [Unreleased]`, drop one that copies an entry the file holds
+/// elsewhere, or join a `### <kind>` subsection it adds under `## [Unreleased]` beside another of
+/// its kind into that one ([`changelog::rehome`]), and commit the change:
 /// into HEAD, restated as `merge` (the tool's own merge's subject), else as a commit of its own.
 fn rehome_changelog(
     git: &Git<'_>,
@@ -1202,11 +1203,17 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         cmd
     };
     let mut say = |line: &str| println!("{line}");
+    // This parent image owns the adjacent judgments. Each child also hashes its actual image
+    // and complete runtime inputs, so a newly built verifier cannot borrow the old policy.
+    let carry_context = development_context(crate::report::running_driver());
+    let mut passed = crate::testrun::Passed::new();
     land(
         &root,
         &mut Seams {
             git: &git,
-            judge: &mut |root, base| live_judge(root, base, admit),
+            judge: &mut |root, base| {
+                live_judge(root, base, admit, carry_context.as_deref(), &mut passed)
+            },
             branch: &mut live_branch,
             lane: &mut live_lane,
             say: &mut say,
@@ -1217,7 +1224,14 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 /// The dev set over the cone since `base`, run as the checkout's own verify (`targo
 /// --unverified verify --base <base>`, so the merged tree's tools judge it), its rows read from
 /// the check-finished events it keeps and its record's end from its run-finished one.
-fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
+fn live_judge(
+    root: &Path,
+    base: &str,
+    admit: aterm_capacity::Admit,
+    context: Option<&str>,
+    passed: &mut crate::testrun::Passed,
+) -> Judged {
+    let prior = std::mem::take(passed);
     let began = Instant::now();
     let not_run = |why: String| {
         println!("verify land: {why}");
@@ -1248,12 +1262,165 @@ fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
         admit,
         build_dir.as_deref(),
     );
+    // No durable cache or extra prerequisite: unavailable carry custody runs the ordinary
+    // complete check. The owned directory outlives the child and is dropped after its record.
+    if let Some(context) = context {
+        let path = dir.path().join("passed-binaries.jsonl");
+        let saved = crate::testrun::encode_passed(&prior).ok().and_then(|text| {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            crate::event_log::private_flags(&mut options);
+            let mut file = options.open(&path).ok()?;
+            file.write_all(text.as_bytes()).ok()
+        });
+        if saved.is_some() {
+            cmd.args(["--carry-context", context, "--passed-binaries"])
+                .arg(path);
+        }
+    }
     let code = match cmd.status() {
         Ok(status) => status.code().unwrap_or(exit::COULD_NOT_RUN),
         Err(e) => return not_run(format!("{} did not start: {e}", tools.targo.display())),
     };
     let text = std::fs::read_to_string(&events).unwrap_or_default();
-    Judged::from_events(&text, code, began.elapsed().as_secs())
+    let judged = Judged::from_events(&text, code, began.elapsed().as_secs());
+    *passed = development_proofs(&text, &judged);
+    judged
+}
+
+/// A separate proof domain for this actual parent, not a release's cutter context. Toolchain
+/// files, child verifier and exact command policy remain in each existing content key.
+fn development_context(driver: Option<&str>) -> Option<String> {
+    let driver = driver.filter(|value| aterm_codec::hex::is_lower(value, 64))?;
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-dev-land-test-carry-v1\0");
+    hash.update(driver.as_bytes());
+    Some(aterm_codec::hex::encode_lower(&hash.finalize()))
+}
+
+/// Read only this parent's owned, complete child stream. Truncation, ambiguous fields,
+/// attribution changes or a second verdict for a spec discard the whole carry opportunity.
+/// After the terminal, only the existing single disk-accounting footer may follow.
+/// No compiler artifact, legacy NULL identity or diagnostic timing creates a proof.
+fn development_proofs(text: &str, judged: &Judged) -> crate::testrun::Passed {
+    use crate::testrun::Passed;
+    let collect = || -> Option<Passed> {
+        if judged.code != exit::PASS
+            || !judged.whole()
+            || !judged
+                .checks
+                .iter()
+                .any(|row| row.check == "test" && row.word == "ok")
+            || !text.ends_with('\n')
+        {
+            return None;
+        }
+        let mut binding = None;
+        let mut finished = false;
+        let mut disk_accounted = false;
+        let mut specs = BTreeSet::new();
+        let mut passed = Passed::new();
+        for line in text.lines() {
+            let raw = line.strip_prefix("verify-event: ")?;
+            if raw.len() > crate::event_log::MAX_RECORD_BYTES {
+                return None;
+            }
+            let checked: crate::compiler_message::CheckedValue = aterm_json::from_str(raw).ok()?;
+            let (value, duplicate) = checked.into_parts();
+            if duplicate {
+                return None;
+            }
+            let attribution = crate::event_log::attribution(&value)?;
+            let here = (attribution.id, attribution.source_observation?);
+            let event = value["event"].as_str()?;
+            if event == "invocation-started" {
+                if binding.is_some()
+                    || value["invocation"]["source_observation"]["release"].as_bool() != Some(false)
+                    || value["invocation"]["source_observation"]["observed_head"]
+                        .as_str()
+                        .is_none()
+                    || value["invocation"]["source_observation"]["fix"].as_bool() != Some(false)
+                    || value["invocation"]["source_observation"]["compile_only"].as_bool()
+                        != Some(false)
+                {
+                    return None;
+                }
+                binding = Some(here);
+                continue;
+            }
+            if binding.as_ref() != Some(&here) || event == "observation-unavailable" {
+                return None;
+            }
+            if finished {
+                // run_cli releases its disk claim after run() has emitted run-finished.
+                // This exact attributed accounting footer grants no test authority.
+                let fields = value.as_object()?;
+                let keys = ["schema", "event", "invocation", "mode", "walks"];
+                if disk_accounted
+                    || event != "disk"
+                    || fields.len() != keys.len()
+                    || fields.keys().any(|key| !keys.contains(&key.as_str()))
+                    || !matches!(
+                        value["mode"].as_str(),
+                        Some("claimed" | "covered" | "unclaimed")
+                    )
+                    || value["walks"].as_u64().is_none()
+                {
+                    return None;
+                }
+                disk_accounted = true;
+                continue;
+            }
+            if event == "disk" {
+                return None;
+            }
+            if event == "run-finished" {
+                if value["code"].as_i64() != Some(i64::from(exit::PASS)) {
+                    return None;
+                }
+                finished = true;
+            }
+            if event != "test-binary-finished" {
+                continue;
+            }
+            let spec = value["test"].as_str()?;
+            if finished || !specs.insert(spec.to_owned()) {
+                return None;
+            }
+            if value["outcome"].as_str() != Some("ok") {
+                return None;
+            }
+            if value["inputs_bounded"].as_bool() != Some(true) {
+                continue;
+            }
+            let carried = value["carried"].as_bool()?;
+            if (!carried && value["exit_code"].as_i64() != Some(0))
+                || (carried && !value["exit_code"].is_null())
+                || value["evidence"]["schema"].as_u64()
+                    != Some(u64::from(crate::test_content::SCHEMA))
+                || value["evidence"]["exe_sha256"] != value["exe_sha256"]
+                || value["evidence"]["content_key"] != value["content_key"]
+                || value["evidence"]["inputs_bounded"].as_bool() != Some(true)
+                || !value["evidence"]["input_reason"].is_null()
+            {
+                return None;
+            }
+            let proof = aterm_json::json!({
+                "schema": crate::test_content::SCHEMA,
+                "spec": spec, "outcome": "ok",
+                "exe_sha256": value["exe_sha256"],
+                "content_key": value["content_key"],
+                "inputs_bounded": true,
+                "input_reason": value["input_reason"],
+                "json": value["json"],
+                "execution_s": value["recorded_execution_s"],
+            });
+            passed.extend(crate::testrun::read_passed(&proof.to_string()).ok()?);
+        }
+        finished.then_some(passed)
+    };
+    collect().unwrap_or_default()
 }
 
 /// Build the checkout's nested verification command, owned by the calling land process.

@@ -469,7 +469,7 @@ fn retained_response_after_cancel(held: bool, broken_namespace: bool) {
         assert_eq!(witness.revision.generation, 1);
         assert!(witness.pending.is_some());
         let exclusive =
-            codex_source_gate::PublicationLock::released_for_home(env.home.as_deref().unwrap());
+            codex_source_gate::PublicationLock::for_home(env.home.as_deref().unwrap()).unwrap();
         drop(exclusive);
         drained.resume().unwrap();
         let NativeUsageSettlement::Deferred(deferred) = deferred.resume().unwrap() else {

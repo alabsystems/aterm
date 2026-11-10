@@ -64,6 +64,9 @@ fn spawn(generation: u64, args: Arc<Args>) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aterm-linux-update".into())
         .spawn(move || {
+            let Some(_worker) = WATCH.worker(generation) else {
+                return;
+            };
             let started = now().map_or_else(
                 |_| String::new(),
                 |unix| aterm_types::rfc3339::format_rfc3339(unix as u64),

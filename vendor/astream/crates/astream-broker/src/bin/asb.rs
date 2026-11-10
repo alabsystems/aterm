@@ -261,14 +261,17 @@ use astream_cap::capfile;
 #[path = "../../../astream-cap/src/capfile.rs"]
 mod capfile;
 
-const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
+const USAGE: &str = "usage: asb --help | --version
+       asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
                   [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
                   [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N] [--rate-limit SPEC]
                   [--retain-file PATH] [--retention-interval-ms N]
                   [--max-retained-records N] [--max-retained-bytes N]
        asb serve  [log] --listen <scheme>:<addr>... [--key-env NAME | --key-file PATH]
-                  [--host-key-file PATH --allow-peer-file PATH...] [--allow-plaintext] [--allow-remote]
+                  [--host-key-file PATH --allow-peer-file PATH...]
+                  [--host-cert-file PATH --ca-key-file PATH... (--host-key-file PATH | --ssh-agent-sock PATH)]
+                  [--allow-plaintext] [--allow-remote]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH]
                   [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
                   [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N] [--rate-limit SPEC]
@@ -1075,6 +1078,137 @@ fn load_peer_files(paths: &[String]) -> Result<Vec<[u8; 32]>, u8> {
     Ok(peers)
 }
 
+#[cfg_attr(not(feature = "identity"), allow(dead_code))]
+enum HostSignSource {
+    Seed([u8; 32]),
+    AgentSock(String),
+}
+
+impl Drop for HostSignSource {
+    fn drop(&mut self) {
+        if let HostSignSource::Seed(ref mut s) = self {
+            s.fill(0);
+            std::hint::black_box(s);
+        }
+    }
+}
+
+/// Read repeatable `--ca-key-file PATH` files (either raw 32-byte Ed25519 public key or
+/// one or more 64-hex Ed25519 CA public-key lines).
+fn load_ca_files(paths: &[String]) -> Result<Vec<[u8; 32]>, u8> {
+    let mut cas: Vec<[u8; 32]> = Vec::new();
+    for path in paths {
+        let bytes = match std::fs::read(path) {
+            Ok(v) => v,
+            Err(e) => return Err(fail_exit(2, &format!("--ca-key-file {path}: {e}"))),
+        };
+        if let Some((raw32, tail)) = bytes.split_first_chunk::<32>() {
+            if tail.is_empty() {
+                cas.push(*raw32);
+                continue;
+            }
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Err(fail_exit(
+                2,
+                &format!("--ca-key-file {path}: expected 32 raw bytes or UTF-8 64-hex lines"),
+            ));
+        };
+        let mut line_no = 0usize;
+        for line in text.lines() {
+            line_no = line_no.saturating_add(1);
+            let trimmed = line.trim_ascii();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut pk = [0u8; 32];
+            if let Err(e) = decode_hex(trimmed.as_bytes(), &mut pk) {
+                return Err(usage_error(&format!("--ca-key-file {path}:{line_no}: {e}")));
+            }
+            cas.push(pk);
+        }
+    }
+    if cas.is_empty() {
+        return Err(usage_error("--ca-key-file holds no Ed25519 CA public keys"));
+    }
+    Ok(cas)
+}
+
+/// Read an `ACRT` v1 certificate from `--host-cert-file PATH` (either raw binary `ACRT...`
+/// or ASCII hex).
+fn load_cert_bytes(path: &str) -> Result<Vec<u8>, u8> {
+    let bytes = match std::fs::read(path) {
+        Ok(v) => v,
+        Err(e) => return Err(fail_exit(2, &format!("--host-cert-file {path}: {e}"))),
+    };
+    if bytes.starts_with(b"ACRT") {
+        return Ok(bytes);
+    }
+    let trimmed = bytes.trim_ascii();
+    if trimmed.is_empty() || trimmed.len() % 2 != 0 || trimmed.len() > 8192 {
+        return Err(fail_exit(
+            2,
+            &format!(
+                "--host-cert-file {path}: expected binary ACRT certificate or bounded even-length hex"
+            ),
+        ));
+    }
+    let mut out = vec![0u8; trimmed.len() / 2];
+    if let Err(e) = decode_hex(trimmed, &mut out) {
+        return Err(fail_exit(2, &format!("--host-cert-file {path}: {e}")));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "identity")]
+fn serve_certified(
+    broker: &Broker,
+    ep: &str,
+    sign_src: &HostSignSource,
+    cert_bytes: &[u8],
+    ca_pubs: &[[u8; 32]],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    let host_cert = match astream_broker::IdentityCertificate::decode(cert_bytes) {
+        Ok(c) => c,
+        Err(e) => return Err(fail_exit(2, &format!("--host-cert-file: {e}"))),
+    };
+    let signer = match sign_src {
+        HostSignSource::Seed(seed) => {
+            astream_broker::IdentitySigner::from(astream_broker::IdentityKeypair::from_seed(*seed))
+        }
+        HostSignSource::AgentSock(sock) => {
+            match astream_broker::SshAgentSigner::connect_for_key(sock, host_cert.subject_pub()) {
+                Ok(ag) => astream_broker::IdentitySigner::from(ag),
+                Err(e) => return Err(fail_exit(2, &format!("--ssh-agent-sock {sock}: {e}"))),
+            }
+        }
+    };
+    let rotator = match astream_broker::HostCertRotator::new(signer, host_cert) {
+        Ok(r) => r,
+        Err(e) => return Err(fail_exit(2, &format!("--listen certified: {e}"))),
+    };
+    let store = match astream_broker::CertTrustStore::new(ca_pubs.to_vec(), 30 * 86_400_000) {
+        Ok(s) => s,
+        Err(e) => return Err(fail_exit(2, &format!("--ca-key-file: {e}"))),
+    };
+    let trust = astream_broker::SharedCertTrust::new(store);
+    Ok(broker.serve_tcp_certified(ep, rotator, trust))
+}
+
+#[cfg(not(feature = "identity"))]
+fn serve_certified(
+    _broker: &Broker,
+    _ep: &str,
+    _sign_src: &HostSignSource,
+    _cert_bytes: &[u8],
+    _ca_pubs: &[[u8; 32]],
+) -> Result<io::Result<BrokerHandle>, u8> {
+    Err(fail_exit(
+        2,
+        "--listen certified: requires asb built with `--features identity`",
+    ))
+}
+
 struct Cli {
     pos: Vec<String>,
     bools: HashSet<String>,
@@ -1095,6 +1229,8 @@ struct Cli {
     listens: Vec<String>,
     /// `--allow-peer-file PATH` is repeatable for `--listen identity:<addr>`.
     peer_files: Vec<String>,
+    /// `--ca-key-file PATH` is repeatable for `--listen certified:<addr>`.
+    ca_files: Vec<String>,
 }
 
 /// Flags that take a value (`--flag VALUE` or `--flag=VALUE`), given at most once.
@@ -1118,6 +1254,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--at-rest-key-env",
     "--at-rest-key-file",
     "--host-key-file",
+    "--host-cert-file",
+    "--ssh-agent-sock",
     "--secret-env",
     "--secret-file",
     "--revocation-file",
@@ -1172,6 +1310,8 @@ const ARGV_SECRETS: &[(&str, &str)] = &[
         "pass it with --at-rest-key-env NAME or --at-rest-key-file PATH",
     ),
     ("--host-key", "pass it with --host-key-file PATH"),
+    ("--host-cert", "pass it with --host-cert-file PATH"),
+    ("--ca-key", "pass it with --ca-key-file PATH"),
     (
         "--secret",
         "pass it with --secret-env NAME or --secret-file PATH",
@@ -1245,7 +1385,7 @@ fn usage_error(msg: &str) -> u8 {
     2
 }
 
-fn parse() -> Result<Cli, u8> {
+fn arguments() -> Result<Vec<String>, u8> {
     // `args_os`, NOT `args`: `std::env::args()` PANICS on an argument that is not
     // valid Unicode — exit 101 with a backtrace, before any of this strict-flag
     // handling runs. A non-UTF-8 `--key-file` path is a plausible real input on any
@@ -1261,6 +1401,10 @@ fn parse() -> Result<Cli, u8> {
             }
         }
     }
+    Ok(args)
+}
+
+fn parse(args: &[String]) -> Result<Cli, u8> {
     let mut pos = Vec::new();
     let mut bools: HashSet<String> = HashSet::new();
     let mut kv: HashMap<String, String> = HashMap::new();
@@ -1269,6 +1413,7 @@ fn parse() -> Result<Cli, u8> {
     let mut excludes: Vec<String> = Vec::new();
     let mut listens: Vec<String> = Vec::new();
     let mut peer_files: Vec<String> = Vec::new();
+    let mut ca_files: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         // `--` ends flag parsing: every token after it is a positional. Without it a
@@ -1301,6 +1446,7 @@ fn parse() -> Result<Cli, u8> {
             || flag == "--exclude"
             || flag == "--listen"
             || flag == "--allow-peer-file"
+            || flag == "--ca-key-file"
             || VALUE_FLAGS.contains(&flag)
         {
             let v = match inline {
@@ -1320,6 +1466,8 @@ fn parse() -> Result<Cli, u8> {
                 listens.push(v);
             } else if flag == "--allow-peer-file" {
                 peer_files.push(v);
+            } else if flag == "--ca-key-file" {
+                ca_files.push(v);
             } else if kv.insert(flag.to_string(), v).is_some() {
                 return Err(usage_error(&format!("{flag} given more than once")));
             }
@@ -1346,6 +1494,7 @@ fn parse() -> Result<Cli, u8> {
         excludes,
         listens,
         peer_files,
+        ca_files,
     })
 }
 
@@ -2009,6 +2158,17 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
     Ok(next)
 }
 
+/// The sequence file's sidecar lock, let go by `LOCK_UN` before its close on every path: a
+/// close alone releases an flock only when the open file description's last reference goes,
+/// and a `fork` in another thread holds one until its `execve`.
+struct SeqLock(std::fs::File);
+
+impl Drop for SeqLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Take the EXCLUSIVE advisory lock that makes [`advance_seq_file`]'s read-modify-
 /// write atomic against every other `asb` invocation on the same sequence file.
 ///
@@ -2028,7 +2188,7 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
 /// that is tolerated — the same judgement `store::lock_exclusive` makes for the log
 /// lock. There, concurrent invocations are back to racing, and only the per-process
 /// staging name protects them.
-fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
+fn lock_seq_file(path: &str) -> io::Result<SeqLock> {
     let lock_path = format!("{path}.lock");
     // Open the sidecar that is there; CREATE it only when nothing is, and then with
     // `create_new` (O_EXCL), which refuses a symlink at the name where a plain create
@@ -2057,8 +2217,8 @@ fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
         )
     })?;
     match f.lock() {
-        Ok(()) => Ok(f),
-        Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(f),
+        Ok(()) => Ok(SeqLock(f)),
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(SeqLock(f)),
         Err(e) => Err(io::Error::new(
             e.kind(),
             format!("--seq-file {path}: lock {lock_path}: {e}"),
@@ -2854,13 +3014,14 @@ enum ListenSpec {
     Sealed(String),
     Handshake(String),
     Identity(String),
+    Certified(String),
     Tcp(String),
 }
 
 fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
     let Some((scheme, addr)) = raw.split_once(':') else {
         return Err(usage_error(&format!(
-            "--listen {raw:?}: expected unix:<path>, sealed:<host:port>, handshake:<host:port>, identity:<host:port>, or tcp:<host:port>"
+            "--listen {raw:?}: expected unix:<path>, sealed:<host:port>, handshake:<host:port>, identity:<host:port>, certified:<host:port>, or tcp:<host:port>"
         )));
     };
     if addr.is_empty() {
@@ -2876,11 +3037,13 @@ fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
         Ok(ListenSpec::Handshake(addr.to_string()))
     } else if scheme == "identity" {
         Ok(ListenSpec::Identity(addr.to_string()))
+    } else if scheme == "certified" {
+        Ok(ListenSpec::Certified(addr.to_string()))
     } else if scheme == "tcp" {
         Ok(ListenSpec::Tcp(addr.to_string()))
     } else {
         Err(usage_error(&format!(
-            "--listen {raw:?}: unknown scheme {scheme:?} (expected unix, sealed, handshake, identity, or tcp)"
+            "--listen {raw:?}: unknown scheme {scheme:?} (expected unix, sealed, handshake, identity, certified, or tcp)"
         )))
     }
 }
@@ -2908,6 +3071,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
     let mut has_sealed = false;
     let mut has_handshake = false;
     let mut has_identity = false;
+    let mut has_certified = false;
     let mut has_tcp_plain = false;
     let mut unix_paths: Vec<String> = Vec::new();
     for raw in &cli.listens {
@@ -2927,6 +3091,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             ListenSpec::Sealed(_) => has_sealed = true,
             ListenSpec::Handshake(_) => has_handshake = true,
             ListenSpec::Identity(_) => has_identity = true,
+            ListenSpec::Certified(_) => has_certified = true,
             ListenSpec::Tcp(_) => has_tcp_plain = true,
         }
         specs.push(spec);
@@ -2988,7 +3153,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             "--allow-plaintext applies only to --listen tcp:<addr>",
         )));
     }
-    let has_any_tcp = has_sealed || has_handshake || has_identity || has_tcp_plain;
+    let has_any_tcp = has_sealed || has_handshake || has_identity || has_certified || has_tcp_plain;
     let allow_remote = cli.has("--allow-remote");
     if !has_any_tcp && allow_remote {
         return Err(AsbErr::Exit(usage_error(
@@ -3017,6 +3182,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
             ListenSpec::Sealed(ep)
             | ListenSpec::Handshake(ep)
             | ListenSpec::Identity(ep)
+            | ListenSpec::Certified(ep)
             | ListenSpec::Tcp(ep) => check_tcp_loopback(ep, allow_remote)?,
         }
     }
@@ -3045,6 +3211,8 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let host_key_file = cli.kv.get("--host-key-file").cloned();
+    let host_cert_file = cli.kv.get("--host-cert-file").cloned();
+    let ssh_agent_sock = cli.kv.get("--ssh-agent-sock").cloned();
     if has_identity {
         if cfg!(not(feature = "identity")) {
             return Err(AsbErr::Exit(fail_exit(
@@ -3057,18 +3225,62 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
                 "--listen identity: needs --host-key-file PATH and --allow-peer-file PATH",
             )));
         }
-    } else if host_key_file.is_some() || !cli.peer_files.is_empty() {
+    } else if !cli.peer_files.is_empty() || (!has_certified && host_key_file.is_some()) {
         return Err(AsbErr::Exit(usage_error(
             "--host-key-file/--allow-peer-file apply only to --listen identity:<host:port>",
+        )));
+    }
+    if has_certified {
+        if cfg!(not(feature = "identity")) {
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                "--listen certified: requires asb built with `--features identity`",
+            )));
+        }
+        let sign_ways = usize::from(host_key_file.is_some())
+            .saturating_add(usize::from(ssh_agent_sock.is_some()));
+        if host_cert_file.is_none() || cli.ca_files.is_empty() || sign_ways != 1 {
+            return Err(AsbErr::Exit(usage_error(
+                "--listen certified: needs --host-cert-file PATH, --ca-key-file PATH, and exactly one of --host-key-file PATH or --ssh-agent-sock PATH",
+            )));
+        }
+    } else if host_cert_file.is_some() || !cli.ca_files.is_empty() || ssh_agent_sock.is_some() {
+        return Err(AsbErr::Exit(usage_error(
+            "--host-cert-file/--ca-key-file/--ssh-agent-sock apply only to --listen certified:<host:port>",
         )));
     }
     let psk = match &key_src {
         Some(src) => Some(load_key(src, KeyFile::OwnerOnly)?),
         None => None,
     };
-    let id_material = match &host_key_file {
-        Some(hk) => Some((load_host_seed(hk)?, load_peer_files(&cli.peer_files)?)),
+    let loaded_host_seed = match &host_key_file {
+        Some(hk) => Some(load_host_seed(hk)?),
         None => None,
+    };
+    let id_material = if has_identity {
+        match loaded_host_seed {
+            Some(seed) => Some((seed, load_peer_files(&cli.peer_files)?)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let cert_material = if has_certified {
+        let sign_src = match (loaded_host_seed, &ssh_agent_sock) {
+            (Some(seed), None) => HostSignSource::Seed(seed),
+            (None, Some(sock)) => HostSignSource::AgentSock(sock.clone()),
+            _ => return Err(AsbErr::Exit(2)),
+        };
+        let Some(ref cert_path) = host_cert_file else {
+            return Err(AsbErr::Exit(2));
+        };
+        Some((
+            sign_src,
+            load_cert_bytes(cert_path)?,
+            load_ca_files(&cli.ca_files)?,
+        ))
+    } else {
+        None
     };
     let secret = match &guard {
         Some(src) => Some(load_secret(src)?),
@@ -3166,6 +3378,17 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
                     serve_identity(&broker, ep, *seed, peers.clone())?,
                 )
             }
+            ListenSpec::Certified(ep) => {
+                let Some((sign_src, cert_bytes, ca_pubs)) = cert_material.as_ref() else {
+                    drop(handles);
+                    discard_created_log(&log, created_here, broker);
+                    return Err(AsbErr::Exit(2));
+                };
+                (
+                    ep.as_str(),
+                    serve_certified(&broker, ep, sign_src, cert_bytes, ca_pubs)?,
+                )
+            }
         };
         match served {
             Ok(h) => {
@@ -3237,6 +3460,9 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--allow-plaintext",
             "--host-key-file",
             "--allow-peer-file",
+            "--host-cert-file",
+            "--ca-key-file",
+            "--ssh-agent-sock",
             "--tcp",
             "--handshake",
             "--key-env",
@@ -3272,6 +3498,14 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
     if cli.kv.contains_key("--host-key-file") || !cli.peer_files.is_empty() {
         return Err(AsbErr::Exit(usage_error(
             "--host-key-file/--allow-peer-file apply only to --listen identity:<host:port>",
+        )));
+    }
+    if cli.kv.contains_key("--host-cert-file")
+        || !cli.ca_files.is_empty()
+        || cli.kv.contains_key("--ssh-agent-sock")
+    {
+        return Err(AsbErr::Exit(usage_error(
+            "--host-cert-file/--ca-key-file/--ssh-agent-sock apply only to --listen certified:<host:port>",
         )));
     }
     let ep = cli.at(1, "endpoint")?;
@@ -4219,7 +4453,19 @@ fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
 }
 
 fn run() -> Result<(), AsbErr> {
-    let cli = parse()?;
+    let args = arguments()?;
+    // Informational flags stand alone: never hide an invalid command or skip its
+    // argument validation just because --help/--version appears elsewhere.
+    if let [_, flag] = args.as_slice() {
+        match flag.as_str() {
+            "--help" => return say(USAGE).map_err(AsbErr::Io),
+            "--version" => {
+                return say(concat!("asb ", env!("CARGO_PKG_VERSION"))).map_err(AsbErr::Io);
+            }
+            _ => {}
+        }
+    }
+    let cli = parse(&args)?;
     match cli.pos.first().map(String::as_str) {
         Some("repair") => cmd_repair(&cli),
         Some("stats") => cmd_stats(&cli),

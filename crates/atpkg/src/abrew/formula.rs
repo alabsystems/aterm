@@ -612,6 +612,9 @@ pub struct Cask {
     pub url: String,
     /// `None` when the cask says `no_check`.
     pub sha256: Option<String>,
+    /// The cask explicitly states `sha256 :no_check` (a tap
+    /// cask with no sha256 stanza at all has neither).
+    pub sha256_no_check: bool,
     pub artifacts: Vec<Artifact>,
     pub auto_updates: bool,
     /// Declared `language` blocks, in API order (info display).
@@ -661,6 +664,13 @@ pub struct Cask {
     pub nested: Option<String>,
     /// Renamed-from tokens (`old_tokens`; `migrate` resolution).
     pub old_tokens: Vec<String>,
+    /// The web URL of the cask file for tap-loaded records
+    /// (info's `From:` line); API records use the core cask
+    /// tap URL instead.
+    pub source_url: Option<String>,
+    /// Qualified `user/repo/token` for tap-loaded records
+    /// (install displays); empty for API records.
+    pub full_name: String,
 }
 
 /// One cask `variations` entry.
@@ -1365,6 +1375,7 @@ impl Cask {
                 }
             }
         }
+        let no_check = sha_raw == "no_check";
         let sha256 = if sha_raw == "no_check" {
             None
         } else if sha_raw.len() == 64 && sha_raw.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1387,6 +1398,7 @@ impl Cask {
             homepage: s(v.get("homepage")),
             version: s(v.get("version")),
             url: s(v.get("url")),
+            sha256_no_check: no_check,
             sha256,
             artifacts,
             auto_updates: v
@@ -1416,6 +1428,8 @@ impl Cask {
             git_branch_path,
             nested,
             old_tokens: str_list(v.get("old_tokens")),
+            source_url: None,
+            full_name: String::new(),
         })
     }
 }

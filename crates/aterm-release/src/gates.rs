@@ -1815,6 +1815,7 @@ pub fn harness_versions_gate_at(
     match harness_versions_base(git, origin, commit, version)? {
         None => Ok("harness versions: no earlier public release to compare".to_string()),
         Some((release, released)) => {
+            crate::harness_versions::notes_gate_at(git, (&release, &released), commit, version)?;
             crate::harness_versions::gate(git, (&release, &released), commit)
         }
     }
@@ -2598,7 +2599,9 @@ pub fn changelog_gate_at(
     } else {
         "Unreleased"
     };
-    changelog_section_gate(&text, section).map(|found| (section.to_string(), found))
+    let found = changelog_section_gate(&text, section)?;
+    changelog::gate_history(git, commit, &text, section)?;
+    Ok((section.to_string(), found))
 }
 
 fn changelog_section_gate(text: &str, section: &str) -> Result<changelog::GateSummary> {
@@ -2795,13 +2798,18 @@ pub(crate) fn release_through(
     version: &str,
     shipped: &dyn Fn(&str) -> bool,
 ) -> Result<Option<String>> {
+    first_shipped(release_candidates_through(ledger_text, version)?, shipped)
+}
+
+/// Ordered, deduplicated full release identities eligible for an inclusive
+/// public-tag query. Historical ledger labels without three components remain
+/// untouched in the ledger and are not numeric release candidates.
+pub(crate) fn release_candidates_through(ledger_text: &str, version: &str) -> Result<Vec<String>> {
     let ceiling = version_triple(version)
         .ok_or_else(|| Error::new(format!("cannot order product release {version}")))?;
-    recorded_release(
-        ledger_text,
-        &|candidate| version_triple(candidate).is_some_and(|key| key <= ceiling),
-        shipped,
-    )
+    recorded_candidates(ledger_text, &|candidate| {
+        version_triple(candidate).is_some_and(|key| key <= ceiling)
+    })
 }
 
 fn recorded_release(
@@ -2809,25 +2817,35 @@ fn recorded_release(
     eligible: &dyn Fn(&str) -> bool,
     shipped: &dyn Fn(&str) -> bool,
 ) -> Result<Option<String>> {
-    let mut passed_over: Vec<&str> = Vec::new();
-    let records = crate::ledger::parse(ledger_text)?;
-    for record in records.iter().rev() {
-        let candidate = record.version.as_str();
-        if !eligible(candidate) || passed_over.contains(&candidate) {
+    first_shipped(recorded_candidates(ledger_text, eligible)?, shipped)
+}
+
+fn recorded_candidates(ledger_text: &str, eligible: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
+    let mut candidates = Vec::new();
+    for record in crate::ledger::parse(ledger_text)?.into_iter().rev() {
+        let candidate = record.version;
+        if !eligible(&candidate) || candidates.contains(&candidate) {
             continue;
         }
-        if shipped(candidate) {
-            return Ok(Some(candidate.to_string()));
-        }
-        passed_over.push(candidate);
+        candidates.push(candidate);
     }
-    match passed_over.first() {
+    Ok(candidates)
+}
+
+fn first_shipped(
+    candidates: Vec<String>,
+    shipped: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>> {
+    if let Some(candidate) = candidates.iter().find(|candidate| shipped(candidate)) {
+        return Ok(Some(candidate.clone()));
+    }
+    match candidates.first() {
         None => Ok(None),
         Some(newest) => Err(Error::new(format!(
             "none of the {} earlier versions in {} (newest {newest}) has its v<version> tag \
              on origin, so no shipped release precedes this cut — is origin the repository \
              this ledger records?",
-            passed_over.len(),
+            candidates.len(),
             crate::ledger::LEDGER_FILE,
         ))),
     }
@@ -4335,6 +4353,34 @@ mod handoff_fixture_gate_tests {
     }
 
     #[test]
+    fn inclusive_release_candidates_keep_history_and_skip_short_labels() {
+        let ledger = "1 0.61\n2 0.60.0\n3 0.62.0\n4 0.62.0\n5 1.20261109.2\n6 1.20261109.3\n";
+        assert_eq!(
+            release_candidates_through(ledger, "0.193.0").unwrap(),
+            ["0.62.0", "0.60.0"]
+        );
+        assert_eq!(
+            release_candidates_through(ledger, "1.20261109.2").unwrap(),
+            ["1.20261109.2", "0.62.0", "0.60.0"]
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            release_through(ledger, "1.20261109.2", &|candidate| {
+                asked.borrow_mut().push(candidate.to_string());
+                candidate == "0.62.0"
+            })
+            .unwrap(),
+            Some("0.62.0".to_string())
+        );
+        assert_eq!(*asked.borrow(), ["1.20261109.2", "0.62.0"]);
+        assert!(release_candidates_through(ledger, "0.193").is_err());
+        assert!(release_candidates_through("not a ledger record\n", "0.193.0").is_err());
+        // Required-desk floors remain strict; the repair belongs in the ledger
+        // candidate reader, not in relaxed release/floor comparison.
+        assert!(release_at_least("0.193.0", "0.61").is_err());
+    }
+
+    #[test]
     fn a_recut_judges_the_release_before_the_version_it_recuts() {
         let once = "1 0.91.0\n2 0.92.0\n3 0.93.0\n";
         let twice = "1 0.91.0\n2 0.92.0\n3 0.93.0\n4 0.92.0\n5 0.93.0\n";
@@ -4848,6 +4894,142 @@ mod published_commit_tests {
             commit: commit.to_string(),
             verified_at: "2026-09-22T23:37:28+00:00".to_string(),
         }
+    }
+
+    #[test]
+    fn release_notes_harness_predecessor_is_the_public_object() {
+        let repo = Repo::new("harness-note-authority");
+        let published = "## [Unreleased]\n\n## [0.194.0] - date\n\n- `alab claude harness 0.31` records the changes.\n";
+        repo.commit(
+            "public release",
+            &[
+                ("CHANGELOG.md", published),
+                ("RELEASES.ledger", "1794311832 0.194.0\n"),
+                (
+                    "crates/aterm-phase/src/phase.rs",
+                    &crate::harness_versions::version_line((0, 31)),
+                ),
+            ],
+        );
+        repo.run(&["tag", "v0.194.0"]);
+        repo.publish_origin();
+        for (base, announced, older, expected) in [
+            ("0.193.0", "0.32", "0.193.0", Some("immediately preceding")),
+            ("0.194.0", "0.31", "0.194.0", Some("already announced")),
+            ("0.194.0", "0.32", "0.194.0", None),
+        ] {
+            // The candidate's stale copied history claims only 0.30. The
+            // immutable public object, not that copy, decides both rules.
+            let current = format!(
+                "## [Unreleased]\n\n- new fix\n\n- **Harness versions since v{base}: `alab claude harness {announced}`.**\n\n## [{older}] - date\n\n- `alab claude harness 0.30` was announced.\n"
+            );
+            assert!(changelog::gate_unreleased(&current).is_ok());
+            let commit = repo.commit(
+                "candidate notes",
+                &[
+                    ("CHANGELOG.md", &current),
+                    (
+                        "crates/aterm-phase/src/phase.rs",
+                        &crate::harness_versions::version_line((0, 32)),
+                    ),
+                ],
+            );
+            let verdict = harness_versions_gate_at(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &commit,
+                "0.195.0",
+            );
+            match expected {
+                Some(why) => assert!(verdict.unwrap_err().to_string().contains(why)),
+                None => {
+                    verdict.unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn release_notes_resurrection_refuses_and_names_both_commits() {
+        let repo = Repo::new("note-resurrection");
+        let original = "## [Unreleased]\n\n### Fixed\n\n- **Idle node.** Polls less often.\n\n## [0.1.0] - date\n\n- older change\n";
+        repo.commit("original note", &[("CHANGELOG.md", original)]);
+        repo.run(&["branch", "peer"]);
+        repo.run(&["branch", "unmerged"]);
+        let rewritten = original.replace("Polls less often.", "Polls less often. Waits for work.");
+        let removed = repo.commit("rewrite note", &[("CHANGELOG.md", &rewritten)]);
+        repo.run(&["checkout", "-q", "peer"]);
+        repo.commit("peer change", &[("peer", "peer work")]);
+        repo.run(&["checkout", "-q", "main"]);
+        repo.run(&["merge", "--no-ff", "--no-commit", "peer"]);
+        let both = rewritten.replace(
+            "\n## [0.1.0]",
+            "\n* **Idle node.** Polls\n  less often.\n\n## [0.1.0]",
+        );
+        let restored = repo.commit("merge restores stale note", &[("CHANGELOG.md", &both)]);
+        // A later peer landing can put the removal on the other ancestry,
+        // exactly how real main lost the evidence from its first-parent spine.
+        repo.run(&["checkout", "-q", "peer"]);
+        repo.run(&["merge", "--no-ff", "-qm", "peer lands main", "main"]);
+        // The original text-only preflight accepts both distinct strings. The
+        // new public commit preflight must refuse the history-backed duplicate.
+        assert!(changelog::gate_unreleased(&both).is_ok());
+        let err = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&removed) && err.contains(&restored) && err.contains("resurrects"),
+            "{err}"
+        );
+        let rolled = both.replacen("## [Unreleased]", "## [0.2.0]", 1);
+        let cut = repo.commit("recut snapshot", &[("CHANGELOG.md", &rolled)]);
+        let err = changelog_gate_at(&repo.git(), &cut, "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&removed) && err.contains(&restored), "{err}");
+        let followup = both.replace(
+            "* **Idle node.** Polls\n  less often.",
+            "- **Idle node.** Also sleeps while disconnected.",
+        );
+        let clean = repo.commit("distinct follow-up", &[("CHANGELOG.md", &followup)]);
+        assert!(changelog_gate_at(&repo.git(), &clean, "0.2.0").is_ok());
+
+        // Unmerged peer history cannot poison a candidate.
+        repo.run(&["checkout", "-q", "unmerged"]);
+        assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
+        struct TooLarge<'a>(&'a Git);
+        impl GitRunner for TooLarge<'_> {
+            fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+                self.0.git(args)
+            }
+            fn git_input(&self, args: &[&str], input: &[u8]) -> Result<crate::ledger::RunOut> {
+                assert!(
+                    args.ends_with(&["cat-file", "--batch-check"]),
+                    "an oversized blob must never be read"
+                );
+                let mut out = self.0.git_input(args, input)?;
+                out.stdout = out
+                    .stdout_utf8()
+                    .lines()
+                    .map(|line| {
+                        format!("{} blob 8388609\n", line.split_whitespace().next().unwrap())
+                    })
+                    .collect::<String>()
+                    .into_bytes();
+                Ok(out)
+            }
+        }
+        let git = repo.git();
+        let err = changelog_gate_at(&TooLarge(&git), "HEAD", "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("8 MiB"), "{err}");
+        let head = repo.run(&["rev-parse", "HEAD"]);
+        fs::write(repo.work().join(".git/shallow"), format!("{head}\n")).unwrap();
+        let err = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shallow"), "{err}");
     }
 
     #[test]

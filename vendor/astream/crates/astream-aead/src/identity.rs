@@ -116,6 +116,14 @@ impl IdentityKeypair {
     pub fn public(&self) -> [u8; ID_PUB_LEN] {
         self.signing.verifying_key().to_bytes()
     }
+
+    /// Sign an arbitrary `message` with this Ed25519 private key, returning the
+    /// raw 64-byte Ed25519 signature (used by [`crate::CertificateAuthority`] and
+    /// [`crate::IdentitySigner`]).
+    #[must_use]
+    pub fn sign_raw(&self, message: &[u8]) -> [u8; SIG_LEN] {
+        self.signing.sign(message).to_bytes()
+    }
 }
 
 impl Drop for IdentityKeypair {

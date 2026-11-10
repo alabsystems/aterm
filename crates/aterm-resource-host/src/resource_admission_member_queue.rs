@@ -1039,15 +1039,11 @@ impl Owner {
                 let bound = if active.bound {
                     Ok(())
                 } else {
-                    (|| {
-                        self.journal.update(
-                            binding,
-                            "member_bound",
-                            aterm_json::json!({"pid":pid,"birth":birth}),
-                        )?;
-                        self.journal
-                            .update(binding, "member_running", aterm_json::json!({}))
-                    })()
+                    self.journal.update(
+                        binding,
+                        "member_bound",
+                        aterm_json::json!({"pid":pid,"birth":birth}),
+                    )
                 };
                 match bound {
                     Ok(()) => active.bound = true,

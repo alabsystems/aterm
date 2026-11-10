@@ -25,6 +25,7 @@ pub mod coalition_heat;
 pub mod coalitions;
 pub mod cpu_hardware;
 pub mod cpu_policy;
+pub mod dstate;
 pub mod file_events;
 mod process_thermal;
 pub use process_thermal::{ProcessThermal, ProcessThermalState, process_thermal};
@@ -36,9 +37,11 @@ pub mod jobs;
 pub mod kproc;
 pub mod linux;
 mod machine;
+pub mod machine_type;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod neural_engine;
+pub mod notify;
 #[cfg(target_os = "linux")]
 mod nvml;
 pub mod paths;
@@ -48,8 +51,13 @@ pub mod power;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate reads it through (aterm-uds re-exports it as `aterm_uds::procargs`).
 pub mod procargs;
 pub mod procs;
+pub mod rapl;
 pub mod room;
+pub mod runq;
 pub mod rusage;
+pub mod situation;
+#[cfg(target_os = "macos")]
+mod situation_macos;
 pub mod slots;
 pub mod timeline;
 pub mod volumes;

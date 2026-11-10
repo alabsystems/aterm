@@ -368,11 +368,10 @@ const LET_GO_HANG: Duration = Duration::from_secs(60);
 #[cfg(any(test, debug_assertions))]
 impl Lease {
     /// Test seam: let the lease go, and return once it is let go ([`let_go_within`], under a
-    /// one-minute hang detector). A lease is let go by the last close of its descriptor (on Unix,
-    /// close-only custody), and a child another thread of this process forks holds a copy of
-    /// every descriptor from its `fork` until its `exec` closes it, which a test binary's sibling
-    /// tests do at any moment (`aterm_uds::fork_window`); so a test that asks what letting a
-    /// lease go changed asks after this, not after a drop.
+    /// one-minute hang detector). A lease never offered to a child is let go by `LOCK_UN` at its
+    /// drop; one whose descriptor was offered out (on Unix, close-only custody) is let go by the
+    /// last close of a copy, so a test that asks what letting such a lease go changed asks after
+    /// this, not after a drop.
     ///
     /// # Panics
     /// It was still held when the hang detector ended, or its file could not be tested.
@@ -651,11 +650,11 @@ pub fn take(
     let _ = gate.unlock();
     match laid {
         Ok(file) => {
-            // Keep the rendezvous named while any genuine duplicate remains.
-            // No Unix Drop may LOCK_UN a shared original description or hide it
-            // from reclaim. Existing kernel probes reap it after the last close.
+            // Keep the rendezvous named while any genuine duplicate remains: a lease
+            // offered to a child is let go only by its last close, which reclaim's kernel
+            // probes reap after; one never offered out lets go by LOCK_UN at its drop.
             #[cfg(unix)]
-            let file = file.into_close_only();
+            let file = file.into_sole_close_only();
             Ok(Lease {
                 file,
                 path,
@@ -1226,26 +1225,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
     }
 
-    /// A lease dropped while a child forked by another thread holds a copy of its descriptor stays
-    /// held until that child's `exec` closes the copy, so a drop alone does not let it go
-    /// (NEGATIVE CONTROL: with the child parked, a zero wait finds it held); `release` returns once
-    /// it is let go.
+    /// A lease never offered to a child is let go by `LOCK_UN` at its drop, so a child forked by
+    /// another thread, holding a copy of its descriptor until its `exec`, does not keep it held.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
-    fn a_lease_is_let_go_once_a_forked_childs_copy_closes() {
+    fn a_dropped_lease_is_let_go_while_a_forked_child_holds_its_copy() {
         let root = aterm_tempfile::tempdir().unwrap();
         let subject = trust(92);
         let lease = take(root.path(), &subject, "forked sibling", Duration::ZERO).unwrap();
         let path = lease.path().to_path_buf();
         let parked = aterm_uds::fork_window::Parked::park();
         drop(lease);
-        assert!(matches!(holders(root.path(), &subject), Holders::Held(_)));
-        assert!(
-            let_go_within(&path, Duration::ZERO).is_err(),
-            "the parked child's copy holds it"
-        );
-        drop(parked);
-        assert_eq!(let_go_within(&path, LET_GO_HANG), Ok(()));
+        assert_eq!(let_go_within(&path, Duration::ZERO), Ok(()));
+        assert!(parked.release().success());
         assert_eq!(holders(root.path(), &subject), Holders::Free);
         let again = take(root.path(), &subject, "after", Duration::ZERO).unwrap();
         again.release();

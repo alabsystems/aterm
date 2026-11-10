@@ -21,6 +21,13 @@ pub(crate) fn macos_kinfo(pid: std::ffi::c_int) -> Option<darwin::Kinfo> {
     macos::kinfo(pid)
 }
 
+/// The D-state census's read of one process ([`crate::dstate`]): its threads, at most
+/// [`MAX_THREADS`] as this probe reads a member's, and how many wait uninterruptibly.
+#[cfg(target_os = "macos")]
+pub(crate) fn census_read(pid: u32) -> crate::dstate::Read {
+    macos::census_read(pid)
+}
+
 /// Whether `pid` has begun to exit: on Apple `PROC_FLAG_INEXIT` (the kernel's `P_LEXIT`), on
 /// Linux `PF_EXITING`. Each is set as the exit starts and never cleared, before the exit closes
 /// the process's descriptors or ends a session leader's hold on its terminal (XNU revokes it),

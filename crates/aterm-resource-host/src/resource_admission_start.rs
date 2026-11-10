@@ -93,7 +93,7 @@ impl Owner {
                 if let Some(root) = pending.bootstrap_graph.as_mut() {
                     // Capture the actual original locator together with all
                     // original transport descriptions before the first ARM.
-                    root.configured(&command)?;
+                    root.configured(&mut command)?;
                 }
                 if resolver {
                     let sdk = service_sdk
@@ -117,7 +117,7 @@ impl Owner {
                             &mut prelude,
                             vec![(sdk.descriptor()?, sdk::TARGET), preparation.extra()?],
                         )?;
-                    preparation.configured(&prelude)?;
+                    preparation.configured(&mut prelude)?;
                     pending.resolver = Some(preparation);
                     command = prelude;
                 }

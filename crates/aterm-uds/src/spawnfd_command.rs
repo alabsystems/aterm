@@ -542,6 +542,33 @@ impl Command {
         }
     }
 
+    /// Add mapped guards without replacing already selected resource custody.
+    /// All descriptions are prepared together so a new target cannot overwrite
+    /// an earlier source during child placement. Failure preserves this command's
+    /// original table; the supplied additions are consumed without being installed.
+    #[cfg(unix)]
+    pub fn append_guards_at(&mut self, guards: Vec<(OwnedFd, RawFd)>) -> io::Result<&mut Self> {
+        let count = self
+            .guards
+            .len()
+            .checked_add(guards.len())
+            .filter(|count| *count <= super::MAX_GUARD_FDS)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many explicit spawn guards",
+                )
+            })?;
+        let mut combined = Vec::with_capacity(count);
+        for guard in &self.guards {
+            // Preserve the native fork exclusion while assembling the new table,
+            // before inherit_guards_at makes its final placeable copies.
+            combined.push((crate::kept_out(|| guard.source.try_clone())?, guard.target));
+        }
+        combined.extend(guards);
+        self.inherit_guards_at(combined)
+    }
+
     /// Stable child descriptor numbers after either inheritance method, available before spawn
     /// so an authenticated launch can journal each actual guard's identity and position.
     #[cfg(unix)]
@@ -589,6 +616,15 @@ impl Command {
     #[must_use]
     pub const fn get_footprint_limit(&self) -> Option<trust_exec_policy::FootprintLimit> {
         self.footprint
+    }
+
+    /// Remove the requested attributes for transfer to a final selected exec.
+    /// This moves launch configuration only, not an installed policy or a
+    /// memory reservation. After extraction this command carries no such cap.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn take_footprint_limit(&mut self) -> Option<trust_exec_policy::FootprintLimit> {
+        self.footprint.take()
     }
 
     /// Start the child, or replace this process, OUT OF THIS PROCESS'S BACKGROUND BAND (`true`):

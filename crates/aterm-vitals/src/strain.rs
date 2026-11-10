@@ -15,20 +15,26 @@
 //!   hard load and gives the heat back as slowly ([`soak()`]).
 //!
 //! Every input is a reading the snapshot already keeps: the CPU and GPU rows' now and capacity,
-//! [`RowFacts::load1`](crate::RowFacts::load1) and [`RowFacts::swap_rate`](crate::RowFacts::swap_rate),
-//! the memory pressure, and the hour rings' per-bucket over flags and pressure. Two readings it
-//! would want are not kept, so it reads the nearest kept one instead, and one kept reading it
-//! leaves out on purpose:
+//! [`RowFacts::queue`](crate::RowFacts::queue) (P10, the machine's runnable threads over 10 s,
+//! where read, else the 1-minute load average: [`crate::runq`]) and
+//! [`RowFacts::swap_rate`](crate::RowFacts::swap_rate), the memory pressure, and the hour rings'
+//! per-bucket over flags and pressure. Two readings it would want are not kept, so it reads the
+//! nearest kept one instead, and one kept reading it leaves out on purpose:
 //!
-//! - No bucket keeps its load average or swap rate, so the soak cannot grade how far over each
+//! - No bucket keeps its run queue or swap rate, so the soak cannot grade how far over each
 //!   bucket was. It reads the buckets' over flags, so an hour at twice the cores soaks as much as
 //!   an hour at ten times.
 //! - The GPU keeps no over flag: its reading is a share of time busy, which cannot pass 100%. A
 //!   GPU flat out lifts the level to 1 but never moves the over or the soak.
-//! - The deck's CPU over needs a queue (the load average past the cores) as well as busy cores.
-//!   A CPU pegged with nothing waiting is at capacity, not over it, so it soaks nothing. The
+//! - The deck's CPU over needs a queue (the run queue past the cores) as well as busy cores. A
+//!   CPU pegged with nothing waiting is at capacity, not over it, so it soaks nothing. The
 //!   bucket means are kept, but the soak leaves them out on purpose: the owner's own light
 //!   capture has pegged ten-second cells, and a light Mac must read calm.
+//!
+//! One rule of CPU over, [`cpu_over_depth`], holds the dial ([`over()`]), the CPU row's over
+//! flags and the queue tile ([`crate::units::cpu_over`]) and the CPU cause pointer's score
+//! ([`cpu_score`]), so the pointer never paints CPU over while the needle sits below the redline
+//! (A4 §3).
 
 use crate::model::{CPU_OVER_BUSY, Pressure, Resource, ResourceView, SWAP_OVER_BPS, Snapshot};
 use crate::ring::{BUCKET_S, Cell, RING_BUCKETS};
@@ -46,7 +52,7 @@ pub const PRESSURE_CRITICAL_LEVEL: f32 = 1.0;
 /// the first step past capacity is visible.
 pub const OVER_FLOOR: f32 = 0.12;
 
-/// Doublings of the load average past the cores that pin [`Strain::over`] at 1: 3, so twice the
+/// Doublings of the run queue past the cores that pin [`Strain::over`] at 1: 3, so twice the
 /// cores reads a third and eight times the cores pins it.
 pub const OVER_LOAD_DOUBLINGS: f64 = 3.0;
 
@@ -96,8 +102,9 @@ pub struct Now {
     pub gpu: Option<f64>,
     /// CPU: logical cores.
     pub cores: Option<f64>,
-    /// CPU: the 1-minute load average.
-    pub load1: Option<f64>,
+    /// CPU: the run queue the over rule reads, threads: P10 where read, else the 1-minute load
+    /// average ([`crate::runq::RunQueue`]).
+    pub queue: Option<f64>,
     /// Memory: swap traffic, in plus out, bytes per second.
     pub swap_bps: Option<f64>,
     /// Memory: the kernel's pressure.
@@ -105,8 +112,8 @@ pub struct Now {
 }
 
 impl Now {
-    /// The readings a snapshot holds: the CPU and GPU rows' now against their capacity, the load
-    /// average and swap rate the rows' facts keep, and the memory reading's pressure.
+    /// The readings a snapshot holds: the CPU and GPU rows' now against their capacity, the run
+    /// queue and swap rate the rows' facts keep, and the memory reading's pressure.
     #[must_use]
     pub fn of(snap: &Snapshot) -> Self {
         let cpu = &snap.resources[Resource::Cpu.index()];
@@ -114,7 +121,7 @@ impl Now {
             cpu: share(cpu),
             gpu: share(&snap.resources[Resource::Gpu.index()]),
             cores: cpu.capacity,
-            load1: snap.facts.load1,
+            queue: snap.facts.queue.map(|q| q.threads),
             swap_bps: snap.facts.swap_rate,
             pressure: snap
                 .mem
@@ -133,7 +140,7 @@ fn share(row: &ResourceView) -> Option<f64> {
 /// One 10 s bucket of the hour as [`soak()`] reads it. The default is a bucket nothing was read in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
-    /// The CPU bucket was over: the load average past the cores with at least
+    /// The CPU bucket was over ([`cpu_over_depth`]): the run queue past the cores with at least
     /// [`CPU_OVER_BUSY`] of them busy, for at least half its readings.
     pub cpu_over: bool,
     /// The Memory bucket was over: swapping at [`SWAP_OVER_BPS`] (4 MiB/s) or more, for at least
@@ -233,8 +240,9 @@ pub fn level(now: &Now) -> Option<f32> {
 /// How far past capacity the Mac is now: 0 within capacity or where nothing says otherwise, and
 /// otherwise the larger depth below, held to [`OVER_FLOOR`]`..=1`:
 ///
-/// - the CPU, by the deck's own over rule (the load average past the cores while at least
-///   [`CPU_OVER_BUSY`] of them are busy): `log2(load1 / cores) / OVER_LOAD_DOUBLINGS`;
+/// - the CPU, by the deck's one over rule, [`cpu_over_depth`] (the run queue past the cores
+///   while at least [`CPU_OVER_BUSY`] of them are busy): `log2(queue / cores) /
+///   OVER_LOAD_DOUBLINGS`;
 /// - swapping at [`SWAP_OVER_BPS`] (4 MiB/s) or more:
 ///   `log2(swap / SWAP_OVER_BPS) / OVER_SWAP_DOUBLINGS`;
 /// - memory pressure `critical`, the kernel killing to make room: the floor, since it has no
@@ -245,12 +253,7 @@ pub fn level(now: &Now) -> Option<f32> {
 /// puts the over past the level's end.
 #[must_use]
 pub fn over(now: &Now) -> f32 {
-    let cpu = match (read(now.cpu), read(now.cores), read(now.load1)) {
-        (Some(busy), Some(cores), Some(load)) if cores > 0.0 && load > cores => {
-            (busy >= CPU_OVER_BUSY).then(|| (load / cores).log2() / OVER_LOAD_DOUBLINGS)
-        }
-        _ => None,
-    };
+    let cpu = cpu_over_depth(now.cpu, now.cores, now.queue);
     let swap = read(now.swap_bps)
         .filter(|&r| r >= SWAP_OVER_BPS)
         .map(|r| (r / SWAP_OVER_BPS).log2() / OVER_SWAP_DOUBLINGS);
@@ -260,6 +263,36 @@ pub fn over(now: &Now) -> f32 {
         .flatten()
         .reduce(f64::max)
         .map_or(0.0, |d| d.clamp(f64::from(OVER_FLOOR), 1.0) as f32)
+}
+
+/// The CPU's depth past capacity by the deck's one over rule (A4 §3): where at least
+/// [`CPU_OVER_BUSY`] of the `cores` are busy (`busy` their share, `0..=1`) and the run queue
+/// `queue` (threads) passes them, `log2(queue / cores) / OVER_LOAD_DOUBLINGS` held to
+/// [`OVER_FLOOR`]`..=1`; `None` within capacity or where any of the three is unread or not a
+/// number.
+///
+/// The dial ([`over()`]), the CPU row's over flags and queue tile ([`crate::units::cpu_over`])
+/// and the CPU cause pointer ([`cpu_score`]) all read it, each with its own `busy` (the dial and
+/// the pointer the row's 10 s mean, a flag its own reading's) and the one queue
+/// ([`crate::RowFacts::queue`]).
+#[must_use]
+pub fn cpu_over_depth(busy: Option<f64>, cores: Option<f64>, queue: Option<f64>) -> Option<f64> {
+    let (busy, cores, queue) = (read(busy)?, read(cores)?, read(queue)?);
+    (cores > 0.0 && queue > cores && busy >= CPU_OVER_BUSY)
+        .then(|| ((queue / cores).log2() / OVER_LOAD_DOUBLINGS).clamp(f64::from(OVER_FLOOR), 1.0))
+}
+
+/// The CPU cause pointer's score (A4 §3): `1 + over` while the CPU is over
+/// ([`cpu_over_depth`]), else its busy share held under 1; `None` where the busy share is unread.
+/// A score of 1 or more draws in over ink, so it does exactly while the dial reads the CPU over:
+/// every core pegged with nothing waiting is at capacity, not past it.
+#[must_use]
+pub fn cpu_score(now: &Now) -> Option<f64> {
+    let busy = read(now.cpu)?;
+    Some(
+        cpu_over_depth(now.cpu, now.cores, now.queue)
+            .map_or(busy.min(1.0 - f64::EPSILON), |over| 1.0 + over),
+    )
 }
 
 /// How much of the recent hour was spent past capacity, `0..=1`: the exponential average of each
@@ -287,6 +320,7 @@ mod tests {
     use crate::ink::heat_step;
     use crate::model::{GpuSample, MemSample, Sample, Ticks, Vitals};
     use crate::ring::Cell;
+    use crate::runq::{QueueBasis, RunQueueRead};
     use Pressure::{Critical, Normal, Warn};
 
     const CORES: f64 = 18.0;
@@ -321,13 +355,13 @@ mod tests {
         (f64::from(a) - b).abs() <= tol
     }
 
-    /// A Mac of 18 cores, its GPU, load average, swap and pressure now.
-    fn now(cpu: f64, gpu: f64, load1: f64, swap_mib: f64, pressure: Pressure) -> Now {
+    /// A Mac of 18 cores, its GPU, run queue, swap and pressure now.
+    fn now(cpu: f64, gpu: f64, queue: f64, swap_mib: f64, pressure: Pressure) -> Now {
         Now {
             cpu: Some(cpu),
             gpu: Some(gpu),
             cores: Some(CORES),
-            load1: Some(load1),
+            queue: Some(queue),
             swap_bps: Some(swap_mib * MIB),
             pressure,
         }
@@ -563,7 +597,7 @@ mod tests {
             cpu: Some(f64::NAN),
             gpu: Some(f64::INFINITY),
             cores: Some(CORES),
-            load1: Some(f64::NAN),
+            queue: Some(f64::NAN),
             swap_bps: Some(f64::INFINITY),
             pressure: Normal,
         };
@@ -599,7 +633,10 @@ mod tests {
             capacity: Some(0.0),
             ..ResourceView::default()
         };
-        snap.facts.load1 = Some(50.0);
+        snap.facts.queue = Some(crate::runq::RunQueue {
+            threads: 50.0,
+            basis: crate::runq::QueueBasis::Runnable,
+        });
         let held = Now::of(&snap);
         assert_eq!((held.cpu, held.gpu, held.cores), (None, None, Some(0.0)));
         assert_eq!(Strain::of(&snap), Strain::default());
@@ -803,7 +840,7 @@ mod tests {
         assert!(near(now.cpu.expect("busy") as f32, 0.1, 1e-6));
         assert!(near(now.gpu.expect("the GPU") as f32, 0.3, 1e-6));
         assert_eq!(
-            (now.cores, now.load1, now.swap_bps, now.pressure),
+            (now.cores, now.queue, now.swap_bps, now.pressure),
             (Some(2.0), Some(0.5), Some(0.0), Normal)
         );
         let hour: Vec<Flags> = hour_of(&snap).collect();
@@ -839,5 +876,125 @@ mod tests {
         );
         assert_eq!((s.over, s.soak), (0.0, 0.0), "no busy, no swap rate");
         assert_eq!(hour_of(&snap).collect::<Vec<_>>(), want);
+    }
+
+    /// A ten-core Mac read once a second for 12 s, every core `busy`, the host's run-queue
+    /// reading `p` and the 1-minute load `load1` at each: the model's last snapshot.
+    fn steady(busy: f64, p: RunQueueRead, load1: f64) -> Snapshot {
+        let mut v = Vitals::new();
+        let mut snap = Snapshot::default();
+        for t in 1..=12u64 {
+            let core = Ticks {
+                busy: (busy * TICKS as f64).round() as u64 * t,
+                total: TICKS * t,
+            };
+            snap = v.absorb(&Sample {
+                at_ns: t * 1_000_000_000,
+                at_unix_ms: T0 + i64::try_from(t).expect("few") * 1000,
+                mono_ms: t * 1000,
+                cadence_ms: 1000,
+                cores: Some(vec![core; 10]),
+                load1: Some(load1),
+                run_queue: p,
+                ..Sample::default()
+            });
+        }
+        snap
+    }
+
+    /// What the dial, the CPU row and its queue tile, and the CPU pointer say of one snapshot:
+    /// the dial's over, the row's over flag, the tile's, and the pointer's score.
+    fn three(snap: &Snapshot) -> (f32, bool, bool, f64) {
+        let now = Now::of(snap);
+        (
+            over(&now),
+            snap.resources[Resource::Cpu.index()].over,
+            snap.units.queue.expect("the queue tile").over,
+            cpu_score(&now).expect("busy is read"),
+        )
+    }
+
+    fn milli(threads: f64) -> RunQueueRead {
+        RunQueueRead::Milli((threads * 1000.0).round() as u64)
+    }
+
+    /// A4 §15 `the_pointer_the_dial_and_the_row_share_one_over`, the CPU's part (N2): the dial,
+    /// the CPU row's over flag and queue tile, and the CPU pointer's score are one rule over one
+    /// queue, P10, and load1 only where P10 is unread. Cores' ranking beside it lands with the
+    /// pointers' ranking (N5).
+    #[test]
+    fn the_pointer_the_dial_and_the_row_share_one_over() {
+        // Every pair of busy share and runnable count on ten cores, away from the rule's edges:
+        // the three agree, and over ink (a score of 1 or more) is exactly the dial over.
+        for busy in [0.5, 0.94, 0.96, 1.0] {
+            for p in [5.0, 9.9, 10.5, 16.59, 26.8, 100.0] {
+                let snap = steady(busy, milli(p), 2.0);
+                let (dial, row, tile, score) = three(&snap);
+                let over = dial > 0.0;
+                assert_eq!((row, tile), (over, over), "busy {busy}, P10 {p}");
+                assert_eq!(score >= 1.0, over, "busy {busy}, P10 {p}: {score}");
+                let q = snap.facts.queue.expect("P10 read");
+                assert_eq!(q.basis, QueueBasis::Runnable, "P10, not the load of 2");
+                assert!((q.threads - p).abs() < 1e-3, "{q:?}");
+            }
+        }
+
+        // 09:59:25–34: the machine 0.654 busy with 16.59 waiting: within capacity, no pointer
+        // (under the amber's 0.75).
+        let (dial, row, tile, score) = three(&steady(0.654, milli(16.59), 16.59));
+        assert_eq!((dial, row, tile), (0.0, false, false));
+        assert!((score - 0.654).abs() < 1e-3, "{score}");
+        // 10:42:59: every core busy, 26.8 runnable on 10: over 0.474, the pointer 1.474.
+        let (dial, row, tile, score) = three(&steady(1.0, milli(26.8), 26.8));
+        assert!((f64::from(dial) - 0.474).abs() < 1e-3, "{dial}");
+        assert!(row && tile);
+        assert!((score - 1.474).abs() < 1e-3, "{score}");
+
+        // A burst just drained: P10 is back to 4 on 10 cores, the cores still 0.97 busy, and
+        // load1 still holds 26.8 (it lags by a minute). P10 says within capacity, and all three
+        // say so.
+        let drained = steady(0.97, milli(4.0), 26.8);
+        let (dial, row, tile, score) = three(&drained);
+        assert_eq!((dial, row, tile), (0.0, false, false));
+        assert!(score < 1.0, "{score}");
+        // Negative control: a pointer that kept load1 as its queue paints CPU over (1.474) while
+        // the needle reads nothing past the redline: two rules, not one.
+        let now = Now::of(&drained);
+        let mutant = cpu_over_depth(now.cpu, now.cores, drained.facts.load1)
+            .map_or(now.cpu.expect("busy"), |o| 1.0 + o);
+        assert!(mutant >= 1.0 && dial == 0.0, "the control reads {mutant}");
+
+        // P10 unread (no reader on this OS, or its self-check failed): load1 is the queue, for
+        // all three alike.
+        for why in [RunQueueRead::Unsupported, RunQueueRead::UnreadFormat] {
+            let snap = steady(1.0, why, 26.8);
+            assert_eq!(snap.facts.queue.map(|q| q.basis), Some(QueueBasis::Load1));
+            let (dial, row, tile, score) = three(&snap);
+            assert!(dial > 0.0 && row && tile && score >= 1.0);
+        }
+    }
+
+    #[test]
+    fn the_over_rule_reads_nothing_it_was_not_given() {
+        assert_eq!(cpu_over_depth(Some(1.0), Some(10.0), None), None);
+        assert_eq!(cpu_over_depth(None, Some(10.0), Some(40.0)), None);
+        assert_eq!(cpu_over_depth(Some(1.0), Some(0.0), Some(40.0)), None);
+        assert_eq!(cpu_over_depth(Some(1.0), Some(10.0), Some(f64::NAN)), None);
+        assert_eq!(
+            cpu_over_depth(Some(1.0), Some(10.0), Some(10.0)),
+            None,
+            "at, not past"
+        );
+        let floor = cpu_over_depth(Some(1.0), Some(10.0), Some(10.01)).expect("over");
+        assert_eq!(
+            floor,
+            f64::from(OVER_FLOOR),
+            "the first step past is visible"
+        );
+        assert_eq!(
+            cpu_over_depth(Some(1.0), Some(10.0), Some(900.0)),
+            Some(1.0)
+        );
+        assert_eq!(cpu_score(&Now::default()), None, "no busy share, no score");
     }
 }

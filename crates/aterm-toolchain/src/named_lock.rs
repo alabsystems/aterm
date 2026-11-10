@@ -303,6 +303,18 @@ impl NamedLock {
             .into_close_only()
     }
 
+    /// [`Self::into_close_only`] for a lock this process took, no copy of whose description it
+    /// made: its last guard lets it go by `LOCK_UN` unless a copy was offered out since
+    /// ([`crate::record_lock::RecordLock::into_sole_close_only`]).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn into_sole_close_only(mut self) -> crate::record_lock::CloseOnlyLock {
+        self.lock
+            .take()
+            .expect("a named lock owns its guard until consuming transfer")
+            .into_sole_close_only()
+    }
+
     /// The record this lock's file holds: its taker, since the moment the taker had the lock.
     #[must_use]
     pub fn holder(&self) -> &Holder {
